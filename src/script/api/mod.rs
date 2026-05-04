@@ -523,14 +523,22 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
         proxy_ns
             .setattr("_utils", proxy_utils_py.bind(python))
             .map_err(|error| SiphonError::Script(format!("setattr proxy._utils: {error}")))?;
+    }
 
-        if let Some(subscribe_state_py) = SUBSCRIBE_STATE_SINGLETON.get() {
-            proxy_ns
-                .setattr("subscribe_state", subscribe_state_py.bind(python))
-                .map_err(|error| {
-                    SiphonError::Script(format!("setattr proxy.subscribe_state: {error}"))
-                })?;
-        }
+    // Inject the subscribe_state singleton onto `proxy` independently of
+    // RUST_SINGLETONS — subscribe_state has no dependency on auth/registrar/log
+    // and gating it under that tuple would mean dropping the Rust namespace
+    // (and silently leaving the Python stub bound) any time auth/registrar
+    // singletons aren't yet wired (e.g. tests, or re-entrant install paths).
+    if let Some(subscribe_state_py) = SUBSCRIBE_STATE_SINGLETON.get() {
+        let proxy_ns = module
+            .getattr("proxy")
+            .map_err(|error| SiphonError::Script(format!("getattr proxy: {error}")))?;
+        proxy_ns
+            .setattr("subscribe_state", subscribe_state_py.bind(python))
+            .map_err(|error| {
+                SiphonError::Script(format!("setattr proxy.subscribe_state: {error}"))
+            })?;
     }
 
     // Inject optional RTPEngine singleton (only when media.rtpengine is configured).

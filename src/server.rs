@@ -568,6 +568,51 @@ impl SiphonServer {
             None
         };
 
+        // --- Subscribe-state namespace (proxy.subscribe_state) ---
+        //
+        // Must run BEFORE `ScriptEngine::new()` so that
+        // `install_siphon_module()` can replace the Python `_SubscribeStateStub`
+        // with the Rust-backed namespace on the very first script load.
+        // Embedded-bytecode apps load the script exactly once, so a
+        // post-engine setup leaves the stub bound forever and any
+        // `await proxy.subscribe_state.send(...)` raises AttributeError.
+        // Source-script apps masked the bug because file-watcher reloads
+        // re-run install_siphon_module after the singleton is set.
+        {
+            let cache_manager = std::sync::Arc::new(
+                crate::cache::CacheManager::new(config.cache.as_deref().unwrap_or(&[])),
+            );
+            let mut store = crate::subscribe_state::SubscribeStore::new();
+            if let Some(ref cfg) = config.subscribe_state {
+                if let Some(ref cache_name) = cfg.cache {
+                    if cache_manager.has_cache(cache_name) {
+                        store = store.with_cache(
+                            Arc::clone(&cache_manager),
+                            cache_name.clone(),
+                        );
+                        info!(cache = %cache_name, "subscribe_state: L2 persistence enabled");
+                    } else {
+                        error!(
+                            cache = %cache_name,
+                            "subscribe_state: configured cache not found in cache: list"
+                        );
+                    }
+                }
+            }
+            let store_arc = Arc::new(store);
+            pyo3::Python::attach(|python| {
+                let namespace =
+                    crate::script::api::subscribe_state::PySubscribeState::new(
+                        Arc::clone(&store_arc),
+                    );
+                if let Err(error) =
+                    crate::script::api::set_subscribe_state_singleton(python, namespace)
+                {
+                    error!("failed to store subscribe_state singleton: {error}");
+                }
+            });
+        }
+
         // --- Script engine ---
         let engine = if let Some(bytecode) = self.embedded_bytecode {
             Arc::new(ScriptEngine::new_from_bytecode(bytecode).unwrap_or_else(|error| {
@@ -913,42 +958,6 @@ impl SiphonServer {
             );
             crate::script::api::subscribe_state::set_uac_sender(Arc::clone(&uac_sender));
             crate::script::api::subscribe_state::set_resolver(Arc::clone(&dns_resolver));
-        }
-
-        // --- Subscribe-state namespace (proxy.subscribe_state) ---
-        {
-            let cache_manager = std::sync::Arc::new(
-                crate::cache::CacheManager::new(config.cache.as_deref().unwrap_or(&[])),
-            );
-            let mut store = crate::subscribe_state::SubscribeStore::new();
-            if let Some(ref cfg) = config.subscribe_state {
-                if let Some(ref cache_name) = cfg.cache {
-                    if cache_manager.has_cache(cache_name) {
-                        store = store.with_cache(
-                            Arc::clone(&cache_manager),
-                            cache_name.clone(),
-                        );
-                        info!(cache = %cache_name, "subscribe_state: L2 persistence enabled");
-                    } else {
-                        error!(
-                            cache = %cache_name,
-                            "subscribe_state: configured cache not found in cache: list"
-                        );
-                    }
-                }
-            }
-            let store_arc = Arc::new(store);
-            pyo3::Python::attach(|python| {
-                let namespace =
-                    crate::script::api::subscribe_state::PySubscribeState::new(
-                        Arc::clone(&store_arc),
-                    );
-                if let Err(error) =
-                    crate::script::api::set_subscribe_state_singleton(python, namespace)
-                {
-                    error!("failed to store subscribe_state singleton: {error}");
-                }
-            });
         }
 
         // --- Gateway health probers ---

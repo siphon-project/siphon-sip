@@ -1072,6 +1072,7 @@ fn strip_nameaddr(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pyo3::types::PyDict;
 
     #[test]
     fn extract_tag_basic() {
@@ -1089,5 +1090,98 @@ mod tests {
             "sip:alice@ex"
         );
         assert_eq!(strip_nameaddr("sip:alice@ex;tag=abc"), "sip:alice@ex");
+    }
+
+    /// Singleton-injection regression: with the singleton registered before
+    /// `install_siphon_module()` runs, the resulting `siphon` module must
+    /// expose a Rust-backed `proxy.subscribe_state` carrying the full method
+    /// surface (`send`, `find`, `create`, `get`, `local_count`).
+    ///
+    /// This guards the startup-ordering bug where `_SubscribeStateStub` stayed
+    /// bound to `proxy.subscribe_state` for embedded-bytecode apps because the
+    /// singleton was being set *after* the script engine loaded.
+    #[test]
+    fn rust_namespace_replaces_stub_when_singleton_set_first() {
+        Python::initialize();
+        Python::attach(|python| {
+            let store = Arc::new(SubscribeStore::new());
+            let namespace = PySubscribeState::new(store);
+            // Idempotent: if another test already populated the OnceLock
+            // we still want to verify install_siphon_module's behaviour.
+            let _ = crate::script::api::set_subscribe_state_singleton(python, namespace);
+
+            crate::script::api::ensure_registry(python).expect("ensure registry");
+            crate::script::api::install_siphon_module(python).expect("install siphon module");
+
+            let script = r#"
+import siphon
+ns = siphon.proxy.subscribe_state
+assert type(ns).__name__ != '_SubscribeStateStub', type(ns).__name__
+for m in ('create', 'get', 'send', 'find'):
+    assert hasattr(ns, m), m
+assert hasattr(ns, 'local_count'), 'local_count'
+"#;
+            let assertions = std::ffi::CString::new(script).expect("CString");
+            python
+                .run(assertions.as_c_str(), None, None)
+                .expect("Rust subscribe_state namespace must replace the stub");
+        });
+    }
+
+    /// Stub-API surface regression: without the Rust namespace, the
+    /// `_SubscribeStateStub` must mirror the real method surface and raise a
+    /// self-describing `NotImplementedError` for every method, not opaque
+    /// `AttributeError`. Catches stub drift when methods are added to the
+    /// Rust side without updating siphon_package.py.
+    #[test]
+    fn stub_methods_raise_self_describing_error() {
+        Python::initialize();
+        Python::attach(|python| {
+            // Reach _SubscribeStateStub directly out of the package source —
+            // independent of whether the OnceLock has been populated by other
+            // tests (it likely has, in the parallel cargo test process).
+            let source = include_str!("siphon_package.py");
+            let module_globals = PyDict::new(python);
+            python
+                .run(
+                    &std::ffi::CString::new(source).expect("CString"),
+                    Some(&module_globals),
+                    Some(&module_globals),
+                )
+                .expect("evaluate siphon_package.py");
+
+            let script = r#"
+stub = _SubscribeStateStub()
+for m in ('create', 'get', 'send', 'find'):
+    assert hasattr(stub, m), m
+# local_count is a @property whose getter raises — check its presence on the class.
+assert 'local_count' in dir(_SubscribeStateStub), 'local_count missing from stub'
+try:
+    stub.local_count
+except NotImplementedError:
+    pass
+else:
+    raise AssertionError('stub.local_count did not raise')
+try:
+    stub.send('sip:x', 'reg', 60)
+except NotImplementedError as e:
+    msg = str(e)
+    assert 'subscribe_state' in msg and 'singleton' in msg, msg
+except AttributeError as e:
+    raise AssertionError('stub raised AttributeError instead of NotImplementedError: ' + str(e))
+else:
+    raise AssertionError('stub.send() did not raise')
+try:
+    stub.find('cid', 'lt', 'rt')
+except NotImplementedError:
+    pass
+else:
+    raise AssertionError('stub.find() did not raise')
+"#;
+            let assertions = std::ffi::CString::new(script).expect("CString");
+            python
+                .run(assertions.as_c_str(), Some(&module_globals), Some(&module_globals))
+                .expect("stub surface assertions");
+        });
     }
 }

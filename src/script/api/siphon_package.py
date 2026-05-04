@@ -424,19 +424,47 @@ class _RegistrationNamespace:
 
 
 class _SubscribeStateStub:
-    """Pre-startup stub for ``proxy.subscribe_state``.  Replaced by the
-    Rust-backed namespace before any user handler runs."""
+    """Pre-startup stub for ``proxy.subscribe_state``.
+
+    The real, Rust-backed namespace is installed onto ``proxy`` by
+    ``install_siphon_module()`` before any user handler runs.  If a
+    handler ever lands on this stub it means the singleton wasn't
+    registered before the script was loaded — every method below raises
+    a self-describing :class:`NotImplementedError` so the failure points
+    at the cause instead of an opaque ``AttributeError``.
+    """
+
+    _ERROR = (
+        "proxy.subscribe_state.{name}() not available — the Rust "
+        "namespace was not installed before the script was loaded. "
+        "This is a siphon startup-ordering bug; the subscribe_state "
+        "singleton must be registered before ScriptEngine::new()."
+    )
 
     def create(self, request, expires=None):
-        raise NotImplementedError(
-            "proxy.subscribe_state.create() not available yet — "
-            "called before the Rust namespace was installed"
-        )
+        raise NotImplementedError(self._ERROR.format(name="create"))
 
     def get(self, id):
-        raise NotImplementedError(
-            "proxy.subscribe_state.get() not available yet"
-        )
+        raise NotImplementedError(self._ERROR.format(name="get"))
+
+    def find(self, call_id, local_tag, remote_tag):
+        raise NotImplementedError(self._ERROR.format(name="find"))
+
+    def send(
+        self,
+        ruri,
+        event,
+        expires,
+        accept=None,
+        target_uri=None,
+        headers=None,
+        timeout_ms=2000,
+    ):
+        raise NotImplementedError(self._ERROR.format(name="send"))
+
+    @property
+    def local_count(self):
+        raise NotImplementedError(self._ERROR.format(name="local_count"))
 
 
 # ---------------------------------------------------------------------------
