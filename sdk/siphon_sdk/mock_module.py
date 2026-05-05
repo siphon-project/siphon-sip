@@ -54,6 +54,29 @@ class _HandlerRegistry:
 _registry = _HandlerRegistry()
 
 
+def _run_async(coroutine: Any) -> Any:
+    """Drive an awaitable to completion from sync code.
+
+    Used by the mock fire-paths (``_fire_on_change`` etc.) that are
+    synchronous methods but may invoke handlers registered as ``async def``.
+    Reuses the running loop when one is available so the harness's loop is
+    preferred; otherwise falls back to a fresh per-call loop.
+    """
+    if not asyncio.iscoroutine(coroutine):
+        return coroutine
+    try:
+        # Already inside a running loop — schedule and let it complete.
+        running = asyncio.get_running_loop()
+        return asyncio.ensure_future(coroutine, loop=running)
+    except RuntimeError:
+        pass
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coroutine)
+    finally:
+        loop.close()
+
+
 # ---------------------------------------------------------------------------
 # Proxy namespace
 # ---------------------------------------------------------------------------
@@ -142,17 +165,17 @@ class MockProxy:
         _registry.register("proxy.on_register_reply", None, fn, is_async)
         return fn
 
-    def send_request(self, method: str, ruri: str,
-                     headers: Optional[dict[str, str]] = None,
-                     body: Optional[Any] = None,
-                     next_hop: Optional[str] = None,
-                     wait_for_response: bool = False,
-                     timeout_ms: int = 2000) -> Any:
+    async def send_request(self, method: str, ruri: str,
+                           headers: Optional[dict[str, str]] = None,
+                           body: Optional[Any] = None,
+                           next_hop: Optional[str] = None,
+                           wait_for_response: bool = False,
+                           timeout_ms: int = 2000) -> Any:
         """Originate an outbound SIP request.
 
-        Fire-and-forget by default; when ``wait_for_response=True``, blocks
-        until a response is configured for the destination and returns a
-        mock ``Reply`` (or ``None`` on timeout).
+        Always returns an awaitable — scripts must ``await`` it. Fire-and-forget
+        by default; when ``wait_for_response=True``, the awaitable resolves to
+        a configured mock ``Reply`` (or ``None`` on timeout).
 
         Args:
             method: SIP method name (e.g. "NOTIFY", "OPTIONS", "MESSAGE").
@@ -870,10 +893,18 @@ class MockRegistrar:
             self._fire_on_change(aor, "deregistered")
 
     def _fire_on_change(self, aor: str, event_type: str) -> None:
-        """Invoke all on_change handlers registered via decorator."""
+        """Invoke all on_change handlers registered via decorator.
+
+        Handles both sync and async handlers — async ones are driven on a
+        per-call event loop so callers don't need to maintain one (matches
+        how the harness drives ``@proxy.on_request`` async handlers).
+        """
         contacts = self._store.get(aor, [])
-        for _, fn, _, _meta in _registry.handlers.get("registrar.on_change", []):
-            fn(aor, event_type, contacts)
+        for _, fn, is_async, _meta in _registry.handlers.get("registrar.on_change", []):
+            if is_async:
+                _run_async(fn(aor, event_type, contacts))
+            else:
+                fn(aor, event_type, contacts)
 
 
 # ---------------------------------------------------------------------------

@@ -106,7 +106,7 @@ def handle_register(request):
 
 
 @proxy.on_request("SUBSCRIBE")
-def handle_subscribe(request):
+async def handle_subscribe(request):
     """Handle SUBSCRIBE for reg event and other packages."""
     if request.in_dialog:
         if request.loose_route():
@@ -129,7 +129,7 @@ def handle_subscribe(request):
 
         # Send initial NOTIFY with full reginfo (RFC 3680 §3.2).
         body = registrar.reginfo_xml(aor, state="full", version=0)
-        proxy.send_request("NOTIFY", str(request.from_uri), headers={
+        await proxy.send_request("NOTIFY", str(request.from_uri), headers={
             "Event": "reg",
             "Subscription-State": f"active;expires={expires}",
             "Content-Type": "application/reginfo+xml",
@@ -150,7 +150,7 @@ def handle_subscribe(request):
 
 
 @registrar.on_change
-def on_registration_change(aor, event_type, contacts):
+async def on_registration_change(aor, event_type, contacts):
     """Send NOTIFY to all reg event subscribers when registration state changes.
 
     Triggered by the registrar broadcast channel on save/remove/expire.
@@ -159,7 +159,7 @@ def on_registration_change(aor, event_type, contacts):
         if watcher.get("event") != "reg":
             continue
         body = registrar.reginfo_xml(aor, state="partial")
-        proxy.send_request("NOTIFY", watcher["subscriber"], headers={
+        await proxy.send_request("NOTIFY", watcher["subscriber"], headers={
             "Event": "reg",
             "Subscription-State": "active",
             "Content-Type": "application/reginfo+xml",

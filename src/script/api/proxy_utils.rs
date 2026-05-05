@@ -3,12 +3,13 @@
 //! These are injected onto the Python `proxy` namespace alongside the
 //! decorator methods defined in `siphon_package.py`.
 
+use std::ffi::CString;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use dashmap::DashMap;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyModule};
 
 use crate::dns::SipResolver;
 use crate::sip::builder::SipMessageBuilder;
@@ -230,11 +231,11 @@ impl PyProxyUtils {
         })
     }
 
-    /// Originate an outbound SIP request (fire-and-forget).
+    /// Originate an outbound SIP request.
     ///
-    /// Used to send NOTIFY, MESSAGE, OPTIONS, and other requests from Python
-    /// scripts.  Fire-and-forget by default; pass ``wait_for_response=True``
-    /// to block until the peer responds (or ``timeout_ms`` elapses).
+    /// Always returns a Python awaitable — scripts must ``await`` it.
+    /// Fire-and-forget by default; pass ``wait_for_response=True`` to wait
+    /// for the peer's response (or ``timeout_ms`` elapses).
     ///
     /// Args:
     ///     method: SIP method name (e.g. "NOTIFY", "OPTIONS", "MESSAGE").
@@ -244,21 +245,38 @@ impl PyProxyUtils {
     ///     next_hop: Optional next-hop URI (e.g. Path from registrar).  The
     ///               R-URI stays in the Request-Line; the message is routed
     ///               to next_hop.
-    ///     wait_for_response: When ``True``, block until the peer responds
-    ///               or ``timeout_ms`` elapses, and return the :class:`Reply`.
-    ///               When ``False`` (default), fire-and-forget and return
-    ///               ``None``.
+    ///     wait_for_response: When ``True``, the awaitable resolves to a
+    ///               :class:`Reply` once the peer responds (or ``None`` after
+    ///               ``timeout_ms``).  When ``False`` (default), the
+    ///               awaitable resolves to ``None`` as soon as the request
+    ///               is on the wire.  Either way the UAC registers a pending
+    ///               entry so the dispatcher silently consumes the matching
+    ///               response (no "unknown branch" log noise on every reply).
     ///     timeout_ms: Response timeout in milliseconds (default 2000).
     ///               Ignored when ``wait_for_response=False``.
     ///
     /// Returns:
-    ///     ``None`` when ``wait_for_response=False``; a :class:`Reply` (or
-    ///     ``None`` on timeout) when ``wait_for_response=True``.
+    ///     A Python awaitable. ``await`` it to get ``None`` (fire-and-forget
+    ///     or timeout) or a :class:`Reply` (when ``wait_for_response=True``
+    ///     and the peer responded in time).
+    ///
+    /// Example (Python script):
+    ///
+    /// ```text
+    /// # Fire-and-forget -- still must be awaited.
+    /// await proxy.send_request("MESSAGE", "sip:alice@10.0.0.1", body=text)
+    ///
+    /// # Wait for the response.
+    /// reply = await proxy.send_request(
+    ///     "OPTIONS", target_uri,
+    ///     wait_for_response=True, timeout_ms=5000,
+    /// )
+    /// ```
     #[pyo3(signature = (method, ruri, headers=None, body=None, next_hop=None, wait_for_response=false, timeout_ms=2000))]
     #[allow(clippy::too_many_arguments)]
-    fn send_request(
+    fn send_request<'py>(
         &self,
-        python: Python<'_>,
+        python: Python<'py>,
         method: &str,
         ruri: &str,
         headers: Option<&Bound<'_, PyDict>>,
@@ -266,7 +284,7 @@ impl PyProxyUtils {
         next_hop: Option<&str>,
         wait_for_response: bool,
         timeout_ms: u64,
-    ) -> PyResult<Option<Py<PyReply>>> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         let uac_sender = UAC_SENDER.get().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "proxy.send_request() unavailable: UAC sender not initialized",
@@ -303,6 +321,11 @@ impl PyProxyUtils {
         let port = resolve_uri.port;
         let scheme = resolve_uri.scheme.clone();
 
+        // Resolver is async, but cheap for numeric IPs (short-circuits).
+        // Doing this synchronously up-front lets the wire send happen before
+        // we hand a coroutine back to Python — scripts that don't `await`
+        // still get the message out.  The only awaitable work is the
+        // optional response wait.
         let destination = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(resolver_clone.resolve(
                 &host,
@@ -336,7 +359,7 @@ impl PyProxyUtils {
             None => if scheme == "sips" { Transport::Tls } else { Transport::Udp },
         };
 
-        let message = build_send_request_message(
+        let (message, branch) = build_send_request_message(
             method,
             uri,
             transport,
@@ -345,32 +368,55 @@ impl PyProxyUtils {
             body,
         )?;
 
-        if !wait_for_response {
-            uac_sender.send_request(message, target.address, transport);
-            return Ok(None);
-        }
-
+        // Always register a pending entry. For fire-and-forget the entry
+        // exists only so the dispatcher's `UacSender::match_response` silently
+        // consumes the matching response — without it, every legitimate
+        // response logs "response for unknown branch (not ours)".
         let receiver = uac_sender.send_request_with_response(
             message,
             target.address,
             transport,
         );
 
-        let timeout = std::time::Duration::from_millis(timeout_ms);
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                tokio::time::timeout(timeout, receiver).await
-            })
-        });
-
-        match result {
-            Ok(Ok(crate::uac::UacResult::Response(message))) => {
-                let py_reply = PyReply::new(Arc::new(std::sync::Mutex::new(*message)));
-                Ok(Some(Py::new(python, py_reply)?))
-            }
-            // Timeout or channel closed or explicit UacResult::Timeout
-            _ => Ok(None),
+        if !wait_for_response {
+            // Fire-and-forget: clean up the pending entry after RFC 3261
+            // §17.1.2.2 Timer F (32 s = 64 × T1) — no peer can sensibly
+            // respond after that, and the slot must self-evict.  On a
+            // matched response, the receiver fires before the timeout and
+            // the entry has already been removed by `match_response`.
+            let uac_for_cleanup = Arc::clone(uac_sender);
+            let branch_for_cleanup = branch;
+            tokio::spawn(async move {
+                if tokio::time::timeout(
+                    std::time::Duration::from_secs(32),
+                    receiver,
+                )
+                .await
+                .is_err()
+                {
+                    uac_for_cleanup.expire_branch(&branch_for_cleanup);
+                }
+            });
+            return immediate_none_coroutine(python);
         }
+
+        // wait_for_response: hand a coroutine back that resolves to the
+        // Reply (or None on timeout).  The caller is necessarily inside an
+        // async context — `await proxy.send_request(..., wait_for_response=True)`
+        // — so `future_into_py` finds a running event loop.
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            match tokio::time::timeout(timeout, receiver).await {
+                Ok(Ok(crate::uac::UacResult::Response(message))) => {
+                    Python::attach(|py| {
+                        let py_reply = PyReply::new(Arc::new(std::sync::Mutex::new(*message)));
+                        Py::new(py, py_reply).map(Some)
+                    })
+                }
+                // Timeout, channel closed, or explicit UacResult::Timeout
+                _ => Ok(None),
+            }
+        })
     }
 
     /// Return approximate RSS memory usage as a percentage (0-100).
@@ -390,6 +436,9 @@ impl PyProxyUtils {
 
 /// Build the SIP message originated by `proxy.send_request()`.
 ///
+/// Returns the built message paired with its top-Via branch — the caller
+/// needs the branch to register / expire the matching pending UAC entry.
+///
 /// Pulled out as a free function so it can be unit-tested without a UAC
 /// sender / DNS resolver — the bug that motivated the extraction was the
 /// body argument silently dropping on REGISTER 3PR (TS 24.229 §5.4.1.7).
@@ -400,11 +449,10 @@ fn build_send_request_message(
     destination: SocketAddr,
     headers: Option<&Bound<'_, PyDict>>,
     body: Option<&Bound<'_, PyAny>>,
-) -> PyResult<SipMessage> {
+) -> PyResult<(SipMessage, String)> {
     let sip_method = Method::from_str(method);
-    // Always use the z9hG4bK-uac- prefix — harmless for fire-and-forget
-    // (no pending entry is registered), required for wait_for_response so
-    // UacSender::match_response picks it up.
+    // The z9hG4bK-uac- prefix is what UacSender::match_response keys on
+    // when correlating the eventual response with the pending entry.
     let branch = format!("z9hG4bK-uac-py-{}", uuid::Uuid::new_v4());
     let via = format!("SIP/2.0/{} {};branch={}", transport, destination, branch);
     let call_id = format!("py-{}", uuid::Uuid::new_v4());
@@ -444,11 +492,41 @@ fn build_send_request_message(
         builder = builder.content_length(0);
     }
 
-    builder.build().map_err(|error| {
+    let message = builder.build().map_err(|error| {
         pyo3::exceptions::PyRuntimeError::new_err(format!(
             "failed to build SIP message: {error}"
         ))
-    })
+    })?;
+    Ok((message, branch))
+}
+
+/// Return a Python coroutine that resolves to ``None`` immediately.
+///
+/// Used by ``proxy.send_request(wait_for_response=False)`` so the function
+/// always hands back an awaitable, even when no event loop is "running"
+/// at the call site (e.g. when invoked from a sync handler context).
+/// `future_into_py` requires a running asyncio loop at construction time;
+/// a plain Python ``async def`` coroutine does not, so this works in any
+/// caller context — including unit tests with no asyncio loop.
+fn immediate_none_coroutine<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    static HELPER: OnceLock<Py<PyAny>> = OnceLock::new();
+    if let Some(handle) = HELPER.get() {
+        return handle.bind(py).call0();
+    }
+
+    let source = CString::new("async def _none():\n    return None\n").map_err(|error| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("helper source CString: {error}"))
+    })?;
+    let file_name = CString::new("_proxy_send_request_helper.py").map_err(|error| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("helper file CString: {error}"))
+    })?;
+    let module_name = CString::new("_proxy_send_request_helper").map_err(|error| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!("helper module CString: {error}"))
+    })?;
+    let module = PyModule::from_code(py, &source, &file_name, &module_name)?;
+    let func = module.getattr("_none")?;
+    let _ = HELPER.set(func.clone().unbind());
+    func.call0()
 }
 
 /// Perform ENUM NAPTR lookup for a phone number.
@@ -690,7 +768,7 @@ mod tests {
             let body_obj = body.into_pyobject(py).unwrap();
             let body_any = body_obj.as_any();
 
-            let message = build_send_request_message(
+            let (message, branch) = build_send_request_message(
                 "REGISTER",
                 target_uri(),
                 Transport::Udp,
@@ -700,6 +778,10 @@ mod tests {
             )
             .expect("build_send_request_message");
 
+            assert!(
+                branch.starts_with("z9hG4bK-uac-py-"),
+                "branch must use the UAC-py prefix, got {branch}"
+            );
             assert_eq!(
                 message.body, body.as_bytes(),
                 "body must round-trip through the builder"
@@ -739,7 +821,7 @@ mod tests {
             let body_bytes: &[u8] = b"v=0\r\no=- 0 0 IN IP4 10.0.0.1\r\n";
             let body_obj = pyo3::types::PyBytes::new(py, body_bytes);
 
-            let message = build_send_request_message(
+            let (message, _branch) = build_send_request_message(
                 "MESSAGE",
                 target_uri(),
                 Transport::Udp,
@@ -761,7 +843,7 @@ mod tests {
             let headers = PyDict::new(py);
             headers.set_item("Event", "reg").unwrap();
 
-            let message = build_send_request_message(
+            let (message, _branch) = build_send_request_message(
                 "OPTIONS",
                 target_uri(),
                 Transport::Udp,
@@ -790,7 +872,7 @@ mod tests {
             let body = "REGISTER sip:bob@biloxi.com SIP/2.0\r\n\r\n";
             let body_obj = body.into_pyobject(py).unwrap();
 
-            let message = build_send_request_message(
+            let (message, _branch) = build_send_request_message(
                 "REGISTER",
                 target_uri(),
                 Transport::Udp,
@@ -811,13 +893,16 @@ mod tests {
     /// tests *can't* catch — it exercises the kwarg-binding path that the
     /// 3PR bug report says is dropping the body.
     ///
-    /// Runs three scenarios back-to-back (UAC_SENDER is a OnceLock — only
+    /// Runs four scenarios back-to-back (UAC_SENDER is a OnceLock — only
     /// one test per process can install it, so we cover everything here):
     /// 1. The reporter's 3PR shape: 9 headers including Content-Type,
     ///    1809-byte str body.
     /// 2. body=bytes (binary SDP-style).
     /// 3. headers dict containing `Content-Length: 0` plus a non-empty
     ///    body — the builder must override the stale CL.
+    /// 4. Fire-and-forget registers a pending UAC entry (so dispatcher
+    ///    silently consumes the response — no "unknown branch" log) and
+    ///    `match_response` removes it on the matching reply.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn send_request_python_kwargs_preserve_body_and_content_type() {
         use crate::transport::OutboundRouter;
@@ -912,9 +997,13 @@ mod tests {
 
             // Numeric IP — the resolver short-circuits without DNS.
             let args = PyTuple::new(py, ["REGISTER", "sip:127.0.0.1:5060"]).unwrap();
-            bound
+            let coroutine = bound
                 .call_method("send_request", args, Some(&kwargs))
                 .expect("scenario 1: kwarg dispatch");
+            // send_request returns an awaitable; the wire send already
+            // happened synchronously.  Close the coroutine to suppress
+            // Python's "coroutine was never awaited" warning.
+            let _ = coroutine.call_method0("close");
         });
 
         let outbound = udp_rx
@@ -953,9 +1042,10 @@ mod tests {
                 .unwrap();
 
             let args = PyTuple::new(py, ["MESSAGE", "sip:127.0.0.1:5060"]).unwrap();
-            bound
+            let coroutine = bound
                 .call_method("send_request", args, Some(&kwargs))
                 .expect("scenario 2: bytes-body dispatch");
+            let _ = coroutine.call_method0("close");
         });
 
         let outbound = udp_rx
@@ -989,9 +1079,10 @@ mod tests {
             kwargs.set_item("body", body_3).unwrap();
 
             let args = PyTuple::new(py, ["MESSAGE", "sip:127.0.0.1:5060"]).unwrap();
-            bound
+            let coroutine = bound
                 .call_method("send_request", args, Some(&kwargs))
                 .expect("scenario 3: stale-CL dispatch");
+            let _ = coroutine.call_method0("close");
         });
 
         let outbound = udp_rx
@@ -1009,6 +1100,73 @@ mod tests {
         assert!(
             wire.ends_with(body_3),
             "scenario 3: body not verbatim on wire:\n{wire}"
+        );
+
+        // ---------------------------------------------------------------
+        // Scenario 4 — fire-and-forget registers a pending UAC entry so
+        // the dispatcher silently consumes the matching response.  Without
+        // this the dispatcher logs "response for unknown branch (not ours)"
+        // on every legitimate reply (the second half of the bug report).
+        // ---------------------------------------------------------------
+        let installed_sender = UAC_SENDER
+            .get()
+            .expect("scenario 4: UAC_SENDER must be installed");
+        let pending_before = installed_sender.pending_count();
+
+        Python::attach(|py| {
+            let bound = utils_py.bind(py);
+            let kwargs = PyDict::new(py);
+            let args = PyTuple::new(py, ["OPTIONS", "sip:127.0.0.1:5060"]).unwrap();
+            let coroutine = bound
+                .call_method("send_request", args, Some(&kwargs))
+                .expect("scenario 4: fire-and-forget dispatch");
+            let _ = coroutine.call_method0("close");
+        });
+
+        let outbound = udp_rx
+            .try_recv()
+            .expect("scenario 4: no UDP egress — dispatch dropped the message");
+        let wire = String::from_utf8(outbound.data.to_vec()).unwrap();
+        assert_eq!(
+            installed_sender.pending_count(),
+            pending_before + 1,
+            "scenario 4: fire-and-forget must register a pending UAC entry \
+             so the dispatcher can silently consume the eventual response"
+        );
+
+        // Reflect a 200 OK back with the same Via branch and verify
+        // match_response consumes it (the silent-consumption path the
+        // dispatcher's `handle_response` short-circuit relies on).
+        let branch = wire
+            .lines()
+            .find(|line| line.starts_with("Via:"))
+            .and_then(|via| via.split(";branch=").nth(1))
+            .and_then(|rest| rest.split(|c: char| c == ';' || c.is_ascii_whitespace()).next())
+            .expect("scenario 4: outbound Via must carry branch");
+        assert!(
+            branch.starts_with("z9hG4bK-uac-py-"),
+            "scenario 4: branch must be UAC-shaped, got {branch}"
+        );
+
+        let response = SipMessageBuilder::new()
+            .response(200, "OK".to_string())
+            .via(format!("SIP/2.0/UDP 127.0.0.1:5060;branch={branch}"))
+            .to("<sip:127.0.0.1>".to_string())
+            .from("<sip:siphon@127.0.0.1>;tag=py-1".to_string())
+            .call_id("scenario4-call".to_string())
+            .cseq("1 OPTIONS".to_string())
+            .content_length(0)
+            .build()
+            .expect("scenario 4: build response");
+
+        assert!(
+            installed_sender.match_response(&response),
+            "scenario 4: match_response must consume the reply for the registered branch"
+        );
+        assert_eq!(
+            installed_sender.pending_count(),
+            pending_before,
+            "scenario 4: matched response must remove the pending entry"
         );
     }
 }
