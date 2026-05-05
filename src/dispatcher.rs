@@ -3804,8 +3804,10 @@ fn build_response(
     status_code: u16,
     reason: &str,
     server_header: Option<&str>,
-    reply_headers: &[(String, String)],
+    reply_headers: &[(crate::script::api::request::ReplyHeaderOp, String, String)],
 ) -> SipMessage {
+    use crate::script::api::request::ReplyHeaderOp;
+
     let mut builder = SipMessageBuilder::new()
         .response(status_code, reason.to_string());
 
@@ -3857,8 +3859,24 @@ fn build_response(
 
     // Inject script-provided reply headers before Content-Length so that
     // parsers that stop at Content-Length: 0 still see them.
-    for (name, value) in reply_headers {
-        builder = builder.header(name, value.clone());
+    //
+    // Replace semantics for `set_reply_header` are critical here: the
+    // mandatory-copy block above already populated To/From/Call-ID/CSeq
+    // and the optional-copy block populated Expires/SIP-ETag/Server.
+    // A script calling `set_reply_header("To", "<...>;tag=...")` to add
+    // a UAS-side To-tag (RFC 3261 §12.1.1.2 / RFC 6665 §4.1.3) MUST end
+    // up with exactly one To header — append-only would produce two.
+    // `add_reply_header` (op = Add) is reserved for genuinely multi-value
+    // headers (Service-Route, P-Associated-URI, Path, etc.).
+    for (op, name, value) in reply_headers {
+        match op {
+            ReplyHeaderOp::Replace => {
+                builder = builder.set_header(name, value.clone());
+            }
+            ReplyHeaderOp::Add => {
+                builder = builder.header(name, value.clone());
+            }
+        }
     }
 
     builder = builder.content_length(0);
@@ -9024,6 +9042,99 @@ mod tests {
             response.headers.get("Expires").is_none(),
             "Expires should not appear in response when not set on request"
         );
+    }
+
+    // --- Reply-header replace/add semantics --------------------------------
+    //
+    // Regression coverage for the `set_reply_header` append bug:
+    // build_response must apply Replace ops via `set_header` so that
+    // a script-supplied To-tag (RFC 3261 §12.1.1.2 / RFC 6665 §4.1.3)
+    // ends up as exactly one To header in the wire response.
+
+    #[test]
+    fn build_response_replace_op_overwrites_copied_to_header() {
+        use crate::script::api::request::ReplyHeaderOp;
+        let request = sample_invite();
+        let to_with_tag = format!(
+            "{};tag=scscf-abc123",
+            request.headers.to().unwrap()
+        );
+        let reply_headers = vec![(
+            ReplyHeaderOp::Replace,
+            "To".to_string(),
+            to_with_tag.clone(),
+        )];
+        let response = build_response(&request, 200, "OK", None, &reply_headers);
+
+        // Exactly one To header — not two.
+        let tos = response.headers.get_all("To").unwrap();
+        assert_eq!(
+            tos.len(),
+            1,
+            "set_reply_header(\"To\", …) must replace, not append; got {:?}",
+            tos,
+        );
+        assert!(tos[0].contains(";tag=scscf-abc123"));
+
+        // Wire-format check — only one "To:" line in the serialized response.
+        let bytes = response.to_bytes();
+        let text = String::from_utf8(bytes).unwrap();
+        let to_line_count = text.lines().filter(|line| line.starts_with("To:")).count();
+        assert_eq!(to_line_count, 1, "wire output must carry exactly one To header");
+    }
+
+    #[test]
+    fn build_response_add_op_appends_multi_value_headers() {
+        use crate::script::api::request::ReplyHeaderOp;
+        let request = sample_invite();
+        let reply_headers = vec![
+            (ReplyHeaderOp::Add, "Service-Route".to_string(), "<sip:orig@scscf:6060;lr>".to_string()),
+            (ReplyHeaderOp::Add, "Service-Route".to_string(), "<sip:term@scscf:6060;lr>".to_string()),
+            (ReplyHeaderOp::Add, "P-Associated-URI".to_string(), "<sip:alice@ims.example.com>".to_string()),
+        ];
+        let response = build_response(&request, 200, "OK", None, &reply_headers);
+
+        let routes = response.headers.get_all("Service-Route").unwrap();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0], "<sip:orig@scscf:6060;lr>");
+        assert_eq!(routes[1], "<sip:term@scscf:6060;lr>");
+
+        let assoc = response.headers.get_all("P-Associated-URI").unwrap();
+        assert_eq!(assoc.len(), 1);
+    }
+
+    #[test]
+    fn build_response_replace_overrides_copied_expires() {
+        use crate::script::api::request::ReplyHeaderOp;
+        let mut request = sample_invite();
+        request.headers.set("Expires", "3600".to_string()); // copied by build_response
+        let reply_headers = vec![(
+            ReplyHeaderOp::Replace,
+            "Expires".to_string(),
+            "60".to_string(),
+        )];
+        let response = build_response(&request, 200, "OK", None, &reply_headers);
+
+        let expires = response.headers.get_all("Expires").unwrap();
+        assert_eq!(expires.len(), 1, "Expires must not duplicate when replaced");
+        assert_eq!(expires[0], "60");
+    }
+
+    #[test]
+    fn build_response_replace_then_add_for_same_header_keeps_replace_then_appends() {
+        use crate::script::api::request::ReplyHeaderOp;
+        let request = sample_invite();
+        // Pathological but well-defined: replace clears prior values,
+        // subsequent add accumulates on top.
+        let reply_headers = vec![
+            (ReplyHeaderOp::Replace, "Warning".to_string(), "399 siphon \"first\"".to_string()),
+            (ReplyHeaderOp::Add, "Warning".to_string(), "399 siphon \"second\"".to_string()),
+        ];
+        let response = build_response(&request, 200, "OK", None, &reply_headers);
+        let warns = response.headers.get_all("Warning").unwrap();
+        assert_eq!(warns.len(), 2);
+        assert!(warns[0].contains("first"));
+        assert!(warns[1].contains("second"));
     }
 
     #[test]

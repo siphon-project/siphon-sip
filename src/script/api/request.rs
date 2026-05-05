@@ -59,6 +59,17 @@ fn has_lr_uri_param(uri: &str) -> bool {
     })
 }
 
+/// Whether a script-supplied reply header should replace any existing
+/// header of the same name (single-value: To, From, Contact, Expires, …)
+/// or append (multi-value: Via, Route, Service-Route, P-Associated-URI, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplyHeaderOp {
+    /// Replace any existing header of the same name in the response.
+    Replace,
+    /// Append — preserves any existing values, allows multiple values.
+    Add,
+}
+
 /// The action the script chose for this request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestAction {
@@ -109,8 +120,10 @@ pub struct PyRequest {
     on_reply_callback: Option<Py<PyAny>>,
     /// Per-relay on_failure callback (set by `relay(on_failure=...)`)
     on_failure_callback: Option<Py<PyAny>>,
-    /// Extra headers to include in the response (set by `set_reply_header`).
-    reply_headers: Vec<(String, String)>,
+    /// Extra headers to include in the response.  Each entry is
+    /// ``(op, name, value)`` — `op` is `Replace` (set by `set_reply_header`)
+    /// or `Add` (set by `add_reply_header`).
+    reply_headers: Vec<(ReplyHeaderOp, String, String)>,
     /// Optional body to attach to the response built by `reply()` — set by
     /// `set_reply_body()`.  Carries ``(body, content_type)``.
     reply_body: Option<(Vec<u8>, String)>,
@@ -256,7 +269,7 @@ impl PyRequest {
     }
 
     /// Take the accumulated reply headers (consumed by the dispatcher).
-    pub fn take_reply_headers(&mut self) -> Vec<(String, String)> {
+    pub fn take_reply_headers(&mut self) -> Vec<(ReplyHeaderOp, String, String)> {
         std::mem::take(&mut self.reply_headers)
     }
 
@@ -791,14 +804,63 @@ impl PyRequest {
         Ok(())
     }
 
-    /// Set an extra header to include in the response (200 OK, 401, etc.).
+    /// Set (replace) a header on the response built by ``request.reply()``
+    /// or ``registrar.save()``.
     ///
-    /// Unlike ``set_header`` which modifies the request, this stores headers
-    /// that the dispatcher injects into the reply built by ``request.reply()``
-    /// or ``registrar.save()``.  Multiple calls with the same name append
-    /// (multi-value headers like P-Associated-URI, Service-Route).
+    /// Use this for single-value headers — To, From, Contact, Expires,
+    /// Server, Content-Type, Require, Min-Expires, etc. (RFC 3261 §7.3.1).
+    /// The dispatcher removes any existing header of the same name before
+    /// inserting this one, so the response will carry exactly one value
+    /// even if the framework copied a header from the request (e.g. To,
+    /// From) before the script ran.
+    ///
+    /// For multi-value headers (Via, Route, Service-Route,
+    /// P-Associated-URI), use ``add_reply_header`` instead.
     fn set_reply_header(&mut self, name: &str, value: &str) {
-        self.reply_headers.push((name.to_string(), value.to_string()));
+        self.reply_headers.push((ReplyHeaderOp::Replace, name.to_string(), value.to_string()));
+    }
+
+    /// Append a header to the response built by ``request.reply()`` or
+    /// ``registrar.save()``.
+    ///
+    /// Use this for multi-value headers — Via, Record-Route, Route,
+    /// Service-Route, P-Associated-URI, Path, etc.  Multiple calls with
+    /// the same name accumulate in insertion order, and any existing
+    /// values copied by the framework (e.g. Via) are preserved.
+    ///
+    /// For single-value headers, use ``set_reply_header`` instead.
+    fn add_reply_header(&mut self, name: &str, value: &str) {
+        self.reply_headers.push((ReplyHeaderOp::Add, name.to_string(), value.to_string()));
+    }
+
+    /// Attach a To-tag to the response built by ``request.reply()``.
+    ///
+    /// Required by RFC 3261 §12.1.1.2 / RFC 6665 §4.1.3 on the
+    /// dialog-establishing 2xx (and any 1xx that establishes early
+    /// dialog) for INVITE / SUBSCRIBE / REFER from a UAS.
+    ///
+    /// Reads the request's ``To`` header, parses it, sets or overwrites
+    /// the ``;tag=`` parameter, and queues the result for replace
+    /// semantics.  Idempotent: calling twice with different tags leaves
+    /// the most recent tag on the response.  No-op if the request has no
+    /// ``To`` header (which would be malformed anyway).
+    fn set_reply_to_tag(&mut self, tag: &str) -> PyResult<()> {
+        let to_value = {
+            let message = self.lock()?;
+            message.headers.to().cloned()
+        };
+        let Some(to) = to_value else { return Ok(()); };
+        let mut parsed = NameAddr::parse(&to)
+            .map_err(|error| pyo3::exceptions::PyValueError::new_err(
+                format!("set_reply_to_tag: failed to parse To header '{to}': {error}"),
+            ))?;
+        parsed.tag = Some(tag.to_string());
+        self.reply_headers.push((
+            ReplyHeaderOp::Replace,
+            "To".to_string(),
+            parsed.to_string(),
+        ));
+        Ok(())
     }
 
     /// Replace the body of the incoming request message.
@@ -1958,5 +2020,102 @@ mod tests {
     fn contact_expires_none_when_absent() {
         let request = make_request(); // INVITE has no Expires
         assert_eq!(request.contact_expires().unwrap(), None);
+    }
+
+    // --- Reply-header replace/add semantics (regression) ---
+    //
+    // Single `set_reply_header("To", ";tag=…")` MUST end up as a single
+    // To header in the response — RFC 3261 §7.3.1, §12.1.1.2 and
+    // RFC 6665 §4.1.3. Two To headers (one untagged, one tagged) is
+    // wire-format invalid and breaks strict parsers that key off the
+    // first To value (e.g. subscribe_state dialog establishment).
+
+    #[test]
+    fn set_reply_header_records_replace_op() {
+        let mut request = make_request();
+        request.set_reply_header("To", "<sip:bob@biloxi.com>;tag=abc");
+        let queued = request.take_reply_headers();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, ReplyHeaderOp::Replace);
+        assert_eq!(queued[0].1, "To");
+        assert_eq!(queued[0].2, "<sip:bob@biloxi.com>;tag=abc");
+    }
+
+    #[test]
+    fn add_reply_header_records_add_op() {
+        let mut request = make_request();
+        request.add_reply_header("Service-Route", "<sip:orig@scscf:6060;lr>");
+        request.add_reply_header("Service-Route", "<sip:term@scscf:6060;lr>");
+        let queued = request.take_reply_headers();
+        assert_eq!(queued.len(), 2);
+        assert!(queued.iter().all(|(op, _, _)| *op == ReplyHeaderOp::Add));
+        assert_eq!(queued[0].2, "<sip:orig@scscf:6060;lr>");
+        assert_eq!(queued[1].2, "<sip:term@scscf:6060;lr>");
+    }
+
+    #[test]
+    fn set_reply_to_tag_appends_tag_to_existing_to() {
+        let mut request = make_request(); // To: "Bob <sip:bob@biloxi.com>"
+        request.set_reply_to_tag("scscf-12345").unwrap();
+        let queued = request.take_reply_headers();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, ReplyHeaderOp::Replace);
+        assert_eq!(queued[0].1, "To");
+        assert!(queued[0].2.contains(";tag=scscf-12345"));
+        assert!(queued[0].2.contains("bob@biloxi.com"));
+    }
+
+    #[test]
+    fn set_reply_to_tag_overwrites_existing_tag() {
+        // Build a request whose To already carries a tag (mid-dialog UPDATE
+        // / re-INVITE / re-SUBSCRIBE) — we should overwrite, not stack.
+        let message = SipMessageBuilder::new()
+            .request(Method::Subscribe, SipUri::new("biloxi.com".to_string()))
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-resub".to_string())
+            .to("<sip:bob@biloxi.com>;tag=stale-tag".to_string())
+            .from("<sip:alice@atlanta.com>;tag=alice".to_string())
+            .call_id("resub-call".to_string())
+            .cseq("2 SUBSCRIBE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        let mut request = PyRequest::new(
+            Arc::new(Mutex::new(message)), "udp".to_string(), "10.0.0.1".to_string(), 5060,
+        );
+        request.set_reply_to_tag("fresh-tag").unwrap();
+        let queued = request.take_reply_headers();
+        assert_eq!(queued.len(), 1);
+        let value = &queued[0].2;
+        assert!(value.contains(";tag=fresh-tag"), "expected fresh tag, got {value}");
+        assert!(!value.contains("stale-tag"), "stale tag must be overwritten, got {value}");
+    }
+
+    #[test]
+    fn set_reply_to_tag_idempotent_across_double_call() {
+        let mut request = make_request();
+        request.set_reply_to_tag("first").unwrap();
+        request.set_reply_to_tag("second").unwrap();
+        let queued = request.take_reply_headers();
+        assert_eq!(queued.len(), 2);
+        // Latest call wins — both ops are Replace, so build_response
+        // applies them in order and the second clobbers the first.
+        assert!(queued[1].2.contains(";tag=second"));
+        assert!(!queued[1].2.contains(";tag=first"));
+    }
+
+    #[test]
+    fn mixed_replace_and_add_preserve_order() {
+        let mut request = make_request();
+        request.set_reply_header("To", "<sip:bob@biloxi.com>;tag=t1");
+        request.add_reply_header("Service-Route", "<sip:orig@scscf:6060;lr>");
+        request.set_reply_header("Expires", "3600");
+        let queued = request.take_reply_headers();
+        assert_eq!(queued.len(), 3);
+        assert_eq!(queued[0].0, ReplyHeaderOp::Replace);
+        assert_eq!(queued[0].1, "To");
+        assert_eq!(queued[1].0, ReplyHeaderOp::Add);
+        assert_eq!(queued[1].1, "Service-Route");
+        assert_eq!(queued[2].0, ReplyHeaderOp::Replace);
+        assert_eq!(queued[2].1, "Expires");
     }
 }

@@ -436,12 +436,43 @@ class Request:
         self._headers[name] = value
 
     def set_reply_header(self, name: str, value: str) -> None:
-        """Set an extra header to include in the response.
+        """Set (replace) a single-value header on the response built by
+        :meth:`reply` or :meth:`registrar.save`.
 
-        Unlike :meth:`set_header` which modifies the request, this stores
-        headers that the dispatcher injects into the reply built by
-        ``request.reply()`` or ``registrar.save()``.  Multiple calls with
-        the same name append (multi-value headers like P-Associated-URI).
+        Use this for single-value headers per RFC 3261 §7.3.1 — To, From,
+        Contact, Expires, Server, Content-Type, Require, Min-Expires.
+        The dispatcher removes any existing header of the same name
+        before inserting this one, so the response will carry exactly
+        one value even if the framework copied a header from the
+        request (e.g. To, From) before the script ran.
+
+        For multi-value headers (Via, Route, Service-Route,
+        P-Associated-URI, Path), use :meth:`add_reply_header` instead.
+
+        Args:
+            name: Header name.
+            value: Header value.
+
+        Example::
+
+            our_tag = f"scscf-{request.call_id[:8]}"
+            request.set_reply_header(
+                "To", f"{request.get_header('To')};tag={our_tag}"
+            )
+            request.reply(200, "OK")
+        """
+        self._set_reply_header_op("replace", name, value)
+
+    def add_reply_header(self, name: str, value: str) -> None:
+        """Append a header to the response built by :meth:`reply` or
+        :meth:`registrar.save`.
+
+        Use this for multi-value headers — Via, Record-Route, Route,
+        Service-Route, P-Associated-URI, Path.  Multiple calls with the
+        same name accumulate in insertion order, and any existing values
+        copied by the framework (e.g. Via) are preserved.
+
+        For single-value headers, use :meth:`set_reply_header`.
 
         Args:
             name: Header name.
@@ -450,27 +481,100 @@ class Request:
         Example::
 
             registrar.save(request)
-            request.set_reply_header("P-Associated-URI", "<sip:user@ims.net>")
-            request.set_reply_header("Service-Route", "<sip:orig@scscf:6060;lr>")
+            request.add_reply_header(
+                "P-Associated-URI", "<sip:user@ims.net>"
+            )
+            request.add_reply_header(
+                "Service-Route", "<sip:orig@scscf:6060;lr>"
+            )
         """
+        self._set_reply_header_op("add", name, value)
+
+    def set_reply_to_tag(self, tag: str) -> None:
+        """Attach a To-tag to the response built by :meth:`reply`.
+
+        Required by RFC 3261 §12.1.1.2 / RFC 6665 §4.1.3 on the
+        dialog-establishing 2xx (and any 1xx that establishes early
+        dialog) for INVITE / SUBSCRIBE / REFER from a UAS.
+
+        Reads the request's ``To`` header, sets or overwrites the
+        ``;tag=`` parameter, and queues the result for replace
+        semantics.  Idempotent: calling twice with different tags
+        leaves the most recent tag on the response.
+
+        Args:
+            tag: The To-tag value (no ``tag=`` prefix, no quoting).
+
+        Example::
+
+            request.set_reply_to_tag(f"scscf-{request.call_id[:8]}")
+            request.reply(200, "OK")
+        """
+        to_value = self.get_header("To")
+        if to_value is None:
+            return
+        # Strip any existing ;tag=... segment, then append the new one.
+        # Mirrors NameAddr semicolon parsing in Rust — angle-bracket
+        # contents are URI parameters and stay attached to the URI.
+        parts = to_value.split(";")
+        head = parts[0]
+        kept_params = []
+        for param in parts[1:]:
+            stripped = param.strip()
+            if not stripped:
+                continue
+            name = stripped.split("=", 1)[0].strip().lower()
+            if name == "tag":
+                continue
+            kept_params.append(stripped)
+        rebuilt = head
+        for param in kept_params:
+            rebuilt += f";{param}"
+        rebuilt += f";tag={tag}"
+        self._set_reply_header_op("replace", "To", rebuilt)
+
+    def _set_reply_header_op(self, op: str, name: str, value: str) -> None:
         if not hasattr(self, "_reply_headers"):
             self._reply_headers = []
-        self._reply_headers.append((name, value))
+        self._reply_headers.append((op, name, value))
 
     def get_reply_header(self, name: str) -> Optional[str]:
-        """Return the reply header value set by :meth:`set_reply_header`, or
-        ``None`` if not set.  Joins multi-value headers with ``, ``.
+        """Return the reply header value set by :meth:`set_reply_header`
+        or :meth:`add_reply_header`, or ``None`` if not set.
 
-        Test-only convenience — matches what the dispatcher would inject
-        into the outgoing response.
+        Test-only convenience — applies replace/add ops in order so the
+        result matches what the dispatcher would inject into the outgoing
+        response.  Multi-value (``add``) entries are joined with ``, ``.
         """
-        reply_headers = getattr(self, "_reply_headers", [])
-        values = [v for (n, v) in reply_headers if n.lower() == name.lower()]
-        return ", ".join(values) if values else None
+        applied: list[str] = []
+        for op, n, v in getattr(self, "_reply_headers", []):
+            if n.lower() != name.lower():
+                continue
+            if op == "replace":
+                applied = [v]
+            else:
+                applied.append(v)
+        return ", ".join(applied) if applied else None
 
     @property
     def reply_headers(self) -> list[tuple[str, str]]:
-        """All ``(name, value)`` pairs set via :meth:`set_reply_header`."""
+        """All ``(name, value)`` pairs queued for the response, with
+        replace/add ops resolved (replace wipes earlier values for the
+        same name, add appends).  Order preserved per name.
+        """
+        out: list[tuple[str, str]] = []
+        for op, n, v in getattr(self, "_reply_headers", []):
+            if op == "replace":
+                out = [(en, ev) for (en, ev) in out if en.lower() != n.lower()]
+            out.append((n, v))
+        return out
+
+    @property
+    def reply_header_ops(self) -> list[tuple[str, str, str]]:
+        """All ``(op, name, value)`` triples as queued — exposes the raw
+        replace/add semantics for tests that need to inspect the queue
+        before resolution.
+        """
         return list(getattr(self, "_reply_headers", []))
 
     def set_body(self, body, content_type: str | None = None) -> None:

@@ -55,11 +55,11 @@ def handle_register(request):
     public_id = f"sip:{request.auth_user}"
     if "@" not in public_id:
         public_id = f"{public_id}@{REALM}"
-    request.set_reply_header("P-Associated-URI", f"<{public_id}>")
+    request.add_reply_header("P-Associated-URI", f"<{public_id}>")
 
     # Service-Route: subsequent requests from this UE route through S-CSCF.
     # The "orig" parameter marks originating-session routing (3GPP TS 24.229).
-    request.set_reply_header("Service-Route", f"<sip:orig@{REALM}:6060;lr>")
+    request.add_reply_header("Service-Route", f"<sip:orig@{REALM}:6060;lr>")
 
     log.info(f"registered {request.from_uri} at S-CSCF")
 

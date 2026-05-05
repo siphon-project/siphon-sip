@@ -93,11 +93,11 @@ def handle_register(request):
     associated_uris = f"<{public_id}>"
     if tel_id:
         associated_uris += f", <{tel_id}>"
-    request.set_reply_header("P-Associated-URI", associated_uris)
+    request.add_reply_header("P-Associated-URI", associated_uris)
 
     # Service-Route: subsequent requests from this UE route through S-CSCF.
     # The "orig" parameter marks originating-session routing (3GPP TS 24.229).
-    request.set_reply_header("Service-Route", f"<sip:orig@{REALM}:6060;lr>")
+    request.add_reply_header("Service-Route", f"<sip:orig@{REALM}:6060;lr>")
 
     # Store service routes for this user (used by registrar.service_route()).
     registrar.set_service_routes(str(request.from_uri), [f"sip:orig@{REALM}:6060;lr"])
