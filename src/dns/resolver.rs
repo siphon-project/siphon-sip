@@ -203,6 +203,13 @@ impl SipResolver {
     }
 
     /// Resolve a hostname to IP addresses via A/AAAA lookup.
+    ///
+    /// Records are returned in a fresh random order on every call. RFC 3263
+    /// §4.2 mandates that when an explicit port skips SRV, the client tries
+    /// multiple A/AAAA records — but if the consumer always picks `.next()`,
+    /// any deterministic order pins traffic to a single IP. Shuffling here
+    /// guarantees uniform distribution regardless of upstream ordering or
+    /// resolver-cache stickiness.
     async fn resolve_a_aaaa(
         &self,
         host: &str,
@@ -210,18 +217,36 @@ impl SipResolver {
         transport: Option<&str>,
     ) -> Vec<ResolvedTarget> {
         match self.resolver.lookup_ip(host).await {
-            Ok(lookup) => lookup
-                .iter()
-                .map(|ip| ResolvedTarget {
-                    address: SocketAddr::new(ip, port),
-                    transport: transport.map(|s| s.to_string()),
-                })
-                .collect(),
+            Ok(lookup) => {
+                let mut results: Vec<ResolvedTarget> = lookup
+                    .iter()
+                    .map(|ip| ResolvedTarget {
+                        address: SocketAddr::new(ip, port),
+                        transport: transport.map(|s| s.to_string()),
+                    })
+                    .collect();
+                shuffle_targets(&mut results, random_u32_inclusive);
+                results
+            }
             Err(error) => {
                 warn!(host = %host, %error, "DNS A/AAAA lookup failed");
                 Vec::new()
             }
         }
+    }
+}
+
+/// Fisher-Yates shuffle over the resolved A/AAAA list.
+///
+/// `random_inclusive(max)` must return a uniform integer in `[0, max]`.
+/// Factored as a parameter so tests can pump in deterministic draws.
+fn shuffle_targets<F>(targets: &mut [ResolvedTarget], mut random_inclusive: F)
+where
+    F: FnMut(u32) -> u32,
+{
+    for index in (1..targets.len()).rev() {
+        let pick = random_inclusive(index as u32) as usize;
+        targets.swap(index, pick);
     }
 }
 
@@ -494,6 +519,103 @@ mod tests {
         assert!(
             wins_a > 1500 && wins_a < 1950,
             "weighted distribution looks broken: a won {wins_a}/{trials}"
+        );
+    }
+
+    fn target(ip: &str, port: u16) -> ResolvedTarget {
+        ResolvedTarget {
+            address: format!("{ip}:{port}").parse::<SocketAddr>().unwrap(),
+            transport: None,
+        }
+    }
+
+    #[test]
+    fn shuffle_targets_empty_is_noop() {
+        let mut targets: Vec<ResolvedTarget> = vec![];
+        shuffle_targets(&mut targets, scripted_random(vec![]));
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn shuffle_targets_single_is_noop() {
+        let mut targets = vec![target("10.0.0.1", 5060)];
+        shuffle_targets(&mut targets, scripted_random(vec![]));
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].address.ip().to_string(), "10.0.0.1");
+    }
+
+    #[test]
+    fn shuffle_targets_two_elements_swap_with_zero_draw() {
+        // Fisher-Yates with i=1 picks j in [0,1]; draw=0 swaps targets[1] with
+        // targets[0], reversing the pair.
+        let mut targets = vec![target("10.0.0.1", 5060), target("10.0.0.2", 5060)];
+        shuffle_targets(&mut targets, scripted_random(vec![0]));
+        assert_eq!(targets[0].address.ip().to_string(), "10.0.0.2");
+        assert_eq!(targets[1].address.ip().to_string(), "10.0.0.1");
+    }
+
+    #[test]
+    fn shuffle_targets_two_elements_keep_with_max_draw() {
+        // draw=1 swaps targets[1] with itself — order preserved.
+        let mut targets = vec![target("10.0.0.1", 5060), target("10.0.0.2", 5060)];
+        shuffle_targets(&mut targets, scripted_random(vec![1]));
+        assert_eq!(targets[0].address.ip().to_string(), "10.0.0.1");
+        assert_eq!(targets[1].address.ip().to_string(), "10.0.0.2");
+    }
+
+    #[test]
+    fn shuffle_targets_three_elements_deterministic_with_scripted_rng() {
+        // i=2: draw=1 swaps [2] with [1] → ["a","c","b"]
+        // i=1: draw=0 swaps [1] with [0] → ["c","a","b"]
+        let mut targets = vec![
+            target("10.0.0.1", 5060),
+            target("10.0.0.2", 5060),
+            target("10.0.0.3", 5060),
+        ];
+        shuffle_targets(&mut targets, scripted_random(vec![1, 0]));
+        assert_eq!(targets[0].address.ip().to_string(), "10.0.0.3");
+        assert_eq!(targets[1].address.ip().to_string(), "10.0.0.1");
+        assert_eq!(targets[2].address.ip().to_string(), "10.0.0.2");
+    }
+
+    #[test]
+    fn shuffle_targets_real_rng_eventually_picks_both_orderings() {
+        // Pin the bug: A-only resolver path was returning records in
+        // deterministic DNS order. After the fix, two equal-cost records
+        // must each appear at index 0 across repeated shuffles.
+        let mut a_first = false;
+        let mut b_first = false;
+        for _ in 0..200 {
+            let mut targets = vec![target("10.0.0.1", 5060), target("10.0.0.2", 5060)];
+            shuffle_targets(&mut targets, random_u32_inclusive);
+            match targets[0].address.ip().to_string().as_str() {
+                "10.0.0.1" => a_first = true,
+                "10.0.0.2" => b_first = true,
+                _ => unreachable!(),
+            }
+            if a_first && b_first {
+                return;
+            }
+        }
+        panic!("A/AAAA shuffle is sticky: a_first={a_first} b_first={b_first}");
+    }
+
+    #[test]
+    fn shuffle_targets_real_rng_distribution_roughly_uniform() {
+        // With two equal records, each should win the first slot ~50% of
+        // the time. Generous slack for RNG variance over a 2000-trial run.
+        let mut wins_a = 0u32;
+        let trials = 2000u32;
+        for _ in 0..trials {
+            let mut targets = vec![target("10.0.0.1", 5060), target("10.0.0.2", 5060)];
+            shuffle_targets(&mut targets, random_u32_inclusive);
+            if targets[0].address.ip().to_string() == "10.0.0.1" {
+                wins_a += 1;
+            }
+        }
+        assert!(
+            wins_a > 800 && wins_a < 1200,
+            "shuffle distribution looks broken: a won {wins_a}/{trials}"
         );
     }
 

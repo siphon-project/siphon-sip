@@ -242,7 +242,8 @@ This document tracks the maturity of every SIPhon feature across three readiness
 
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
-| SRV lookup (RFC 3263) | Implemented | Core | With A/AAAA fallback |
+| SRV lookup (RFC 3263) | Implemented | Core | With A/AAAA fallback; weighted-random RFC 2782 selection per call |
+| A/AAAA load distribution (RFC 3263 §4.2) | Implemented | Core | Fisher-Yates shuffle on every A-only resolution so callers picking `.next()` distribute uniformly across equal-cost records |
 | NAPTR support | Implemented | Core | |
 | ENUM (RFC 6116) | Implemented | Core | |
 
