@@ -35,6 +35,35 @@ pub enum RegistrationEvent {
 /// Typically `sip:user@domain`.
 pub type Aor = String;
 
+/// Normalize a URI string to canonical AoR form.
+///
+/// - Strip surrounding angle brackets.
+/// - If the input doesn't start with `sip:` or `sips:`, prepend `sip:`.
+/// - Strip URI parameters (`;…`) and headers (`?…`).
+/// - Strip the default port (`:5060` for sip, `:5061` for sips).
+///
+/// The same canonicalization is applied at the Python API boundary and
+/// when populating the alias index, so both writes and reads of an AoR
+/// land on the same key regardless of how the input is spelled.
+pub fn normalize_aor(uri: &str) -> Aor {
+    let uri = uri.trim_start_matches('<').trim_end_matches('>');
+
+    let uri = if uri.starts_with("sip:") || uri.starts_with("sips:") {
+        uri.to_string()
+    } else {
+        format!("sip:{uri}")
+    };
+
+    let uri = uri.split(';').next().unwrap_or(&uri).to_string();
+    let uri = uri.split('?').next().unwrap_or(&uri).to_string();
+
+    if uri.starts_with("sips:") {
+        uri.trim_end_matches(":5061").to_string()
+    } else {
+        uri.trim_end_matches(":5060").to_string()
+    }
+}
+
 /// A single contact binding.
 #[derive(Debug, Clone)]
 pub struct Contact {
@@ -134,6 +163,14 @@ pub struct Registrar {
     asserted_identities: DashMap<Aor, String>,
     /// AoR → P-Associated-URI list (from upstream 200 OK to REGISTER).
     associated_uris: DashMap<Aor, Vec<String>>,
+    /// Alias AoR → primary AoR.  Derived index, always reflects
+    /// `associated_uris`.  Rebuilt on `set_associated_uris` and
+    /// `apply_aor_state`; pruned on `drop_aor_state` / `remove_all`.
+    /// Lookups (`lookup`, `is_registered`, etc.) resolve the input AoR
+    /// through this index before touching `bindings`, so contacts saved
+    /// under the primary IMS public identity are reachable via every
+    /// IMPU in the implicit registration set (3GPP TS 23.228).
+    aliases: DashMap<Aor, Aor>,
     pub config: RegistrarConfig,
     /// Broadcast channel for registration change events.
     event_sender: broadcast::Sender<RegistrationEvent>,
@@ -163,6 +200,7 @@ impl Registrar {
             service_routes: DashMap::new(),
             asserted_identities: DashMap::new(),
             associated_uris: DashMap::new(),
+            aliases: DashMap::new(),
             config,
             event_sender,
             backend_writer: OnceLock::new(),
@@ -205,6 +243,43 @@ impl Registrar {
         match (self.instance_identity.get(), contact.instance_id.as_deref(), contact.instance_epoch.as_deref()) {
             (Some(identity), Some(id), Some(epoch)) => identity.id == id && identity.epoch == epoch,
             _ => false,
+        }
+    }
+
+    /// Resolve an AoR through the alias index to its primary.
+    ///
+    /// If `aor` is registered as an alias of some primary IMPU
+    /// (via `set_associated_uris`), returns the primary; otherwise
+    /// returns `aor` unchanged.  Single-hop only — alias chains are
+    /// not followed (IMS implicit sets are flat per TS 23.228).
+    ///
+    /// Every AoR-keyed Registrar method funnels its input through this
+    /// helper before touching `bindings` / `associated_uris` / etc.
+    fn resolve_alias(&self, aor: &str) -> Aor {
+        self.aliases
+            .get(aor)
+            .map(|entry| entry.value().clone())
+            .unwrap_or_else(|| aor.to_string())
+    }
+
+    /// Drop every alias entry pointing at `primary`.  Used on dereg
+    /// (`remove_all`, `drop_aor_state`) and as the first step of
+    /// `install_aliases` when the implicit set is being replaced.
+    fn prune_aliases_to(&self, primary: &str) {
+        self.aliases.retain(|_, target| target != primary);
+    }
+
+    /// Replace the alias entries for `primary` with one entry per URI
+    /// in `uris` (after canonicalization, skipping self-aliases).
+    /// Caller is responsible for updating `associated_uris[primary]`
+    /// and persistence.
+    fn install_aliases(&self, primary: &str, uris: &[String]) {
+        self.prune_aliases_to(primary);
+        for uri in uris {
+            let alias = normalize_aor(uri);
+            if alias != primary {
+                self.aliases.insert(alias, primary.to_string());
+            }
         }
     }
 
@@ -265,6 +340,10 @@ impl Registrar {
         let removed = self.service_routes.remove(aor).is_some()
             | self.asserted_identities.remove(aor).is_some()
             | self.associated_uris.remove(aor).is_some();
+        // Always prune the alias index for this primary, even if no aux
+        // state was attached — `set_associated_uris` may have populated
+        // aliases without a service_route / asserted_identity.
+        self.prune_aliases_to(aor);
         if removed {
             if let Some(writer) = self.backend_writer.get() {
                 writer.remove_aor_state(aor);
@@ -282,6 +361,9 @@ impl Registrar {
             self.asserted_identities.insert(aor.to_string(), identity);
         }
         if !state.associated_uris.is_empty() {
+            // Rebuild the derived alias index from the persisted AU list so
+            // `lookup(alias)` works immediately after a restart.
+            self.install_aliases(aor, &state.associated_uris);
             self.associated_uris.insert(aor.to_string(), state.associated_uris);
         }
     }
@@ -339,6 +421,10 @@ impl Registrar {
         reg_id: Option<u32>,
         path: Vec<String>,
     ) -> Result<(), RegistrarError> {
+        // Resolve alias → primary so a REGISTER arriving with a non-primary
+        // IMPU still attaches contacts to the implicit set's primary AoR.
+        let primary = self.resolve_alias(aor);
+        let aor = primary.as_str();
         let expires_secs = std::cmp::min(expires_secs, self.config.max_expires);
 
         if expires_secs > 0 && expires_secs < self.config.min_expires {
@@ -446,6 +532,8 @@ impl Registrar {
 
     /// Remove all contacts for an AoR (wildcard deregister, Contact: *).
     pub fn remove_all(&self, aor: &str) {
+        let primary = self.resolve_alias(aor);
+        let aor = primary.as_str();
         let had_bindings = self.bindings.remove(aor).is_some();
         if let Some(writer) = self.backend_writer.get() {
             writer.remove(aor);
@@ -465,6 +553,8 @@ impl Registrar {
     /// re-processing contacts — the subsequent per-contact `save()` calls
     /// emit the appropriate events themselves.
     pub fn clear_bindings(&self, aor: &str) {
+        let primary = self.resolve_alias(aor);
+        let aor = primary.as_str();
         self.bindings.remove(aor);
         if let Some(writer) = self.backend_writer.get() {
             writer.remove(aor);
@@ -535,8 +625,13 @@ impl Registrar {
     }
 
     /// Look up contacts for an AoR. Returns non-expired contacts sorted by q descending.
+    ///
+    /// If `aor` is an alias of an IMS implicit registration set's primary,
+    /// returns the primary's contacts (so terminating routing on a non-primary
+    /// IMPU like `tel:+15551234` resolves transparently).
     pub fn lookup(&self, aor: &str) -> Vec<Contact> {
-        match self.bindings.get(aor) {
+        let primary = self.resolve_alias(aor);
+        match self.bindings.get(primary.as_str()) {
             Some(entry) => entry
                 .value()
                 .iter()
@@ -549,7 +644,8 @@ impl Registrar {
 
     /// Check if an AoR has any non-expired contacts.
     pub fn is_registered(&self, aor: &str) -> bool {
-        match self.bindings.get(aor) {
+        let primary = self.resolve_alias(aor);
+        match self.bindings.get(primary.as_str()) {
             Some(entry) => entry.value().iter().any(|c| !c.is_expired()),
             None => false,
         }
@@ -595,6 +691,8 @@ impl Registrar {
 
     /// Remove a specific contact URI from an AoR.
     pub fn remove_contact(&self, aor: &str, contact_uri: &str) {
+        let primary = self.resolve_alias(aor);
+        let aor = primary.as_str();
         if let Some(mut entry) = self.bindings.get_mut(aor) {
             let before = entry.value().len();
             entry.value_mut().retain(|c| c.uri.to_string() != contact_uri);
@@ -696,7 +794,8 @@ impl Registrar {
             .strip_prefix('<').unwrap_or(sip_instance.trim())
             .strip_suffix('>').unwrap_or(sip_instance.trim());
 
-        match self.bindings.get(aor) {
+        let primary = self.resolve_alias(aor);
+        match self.bindings.get(primary.as_str()) {
             Some(entry) => entry
                 .value()
                 .iter()
@@ -718,6 +817,8 @@ impl Registrar {
     /// Store Service-Route headers for an AoR (RFC 3608).
     /// Called when processing a 200 OK to REGISTER from the upstream registrar.
     pub fn set_service_routes(&self, aor: &str, routes: Vec<String>) {
+        let primary = self.resolve_alias(aor);
+        let aor = primary.as_str();
         if routes.is_empty() {
             self.service_routes.remove(aor);
         } else {
@@ -728,26 +829,38 @@ impl Registrar {
 
     /// Retrieve stored Service-Route headers for an AoR.
     pub fn service_routes(&self, aor: &str) -> Vec<String> {
+        let primary = self.resolve_alias(aor);
         self.service_routes
-            .get(aor)
+            .get(primary.as_str())
             .map(|entry| entry.value().clone())
             .unwrap_or_default()
     }
 
-    /// Store P-Associated-URI list for an AoR (from upstream 200 OK to REGISTER).
+    /// Store the P-Associated-URI list for an AoR and rebuild the
+    /// derived alias index so every URI in the list resolves back to
+    /// `aor` on subsequent lookups.
+    ///
+    /// If `aor` is itself an alias, writes go to the resolved primary —
+    /// which clobbers the primary's existing AU list, matching the IMS
+    /// "implicit set is replaced wholesale by the latest SAR" semantic
+    /// (3GPP TS 29.228 §6.1.2).  Empty `uris` clears the AU list and
+    /// drops every alias entry that was pointing at this primary.
     pub fn set_associated_uris(&self, aor: &str, uris: Vec<String>) {
+        let primary = self.resolve_alias(aor);
+        self.install_aliases(&primary, &uris);
         if uris.is_empty() {
-            self.associated_uris.remove(aor);
+            self.associated_uris.remove(primary.as_str());
         } else {
-            self.associated_uris.insert(aor.to_string(), uris);
+            self.associated_uris.insert(primary.clone(), uris);
         }
-        self.persist_aor_state(aor);
+        self.persist_aor_state(primary.as_str());
     }
 
     /// Retrieve stored P-Associated-URI list for an AoR.
     pub fn associated_uris(&self, aor: &str) -> Vec<String> {
+        let primary = self.resolve_alias(aor);
         self.associated_uris
-            .get(aor)
+            .get(primary.as_str())
             .map(|entry| entry.value().clone())
             .unwrap_or_default()
     }
@@ -762,6 +875,8 @@ impl Registrar {
         call_id: String,
         cseq: u32,
     ) {
+        let primary = self.resolve_alias(aor);
+        let aor = primary.as_str();
         let (instance_id, instance_epoch) = self.current_identity_pair();
         let contact = Contact {
             uri: uri.clone(),
@@ -796,7 +911,8 @@ impl Registrar {
     ///
     /// Promotes all pending contacts to active state.
     pub fn confirm_pending(&self, aor: &str) {
-        if let Some(mut entry) = self.bindings.get_mut(aor) {
+        let primary = self.resolve_alias(aor);
+        if let Some(mut entry) = self.bindings.get_mut(primary.as_str()) {
             for contact in entry.value_mut().iter_mut() {
                 contact.pending = false;
             }
@@ -805,13 +921,18 @@ impl Registrar {
 
     /// Store a P-Asserted-Identity for an AoR (from SAR user profile).
     pub fn set_asserted_identity(&self, aor: &str, identity: String) {
+        let primary = self.resolve_alias(aor);
+        let aor = primary.as_str();
         self.asserted_identities.insert(aor.to_string(), identity);
         self.persist_aor_state(aor);
     }
 
     /// Look up stored P-Asserted-Identity for an AoR.
     pub fn asserted_identity(&self, aor: &str) -> Option<String> {
-        self.asserted_identities.get(aor).map(|v| v.value().clone())
+        let primary = self.resolve_alias(aor);
+        self.asserted_identities
+            .get(primary.as_str())
+            .map(|v| v.value().clone())
     }
 
     /// Run a garbage-collection pass: remove expired contacts from all AoRs.
@@ -1614,5 +1735,146 @@ mod tests {
             .unwrap();
         registrar.remove_all(aor);
         assert!(registrar.associated_uris(aor).is_empty());
+    }
+
+    // ---- alias-chain (IMS implicit registration set) ----
+
+    #[test]
+    fn alias_index_built_by_set_associated_uris() {
+        let registrar = Registrar::default();
+        let primary = "sip:alice@ims.example.com";
+        registrar
+            .save(primary, contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .unwrap();
+        registrar.set_associated_uris(
+            primary,
+            vec![
+                "tel:+15551234".to_string(),
+                "sip:wildcard@ims.example.com".to_string(),
+            ],
+        );
+
+        // Lookup by either alias resolves to the primary's contact.
+        let by_tel = registrar.lookup("sip:tel:+15551234");
+        assert_eq!(by_tel.len(), 1);
+        assert_eq!(by_tel[0].uri.host, "10.0.0.1");
+
+        let by_wildcard = registrar.lookup("sip:wildcard@ims.example.com");
+        assert_eq!(by_wildcard.len(), 1);
+        assert_eq!(by_wildcard[0].uri.host, "10.0.0.1");
+
+        assert!(registrar.is_registered("sip:tel:+15551234"));
+        assert!(registrar.is_registered(primary));
+    }
+
+    #[test]
+    fn alias_index_skips_self_aliases() {
+        let registrar = Registrar::default();
+        let primary = "sip:alice@ims.example.com";
+        registrar.set_associated_uris(
+            primary,
+            vec![
+                primary.to_string(),
+                "tel:+15551234".to_string(),
+            ],
+        );
+
+        // The primary URI in the AU list must not become an alias of itself
+        // (a self-loop would break resolve_alias semantics).
+        assert!(registrar.aliases.get(primary).is_none());
+        // The other URI is registered as an alias.
+        assert_eq!(
+            registrar
+                .aliases
+                .get("sip:tel:+15551234")
+                .map(|e| e.value().clone()),
+            Some(primary.to_string()),
+        );
+    }
+
+    #[test]
+    fn alias_index_replaces_on_resave() {
+        let registrar = Registrar::default();
+        let primary = "sip:alice@ims.example.com";
+        registrar.set_associated_uris(
+            primary,
+            vec!["tel:+15550000".to_string()],
+        );
+        assert!(registrar.aliases.contains_key("sip:tel:+15550000"));
+
+        // Replace the implicit set with a different list.
+        registrar.set_associated_uris(
+            primary,
+            vec!["tel:+15551111".to_string()],
+        );
+        assert!(!registrar.aliases.contains_key("sip:tel:+15550000"));
+        assert!(registrar.aliases.contains_key("sip:tel:+15551111"));
+    }
+
+    #[test]
+    fn alias_index_resolved_on_save() {
+        let registrar = Registrar::default();
+        let primary = "sip:alice@ims.example.com";
+        registrar.set_associated_uris(
+            primary,
+            vec!["tel:+15551234".to_string()],
+        );
+
+        // REGISTER arrives with To = alias; bindings should still land on primary.
+        registrar
+            .save("sip:tel:+15551234", contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .unwrap();
+
+        let by_primary = registrar.lookup(primary);
+        assert_eq!(by_primary.len(), 1);
+        assert_eq!(by_primary[0].uri.host, "10.0.0.1");
+
+        // The bindings DashMap has a single key — the primary, not the alias.
+        assert!(registrar.bindings.contains_key(primary));
+        assert!(!registrar.bindings.contains_key("sip:tel:+15551234"));
+    }
+
+    #[test]
+    fn dereg_clears_alias_index() {
+        let registrar = Registrar::default();
+        let primary = "sip:alice@ims.example.com";
+        registrar
+            .save(primary, contact_uri("alice", "10.0.0.1"), 3600, 1.0, "c1".into(), 1)
+            .unwrap();
+        registrar.set_associated_uris(
+            primary,
+            vec!["tel:+15551234".to_string()],
+        );
+        assert!(registrar.aliases.contains_key("sip:tel:+15551234"));
+
+        registrar.remove_all(primary);
+
+        // Aliases pruned along with bindings + AU list.
+        assert!(!registrar.aliases.contains_key("sip:tel:+15551234"));
+        assert!(registrar.lookup("sip:tel:+15551234").is_empty());
+    }
+
+    #[test]
+    fn alias_set_via_alias_clobbers_primary() {
+        // set_associated_uris on something already registered as an alias
+        // resolves to the primary and replaces the primary's implicit set.
+        let registrar = Registrar::default();
+        let primary = "sip:alice@ims.example.com";
+        registrar.set_associated_uris(primary, vec!["tel:+15550000".to_string()]);
+
+        // Same caller now claims a different IMPU as the implicit set —
+        // calling via the alias should land on the primary.
+        registrar.set_associated_uris(
+            "sip:tel:+15550000",
+            vec!["tel:+15551111".to_string()],
+        );
+
+        assert_eq!(
+            registrar.associated_uris(primary),
+            vec!["tel:+15551111".to_string()],
+        );
+        // Old alias dropped, new one in place.
+        assert!(!registrar.aliases.contains_key("sip:tel:+15550000"));
+        assert!(registrar.aliases.contains_key("sip:tel:+15551111"));
     }
 }

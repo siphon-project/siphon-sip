@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use pyo3::prelude::*;
 
-use crate::registrar::{Contact, Registrar, RegistrarError, reginfo};
+use crate::registrar::{Contact, Registrar, RegistrarError, normalize_aor, reginfo};
 use crate::sip::headers::nameaddr::NameAddr;
 use crate::sip::message::SipMessage;
 use super::request::PyRequest;
@@ -198,18 +198,26 @@ impl PyRegistrar {
 
 #[pymethods]
 impl PyRegistrar {
-    /// Save contact bindings from a REGISTER request.
-    ///
-    /// Extracts the AoR from the To header and the Contact header(s) from the
-    /// message. If `force` is True, all existing contacts are removed first.
-    #[pyo3(signature = (request, force=false))]
     /// Save contact bindings from a REGISTER and send 200 OK with granted
     /// Expires (like OpenSIPS `save("location")`).
     ///
-    /// Stores the contacts, sets the Expires header to the granted value
-    /// (capped by `max_expires`), and sends a 200 OK reply.  The script
-    /// should **not** call `request.reply()` after `save()`.
-    fn save(&self, request: &mut PyRequest, force: bool) -> PyResult<bool> {
+    /// Stores the contacts under the AoR derived from the To header,
+    /// sets the Expires header to the granted value (capped by
+    /// `max_expires`), and sends a 200 OK reply.  The script should
+    /// **not** call `request.reply()` after `save()`.
+    ///
+    /// `aliases` declares the IMS implicit registration set: every URI
+    /// in the list becomes an alias of this AoR, so subsequent
+    /// `registrar.lookup(alias)` calls resolve to the same contacts.
+    /// Empty list (the default) is a no-op — call
+    /// `registrar.set_associated_uris(aor, [])` to clear an existing set.
+    #[pyo3(signature = (request, force=false, aliases=Vec::new()))]
+    fn save(
+        &self,
+        request: &mut PyRequest,
+        force: bool,
+        aliases: Vec<String>,
+    ) -> PyResult<bool> {
         let message = request.message();
         let mut message = message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
@@ -337,6 +345,14 @@ impl PyRegistrar {
         // copies it into the 200 OK (RFC 3261 §10.3 step 8).
         message.headers.set("Expires", granted_expires.to_string());
         drop(message);
+
+        // Declare the implicit registration set (3GPP TS 23.228) — each
+        // alias URI becomes resolvable to this AoR for subsequent
+        // `registrar.lookup(alias)` calls.  Empty list is intentionally
+        // a no-op: callers clear via `set_associated_uris(aor, [])`.
+        if !aliases.is_empty() {
+            self.inner.set_associated_uris(&aor, aliases);
+        }
 
         // Send 200 OK — the dispatcher's build_response() will include
         // the Expires header we just set.
@@ -606,35 +622,9 @@ fn extract_uri_string(uri: &Bound<'_, PyAny>) -> PyResult<String> {
     Ok(string_repr.to_string())
 }
 
-/// Normalize a URI string to an AoR format.
-///
-/// - If the input doesn't start with "sip:" or "sips:", prepend "sip:".
-/// - Strip URI parameters (e.g. `transport=tls`) so that the same user@host
-///   is always matched regardless of transport or other parameters.
-/// - Strip the default port (:5060 for sip, :5061 for sips) so that
-///   `sip:bob@host` and `sip:bob@host:5060` map to the same AoR.
-fn normalize_aor(uri: &str) -> String {
-    // Strip angle brackets first
-    let uri = uri.trim_start_matches('<').trim_end_matches('>');
-
-    let uri = if uri.starts_with("sip:") || uri.starts_with("sips:") {
-        uri.to_string()
-    } else {
-        format!("sip:{uri}")
-    };
-
-    // Strip URI parameters (everything after ';') and headers (after '?')
-    // AoR should be just scheme:user@host[:port]
-    let uri = uri.split(';').next().unwrap_or(&uri).to_string();
-    let uri = uri.split('?').next().unwrap_or(&uri).to_string();
-
-    // Strip default port for consistent AoR matching
-    if uri.starts_with("sips:") {
-        uri.trim_end_matches(":5061").to_string()
-    } else {
-        uri.trim_end_matches(":5060").to_string()
-    }
-}
+// AoR canonicalization lives in `crate::registrar::normalize_aor` (imported
+// at module scope) so the script-API boundary and the alias-index inside the
+// registrar agree on the same keying.
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -693,7 +683,7 @@ mod tests {
         let (mut request, py_reg) =
             make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.1:5060>", &registrar);
 
-        py_reg.save(&mut request, false).unwrap();
+        py_reg.save(&mut request, false, vec![]).unwrap();
 
         let contacts = py_reg.lookup_str("sip:alice@example.com");
         assert_eq!(contacts.len(), 1);
@@ -710,7 +700,7 @@ mod tests {
             make_register_request("<sip:bob@example.com>", "<sip:bob@10.0.0.2>", &registrar);
 
         assert!(!py_reg.is_registered_str("sip:bob@example.com"));
-        py_reg.save(&mut request, false).unwrap();
+        py_reg.save(&mut request, false, vec![]).unwrap();
         assert!(py_reg.is_registered_str("sip:bob@example.com"));
     }
 
@@ -720,7 +710,7 @@ mod tests {
         let (mut request, py_reg) =
             make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.1>", &registrar);
 
-        py_reg.save(&mut request, false).unwrap();
+        py_reg.save(&mut request, false, vec![]).unwrap();
         assert!(py_reg.is_registered_str("sip:alice@example.com"));
 
         // Wildcard Contact: *
@@ -744,7 +734,7 @@ mod tests {
             "10.0.0.1".to_string(),
             5060,
         );
-        py_reg.save(&mut dereg_request, false).unwrap();
+        py_reg.save(&mut dereg_request, false, vec![]).unwrap();
         assert!(!py_reg.is_registered_str("sip:alice@example.com"));
     }
 
@@ -753,11 +743,11 @@ mod tests {
         let registrar = make_registrar();
         let (mut request1, py_reg) =
             make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.1>", &registrar);
-        py_reg.save(&mut request1, false).unwrap();
+        py_reg.save(&mut request1, false, vec![]).unwrap();
 
         let (mut request2, _) =
             make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.2>", &registrar);
-        py_reg.save(&mut request2, true).unwrap();
+        py_reg.save(&mut request2, true, vec![]).unwrap();
 
         let contacts = py_reg.lookup_str("sip:alice@example.com");
         assert_eq!(contacts.len(), 1);
@@ -784,14 +774,14 @@ mod tests {
             "<sip:alice@10.0.0.1>",
             &registrar,
         );
-        py_reg.save(&mut alice, false).unwrap();
+        py_reg.save(&mut alice, false, vec![]).unwrap();
 
         let (mut bob, _) = make_register_request(
             "<sip:bob@example.com>",
             "<sip:bob@10.0.0.2>",
             &registrar,
         );
-        py_reg.save(&mut bob, false).unwrap();
+        py_reg.save(&mut bob, false, vec![]).unwrap();
         assert_eq!(registrar.aor_count_distributed().await.unwrap(), 2);
 
         // Refreshing alice does not change the AoR count.
@@ -800,7 +790,7 @@ mod tests {
             "<sip:alice@10.0.0.1>",
             &registrar,
         );
-        py_reg.save(&mut alice_refresh, false).unwrap();
+        py_reg.save(&mut alice_refresh, false, vec![]).unwrap();
         assert_eq!(registrar.aor_count_distributed().await.unwrap(), 2);
 
         registrar.remove_all("sip:alice@example.com");
@@ -851,7 +841,7 @@ mod tests {
             "<sip:alice@10.0.0.1:5060>",
             &registrar,
         );
-        py_reg.save(&mut request, false).unwrap();
+        py_reg.save(&mut request, false, vec![]).unwrap();
 
         // Lookup with transport param should still find the contact
         let contacts = py_reg.lookup_str("sip:alice@example.com;transport=tcp");
@@ -884,7 +874,7 @@ mod tests {
             &registrar,
         );
 
-        py_reg.save(&mut request, false).unwrap();
+        py_reg.save(&mut request, false, vec![]).unwrap();
         let contacts = py_reg.lookup_str("sip:alice@example.com");
         assert_eq!(contacts.len(), 1);
         assert!((contacts[0].q() - 0.7).abs() < 0.01);
@@ -899,7 +889,7 @@ mod tests {
         let (mut request, py_reg) =
             make_register_request("<sip:carol@example.com>", "<sip:carol@10.0.0.3>", &registrar);
 
-        py_reg.save(&mut request, false).unwrap();
+        py_reg.save(&mut request, false, vec![]).unwrap();
         assert!(py_reg.is_registered_str("sip:carol@example.com"));
 
         // expire() should remove all contacts
@@ -941,7 +931,7 @@ mod tests {
         let py_reg = PyRegistrar::new(Arc::clone(&registrar));
 
         // save() should return true and set the reply action
-        let result = py_reg.save(&mut request, false).unwrap();
+        let result = py_reg.save(&mut request, false, vec![]).unwrap();
         assert!(result);
 
         // The reply action should be 200 OK
@@ -980,7 +970,7 @@ mod tests {
         let (mut request, py_reg) =
             make_register_request("<sip:alice@example.com>", "<sip:alice@10.0.0.1>", &registrar);
 
-        py_reg.save(&mut request, false).unwrap();
+        py_reg.save(&mut request, false, vec![]).unwrap();
         assert!(py_reg.is_registered_str("sip:alice@example.com"));
 
         let uri = SipUri::new("example.com".to_string());
@@ -1004,7 +994,7 @@ mod tests {
             5060,
         );
 
-        let result = py_reg.save(&mut dereg_request, false).unwrap();
+        let result = py_reg.save(&mut dereg_request, false, vec![]).unwrap();
         assert!(result);
 
         // save() should have sent 200 OK for wildcard deregister
@@ -1021,5 +1011,44 @@ mod tests {
         let message = dereg_request.message();
         let message = message.lock().unwrap();
         assert_eq!(message.headers.get("Expires").unwrap(), "0");
+    }
+
+    /// `save(aliases=…)` declares the IMS implicit registration set: the
+    /// contacts saved under the To-header AoR must be reachable via
+    /// `lookup(alias)` for every URI in `aliases`.
+    #[test]
+    fn save_with_aliases_registers_implicit_set() {
+        let registrar = make_registrar();
+        let (mut request, py_reg) = make_register_request(
+            "<sip:alice@ims.example.com>",
+            "<sip:alice@10.0.0.1>",
+            &registrar,
+        );
+        py_reg
+            .save(
+                &mut request,
+                false,
+                vec!["tel:+15551234".to_string(), "sip:wildcard@ims.example.com".to_string()],
+            )
+            .unwrap();
+
+        // The primary AoR is registered.
+        assert!(py_reg.is_registered_str("sip:alice@ims.example.com"));
+        // Both alias IMPUs resolve to the same contact.
+        let by_tel = py_reg.lookup_str("tel:+15551234");
+        assert_eq!(by_tel.len(), 1);
+        assert!(by_tel[0].uri().contains("10.0.0.1"));
+
+        let by_wildcard = py_reg.lookup_str("sip:wildcard@ims.example.com");
+        assert_eq!(by_wildcard.len(), 1);
+        assert!(by_wildcard[0].uri().contains("10.0.0.1"));
+
+        // The AU list is queryable from any IMPU in the set — internal
+        // callers pass already-normalized AoR keys, so the tel-URI
+        // becomes "sip:tel:+15551234" via `normalize_aor`.
+        assert_eq!(
+            registrar.associated_uris("sip:tel:+15551234"),
+            vec!["tel:+15551234".to_string(), "sip:wildcard@ims.example.com".to_string()],
+        );
     }
 }

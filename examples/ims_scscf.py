@@ -71,18 +71,10 @@ def handle_register(request):
         else:
             log.warn("SAR failed — proceeding with local data")
 
-    if is_dereg:
-        registrar.save(request)
-        if diameter.peer_count() > 0:
-            isc.remove_profile(public_id)
-        log.info(f"deregistered {request.from_uri}")
-        return
-
-    # Save the registration.
-    registrar.save(request)
-
-    # Build P-Associated-URI from the authenticated identity.
-    # In production with HSS, this would come from the SAA user profile XML.
+    # Build the implicit registration set (3GPP TS 23.228) — the public
+    # identities that share this UE's bindings.  In production with HSS,
+    # this list comes from the SAA user profile XML; here we derive it
+    # from the authenticated identity.
     public_id = f"sip:{request.auth_user}"
     if "@" not in public_id:
         public_id = f"{public_id}@{REALM}"
@@ -90,9 +82,24 @@ def handle_register(request):
     if request.auth_user and request.auth_user.isdigit():
         tel_id = f"tel:+{request.auth_user}"
 
-    associated_uris = f"<{public_id}>"
+    implicit_set = [public_id]
     if tel_id:
-        associated_uris += f", <{tel_id}>"
+        implicit_set.append(tel_id)
+
+    if is_dereg:
+        registrar.save(request)
+        if diameter.peer_count() > 0:
+            isc.remove_profile(public_id)
+        log.info(f"deregistered {request.from_uri}")
+        return
+
+    # Save the registration AND declare the implicit set.  Lookups for
+    # any IMPU in the set (e.g. terminating INVITE to the tel-URI) will
+    # resolve to this binding.
+    registrar.save(request, aliases=implicit_set)
+
+    # P-Associated-URI on the 200 OK lists the same set for the UE.
+    associated_uris = ", ".join(f"<{u}>" for u in implicit_set)
     request.add_reply_header("P-Associated-URI", associated_uris)
 
     # Service-Route: subsequent requests from this UE route through S-CSCF.

@@ -616,9 +616,37 @@ class MockRegistrar:
         self._asserted_identities: dict[str, str] = {}
         self._service_routes: dict[str, list[str]] = {}
         self._associated_uris: dict[str, list[str]] = {}
+        # Alias AoR → primary AoR.  Derived index over ``_associated_uris``,
+        # mirrors the Rust ``Registrar::aliases`` map.
+        self._aliases: dict[str, str] = {}
         self._on_change_callbacks: list[Callable] = []
 
-    def save(self, request: Any, force: bool = False) -> bool:
+    @staticmethod
+    def _normalize_aor(uri: str) -> str:
+        """Mirror of ``crate::registrar::normalize_aor``.
+
+        Strip angle brackets, prepend ``sip:`` if no scheme, drop URI
+        parameters / headers and the default port.
+        """
+        s = str(uri).strip().lstrip("<").rstrip(">")
+        if not (s.startswith("sip:") or s.startswith("sips:")):
+            s = f"sip:{s}"
+        s = s.split(";", 1)[0].split("?", 1)[0]
+        if s.startswith("sips:") and s.endswith(":5061"):
+            s = s[:-5]
+        elif s.startswith("sip:") and s.endswith(":5060"):
+            s = s[:-5]
+        return s
+
+    def _resolve_alias(self, aor: str) -> str:
+        return self._aliases.get(aor, aor)
+
+    def save(
+        self,
+        request: Any,
+        force: bool = False,
+        aliases: Optional[list[str]] = None,
+    ) -> bool:
         """Save contact bindings from a REGISTER request and send the 200 OK reply.
 
         Stores the contact bindings and automatically sends a ``200 OK`` reply
@@ -631,6 +659,12 @@ class MockRegistrar:
         Args:
             request: The REGISTER request object.
             force: If ``True``, evict all existing contacts first.
+            aliases: IMS implicit registration set (3GPP TS 23.228) —
+                every URI in the list becomes an alias of this AoR, so
+                subsequent ``registrar.lookup(alias)`` calls resolve to
+                the same contacts.  Empty / ``None`` is a no-op; clear
+                an existing set with
+                ``registrar.set_associated_uris(aor, [])``.
 
         Returns:
             ``True`` on success.
@@ -640,10 +674,11 @@ class MockRegistrar:
             if request.method == "REGISTER":
                 if not auth.require_digest(request, realm=DOMAIN):
                     return
-                registrar.save(request)  # sends 200 OK automatically
+                registrar.save(request, aliases=["tel:+15551234"])
                 return
         """
-        aor = str(request.to_uri) if request.to_uri else str(request.ruri)
+        raw_aor = str(request.to_uri) if request.to_uri else str(request.ruri)
+        aor = self._resolve_alias(self._normalize_aor(raw_aor))
         if force:
             self._store.pop(aor, None)
         contacts = self._store.setdefault(aor, [])
@@ -655,6 +690,9 @@ class MockRegistrar:
         # Fire on_change callbacks
         event_type = "refreshed" if already_exists else "registered"
         self._fire_on_change(aor, event_type)
+        # Declare the implicit registration set.
+        if aliases:
+            self.set_associated_uris(aor, list(aliases))
         # Automatically reply 200 OK on behalf of the script — matches the
         # real Rust registrar.save() behaviour (the script must NOT also
         # call request.reply()).
@@ -665,6 +703,10 @@ class MockRegistrar:
     def lookup(self, uri: Union[str, SipUri]) -> list[Contact]:
         """Look up contacts for an address-of-record.
 
+        If the URI is an alias of an IMS implicit registration set,
+        resolves to the primary's contacts (matching production
+        ``registrar.lookup`` behaviour).
+
         Args:
             uri: AoR as string or :class:`SipUri`.
 
@@ -672,7 +714,7 @@ class MockRegistrar:
             List of :class:`Contact` objects sorted by q-value (descending).
             Empty list if no contacts registered.
         """
-        key = str(uri)
+        key = self._resolve_alias(self._normalize_aor(str(uri)))
         contacts = self._store.get(key, [])
         return sorted(contacts, key=lambda c: c.q, reverse=True)
 
@@ -717,7 +759,13 @@ class MockRegistrar:
         Args:
             uri: AoR to expire.
         """
-        self._store.pop(str(uri), None)
+        primary = self._resolve_alias(self._normalize_aor(str(uri)))
+        self._store.pop(primary, None)
+        self._associated_uris.pop(primary, None)
+        self._service_routes.pop(primary, None)
+        self._asserted_identities.pop(primary, None)
+        # Drop alias entries pointing at this primary.
+        self._aliases = {k: v for k, v in self._aliases.items() if v != primary}
 
     def remove(self, uri: Union[str, SipUri]) -> None:
         """Remove all contacts for a URI (deregistration).
@@ -789,19 +837,31 @@ class MockRegistrar:
         return list(self._service_routes.get(str(uri), []))
 
     def set_associated_uris(self, aor: str, uris: list[str]) -> None:
-        """Store P-Associated-URI list for an AoR.
+        """Store P-Associated-URI list for an AoR and rebuild the
+        derived alias index.
 
-        Called from reply handlers to cache the public identities returned
-        by the upstream S-CSCF in the 200 OK to REGISTER.
+        Each URI in ``uris`` becomes an alias of ``aor``, so subsequent
+        ``registrar.lookup(alias)`` / ``registrar.is_registered(alias)``
+        calls resolve to ``aor``'s contacts.  Empty list clears both the
+        AU list and every alias entry pointing at this primary.
 
         Args:
-            aor: Address-of-record string.
+            aor: Address-of-record string (or any alias of it — the
+                call is resolved to the primary).
             uris: List of P-Associated-URI strings.
         """
+        primary = self._resolve_alias(self._normalize_aor(str(aor)))
+        # Drop existing alias entries pointing at this primary.
+        self._aliases = {k: v for k, v in self._aliases.items() if v != primary}
+        # Re-install one entry per URI in the new list (skip self-aliases).
+        for uri in uris or []:
+            alias = self._normalize_aor(uri)
+            if alias != primary:
+                self._aliases[alias] = primary
         if uris:
-            self._associated_uris[str(aor)] = list(uris)
+            self._associated_uris[primary] = list(uris)
         else:
-            self._associated_uris.pop(str(aor), None)
+            self._associated_uris.pop(primary, None)
 
     def associated_uris(self, uri: Union[str, SipUri]) -> list[str]:
         """Get stored P-Associated-URI list for a URI.

@@ -1847,6 +1847,18 @@ mod tests {
                 "tel:+15551234".to_string(),
             ],
         );
+
+        // Alias index was rebuilt from the persisted AU list — looking up
+        // the tel-URI alias resolves to the primary AoR.  No bindings are
+        // persisted in this test, so the lookup itself returns empty, but
+        // the resolution + AU echo prove the index round-tripped.
+        assert_eq!(
+            restored.associated_uris("sip:tel:+15551234"),
+            vec![
+                "sip:alice@ims.example.com".to_string(),
+                "tel:+15551234".to_string(),
+            ],
+        );
     }
 
     #[tokio::test]
