@@ -28,7 +28,7 @@ use crate::diameter::peer::DiameterPeer;
 use crate::diameter::rf::{
     self, termination_cause, AccountingAnswer, AccountingParams, AccountingRecordType,
 };
-use crate::diameter::ro::{ImsChargingData, NodeFunctionality};
+use crate::diameter::ro::{ImsChargingData, NodeFunctionality, NodeRole};
 use crate::diameter::DiameterManager;
 
 /// State held per active accounting session.
@@ -403,6 +403,110 @@ pub fn termination_cause_for_reason(reason: &str) -> u32 {
     }
 }
 
+/// Build an [`ImsChargingData`] from a SIP request, populating every
+/// IMS-Information sub-AVP that can be derived from the headers.
+///
+/// Role-of-Node determination follows TS 24.229 §5.4.3.2 / RFC 5502:
+/// 1. `P-Served-User` `sescase=orig` → ORIGINATING_ROLE,
+///    `sescase=term` → TERMINATING_ROLE.
+/// 2. Fallback: caller supplies an `is_local_uri` predicate so the proxy
+///    can decide based on whether the From / P-Asserted-Identity is a
+///    locally-served identity.  When `None`, defaults to ORIGINATING_ROLE.
+///
+/// `node_functionality` comes from `RfConfig.node_functionality` so the
+/// caller can configure once per deployment role (S-CSCF / P-CSCF / AS).
+pub fn ims_data_from_request<F>(
+    message: &crate::sip::SipMessage,
+    node_functionality: Option<NodeFunctionality>,
+    is_local_uri: F,
+) -> ImsChargingData
+where
+    F: Fn(&str) -> bool,
+{
+    use crate::sip::headers::charging::{ChargingVector, ServedUser};
+
+    let calling_party = message
+        .headers
+        .get("P-Asserted-Identity")
+        .map(|s| strip_uri_brackets(s).to_string())
+        .or_else(|| message.headers.get("From").map(|s| extract_uri(s).to_string()));
+    let called_party = message
+        .headers
+        .get("To")
+        .map(|s| extract_uri(s).to_string());
+    let user_session_id = message.headers.get("Call-ID").cloned();
+
+    let charging_vector = message
+        .headers
+        .get("P-Charging-Vector")
+        .map(|v| ChargingVector::parse(v))
+        .unwrap_or_default();
+    let visited_network_id = message
+        .headers
+        .get("P-Visited-Network-ID")
+        .and_then(|v| crate::sip::headers::charging::parse_visited_network_id(v));
+
+    // Role determination: P-Served-User wins, else compare From-URI to
+    // local-domain predicate, else default ORIGINATING_ROLE.
+    let role_of_node = message
+        .headers
+        .get("P-Served-User")
+        .and_then(|v| ServedUser::parse(v))
+        .and_then(|su| match su.sescase.as_deref() {
+            Some("orig") => Some(NodeRole::OriginatingRole),
+            Some("term") => Some(NodeRole::TerminatingRole),
+            _ => None,
+        })
+        .or_else(|| {
+            let from_uri = message
+                .headers
+                .get("From")
+                .map(|s| extract_uri(s).to_string());
+            from_uri.as_deref().map(|uri| {
+                if is_local_uri(uri) {
+                    NodeRole::OriginatingRole
+                } else {
+                    NodeRole::TerminatingRole
+                }
+            })
+        })
+        .or(Some(NodeRole::OriginatingRole));
+
+    let sip_method = message.method().map(|m| m.as_str().to_string());
+
+    ImsChargingData {
+        calling_party,
+        called_party,
+        sip_method,
+        event: None,
+        role_of_node,
+        node_functionality,
+        ims_charging_identifier: charging_vector.icid,
+        cause_code: None,
+        user_session_id,
+        request_timestamp: Some(SystemTime::now()),
+        response_timestamp: None,
+        originating_ioi: charging_vector.orig_ioi,
+        terminating_ioi: charging_vector.term_ioi,
+        application_server: None,
+        visited_network_id,
+    }
+}
+
+fn strip_uri_brackets(s: &str) -> &str {
+    let trimmed = s.trim();
+    if let (Some(open), Some(close)) = (trimmed.find('<'), trimmed.rfind('>')) {
+        if open < close {
+            return trimmed[open + 1..close].trim();
+        }
+    }
+    trimmed
+}
+
+fn extract_uri(name_addr: &str) -> &str {
+    strip_uri_brackets(name_addr.split(';').next().unwrap_or(name_addr))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +575,144 @@ mod tests {
         cfg.node_functionality = "totally-bogus".into();
         let service = RfChargingService::new(manager, cfg);
         assert_eq!(service.node_functionality(), None);
+    }
+
+    // ── ims_data_from_request ───────────────────────────────────────────
+
+    fn parse_test_sip(raw: &str) -> crate::sip::SipMessage {
+        crate::sip::parser::parse_sip_message_bytes(raw.as_bytes())
+            .expect("test SIP message must parse")
+    }
+
+    #[test]
+    fn ims_data_extracts_charging_vector_icid_and_iois() {
+        let raw = concat!(
+            "INVITE sip:bob@biloxi.example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP pc.atlanta.example.com;branch=z9hG4bK776\r\n",
+            "From: <sip:alice@atlanta.example.com>;tag=1928301774\r\n",
+            "To: <sip:bob@biloxi.example.com>\r\n",
+            "Call-ID: a84b4c76e66710\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "P-Charging-Vector: icid-value=icid-test-001;orig-ioi=home1.net;term-ioi=home2.net\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        let msg = parse_test_sip(raw);
+        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |_| false);
+
+        assert_eq!(ims.ims_charging_identifier.as_deref(), Some("icid-test-001"));
+        assert_eq!(ims.originating_ioi.as_deref(), Some("home1.net"));
+        assert_eq!(ims.terminating_ioi.as_deref(), Some("home2.net"));
+        assert_eq!(ims.user_session_id.as_deref(), Some("a84b4c76e66710"));
+        assert_eq!(ims.sip_method.as_deref(), Some("INVITE"));
+        assert_eq!(ims.node_functionality, Some(NodeFunctionality::SCscf));
+    }
+
+    #[test]
+    fn ims_data_role_from_p_served_user() {
+        let raw = concat!(
+            "INVITE sip:bob@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP host;branch=z9hG4bK1\r\n",
+            "From: <sip:alice@example.com>;tag=a\r\n",
+            "To: <sip:bob@example.com>\r\n",
+            "Call-ID: c\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "P-Served-User: <sip:bob@example.com>;sescase=term;regstate=reg\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        let msg = parse_test_sip(raw);
+        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |_| false);
+        assert_eq!(ims.role_of_node, Some(NodeRole::TerminatingRole));
+    }
+
+    #[test]
+    fn ims_data_role_falls_back_to_local_predicate() {
+        let raw = concat!(
+            "INVITE sip:bob@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP host;branch=z9hG4bK1\r\n",
+            "From: <sip:alice@home.example.com>;tag=a\r\n",
+            "To: <sip:bob@other.example.com>\r\n",
+            "Call-ID: c\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        let msg = parse_test_sip(raw);
+        // Predicate: "home.example.com" caller is local → originating role
+        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |uri| {
+            uri.contains("home.example.com")
+        });
+        assert_eq!(ims.role_of_node, Some(NodeRole::OriginatingRole));
+
+        // With opposite predicate → terminating
+        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |uri| {
+            uri.contains("other.example.com")
+        });
+        assert_eq!(ims.role_of_node, Some(NodeRole::TerminatingRole));
+    }
+
+    #[test]
+    fn ims_data_extracts_visited_network_id_for_roaming() {
+        let raw = concat!(
+            "REGISTER sip:home.example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP host;branch=z9hG4bK1\r\n",
+            "From: <sip:alice@home.example.com>;tag=a\r\n",
+            "To: <sip:alice@home.example.com>\r\n",
+            "Call-ID: c\r\n",
+            "CSeq: 1 REGISTER\r\n",
+            "P-Visited-Network-ID: visited.example.com\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        let msg = parse_test_sip(raw);
+        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::PCscf), |_| true);
+        assert_eq!(ims.visited_network_id.as_deref(), Some("visited.example.com"));
+    }
+
+    #[test]
+    fn ims_data_strips_uri_brackets_and_params() {
+        let raw = concat!(
+            "INVITE sip:bob@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP host;branch=z9hG4bK1\r\n",
+            "From: \"Alice\" <sip:alice@example.com>;tag=a\r\n",
+            "To: \"Bob\" <sip:bob@example.com>\r\n",
+            "Call-ID: c\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        let msg = parse_test_sip(raw);
+        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |_| false);
+        assert_eq!(ims.calling_party.as_deref(), Some("sip:alice@example.com"));
+        assert_eq!(ims.called_party.as_deref(), Some("sip:bob@example.com"));
+    }
+
+    #[test]
+    fn ims_data_uses_p_asserted_identity_when_present() {
+        let raw = concat!(
+            "INVITE sip:bob@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP host;branch=z9hG4bK1\r\n",
+            "From: <sip:anonymous@anonymous.invalid>;tag=a\r\n",
+            "To: <sip:bob@example.com>\r\n",
+            "P-Asserted-Identity: <sip:alice@home.example.com>\r\n",
+            "Call-ID: c\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        let msg = parse_test_sip(raw);
+        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |_| false);
+        assert_eq!(
+            ims.calling_party.as_deref(),
+            Some("sip:alice@home.example.com"),
+            "P-Asserted-Identity should override From for Calling-Party-Address"
+        );
     }
 }

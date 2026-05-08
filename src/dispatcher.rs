@@ -150,6 +150,24 @@ struct DispatcherState {
     /// Unavailable; in-dialog requests (ACK, BYE, PRACK, re-INVITE) and
     /// responses still flow so active calls can drain.
     pub is_draining: Arc<DrainState>,
+    /// Rf offline-charging service (3GPP TS 32.299) — `None` when
+    /// `rf:` is unset/disabled or no Diameter peers are configured.
+    rf_charger: Option<Arc<crate::diameter::rf_service::RfChargingService>>,
+    /// Per-dialog Rf state for proxy auto-emit, keyed by
+    /// `<Call-ID>\0<From-tag>` (matching `ProxySessionStore::dialog_key`).
+    /// Inserted when ACR-START succeeds for a 2xx INVITE; removed when
+    /// ACR-STOP fires for the matching BYE.  Empty when `rf_charger` is
+    /// `None` so the auto-emit hot path branches out cheaply.
+    rf_sessions: Arc<DashMap<String, ProxyRfState>>,
+}
+
+/// Bundle held in `DispatcherState::rf_sessions` so ACR-STOP can reuse
+/// the IMS data captured at ACR-START (calling/called party, ICID, IOI,
+/// User-Session-Id, etc.) and just update the cause_code from the BYE.
+struct ProxyRfState {
+    session: crate::diameter::rf_service::RfChargingSession,
+    ims_data: crate::diameter::ro::ImsChargingData,
+    user_name: Option<String>,
 }
 
 /// State for one outstanding reliable provisional response (RFC 3262 §3).
@@ -273,6 +291,7 @@ pub async fn run(
         std::sync::Arc<crate::diameter::peer::DiameterPeer>,
     )>,
     rtpengine_events_rx: tokio::sync::mpsc::Receiver<crate::rtpengine::events::RtpEngineEvent>,
+    rf_charger: Option<Arc<crate::diameter::rf_service::RfChargingService>>,
     drain: Arc<DrainState>,
     product_name: &'static str,
     product_version: &'static str,
@@ -396,6 +415,8 @@ pub async fn run(
         call_event_receivers: Arc::new(DashMap::new()),
         reliable_provisionals: Arc::new(DashMap::new()),
         is_draining: drain.clone(),
+        rf_charger,
+        rf_sessions: Arc::new(DashMap::new()),
     });
 
     // Hand the freshly-constructed manager handles to the drain coordinator
@@ -1850,6 +1871,13 @@ fn handle_request(
             }
         }
     }
+    // Rf ACR-STOP on inbound proxy BYE (TS 32.299 §6.2.2).  Fires
+    // before the script handler so accounting is closed even if the
+    // script chooses to drop or reject the BYE; the SIP path itself
+    // is unaffected (spawn is fire-and-forget).
+    if method == "BYE" {
+        spawn_rf_proxy_stop_if_tracked(state, &message);
+    }
     if method == "UPDATE" && engine_state.has_b2bua_handlers() {
         // RFC 3311 in-dialog UPDATE belonging to a B2BUA call: bridge it
         // across like a re-INVITE. Calls that don't match a tracked B2BUA
@@ -3145,6 +3173,10 @@ fn handle_response(
                     crate::proxy::fork::ForkAction::Forward2xx => {
                         debug!(status = status_code, "fork: forwarding 2xx, cancelling others");
                         cancel_other_fork_branches(client_key, &server_key, state);
+                        // Rf ACR-START on INVITE 2xx (TS 32.299 §6.2.2).
+                        // Fire-and-forget so a slow CDF doesn't stall the
+                        // 2xx-forward path (TS 32.299 §6.5).
+                        spawn_rf_proxy_start_if_invite(state, &server_key, &original_request);
                     }
                     crate::proxy::fork::ForkAction::Forward6xx => {
                         debug!(status = status_code, "fork: forwarding 6xx, cancelling others");
@@ -4604,6 +4636,157 @@ pub fn inject_python_singletons(config: &Config) {
     });
 
     // RTPEngine Python singleton is now initialized in init_rtpengine() above.
+}
+
+// ---------------------------------------------------------------------------
+// Rf offline-charging helpers (3GPP TS 32.299) — proxy auto-emit
+// ---------------------------------------------------------------------------
+
+/// Compute the dialog key used by `ProxySessionStore::by_dialog_key` —
+/// `<Call-ID>\0<From-tag>`.  Returns `None` when either header is
+/// missing (an in-dialog request without a From-tag would be malformed).
+fn rf_dialog_key(message: &SipMessage) -> Option<String> {
+    let call_id = message.headers.get("Call-ID")?;
+    let from_tag = message
+        .typed_from()
+        .ok()
+        .flatten()
+        .and_then(|na| na.tag)?;
+    Some(format!("{}\0{}", call_id, from_tag))
+}
+
+/// Predicate factory: returns `true` when a SIP URI / name-addr value
+/// belongs to one of the locally-served domains.  Used by the
+/// `ims_data_from_request` builder to decide ORIGINATING vs
+/// TERMINATING role when no `P-Served-User` is present.
+fn rf_local_uri_predicate(local_domains: &Arc<Vec<String>>) -> impl Fn(&str) -> bool {
+    let domains: Vec<String> = local_domains
+        .iter()
+        .map(|d| d.to_ascii_lowercase())
+        .collect();
+    move |uri: &str| {
+        let lower = uri.to_ascii_lowercase();
+        domains.iter().any(|d| lower.contains(d))
+    }
+}
+
+/// Spawn ACR-START for the INVITE that just got a 2xx forwarded by the
+/// proxy.  No-op when `rf_charger` is unset, auto-emit is disabled, or
+/// the original method wasn't INVITE.  The handle returned by the CDF
+/// is stored in `state.rf_sessions` keyed by dialog key so the
+/// matching BYE can find and STOP it.
+fn spawn_rf_proxy_start_if_invite(
+    state: &DispatcherState,
+    server_key: &TransactionKey,
+    original_request: &SipMessage,
+) {
+    let charger = match state.rf_charger.as_ref() {
+        Some(c) if c.auto_emit_proxy() => Arc::clone(c),
+        _ => return,
+    };
+    if server_key.method != crate::sip::message::Method::Invite {
+        return;
+    }
+    let dialog_key = match rf_dialog_key(original_request) {
+        Some(k) => k,
+        None => return,
+    };
+    if state.rf_sessions.contains_key(&dialog_key) {
+        // Already charging this dialog (e.g. forked branches that all
+        // went 2xx in quick succession before the first task inserted).
+        return;
+    }
+    let local_predicate = rf_local_uri_predicate(&state.local_domains);
+    let ims_data = crate::diameter::rf_service::ims_data_from_request(
+        original_request,
+        charger.node_functionality(),
+        local_predicate,
+    );
+    let user_name = ims_data.calling_party.clone();
+    let rf_sessions = Arc::clone(&state.rf_sessions);
+    tokio::spawn(async move {
+        let session = match charger.acr_start(ims_data.clone(), user_name.clone()).await {
+            Some(s) => s,
+            None => return,
+        };
+        rf_sessions.insert(
+            dialog_key,
+            ProxyRfState {
+                session,
+                ims_data,
+                user_name,
+            },
+        );
+    });
+}
+
+/// Spawn ACR-STOP for the dialog this BYE belongs to.  No-op when no
+/// matching Rf session is tracked.
+fn spawn_rf_proxy_stop_if_tracked(state: &DispatcherState, bye: &SipMessage) {
+    let charger = match state.rf_charger.as_ref() {
+        Some(c) if c.auto_emit_proxy() => Arc::clone(c),
+        _ => return,
+    };
+    let direct_key = match rf_dialog_key(bye) {
+        Some(k) => k,
+        None => return,
+    };
+    // BYE may flow in either direction — try the dialog key as-is
+    // first (caller-initiated BYE matches our INVITE's From-tag) and
+    // fall back to swapping From/To tags (callee-initiated BYE).
+    let removed = state
+        .rf_sessions
+        .remove(&direct_key)
+        .or_else(|| {
+            let to_tag = bye
+                .typed_to()
+                .ok()
+                .flatten()
+                .and_then(|na| na.tag)?;
+            let call_id = bye.headers.get("Call-ID")?;
+            let swapped = format!("{}\0{}", call_id, to_tag);
+            state.rf_sessions.remove(&swapped)
+        });
+    let entry = match removed {
+        Some((_, e)) => e,
+        None => return,
+    };
+
+    // Pick up the Reason header if present (RFC 3326) — maps SIP cause
+    // through to IMS-Information Cause-Code per TS 32.299 §5.2.5.
+    let cause_code = bye
+        .headers
+        .get("Reason")
+        .and_then(|r| {
+            // Reason: SIP ;cause=200 ;text="..."
+            r.split(';')
+                .filter_map(|p| p.trim().strip_prefix("cause="))
+                .next()
+                .and_then(|v| v.split_whitespace().next())
+                .and_then(|v| v.parse::<u16>().ok())
+        })
+        .and_then(crate::diameter::rf::sip_status_to_cause_code);
+
+    let mut ims_data = entry.ims_data;
+    ims_data.sip_method = Some("BYE".to_string());
+    if cause_code.is_some() {
+        ims_data.cause_code = cause_code;
+    } else {
+        // Default: clean termination.  TS 32.299 §5.2.5: 0 == success.
+        ims_data.cause_code = Some(0);
+    }
+    ims_data.response_timestamp = Some(std::time::SystemTime::now());
+
+    tokio::spawn(async move {
+        charger
+            .acr_stop(
+                &entry.session,
+                ims_data,
+                entry.user_name,
+                crate::diameter::rf::termination_cause::DIAMETER_LOGOUT,
+            )
+            .await;
+    });
 }
 
 // ---------------------------------------------------------------------------

@@ -1274,6 +1274,7 @@ impl SiphonServer {
             registrar_event_rx,
             diameter_incoming_rx,
             rtpengine_events_rx,
+            rf_charger.clone(),
             Arc::clone(&drain),
             product_name,
             product_version,
