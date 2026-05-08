@@ -922,10 +922,25 @@ pub(crate) fn run_coroutine(
 /// Same scheduling semantics as [`run_coroutine`] — exposed separately so
 /// callers that need the coroutine's return value (e.g. host extensions
 /// dispatching to script handlers) don't have to re-drive the loop.
+///
+/// When the global async pool is installed (the production path,
+/// initialised from `SiphonServer` bootstrap), the coroutine is dispatched
+/// onto one of the pool's long-running asyncio loops via
+/// `asyncio.run_coroutine_threadsafe`.  That path keeps the loop running
+/// across handler invocations so `asyncio.create_task(...)` actually runs
+/// to completion (see `script::async_pool` for details).  When no pool is
+/// installed (e.g. in lightweight tests that don't need fire-and-forget
+/// task semantics), we fall back to the legacy per-thread
+/// `loop.run_until_complete(coro)` path below.
 pub(crate) fn run_coroutine_value(
     python: Python<'_>,
     coroutine: &Bound<'_, pyo3::PyAny>,
 ) -> PyResult<Py<PyAny>> {
+    if let Some(value) =
+        crate::script::async_pool::run_coroutine_via_pool(python, coroutine)?
+    {
+        return Ok(value);
+    }
     let loop_handle = PYTHON_LOOP.with(|cell| -> PyResult<Py<PyAny>> {
         let mut slot = cell.borrow_mut();
         let handle = match slot.as_ref() {
@@ -1109,6 +1124,7 @@ async def route(request):
         let config = ScriptConfig {
             path: "/nonexistent/script.py".to_owned(),
             reload: ReloadMode::Auto,
+            async_pool_size: None,
         };
         let result = ScriptEngine::new(&config);
         assert!(result.is_err());
@@ -1133,6 +1149,7 @@ def route(request):
         let config = ScriptConfig {
             path: file.path().to_str().unwrap().to_owned(),
             reload: ReloadMode::Auto,
+            async_pool_size: None,
         };
         let engine = ScriptEngine::new(&config).unwrap();
         assert_eq!(engine.state().handlers.len(), 1);
@@ -1179,6 +1196,7 @@ def route(request):
         let config = ScriptConfig {
             path: file.path().to_str().unwrap().to_owned(),
             reload: ReloadMode::Auto,
+            async_pool_size: None,
         };
         let engine = ScriptEngine::new(&config).unwrap();
         assert_eq!(engine.state().handlers.len(), 1);

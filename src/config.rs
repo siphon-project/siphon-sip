@@ -360,6 +360,13 @@ pub struct ScriptConfig {
     pub path: String,
     #[serde(default = "default_reload")]
     pub reload: ReloadMode,
+    /// Size of the asyncio loop driver pool used to run async script
+    /// handlers.  Each driver is a dedicated OS thread running a Python
+    /// event loop forever — see `script::async_pool` for why this is
+    /// needed (orphaned `asyncio.create_task` survival).  Defaults to
+    /// the number of available CPUs (clamped to at least 1).
+    #[serde(default)]
+    pub async_pool_size: Option<usize>,
 }
 
 fn default_script_path() -> String {
@@ -371,6 +378,7 @@ impl Default for ScriptConfig {
         Self {
             path: default_script_path(),
             reload: default_reload(),
+            async_pool_size: None,
         }
     }
 }

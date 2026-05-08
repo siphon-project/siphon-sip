@@ -194,6 +194,7 @@ mod tests {
             ScriptEngine::new(&crate::config::ScriptConfig {
                 path: file.path().to_str().unwrap().to_owned(),
                 reload: crate::config::ReloadMode::Sighup,
+                async_pool_size: None,
             })
             .unwrap(),
         )

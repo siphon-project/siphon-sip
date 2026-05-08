@@ -323,6 +323,20 @@ impl SiphonServer {
 
         // --- Inject Rust singletons before script loads ---
         pyo3::Python::initialize();
+
+        // Spin up the async script-handler driver pool before any script is
+        // loaded so the very first handler invocation routes through it.
+        // Sized from `script.async_pool_size` (default = num CPUs); each
+        // driver is a dedicated OS thread running a Python event loop
+        // forever, which is what gives `asyncio.create_task(...)` from
+        // inside a handler real fire-and-forget semantics (see
+        // `script::async_pool` for the full story).
+        let async_pool_size = config
+            .script
+            .async_pool_size
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+        crate::script::async_pool::AsyncPool::install(async_pool_size);
+
         dispatcher::inject_python_singletons(&config);
         let pre_rtpengine = dispatcher::init_rtpengine(&config);
 

@@ -2,6 +2,7 @@
 //! registry, and bridges between the Rust SIP core and Python policy logic.
 
 pub mod api;
+pub mod async_pool;
 pub mod engine;
 pub mod handle;
 
