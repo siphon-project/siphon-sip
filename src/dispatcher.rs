@@ -3203,10 +3203,6 @@ fn handle_response(
                     crate::proxy::fork::ForkAction::Forward2xx => {
                         debug!(status = status_code, "fork: forwarding 2xx, cancelling others");
                         cancel_other_fork_branches(client_key, &server_key, state);
-                        // Rf ACR-START on INVITE 2xx (TS 32.299 §6.2.2).
-                        // Fire-and-forget so a slow CDF doesn't stall the
-                        // 2xx-forward path (TS 32.299 §6.5).
-                        spawn_rf_proxy_start_if_invite(state, &server_key, &original_request);
                     }
                     crate::proxy::fork::ForkAction::Forward6xx => {
                         debug!(status = status_code, "fork: forwarding 6xx, cancelling others");
@@ -3319,6 +3315,23 @@ fn handle_response(
                         return;
                     }
                 }
+            }
+
+            // Rf ACR-START on INVITE 2xx (TS 32.299 §6.2.2).
+            //
+            // Fires for both single-destination `request.relay(target)`
+            // (which has no fork aggregator) and multi-branch
+            // `request.fork(...)` (Forward2xx after the aggregator
+            // selects a winner), so any path that lands a 2xx on a
+            // confirmed proxy session opens an accounting record.
+            // Idempotency inside spawn_rf_proxy_start_if_invite +
+            // RfChargingService prevents double-emission if 2xx
+            // retransmits arrive on the same session.  Fire-and-forget
+            // per TS 32.299 §6.5.
+            if (200..300).contains(&status_code)
+                && server_key.method == crate::sip::message::Method::Invite
+            {
+                spawn_rf_proxy_start_if_invite(state, &server_key, &original_request);
             }
 
             // Feed the response into the server transaction for caching
