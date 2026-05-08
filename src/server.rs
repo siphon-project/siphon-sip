@@ -335,7 +335,10 @@ impl SiphonServer {
             .script
             .async_pool_size
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-        crate::script::async_pool::AsyncPool::install(async_pool_size);
+        crate::script::async_pool::AsyncPool::install(
+            async_pool_size,
+            tokio::runtime::Handle::current(),
+        );
 
         dispatcher::inject_python_singletons(&config);
         let pre_rtpengine = dispatcher::init_rtpengine(&config);

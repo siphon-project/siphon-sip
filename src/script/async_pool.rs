@@ -47,6 +47,7 @@ use std::thread::JoinHandle;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
@@ -72,18 +73,31 @@ pub struct AsyncPool {
 }
 
 impl AsyncPool {
-    /// Initialise the global pool with `size` driver threads.  Subsequent
-    /// calls are no-ops and return the previously-installed pool — safe to
-    /// call multiple times (e.g. once from server bootstrap, then again
-    /// from each test that wants pool-backed dispatch).
+    /// Initialise the global pool with `size` driver threads, each
+    /// entering `tokio_handle` for its lifetime.  Subsequent calls are
+    /// no-ops and return the previously-installed pool — safe to call
+    /// multiple times (e.g. once from server bootstrap, then again from
+    /// each test that wants pool-backed dispatch).
     ///
     /// `size` is clamped to at least 1.
-    pub fn install(size: usize) -> Arc<AsyncPool> {
+    ///
+    /// `tokio_handle` **must outlive the process / test binary** — every
+    /// driver thread holds an `EnterGuard` for that handle for the entire
+    /// time it's running.  Rust API methods invoked back from script
+    /// coroutines (`proxy.send_request`, `proxy.subscribe_state.send`,
+    /// `diameter.send_*`, etc.) resolve `Handle::current()` to the
+    /// captured handle, so passing in a runtime that's about to be torn
+    /// down (e.g. a `#[tokio::test]`'s implicit per-test runtime) leads
+    /// to spurious "context was found, but it is being shutdown" panics
+    /// once that runtime drops.  In production, pass the bootstrap
+    /// runtime's `Handle::current()`.  In tests, use a long-lived
+    /// static runtime.
+    pub fn install(size: usize, tokio_handle: TokioHandle) -> Arc<AsyncPool> {
         if let Some(existing) = GLOBAL.get() {
             return Arc::clone(existing);
         }
         let size = size.max(1);
-        let pool = Arc::new(AsyncPool::spawn(size));
+        let pool = Arc::new(AsyncPool::spawn(size, tokio_handle));
         match GLOBAL.set(Arc::clone(&pool)) {
             Ok(()) => {
                 info!(size, "async script pool initialised");
@@ -108,10 +122,10 @@ impl AsyncPool {
         self.drivers.len()
     }
 
-    fn spawn(size: usize) -> Self {
+    fn spawn(size: usize, tokio_handle: TokioHandle) -> Self {
         let mut drivers = Vec::with_capacity(size);
         for index in 0..size {
-            drivers.push(spawn_driver(index));
+            drivers.push(spawn_driver(index, tokio_handle.clone()));
         }
         Self {
             drivers,
@@ -192,12 +206,12 @@ impl Drop for AsyncPool {
 
 /// Spawn a single driver thread and return its handle once the loop is
 /// ready to accept work.
-fn spawn_driver(index: usize) -> Driver {
+fn spawn_driver(index: usize, tokio_handle: TokioHandle) -> Driver {
     let (tx, rx) = std::sync::mpsc::sync_channel::<DriverHandshake>(1);
 
     let thread = std::thread::Builder::new()
         .name(format!("siphon-asyncio-{index}"))
-        .spawn(move || driver_main(index, tx))
+        .spawn(move || driver_main(index, tx, tokio_handle))
         .expect("failed to spawn asyncio driver thread");
 
     let handshake = rx
@@ -221,7 +235,21 @@ enum DriverHandshake {
     Failed(String),
 }
 
-fn driver_main(index: usize, handshake: std::sync::mpsc::SyncSender<DriverHandshake>) {
+fn driver_main(
+    index: usize,
+    handshake: std::sync::mpsc::SyncSender<DriverHandshake>,
+    tokio_handle: TokioHandle,
+) {
+    // Enter the bootstrap Tokio runtime context for the lifetime of this
+    // driver.  Every Rust API method script coroutines call into
+    // (`proxy.send_request`, `proxy.subscribe_state`, `diameter.send_*`,
+    // etc.) ultimately reaches `Handle::current()` or `tokio::spawn` — and
+    // without an entered runtime the reactor lookup panics with
+    // "there is no reactor running, must be called from the context of a
+    // Tokio 1.x runtime".  The guard is dropped only when this function
+    // returns, i.e. when the driver loop has stopped at shutdown.
+    let _runtime_guard = tokio_handle.enter();
+
     // Persistent attach trick — same rationale as the tokio worker threads
     // (`server.rs::on_thread_start`): keep the per-thread Python state
     // alive for the lifetime of this OS thread so free-threaded mimalloc
@@ -418,12 +446,31 @@ mod tests {
         })
     }
 
+    /// Mimics the synchronous `block_in_place + Handle::current().block_on(...)`
+    /// pattern used by `proxy.send_request`, `proxy.subscribe_state.send`,
+    /// `diameter.send_*`, etc.  Without entering the bootstrap Tokio
+    /// runtime on the driver thread, `Handle::current()` panics with
+    /// "there is no reactor running".  Used by the regression test below.
+    #[pyfunction]
+    fn _ap_blocking_tokio_call() -> PyResult<i64> {
+        let value = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                42i64
+            })
+        });
+        Ok(value)
+    }
+
     fn install_test_module(python: Python<'_>) {
         // Module name needs to be process-unique because we install once
         // per test binary.  Re-installation just overwrites which is OK.
         let module = PyModule::new(python, "_siphon_async_pool_test").unwrap();
         module
             .add_function(pyo3::wrap_pyfunction!(_ap_async_op, &module).unwrap())
+            .unwrap();
+        module
+            .add_function(pyo3::wrap_pyfunction!(_ap_blocking_tokio_call, &module).unwrap())
             .unwrap();
         let sys = python.import("sys").unwrap();
         sys.getattr("modules")
@@ -432,10 +479,30 @@ mod tests {
             .unwrap();
     }
 
+    /// Long-lived multi-threaded runtime used by every test in this
+    /// module.  Cannot use the implicit per-test runtime created by
+    /// `#[tokio::test]`: the pool's driver threads enter the runtime
+    /// captured at install time and hold the guard forever, so a
+    /// per-test runtime gets torn down underneath the drivers and
+    /// subsequent tests panic with "context was found, but it is being
+    /// shutdown".  A single process-wide runtime survives all tests.
+    fn test_runtime() -> &'static tokio::runtime::Runtime {
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> =
+            std::sync::OnceLock::new();
+        RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .enable_all()
+                .thread_name("async-pool-test-rt")
+                .build()
+                .expect("failed to build test runtime")
+        })
+    }
+
     fn ensure_pool() -> Arc<AsyncPool> {
         Python::initialize();
         Python::attach(install_test_module);
-        AsyncPool::install(2)
+        AsyncPool::install(2, test_runtime().handle().clone())
     }
 
     /// Build a coroutine factory from a Python source string.  Returns
@@ -462,18 +529,21 @@ mod tests {
         .unwrap()
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn pool_runs_simple_coroutine() {
-        ensure_pool();
-        let factory = Python::attach(|python| {
-            Arc::new(build_factory(
-                python,
-                "async def factory():\n    return 1 + 2\n",
-            ))
+    #[test]
+    fn pool_runs_simple_coroutine() {
+        test_runtime().block_on(async move {
+            ensure_pool();
+            let factory = Python::attach(|python| {
+                Arc::new(build_factory(
+                    python,
+                    "async def factory():\n    return 1 + 2\n",
+                ))
+            });
+            let value = dispatch(factory).await;
+            let extracted: i64 =
+                Python::attach(|python| value.bind(python).extract().unwrap());
+            assert_eq!(extracted, 3);
         });
-        let value = dispatch(factory).await;
-        let extracted: i64 = Python::attach(|python| value.bind(python).extract().unwrap());
-        assert_eq!(extracted, 3);
     }
 
     /// Regression test for the orphan-create_task bug: an `asyncio.create_task`
@@ -481,38 +551,40 @@ mod tests {
     /// returns.  Previously, `run_until_complete` stopped the loop the
     /// moment the handler coroutine resolved, leaving the spawned task
     /// stuck in `_ready` forever.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn pool_drives_create_task_to_completion() {
-        ensure_pool();
-        let factory = Python::attach(|python| {
-            Arc::new(build_factory(
-                python,
-                "import asyncio\n\
-                 _hits = []\n\
-                 async def child():\n\
-                 \x20\x20\x20\x20await asyncio.sleep(0.01)\n\
-                 \x20\x20\x20\x20_hits.append('child ran')\n\
-                 async def factory():\n\
-                 \x20\x20\x20\x20task = asyncio.create_task(child())\n\
-                 \x20\x20\x20\x20# Don't await it — fire-and-forget.\n\
-                 \x20\x20\x20\x20await asyncio.sleep(0)\n\
-                 \x20\x20\x20\x20return task\n",
-            ))
-        });
-        let task = dispatch(factory).await;
+    #[test]
+    fn pool_drives_create_task_to_completion() {
+        test_runtime().block_on(async move {
+            ensure_pool();
+            let factory = Python::attach(|python| {
+                Arc::new(build_factory(
+                    python,
+                    "import asyncio\n\
+                     _hits = []\n\
+                     async def child():\n\
+                     \x20\x20\x20\x20await asyncio.sleep(0.01)\n\
+                     \x20\x20\x20\x20_hits.append('child ran')\n\
+                     async def factory():\n\
+                     \x20\x20\x20\x20task = asyncio.create_task(child())\n\
+                     \x20\x20\x20\x20# Don't await it — fire-and-forget.\n\
+                     \x20\x20\x20\x20await asyncio.sleep(0)\n\
+                     \x20\x20\x20\x20return task\n",
+                ))
+            });
+            let task = dispatch(factory).await;
 
-        // Give the driver loop a beat to actually run the orphan task.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+            // Give the driver loop a beat to actually run the orphan task.
+            tokio::time::sleep(Duration::from_millis(100)).await;
 
-        Python::attach(|python| {
-            let task = task.bind(python);
-            assert!(
-                task.call_method0("done")
-                    .unwrap()
-                    .extract::<bool>()
-                    .unwrap(),
-                "child task must run to completion after handler returns"
-            );
+            Python::attach(|python| {
+                let task = task.bind(python);
+                assert!(
+                    task.call_method0("done")
+                        .unwrap()
+                        .extract::<bool>()
+                        .unwrap(),
+                    "child task must run to completion after handler returns"
+                );
+            });
         });
     }
 
@@ -521,111 +593,145 @@ mod tests {
     /// orphan task must reach `await helper._ap_async_op()`, the tokio
     /// future must wake it via `loop.call_soon_threadsafe(set_result, ...)`,
     /// and the task body must finish.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn pool_drives_create_task_through_pyo3_async_future() {
-        ensure_pool();
-        let factory = Python::attach(|python| {
-            Arc::new(build_factory(
-                python,
-                "import asyncio\n\
-                 import _siphon_async_pool_test as helper\n\
-                 async def child():\n\
-                 \x20\x20\x20\x20return await helper._ap_async_op()\n\
-                 async def factory():\n\
-                 \x20\x20\x20\x20task = asyncio.create_task(child())\n\
-                 \x20\x20\x20\x20await asyncio.sleep(0)\n\
-                 \x20\x20\x20\x20return task\n",
-            ))
-        });
-        let task = dispatch(factory).await;
-
-        // Wait for the orphan task to finish on the driver loop.
-        for _ in 0..50 {
-            let done = Python::attach(|python| {
-                task.bind(python)
-                    .call_method0("done")
-                    .unwrap()
-                    .extract::<bool>()
-                    .unwrap()
+    #[test]
+    fn pool_drives_create_task_through_pyo3_async_future() {
+        test_runtime().block_on(async move {
+            ensure_pool();
+            let factory = Python::attach(|python| {
+                Arc::new(build_factory(
+                    python,
+                    "import asyncio\n\
+                     import _siphon_async_pool_test as helper\n\
+                     async def child():\n\
+                     \x20\x20\x20\x20return await helper._ap_async_op()\n\
+                     async def factory():\n\
+                     \x20\x20\x20\x20task = asyncio.create_task(child())\n\
+                     \x20\x20\x20\x20await asyncio.sleep(0)\n\
+                     \x20\x20\x20\x20return task\n",
+                ))
             });
-            if done {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+            let task = dispatch(factory).await;
 
-        Python::attach(|python| {
-            let task = task.bind(python);
-            assert!(
-                task.call_method0("done")
-                    .unwrap()
-                    .extract::<bool>()
-                    .unwrap(),
-                "child task awaiting future_into_py future must complete"
-            );
-            let value: i64 = task.call_method0("result").unwrap().extract().unwrap();
-            assert_eq!(value, 7);
+            // Wait for the orphan task to finish on the driver loop.
+            for _ in 0..50 {
+                let done = Python::attach(|python| {
+                    task.bind(python)
+                        .call_method0("done")
+                        .unwrap()
+                        .extract::<bool>()
+                        .unwrap()
+                });
+                if done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+
+            Python::attach(|python| {
+                let task = task.bind(python);
+                assert!(
+                    task.call_method0("done")
+                        .unwrap()
+                        .extract::<bool>()
+                        .unwrap(),
+                    "child task awaiting future_into_py future must complete"
+                );
+                let value: i64 =
+                    task.call_method0("result").unwrap().extract().unwrap();
+                assert_eq!(value, 7);
+            });
         });
     }
 
     /// Concurrency smoke test — submit many coroutines simultaneously
     /// across the pool's drivers and verify each resolves to its own
     /// distinct value.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn pool_handles_concurrent_submissions() {
-        ensure_pool();
-        let factory = Python::attach(|python| {
-            Arc::new(build_factory(
-                python,
-                "import _siphon_async_pool_test as helper\n\
-                 async def factory():\n\
-                 \x20\x20\x20\x20return await helper._ap_async_op()\n",
-            ))
-        });
+    #[test]
+    fn pool_handles_concurrent_submissions() {
+        test_runtime().block_on(async move {
+            ensure_pool();
+            let factory = Python::attach(|python| {
+                Arc::new(build_factory(
+                    python,
+                    "import _siphon_async_pool_test as helper\n\
+                     async def factory():\n\
+                     \x20\x20\x20\x20return await helper._ap_async_op()\n",
+                ))
+            });
 
-        let success = Arc::new(AtomicUsize::new(0));
-        let mut handles = Vec::new();
-        for _ in 0..40 {
-            let factory = Arc::clone(&factory);
-            let success = Arc::clone(&success);
-            handles.push(tokio::spawn(async move {
-                let value = dispatch(factory).await;
-                let extracted: i64 =
-                    Python::attach(|python| value.bind(python).extract().unwrap());
-                assert_eq!(extracted, 7);
-                success.fetch_add(1, Ordering::Relaxed);
-            }));
-        }
-        for handle in handles {
-            handle.await.unwrap();
-        }
-        assert_eq!(success.load(Ordering::Relaxed), 40);
+            let success = Arc::new(AtomicUsize::new(0));
+            let mut handles = Vec::new();
+            for _ in 0..40 {
+                let factory = Arc::clone(&factory);
+                let success = Arc::clone(&success);
+                handles.push(tokio::spawn(async move {
+                    let value = dispatch(factory).await;
+                    let extracted: i64 =
+                        Python::attach(|python| value.bind(python).extract().unwrap());
+                    assert_eq!(extracted, 7);
+                    success.fetch_add(1, Ordering::Relaxed);
+                }));
+            }
+            for handle in handles {
+                handle.await.unwrap();
+            }
+            assert_eq!(success.load(Ordering::Relaxed), 40);
+        });
+    }
+
+    /// Regression test for the v1f2cbc6 panic: a script coroutine that
+    /// calls back into a Rust API doing
+    /// `tokio::task::block_in_place(|| Handle::current().block_on(...))`
+    /// must work — that is the synchronous shape used by
+    /// `proxy.send_request`, `proxy.subscribe_state.send`,
+    /// `diameter.send_*`, `proxy.relay`, etc.  Driver threads enter the
+    /// bootstrap runtime in `driver_main`; without that, `Handle::current()`
+    /// inside the API call panics with "there is no reactor running".
+    #[test]
+    fn pool_drivers_have_tokio_runtime_context() {
+        test_runtime().block_on(async move {
+            ensure_pool();
+            let factory = Python::attach(|python| {
+                Arc::new(build_factory(
+                    python,
+                    "import _siphon_async_pool_test as helper\n\
+                     async def factory():\n\
+                     \x20\x20\x20\x20return helper._ap_blocking_tokio_call()\n",
+                ))
+            });
+            let value = dispatch(factory).await;
+            let extracted: i64 =
+                Python::attach(|python| value.bind(python).extract().unwrap());
+            assert_eq!(extracted, 42);
+        });
     }
 
     /// Coroutine that raises must surface the exception to the caller.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pool_propagates_python_exception() {
-        ensure_pool();
-        let factory = Python::attach(|python| {
-            Arc::new(build_factory(
-                python,
-                "async def factory():\n\
-                 \x20\x20\x20\x20raise ValueError('boom')\n",
-            ))
-        });
-        let outcome = tokio::task::spawn_blocking(move || {
-            Python::attach(|python| {
-                let coro = factory.bind(python).call0().unwrap();
-                run_coroutine_via_pool(python, &coro)
+    #[test]
+    fn pool_propagates_python_exception() {
+        test_runtime().block_on(async move {
+            ensure_pool();
+            let factory = Python::attach(|python| {
+                Arc::new(build_factory(
+                    python,
+                    "async def factory():\n\
+                     \x20\x20\x20\x20raise ValueError('boom')\n",
+                ))
+            });
+            let outcome = tokio::task::spawn_blocking(move || {
+                Python::attach(|python| {
+                    let coro = factory.bind(python).call0().unwrap();
+                    run_coroutine_via_pool(python, &coro)
+                })
             })
-        })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
-        let error = outcome.expect_err("ValueError must propagate");
-        assert!(
-            error.to_string().contains("boom"),
-            "expected raised exception, got {error}"
-        );
+            let error = outcome.expect_err("ValueError must propagate");
+            assert!(
+                error.to_string().contains("boom"),
+                "expected raised exception, got {error}"
+            );
+        });
     }
 }
