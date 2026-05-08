@@ -305,42 +305,13 @@ impl PySubscribeState {
         // Mint dialog identity on our side.
         let call_id = format!("py-sub-{}", Uuid::new_v4());
         let local_tag = short_uuid();
-        let branch = format!("z9hG4bK-uac-py-{}", Uuid::new_v4());
-        let via = format!("SIP/2.0/{} {};branch={}", transport, target.address, branch);
-        let cseq_value: u32 = 1;
-        let cseq_str = format!("{cseq_value} SUBSCRIBE");
-
-        // From/To URIs:
-        //   From = us (subscriber). We use the R-URI as a stand-in identity
-        //          unless the script overrides via headers={"From": ...}.
-        //   To   = the watched resource (R-URI bareform).
+        let local_contact_addr = uac_sender.addr_for(&transport);
         let local_uri_default = strip_uri_params(ruri);
-        let remote_uri_default = strip_uri_params(ruri);
-        let from_header_default = format!("<{}>;tag={}", local_uri_default, local_tag);
-        let to_header_default = format!("<{}>", remote_uri_default);
 
-        let mut builder = SipMessageBuilder::new()
-            .request(Method::Subscribe, ruri_parsed)
-            .via(via)
-            .call_id(call_id.clone())
-            .cseq(cseq_str)
-            .max_forwards(70)
-            .from(from_header_default.clone())
-            .to(to_header_default)
-            .header("Event", event.to_string())
-            .header("Expires", expires.to_string());
-
-        if let Some(accept_val) = accept {
-            builder = builder.header("Accept", accept_val.to_string());
-        }
-        if let Some(loose_route) = target_uri {
-            builder = builder.header("Route", format!("<{loose_route}>"));
-        }
-
-        // Apply caller-supplied extra headers; allow them to override
-        // the From line if needed (some IMS flows want a specific
-        // P-Preferred-Identity-style URI in From).
-        let mut from_override: Option<String> = None;
+        // Pre-extract the script-supplied header dict into a Vec so the
+        // builder can be assembled inside a non-Python helper that is unit
+        // testable.
+        let mut extra_headers: Vec<(String, String)> = Vec::new();
         if let Some(header_dict) = headers {
             for (key, value) in header_dict.iter() {
                 let name: String = key.extract().map_err(|error| {
@@ -353,23 +324,24 @@ impl PySubscribeState {
                         "header value must be str: {error}"
                     ))
                 })?;
-                if name.eq_ignore_ascii_case("from") {
-                    from_override = Some(val);
-                    continue;
-                }
-                builder = builder.header(&name, val);
+                extra_headers.push((name, val));
             }
         }
-        if let Some(custom_from) = from_override.as_ref() {
-            builder = builder.from(ensure_tag(custom_from, &local_tag));
-        }
-        builder = builder.content_length(0);
 
-        let message = builder.build().map_err(|error| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "failed to build SUBSCRIBE: {error}"
-            ))
-        })?;
+        let (message, cseq_value, from_override) = build_outbound_subscribe(
+            ruri,
+            ruri_parsed,
+            event,
+            expires,
+            accept,
+            target_uri,
+            transport,
+            target.address,
+            local_contact_addr,
+            &call_id,
+            &local_tag,
+            &extra_headers,
+        )?;
 
         let receiver = uac_sender.send_request_with_response(
             message,
@@ -1010,6 +982,157 @@ fn build_in_dialog_subscribe(
     Ok((message, target.address, transport))
 }
 
+/// Build the outbound SUBSCRIBE message originated by
+/// `proxy.subscribe_state.send()`.
+///
+/// Returns the built message, the CSeq value used, and the optional
+/// caller-supplied From override (so the caller can record `local_uri`
+/// from the override rather than the default R-URI).
+///
+/// Pulled out as a free function so it can be unit-tested without a UAC
+/// sender / DNS resolver — the bug that motivated the extraction was the
+/// missing default Contact (RFC 6665 §4.1.2.1) which left notifiers
+/// without a dialog remote target and silently dropped every NOTIFY.
+#[allow(clippy::too_many_arguments)]
+fn build_outbound_subscribe(
+    ruri: &str,
+    ruri_parsed: crate::sip::uri::SipUri,
+    event: &str,
+    expires: u64,
+    accept: Option<&str>,
+    target_uri: Option<&str>,
+    transport: Transport,
+    target_address: std::net::SocketAddr,
+    local_contact_addr: std::net::SocketAddr,
+    call_id: &str,
+    local_tag: &str,
+    extra_headers: &[(String, String)],
+) -> PyResult<(crate::sip::message::SipMessage, u32, Option<String>)> {
+    let branch = format!("z9hG4bK-uac-py-{}", Uuid::new_v4());
+    let via = format!("SIP/2.0/{} {};branch={}", transport, target_address, branch);
+    let cseq_value: u32 = 1;
+    let cseq_str = format!("{cseq_value} SUBSCRIBE");
+
+    // From/To URIs:
+    //   From = us (subscriber). We use the R-URI as a stand-in identity
+    //          unless the script overrides via headers={"From": ...}.
+    //   To   = the watched resource (R-URI bareform).
+    let local_uri_default = strip_uri_params(ruri);
+    let remote_uri_default = strip_uri_params(ruri);
+    let from_header_default = format!("<{}>;tag={}", local_uri_default, local_tag);
+    let to_header_default = format!("<{}>", remote_uri_default);
+
+    // RFC 6665 §4.1.2.1: every SUBSCRIBE MUST contain a Contact.  Without
+    // it, the notifier has no dialog remote target (RFC 3261 §12.1.1) and
+    // any in-dialog NOTIFY it tries to send has nowhere to go.  Derive
+    // the default from siphon's listen address for the chosen transport;
+    // a caller-supplied ``headers={"Contact": ...}`` replaces this below.
+    let contact_default = format_default_contact(local_contact_addr, transport);
+
+    let mut builder = SipMessageBuilder::new()
+        .request(Method::Subscribe, ruri_parsed)
+        .via(via)
+        .call_id(call_id.to_string())
+        .cseq(cseq_str)
+        .max_forwards(70)
+        .from(from_header_default)
+        .to(to_header_default)
+        .header("Contact", contact_default)
+        .header("Event", event.to_string())
+        .header("Expires", expires.to_string());
+
+    if let Some(accept_val) = accept {
+        builder = builder.header("Accept", accept_val.to_string());
+    }
+    if let Some(loose_route) = target_uri {
+        builder = builder.header("Route", format!("<{loose_route}>"));
+    }
+
+    // Apply caller-supplied extra headers.  Single-value headers (RFC 3261
+    // §7.3.1) are *replaced* — without this, a script-supplied Contact
+    // would stack on top of the default we just added, producing a dual-
+    // Contact SUBSCRIBE that strict UAS impls truncate to the first
+    // (auto-generated) value.  Same root cause as the dual-To bug fixed
+    // in b1b2d55 / dual-Call-ID bug fixed in proxy_utils.
+    let mut from_override: Option<String> = None;
+    for (name, val) in extra_headers {
+        if name.eq_ignore_ascii_case("from") {
+            from_override = Some(val.clone());
+            continue;
+        }
+        if is_single_value_header(name) {
+            builder = builder.set_header(name, val.clone());
+        } else {
+            builder = builder.header(name, val.clone());
+        }
+    }
+    if let Some(custom_from) = from_override.as_ref() {
+        // From is single-value (RFC 3261 §7.3.1) — replace the default
+        // we already wrote rather than appending alongside it.
+        builder = builder.set_header("From", ensure_tag(custom_from, local_tag));
+    }
+    builder = builder.content_length(0);
+
+    let message = builder.build().map_err(|error| {
+        pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "failed to build SUBSCRIBE: {error}"
+        ))
+    })?;
+
+    Ok((message, cseq_value, from_override))
+}
+
+/// Format a default Contact URI from a local socket address + transport.
+///
+/// Mirrors the `Via` host-port siphon already emits, with a transport
+/// param appended for non-UDP (UDP is the default per RFC 3261 §19.1.1).
+/// Used so the SUBSCRIBE we originate carries a routable Contact, which
+/// becomes the dialog's remote target for the notifier (RFC 3261 §12.1.1
+/// / RFC 6665 §4.1.2.1).
+fn format_default_contact(addr: std::net::SocketAddr, transport: Transport) -> String {
+    let transport_param = match transport {
+        Transport::Udp => "",
+        Transport::Tcp => ";transport=tcp",
+        Transport::Tls => ";transport=tls",
+        Transport::WebSocket => ";transport=ws",
+        Transport::WebSocketSecure => ";transport=wss",
+        Transport::Sctp => ";transport=sctp",
+    };
+    format!("<sip:{}{}>", addr, transport_param)
+}
+
+/// Return true for SIP headers that must appear at most once per RFC 3261
+/// §7.3.1 — script-supplied values for these headers should *replace* the
+/// builder's default rather than appending alongside it.  Multi-value
+/// headers (Via, Route, Record-Route, P-Associated-URI, P-Asserted-Identity,
+/// etc.) deliberately stay out of this list so callers can append.
+fn is_single_value_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "contact"
+            | "m"
+            | "event"
+            | "o"
+            | "expires"
+            | "accept"
+            | "call-id"
+            | "i"
+            | "cseq"
+            | "max-forwards"
+            | "content-type"
+            | "c"
+            | "content-length"
+            | "l"
+            | "to"
+            | "t"
+            | "subject"
+            | "s"
+            | "user-agent"
+            | "server"
+            | "subscription-state"
+    )
+}
+
 /// Strip parameters (`;param=val`) from a SIP URI string, returning
 /// only the bare `scheme:user@host[:port]` portion. Used to derive a
 /// stable identity URI for the From/To lines on an originated
@@ -1183,5 +1306,294 @@ else:
                 .run(assertions.as_c_str(), Some(&module_globals), Some(&module_globals))
                 .expect("stub surface assertions");
         });
+    }
+
+    fn parse_ruri(ruri: &str) -> crate::sip::uri::SipUri {
+        parse_uri_standalone(ruri).expect("parse ruri")
+    }
+
+    fn target_addr() -> std::net::SocketAddr {
+        "10.0.0.99:5060".parse().unwrap()
+    }
+
+    fn local_addr() -> std::net::SocketAddr {
+        "172.30.0.46:5070".parse().unwrap()
+    }
+
+    fn collect_header<'a>(message: &'a crate::sip::message::SipMessage, name: &str) -> Vec<&'a str> {
+        message
+            .headers
+            .get_all(name)
+            .map(|values| values.iter().map(String::as_str).collect())
+            .unwrap_or_default()
+    }
+
+    /// RFC 6665 §4.1.2.1 regression: every SUBSCRIBE built by
+    /// `subscribe_state.send()` MUST carry exactly one Contact, derived from
+    /// siphon's own listen address. Without it, the notifier has no dialog
+    /// remote target (RFC 3261 §12.1.1) and every NOTIFY is silently dropped.
+    #[test]
+    fn outbound_subscribe_carries_default_contact() {
+        let ruri = "sip:alice@ims.example.org";
+        let (message, _cseq, _from) = build_outbound_subscribe(
+            ruri,
+            parse_ruri(ruri),
+            "reg",
+            7200,
+            Some("application/reginfo+xml"),
+            None,
+            Transport::Udp,
+            target_addr(),
+            local_addr(),
+            "py-sub-test",
+            "local-tag-1",
+            &[],
+        )
+        .expect("build SUBSCRIBE");
+
+        let contacts = collect_header(&message, "Contact");
+        assert_eq!(
+            contacts.len(),
+            1,
+            "default Contact must be present exactly once, got {contacts:?}"
+        );
+        assert_eq!(
+            contacts[0], "<sip:172.30.0.46:5070>",
+            "default Contact must carry siphon's listen address (transport-param omitted for UDP)"
+        );
+
+        // Wire-level sanity: the Contact line is on the wire.
+        let wire = String::from_utf8(message.to_bytes()).unwrap();
+        assert!(
+            wire.contains("Contact: <sip:172.30.0.46:5070>"),
+            "wire output must include the default Contact line:\n{wire}"
+        );
+    }
+
+    /// Non-UDP transports must surface `;transport=<proto>` in the Contact so
+    /// the notifier can route in-dialog NOTIFYs back over the same transport
+    /// (RFC 3261 §19.1.1 — UDP is the default, others must be explicit).
+    #[test]
+    fn outbound_subscribe_contact_has_transport_param_for_tcp() {
+        let ruri = "sip:bob@example.com";
+        let (message, _, _) = build_outbound_subscribe(
+            ruri,
+            parse_ruri(ruri),
+            "presence",
+            3600,
+            None,
+            None,
+            Transport::Tcp,
+            target_addr(),
+            local_addr(),
+            "py-sub-tcp",
+            "local-tag-tcp",
+            &[],
+        )
+        .expect("build SUBSCRIBE");
+
+        let contacts = collect_header(&message, "Contact");
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0], "<sip:172.30.0.46:5070;transport=tcp>");
+    }
+
+    /// Caller-supplied `headers={"Contact": "..."}` MUST replace the default,
+    /// not append.  Two Contacts is a dual-Contact bug — strict UAS impls
+    /// truncate to the first (auto-generated) value, breaking the override.
+    #[test]
+    fn outbound_subscribe_user_contact_replaces_default() {
+        let ruri = "sip:alice@ims.example.org";
+        let extra = vec![(
+            "Contact".to_string(),
+            "<sip:ipsmgw@ipsmgw.example.com:6060>".to_string(),
+        )];
+        let (message, _, _) = build_outbound_subscribe(
+            ruri,
+            parse_ruri(ruri),
+            "reg",
+            3600,
+            None,
+            None,
+            Transport::Udp,
+            target_addr(),
+            local_addr(),
+            "py-sub-override",
+            "local-tag-2",
+            &extra,
+        )
+        .expect("build SUBSCRIBE");
+
+        let contacts = collect_header(&message, "Contact");
+        assert_eq!(
+            contacts.len(),
+            1,
+            "user Contact must replace the default, got {contacts:?}"
+        );
+        assert_eq!(contacts[0], "<sip:ipsmgw@ipsmgw.example.com:6060>");
+
+        // No stale default leaks onto the wire.
+        let wire = String::from_utf8(message.to_bytes()).unwrap();
+        assert!(
+            !wire.contains("172.30.0.46:5070"),
+            "default Contact host:port leaked alongside user override:\n{wire}"
+        );
+    }
+
+    /// The other single-value SUBSCRIBE headers (Event, Expires, Accept) MUST
+    /// also use replace semantics when the script supplies them — otherwise
+    /// the kwarg dict stacks on top of the builder defaults and produces
+    /// duplicates that strict UAS impls reject.
+    #[test]
+    fn outbound_subscribe_user_event_and_expires_replace_default() {
+        let ruri = "sip:alice@ims.example.org";
+        let extra = vec![
+            ("Event".to_string(), "presence".to_string()),
+            ("Expires".to_string(), "1800".to_string()),
+            ("Accept".to_string(), "application/pidf+xml".to_string()),
+        ];
+        let (message, _, _) = build_outbound_subscribe(
+            ruri,
+            parse_ruri(ruri),
+            // Built-in defaults — should be overridden by extra_headers.
+            "reg",
+            7200,
+            Some("application/reginfo+xml"),
+            None,
+            Transport::Udp,
+            target_addr(),
+            local_addr(),
+            "py-sub-event",
+            "local-tag-3",
+            &extra,
+        )
+        .expect("build SUBSCRIBE");
+
+        let events = collect_header(&message, "Event");
+        assert_eq!(events, vec!["presence"], "Event must be replaced");
+        let expires = collect_header(&message, "Expires");
+        assert_eq!(expires, vec!["1800"], "Expires must be replaced");
+        let accepts = collect_header(&message, "Accept");
+        assert_eq!(
+            accepts,
+            vec!["application/pidf+xml"],
+            "Accept must be replaced"
+        );
+    }
+
+    /// Multi-value headers (Route, Record-Route, Via, P-Associated-URI, etc.)
+    /// must NOT be collapsed to set-semantics — the kwarg loop appends them.
+    /// Verified here for `Route`, since IMS scripts often add an additional
+    /// Route alongside the `target_uri=` pre-loaded route.
+    #[test]
+    fn outbound_subscribe_multivalue_headers_append() {
+        let ruri = "sip:alice@ims.example.org";
+        let extra = vec![
+            (
+                "Route".to_string(),
+                "<sip:second-route@bgcf.example.org;lr>".to_string(),
+            ),
+            (
+                "P-Associated-URI".to_string(),
+                "<sip:alice2@ims.example.org>".to_string(),
+            ),
+            (
+                "P-Associated-URI".to_string(),
+                "<tel:+15551234>".to_string(),
+            ),
+        ];
+        let (message, _, _) = build_outbound_subscribe(
+            ruri,
+            parse_ruri(ruri),
+            "reg",
+            3600,
+            None,
+            Some("sip:scscf.example.org;lr"),
+            Transport::Udp,
+            target_addr(),
+            local_addr(),
+            "py-sub-multi",
+            "local-tag-4",
+            &extra,
+        )
+        .expect("build SUBSCRIBE");
+
+        let routes = collect_header(&message, "Route");
+        assert_eq!(
+            routes.len(),
+            2,
+            "Route must be multi-value (target_uri + script-supplied), got {routes:?}"
+        );
+        assert_eq!(routes[0], "<sip:scscf.example.org;lr>");
+        assert_eq!(routes[1], "<sip:second-route@bgcf.example.org;lr>");
+    }
+
+    /// Caller-supplied `From` overrides the R-URI-based default and the
+    /// returned `from_override` reflects it (used by the caller to record
+    /// `local_uri` correctly on the dialog).
+    #[test]
+    fn outbound_subscribe_from_override_returned() {
+        let ruri = "sip:alice@ims.example.org";
+        let extra = vec![(
+            "From".to_string(),
+            "<sip:scscf-0.example.org:6060>".to_string(),
+        )];
+        let (message, _, from_override) = build_outbound_subscribe(
+            ruri,
+            parse_ruri(ruri),
+            "reg",
+            3600,
+            None,
+            None,
+            Transport::Udp,
+            target_addr(),
+            local_addr(),
+            "py-sub-from",
+            "local-tag-5",
+            &extra,
+        )
+        .expect("build SUBSCRIBE");
+
+        assert_eq!(
+            from_override.as_deref(),
+            Some("<sip:scscf-0.example.org:6060>")
+        );
+        let froms = collect_header(&message, "From");
+        assert_eq!(froms.len(), 1, "From must be unique, got {froms:?}");
+        assert!(
+            froms[0].contains(";tag=local-tag-5"),
+            "user From must carry the dialog tag, got {}",
+            froms[0]
+        );
+    }
+
+    /// `format_default_contact` produces the correct shape for every
+    /// supported transport — the transport param is omitted only for UDP.
+    #[test]
+    fn format_default_contact_per_transport() {
+        let addr: std::net::SocketAddr = "192.0.2.10:5070".parse().unwrap();
+        assert_eq!(
+            format_default_contact(addr, Transport::Udp),
+            "<sip:192.0.2.10:5070>"
+        );
+        assert_eq!(
+            format_default_contact(addr, Transport::Tcp),
+            "<sip:192.0.2.10:5070;transport=tcp>"
+        );
+        assert_eq!(
+            format_default_contact(addr, Transport::Tls),
+            "<sip:192.0.2.10:5070;transport=tls>"
+        );
+        assert_eq!(
+            format_default_contact(addr, Transport::WebSocket),
+            "<sip:192.0.2.10:5070;transport=ws>"
+        );
+        assert_eq!(
+            format_default_contact(addr, Transport::WebSocketSecure),
+            "<sip:192.0.2.10:5070;transport=wss>"
+        );
+        assert_eq!(
+            format_default_contact(addr, Transport::Sctp),
+            "<sip:192.0.2.10:5070;transport=sctp>"
+        );
     }
 }

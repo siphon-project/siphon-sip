@@ -125,7 +125,7 @@ impl UacSender {
 
     /// Return the effective address for a given transport, resolving
     /// unspecified (0.0.0.0) addresses via advertised address config.
-    fn addr_for(&self, transport: &Transport) -> SocketAddr {
+    pub fn addr_for(&self, transport: &Transport) -> SocketAddr {
         let addr = self.listen_addrs.get(transport).copied().unwrap_or(self.local_addr);
         resolve_via_addr(addr, transport, &self.advertised_addrs, self.advertised_address.as_deref())
     }
