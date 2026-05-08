@@ -3473,15 +3473,27 @@ fn run_reply_handlers(
         );
     }
 
-    // Extract the (possibly modified) message back
+    // Extract the (possibly modified) message back.  Under the
+    // long-lived asyncio loops in `script::async_pool`, the asyncio
+    // Task object retains the coroutine frame — and therefore the
+    // `Py<PyReply>` argument — until the loop's next garbage-collection
+    // pass.  That keeps `PyReply`'s `Arc::clone` of `message_arc` alive
+    // a moment longer than the dispatcher closure, so `Arc::try_unwrap`
+    // sometimes hits strong_count > 1 here and falls back to a clone.
+    // The clone is correctness-neutral (mutations from the script are
+    // visible through the lock) and bounded (one `SipMessage::clone`
+    // per response with an async on_reply handler), so the fallback
+    // logs at `debug!` rather than `warn!`.
     let extracted = match Arc::try_unwrap(message_arc) {
         Ok(mutex) => mutex.into_inner().unwrap_or_else(|error| {
             warn!("message mutex poisoned in reply handler: {error}");
             error.into_inner()
         }),
         Err(arc) => {
-            // Arc still has extra references — clone from the shared state
-            warn!("PyReply still holds message arc reference, cloning");
+            debug!(
+                "PyReply still holds message arc (async Task frame retains \
+                 Py<PyReply>); cloning"
+            );
             arc.lock().unwrap_or_else(|error| error.into_inner()).clone()
         }
     };
