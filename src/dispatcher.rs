@@ -4732,20 +4732,44 @@ fn spawn_rf_proxy_start_if_invite(
 ) {
     let charger = match state.rf_charger.as_ref() {
         Some(c) if c.auto_emit_proxy() => Arc::clone(c),
-        _ => return,
+        Some(_) => {
+            debug!("rf: proxy ACR-START skipped — auto_emit_proxy disabled");
+            return;
+        }
+        None => {
+            debug!("rf: proxy ACR-START skipped — rf_charger not configured");
+            return;
+        }
     };
     if server_key.method != crate::sip::message::Method::Invite {
+        debug!(
+            method = server_key.method.as_str(),
+            "rf: proxy ACR-START skipped — non-INVITE method"
+        );
         return;
     }
     let dialog_key = match rf_dialog_key(original_request) {
         Some(k) => k,
-        None => return,
+        None => {
+            debug!(
+                "rf: proxy ACR-START skipped — INVITE has no Call-ID + From-tag"
+            );
+            return;
+        }
     };
     if state.rf_sessions.contains_key(&dialog_key) {
         // Already charging this dialog (e.g. forked branches that all
         // went 2xx in quick succession before the first task inserted).
+        debug!(
+            dialog_key = %dialog_key,
+            "rf: proxy ACR-START skipped — dialog already tracked"
+        );
         return;
     }
+    debug!(
+        dialog_key = %dialog_key,
+        "rf: proxy ACR-START spawning"
+    );
     let local_predicate = rf_local_uri_predicate(&state.local_domains);
     let ims_data = crate::diameter::rf_service::ims_data_from_request(
         original_request,
@@ -4946,12 +4970,33 @@ fn spawn_rf_b2bua_start(
 ) {
     let charger = match state.rf_charger.as_ref() {
         Some(c) if c.auto_emit_b2bua() => Arc::clone(c),
-        _ => return,
+        Some(_) => {
+            debug!(
+                call_id = %internal_call_id,
+                "rf: B2BUA ACR-START skipped — auto_emit_b2bua disabled"
+            );
+            return;
+        }
+        None => {
+            debug!(
+                call_id = %internal_call_id,
+                "rf: B2BUA ACR-START skipped — rf_charger not configured"
+            );
+            return;
+        }
     };
     let key = rf_b2bua_key(internal_call_id);
     if state.rf_sessions.contains_key(&key) {
+        debug!(
+            call_id = %internal_call_id,
+            "rf: B2BUA ACR-START skipped — call already tracked"
+        );
         return;
     }
+    debug!(
+        call_id = %internal_call_id,
+        "rf: B2BUA ACR-START spawning"
+    );
     // Snapshot the A-leg INVITE under the script-side mutex so we
     // build a stable IMS-Information block even if a script later
     // mutates the message.
