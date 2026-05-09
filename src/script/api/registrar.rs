@@ -11,7 +11,15 @@ use pyo3::prelude::*;
 use crate::registrar::{Contact, Registrar, RegistrarError, normalize_aor, reginfo};
 use crate::sip::headers::nameaddr::NameAddr;
 use crate::sip::message::SipMessage;
+use super::reply::PyReply;
 use super::request::PyRequest;
+
+/// Grace seconds added to the registrar's granted Expires when caching a
+/// binding on a proxy. Sized to one SIP non-INVITE transaction timeout
+/// (RFC 3261 Timer F = 64·T1 = 32 s) so a NOTIFY[reg-event;state=terminated]
+/// emitted by the registrar of record at expiry has a full retransmission
+/// window to land before the proxy's cached binding evaporates.
+const PROXY_BINDING_GRACE_SECS: u32 = 32;
 
 /// Python-visible contact object returned from `registrar.lookup()`.
 #[pyclass(name = "Contact", skip_from_py_object)]
@@ -211,12 +219,23 @@ impl PyRegistrar {
     /// `registrar.lookup(alias)` calls resolve to the same contacts.
     /// Empty list (the default) is a no-op — call
     /// `registrar.set_associated_uris(aor, [])` to clear an existing set.
-    #[pyo3(signature = (request, force=false, aliases=Vec::new()))]
+    ///
+    /// `flow_token` (optional) tags every contact saved by this call with
+    /// an opaque proxy-side token plus the captured inbound flow
+    /// (source address, listener local address, accepted-connection id).
+    /// On a mobile-terminating request whose topmost Route was inserted
+    /// by this proxy with the same token in its userpart, the script can
+    /// `registrar.lookup_by_token(token)` to resolve back to this binding
+    /// and `request.relay(flow=binding.flow)` to send the request over
+    /// the captured flow without DNS-resolving the Contact URI
+    /// (RFC 3327 §5 / TS 24.229 §5.2.7.2 — Path-token MT routing).
+    #[pyo3(signature = (request, force=false, aliases=Vec::new(), flow_token=None))]
     fn save(
         &self,
         request: &mut PyRequest,
         force: bool,
         aliases: Vec<String>,
+        flow_token: Option<String>,
     ) -> PyResult<bool> {
         let message = request.message();
         let mut message = message.lock().map_err(|error| {
@@ -244,6 +263,19 @@ impl PyRegistrar {
         // Extract source address for NAT traversal (like OpenSIPS received_avp).
         let source_addr = request.source_socket_addr();
         let source_transport = Some(request.transport_name().to_string());
+
+        // Capture the inbound flow when the script asked for token-keyed MT
+        // routing.  Without `flow_token`, the FlowCapture is empty and the
+        // resulting Contact behaves like any pre-feature binding.
+        let flow_capture = if flow_token.is_some() {
+            crate::registrar::FlowCapture {
+                flow_token: flow_token.clone(),
+                inbound_local_addr: request.inbound_local_addr(),
+                inbound_connection_id: request.inbound_connection_id_u64(),
+            }
+        } else {
+            crate::registrar::FlowCapture::default()
+        };
 
         // Extract expires from Expires header or default
         let default_expires = message
@@ -325,6 +357,7 @@ impl PyRegistrar {
                         sip_instance,
                         reg_id,
                         path.clone(),
+                        flow_capture.clone(),
                     )
                     .map_err(|error| match error {
                         RegistrarError::IntervalTooBrief { min_expires } => {
@@ -357,6 +390,189 @@ impl PyRegistrar {
         // Send 200 OK — the dispatcher's build_response() will include
         // the Expires header we just set.
         request.set_reply(200, "OK".to_string());
+
+        Ok(true)
+    }
+
+    /// Cache a binding on a proxy after the upstream registrar accepted it.
+    ///
+    /// Use this on a proxy (e.g. P-CSCF in IMS) that wants a local copy of
+    /// a UE's binding for routing terminating requests, where the actual
+    /// REGISTER was forwarded to a registrar of record (e.g. S-CSCF) and a
+    /// 200 OK has just come back.
+    ///
+    /// Differs from [`save`](Self::save) in three ways:
+    ///
+    /// 1. The contact lifetime is read from the **reply's** `Expires` header
+    ///    (the registrar's grant per RFC 3261 §10.3 step 8), not the
+    ///    request's (the UE's ask). UEs commonly ask for 600000 s and the
+    ///    registrar caps to a sensible value; mirroring the cap locally is
+    ///    incorrect — the proxy must trust the upstream's decision.
+    /// 2. The local `max_expires` cap is **not** applied. The registrar of
+    ///    record has already capped, and a tighter local cap would expire
+    ///    the proxy cache before the upstream binding, opening a window
+    ///    where MT requests would 404 against an entry the registrar still
+    ///    considers live.
+    /// 3. No 200 OK is generated — the proxy will relay the upstream's
+    ///    response itself.
+    ///
+    /// A grace of [`PROXY_BINDING_GRACE_SECS`] (32 s) is added on top so a
+    /// `NOTIFY[reg-event;state=terminated]` from the registrar at expiry
+    /// has a transaction-timer window to land before the proxy forgets.
+    ///
+    /// `aliases` declares the IMS implicit registration set the same way
+    /// `save()` does — see that method's docs.
+    ///
+    /// `flow_token` (optional) tags every cached contact with an opaque
+    /// proxy-side token plus the captured inbound flow — same semantics
+    /// as `save(flow_token=...)`.  Use this from a P-CSCF script that
+    /// proxies REGISTER to an upstream registrar of record (S-CSCF) and
+    /// caches the granted bindings locally for Path-token MT routing.
+    #[pyo3(signature = (request, reply, aliases=Vec::new(), flow_token=None))]
+    fn save_proxy(
+        &self,
+        request: &PyRequest,
+        reply: &PyReply,
+        aliases: Vec<String>,
+        flow_token: Option<String>,
+    ) -> PyResult<bool> {
+        let granted_expires = {
+            let reply_msg = reply.message();
+            let reply_msg = reply_msg.lock().map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+            })?;
+            reply_msg
+                .headers
+                .get("Expires")
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(
+                        "save_proxy: reply has no parseable Expires header — \
+                         the registrar of record must include the granted \
+                         Expires per RFC 3261 §10.3 step 8",
+                    )
+                })?
+        };
+
+        // Wildcard de-REGISTER (`Contact: *` with `Expires: 0`) handled by
+        // the upstream — clear our cache and we're done. No need to walk
+        // contacts.
+        let request_msg = request.message();
+        let request_msg = request_msg.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        let aor = normalize_aor(&extract_aor(&request_msg)?);
+
+        if granted_expires == 0 {
+            self.inner.remove_all(&aor);
+            return Ok(true);
+        }
+
+        let source_addr = request.source_socket_addr();
+        let source_transport = Some(request.transport_name().to_string());
+
+        // Capture the inbound flow for token-keyed MT routing.  Same
+        // semantics as `save(flow_token=...)` — empty FlowCapture when
+        // the script didn't pass a token, so existing callers behave
+        // identically.
+        let flow_capture = if flow_token.is_some() {
+            crate::registrar::FlowCapture {
+                flow_token: flow_token.clone(),
+                inbound_local_addr: request.inbound_local_addr(),
+                inbound_connection_id: request.inbound_connection_id_u64(),
+            }
+        } else {
+            crate::registrar::FlowCapture::default()
+        };
+
+        let cseq_seq = request_msg
+            .headers
+            .cseq()
+            .and_then(|raw| {
+                crate::sip::headers::cseq::CSeq::parse(raw)
+                    .ok()
+                    .map(|cseq| cseq.sequence)
+            })
+            .unwrap_or(1);
+
+        let call_id = request_msg
+            .headers
+            .call_id()
+            .cloned()
+            .unwrap_or_default();
+
+        let path: Vec<String> = request_msg
+            .headers
+            .get_all("Path")
+            .cloned()
+            .unwrap_or_default();
+
+        let contact_values = request_msg
+            .headers
+            .get_all("Contact")
+            .cloned()
+            .unwrap_or_default();
+
+        for raw in &contact_values {
+            let nameaddrs = match NameAddr::parse_multi(raw) {
+                Ok(addrs) => addrs,
+                Err(_) => continue,
+            };
+
+            for nameaddr in nameaddrs {
+                // Per-contact `expires=` param overrides only when *shorter*
+                // than the registrar's grant. UEs sometimes carry a longer
+                // value here than they put in the top-level Expires header;
+                // the registrar's grant is the ceiling.
+                let contact_expires = nameaddr
+                    .expires
+                    .map(|e| std::cmp::min(e, granted_expires))
+                    .unwrap_or(granted_expires)
+                    .saturating_add(PROXY_BINDING_GRACE_SECS);
+                let q = nameaddr.q.unwrap_or(1.0);
+
+                let sip_instance = nameaddr.other_params.iter()
+                    .find(|(name, _)| name == "+sip.instance")
+                    .and_then(|(_, value)| value.clone());
+                let reg_id = nameaddr.other_params.iter()
+                    .find(|(name, _)| name == "reg-id")
+                    .and_then(|(_, value)| value.as_ref()?.parse::<u32>().ok());
+
+                self.inner
+                    .save_full_uncapped(
+                        &aor,
+                        nameaddr.uri,
+                        contact_expires,
+                        q,
+                        call_id.clone(),
+                        cseq_seq,
+                        source_addr,
+                        source_transport.clone(),
+                        sip_instance,
+                        reg_id,
+                        path.clone(),
+                        flow_capture.clone(),
+                    )
+                    .map_err(|error| match error {
+                        RegistrarError::IntervalTooBrief { min_expires } => {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "registrar grant ({granted_expires}s) below local \
+                                 min_expires ({min_expires}s) — registrar of record \
+                                 misconfigured?"
+                            ))
+                        }
+                        RegistrarError::TooManyContacts { max } => {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "too many contacts (max: {max})"
+                            ))
+                        }
+                    })?;
+            }
+        }
+
+        if !aliases.is_empty() {
+            self.inner.set_associated_uris(&aor, aliases);
+        }
 
         Ok(true)
     }
@@ -1049,6 +1265,159 @@ mod tests {
         assert_eq!(
             registrar.associated_uris("sip:tel:+15551234"),
             vec!["tel:+15551234".to_string(), "sip:wildcard@ims.example.com".to_string()],
+        );
+    }
+
+    /// Build a 200 OK reply with a given Expires header to feed `save_proxy`.
+    fn make_reply_with_expires(expires: &str) -> PyReply {
+        let uri = SipUri::new("example.com".to_string());
+        let message = SipMessageBuilder::new()
+            .response(200, "OK".to_string())
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-rep".to_string())
+            .to("<sip:alice@ims.example.com>".to_string())
+            .from("<sip:alice@ims.example.com>;tag=reg-tag".to_string())
+            .call_id("reg-call@host".to_string())
+            .cseq("1 REGISTER".to_string())
+            .header("Contact", "<sip:alice@10.0.0.1:5060>".to_string())
+            .header("Expires", expires.to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        let _ = uri;
+        PyReply::new(Arc::new(Mutex::new(message)))
+    }
+
+    /// `save_proxy` must use the **reply's** granted Expires (3600), not the
+    /// request's UE-asked value (600000). Local `max_expires` (here 7200) is
+    /// not applied either — only the upstream's grant + 32 s grace.
+    #[test]
+    fn save_proxy_uses_reply_expires_not_request() {
+        let registrar = make_registrar();
+        let py_reg = PyRegistrar::new(Arc::clone(&registrar));
+
+        // UE asks for 600000 (7 days). This is what would be in the request.
+        let uri = SipUri::new("ims.example.com".to_string());
+        let message = SipMessageBuilder::new()
+            .request(Method::Register, uri)
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-reg".to_string())
+            .to("<sip:alice@ims.example.com>".to_string())
+            .from("<sip:alice@ims.example.com>;tag=reg-tag".to_string())
+            .call_id("reg-call@host".to_string())
+            .cseq("1 REGISTER".to_string())
+            .header("Contact", "<sip:alice@10.0.0.1:5060>".to_string())
+            .header("Expires", "600000".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        let request = PyRequest::new(
+            Arc::new(Mutex::new(message)),
+            "udp".to_string(),
+            "10.0.0.1".to_string(),
+            5060,
+        );
+
+        // Upstream registrar capped to 3600.
+        let reply = make_reply_with_expires("3600");
+
+        py_reg.save_proxy(&request, &reply, vec![]).unwrap();
+
+        let contacts = py_reg.lookup_str("sip:alice@ims.example.com");
+        assert_eq!(contacts.len(), 1);
+        // 3600 grant + 32s grace = 3632; tolerate 1s drift from Instant::now.
+        let exp = contacts[0].expires();
+        assert!(
+            (3625..=3632).contains(&exp),
+            "expires {exp} should be ~3632 (grant 3600 + grace 32), \
+             not request's 600000 nor capped to local max 7200"
+        );
+    }
+
+    /// `save_proxy` with `Expires: 0` in the reply must clear the binding
+    /// (de-REGISTER path).
+    #[test]
+    fn save_proxy_zero_expires_clears_binding() {
+        let registrar = make_registrar();
+        let py_reg = PyRegistrar::new(Arc::clone(&registrar));
+
+        // Pre-populate.
+        let (mut req1, _) = make_register_request(
+            "<sip:alice@ims.example.com>",
+            "<sip:alice@10.0.0.1:5060>",
+            &registrar,
+        );
+        py_reg.save(&mut req1, false, vec![]).unwrap();
+        assert!(py_reg.is_registered_str("sip:alice@ims.example.com"));
+
+        // De-REGISTER via proxy save.
+        let uri = SipUri::new("ims.example.com".to_string());
+        let dereg = SipMessageBuilder::new()
+            .request(Method::Register, uri)
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-d".to_string())
+            .to("<sip:alice@ims.example.com>".to_string())
+            .from("<sip:alice@ims.example.com>;tag=d".to_string())
+            .call_id("reg-call@host".to_string())
+            .cseq("2 REGISTER".to_string())
+            .header("Contact", "*".to_string())
+            .header("Expires", "0".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        let dereg_req = PyRequest::new(
+            Arc::new(Mutex::new(dereg)),
+            "udp".to_string(),
+            "10.0.0.1".to_string(),
+            5060,
+        );
+        let reply = make_reply_with_expires("0");
+
+        py_reg.save_proxy(&dereg_req, &reply, vec![]).unwrap();
+        assert!(!py_reg.is_registered_str("sip:alice@ims.example.com"));
+    }
+
+    /// Local `max_expires` cap is **not** applied by `save_proxy`. Even if
+    /// the local config is more conservative than the upstream's grant, the
+    /// upstream wins (it's the registrar of record).
+    #[test]
+    fn save_proxy_ignores_local_max_expires_cap() {
+        // Local cap: 600s. Upstream grants 3600s.
+        let registrar = Arc::new(Registrar::new(RegistrarConfig {
+            default_expires: 600,
+            max_expires: 600,
+            min_expires: 60,
+            max_contacts: 10,
+        }));
+        let py_reg = PyRegistrar::new(Arc::clone(&registrar));
+
+        let uri = SipUri::new("ims.example.com".to_string());
+        let message = SipMessageBuilder::new()
+            .request(Method::Register, uri)
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK".to_string())
+            .to("<sip:bob@ims.example.com>".to_string())
+            .from("<sip:bob@ims.example.com>;tag=t".to_string())
+            .call_id("c@h".to_string())
+            .cseq("1 REGISTER".to_string())
+            .header("Contact", "<sip:bob@10.0.0.2:5060>".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        let request = PyRequest::new(
+            Arc::new(Mutex::new(message)),
+            "udp".to_string(),
+            "10.0.0.2".to_string(),
+            5060,
+        );
+        let reply = make_reply_with_expires("3600");
+
+        py_reg.save_proxy(&request, &reply, vec![]).unwrap();
+
+        let contacts = py_reg.lookup_str("sip:bob@ims.example.com");
+        let exp = contacts[0].expires();
+        // Upstream's 3600 + 32s grace; local cap of 600 must NOT have
+        // truncated this.
+        assert!(
+            exp > 3500,
+            "expires {exp} should be ~3632, local max_expires cap of 600 \
+             must not apply on save_proxy"
         );
     }
 }

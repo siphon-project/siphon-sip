@@ -101,6 +101,25 @@ pub struct Contact {
     /// "I (this pod) accepted this binding in a previous life" from
     /// "another instance accepted it."
     pub instance_epoch: Option<String>,
+    /// Opaque proxy-side token that references this binding.  Set by the
+    /// script (typically the P-CSCF) at REGISTER time to enable token-keyed
+    /// MT routing — the token is embedded in the userpart of the Path URI
+    /// the proxy advertises upstream, and `Registrar::lookup_by_token`
+    /// resolves it back to the binding when the request comes back via the
+    /// consumed Route header (RFC 3327 §5 / TS 24.229 §5.2.7.2).
+    pub flow_token: Option<String>,
+    /// The local socket the inbound REGISTER landed on.  Lets the relay
+    /// path egress an MT request from the same listener — load-bearing
+    /// for IPSec sec-agree where `pcscf_port_s` is non-default and the
+    /// Via on the outbound message must reflect that port (3GPP TS 33.203
+    /// §7.4).
+    pub inbound_local_addr: Option<SocketAddr>,
+    /// `ConnectionId.0` of the accepted inbound connection that delivered
+    /// the REGISTER.  Meaningful only on the accepting instance and only
+    /// for the lifetime of the connection (TCP/TLS/WS/WSS); recomputable
+    /// on demand for UDP since UDP `ConnectionId`s are deterministic
+    /// hashes of `(local_addr, remote_addr)`.
+    pub inbound_connection_id: Option<u64>,
 }
 
 impl Contact {
@@ -140,6 +159,20 @@ impl Default for RegistrarConfig {
     }
 }
 
+/// Captured inbound flow + opaque proxy-side token, supplied by the script
+/// at REGISTER time to enable Path-token MT routing.  Stored on the
+/// resulting `Contact`; reconstituted as a `Flow` view on lookup.
+///
+/// All fields default to `None`: callers that don't need flow-aware MT
+/// routing pass `FlowCapture::default()` and the resulting Contact behaves
+/// identically to a pre-feature binding.
+#[derive(Debug, Clone, Default)]
+pub struct FlowCapture {
+    pub flow_token: Option<String>,
+    pub inbound_local_addr: Option<SocketAddr>,
+    pub inbound_connection_id: Option<u64>,
+}
+
 /// Identity of the siphon process that accepts new REGISTERs.
 ///
 /// `id` is stable across restarts of the same logical replica (e.g. the
@@ -171,6 +204,13 @@ pub struct Registrar {
     /// under the primary IMS public identity are reachable via every
     /// IMPU in the implicit registration set (3GPP TS 23.228).
     aliases: DashMap<Aor, Aor>,
+    /// Opaque flow-token → AoR reverse index.  Populated when a binding is
+    /// saved with a `flow_token` (typically by P-CSCF for Path-token MT
+    /// routing per TS 24.229 §5.2.7.2).  Maintained inline by every
+    /// add/remove path that touches `bindings` and rebuilt wholesale by
+    /// `rebuild_token_index` on `restore_from_backend` /
+    /// `evict_connection_oriented`.
+    tokens: DashMap<String, Aor>,
     pub config: RegistrarConfig,
     /// Broadcast channel for registration change events.
     event_sender: broadcast::Sender<RegistrationEvent>,
@@ -201,6 +241,7 @@ impl Registrar {
             asserted_identities: DashMap::new(),
             associated_uris: DashMap::new(),
             aliases: DashMap::new(),
+            tokens: DashMap::new(),
             config,
             event_sender,
             backend_writer: OnceLock::new(),
@@ -402,10 +443,16 @@ impl Registrar {
         source_addr: Option<SocketAddr>,
         source_transport: Option<String>,
     ) -> Result<(), RegistrarError> {
-        self.save_full(aor, uri, expires_secs, q, call_id, cseq, source_addr, source_transport, None, None, vec![])
+        self.save_full(aor, uri, expires_secs, q, call_id, cseq, source_addr, source_transport, None, None, vec![], FlowCapture::default())
     }
 
     /// Core save with all fields including +sip.instance and reg-id.
+    ///
+    /// Applies the local `max_expires` cap. Most callers want this — they're
+    /// the registrar of record and own the policy on how long a binding
+    /// lives. Proxy-side caches that mirror an upstream registrar's grant
+    /// should call [`save_full_uncapped`](Self::save_full_uncapped) instead,
+    /// since the upstream is authoritative on lifetime.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn save_full(
         &self,
@@ -420,12 +467,45 @@ impl Registrar {
         sip_instance: Option<String>,
         reg_id: Option<u32>,
         path: Vec<String>,
+        flow: FlowCapture,
+    ) -> Result<(), RegistrarError> {
+        let capped = std::cmp::min(expires_secs, self.config.max_expires);
+        self.save_full_uncapped(
+            aor, uri, capped, q, call_id, cseq, source_addr, source_transport,
+            sip_instance, reg_id, path, flow,
+        )
+    }
+
+    /// Core save without applying the local `max_expires` cap.
+    ///
+    /// Used by proxy-side `save_proxy` — the upstream registrar of record
+    /// has already capped, and a local cap would shorten the cached binding
+    /// below the upstream's grant, causing MT routing failures inside the
+    /// upstream's still-valid expiry window.
+    ///
+    /// `min_expires` is still enforced (RFC 3261 §10.3 423 Interval Too
+    /// Brief): callers must not save bindings shorter than the configured
+    /// floor regardless of upstream grant.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn save_full_uncapped(
+        &self,
+        aor: &str,
+        uri: SipUri,
+        expires_secs: u32,
+        q: f32,
+        call_id: String,
+        cseq: u32,
+        source_addr: Option<SocketAddr>,
+        source_transport: Option<String>,
+        sip_instance: Option<String>,
+        reg_id: Option<u32>,
+        path: Vec<String>,
+        flow: FlowCapture,
     ) -> Result<(), RegistrarError> {
         // Resolve alias → primary so a REGISTER arriving with a non-primary
         // IMPU still attaches contacts to the implicit set's primary AoR.
         let primary = self.resolve_alias(aor);
         let aor = primary.as_str();
-        let expires_secs = std::cmp::min(expires_secs, self.config.max_expires);
 
         if expires_secs > 0 && expires_secs < self.config.min_expires {
             return Err(RegistrarError::IntervalTooBrief {
@@ -434,6 +514,11 @@ impl Registrar {
         }
 
         let (instance_id, instance_epoch) = self.current_identity_pair();
+        let FlowCapture {
+            flow_token,
+            inbound_local_addr,
+            inbound_connection_id,
+        } = flow;
         let contact = Contact {
             uri: uri.clone(),
             q,
@@ -449,6 +534,9 @@ impl Registrar {
             pending: false,
             instance_id,
             instance_epoch,
+            flow_token: flow_token.clone(),
+            inbound_local_addr,
+            inbound_connection_id,
         };
 
         let uri_string = uri.to_string();
@@ -456,12 +544,36 @@ impl Registrar {
         let mut entry = self.bindings.entry(aor.to_string()).or_default();
         let contacts = entry.value_mut();
 
-        // Remove expired contacts first
-        contacts.retain(|c| !c.is_expired());
+        // Tokens to remove from the reverse index — collected from contacts
+        // we drop in this critical section.  Applied after `drop(entry)` to
+        // keep the index update outside the bindings shard guard, but still
+        // before any await/IO so concurrent readers see a consistent view.
+        let mut tokens_to_remove: Vec<String> = Vec::new();
+
+        // Remove expired contacts; harvest their tokens.
+        contacts.retain(|c| {
+            if c.is_expired() {
+                if let Some(token) = &c.flow_token {
+                    tokens_to_remove.push(token.clone());
+                }
+                false
+            } else {
+                true
+            }
+        });
 
         if expires_secs == 0 {
-            // Expires=0 means deregister this specific contact
-            contacts.retain(|c| c.uri.to_string() != uri_string);
+            // Expires=0 means deregister this specific contact.
+            contacts.retain(|c| {
+                if c.uri.to_string() == uri_string {
+                    if let Some(token) = &c.flow_token {
+                        tokens_to_remove.push(token.clone());
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
             let remaining: Vec<_> = contacts
                 .iter()
                 .map(backend::StoredContact::from_contact)
@@ -472,6 +584,9 @@ impl Registrar {
                 self.bindings.remove(aor);
             } else {
                 drop(entry);
+            }
+            for token in &tokens_to_remove {
+                self.tokens.remove(token);
             }
             self.persist_aor(aor, remaining);
             if aor_empty {
@@ -496,6 +611,11 @@ impl Registrar {
 
         let is_refresh = replace_idx.is_some();
         if let Some(idx) = replace_idx {
+            // Harvest the displaced contact's token so a re-REGISTER with
+            // a fresh token cleanly retires the old entry from the index.
+            if let Some(old_token) = &contacts[idx].flow_token {
+                tokens_to_remove.push(old_token.clone());
+            }
             contacts[idx] = contact;
         } else {
             // Check max_contacts
@@ -517,6 +637,21 @@ impl Registrar {
             .collect();
         let aor_owned = aor.to_string();
         drop(entry);
+
+        // Update the token index: remove harvested tokens first (so a
+        // refresh that reuses the same token isn't accidentally deleted),
+        // then insert the new mapping.
+        for token in &tokens_to_remove {
+            // Don't drop the about-to-be-(re)inserted mapping if the
+            // script reused the same token on the refresh.
+            if Some(token.as_str()) != flow_token.as_deref() {
+                self.tokens.remove(token);
+            }
+        }
+        if let Some(token) = &flow_token {
+            self.tokens.insert(token.clone(), aor_owned.clone());
+        }
+
         self.persist_aor(aor, stored);
         if is_refresh {
             self.emit_event(RegistrationEvent::Refreshed { aor: aor_owned });
@@ -727,7 +862,7 @@ impl Registrar {
         sip_instance: Option<String>,
         reg_id: Option<u32>,
     ) -> Result<(), RegistrarError> {
-        self.save_full(aor, uri, expires_secs, q, call_id, cseq, source_addr, None, sip_instance, reg_id, vec![])
+        self.save_full(aor, uri, expires_secs, q, call_id, cseq, source_addr, None, sip_instance, reg_id, vec![], FlowCapture::default())
     }
 
     /// Generate a public GRUU for a contact with a `+sip.instance`.

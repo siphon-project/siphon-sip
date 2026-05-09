@@ -59,6 +59,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Service-Route (RFC 3608) | **Production** | | Via `registrar.set_service_routes()` / `service_route()` |
 | Registration state change hooks | **Production** | `@registrar.on_change` | Callbacks on insert/delete/expire |
 | Outbound registration (registrant) | **Production** | `registrant:` | UAC REGISTER to upstream trunks |
+| Proxy-side binding cache | Implemented | `registrar.save_proxy(request, reply)` | P-CSCF caches what S-CSCF granted; reads Expires from reply (not request), bypasses local `max_expires` cap, +32 s Timer F grace, no auto-200 OK (proxy relays upstream's response) |
 
 ## Authentication
 
