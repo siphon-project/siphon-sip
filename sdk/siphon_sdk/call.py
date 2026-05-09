@@ -397,6 +397,32 @@ class Call:
         if '@' in old:
             self._from_uri = f"{value}@{old.split('@', 1)[-1]}"
 
+    def set_to_user(self, value: str) -> None:
+        """Set the user part of the To header URI.
+
+        Mirrors :meth:`set_from_user` / :meth:`set_ruri_user` for the To
+        header.  Useful at IMS edges (BGCF inbound) where the B-leg R-URI
+        is rewritten from a public E.164 to a short-code IMPU and
+        downstream nodes expect To to match.
+
+        Preserves scheme/host/port and any existing To-tag — only the
+        userpart changes.  Must be called before :meth:`dial` for the
+        change to take effect on the B-leg INVITE.
+
+        Args:
+            value: New user part (e.g. ``"5112"``).
+
+        Example::
+
+            @b2bua.on_invite
+            async def on_invite(call):
+                call.set_ruri_user("5112")
+                call.set_to_user("5112")
+                call.dial("sip:5112@ims.mnc088.mcc204.3gppnetwork.org")
+        """
+        if self._to_uri is not None:
+            self._to_uri.user = value
+
     # -- Header access ---------------------------------------------------------
 
     def get_header(self, name: str) -> Optional[str]:

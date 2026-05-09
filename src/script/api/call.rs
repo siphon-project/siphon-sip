@@ -641,6 +641,46 @@ impl PyCall {
         Ok(())
     }
 
+    /// Set the user part of the To header URI.
+    ///
+    /// Mirrors [`set_from_user`] / [`set_ruri_user`] for the To header.  Useful at
+    /// IMS edges (BGCF inbound) where the B-leg R-URI gets rewritten from a
+    /// public E.164 to a short-code IMPU and downstream nodes expect To to
+    /// match (RFC 3261 §8.1.1.2 doesn't mandate it, but pickier IMS
+    /// elements treat the asymmetry as malformed).
+    ///
+    /// Only the userpart changes; scheme/host/port/params and any existing
+    /// To-tag are preserved.  Must be called before [`dial`] for the change
+    /// to take effect on the B-leg INVITE — same model as [`set_from_user`].
+    ///
+    /// Usage in Python:
+    ///   call.set_to_user("5112")
+    ///   call.dial("sip:5112@ims.mnc088.mcc204.3gppnetwork.org")
+    fn set_to_user(&self, value: &str) -> PyResult<()> {
+        let mut message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        let to_raw = message.headers.get("To")
+            .or_else(|| message.headers.get("t"))
+            .cloned();
+        if let Some(raw) = to_raw {
+            if let Ok(nameaddr) = crate::sip::headers::nameaddr::NameAddr::parse(&raw) {
+                let mut uri = nameaddr.uri;
+                uri.user = Some(value.to_string());
+                let mut new_to = if let Some(ref display) = nameaddr.display_name {
+                    format!("\"{display}\" <{uri}>")
+                } else {
+                    format!("<{uri}>")
+                };
+                if let Some(ref tag) = nameaddr.tag {
+                    new_to.push_str(&format!(";tag={tag}"));
+                }
+                message.headers.set("To", new_to);
+            }
+        }
+        Ok(())
+    }
+
     /// Copy the A-leg Call-ID to the B-leg instead of generating a new one.
     ///
     /// By default the B2BUA generates a fresh Call-ID for each B-leg to fully
@@ -892,6 +932,30 @@ mod tests {
         let from = msg.headers.get("From").unwrap();
         assert!(from.contains("+33999888777@atlanta.com"), "From should contain new user: {from}");
         assert!(from.contains(";tag=abc"), "From should preserve tag: {from}");
+    }
+
+    #[test]
+    fn call_set_to_user() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string());
+        call.set_to_user("5112").unwrap();
+        let msg = message.lock().unwrap();
+        let to = msg.headers.get("To").unwrap();
+        assert!(to.contains("5112@example.com"), "To should contain new user: {to}");
+        assert!(!to.contains(";tag="), "Initial INVITE To must not gain a tag: {to}");
+    }
+
+    #[test]
+    fn call_set_to_user_preserves_tag() {
+        let mut invite = make_invite();
+        invite.headers.set("To", "<sip:bob@example.com>;tag=remote-tag".to_string());
+        let message = Arc::new(Mutex::new(invite));
+        let call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string());
+        call.set_to_user("5112").unwrap();
+        let msg = message.lock().unwrap();
+        let to = msg.headers.get("To").unwrap();
+        assert!(to.contains("5112@example.com"), "To should contain new user: {to}");
+        assert!(to.contains(";tag=remote-tag"), "To should preserve existing tag: {to}");
     }
 
     #[test]
