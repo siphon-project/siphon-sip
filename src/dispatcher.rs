@@ -2470,6 +2470,22 @@ fn relay_request(
         return;
     }
 
+    // For UDP destinations, ask the IPsec module whether this
+    // destination is on a registered SA pair — if so, the source
+    // (and therefore Via) must reflect the matching P-CSCF port
+    // (e.g. `pcscf_port_c` for an MT INVITE landing on the UE's
+    // `port_us`) rather than the default per-transport via_host /
+    // listener (3GPP TS 33.203 §6.3 / §7.4).  Returns `None` for
+    // non-IPsec deployments and ordinary destinations — zero impact
+    // on the hot path when no IpsecManager is wired.  Computed once
+    // here and reused for both Via construction and the OutboundMessage
+    // built below.
+    let ipsec_source = if outbound_transport == Transport::Udp {
+        crate::script::api::ipsec::outbound_local_addr_for(destination)
+    } else {
+        None
+    };
+
     // Add our Via — use the outbound transport for the Via header.
     // If force_send_via set a target, use it as the Via sent-by address.
     let transport_str = format!("{}", outbound_transport);
@@ -2480,6 +2496,12 @@ fn relay_request(
         // transport via_host would emit a Via with the wrong port and
         // the UE's response would land on the wrong listener
         // (3GPP TS 33.203 §7.4).
+        (local.ip().to_string(), Some(local.port()))
+    } else if let Some(local) = ipsec_source {
+        // IPsec auto-source: same correctness invariant as the flow
+        // path — the UE's response on SA #4 (UE → port_pc) must land
+        // on the Via we advertise, otherwise the kernel selector
+        // doesn't match and the response is silently dropped.
         (local.ip().to_string(), Some(local.port()))
     } else if let Some(target_str) = send_via_target {
         // Parse "host:port" or just "host"
@@ -3862,13 +3884,26 @@ fn send_to_target(
             }
         }
         _ => {
-            // UDP and other transports: use the existing outbound channel
+            // UDP and other transports: use the existing outbound channel.
+            //
+            // IPsec auto-source (3GPP TS 33.203 §6.3): when the
+            // destination matches an installed SA pair, ask the IPsec
+            // module which P-CSCF port to egress from.  Without this,
+            // an MT INVITE to an IPsec-protected UE leaves on the
+            // default listener (typically port 5060), the kernel
+            // selector for SA #3 (src=`port_pc`, dst=`port_us`)
+            // doesn't match, and the packet is silently dropped.
+            // Returns `None` for non-IPsec deployments and ordinary
+            // (non-UE) destinations — i.e. zero impact on the hot
+            // path when no IpsecManager is wired.
+            let source_local_addr =
+                crate::script::api::ipsec::outbound_local_addr_for(destination);
             let outbound_message = OutboundMessage {
                 connection_id: fallback_connection_id,
                 transport,
                 destination,
                 data,
-                source_local_addr: None,
+                source_local_addr,
             };
             if let Err(error) = state.outbound.send(outbound_message) {
                 error!("failed to enqueue relayed request: {error}");

@@ -93,6 +93,70 @@ pub fn pcscf_path_host() -> Option<String> {
     IPSEC_CONFIG_REF.get().and_then(|config| config.path_host.clone())
 }
 
+/// Pick the local egress address that should be used to send a packet
+/// to `destination` over an installed IPsec SA pair, or `None` when
+/// the destination isn't IPsec-protected.
+///
+/// 3GPP TS 33.203 §6.3 installs four SAs per registered UE:
+///
+/// ```text
+///   #1  UE:port_uc   → P-CSCF:port_ps   (UE → P-CSCF requests)
+///   #2  P-CSCF:port_ps → UE:port_uc     (P-CSCF → UE responses)
+///   #3  P-CSCF:port_pc → UE:port_us     (P-CSCF → UE requests, e.g. MT INVITE)
+///   #4  UE:port_us   → P-CSCF:port_pc   (UE → P-CSCF responses to MT)
+/// ```
+///
+/// SA #2 fires automatically because the dispatcher's reply path pins
+/// `source_local_addr = Some(inbound.local_addr)` — that local addr
+/// IS `(pcscf_addr, port_ps)` and the kernel egress XFRM policy
+/// matches.  But there is no equivalent capture for an originated MT
+/// request (the script has no inbound to copy from), so without this
+/// helper the dispatcher defaults to the listen-port-5060 listener
+/// and the kernel selector for SA #3 (src=`port_pc`, dst=`port_us`)
+/// never matches, silently dropping the packet.
+///
+/// Resolution rules, keyed on `destination.port()`:
+///
+/// - `== sa.ue_port_s` → SA #3 outbound, return `(pcscf_addr, pcscf_port_c)`.
+/// - `== sa.ue_port_c` → SA #2 outbound, return `(pcscf_addr, pcscf_port_s)`.
+///
+/// Returns `None` when:
+///
+/// - No IPsec manager is wired (siphon isn't running as P-CSCF).
+/// - The destination IP isn't a registered UE (ordinary outbound).
+/// - The destination port doesn't match either of the UE's registered
+///   ports (defensive — shouldn't happen if the SA was installed).
+///
+/// Walks the active-SA DashMap (O(N) in concurrent UEs).  Cheap at a
+/// few hundred UEs, noticeable at 50k+; revisit when that becomes a
+/// real workload.
+pub fn outbound_local_addr_for(destination: std::net::SocketAddr) -> Option<std::net::SocketAddr> {
+    let manager = IPSEC_MANAGER_REF.get()?;
+    let sa = manager.find_sa_by_ue(&destination.ip(), destination.port())?;
+    outbound_endpoint_for_sa(&sa, destination.port())
+}
+
+/// Pure resolution logic split out so tests can drive it with a
+/// synthetic `SecurityAssociationPair` without touching the global
+/// `IPSEC_MANAGER_REF`.  Encapsulates the TS 33.203 §6.3 SA-pair
+/// directional layout: the destination port tells us which SA's
+/// outbound leg the packet will traverse, which dictates which
+/// P-CSCF source port pairs with it.
+fn outbound_endpoint_for_sa(
+    sa: &SecurityAssociationPair,
+    dst_port: u16,
+) -> Option<std::net::SocketAddr> {
+    if dst_port == sa.ue_port_s {
+        // SA #3 outbound — P-CSCF originating, e.g. MT INVITE.
+        Some(std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_c))
+    } else if dst_port == sa.ue_port_c {
+        // SA #2 outbound — P-CSCF response to UE-originated request.
+        Some(std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_s))
+    } else {
+        None
+    }
+}
+
 /// Find the active SA pair (if any) matching the given UE address and
 /// source port.  The UE may be sending from either its client port
 /// (`ue_port_c`) or its server port (`ue_port_s`); we try both keys
@@ -1559,5 +1623,102 @@ mod tests {
         let handle = PySAHandle::from_sa(&sa);
         assert_eq!(handle.protocol, "tcp");
         assert!(handle.__repr__().contains("protocol=\"tcp\""));
+    }
+
+    fn ipsec_test_sa() -> SecurityAssociationPair {
+        SecurityAssociationPair {
+            ue_addr: "10.0.0.1".parse().unwrap(),
+            pcscf_addr: "10.0.0.10".parse().unwrap(),
+            ue_port_c: 50000,
+            ue_port_s: 50001,
+            pcscf_port_c: 5064,
+            pcscf_port_s: 5066,
+            spi_uc: 1000,
+            spi_us: 1001,
+            spi_pc: 10000,
+            spi_ps: 10001,
+            ealg: EncryptionAlgorithm::Null,
+            aalg: IntegrityAlgorithm::HmacSha1,
+            encryption_key: String::new(),
+            integrity_key: "deadbeefdeadbeefdeadbeefdeadbeef".into(),
+            hard_lifetime_secs: None,
+            protocol: SaProtocol::Udp,
+        }
+    }
+
+    #[test]
+    fn outbound_endpoint_picks_pcscf_port_c_for_mt_request() {
+        // Destination port == ue_port_s: this is an MT INVITE landing
+        // on the UE's server port — the kernel selector for SA #3
+        // requires source port == pcscf_port_c.  Without this, the
+        // packet leaves on listen port 5060, no SA matches, drop.
+        let sa = ipsec_test_sa();
+        let result = outbound_endpoint_for_sa(&sa, sa.ue_port_s);
+        assert_eq!(
+            result,
+            Some(std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_c)),
+            "MT request to ue_port_s must egress from pcscf_port_c (SA #3)"
+        );
+    }
+
+    #[test]
+    fn outbound_endpoint_picks_pcscf_port_s_for_response_to_mo() {
+        // Destination port == ue_port_c: P-CSCF responding to a UE-
+        // originated request — the kernel selector for SA #2 requires
+        // source port == pcscf_port_s (already what
+        // `source_local_addr = Some(inbound.local_addr)` produces on
+        // the reply path; this case fires for fresh proxy-originated
+        // traffic to the same port, e.g. an in-dialog request siphon
+        // emits without an inbound to copy from).
+        let sa = ipsec_test_sa();
+        let result = outbound_endpoint_for_sa(&sa, sa.ue_port_c);
+        assert_eq!(
+            result,
+            Some(std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_s)),
+            "request to ue_port_c must egress from pcscf_port_s (SA #2)"
+        );
+    }
+
+    #[test]
+    fn outbound_endpoint_returns_none_for_unknown_port() {
+        // Destination port matches neither of the UE's registered
+        // ports — defensive case; should never fire if the SA was
+        // installed correctly, but we don't want to silently pick
+        // the wrong source.
+        let sa = ipsec_test_sa();
+        assert!(outbound_endpoint_for_sa(&sa, 9999).is_none());
+    }
+
+    #[test]
+    fn outbound_endpoint_distinguishes_close_ports() {
+        // ue_port_c=50000, ue_port_s=50001 — make sure we're matching
+        // exactly, not by range or off-by-one.
+        let sa = ipsec_test_sa();
+        let from_us = outbound_endpoint_for_sa(&sa, sa.ue_port_s).unwrap();
+        let from_uc = outbound_endpoint_for_sa(&sa, sa.ue_port_c).unwrap();
+        assert_ne!(
+            from_us.port(),
+            from_uc.port(),
+            "SA #3 and SA #2 must not collapse onto the same source port"
+        );
+        assert_eq!(from_us.port(), sa.pcscf_port_c);
+        assert_eq!(from_uc.port(), sa.pcscf_port_s);
+    }
+
+    #[test]
+    fn outbound_local_addr_for_returns_none_without_manager() {
+        // No IpsecManager wired (typical non-P-CSCF deployment) —
+        // helper short-circuits, dispatcher falls back to the default
+        // listener.  Zero-impact on non-P-CSCF hot paths.
+        //
+        // Note: this test is order-dependent on IPSEC_MANAGER_REF
+        // being unset.  If a future test installs the static, this
+        // assertion flips.  Keep this as the only test that pokes
+        // the global accessor.
+        let dst: std::net::SocketAddr = "10.0.0.99:50001".parse().unwrap();
+        // Best-effort: only assert when no manager is present.
+        if IPSEC_MANAGER_REF.get().is_none() {
+            assert!(outbound_local_addr_for(dst).is_none());
+        }
     }
 }
