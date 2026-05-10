@@ -212,22 +212,59 @@ impl ConnectionPool {
         // bind to a specific `(pcscf_addr, pcscf_port_c)` because
         // ESP-over-TCP SA selectors require it; SO_REUSEADDR (set
         // below) lets us survive single-UE TIME_WAIT churn.
+        //
+        // SO_REUSEPORT is also set: the inbound TCP listener on the
+        // protected ports (P-CSCF) is created with SO_REUSEPORT (see
+        // transport/tcp.rs), and Linux requires every socket bound to
+        // the same (addr, port) tuple to have SO_REUSEPORT set
+        // consistently — otherwise our outbound bind to e.g.
+        // (pcscf_addr, pcscf_port_c) collides with the listener and
+        // returns EADDRINUSE.  For ephemeral binds (port 0) the flag
+        // is a no-op since each socket gets its own port.
         let socket = if destination.is_ipv6() {
             tokio::net::TcpSocket::new_v6()?
         } else {
             tokio::net::TcpSocket::new_v4()?
         };
         socket.set_reuseaddr(true)?;
+        socket.set_reuseport(true)?;
         if let Some(tos) = self.tos {
             let sock_ref = socket2::SockRef::from(&socket);
             sock_ref.set_tos_v4(tos)?;
         }
-        socket.bind(bind_addr)?;
-        let stream = socket.connect(destination).await?;
+        socket.bind(bind_addr).map_err(|e| {
+            warn!(
+                bind_addr = %bind_addr,
+                destination = %destination,
+                "pool: TCP bind to requested source failed: {e}"
+            );
+            e
+        })?;
+        let stream = socket.connect(destination).await.map_err(|e| {
+            warn!(
+                bind_addr = %bind_addr,
+                destination = %destination,
+                "pool: TCP connect failed: {e}"
+            );
+            e
+        })?;
         configure_tcp_socket(&stream, self.tos);
 
         let connection_id = next_connection_id();
         let local_addr = stream.local_addr().unwrap_or(self.local_addr);
+        // Diagnostic: emit the actual `(local_addr → destination)` so
+        // ESP-over-TCP issues are debuggable without a tcpdump.  The
+        // kernel egress XFRM selector matches on the FULL 4-tuple, so
+        // a mismatch between `bind_addr` and the resulting `local_addr`
+        // (e.g. silent fallback to ephemeral on REUSE conflict) is the
+        // first thing to check when SA `oseq` stays at 0.
+        debug!(
+            connection_id = ?connection_id,
+            requested_bind = %bind_addr,
+            actual_local = %local_addr,
+            destination = %destination,
+            "pool: opened outbound TCP connection (4-tuple)"
+        );
         let (mut reader, mut writer) = stream.into_split();
 
         // Per-connection write channel
