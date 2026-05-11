@@ -4282,6 +4282,26 @@ fn build_ack_for_non2xx(
 /// Unlike the proxy path, we don't store the B-leg INVITE. Instead we
 /// reconstruct the ACK from the response (which carries the same Call-ID,
 /// From, and CSeq as the original B-leg INVITE) plus the B-leg target URI.
+/// Flatten Record-Route header lines into one URI per entry.
+///
+/// SIP allows multiple URIs per Record-Route header line separated by commas
+/// (RFC 3261 §7.3.1), so a Vec of raw header lines can contain anywhere from
+/// one URI per element to all URIs on a single element. Splitting on commas
+/// preserves wire order; callers reverse only if RFC 3261 §12.1.1 requires it
+/// (UAC route-set = Record-Route from 2xx reversed; UAS route-set = in order).
+fn flatten_record_route_headers(headers: &[String]) -> Vec<String> {
+    let mut routes = Vec::new();
+    for header_line in headers {
+        for entry in header_line.split(',') {
+            let trimmed = entry.trim();
+            if !trimmed.is_empty() {
+                routes.push(trimmed.to_string());
+            }
+        }
+    }
+    routes
+}
+
 /// Sanitize a B2BUA response before forwarding it to the A-leg.
 ///
 /// A proper B2BUA terminates and regenerates the dialog, so B-leg-specific
@@ -7568,32 +7588,16 @@ fn handle_b2bua_response(
         // Persist dialog route sets for in-dialog requests (BYE, re-INVITE).
         // Must happen before we consume the Record-Routes for ACK building.
         {
-            // B-leg route set from B-leg 200 OK Record-Route (reversed per RFC 3261 §12.1.1)
-            let mut b_routes = Vec::new();
-            for rr in b_leg_record_routes.iter().rev() {
-                for entry in rr.split(',') {
-                    let trimmed = entry.trim();
-                    if !trimmed.is_empty() {
-                        b_routes.push(trimmed.to_string());
-                    }
-                }
-            }
+            // B-leg route set from B-leg 200 OK Record-Route, reversed per RFC 3261
+            // §12.1.1. Reversal MUST happen after flattening — multiple URIs sharing one
+            // header line stay in wire order until then.
+            let mut b_routes = flatten_record_route_headers(&b_leg_record_routes);
+            b_routes.reverse();
             // A-leg route set from stored INVITE's Record-Route (in order for UAS)
             let a_routes = a_leg_invite.as_ref()
                 .and_then(|arc| arc.lock().ok())
                 .and_then(|invite| invite.headers.get_all("Record-Route").cloned())
-                .map(|rrs| {
-                    let mut routes = Vec::new();
-                    for rr in &rrs {
-                        for entry in rr.split(',') {
-                            let trimmed = entry.trim();
-                            if !trimmed.is_empty() {
-                                routes.push(trimmed.to_string());
-                            }
-                        }
-                    }
-                    routes
-                })
+                .map(|rrs| flatten_record_route_headers(&rrs))
                 .unwrap_or_default();
 
             if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
@@ -9884,6 +9888,82 @@ mod tests {
             .content_length(0)
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn flatten_record_route_headers_single_line_multi_uri() {
+        // RFC 3261 §7.3.1 allows multiple comma-separated URIs on a single header line.
+        // B2BUA must split them so the route-set has one URI per entry — a precondition
+        // for reversal to produce the RFC §12.1.1 UAC route order.
+        let headers = vec![
+            "<sip:p1.example.com:5060;lr;transport=tcp>, \
+             <sip:p2.example.com:5060;lr;transport=udp>, \
+             <sip:p3.example.com:6060;lr;transport=udp>".to_string(),
+        ];
+        let routes = flatten_record_route_headers(&headers);
+        assert_eq!(routes.len(), 3);
+        assert_eq!(routes[0], "<sip:p1.example.com:5060;lr;transport=tcp>");
+        assert_eq!(routes[1], "<sip:p2.example.com:5060;lr;transport=udp>");
+        assert_eq!(routes[2], "<sip:p3.example.com:6060;lr;transport=udp>");
+    }
+
+    #[test]
+    fn flatten_record_route_headers_multi_line_one_uri_each() {
+        let headers = vec![
+            "<sip:p1.example.com;lr>".to_string(),
+            "<sip:p2.example.com;lr>".to_string(),
+            "<sip:p3.example.com;lr>".to_string(),
+        ];
+        let routes = flatten_record_route_headers(&headers);
+        assert_eq!(routes, vec![
+            "<sip:p1.example.com;lr>".to_string(),
+            "<sip:p2.example.com;lr>".to_string(),
+            "<sip:p3.example.com;lr>".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn flatten_record_route_headers_mixed_lines() {
+        let headers = vec![
+            "<sip:a;lr>, <sip:b;lr>".to_string(),
+            "<sip:c;lr>".to_string(),
+            "<sip:d;lr>, <sip:e;lr>".to_string(),
+        ];
+        let routes = flatten_record_route_headers(&headers);
+        assert_eq!(routes, vec![
+            "<sip:a;lr>".to_string(),
+            "<sip:b;lr>".to_string(),
+            "<sip:c;lr>".to_string(),
+            "<sip:d;lr>".to_string(),
+            "<sip:e;lr>".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn flatten_record_route_headers_then_reverse_matches_rfc_12_1_1() {
+        // The bug: B2BUA was calling .iter().rev() on the Vec<String> before flattening.
+        // For a typical IMS 200 OK where all RR URIs come back on a single header line,
+        // the outer reverse was a no-op and the UAC route-set ended up in wire order
+        // instead of reversed — sending in-dialog BYE through P-CSCF instead of I-CSCF.
+        let single_line = vec![
+            "<sip:pcscf;lr;transport=tcp>, <sip:pcscf;lr;transport=udp>, \
+             <sip:scscf;lr;transport=udp>".to_string(),
+        ];
+        let mut routes = flatten_record_route_headers(&single_line);
+        routes.reverse();
+        assert_eq!(routes[0], "<sip:scscf;lr;transport=udp>");
+        assert_eq!(routes[2], "<sip:pcscf;lr;transport=tcp>");
+    }
+
+    #[test]
+    fn flatten_record_route_headers_ignores_empty_entries() {
+        let headers = vec![
+            "".to_string(),
+            "<sip:a;lr>,".to_string(),
+            ",  ,".to_string(),
+        ];
+        let routes = flatten_record_route_headers(&headers);
+        assert_eq!(routes, vec!["<sip:a;lr>".to_string()]);
     }
 
     #[test]
