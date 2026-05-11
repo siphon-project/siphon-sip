@@ -4282,6 +4282,49 @@ fn build_ack_for_non2xx(
 /// Unlike the proxy path, we don't store the B-leg INVITE. Instead we
 /// reconstruct the ACK from the response (which carries the same Call-ID,
 /// From, and CSeq as the original B-leg INVITE) plus the B-leg target URI.
+/// Extract the bare URI string from the first entry of a dialog route set.
+///
+/// Route entries are stored in wire form (e.g. `<sip:p.example.com;lr>`); this
+/// strips angle brackets and any header-level params and returns
+/// `sip:p.example.com;lr` ready to feed to `resolve_target`. Returns `None`
+/// if the route set is empty or the first entry cannot be parsed.
+fn first_route_uri(route_set: &[String]) -> Option<String> {
+    let first = route_set.first()?;
+    crate::sip::headers::route::RouteEntry::parse(first)
+        .ok()
+        .map(|entry| entry.uri.to_string())
+}
+
+/// Resolve the destination for an in-dialog request per RFC 3261 §12.2.1.1
+/// and §16.12. When `route_set` is non-empty, the first Route URI is the next
+/// hop (after DNS resolution per RFC 3263) — NOT the Request-URI and NOT the
+/// cached destination of the original INVITE. Falls back to the cached
+/// `(addr, transport)` only when the route set is empty or resolution fails.
+///
+/// This matters whenever Record-Route adds intermediaries on the response path
+/// that aren't the original next-hop — for IMS calls the 200 OK comes back
+/// through I-CSCF (which doesn't Record-Route per TS 24.229 §5.3.2), so the
+/// cached INVITE destination is I-CSCF while the route-set first hop is
+/// S-CSCF. Sending in-dialog requests to the cached destination produces 404
+/// from the wrong node.
+fn resolve_in_dialog_destination(
+    route_set: &[String],
+    state: &DispatcherState,
+    fallback_addr: SocketAddr,
+    fallback_transport: Transport,
+) -> (SocketAddr, Transport) {
+    if let Some(uri_str) = first_route_uri(route_set) {
+        if let Some(target) = resolve_target(&uri_str, &state.dns_resolver) {
+            return (target.address, target.transport.unwrap_or(fallback_transport));
+        }
+        warn!(
+            route = %route_set[0],
+            "B2BUA: failed to resolve in-dialog Route — falling back to cached destination",
+        );
+    }
+    (fallback_addr, fallback_transport)
+}
+
 /// Flatten Record-Route header lines into one URI per entry.
 ///
 /// SIP allows multiple URIs per Record-Route header line separated by commas
@@ -6756,12 +6799,29 @@ fn handle_b2bua_response(
                 });
                 if let Some(prack) = prack {
                     if let Some((dest, transport)) = b_leg_dest {
+                        // PRACK follows the early-dialog route set (RFC 3262 §4
+                        // + RFC 3261 §12.2.1.1). At reliable-1xx time the
+                        // confirmed-dialog route set (set on 200 OK) is
+                        // typically still empty; resolve_in_dialog_destination
+                        // falls back to the cached destination in that case.
+                        let leg_route_set = state.call_actors.get_call(call_id)
+                            .and_then(|call| {
+                                call.b_legs.get(idx).map(|leg| leg.dialog.route_set.clone())
+                            })
+                            .unwrap_or_default();
+                        let (destination, prack_transport) = resolve_in_dialog_destination(
+                            &leg_route_set,
+                            state,
+                            dest,
+                            transport,
+                        );
                         debug!(
                             call_id = %call_id,
                             rseq = rseq.response_number,
+                            %destination,
                             "B2BUA: sending auto-PRACK for reliable 1xx from B-leg"
                         );
-                        send_b2bua_to_bleg(prack, transport, dest, state);
+                        send_b2bua_to_bleg(prack, prack_transport, destination, state);
                     }
                 }
             }
@@ -7645,16 +7705,9 @@ fn handle_b2bua_response(
                 let to = message.headers.to().cloned().unwrap_or_default();
 
                 // Build B-leg Route set from Record-Route (reversed per RFC 3261 §12.2.1.1).
-                let mut b_leg_routes: Vec<String> = Vec::new();
-                for rr_value in b_leg_record_routes.iter().rev() {
-                    // Each Record-Route value can contain multiple comma-separated entries
-                    for entry in rr_value.split(',') {
-                        let trimmed = entry.trim();
-                        if !trimmed.is_empty() {
-                            b_leg_routes.push(trimmed.to_string());
-                        }
-                    }
-                }
+                // Flatten BEFORE reversing — see flatten_record_route_headers comment.
+                let mut b_leg_routes = flatten_record_route_headers(&b_leg_record_routes);
+                b_leg_routes.reverse();
 
                 let mut ack_builder = SipMessageBuilder::new()
                     .request(Method::Ack, ack_uri)
@@ -7680,11 +7733,20 @@ fn handle_b2bua_response(
                     .content_length(0)
                     .build()
                 {
-                    // Store the pre-built ACK (route sets already persisted above).
+                    // ACK to 2xx is end-to-end and follows the dialog route set
+                    // (RFC 3261 §13.2.2.4). Use the first Route URI as next hop
+                    // rather than the cached B-leg destination, which may be an
+                    // upstream that doesn't Record-Route (e.g. IMS I-CSCF).
+                    let (ack_dest, ack_transport) = resolve_in_dialog_destination(
+                        &b_leg_routes,
+                        state,
+                        b_dest,
+                        b_transport,
+                    );
                     if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-                        call.pending_b_leg_ack = Some((ack, b_transport, b_dest));
+                        call.pending_b_leg_ack = Some((ack, ack_transport, ack_dest));
                     }
-                    debug!(call_id = %call_id, "B2BUA: deferred B-leg ACK until A-leg ACKs");
+                    debug!(call_id = %call_id, destination = %ack_dest, "B2BUA: deferred B-leg ACK until A-leg ACKs");
                 }
             }
         }
@@ -8419,8 +8481,18 @@ fn handle_b2bua_bye(
         if let Some(winner_index) = call.winner {
             if let Some(b_leg) = call.b_legs.get(winner_index) {
                 if let Some(bye) = build_b2bua_bye(b_leg, state) {
-                    debug!(call_id = %call_id, destination = %b_leg.transport.remote_addr, "B2BUA: sending BYE to B-leg");
-                    send_b2bua_to_bleg(bye, b_leg.transport.transport, b_leg.transport.remote_addr, state);
+                    // RFC 3261 §12.2.1.1: next hop is the first Route URI, not
+                    // the cached destination of the original INVITE (which may
+                    // have traversed nodes — e.g. an IMS I-CSCF — that don't
+                    // Record-Route and so aren't in the dialog route set).
+                    let (destination, transport) = resolve_in_dialog_destination(
+                        &b_leg.dialog.route_set,
+                        state,
+                        b_leg.transport.remote_addr,
+                        b_leg.transport.transport,
+                    );
+                    debug!(call_id = %call_id, %destination, "B2BUA: sending BYE to B-leg");
+                    send_b2bua_to_bleg(bye, transport, destination, state);
                 } else {
                     warn!(call_id = %call_id, "B2BUA: failed to build B-leg BYE");
                 }
@@ -8433,10 +8505,16 @@ fn handle_b2bua_bye(
     } else {
         // BYE from B → generate new A-leg BYE from stored dialog state.
         if let Some(bye) = build_b2bua_bye(&call.a_leg, state) {
+            let (destination, transport) = resolve_in_dialog_destination(
+                &call.a_leg.dialog.route_set,
+                state,
+                call.a_leg.transport.remote_addr,
+                call.a_leg.transport.transport,
+            );
             send_message(
                 bye,
-                call.a_leg.transport.transport,
-                call.a_leg.transport.remote_addr,
+                transport,
+                destination,
                 call.a_leg.transport.connection_id,
                 state,
             );
@@ -8679,12 +8757,27 @@ fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
     };
 
     // Build BYE for each leg using the shared build_b2bua_bye helper.
+    // Destination derived from the dialog route set (RFC 3261 §12.2.1.1) — see
+    // resolve_in_dialog_destination for why the cached transport.remote_addr
+    // is wrong for routes that don't match the original INVITE next-hop.
     if let Some(bye_msg) = build_b2bua_bye(&a_leg, state) {
-        send_message(bye_msg, a_leg.transport.transport, a_leg.transport.remote_addr, a_leg.transport.connection_id, state);
+        let (destination, transport) = resolve_in_dialog_destination(
+            &a_leg.dialog.route_set,
+            state,
+            a_leg.transport.remote_addr,
+            a_leg.transport.transport,
+        );
+        send_message(bye_msg, transport, destination, a_leg.transport.connection_id, state);
     }
     if let Some(b_leg) = &winner_b_leg {
         if let Some(bye_msg) = build_b2bua_bye(b_leg, state) {
-            send_b2bua_to_bleg(bye_msg, b_leg.transport.transport, b_leg.transport.remote_addr, state);
+            let (destination, transport) = resolve_in_dialog_destination(
+                &b_leg.dialog.route_set,
+                state,
+                b_leg.transport.remote_addr,
+                b_leg.transport.transport,
+            );
+            send_b2bua_to_bleg(bye_msg, transport, destination, state);
         }
     }
 
@@ -9888,6 +9981,42 @@ mod tests {
             .content_length(0)
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn first_route_uri_strips_angle_brackets() {
+        let route_set = vec![
+            "<sip:scscf.example.com:6060;lr;transport=udp>".to_string(),
+            "<sip:pcscf.example.com:5060;lr;transport=tcp>".to_string(),
+        ];
+        let uri = first_route_uri(&route_set);
+        assert_eq!(uri.as_deref(), Some("sip:scscf.example.com:6060;lr;transport=udp"));
+    }
+
+    #[test]
+    fn first_route_uri_empty_route_set() {
+        assert!(first_route_uri(&[]).is_none());
+    }
+
+    #[test]
+    fn first_route_uri_malformed_entry() {
+        // Missing angle brackets — RouteEntry::parse returns Err, so we get None
+        // and the caller falls back to the cached destination.
+        let route_set = vec!["sip:bad.example.com".to_string()];
+        assert!(first_route_uri(&route_set).is_none());
+    }
+
+    #[test]
+    fn first_route_uri_picks_first_only() {
+        // Each route_set entry is one URI (flatten_record_route_headers
+        // guarantees that). first_route_uri must NOT split commas inside the
+        // first entry — that's the previous layer's responsibility.
+        let route_set = vec![
+            "<sip:first.example.com;lr>".to_string(),
+            "<sip:second.example.com;lr>".to_string(),
+        ];
+        let uri = first_route_uri(&route_set);
+        assert_eq!(uri.as_deref(), Some("sip:first.example.com;lr"));
     }
 
     #[test]
