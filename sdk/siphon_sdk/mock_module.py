@@ -4658,28 +4658,49 @@ class MockIpsec:
     async def allocate(self, av: MockAuthVectorHandle, offer: MockSecurityOffer,
                        transform: MockTransform,
                        expires_secs: Optional[int] = None,
-                       protocol: str = "udp") -> MockPendingSA:
+                       protocol: Optional[str] = None) -> MockPendingSA:
         if not transform.compatible_with(offer):
             raise ValueError(
                 f"transform {transform!r} not compatible with offer alg={offer.alg!r}"
                 f" ealg={offer.ealg!r}"
             )
         # Same validation as the Rust binding so scripts fail identically
-        # in unit tests.  ESP-over-UDP is the default; ESP-over-TCP is
-        # required for UEs that did the initial REGISTER over TCP
-        # (3GPP TS 33.203 §7.2).
-        proto_lower = protocol.lower()
-        if proto_lower not in ("udp", "tcp"):
-            raise ValueError(
-                f"protocol must be 'udp' or 'tcp', got {protocol!r}"
-            )
+        # in unit tests.
+        #
+        # ``protocol=None`` (default) installs an XFRM selector covering
+        # both ESP-over-UDP and ESP-over-TCP under one SPI pair —
+        # required by 3GPP TS 33.203 §7.2 ("the SAs shall be used to
+        # protect *all* SIP signalling … including over UDP and TCP").
+        # The wire-form ``protocol`` on the resulting
+        # :class:`SecurityServerParams` collapses to ``"udp"`` because
+        # RFC 3329 §2.2 says an absent ``protocol=`` parameter implies
+        # UDP — keeps the wire shape every existing UE expects.
+        #
+        # Explicit ``"udp"``/``"tcp"``/``"any"`` pin the selector to
+        # that one inner protocol (single-transport deployments, tests).
+        if protocol is None:
+            sa_protocol = "any"
+            wire_protocol = "udp"
+        else:
+            proto_lower = protocol.lower()
+            if proto_lower not in ("udp", "tcp", "any"):
+                raise ValueError(
+                    f"protocol must be 'udp', 'tcp', 'any', or None, got {protocol!r}"
+                )
+            sa_protocol = proto_lower
+            wire_protocol = "udp" if proto_lower == "any" else proto_lower
         av._take()  # raises ValueError if already consumed
         if self._allocate_should_fail is not None:
             raise self._allocate_should_fail(self._allocate_failure_message)
-        return MockPendingSA(
+        pending = MockPendingSA(
             transform, offer, self.pcscf_port_c, self.pcscf_port_s,
-            expires_secs=expires_secs, protocol=proto_lower,
+            expires_secs=expires_secs, protocol=wire_protocol,
         )
+        # Surface the *internal* SA selector mode for tests that want
+        # to assert multi-protocol installation specifically.  Not on
+        # the Rust binding (use SAHandle.protocol for that).
+        pending.sa_protocol = sa_protocol  # type: ignore[attr-defined]
+        return pending
 
     def stash(self, call_id: str, pending: MockPendingSA) -> None:
         self._stash[call_id] = pending

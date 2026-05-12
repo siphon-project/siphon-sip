@@ -2489,7 +2489,7 @@ fn relay_request(
     let ipsec_source = match outbound_transport {
         Transport::Udp | Transport::Tcp => {
             if let Some((source, sa_transport)) =
-                crate::script::api::ipsec::outbound_for(destination)
+                crate::script::api::ipsec::outbound_for(destination, outbound_transport)
             {
                 if sa_transport != outbound_transport {
                     debug!(
@@ -4355,7 +4355,7 @@ fn resolve_in_dialog_destination(
     // wired.
     if matches!(transport, Transport::Udp | Transport::Tcp) {
         if let Some((_, sa_transport)) =
-            crate::script::api::ipsec::outbound_for(destination)
+            crate::script::api::ipsec::outbound_for(destination, transport)
         {
             if sa_transport != transport {
                 debug!(

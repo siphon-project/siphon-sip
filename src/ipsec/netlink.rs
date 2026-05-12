@@ -928,6 +928,55 @@ mod tests {
         assert_eq!(out[SELECTOR_PROTO_OFFSET], 6);
     }
 
+    /// `SaProtocol::Any` (the spec-compliant default per TS 33.203 §7.2)
+    /// must surface as selector_proto=0 in both `xfrm_usersa_info` and
+    /// `xfrm_userpolicy_info`.  The Linux kernel short-circuits the
+    /// proto check when `sel->proto == 0` (see
+    /// `__xfrm{4,6}_selector_match`), so the SA covers both TCP and UDP
+    /// inner flows under one SPI pair without doubling kernel state.
+    /// Port matching still applies because `sport_mask`/`dport_mask`
+    /// remain 0xFFFF — only the proto byte goes wide.
+    #[test]
+    fn usersa_info_carries_any_selector_proto_for_dual_transport() {
+        let mut out = Vec::new();
+        encode_xfrm_usersa_info(
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            50000,
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            5066,
+            0x1000,
+            0, // SaProtocol::Any.as_u8()
+            None,
+            &mut out,
+        );
+        assert_eq!(
+            out[SELECTOR_PROTO_OFFSET], 0,
+            "selector_proto must be 0 to match any inner protocol (TS 33.203 §7.2)"
+        );
+        // Ports remain pinned — the SA still discriminates UE↔P-CSCF
+        // flows by (port_uc, port_ps) vs (port_us, port_pc) even with
+        // proto=0.  dport sits at selector offset 32 (BE u16).
+        assert_eq!(u16::from_be_bytes([out[32], out[33]]), 5066);
+    }
+
+    #[test]
+    fn userpolicy_info_carries_any_selector_proto_for_dual_transport() {
+        let mut out = Vec::new();
+        encode_xfrm_userpolicy_info(
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            50000,
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            5066,
+            XFRM_POLICY_OUT,
+            0, // SaProtocol::Any.as_u8()
+            &mut out,
+        );
+        assert_eq!(
+            out[SELECTOR_PROTO_OFFSET], 0,
+            "policy selector_proto must be 0 to bind both UDP and TCP flows"
+        );
+    }
+
     /// Compile-time cross-check — mirror the kernel C ABI structs as
     /// `#[repr(C)]` in Rust so the compiler computes the same layout
     /// the kernel does, then assert sizes match what the encoders emit.

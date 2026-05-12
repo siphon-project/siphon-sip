@@ -131,7 +131,9 @@ pub fn pcscf_path_host() -> Option<String> {
 /// few hundred UEs, noticeable at 50k+; revisit when that becomes a
 /// real workload.
 pub fn outbound_local_addr_for(destination: std::net::SocketAddr) -> Option<std::net::SocketAddr> {
-    outbound_for(destination).map(|(source, _)| source)
+    let manager = IPSEC_MANAGER_REF.get()?;
+    let sa = manager.find_sa_by_ue(&destination.ip(), destination.port())?;
+    outbound_endpoint_for_sa(&sa, destination.port())
 }
 
 /// Outbound source + pinned transport for an IPsec-protected destination.
@@ -151,14 +153,21 @@ pub fn outbound_local_addr_for(destination: std::net::SocketAddr) -> Option<std:
 /// the dialog route set/Contact and that stamp is absent on many UE
 /// implementations.
 ///
+/// `current_transport` is the transport the dispatcher would otherwise
+/// use (URI hint / inbound transport / default).  When the SA covers
+/// both transports (`SaProtocol::Any` — the spec-compliant default per
+/// TS 33.203 §7.2), the caller's choice is preserved verbatim; only
+/// when the SA is single-transport-pinned does this function override.
+///
 /// Returns `None` under the same conditions as `outbound_local_addr_for`
 /// (no manager wired, destination not a registered UE, port mismatch).
 pub fn outbound_for(
     destination: std::net::SocketAddr,
+    current_transport: crate::transport::Transport,
 ) -> Option<(std::net::SocketAddr, crate::transport::Transport)> {
     let manager = IPSEC_MANAGER_REF.get()?;
     let sa = manager.find_sa_by_ue(&destination.ip(), destination.port())?;
-    outbound_for_sa(&sa, destination.port())
+    outbound_for_sa(&sa, destination.port(), current_transport)
 }
 
 /// Pure resolution logic split out so tests can drive it with a
@@ -185,14 +194,26 @@ fn outbound_endpoint_for_sa(
 /// Combined (source, transport) resolution from an SA pair.  Pure
 /// function so tests can drive both axes (port-direction + protocol)
 /// without standing up a real IpsecManager.
+///
+/// `current_transport` is the transport the dispatcher would otherwise
+/// use; it's returned verbatim when the SA covers both transports
+/// (`SaProtocol::Any` — spec default per TS 33.203 §7.2).  For
+/// single-transport pins the SA's protocol wins, since a UDP-over-TCP
+/// or TCP-over-UDP mismatch silently drops the frame at the kernel
+/// XFRM selector.
 fn outbound_for_sa(
     sa: &SecurityAssociationPair,
     dst_port: u16,
+    current_transport: crate::transport::Transport,
 ) -> Option<(std::net::SocketAddr, crate::transport::Transport)> {
     let source = outbound_endpoint_for_sa(sa, dst_port)?;
     let transport = match sa.protocol {
         SaProtocol::Udp => crate::transport::Transport::Udp,
         SaProtocol::Tcp => crate::transport::Transport::Tcp,
+        // SA covers both transports — preserve whatever the caller
+        // already picked.  The kernel will encrypt either way under
+        // the same SPI pair.
+        SaProtocol::Any => current_transport,
     };
     Some((source, transport))
 }
@@ -569,11 +590,20 @@ pub struct PySecurityServerParams {
     /// P-CSCF protected server port.
     #[pyo3(get)]
     pub port_s: u16,
-    /// Lower-case transport carrying ESP — ``"udp"`` or ``"tcp"``.
-    /// Mirrors the value passed to :func:`siphon.ipsec.allocate`.  When
-    /// non-default (``"tcp"``), append ``protocol=tcp`` to the
-    /// ``Security-Server`` header per RFC 3329 §2.2; UDP stays
-    /// parameterless to match the wire format every existing UE expects.
+    /// Wire-form transport for the RFC 3329 ``Security-Server``
+    /// ``protocol=`` parameter — either ``"udp"`` or ``"tcp"``.  The
+    /// caller appends ``protocol=tcp`` to the header only when this
+    /// field is ``"tcp"``; ``"udp"`` is the RFC 3329 §2.2 default and
+    /// should be omitted from the wire format every existing UE
+    /// expects.
+    ///
+    /// Note: when :func:`siphon.ipsec.allocate` was called with the
+    /// multi-protocol default (no ``protocol`` kwarg), this field
+    /// reads ``"udp"`` — wire-compatible with the spec default — even
+    /// though the underlying SA pair covers both UDP and TCP.  For
+    /// diagnostics of the actual SA selector mode, inspect
+    /// :attr:`SAHandle.protocol`, which surfaces ``"any"`` in that
+    /// case.
     #[pyo3(get)]
     pub protocol: String,
 }
@@ -882,6 +912,40 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// Parse the ``protocol`` kwarg from :meth:`PyIpsec.allocate`.
+///
+/// `None` → :data:`SaProtocol::Any`, the spec-compliant default per
+/// 3GPP TS 33.203 §7.2 — same SPI pair covers both UDP and TCP inner
+/// flows.  Explicit ``"udp"`` / ``"tcp"`` / ``"any"`` (case-insensitive)
+/// pin the selectors to that one inner protocol.  Anything else is an
+/// error message the caller surfaces as a Python ``ValueError``.
+fn parse_allocate_protocol(value: Option<&str>) -> Result<SaProtocol, String> {
+    match value {
+        None => Ok(SaProtocol::Any),
+        Some(raw) => match raw.to_ascii_lowercase().as_str() {
+            "udp" => Ok(SaProtocol::Udp),
+            "tcp" => Ok(SaProtocol::Tcp),
+            "any" => Ok(SaProtocol::Any),
+            other => Err(format!(
+                "protocol must be 'udp', 'tcp', 'any', or None, got {other:?}"
+            )),
+        },
+    }
+}
+
+/// Map an internal :data:`SaProtocol` to the wire-form value the
+/// script appends to the RFC 3329 ``Security-Server`` ``protocol=``
+/// parameter.  `Any` collapses to ``"udp"`` because RFC 3329 §2.2
+/// declares an absent ``protocol=`` parameter to imply UDP — keeping
+/// the wire output identical to the pre-multi-protocol shape every
+/// existing UE expects, while the underlying SA covers both transports.
+fn format_params_protocol(sa_protocol: SaProtocol) -> String {
+    match sa_protocol {
+        SaProtocol::Udp | SaProtocol::Any => "udp".to_string(),
+        SaProtocol::Tcp => "tcp".to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PyIpsec — the singleton injected as ``siphon.ipsec``.
 // ---------------------------------------------------------------------------
@@ -959,20 +1023,31 @@ impl PyIpsec {
     /// the script must allocate fresh SAs on re-REGISTER.  Default is
     /// ``None`` (no kernel-enforced expiry).
     ///
-    /// ``protocol`` selects the upper-layer transport carrying ESP —
-    /// ``"udp"`` (default, ESP-over-UDP, the common IMS deployment) or
-    /// ``"tcp"`` (ESP-over-TCP, TS 33.203 §7.2 — required for UEs that
-    /// performed initial REGISTER over TCP).  The XFRM selectors are
-    /// pinned to this protocol; a mismatch with the UE's actual transport
-    /// silently drops every protected frame.  Pass ``request.transport``
-    /// when negotiating against the originating REGISTER.
+    /// ``protocol`` selects the upper-layer transport(s) the XFRM
+    /// selectors will match against.  The default (``None``) is
+    /// **multi-protocol** — the kernel selector stamps ``proto=0``
+    /// ("any"), so the same SPI pair covers *both* ESP-over-UDP and
+    /// ESP-over-TCP under a single :class:`AuthVectorHandle`
+    /// consumption.  This is the spec-compliant behaviour required by
+    /// 3GPP TS 33.203 §7.2 ("the SAs shall be used to protect *all*
+    /// SIP signalling … including over UDP and TCP") and the only
+    /// shape that works for handsets that mix transports — iOS
+    /// REGISTERs over TCP but sends MO MESSAGE over UDP, and a
+    /// single-transport pin would silently drop the MESSAGE on
+    /// ``XfrmInStateMismatch``.
+    ///
+    /// Explicit ``"udp"`` or ``"tcp"`` pins the selectors to that one
+    /// inner protocol (kept for tests, single-transport deployments,
+    /// and parity with the pre-multi-protocol API).  Pinning to one
+    /// transport while the UE uses the other silently drops every
+    /// protected frame because the kernel selector won't bind.
     ///
     /// Raises :class:`ValueError` when ``av`` was already consumed, when
     /// the chosen ``transform`` is not compatible with ``offer``, when
     /// ``offer.ue_addr`` is not a valid IP literal, or when ``protocol``
-    /// is neither ``"udp"`` nor ``"tcp"``.
+    /// is set to anything other than ``"udp"``, ``"tcp"``, or ``"any"``.
     /// Raises :class:`RuntimeError` on kernel/SPI failures.
-    #[pyo3(signature = (av, offer, transform, expires_secs=None, protocol="udp"))]
+    #[pyo3(signature = (av, offer, transform, expires_secs=None, protocol=None))]
     fn allocate<'py>(
         &self,
         python: Python<'py>,
@@ -980,7 +1055,7 @@ impl PyIpsec {
         offer: PySecurityOffer,
         transform: PyTransform,
         expires_secs: Option<u64>,
-        protocol: &str,
+        protocol: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         if !transform.compatible_with(&offer) {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -988,15 +1063,9 @@ impl PyIpsec {
                 transform, offer.alg, offer.ealg
             )));
         }
-        let sa_protocol = match protocol.to_ascii_lowercase().as_str() {
-            "udp" => SaProtocol::Udp,
-            "tcp" => SaProtocol::Tcp,
-            other => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "protocol must be 'udp' or 'tcp', got {other:?}"
-                )));
-            }
-        };
+        let sa_protocol = parse_allocate_protocol(protocol).map_err(|message| {
+            pyo3::exceptions::PyValueError::new_err(message)
+        })?;
         let keys = av.borrow().take().ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err("AuthVectorHandle already consumed")
         })?;
@@ -1051,6 +1120,7 @@ impl PyIpsec {
                 .create_sa_pair(sa.clone())
                 .await
                 .map_err(map_ipsec_error)?;
+            let params_protocol = format_params_protocol(sa_protocol);
             let params = PySecurityServerParams {
                 mechanism: "ipsec-3gpp".to_string(),
                 alg: transform.alg_str().to_string(),
@@ -1059,7 +1129,7 @@ impl PyIpsec {
                 spi_s: spi_ps,
                 port_c: pcscf_port_c,
                 port_s: pcscf_port_s,
-                protocol: sa_protocol.as_str().to_string(),
+                protocol: params_protocol,
             };
             let pending = PyPendingSA::new(manager, sa, params);
             Python::attach(|python| Py::new(python, pending))
@@ -1500,6 +1570,62 @@ mod tests {
         assert!(rendered.contains("protocol=\"tcp\""));
     }
 
+    /// SAHandle surfaces the *internal* SA selector mode for
+    /// diagnostics — UDP/TCP for single-transport pins, `any` for the
+    /// multi-protocol default (TS 33.203 §7.2).  The Security-Server
+    /// wire format (set via PendingSA) is a separate concern; this
+    /// test pins the diagnostic surface so logs and metrics stay
+    /// useful when chasing iOS-style mixed-transport bugs.
+    #[test]
+    fn sa_handle_protocol_surfaces_any_for_dual_transport_sa() {
+        let mut sa = ipsec_test_sa();
+        sa.protocol = SaProtocol::Any;
+        let handle = PySAHandle::from_sa(&sa);
+        assert_eq!(handle.protocol, "any");
+    }
+
+    /// `protocol=None` (the new default) MUST map to SaProtocol::Any
+    /// so :meth:`PyIpsec.allocate` installs an XFRM selector covering
+    /// both ESP-over-UDP and ESP-over-TCP under one SPI pair
+    /// (3GPP TS 33.203 §7.2).  Without this, iOS handsets that
+    /// REGISTER over TCP and dispatch MO MESSAGE over UDP would have
+    /// their MESSAGEs silently dropped by the kernel selector.
+    #[test]
+    fn parse_allocate_protocol_defaults_to_any_for_none() {
+        assert_eq!(parse_allocate_protocol(None).unwrap(), SaProtocol::Any);
+    }
+
+    #[test]
+    fn parse_allocate_protocol_accepts_explicit_pins() {
+        assert_eq!(parse_allocate_protocol(Some("udp")).unwrap(), SaProtocol::Udp);
+        assert_eq!(parse_allocate_protocol(Some("tcp")).unwrap(), SaProtocol::Tcp);
+        assert_eq!(parse_allocate_protocol(Some("any")).unwrap(), SaProtocol::Any);
+        // Case-insensitive — UE-supplied transport strings vary.
+        assert_eq!(parse_allocate_protocol(Some("UDP")).unwrap(), SaProtocol::Udp);
+        assert_eq!(parse_allocate_protocol(Some("TCP")).unwrap(), SaProtocol::Tcp);
+        assert_eq!(parse_allocate_protocol(Some("Any")).unwrap(), SaProtocol::Any);
+    }
+
+    #[test]
+    fn parse_allocate_protocol_rejects_garbage() {
+        let error = parse_allocate_protocol(Some("sctp")).unwrap_err();
+        assert!(error.contains("'udp', 'tcp', 'any'"));
+        assert!(error.contains("sctp"));
+    }
+
+    /// `Any` MUST collapse to wire-form ``"udp"`` so the existing
+    /// ``protocol=`` formatting in scripts
+    /// (``f"; protocol={params.protocol}" if params.protocol != "udp" else ""``)
+    /// keeps emitting parameter-less Security-Server headers — RFC 3329
+    /// §2.2 says an absent ``protocol=`` parameter implies UDP, and
+    /// every existing UE handles that wire shape.
+    #[test]
+    fn format_params_protocol_collapses_any_to_udp_for_wire() {
+        assert_eq!(format_params_protocol(SaProtocol::Any), "udp");
+        assert_eq!(format_params_protocol(SaProtocol::Udp), "udp");
+        assert_eq!(format_params_protocol(SaProtocol::Tcp), "tcp");
+    }
+
     /// `activate(hard_lifetime_secs=…)` flips the metadata to Active and
     /// writes the new lifetime into the cached SA in-line, before
     /// dispatching the kernel UPDSA work.  Subsequent inspection sees
@@ -1747,14 +1873,20 @@ mod tests {
 
     #[test]
     fn outbound_for_sa_returns_udp_transport_for_udp_protocol() {
-        // ESP-over-UDP SA — the common P-CSCF deployment.  The
-        // resolution must surface Transport::Udp so the dispatcher
+        // ESP-over-UDP SA — pinned single-transport.  The resolution
+        // must surface Transport::Udp regardless of what the caller
+        // would otherwise have picked (here: TCP), so the dispatcher
         // routes the egress through the UDP send path and hits the
         // kernel selector that matches IPPROTO_UDP.
-        let sa = ipsec_test_sa();
-        assert_eq!(sa.protocol, SaProtocol::Udp);
+        let mut sa = ipsec_test_sa();
+        sa.protocol = SaProtocol::Udp;
 
-        let (source, transport) = outbound_for_sa(&sa, sa.ue_port_s).unwrap();
+        let (source, transport) = outbound_for_sa(
+            &sa,
+            sa.ue_port_s,
+            crate::transport::Transport::Tcp, // caller hint — overridden
+        )
+        .unwrap();
         assert_eq!(source, std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_c));
         assert_eq!(transport, crate::transport::Transport::Udp);
     }
@@ -1770,7 +1902,12 @@ mod tests {
         let mut sa = ipsec_test_sa();
         sa.protocol = SaProtocol::Tcp;
 
-        let (source, transport) = outbound_for_sa(&sa, sa.ue_port_s).unwrap();
+        let (source, transport) = outbound_for_sa(
+            &sa,
+            sa.ue_port_s,
+            crate::transport::Transport::Udp,
+        )
+        .unwrap();
         assert_eq!(source, std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_c));
         assert_eq!(transport, crate::transport::Transport::Tcp);
     }
@@ -1784,9 +1921,46 @@ mod tests {
         let mut sa = ipsec_test_sa();
         sa.protocol = SaProtocol::Tcp;
 
-        let (source, transport) = outbound_for_sa(&sa, sa.ue_port_c).unwrap();
+        let (source, transport) = outbound_for_sa(
+            &sa,
+            sa.ue_port_c,
+            crate::transport::Transport::Udp,
+        )
+        .unwrap();
         assert_eq!(source, std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_s));
         assert_eq!(transport, crate::transport::Transport::Tcp);
+    }
+
+    #[test]
+    fn outbound_for_sa_preserves_caller_transport_for_any_protocol() {
+        // SaProtocol::Any — the spec-compliant default per TS 33.203
+        // §7.2.  The SA covers both UDP and TCP under one SPI pair,
+        // so the dispatcher's choice (URI ;transport= hint, inbound
+        // transport, or default) MUST be preserved verbatim — no
+        // override.  This is what lets iOS REGISTER over TCP and then
+        // send MO MESSAGE over UDP without the kernel dropping the
+        // UDP frame at the XFRM selector.
+        let mut sa = ipsec_test_sa();
+        sa.protocol = SaProtocol::Any;
+
+        // Caller wants UDP — Any SA preserves it.
+        let (source, transport) = outbound_for_sa(
+            &sa,
+            sa.ue_port_s,
+            crate::transport::Transport::Udp,
+        )
+        .unwrap();
+        assert_eq!(source, std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_c));
+        assert_eq!(transport, crate::transport::Transport::Udp);
+
+        // Caller wants TCP — same Any SA preserves that too.
+        let (_, transport_tcp) = outbound_for_sa(
+            &sa,
+            sa.ue_port_s,
+            crate::transport::Transport::Tcp,
+        )
+        .unwrap();
+        assert_eq!(transport_tcp, crate::transport::Transport::Tcp);
     }
 
     #[test]
@@ -1796,7 +1970,7 @@ mod tests {
         // derived, otherwise the caller would pin the wrong transport
         // for a destination that isn't actually on the SA pair.
         let sa = ipsec_test_sa();
-        assert!(outbound_for_sa(&sa, 9999).is_none());
+        assert!(outbound_for_sa(&sa, 9999, crate::transport::Transport::Udp).is_none());
     }
 
     #[test]

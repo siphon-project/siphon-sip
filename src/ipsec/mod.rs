@@ -130,36 +130,59 @@ pub(crate) enum PolicyDir {
 /// determines which inner-protocol frames the SA applies to.  IMS IPsec
 /// supports both ESP-over-UDP (the common deployment) and ESP-over-TCP
 /// (3GPP TS 33.203 §7.2 — used by UEs that prefer TCP-first SIP).
+///
+/// `Any` is the spec-compliant default: 3GPP TS 33.203 §7.2 requires that
+/// "the Security Associations established between the UE and the P-CSCF
+/// shall be used to protect *all* SIP signalling exchanged between the UE
+/// and the P-CSCF, including SIP traffic over UDP and TCP."  iOS handsets
+/// rely on this — they REGISTER over TCP but emit MO MESSAGE over UDP,
+/// and a TCP-pinned SA would silently drop the MESSAGE on
+/// `XfrmInStateMismatch`.  When `Any` is selected, the XFRM selector
+/// stamps `proto = 0` (kernel-side "match any inner protocol"), so the
+/// same SPI pair covers both transports without doubling kernel state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaProtocol {
     /// IPPROTO_UDP (17).
     Udp,
     /// IPPROTO_TCP (6).
     Tcp,
+    /// "Any" — selector_proto=0 in XFRM, matches both TCP and UDP inner
+    /// flows.  Default when the script doesn't pin a transport.
+    Any,
 }
 
 impl SaProtocol {
-    /// Numeric IP protocol value as carried in the selector byte.
+    /// Numeric IP protocol value as carried in the selector byte.  `0`
+    /// for `Any` — the kernel treats `xfrm_selector.proto == 0` as
+    /// "match any inner protocol" (Linux `__xfrm{4,6}_selector_match`
+    /// short-circuits the proto check when `sel->proto == 0`).
     pub fn as_u8(self) -> u8 {
         match self {
             SaProtocol::Udp => 17,
             SaProtocol::Tcp => 6,
+            SaProtocol::Any => 0,
         }
     }
 
-    /// Lower-case wire name as used in RFC 3329 ``protocol=`` parameter
-    /// and in the ``ip xfrm`` UPSPEC grammar.
+    /// Lower-case name as used in the ``ip xfrm`` UPSPEC grammar.
+    /// iproute2 accepts the literal string ``any`` and maps it to
+    /// selector proto 0.  Note: this is NOT the right value to put on
+    /// the RFC 3329 ``protocol=`` parameter wire-side for `Any` —
+    /// callers serialising Security-Server headers should treat `Any`
+    /// the same as omitting the ``protocol=`` param (which per
+    /// RFC 3329 §2.2 implies UDP).
     pub fn as_str(self) -> &'static str {
         match self {
             SaProtocol::Udp => "udp",
             SaProtocol::Tcp => "tcp",
+            SaProtocol::Any => "any",
         }
     }
 }
 
 impl Default for SaProtocol {
     fn default() -> Self {
-        SaProtocol::Udp
+        SaProtocol::Any
     }
 }
 
@@ -315,11 +338,15 @@ pub struct SecurityAssociationPair {
     /// IPsec SA lifetime to the SIP registration expiry per 3GPP
     /// TS 33.203 §7.4.
     pub hard_lifetime_secs: Option<u64>,
-    /// Upper-layer protocol pinned into the XFRM selector — UDP for
-    /// ESP-over-UDP (the common case), TCP for ESP-over-TCP (TS 33.203
-    /// §7.2).  Must match the SIP transport the UE uses for protected
-    /// traffic; a mismatched selector silently drops every protected
-    /// frame because the kernel won't bind the SA to it.
+    /// Upper-layer protocol pinned into the XFRM selector.  `Any`
+    /// (selector_proto=0, the default) covers both ESP-over-UDP and
+    /// ESP-over-TCP under the same SPI pair — required for spec
+    /// compliance with 3GPP TS 33.203 §7.2 ("the SAs shall be used to
+    /// protect *all* SIP signalling … including over UDP and TCP") and
+    /// for iOS UEs that mix transports (REGISTER over TCP, MO MESSAGE
+    /// over UDP).  Pin to `Udp` or `Tcp` only for single-transport
+    /// deployments or tests; a mismatched pin silently drops every
+    /// frame the UE sends on the other transport.
     pub protocol: SaProtocol,
 }
 
@@ -1550,6 +1577,12 @@ mod tests {
     fn sa_protocol_numeric_values_match_iana() {
         assert_eq!(SaProtocol::Udp.as_u8(), 17);
         assert_eq!(SaProtocol::Tcp.as_u8(), 6);
+        // `Any` is XFRM's "match any inner proto" — selector_proto=0 in
+        // the kernel ABI.  Linux short-circuits the proto check when
+        // sel->proto==0 (see __xfrm{4,6}_selector_match), so the SA
+        // pair covers both TCP and UDP under one SPI.  This is the
+        // spec-compliant default per 3GPP TS 33.203 §7.2.
+        assert_eq!(SaProtocol::Any.as_u8(), 0);
     }
 
     #[test]
@@ -1557,6 +1590,13 @@ mod tests {
         assert_eq!(SaProtocol::Udp.as_str(), "udp");
         assert_eq!(SaProtocol::Tcp.as_str(), "tcp");
         assert_eq!(format!("{}", SaProtocol::Tcp), "tcp");
+        // `any` is the iproute2 UPSPEC literal for selector_proto=0 —
+        // accepted by `ip xfrm policy add ... proto any sport X dport Y`.
+        // Not a valid RFC 3329 `protocol=` value; callers formatting the
+        // Security-Server header must omit the parameter for `Any`
+        // (RFC 3329 §2.2: absent implies UDP, which is wire-compatible).
+        assert_eq!(SaProtocol::Any.as_str(), "any");
+        assert_eq!(format!("{}", SaProtocol::Any), "any");
     }
 
     /// `update_sa_pair_lifetime` is a no-op (returns Ok) when the UE
@@ -1576,9 +1616,13 @@ mod tests {
     }
 
     #[test]
-    fn sa_protocol_default_is_udp() {
-        // Back-compat: callers that don't specify a protocol get the
-        // ESP-over-UDP behaviour that all production deployments rely on.
-        assert_eq!(SaProtocol::default(), SaProtocol::Udp);
+    fn sa_protocol_default_is_any() {
+        // Spec-driven default change (3GPP TS 33.203 §7.2): an SA pair
+        // must protect SIP signalling on *both* UDP and TCP between the
+        // UE and the P-CSCF.  Single-transport pins are opt-in for tests
+        // / niche deployments; `Default::default()` returns the
+        // any-protocol selector that covers both transports under one
+        // SPI pair.
+        assert_eq!(SaProtocol::default(), SaProtocol::Any);
     }
 }

@@ -172,16 +172,16 @@ async def _handle_401_register(request, reply):
     # up.  +60 s grace allows a re-REGISTER round-trip before expiry.
     expires_secs = (request.contact_expires or 600) + 60
 
-    # Pin the XFRM selectors to the SIP transport the UE used for the
-    # initial REGISTER.  TS 33.203 §7.2 allows both ESP-over-UDP (the
-    # common case) and ESP-over-TCP (TCP-first UEs); a mismatch silently
-    # drops every protected frame because the kernel selector won't bind.
-    sa_protocol = "tcp" if request.transport == "tcp" else "udp"
-
+    # No `protocol=` kwarg → multi-protocol XFRM selectors (TS 33.203
+    # §7.2: "the SAs shall be used to protect *all* SIP signalling …
+    # including over UDP and TCP").  One SPI pair covers both transports
+    # under a single AuthVectorHandle consumption.  Required for iOS
+    # handsets that REGISTER over TCP but emit MO MESSAGE over UDP —
+    # the old single-transport pin would silently drop the MESSAGE on
+    # `XfrmInStateMismatch`.
     try:
         pending = await ipsec.allocate(
-            av, chosen, transform,
-            expires_secs=expires_secs, protocol=sa_protocol,
+            av, chosen, transform, expires_secs=expires_secs,
         )
     except (ValueError, RuntimeError) as exc:
         log.error(f"ipsec.allocate failed for {request.call_id}: {exc}")
