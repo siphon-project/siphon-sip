@@ -48,7 +48,7 @@ use crate::diameter::dictionary::{self, avp, AvpDef, AvpType};
 use crate::diameter::rf::{
     self, AccountingAnswer, AccountingParams, AccountingRecordType,
 };
-use crate::diameter::ro::{ImsChargingData, NodeFunctionality, NodeRole};
+use crate::diameter::ro::{ImsChargingData, NodeFunctionality, NodeRole, SmsChargingData};
 use crate::diameter::rx::extract_result_code;
 use crate::diameter::{DiameterClient, DiameterManager};
 
@@ -89,9 +89,12 @@ impl PyDiameter {
 }
 
 /// Build an `ImsChargingData` from the kwargs accepted by every `rf_acr_*`
-/// binding.  Returns a `PyValueError` on unrecognized role / functionality
-/// strings so script errors fail loudly rather than silently dropping the
-/// AVP.
+/// binding.  Returns `Ok(None)` when no IMS-Information kwarg was passed —
+/// the call site then skips the `Service-Information → IMS-Information`
+/// emission entirely (callers that want a pure SMS-Information record
+/// shouldn't also drop an empty IMS-Information envelope on the wire).
+/// Returns a `PyValueError` on unrecognized role / functionality strings
+/// so script errors fail loudly rather than silently dropping the AVP.
 #[allow(clippy::too_many_arguments)]
 fn build_ims_data(
     calling_party: Option<&str>,
@@ -109,7 +112,26 @@ fn build_ims_data(
     outgoing_trunk_group_id: Option<&str>,
     visited_network_id: Option<&str>,
     cause_code: Option<i32>,
-) -> PyResult<ImsChargingData> {
+) -> PyResult<Option<ImsChargingData>> {
+    let nothing_set = calling_party.is_none()
+        && called_party.is_none()
+        && sip_method.is_none()
+        && role_of_node.is_none()
+        && node_functionality.is_none()
+        && ims_charging_identifier.is_none()
+        && user_session_id.is_none()
+        && originating_ioi.is_none()
+        && terminating_ioi.is_none()
+        && application_server.is_none()
+        && application_provided_called_party_address.is_none()
+        && incoming_trunk_group_id.is_none()
+        && outgoing_trunk_group_id.is_none()
+        && visited_network_id.is_none()
+        && cause_code.is_none();
+    if nothing_set {
+        return Ok(None);
+    }
+
     let role = match role_of_node {
         Some(value) => Some(NodeRole::from_str_ci(value).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(format!(
@@ -129,7 +151,7 @@ fn build_ims_data(
         })?),
         None => None,
     };
-    Ok(ImsChargingData {
+    Ok(Some(ImsChargingData {
         calling_party: calling_party.map(str::to_owned),
         called_party: called_party.map(str::to_owned),
         sip_method: sip_method.map(str::to_owned),
@@ -149,7 +171,124 @@ fn build_ims_data(
         incoming_trunk_group_id: incoming_trunk_group_id.map(str::to_owned),
         outgoing_trunk_group_id: outgoing_trunk_group_id.map(str::to_owned),
         visited_network_id: visited_network_id.map(str::to_owned),
-    })
+    }))
+}
+
+/// Parse an IP address kwarg passed in to one of the SMS Address-typed
+/// AVPs (SCCP / client / MTC-IWF).  Returns `Ok(None)` for `None` input.
+fn parse_optional_ip(label: &str, value: Option<&str>) -> PyResult<Option<std::net::IpAddr>> {
+    match value {
+        None => Ok(None),
+        Some(text) => text
+            .parse::<std::net::IpAddr>()
+            .map(Some)
+            .map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "{label} expects an IPv4/IPv6 literal, got {text:?}"
+                ))
+            }),
+    }
+}
+
+/// Build a `SmsChargingData` from the SMS-specific kwargs accepted by
+/// every `rf_acr_*` binding.  Returns `Ok(None)` when no SMS-Information
+/// kwarg was passed — keeps the wire free of an empty SMS-Information
+/// envelope on IMS-only call records.
+///
+/// `originating_ioi`, `terminating_ioi`, and `user_session_id` are
+/// *shared* with [`build_ims_data`] — they flow into whichever envelope
+/// is emitted but do not, on their own, trigger SMS-Information.  A
+/// script that only passes IOIs gets IMS-Information (current behavior);
+/// a script that passes any SMS-specific kwarg gets SMS-Information with
+/// the shared fields propagated.
+#[allow(clippy::too_many_arguments)]
+fn build_sms_data(
+    originator_address: Option<&str>,
+    recipient_address: Option<&str>,
+    originator_sccp_address: Option<&str>,
+    recipient_sccp_address: Option<&str>,
+    sm_message_type: Option<u32>,
+    reply_path_requested: Option<u32>,
+    sm_user_data_header: Option<Vec<u8>>,
+    sm_service_type: Option<u32>,
+    sms_node: Option<u32>,
+    sm_discharge_time: Option<f64>,
+    number_of_messages_sent: Option<u32>,
+    client_address: Option<&str>,
+    data_coding_scheme: Option<i32>,
+    sms_result: Option<u32>,
+    sm_protocol_id: Option<Vec<u8>>,
+    sm_status: Option<Vec<u8>>,
+    application_port_identifier: Option<u32>,
+    external_identifier: Option<&str>,
+    sm_device_trigger_indicator: Option<u32>,
+    mtc_iwf_address: Option<&str>,
+    originating_ioi: Option<&str>,
+    terminating_ioi: Option<&str>,
+    user_session_id: Option<&str>,
+) -> PyResult<Option<SmsChargingData>> {
+    // Trigger condition: at least one SMS-specific kwarg.  Shared
+    // kwargs (IOIs, user-session-id) do not count — they're propagated
+    // into whichever envelope is emitted.
+    let sms_specific_set = originator_address.is_some()
+        || recipient_address.is_some()
+        || originator_sccp_address.is_some()
+        || recipient_sccp_address.is_some()
+        || sm_message_type.is_some()
+        || reply_path_requested.is_some()
+        || sm_user_data_header.is_some()
+        || sm_service_type.is_some()
+        || sms_node.is_some()
+        || sm_discharge_time.is_some()
+        || number_of_messages_sent.is_some()
+        || client_address.is_some()
+        || data_coding_scheme.is_some()
+        || sms_result.is_some()
+        || sm_protocol_id.is_some()
+        || sm_status.is_some()
+        || application_port_identifier.is_some()
+        || external_identifier.is_some()
+        || sm_device_trigger_indicator.is_some()
+        || mtc_iwf_address.is_some();
+    if !sms_specific_set {
+        return Ok(None);
+    }
+
+    let discharge_time = sm_discharge_time.map(|secs| {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(secs.max(0.0))
+    });
+
+    Ok(Some(SmsChargingData {
+        originator_address: originator_address.map(str::to_owned),
+        recipient_address: recipient_address.map(str::to_owned),
+        originator_sccp_address: parse_optional_ip(
+            "originator_sccp_address",
+            originator_sccp_address,
+        )?,
+        recipient_sccp_address: parse_optional_ip(
+            "recipient_sccp_address",
+            recipient_sccp_address,
+        )?,
+        sm_message_type,
+        reply_path_requested,
+        sm_user_data_header,
+        sm_service_type,
+        sms_node,
+        sm_discharge_time: discharge_time,
+        number_of_messages_sent,
+        client_address: parse_optional_ip("client_address", client_address)?,
+        data_coding_scheme,
+        sms_result,
+        sm_protocol_id,
+        sm_status,
+        application_port_identifier,
+        external_identifier: external_identifier.map(str::to_owned),
+        sm_device_trigger_indicator,
+        mtc_iwf_address: parse_optional_ip("mtc_iwf_address", mtc_iwf_address)?,
+        originating_ioi: originating_ioi.map(str::to_owned),
+        terminating_ioi: terminating_ioi.map(str::to_owned),
+        user_session_id: user_session_id.map(str::to_owned),
+    }))
 }
 
 /// Convert an `AccountingAnswer` to the dict shape every `rf_acr_*` binding
@@ -1291,6 +1430,16 @@ impl PyDiameter {
         application_server=None, application_provided_called_party_address=None,
         incoming_trunk_group_id=None, outgoing_trunk_group_id=None,
         visited_network_id=None,
+        originator_address=None, recipient_address=None,
+        originator_sccp_address=None, recipient_sccp_address=None,
+        sm_message_type=None, reply_path_requested=None,
+        sm_user_data_header=None, sm_service_type=None,
+        sms_node=None, sm_discharge_time=None,
+        number_of_messages_sent=None, client_address=None,
+        data_coding_scheme=None, sms_result=None,
+        sm_protocol_id=None, sm_status=None,
+        application_port_identifier=None, external_identifier=None,
+        sm_device_trigger_indicator=None, mtc_iwf_address=None,
         user_name=None, cause_code=None,
         service_context_id=None, peer=None,
     ))]
@@ -1312,6 +1461,26 @@ impl PyDiameter {
         incoming_trunk_group_id: Option<&str>,
         outgoing_trunk_group_id: Option<&str>,
         visited_network_id: Option<&str>,
+        originator_address: Option<&str>,
+        recipient_address: Option<&str>,
+        originator_sccp_address: Option<&str>,
+        recipient_sccp_address: Option<&str>,
+        sm_message_type: Option<u32>,
+        reply_path_requested: Option<u32>,
+        sm_user_data_header: Option<Vec<u8>>,
+        sm_service_type: Option<u32>,
+        sms_node: Option<u32>,
+        sm_discharge_time: Option<f64>,
+        number_of_messages_sent: Option<u32>,
+        client_address: Option<&str>,
+        data_coding_scheme: Option<i32>,
+        sms_result: Option<u32>,
+        sm_protocol_id: Option<Vec<u8>>,
+        sm_status: Option<Vec<u8>>,
+        application_port_identifier: Option<u32>,
+        external_identifier: Option<&str>,
+        sm_device_trigger_indicator: Option<u32>,
+        mtc_iwf_address: Option<&str>,
         user_name: Option<&str>,
         cause_code: Option<i32>,
         service_context_id: Option<&str>,
@@ -1332,10 +1501,24 @@ impl PyDiameter {
             incoming_trunk_group_id, outgoing_trunk_group_id,
             visited_network_id, cause_code,
         )?;
+        let sms_data = build_sms_data(
+            originator_address, recipient_address,
+            originator_sccp_address, recipient_sccp_address,
+            sm_message_type, reply_path_requested,
+            sm_user_data_header, sm_service_type,
+            sms_node, sm_discharge_time,
+            number_of_messages_sent, client_address,
+            data_coding_scheme, sms_result,
+            sm_protocol_id, sm_status,
+            application_port_identifier, external_identifier,
+            sm_device_trigger_indicator, mtc_iwf_address,
+            originating_ioi, terminating_ioi, user_session_id,
+        )?;
 
         let mut params = AccountingParams::new(AccountingRecordType::StartRecord);
         params.user_name = user_name;
-        params.ims_data = Some(&ims_data);
+        params.ims_data = ims_data.as_ref();
+        params.sms_data = sms_data.as_ref();
         params.service_context_id = service_context_id;
 
         let peer_handle = client.peer().clone();
@@ -1365,6 +1548,16 @@ impl PyDiameter {
         application_server=None, application_provided_called_party_address=None,
         incoming_trunk_group_id=None, outgoing_trunk_group_id=None,
         visited_network_id=None,
+        originator_address=None, recipient_address=None,
+        originator_sccp_address=None, recipient_sccp_address=None,
+        sm_message_type=None, reply_path_requested=None,
+        sm_user_data_header=None, sm_service_type=None,
+        sms_node=None, sm_discharge_time=None,
+        number_of_messages_sent=None, client_address=None,
+        data_coding_scheme=None, sms_result=None,
+        sm_protocol_id=None, sm_status=None,
+        application_port_identifier=None, external_identifier=None,
+        sm_device_trigger_indicator=None, mtc_iwf_address=None,
         user_name=None, cause_code=None,
         service_context_id=None, peer=None,
     ))]
@@ -1388,6 +1581,26 @@ impl PyDiameter {
         incoming_trunk_group_id: Option<&str>,
         outgoing_trunk_group_id: Option<&str>,
         visited_network_id: Option<&str>,
+        originator_address: Option<&str>,
+        recipient_address: Option<&str>,
+        originator_sccp_address: Option<&str>,
+        recipient_sccp_address: Option<&str>,
+        sm_message_type: Option<u32>,
+        reply_path_requested: Option<u32>,
+        sm_user_data_header: Option<Vec<u8>>,
+        sm_service_type: Option<u32>,
+        sms_node: Option<u32>,
+        sm_discharge_time: Option<f64>,
+        number_of_messages_sent: Option<u32>,
+        client_address: Option<&str>,
+        data_coding_scheme: Option<i32>,
+        sms_result: Option<u32>,
+        sm_protocol_id: Option<Vec<u8>>,
+        sm_status: Option<Vec<u8>>,
+        application_port_identifier: Option<u32>,
+        external_identifier: Option<&str>,
+        sm_device_trigger_indicator: Option<u32>,
+        mtc_iwf_address: Option<&str>,
         user_name: Option<&str>,
         cause_code: Option<i32>,
         service_context_id: Option<&str>,
@@ -1408,12 +1621,26 @@ impl PyDiameter {
             incoming_trunk_group_id, outgoing_trunk_group_id,
             visited_network_id, cause_code,
         )?;
+        let sms_data = build_sms_data(
+            originator_address, recipient_address,
+            originator_sccp_address, recipient_sccp_address,
+            sm_message_type, reply_path_requested,
+            sm_user_data_header, sm_service_type,
+            sms_node, sm_discharge_time,
+            number_of_messages_sent, client_address,
+            data_coding_scheme, sms_result,
+            sm_protocol_id, sm_status,
+            application_port_identifier, external_identifier,
+            sm_device_trigger_indicator, mtc_iwf_address,
+            originating_ioi, terminating_ioi, user_session_id,
+        )?;
 
         let mut params = AccountingParams::new(AccountingRecordType::InterimRecord);
         params.record_number = record_number;
         params.session_id = Some(session_id);
         params.user_name = user_name;
-        params.ims_data = Some(&ims_data);
+        params.ims_data = ims_data.as_ref();
+        params.sms_data = sms_data.as_ref();
         params.service_context_id = service_context_id;
 
         let peer_handle = client.peer().clone();
@@ -1451,6 +1678,16 @@ impl PyDiameter {
         application_server=None, application_provided_called_party_address=None,
         incoming_trunk_group_id=None, outgoing_trunk_group_id=None,
         visited_network_id=None,
+        originator_address=None, recipient_address=None,
+        originator_sccp_address=None, recipient_sccp_address=None,
+        sm_message_type=None, reply_path_requested=None,
+        sm_user_data_header=None, sm_service_type=None,
+        sms_node=None, sm_discharge_time=None,
+        number_of_messages_sent=None, client_address=None,
+        data_coding_scheme=None, sms_result=None,
+        sm_protocol_id=None, sm_status=None,
+        application_port_identifier=None, external_identifier=None,
+        sm_device_trigger_indicator=None, mtc_iwf_address=None,
         user_name=None, cause_code=None,
         service_context_id=None, peer=None,
     ))]
@@ -1475,6 +1712,26 @@ impl PyDiameter {
         incoming_trunk_group_id: Option<&str>,
         outgoing_trunk_group_id: Option<&str>,
         visited_network_id: Option<&str>,
+        originator_address: Option<&str>,
+        recipient_address: Option<&str>,
+        originator_sccp_address: Option<&str>,
+        recipient_sccp_address: Option<&str>,
+        sm_message_type: Option<u32>,
+        reply_path_requested: Option<u32>,
+        sm_user_data_header: Option<Vec<u8>>,
+        sm_service_type: Option<u32>,
+        sms_node: Option<u32>,
+        sm_discharge_time: Option<f64>,
+        number_of_messages_sent: Option<u32>,
+        client_address: Option<&str>,
+        data_coding_scheme: Option<i32>,
+        sms_result: Option<u32>,
+        sm_protocol_id: Option<Vec<u8>>,
+        sm_status: Option<Vec<u8>>,
+        application_port_identifier: Option<u32>,
+        external_identifier: Option<&str>,
+        sm_device_trigger_indicator: Option<u32>,
+        mtc_iwf_address: Option<&str>,
         user_name: Option<&str>,
         cause_code: Option<i32>,
         service_context_id: Option<&str>,
@@ -1495,12 +1752,26 @@ impl PyDiameter {
             incoming_trunk_group_id, outgoing_trunk_group_id,
             visited_network_id, cause_code,
         )?;
+        let sms_data = build_sms_data(
+            originator_address, recipient_address,
+            originator_sccp_address, recipient_sccp_address,
+            sm_message_type, reply_path_requested,
+            sm_user_data_header, sm_service_type,
+            sms_node, sm_discharge_time,
+            number_of_messages_sent, client_address,
+            data_coding_scheme, sms_result,
+            sm_protocol_id, sm_status,
+            application_port_identifier, external_identifier,
+            sm_device_trigger_indicator, mtc_iwf_address,
+            originating_ioi, terminating_ioi, user_session_id,
+        )?;
 
         let mut params = AccountingParams::new(AccountingRecordType::StopRecord);
         params.record_number = record_number;
         params.session_id = Some(session_id);
         params.user_name = user_name;
-        params.ims_data = Some(&ims_data);
+        params.ims_data = ims_data.as_ref();
+        params.sms_data = sms_data.as_ref();
         params.service_context_id = service_context_id;
         params.termination_cause = Some(termination_cause);
 
@@ -1534,6 +1805,16 @@ impl PyDiameter {
         application_server=None, application_provided_called_party_address=None,
         incoming_trunk_group_id=None, outgoing_trunk_group_id=None,
         visited_network_id=None,
+        originator_address=None, recipient_address=None,
+        originator_sccp_address=None, recipient_sccp_address=None,
+        sm_message_type=None, reply_path_requested=None,
+        sm_user_data_header=None, sm_service_type=None,
+        sms_node=None, sm_discharge_time=None,
+        number_of_messages_sent=None, client_address=None,
+        data_coding_scheme=None, sms_result=None,
+        sm_protocol_id=None, sm_status=None,
+        application_port_identifier=None, external_identifier=None,
+        sm_device_trigger_indicator=None, mtc_iwf_address=None,
         user_name=None, cause_code=None,
         service_context_id=None, peer=None,
     ))]
@@ -1555,6 +1836,26 @@ impl PyDiameter {
         incoming_trunk_group_id: Option<&str>,
         outgoing_trunk_group_id: Option<&str>,
         visited_network_id: Option<&str>,
+        originator_address: Option<&str>,
+        recipient_address: Option<&str>,
+        originator_sccp_address: Option<&str>,
+        recipient_sccp_address: Option<&str>,
+        sm_message_type: Option<u32>,
+        reply_path_requested: Option<u32>,
+        sm_user_data_header: Option<Vec<u8>>,
+        sm_service_type: Option<u32>,
+        sms_node: Option<u32>,
+        sm_discharge_time: Option<f64>,
+        number_of_messages_sent: Option<u32>,
+        client_address: Option<&str>,
+        data_coding_scheme: Option<i32>,
+        sms_result: Option<u32>,
+        sm_protocol_id: Option<Vec<u8>>,
+        sm_status: Option<Vec<u8>>,
+        application_port_identifier: Option<u32>,
+        external_identifier: Option<&str>,
+        sm_device_trigger_indicator: Option<u32>,
+        mtc_iwf_address: Option<&str>,
         user_name: Option<&str>,
         cause_code: Option<i32>,
         service_context_id: Option<&str>,
@@ -1575,10 +1876,24 @@ impl PyDiameter {
             incoming_trunk_group_id, outgoing_trunk_group_id,
             visited_network_id, cause_code,
         )?;
+        let sms_data = build_sms_data(
+            originator_address, recipient_address,
+            originator_sccp_address, recipient_sccp_address,
+            sm_message_type, reply_path_requested,
+            sm_user_data_header, sm_service_type,
+            sms_node, sm_discharge_time,
+            number_of_messages_sent, client_address,
+            data_coding_scheme, sms_result,
+            sm_protocol_id, sm_status,
+            application_port_identifier, external_identifier,
+            sm_device_trigger_indicator, mtc_iwf_address,
+            originating_ioi, terminating_ioi, user_session_id,
+        )?;
 
         let mut params = AccountingParams::new(AccountingRecordType::EventRecord);
         params.user_name = user_name;
-        params.ims_data = Some(&ims_data);
+        params.ims_data = ims_data.as_ref();
+        params.sms_data = sms_data.as_ref();
         params.service_context_id = service_context_id;
 
         let peer_handle = client.peer().clone();

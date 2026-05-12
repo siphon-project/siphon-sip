@@ -18,7 +18,7 @@ use tracing::info;
 use crate::diameter::codec::*;
 use crate::diameter::dictionary::{self, avp};
 use crate::diameter::peer::DiameterPeer;
-use crate::diameter::ro::ImsChargingData;
+use crate::diameter::ro::{ImsChargingData, SmsChargingData};
 
 // ── Service-Context-Id (TS 32.260 §5.0) ────────────────────────────────
 
@@ -137,6 +137,11 @@ pub struct AccountingParams<'a> {
     pub record_number: u32,
     pub session_id: Option<&'a str>,
     pub ims_data: Option<&'a ImsChargingData>,
+    /// SMS-Information charging data per TS 32.299 §7.2.79.  When set,
+    /// emits the `SMS-Information` grouped AVP under
+    /// `Service-Information`.  May be combined with `ims_data` when a
+    /// record needs both — most call sites use exactly one.
+    pub sms_data: Option<&'a SmsChargingData>,
 
     /// `Event-Timestamp` AVP (RFC 6733 §8.21).  Defaults to the wall-clock
     /// time of `send_acr` when `None`.
@@ -161,6 +166,7 @@ impl<'a> AccountingParams<'a> {
             record_number: 0,
             session_id: None,
             ims_data: None,
+            sms_data: None,
             event_timestamp: None,
             service_context_id: None,
             user_name: None,
@@ -227,9 +233,17 @@ pub fn encode_acr_payload(
         payload.extend_from_slice(&encode_avp_u32(avp::TERMINATION_CAUSE, cause));
     }
 
-    // Service-Information → IMS-Information (shared with Ro)
+    // Service-Information → IMS-Information (shared with Ro) and/or
+    // SMS-Information (TS 32.299 §7.2.79).  When both are set, two
+    // separate Service-Information envelopes are emitted; CDR collectors
+    // accept this and surface the SMS-Information on the SMS tab while
+    // IMS-Information still drives the call tab.  Most call sites pass
+    // exactly one of the two.
     if let Some(ims) = params.ims_data {
         payload.extend_from_slice(&ims.encode_service_information());
+    }
+    if let Some(sms) = params.sms_data {
+        payload.extend_from_slice(&sms.encode_service_information());
     }
 
     payload
@@ -295,10 +309,12 @@ pub async fn send_acr_start(
     peer: &Arc<DiameterPeer>,
     user_name: Option<&str>,
     ims_data: Option<&ImsChargingData>,
+    sms_data: Option<&SmsChargingData>,
 ) -> Result<AccountingAnswer, String> {
     let mut params = AccountingParams::new(AccountingRecordType::StartRecord);
     params.user_name = user_name;
     params.ims_data = ims_data;
+    params.sms_data = sms_data;
     send_acr(peer, &params).await
 }
 
@@ -311,12 +327,14 @@ pub async fn send_acr_interim(
     record_number: u32,
     user_name: Option<&str>,
     ims_data: Option<&ImsChargingData>,
+    sms_data: Option<&SmsChargingData>,
 ) -> Result<AccountingAnswer, String> {
     let mut params = AccountingParams::new(AccountingRecordType::InterimRecord);
     params.record_number = record_number;
     params.session_id = Some(session_id);
     params.user_name = user_name;
     params.ims_data = ims_data;
+    params.sms_data = sms_data;
     send_acr(peer, &params).await
 }
 
@@ -332,12 +350,14 @@ pub async fn send_acr_stop(
     termination_cause: u32,
     user_name: Option<&str>,
     ims_data: Option<&ImsChargingData>,
+    sms_data: Option<&SmsChargingData>,
 ) -> Result<AccountingAnswer, String> {
     let mut params = AccountingParams::new(AccountingRecordType::StopRecord);
     params.record_number = record_number;
     params.session_id = Some(session_id);
     params.user_name = user_name;
     params.ims_data = ims_data;
+    params.sms_data = sms_data;
     params.termination_cause = Some(termination_cause);
     send_acr(peer, &params).await
 }
@@ -348,10 +368,12 @@ pub async fn send_acr_event(
     peer: &Arc<DiameterPeer>,
     user_name: Option<&str>,
     ims_data: Option<&ImsChargingData>,
+    sms_data: Option<&SmsChargingData>,
 ) -> Result<AccountingAnswer, String> {
     let mut params = AccountingParams::new(AccountingRecordType::EventRecord);
     params.user_name = user_name;
     params.ims_data = ims_data;
+    params.sms_data = sms_data;
     send_acr(peer, &params).await
 }
 
@@ -1013,5 +1035,129 @@ mod tests {
     #[test]
     fn service_context_id_ims_constant() {
         assert_eq!(SERVICE_CONTEXT_ID_IMS, "32260@3gpp.org");
+    }
+
+    // ── SMS-Information ACR wire-format (TS 32.299 §7.2.79) ──────────────
+
+    #[test]
+    fn acr_event_carries_sms_information() {
+        let sms = SmsChargingData {
+            originator_address: Some("0015551234001".into()),
+            recipient_address: Some("0015551234002".into()),
+            sm_message_type: Some(0), // SUBMISSION
+            sms_node: Some(1),        // IP-SM-GW
+            sms_result: Some(0),      // Success
+            originating_ioi: Some("orig.example.com".into()),
+            terminating_ioi: Some("term.example.com".into()),
+            ..Default::default()
+        };
+        let mut params = AccountingParams::new(AccountingRecordType::EventRecord);
+        params.sms_data = Some(&sms);
+
+        let payload = encode_acr_payload(
+            "ipsmgw.example.com",
+            "example.com",
+            "example.com",
+            None,
+            "cdf;sms;event;1",
+            &params,
+        );
+        let wire = encode_diameter_message(
+            FLAG_REQUEST | FLAG_PROXIABLE,
+            dictionary::CMD_ACCOUNTING,
+            dictionary::RF_APP_ID,
+            1,
+            2,
+            &payload,
+        );
+        let decoded = decode_diameter(&wire).unwrap();
+
+        // Service-Information must contain SMS-Information (not IMS-Information)
+        let svc_info = decoded
+            .avps
+            .get("Service-Information")
+            .expect("Service-Information present");
+        let sms_info = svc_info
+            .get("SMS-Information")
+            .expect("SMS-Information emitted");
+        assert!(
+            svc_info.get("IMS-Information").is_none(),
+            "pure SMS record must NOT also carry IMS-Information"
+        );
+
+        // Calling/called party reach the wire
+        let orig_addr = sms_info
+            .get("Originator-Received-Address")
+            .expect("Originator-Received-Address");
+        assert_eq!(
+            orig_addr.get("Address-Data").and_then(|v| v.as_str()),
+            Some("0015551234001")
+        );
+        let recip_addr = sms_info
+            .get("Recipient-Info")
+            .and_then(|r| r.get("Recipient-Address"))
+            .expect("Recipient-Address inside Recipient-Info");
+        assert_eq!(
+            recip_addr.get("Address-Data").and_then(|v| v.as_str()),
+            Some("0015551234002")
+        );
+        assert_eq!(
+            sms_info.get("SM-Message-Type").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert_eq!(sms_info.get("SMS-Node").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(sms_info.get("SMS-Result").and_then(|v| v.as_u64()), Some(0));
+    }
+
+    #[test]
+    fn acr_can_carry_both_ims_and_sms() {
+        // Belt-and-braces hybrid record — when both ims_data and sms_data
+        // are set the encoder emits each under its own Service-Information
+        // envelope, so CDR collectors can surface either tab.
+        let ims = ImsChargingData {
+            sip_method: Some("MESSAGE".into()),
+            node_functionality: Some(NodeFunctionality::ApplicationServer),
+            cause_code: Some(0),
+            ..Default::default()
+        };
+        let sms = SmsChargingData {
+            originator_address: Some("0015551234001".into()),
+            recipient_address: Some("0015551234002".into()),
+            sm_message_type: Some(0),
+            ..Default::default()
+        };
+        let mut params = AccountingParams::new(AccountingRecordType::EventRecord);
+        params.ims_data = Some(&ims);
+        params.sms_data = Some(&sms);
+
+        let payload = encode_acr_payload(
+            "ipsmgw.example.com",
+            "example.com",
+            "example.com",
+            None,
+            "cdf;hybrid;event;1",
+            &params,
+        );
+        let wire = encode_diameter_message(
+            FLAG_REQUEST | FLAG_PROXIABLE,
+            dictionary::CMD_ACCOUNTING,
+            dictionary::RF_APP_ID,
+            1,
+            2,
+            &payload,
+        );
+        let decoded = decode_diameter(&wire).unwrap();
+
+        // Multiple Service-Information AVPs decode to an array
+        let svc = decoded
+            .avps
+            .get("Service-Information")
+            .expect("Service-Information array");
+        let entries = svc.as_array().expect("two Service-Information AVPs");
+        assert_eq!(entries.len(), 2);
+        let has_ims = entries.iter().any(|e| e.get("IMS-Information").is_some());
+        let has_sms = entries.iter().any(|e| e.get("SMS-Information").is_some());
+        assert!(has_ims, "IMS-Information envelope must be present");
+        assert!(has_sms, "SMS-Information envelope must be present");
     }
 }

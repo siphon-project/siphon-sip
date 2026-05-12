@@ -425,6 +425,263 @@ impl ImsChargingData {
     }
 }
 
+// ── SMS charging information ────────────────────────────────────────────
+
+/// SMS-specific charging data carried in `Service-Information →
+/// SMS-Information` per TS 32.299 §7.2.79.  Used by Rf (offline)
+/// charging for SIP-MESSAGE-based SMS, SMPP-bridged SMS, and SS7
+/// MO/MT-Forward-SM events emitted by an IP-SM-GW / SMS-Router.
+///
+/// Every field is optional — populate only what the originating node
+/// actually has.  Address-Type for the four party-address fields is
+/// pinned to MSISDN (1) which is what every CDR collector renders as
+/// the calling/called party for SMS; if a deployment needs the other
+/// Address-Type values (1=MSISDN, 2=IPv4, 3=IPv6, 4=NAI, …) extend
+/// the API rather than changing the constant here.
+#[derive(Debug, Clone, Default)]
+pub struct SmsChargingData {
+    /// Calling party — emitted as `Originator-Received-Address (2027)`
+    /// grouped AVP containing `Address-Type=MSISDN (1) + Address-Data`.
+    /// This is what CDR collectors render as the SMS calling party.
+    pub originator_address: Option<String>,
+    /// Called party — emitted inside `Recipient-Info (2026)` as
+    /// `Recipient-Address (1201)` grouped with the same Address-Type +
+    /// Address-Data shape as the originator.
+    pub recipient_address: Option<String>,
+
+    /// SCCP-layer calling address (TS 32.299 §7.2.119), typed `Address`.
+    /// Only meaningful for SS7-bridged paths; omit for pure IP-SM-GW.
+    pub originator_sccp_address: Option<std::net::IpAddr>,
+    /// SCCP-layer called address (TS 32.299 §7.2.151) — emitted inside
+    /// `Recipient-Info (2026)` so it stays grouped with the recipient.
+    pub recipient_sccp_address: Option<std::net::IpAddr>,
+
+    /// `SM-Message-Type (2007)` (TS 32.299 §7.2.171) — Enumerated.
+    /// 0=SUBMISSION, 1=DELIVERY_REPORT, 2=SM_SERVICE_REQUEST,
+    /// 3=T4_DEVICE_TRIGGER, 4=SM_DEVICE_TRIGGER.
+    pub sm_message_type: Option<u32>,
+    /// `Reply-Path-Requested (2011)` (TS 32.299 §7.2.165) — Enumerated.
+    /// 0=No_Reply_Path_Set, 1=Reply_Path_Set.
+    pub reply_path_requested: Option<u32>,
+    /// `SM-User-Data-Header (2015)` (TS 32.299 §7.2.172) — OctetString,
+    /// raw bytes of the TP-UDH (concatenated-SMS / port-number headers).
+    pub sm_user_data_header: Option<Vec<u8>>,
+    /// `SM-Service-Type (2029)` (TS 32.299 §7.2.170) — Enumerated.
+    /// 0=VAS4SMS_Short_Message_content_processing,
+    /// 1=VAS4SMS_Short_Message_forwarding, 2=…_forwarding_multiple_subscriptions,
+    /// 3=…_filtering, 4=…_receipt, 5=…_network_storage,
+    /// 6=…_to_multiple_destinations, 7=…_virtual_private_network,
+    /// 8=…_auto_reply, 9=…_personal_signature, 10=…_deferred_delivery.
+    pub sm_service_type: Option<u32>,
+    /// `SMS-Node (2016)` (TS 32.299 §7.2.169) — Enumerated.
+    /// 0=SMS_Router, 1=IP_SM_GW, 2=SMS_Router_and_IP_SM_GW,
+    /// 3=SMS_Service_Centre.
+    pub sms_node: Option<u32>,
+    /// `SM-Discharge-Time (2012)` — Time AVP, when the SM was delivered
+    /// to or received by the recipient.
+    pub sm_discharge_time: Option<std::time::SystemTime>,
+    /// `Number-of-Messages-Sent (2019)` — Unsigned32, count of
+    /// concatenated SMS segments billed by this record.
+    pub number_of_messages_sent: Option<u32>,
+    /// `Client-Address (2018)` — Address AVP, the originating
+    /// IP-SM-GW / MTC-IWF / SMSC client address.
+    pub client_address: Option<std::net::IpAddr>,
+    /// `Data-Coding-Scheme (2001)` — Integer32, GSM TS 23.038 DCS octet.
+    pub data_coding_scheme: Option<i32>,
+    /// `SMS-Result (3408)` (TS 32.299 §7.2.211) — Unsigned32 result
+    /// code for the SMS submission/delivery attempt. 0=Success;
+    /// non-zero values map to the SMS-Result enumeration (typically
+    /// surfaced from the SM-RP-CAUSE / Mobile Application Part cause).
+    pub sms_result: Option<u32>,
+
+    /// `SM-Protocol-ID (2013)` — OctetString, GSM TS 23.040 TP-PID octet.
+    pub sm_protocol_id: Option<Vec<u8>>,
+    /// `SM-Status (2014)` — OctetString, GSM TS 23.040 TP-Status octet
+    /// from a delivery report.
+    pub sm_status: Option<Vec<u8>>,
+
+    /// `Application-Port-Identifier (3010)` — Unsigned32, destination
+    /// application port for WAP-Push / WDP / WBXML SMS.
+    pub application_port_identifier: Option<u32>,
+    /// `External-Identifier (3111)` — UTF8String, 3GPP external
+    /// identifier of the served MTC subscriber (TS 23.682).
+    pub external_identifier: Option<String>,
+
+    /// `SM-Device-Trigger-Indicator (3407)` — Enumerated.  0=Not_Trigger,
+    /// 1=Trigger (TS 32.299 §7.2.169a).
+    pub sm_device_trigger_indicator: Option<u32>,
+    /// `MTC-IWF-Address (3413)` — Address AVP, identity of the
+    /// originating MTC-IWF when this SM is a device-trigger.
+    pub mtc_iwf_address: Option<std::net::IpAddr>,
+
+    /// Originating IOI (TS 32.299 §7.2.71, RFC 7315 §5.6).  Emitted
+    /// inside `Inter-Operator-Identifier (838)` grouped AVP at the
+    /// SMS-Information level — same AVP shape as inside IMS-Information.
+    pub originating_ioi: Option<String>,
+    /// Terminating IOI — pair to [`Self::originating_ioi`].
+    pub terminating_ioi: Option<String>,
+
+    /// `User-Session-Id (830)` — typically the SIP Call-ID for
+    /// SIP-MESSAGE-based SMS.  Carried directly under
+    /// `Service-Information` alongside the SMS-Information grouped AVP.
+    pub user_session_id: Option<String>,
+}
+
+impl SmsChargingData {
+    /// Encode an `Address-Type + Address-Data` grouped child for either
+    /// `Originator-Received-Address (2027)` or `Recipient-Address (1201)`.
+    /// Address-Type is pinned to MSISDN (1) which is what every CDR
+    /// collector renders as the calling/called party for SMS.
+    fn encode_party_address_children(value: &str) -> Vec<u8> {
+        let mut children = Vec::with_capacity(32);
+        children.extend_from_slice(&encode_avp_u32_3gpp(avp::ADDRESS_TYPE, 1)); // MSISDN
+        children.extend_from_slice(&encode_avp_utf8_3gpp(avp::ADDRESS_DATA, value));
+        children
+    }
+
+    /// Encode the `SMS-Information (2000)` grouped AVP body
+    /// per TS 32.299 §7.2.79.  Field order follows the spec's ABNF.
+    fn encode_sms_information(&self) -> Vec<u8> {
+        let mut sms_inner = Vec::new();
+
+        if let Some(node) = self.sms_node {
+            sms_inner.extend_from_slice(&encode_avp_u32_3gpp(avp::SMS_NODE, node));
+        }
+        if let Some(addr) = self.client_address {
+            sms_inner.extend_from_slice(&encode_avp_address_3gpp(avp::CLIENT_ADDRESS, addr));
+        }
+        if let Some(addr) = self.originator_sccp_address {
+            sms_inner.extend_from_slice(&encode_avp_address_3gpp(
+                avp::ORIGINATOR_SCCP_ADDRESS,
+                addr,
+            ));
+        }
+        if let Some(dcs) = self.data_coding_scheme {
+            sms_inner.extend_from_slice(&encode_avp_i32_3gpp(avp::DATA_CODING_SCHEME, dcs));
+        }
+        if let Some(time) = self.sm_discharge_time {
+            sms_inner.extend_from_slice(&encode_avp_time_3gpp(avp::SM_DISCHARGE_TIME, time));
+        }
+        if let Some(message_type) = self.sm_message_type {
+            sms_inner.extend_from_slice(&encode_avp_u32_3gpp(avp::SM_MESSAGE_TYPE, message_type));
+        }
+        if let Some(ref pid) = self.sm_protocol_id {
+            sms_inner.extend_from_slice(&encode_avp_octet_3gpp(avp::SM_PROTOCOL_ID, pid));
+        }
+        if let Some(reply_path) = self.reply_path_requested {
+            sms_inner.extend_from_slice(&encode_avp_u32_3gpp(avp::REPLY_PATH_REQUESTED, reply_path));
+        }
+        if let Some(ref status) = self.sm_status {
+            sms_inner.extend_from_slice(&encode_avp_octet_3gpp(avp::SM_STATUS, status));
+        }
+        if let Some(ref udh) = self.sm_user_data_header {
+            sms_inner.extend_from_slice(&encode_avp_octet_3gpp(avp::SM_USER_DATA_HEADER, udh));
+        }
+        if let Some(count) = self.number_of_messages_sent {
+            sms_inner.extend_from_slice(&encode_avp_u32_3gpp(avp::NUMBER_OF_MESSAGES_SENT, count));
+        }
+
+        // Recipient-Info (2026) grouped — wraps the called-party
+        // address children (Recipient-Address + Recipient-SCCP-Address).
+        if self.recipient_address.is_some() || self.recipient_sccp_address.is_some() {
+            let mut recipient_info = Vec::new();
+            if let Some(ref addr) = self.recipient_address {
+                let children = Self::encode_party_address_children(addr);
+                recipient_info.extend_from_slice(&encode_avp_grouped_3gpp(
+                    avp::RECIPIENT_ADDRESS,
+                    &children,
+                ));
+            }
+            if let Some(sccp) = self.recipient_sccp_address {
+                recipient_info.extend_from_slice(&encode_avp_address_3gpp(
+                    avp::RECIPIENT_SCCP_ADDRESS,
+                    sccp,
+                ));
+            }
+            sms_inner.extend_from_slice(&encode_avp_grouped_3gpp(
+                avp::RECIPIENT_INFO,
+                &recipient_info,
+            ));
+        }
+
+        // Originator-Received-Address (2027) grouped — Address-Type +
+        // Address-Data envelope for the calling party.
+        if let Some(ref addr) = self.originator_address {
+            let children = Self::encode_party_address_children(addr);
+            sms_inner.extend_from_slice(&encode_avp_grouped_3gpp(
+                avp::ORIGINATOR_RECEIVED_ADDRESS,
+                &children,
+            ));
+        }
+
+        if let Some(service_type) = self.sm_service_type {
+            sms_inner.extend_from_slice(&encode_avp_u32_3gpp(avp::SM_SERVICE_TYPE, service_type));
+        }
+        if let Some(result) = self.sms_result {
+            sms_inner.extend_from_slice(&encode_avp_u32_3gpp(avp::SMS_RESULT, result));
+        }
+        if let Some(trigger) = self.sm_device_trigger_indicator {
+            sms_inner.extend_from_slice(&encode_avp_u32_3gpp(
+                avp::SM_DEVICE_TRIGGER_INDICATOR,
+                trigger,
+            ));
+        }
+        if let Some(addr) = self.mtc_iwf_address {
+            sms_inner.extend_from_slice(&encode_avp_address_3gpp(avp::MTC_IWF_ADDRESS, addr));
+        }
+        if let Some(port) = self.application_port_identifier {
+            sms_inner.extend_from_slice(&encode_avp_u32_3gpp(
+                avp::APPLICATION_PORT_IDENTIFIER,
+                port,
+            ));
+        }
+        if let Some(ref ext_id) = self.external_identifier {
+            sms_inner
+                .extend_from_slice(&encode_avp_utf8_3gpp(avp::EXTERNAL_IDENTIFIER, ext_id));
+        }
+
+        // Inter-Operator-Identifier (838) grouped — same shape as inside
+        // IMS-Information.  Permitted at the SMS-Information level per
+        // TS 32.299 §7.2.71 for inter-operator SMS settlement.
+        if self.originating_ioi.is_some() || self.terminating_ioi.is_some() {
+            let mut ioi_children = Vec::new();
+            if let Some(ref orig) = self.originating_ioi {
+                ioi_children
+                    .extend_from_slice(&encode_avp_utf8_3gpp(avp::ORIGINATING_IOI, orig));
+            }
+            if let Some(ref term) = self.terminating_ioi {
+                ioi_children
+                    .extend_from_slice(&encode_avp_utf8_3gpp(avp::TERMINATING_IOI, term));
+            }
+            sms_inner.extend_from_slice(&encode_avp_grouped_3gpp(
+                avp::INTER_OPERATOR_IDENTIFIER,
+                &ioi_children,
+            ));
+        }
+
+        sms_inner
+    }
+
+    /// Encode the full `Service-Information → SMS-Information` grouped
+    /// AVP chain.  `User-Session-Id` (when set) lives directly under
+    /// Service-Information alongside the SMS-Information envelope, the
+    /// same place IMS-Information puts it.
+    pub fn encode_service_information(&self) -> Vec<u8> {
+        let sms_info = self.encode_sms_information();
+        let mut service_info = encode_avp_grouped_3gpp(avp::SMS_INFORMATION, &sms_info);
+        if let Some(ref session_id) = self.user_session_id {
+            service_info
+                .extend_from_slice(&encode_avp_utf8_3gpp(avp::USER_SESSION_ID, session_id));
+        }
+        let mut wrapped = Vec::with_capacity(service_info.len() + 16);
+        wrapped.extend_from_slice(&encode_avp_grouped_3gpp(
+            avp::SERVICE_INFORMATION,
+            &service_info,
+        ));
+        wrapped
+    }
+}
+
 // ── Credit-Control Answer (parsed) ──────────────────────────────────────
 
 /// Parsed Credit-Control-Answer from the OCS.
@@ -1207,5 +1464,207 @@ mod tests {
     #[test]
     fn ro_command_code_rfc4006() {
         assert_eq!(dictionary::CMD_CREDIT_CONTROL, 272);
+    }
+
+    // ── SMS-Information (TS 32.299 §7.2.79) ────────────────────────────
+
+    /// Roundtrip helper: wrap an `SmsChargingData` Service-Information
+    /// block in a minimal ACR-EVENT envelope and decode it.
+    fn decode_sms_service_info(data: &SmsChargingData) -> serde_json::Value {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "test;sess"));
+        payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "scscf.example.com"));
+        payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "example.com"));
+        payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_REALM, "example.com"));
+        payload.extend_from_slice(&encode_avp_u32(avp::ACCT_APPLICATION_ID, dictionary::RF_APP_ID));
+        payload.extend_from_slice(&encode_avp_u32(avp::ACCOUNTING_RECORD_TYPE, 1));
+        payload.extend_from_slice(&encode_avp_u32(avp::ACCOUNTING_RECORD_NUMBER, 0));
+        payload.extend_from_slice(&data.encode_service_information());
+        let wire = encode_diameter_message(
+            FLAG_REQUEST | FLAG_PROXIABLE,
+            dictionary::CMD_ACCOUNTING,
+            dictionary::RF_APP_ID,
+            1,
+            2,
+            &payload,
+        );
+        decode_diameter(&wire).unwrap().avps
+    }
+
+    #[test]
+    fn sms_charging_data_minimal_addresses() {
+        // Bare-bones SMS event with only calling/called numbers and message type
+        let data = SmsChargingData {
+            originator_address: Some("0015551234001".into()),
+            recipient_address: Some("0015551234002".into()),
+            sm_message_type: Some(0), // SUBMISSION
+            ..Default::default()
+        };
+        let avps = decode_sms_service_info(&data);
+        let svc_info = avps.get("Service-Information").expect("Service-Information");
+        let sms_info = svc_info.get("SMS-Information").expect("SMS-Information");
+
+        // SM-Message-Type lives flat under SMS-Information
+        assert_eq!(
+            sms_info.get("SM-Message-Type").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+
+        // Originator-Received-Address (calling party) — grouped with
+        // Address-Type=1 (MSISDN) + Address-Data
+        let orig_addr = sms_info
+            .get("Originator-Received-Address")
+            .expect("Originator-Received-Address");
+        assert_eq!(orig_addr.get("Address-Type").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            orig_addr.get("Address-Data").and_then(|v| v.as_str()),
+            Some("0015551234001")
+        );
+
+        // Recipient-Info → Recipient-Address (called party) — same shape
+        let recip_info = sms_info.get("Recipient-Info").expect("Recipient-Info");
+        let recip_addr = recip_info
+            .get("Recipient-Address")
+            .expect("Recipient-Address inside Recipient-Info");
+        assert_eq!(
+            recip_addr.get("Address-Type").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            recip_addr.get("Address-Data").and_then(|v| v.as_str()),
+            Some("0015551234002")
+        );
+    }
+
+    #[test]
+    fn sms_charging_data_full_envelope() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let data = SmsChargingData {
+            originator_address: Some("0015551234001".into()),
+            recipient_address: Some("0015551234002".into()),
+            originator_sccp_address: Some("10.0.0.1".parse().unwrap()),
+            recipient_sccp_address: Some("10.0.0.2".parse().unwrap()),
+            sm_message_type: Some(0),
+            reply_path_requested: Some(0),
+            sm_user_data_header: Some(vec![0x05, 0x00, 0x03, 0x42, 0x02, 0x01]),
+            sm_service_type: Some(1),
+            sms_node: Some(1), // IP-SM-GW
+            sm_discharge_time: Some(UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            number_of_messages_sent: Some(1),
+            client_address: Some("10.0.0.3".parse().unwrap()),
+            data_coding_scheme: Some(0),
+            sms_result: Some(0),
+            sm_protocol_id: Some(vec![0x00]),
+            sm_status: Some(vec![0x40]),
+            application_port_identifier: Some(8080),
+            external_identifier: None,
+            sm_device_trigger_indicator: Some(0),
+            mtc_iwf_address: None,
+            originating_ioi: Some("orig.example.com".into()),
+            terminating_ioi: Some("term.example.com".into()),
+            user_session_id: Some("call-id-abc-123".into()),
+        };
+        let avps = decode_sms_service_info(&data);
+        let svc_info = avps.get("Service-Information").expect("Service-Information");
+        let sms_info = svc_info.get("SMS-Information").expect("SMS-Information");
+
+        assert_eq!(sms_info.get("SMS-Node").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            sms_info.get("Client-Address").and_then(|v| v.as_str()),
+            Some("10.0.0.3")
+        );
+        assert_eq!(
+            sms_info.get("Originator-SCCP-Address").and_then(|v| v.as_str()),
+            Some("10.0.0.1")
+        );
+        assert_eq!(
+            sms_info.get("Data-Coding-Scheme").and_then(|v| v.as_i64()),
+            Some(0)
+        );
+        assert_eq!(
+            sms_info.get("SM-Discharge-Time").and_then(|v| v.as_u64()),
+            Some(1_700_000_000)
+        );
+        assert_eq!(
+            sms_info.get("SM-Message-Type").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            sms_info.get("Reply-Path-Requested").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            sms_info.get("Number-of-Messages-Sent").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            sms_info.get("SM-Service-Type").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(sms_info.get("SMS-Result").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(
+            sms_info
+                .get("Application-Port-Identifier")
+                .and_then(|v| v.as_u64()),
+            Some(8080)
+        );
+
+        // Recipient-Info carries both the address grouping and the SCCP addr
+        let recip_info = sms_info.get("Recipient-Info").expect("Recipient-Info");
+        assert_eq!(
+            recip_info
+                .get("Recipient-SCCP-Address")
+                .and_then(|v| v.as_str()),
+            Some("10.0.0.2")
+        );
+
+        // Inter-Operator-Identifier mirrors the IMS-Information shape
+        let ioi = sms_info
+            .get("Inter-Operator-Identifier")
+            .expect("Inter-Operator-Identifier");
+        assert_eq!(
+            ioi.get("Originating-IOI").and_then(|v| v.as_str()),
+            Some("orig.example.com")
+        );
+        assert_eq!(
+            ioi.get("Terminating-IOI").and_then(|v| v.as_str()),
+            Some("term.example.com")
+        );
+
+        // User-Session-Id sits at Service-Information level (not inside SMS-Information)
+        assert_eq!(
+            svc_info.get("User-Session-Id").and_then(|v| v.as_str()),
+            Some("call-id-abc-123")
+        );
+    }
+
+    #[test]
+    fn sms_charging_data_empty_emits_nothing_meaningful() {
+        // Default-empty must still emit a Service-Information wrapper with
+        // an SMS-Information envelope — callers gate emission upstream.
+        let data = SmsChargingData::default();
+        let encoded = data.encode_service_information();
+        assert!(!encoded.is_empty());
+        // Outer AVP code must be Service-Information (873)
+        let code = u32::from_be_bytes([encoded[0], encoded[1], encoded[2], encoded[3]]);
+        assert_eq!(code, avp::SERVICE_INFORMATION);
+    }
+
+    #[test]
+    fn sms_charging_data_ipv6_addresses() {
+        let data = SmsChargingData {
+            client_address: Some("2001:db8::1".parse().unwrap()),
+            sm_message_type: Some(0),
+            ..Default::default()
+        };
+        let avps = decode_sms_service_info(&data);
+        let sms_info = avps
+            .get("Service-Information")
+            .and_then(|s| s.get("SMS-Information"))
+            .expect("SMS-Information");
+        assert_eq!(
+            sms_info.get("Client-Address").and_then(|v| v.as_str()),
+            Some("2001:db8::1")
+        );
     }
 }

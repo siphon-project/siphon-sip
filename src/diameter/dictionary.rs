@@ -219,6 +219,10 @@ static AVP_TABLE: &[AvpDef] = &[
     AvpDef { code: 873,  vendor_id: TGPP, name: "Service-Information",                data_type: AvpType::Grouped },
     AvpDef { code: 874,  vendor_id: TGPP, name: "PS-Information",                     data_type: AvpType::Grouped },
     AvpDef { code: 876,  vendor_id: TGPP, name: "IMS-Information",                    data_type: AvpType::Grouped },
+    // Address Address-Type / Address-Data envelope (TS 32.299 §7.2.8/§7.2.9)
+    AvpDef { code: 886,  vendor_id: TGPP, name: "Originator-Address",                 data_type: AvpType::Grouped },
+    AvpDef { code: 897,  vendor_id: TGPP, name: "Address-Data",                       data_type: AvpType::UTF8String },
+    AvpDef { code: 899,  vendor_id: TGPP, name: "Address-Type",                       data_type: AvpType::Enumerated },
     // Gx (TS 29.212) — codes per 3GPP / HSS crate reference
     AvpDef { code: 1000, vendor_id: TGPP, name: "Bearer-Usage",                       data_type: AvpType::Enumerated },
     AvpDef { code: 1001, vendor_id: TGPP, name: "Charging-Rule-Install",              data_type: AvpType::Grouped },
@@ -257,13 +261,40 @@ static AVP_TABLE: &[AvpDef] = &[
     AvpDef { code: 1048, vendor_id: TGPP, name: "Pre-emption-Vulnerability",          data_type: AvpType::Enumerated },
     AvpDef { code: 1049, vendor_id: TGPP, name: "Default-EPS-Bearer-QoS",             data_type: AvpType::Grouped },
     AvpDef { code: 1050, vendor_id: TGPP, name: "AN-GW-Address",                      data_type: AvpType::Address },
+    // SMS-Information envelope: Recipient-Address (TS 32.299 §7.2.155)
+    AvpDef { code: 1201, vendor_id: TGPP, name: "Recipient-Address",                  data_type: AvpType::Grouped },
     // S6c served-node identifiers (TS 29.336 / 29.272)
     AvpDef { code: 1489, vendor_id: TGPP, name: "SGSN-Number",                        data_type: AvpType::OctetString },
     AvpDef { code: 1645, vendor_id: TGPP, name: "MME-Number-for-MT-SMS",              data_type: AvpType::OctetString },
+    // SMS-Information block (TS 32.299 §7.2.79 / §7.2.158 / §7.2.171)
+    AvpDef { code: 2000, vendor_id: TGPP, name: "SMS-Information",                    data_type: AvpType::Grouped },
+    AvpDef { code: 2001, vendor_id: TGPP, name: "Data-Coding-Scheme",                 data_type: AvpType::Integer32 },
     // Gy (TS 32.299)
     AvpDef { code: 2006, vendor_id: TGPP, name: "Multiple-Services-Credit-Control",   data_type: AvpType::Grouped },
+    AvpDef { code: 2007, vendor_id: TGPP, name: "SM-Message-Type",                    data_type: AvpType::Enumerated },
+    AvpDef { code: 2008, vendor_id: TGPP, name: "Originator-SCCP-Address",            data_type: AvpType::Address },
+    AvpDef { code: 2009, vendor_id: TGPP, name: "Originator-Interface",               data_type: AvpType::Grouped },
+    AvpDef { code: 2010, vendor_id: TGPP, name: "Recipient-SCCP-Address",             data_type: AvpType::Address },
+    AvpDef { code: 2011, vendor_id: TGPP, name: "Reply-Path-Requested",               data_type: AvpType::Enumerated },
+    AvpDef { code: 2012, vendor_id: TGPP, name: "SM-Discharge-Time",                  data_type: AvpType::Time },
+    AvpDef { code: 2013, vendor_id: TGPP, name: "SM-Protocol-ID",                     data_type: AvpType::OctetString },
+    AvpDef { code: 2014, vendor_id: TGPP, name: "SM-Status",                          data_type: AvpType::OctetString },
+    AvpDef { code: 2015, vendor_id: TGPP, name: "SM-User-Data-Header",                data_type: AvpType::OctetString },
+    AvpDef { code: 2016, vendor_id: TGPP, name: "SMS-Node",                           data_type: AvpType::Enumerated },
+    AvpDef { code: 2017, vendor_id: TGPP, name: "Interface-Id",                       data_type: AvpType::UTF8String },
+    AvpDef { code: 2018, vendor_id: TGPP, name: "Client-Address",                     data_type: AvpType::Address },
+    AvpDef { code: 2019, vendor_id: TGPP, name: "Number-of-Messages-Sent",            data_type: AvpType::Unsigned32 },
+    AvpDef { code: 2024, vendor_id: TGPP, name: "Interface-Text",                     data_type: AvpType::UTF8String },
+    AvpDef { code: 2025, vendor_id: TGPP, name: "Interface-Type",                     data_type: AvpType::Enumerated },
+    AvpDef { code: 2026, vendor_id: TGPP, name: "Recipient-Info",                     data_type: AvpType::Grouped },
+    AvpDef { code: 2027, vendor_id: TGPP, name: "Originator-Received-Address",        data_type: AvpType::Grouped },
+    AvpDef { code: 2028, vendor_id: TGPP, name: "Recipient-Received-Address",         data_type: AvpType::Grouped },
+    AvpDef { code: 2029, vendor_id: TGPP, name: "SM-Service-Type",                    data_type: AvpType::Enumerated },
     // Charging — Visited Network Identifier (TS 32.299 §7.2.74)
     AvpDef { code: 2713, vendor_id: TGPP, name: "IMS-Visited-Network-Identifier",     data_type: AvpType::UTF8String },
+    // SMS-Information extras (TS 32.299 §7.2.79) interleaved with S6c codes by code order
+    AvpDef { code: 3010, vendor_id: TGPP, name: "Application-Port-Identifier",        data_type: AvpType::Unsigned32 },
+    AvpDef { code: 3111, vendor_id: TGPP, name: "External-Identifier",                data_type: AvpType::UTF8String },
     // S6c (TS 29.336) and SGd (TS 29.338) — SMS over Diameter
     AvpDef { code: 3300, vendor_id: TGPP, name: "SC-Address",                         data_type: AvpType::OctetString },
     AvpDef { code: 3301, vendor_id: TGPP, name: "SM-RP-UI",                           data_type: AvpType::OctetString },
@@ -271,6 +302,11 @@ static AVP_TABLE: &[AvpDef] = &[
     AvpDef { code: 3316, vendor_id: TGPP, name: "SM-Delivery-Outcome",                data_type: AvpType::Grouped },
     AvpDef { code: 3324, vendor_id: TGPP, name: "SMSMI-Correlation-ID",               data_type: AvpType::Grouped },
     AvpDef { code: 3332, vendor_id: TGPP, name: "SMS-GMSC-Address",                   data_type: AvpType::Address },
+    // SMS-Information device-trigger / result extras (TS 32.299 §7.2.79)
+    AvpDef { code: 3405, vendor_id: TGPP, name: "SM-Device-Trigger-Information",      data_type: AvpType::Grouped },
+    AvpDef { code: 3407, vendor_id: TGPP, name: "SM-Device-Trigger-Indicator",        data_type: AvpType::Enumerated },
+    AvpDef { code: 3408, vendor_id: TGPP, name: "SMS-Result",                         data_type: AvpType::Unsigned32 },
+    AvpDef { code: 3413, vendor_id: TGPP, name: "MTC-IWF-Address",                    data_type: AvpType::Address },
 ];
 
 /// Look up an AVP definition by (code, vendor_id).
@@ -728,6 +764,39 @@ pub mod avp {
     pub const SM_DELIVERY_OUTCOME: u32 = 3316;
     pub const SMSMI_CORRELATION_ID: u32 = 3324;
     pub const SMS_GMSC_ADDRESS: u32 = 3332;
+
+    // 3GPP SMS-Information (TS 32.299 §7.2.79) — IMS SMS offline charging
+    pub const ORIGINATOR_ADDRESS: u32 = 886;
+    pub const ADDRESS_DATA: u32 = 897;
+    pub const ADDRESS_TYPE: u32 = 899;
+    pub const RECIPIENT_ADDRESS: u32 = 1201;
+    pub const SMS_INFORMATION: u32 = 2000;
+    pub const DATA_CODING_SCHEME: u32 = 2001;
+    pub const SM_MESSAGE_TYPE: u32 = 2007;
+    pub const ORIGINATOR_SCCP_ADDRESS: u32 = 2008;
+    pub const ORIGINATOR_INTERFACE: u32 = 2009;
+    pub const RECIPIENT_SCCP_ADDRESS: u32 = 2010;
+    pub const REPLY_PATH_REQUESTED: u32 = 2011;
+    pub const SM_DISCHARGE_TIME: u32 = 2012;
+    pub const SM_PROTOCOL_ID: u32 = 2013;
+    pub const SM_STATUS: u32 = 2014;
+    pub const SM_USER_DATA_HEADER: u32 = 2015;
+    pub const SMS_NODE: u32 = 2016;
+    pub const INTERFACE_ID: u32 = 2017;
+    pub const CLIENT_ADDRESS: u32 = 2018;
+    pub const NUMBER_OF_MESSAGES_SENT: u32 = 2019;
+    pub const INTERFACE_TEXT: u32 = 2024;
+    pub const INTERFACE_TYPE: u32 = 2025;
+    pub const RECIPIENT_INFO: u32 = 2026;
+    pub const ORIGINATOR_RECEIVED_ADDRESS: u32 = 2027;
+    pub const RECIPIENT_RECEIVED_ADDRESS: u32 = 2028;
+    pub const SM_SERVICE_TYPE: u32 = 2029;
+    pub const APPLICATION_PORT_IDENTIFIER: u32 = 3010;
+    pub const EXTERNAL_IDENTIFIER: u32 = 3111;
+    pub const SM_DEVICE_TRIGGER_INFORMATION: u32 = 3405;
+    pub const SM_DEVICE_TRIGGER_INDICATOR: u32 = 3407;
+    pub const SMS_RESULT: u32 = 3408;
+    pub const MTC_IWF_ADDRESS: u32 = 3413;
 }
 
 #[cfg(test)]

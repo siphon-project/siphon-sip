@@ -384,6 +384,24 @@ pub fn encode_avp_address_ipv4(code: u32, ip: std::net::Ipv4Addr) -> Vec<u8> {
     encode_avp(code, AVP_FLAG_MANDATORY, &data)
 }
 
+/// Encode an Address AVP (IPv4 or IPv6) with 3GPP vendor.  Used by the
+/// SMS-Information block for SCCP / Client / MTC-IWF addresses
+/// (TS 32.299 §7.2.79).
+pub fn encode_avp_address_3gpp(code: u32, ip: std::net::IpAddr) -> Vec<u8> {
+    let mut data = Vec::with_capacity(18);
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            data.extend_from_slice(&1u16.to_be_bytes()); // Address family: IPv4
+            data.extend_from_slice(&v4.octets());
+        }
+        std::net::IpAddr::V6(v6) => {
+            data.extend_from_slice(&2u16.to_be_bytes()); // Address family: IPv6
+            data.extend_from_slice(&v6.octets());
+        }
+    }
+    encode_avp_vendor(code, AVP_FLAG_MANDATORY, dictionary::VENDOR_3GPP, &data)
+}
+
 /// Encode a Vendor-Specific-Application-Id grouped AVP.
 pub fn encode_vendor_specific_app_id(vendor_id: u32, auth_app_id: u32) -> Vec<u8> {
     let mut children = Vec::new();
