@@ -2468,20 +2468,42 @@ fn relay_request(
     // SA pair — if so, the source (and therefore Via) must reflect the
     // matching P-CSCF port (e.g. `pcscf_port_c` for an MT INVITE landing
     // on the UE's `port_us`) rather than the default per-transport
-    // via_host / listener (3GPP TS 33.203 §6.3 / §7.4).
+    // via_host / listener (3GPP TS 33.203 §6.3 / §7.4).  The SA's
+    // pinned protocol (UDP/TCP, TS 33.203 §7.2) also overrides whatever
+    // transport the URI / inbound suggested: in-dialog BYE/UPDATE often
+    // routes via a cached Contact that lacks `;transport=`, and the
+    // kernel XFRM selector silently drops every protected frame whose
+    // upper-layer protocol doesn't match.  Initial INVITE works without
+    // this pin because the script stamps the Path; in-dialog re-uses
+    // the dialog route set and that stamp is gone.
     //
     // Applies to both UDP (ESP-over-UDP, the common case) and TCP
-    // (ESP-over-TCP, TS 33.203 §7.2 — used by some iOS clients).  For
-    // TCP this also drives `pool.send_tcp_from(source, ...)` so the
-    // outbound socket binds to the SA's source endpoint instead of
-    // ephemeral; an ephemerally-bound socket would never match the
-    // kernel selector for SA #3.  Returns `None` for non-IPsec
-    // deployments and ordinary destinations — zero impact on the hot
-    // path when no IpsecManager is wired.  Computed once here and
-    // reused for Via construction and the outbound send.
+    // (ESP-over-TCP, used by some iOS clients).  For TCP the source
+    // also drives `pool.send_tcp_from(source, ...)` so the outbound
+    // socket binds to the SA's source endpoint instead of ephemeral;
+    // an ephemerally-bound socket would never match the kernel
+    // selector for SA #3.  Returns `None` for non-IPsec deployments
+    // and ordinary destinations — zero impact on the hot path when
+    // no IpsecManager is wired.  Computed once here and reused for
+    // Via construction and the outbound send.
     let ipsec_source = match outbound_transport {
         Transport::Udp | Transport::Tcp => {
-            crate::script::api::ipsec::outbound_local_addr_for(destination)
+            if let Some((source, sa_transport)) =
+                crate::script::api::ipsec::outbound_for(destination)
+            {
+                if sa_transport != outbound_transport {
+                    debug!(
+                        %destination,
+                        from = %outbound_transport,
+                        to = %sa_transport,
+                        "IPsec: pinning outbound transport to SA protocol",
+                    );
+                    outbound_transport = sa_transport;
+                }
+                Some(source)
+            } else {
+                None
+            }
         }
         _ => None,
     };
@@ -4307,16 +4329,47 @@ fn resolve_in_dialog_destination(
     fallback_addr: SocketAddr,
     fallback_transport: Transport,
 ) -> (SocketAddr, Transport) {
-    if let Some(uri_str) = first_route_uri(route_set) {
+    let (destination, mut transport) = if let Some(uri_str) = first_route_uri(route_set) {
         if let Some(target) = resolve_target(&uri_str, &state.dns_resolver) {
-            return (target.address, target.transport.unwrap_or(fallback_transport));
+            (target.address, target.transport.unwrap_or(fallback_transport))
+        } else {
+            warn!(
+                route = %route_set[0],
+                "B2BUA: failed to resolve in-dialog Route — falling back to cached destination",
+            );
+            (fallback_addr, fallback_transport)
         }
-        warn!(
-            route = %route_set[0],
-            "B2BUA: failed to resolve in-dialog Route — falling back to cached destination",
-        );
+    } else {
+        (fallback_addr, fallback_transport)
+    };
+
+    // IPsec SA transport pin (3GPP TS 33.203 §7.2).  When the
+    // destination matches a registered UE binding, the SA's pinned
+    // protocol (UDP vs TCP) overrides whatever the dialog route set
+    // or cached transport selected.  In-dialog requests (BYE, UPDATE,
+    // in-dialog re-INVITE) often arrive with a Route URI / cached
+    // Contact that lacks `;transport=`, and the kernel XFRM selector
+    // silently drops every protected frame whose upper-layer protocol
+    // doesn't match.  Returns `None` for non-IPsec deployments and
+    // ordinary destinations — zero impact when no IpsecManager is
+    // wired.
+    if matches!(transport, Transport::Udp | Transport::Tcp) {
+        if let Some((_, sa_transport)) =
+            crate::script::api::ipsec::outbound_for(destination)
+        {
+            if sa_transport != transport {
+                debug!(
+                    %destination,
+                    from = %transport,
+                    to = %sa_transport,
+                    "IPsec: pinning B2BUA in-dialog transport to SA protocol",
+                );
+                transport = sa_transport;
+            }
+        }
     }
-    (fallback_addr, fallback_transport)
+
+    (destination, transport)
 }
 
 /// Flatten Record-Route header lines into one URI per entry.

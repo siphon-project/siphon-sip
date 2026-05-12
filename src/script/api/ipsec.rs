@@ -131,9 +131,34 @@ pub fn pcscf_path_host() -> Option<String> {
 /// few hundred UEs, noticeable at 50k+; revisit when that becomes a
 /// real workload.
 pub fn outbound_local_addr_for(destination: std::net::SocketAddr) -> Option<std::net::SocketAddr> {
+    outbound_for(destination).map(|(source, _)| source)
+}
+
+/// Outbound source + pinned transport for an IPsec-protected destination.
+///
+/// Equivalent cost to [`outbound_local_addr_for`] — one DashMap walk —
+/// but also returns the upper-layer protocol pinned into the SA's XFRM
+/// selector (3GPP TS 33.203 §7.2: UDP for ESP-over-UDP, TCP for
+/// ESP-over-TCP).  Use this on relay paths where the dispatcher would
+/// otherwise pick the transport from the URI's ``;transport=`` param or
+/// the inbound transport — in-dialog requests (BYE, UPDATE, in-dialog
+/// re-INVITE) route via the cached Contact captured at REGISTER time,
+/// which may not carry a ``;transport=`` stamp, so without this pin a
+/// TCP-only SA would silently drop the UDP egress because the kernel
+/// selector doesn't match.  Initial out-of-dialog INVITE works without
+/// this pin because the script stamps ``;transport=`` on the Path
+/// header and the cached binding's R-URI carries it; in-dialog re-uses
+/// the dialog route set/Contact and that stamp is absent on many UE
+/// implementations.
+///
+/// Returns `None` under the same conditions as `outbound_local_addr_for`
+/// (no manager wired, destination not a registered UE, port mismatch).
+pub fn outbound_for(
+    destination: std::net::SocketAddr,
+) -> Option<(std::net::SocketAddr, crate::transport::Transport)> {
     let manager = IPSEC_MANAGER_REF.get()?;
     let sa = manager.find_sa_by_ue(&destination.ip(), destination.port())?;
-    outbound_endpoint_for_sa(&sa, destination.port())
+    outbound_for_sa(&sa, destination.port())
 }
 
 /// Pure resolution logic split out so tests can drive it with a
@@ -155,6 +180,21 @@ fn outbound_endpoint_for_sa(
     } else {
         None
     }
+}
+
+/// Combined (source, transport) resolution from an SA pair.  Pure
+/// function so tests can drive both axes (port-direction + protocol)
+/// without standing up a real IpsecManager.
+fn outbound_for_sa(
+    sa: &SecurityAssociationPair,
+    dst_port: u16,
+) -> Option<(std::net::SocketAddr, crate::transport::Transport)> {
+    let source = outbound_endpoint_for_sa(sa, dst_port)?;
+    let transport = match sa.protocol {
+        SaProtocol::Udp => crate::transport::Transport::Udp,
+        SaProtocol::Tcp => crate::transport::Transport::Tcp,
+    };
+    Some((source, transport))
 }
 
 /// Find the active SA pair (if any) matching the given UE address and
@@ -1703,6 +1743,60 @@ mod tests {
         );
         assert_eq!(from_us.port(), sa.pcscf_port_c);
         assert_eq!(from_uc.port(), sa.pcscf_port_s);
+    }
+
+    #[test]
+    fn outbound_for_sa_returns_udp_transport_for_udp_protocol() {
+        // ESP-over-UDP SA — the common P-CSCF deployment.  The
+        // resolution must surface Transport::Udp so the dispatcher
+        // routes the egress through the UDP send path and hits the
+        // kernel selector that matches IPPROTO_UDP.
+        let sa = ipsec_test_sa();
+        assert_eq!(sa.protocol, SaProtocol::Udp);
+
+        let (source, transport) = outbound_for_sa(&sa, sa.ue_port_s).unwrap();
+        assert_eq!(source, std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_c));
+        assert_eq!(transport, crate::transport::Transport::Udp);
+    }
+
+    #[test]
+    fn outbound_for_sa_returns_tcp_transport_for_tcp_protocol() {
+        // ESP-over-TCP SA — TS 33.203 §7.2, iOS-style TCP-first UEs.
+        // The dispatcher MUST route this destination via the TCP send
+        // path even when the URI / inbound suggested UDP; the kernel
+        // selector (proto=IPPROTO_TCP) silently drops UDP egress to
+        // the same address+port.  This is the load-bearing change for
+        // in-dialog BYE/UPDATE to TCP-pinned UEs.
+        let mut sa = ipsec_test_sa();
+        sa.protocol = SaProtocol::Tcp;
+
+        let (source, transport) = outbound_for_sa(&sa, sa.ue_port_s).unwrap();
+        assert_eq!(source, std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_c));
+        assert_eq!(transport, crate::transport::Transport::Tcp);
+    }
+
+    #[test]
+    fn outbound_for_sa_returns_tcp_for_response_direction_too() {
+        // Sanity: SA #2 direction (P-CSCF responding via pcscf_port_s
+        // to UE's port_c) inherits the same protocol pin as SA #3.
+        // The protocol is a property of the SA pair, not the
+        // direction — covers re-keyed in-dialog responses too.
+        let mut sa = ipsec_test_sa();
+        sa.protocol = SaProtocol::Tcp;
+
+        let (source, transport) = outbound_for_sa(&sa, sa.ue_port_c).unwrap();
+        assert_eq!(source, std::net::SocketAddr::new(sa.pcscf_addr, sa.pcscf_port_s));
+        assert_eq!(transport, crate::transport::Transport::Tcp);
+    }
+
+    #[test]
+    fn outbound_for_sa_returns_none_when_endpoint_unresolved() {
+        // Port mismatch propagates as None — `outbound_for_sa` must
+        // not invent a transport when the source endpoint can't be
+        // derived, otherwise the caller would pin the wrong transport
+        // for a destination that isn't actually on the SA pair.
+        let sa = ipsec_test_sa();
+        assert!(outbound_for_sa(&sa, 9999).is_none());
     }
 
     #[test]
