@@ -72,6 +72,14 @@ Content-Length: 0
 ]]>
   </send>
 
+  <!-- Absorb a possible 100 Trying for the BYE.  RFC 3261 §17.2.2 allows
+       a non-INVITE server transaction to send provisional responses but
+       it is uncommon; siphon's NIST may auto-emit one when an in-dialog
+       relay takes longer than `transaction.auto_100_delay` to forward
+       (e.g. under TCP backpressure at high CPS).  Without this absorber
+       sipp treats the 100 as an unexpected response and fails the call. -->
+  <recv response="100" optional="true" />
+
   <recv response="200" rtd="true" />
 
 </scenario>

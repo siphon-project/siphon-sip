@@ -25,6 +25,12 @@ Content-Length: 0
 ]]>
   </send>
 
+  <!-- Absorb a possible 100 Trying for the REGISTER (siphon's NIST may
+       auto-emit one when the registrar takes longer than
+       `transaction.auto_100_delay` to respond — typically only at high
+       CPS under load).  Optional so it never blocks. -->
+  <recv response="100" optional="true" />
+
   <!-- Expect 401 Unauthorized with challenge -->
   <recv response="401" auth="true" />
 
@@ -45,6 +51,10 @@ Content-Length: 0
 
 ]]>
   </send>
+
+  <!-- Same absorber as above — the auth-bearing REGISTER can also race
+       a 100 Trying. -->
+  <recv response="100" optional="true" />
 
   <!-- Expect 200 OK -->
   <recv response="200" rtd="true" />
