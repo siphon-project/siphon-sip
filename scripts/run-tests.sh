@@ -29,6 +29,7 @@ RUN_RTPENGINE=false
 RUN_REINVITE=false
 RUN_B2BUA=false
 RUN_GATEWAY=false
+RUN_AUTO100=false
 SKIP_RUST=false
 
 for arg in "$@"; do
@@ -40,9 +41,10 @@ for arg in "$@"; do
     --reinvite)   RUN_REINVITE=true ;;
     --b2bua)      RUN_B2BUA=true ;;
     --gateway)    RUN_GATEWAY=true ;;
+    --auto100)    RUN_AUTO100=true ;;
     --skip-rust)  SKIP_RUST=true ;;
     --help|-h)
-      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--reinvite] [--b2bua] [--gateway] [--skip-rust]"
+      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--reinvite] [--b2bua] [--gateway] [--auto100] [--skip-rust]"
       exit 0
       ;;
     *)
@@ -94,6 +96,16 @@ if [[ "$RUN_PRESENCE" == true ]]; then
   echo "=== SIPp MESSAGE test (register alice → relay MESSAGE to UAS) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile presence run --rm sipp-message-register
   run_sipp docker compose -f "$COMPOSE_FILE" --profile presence up --abort-on-container-exit sipp-message-uas sipp-message-uac
+fi
+
+# ── Step 6b: NIST auto-100 Trying + UAS To-tag tests (optional) ─────────────
+if [[ "$RUN_AUTO100" == true ]]; then
+  echo "=== SIPp NIST auto-100 test (slow MESSAGE UAS forces proxy auto-100) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile auto100 run --rm sipp-message-auto100-register
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile auto100 up --abort-on-container-exit sipp-message-auto100-uas sipp-message-auto100-uac
+
+  echo "=== SIPp UAS To-tag test (script-built 404 must carry tag=) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile auto100 run --rm sipp-message-404-to-tag
 fi
 
 # ── Step 7: RTPEngine proxy tests (optional) ──────────────────────────────

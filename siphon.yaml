@@ -274,6 +274,9 @@ auth:
 # transaction:
 #   timeout_secs: 5        # non-INVITE transaction timeout (fr_timeout)
 #   invite_timeout_secs: 30  # INVITE transaction timeout (fr_inv_timeout)
+#   auto_emit_100_trying: true             # NIST auto-emits 100 Trying on slow relays
+#                                          # (suppresses UAC retransmits, RFC 3261 §17.1.2)
+#   auto_emit_100_trying_delay_ms: 200     # mirrors RFC 3261 §17.2.1 IST timer
 
 # ---------------------------------------------------------------------------
 # Session timers (RFC 4028) — B2BUA mode only

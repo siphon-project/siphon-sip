@@ -1014,6 +1014,15 @@ pub struct TransactionConfig {
     /// INVITE transaction timeout (fr_inv_timeout). Default: 30s.
     #[serde(default = "default_tx_invite_timeout")]
     pub invite_timeout_secs: u32,
+    /// Auto-emit `100 Trying` on slow non-INVITE server transactions to
+    /// suppress UAC retransmits (RFC 3261 §17.1.2). Mirror of §17.2.1 for
+    /// INVITE applied to MESSAGE/SUBSCRIBE/OPTIONS relays. Default: true.
+    #[serde(default = "default_auto_emit_100_trying")]
+    pub auto_emit_100_trying: bool,
+    /// Delay before the auto-100 Trying fires. Default: 200ms (mirrors
+    /// RFC 3261 §17.2.1's 200 ms IST timer).
+    #[serde(default = "default_auto_emit_100_trying_delay_ms")]
+    pub auto_emit_100_trying_delay_ms: u64,
 }
 
 fn default_tx_timeout() -> u32 {
@@ -1021,6 +1030,12 @@ fn default_tx_timeout() -> u32 {
 }
 fn default_tx_invite_timeout() -> u32 {
     30
+}
+fn default_auto_emit_100_trying() -> bool {
+    true
+}
+fn default_auto_emit_100_trying_delay_ms() -> u64 {
+    200
 }
 
 // ---------------------------------------------------------------------------

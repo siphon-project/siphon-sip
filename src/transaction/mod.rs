@@ -118,8 +118,9 @@ impl TransactionManager {
                 return Ok((key, vec![]));
             }
             _ => {
-                let nist = Nist::new(transport, self.timers);
-                (Transaction::Nist(nist), vec![Action::PassToTu(request.clone())])
+                let (nist, mut actions) = Nist::new(request.clone(), transport, self.timers);
+                actions.push(Action::PassToTu(request.clone()));
+                (Transaction::Nist(nist), actions)
             }
         };
 

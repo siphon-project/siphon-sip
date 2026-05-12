@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  MESSAGE UAC that asserts siphon stamps a UAS To-tag on script-built
+  responses (RFC 3261 §8.2.6.2). Sends a MESSAGE to an unregistered user
+  so siphon's proxy script answers with a script-built 404 — the response
+  arrives at the wire with no upstream UAS in the path, so any To-tag in
+  it must have been stamped by siphon's NIST state machine.
+
+  Run: sipp -sf message_404_to_tag.xml -s nobody <proxy>:<port>
+-->
+<scenario name="MESSAGE script-built 404 carries To-tag">
+
+  <send retrans="500">
+    <![CDATA[
+MESSAGE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:probe@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 MESSAGE
+Contact: <sip:probe@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Type: text/plain
+Content-Length: [len]
+
+to-tag stamping smoke test
+]]>
+  </send>
+
+  <!-- Siphon replies 404 (script's `reply(404, "Not Found")` for unknown user).
+       The ereg fails the call if the To header lacks a non-empty tag= param.
+       The log action references $to_tag so SIPp does not flag it as unused. -->
+  <recv response="404" rtd="true">
+    <action>
+      <ereg regexp="tag=[^;>\r\n ]+" search_in="hdr" header="To:" assign_to="to_tag" />
+      <log message="UAS-stamped To header: [$to_tag]" />
+    </action>
+  </recv>
+
+</scenario>

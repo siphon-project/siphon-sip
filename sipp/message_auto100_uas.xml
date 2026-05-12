@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  MESSAGE UAS that deliberately stalls before sending 200 OK.
+
+  Pairs with message_auto100.xml to exercise siphon's NIST auto-100 Trying
+  timer: with the UAS final response delayed 500 ms, the proxy's 200 ms
+  auto-100 timer must fire and emit a 100 Trying upstream so the UAC sees
+  a provisional before the final and does not retransmit the MESSAGE.
+
+  Run: sipp -sf message_auto100_uas.xml -p 5060
+-->
+<scenario name="MESSAGE UAS (slow)">
+
+  <recv request="MESSAGE" />
+
+  <pause milliseconds="500" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag00[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

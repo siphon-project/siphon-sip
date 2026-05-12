@@ -13,17 +13,35 @@ pub const DEFAULT_T2: Duration = Duration::from_secs(4);
 /// Default T4 value: maximum duration a message will remain in the network (5s).
 pub const DEFAULT_T4: Duration = Duration::from_secs(5);
 
+/// Default delay before a non-INVITE server transaction auto-emits 100 Trying.
+/// Mirrors RFC 3261 §17.2.1's 200 ms timer for the INVITE server transaction.
+pub const DEFAULT_AUTO_100_TRYING_DELAY: Duration = Duration::from_millis(200);
+
 /// Timer configuration — all derived from T1, T2, T4.
 #[derive(Debug, Clone, Copy)]
 pub struct TimerConfig {
     pub t1: Duration,
     pub t2: Duration,
     pub t4: Duration,
+    /// Whether the non-INVITE server transaction (NIST) auto-emits 100 Trying
+    /// after `auto_100_delay` if the TU has not produced a response yet.
+    /// Mirror of RFC 3261 §17.2.1 for INVITE applied to non-INVITE methods
+    /// (MESSAGE, SUBSCRIBE, OPTIONS, etc.) so cross-hop relays do not trigger
+    /// UAC retransmits (§17.1.2).
+    pub auto_100_trying: bool,
+    /// Delay before the NIST auto-100 timer fires.
+    pub auto_100_delay: Duration,
 }
 
 impl TimerConfig {
     pub fn new(t1: Duration, t2: Duration, t4: Duration) -> Self {
-        Self { t1, t2, t4 }
+        Self {
+            t1,
+            t2,
+            t4,
+            auto_100_trying: true,
+            auto_100_delay: DEFAULT_AUTO_100_TRYING_DELAY,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -121,6 +139,8 @@ impl Default for TimerConfig {
             t1: DEFAULT_T1,
             t2: DEFAULT_T2,
             t4: DEFAULT_T4,
+            auto_100_trying: true,
+            auto_100_delay: DEFAULT_AUTO_100_TRYING_DELAY,
         }
     }
 }

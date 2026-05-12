@@ -7,7 +7,45 @@ use std::time::Duration;
 
 use crate::sip::message::{SipMessage, Method, StartLine};
 use crate::sip::builder::SipMessageBuilder;
+use crate::sip::headers::nameaddr::NameAddr;
 use crate::transaction::timer::TimerConfig;
+
+/// Generate a random URL-safe To-tag for UAS-built responses
+/// (RFC 3261 §19.3 — token chars; §8.2.6.2 — UAS-stamped on all responses
+/// except 100 Trying).
+pub fn generate_uas_to_tag() -> String {
+    format!("siphon-{}", &uuid::Uuid::new_v4().as_simple().to_string()[..12])
+}
+
+/// Stamp a UAS-side `tag=` onto the response's `To:` header if it is missing,
+/// caching the generated value in `cache` so all responses to the same server
+/// transaction carry the same tag (RFC 3261 §8.2.6.2 — "The same tag MUST be
+/// used for all responses to that request, both final and provisional").
+///
+/// No-op when:
+///   - the response is `100 Trying` (the only response exempted from the To-tag
+///     requirement by §8.2.6.2);
+///   - the response already has a To-tag (script set it explicitly via
+///     `set_reply_to_tag()`, or the request was in-dialog and the tag is the
+///     remote peer's).
+fn stamp_uas_to_tag(response: &mut SipMessage, cache: &mut Option<String>) {
+    if let StartLine::Response(status_line) = &response.start_line {
+        if status_line.status_code == 100 {
+            return;
+        }
+    } else {
+        return;
+    }
+
+    let Some(to_value) = response.headers.to().cloned() else { return; };
+    let Ok(mut name_addr) = NameAddr::parse(&to_value) else { return; };
+    if name_addr.tag.is_some() {
+        return;
+    }
+    let tag = cache.get_or_insert_with(generate_uas_to_tag).clone();
+    name_addr.tag = Some(tag);
+    response.headers.set("To", name_addr.to_string());
+}
 
 // ---------------------------------------------------------------------------
 // Common types
@@ -64,6 +102,10 @@ pub enum TimerName {
     G, H,       // IST
     I,          // IST
     J,          // NIST
+    /// Auto-100 Trying delay for the non-INVITE server transaction (NIST).
+    /// Not in RFC 3261, but mirrors §17.2.1's 200 ms IST timer to suppress
+    /// UAC retransmits on slow non-INVITE relays (§17.1.2).
+    Trying100,
 }
 
 // ===========================================================================
@@ -94,6 +136,8 @@ pub enum NistEvent {
     TuFinal(SipMessage),
     /// Timer J fired (completed → terminated).
     TimerJ,
+    /// Auto-100 Trying timer fired — emit 100 Trying if still in `Trying`.
+    Trying100Fired,
 }
 
 /// Non-INVITE Server Transaction state machine.
@@ -104,16 +148,38 @@ pub struct Nist {
     pub timers: TimerConfig,
     /// Last response sent (for retransmit on request retransmit).
     pub last_response: Option<SipMessage>,
+    /// Captured at construction so the auto-100 timer can synthesize a
+    /// `100 Trying` response without the TU's involvement (RFC 3261 §8.2.6.2
+    /// mandates Via/From/To/Call-ID/CSeq be echoed from the request).
+    pub original_request: SipMessage,
+    /// UAS-stamped To-tag, lazily generated on the first non-100 response and
+    /// reused across provisional + final + retransmits (RFC 3261 §8.2.6.2:
+    /// same tag for all responses to the same request).
+    pub uas_to_tag: Option<String>,
 }
 
 impl Nist {
-    pub fn new(transport: Transport, timers: TimerConfig) -> Self {
-        Self {
+    /// Construct a NIST. The returned action list starts the auto-100 timer
+    /// when `timers.auto_100_trying` is true; the caller appends any dispatch
+    /// actions (e.g. `PassToTu`) on top.
+    pub fn new(
+        request: SipMessage,
+        transport: Transport,
+        timers: TimerConfig,
+    ) -> (Self, Vec<Action>) {
+        let mut actions = Vec::new();
+        if timers.auto_100_trying {
+            actions.push(Action::StartTimer(TimerName::Trying100, timers.auto_100_delay));
+        }
+        let nist = Self {
             state: NistState::Trying,
             transport,
             timers,
             last_response: None,
-        }
+            original_request: request,
+            uas_to_tag: None,
+        };
+        (nist, actions)
     }
 
     /// Process an event and return the resulting actions.
@@ -124,19 +190,30 @@ impl Nist {
                 // Absorb retransmit silently in Trying (no response to resend yet)
                 vec![]
             }
-            (NistState::Trying, NistEvent::TuProvisional(response)) => {
+            (NistState::Trying, NistEvent::TuProvisional(mut response)) => {
+                stamp_uas_to_tag(&mut response, &mut self.uas_to_tag);
                 self.state = NistState::Proceeding;
                 self.last_response = Some(response.clone());
-                vec![Action::SendMessage(response)]
+                let mut actions = Vec::new();
+                if self.timers.auto_100_trying {
+                    actions.push(Action::CancelTimer(TimerName::Trying100));
+                }
+                actions.push(Action::SendMessage(response));
+                actions
             }
-            (NistState::Trying, NistEvent::TuFinal(response)) => {
+            (NistState::Trying, NistEvent::TuFinal(mut response)) => {
+                stamp_uas_to_tag(&mut response, &mut self.uas_to_tag);
                 self.state = NistState::Completed;
                 self.last_response = Some(response.clone());
                 let timer_j = match self.transport {
                     Transport::Udp => self.timers.timer_j_udp(),
                     Transport::Reliable => self.timers.timer_j_tcp(),
                 };
-                let mut actions = vec![Action::SendMessage(response)];
+                let mut actions = Vec::new();
+                if self.timers.auto_100_trying {
+                    actions.push(Action::CancelTimer(TimerName::Trying100));
+                }
+                actions.push(Action::SendMessage(response));
                 if timer_j.is_zero() {
                     self.state = NistState::Terminated;
                     actions.push(Action::Terminated);
@@ -144,6 +221,19 @@ impl Nist {
                     actions.push(Action::StartTimer(TimerName::J, timer_j));
                 }
                 actions
+            }
+            (NistState::Trying, NistEvent::Trying100Fired) => {
+                // TU was silent past `auto_100_delay` — synthesize the
+                // 100 Trying ourselves to suppress upstream UAC retransmits
+                // (RFC 3261 §17.1.2). Mirror of §17.2.1 for INVITE.
+                let trying = crate::sip::builder::build_response_skeleton(
+                    &self.original_request,
+                    100,
+                    "Trying",
+                );
+                self.state = NistState::Proceeding;
+                self.last_response = Some(trying.clone());
+                vec![Action::SendMessage(trying)]
             }
 
             // -- Proceeding --
@@ -154,11 +244,13 @@ impl Nist {
                     None => vec![],
                 }
             }
-            (NistState::Proceeding, NistEvent::TuProvisional(response)) => {
+            (NistState::Proceeding, NistEvent::TuProvisional(mut response)) => {
+                stamp_uas_to_tag(&mut response, &mut self.uas_to_tag);
                 self.last_response = Some(response.clone());
                 vec![Action::SendMessage(response)]
             }
-            (NistState::Proceeding, NistEvent::TuFinal(response)) => {
+            (NistState::Proceeding, NistEvent::TuFinal(mut response)) => {
+                stamp_uas_to_tag(&mut response, &mut self.uas_to_tag);
                 self.state = NistState::Completed;
                 self.last_response = Some(response.clone());
                 let timer_j = match self.transport {
@@ -244,6 +336,9 @@ pub struct Ist {
     pub last_response: Option<SipMessage>,
     /// Current Timer G interval (doubles each fire, capped at T2).
     pub timer_g_interval: Duration,
+    /// UAS-stamped To-tag, lazily generated on the first non-100 response and
+    /// reused across provisional + final + retransmits (RFC 3261 §8.2.6.2).
+    pub uas_to_tag: Option<String>,
 }
 
 impl Ist {
@@ -255,6 +350,7 @@ impl Ist {
             timers,
             last_response: None,
             timer_g_interval,
+            uas_to_tag: None,
         }
     }
 
@@ -268,16 +364,19 @@ impl Ist {
                     None => vec![],
                 }
             }
-            (IstState::Proceeding, IstEvent::TuProvisional(response)) => {
+            (IstState::Proceeding, IstEvent::TuProvisional(mut response)) => {
+                stamp_uas_to_tag(&mut response, &mut self.uas_to_tag);
                 self.last_response = Some(response.clone());
                 vec![Action::SendMessage(response)]
             }
-            (IstState::Proceeding, IstEvent::Tu2xx(response)) => {
+            (IstState::Proceeding, IstEvent::Tu2xx(mut response)) => {
+                stamp_uas_to_tag(&mut response, &mut self.uas_to_tag);
                 // 2xx: transaction steps aside, TU owns retransmissions
                 self.state = IstState::Accepted;
                 vec![Action::SendMessage(response), Action::Terminated]
             }
-            (IstState::Proceeding, IstEvent::TuNon2xxFinal(response)) => {
+            (IstState::Proceeding, IstEvent::TuNon2xxFinal(mut response)) => {
+                stamp_uas_to_tag(&mut response, &mut self.uas_to_tag);
                 self.state = IstState::Completed;
                 self.last_response = Some(response.clone());
                 let mut actions = vec![Action::SendMessage(response)];
@@ -869,9 +968,20 @@ mod tests {
     // NIST tests
     // =======================================================================
 
+    /// Tests covering the pre-auto-100 NIST lifecycle disable the auto-100
+    /// timer so action vectors keep their pre-feature shape.
+    fn nist_no_auto_100(transport: Transport) -> Nist {
+        let timers = TimerConfig {
+            auto_100_trying: false,
+            ..TimerConfig::default()
+        };
+        let (nist, _) = Nist::new(dummy_request(), transport, timers);
+        nist
+    }
+
     #[test]
     fn nist_trying_absorbs_retransmit() {
-        let mut nist = Nist::new(Transport::Udp, TimerConfig::default());
+        let mut nist = nist_no_auto_100(Transport::Udp);
         let actions = nist.process(NistEvent::RequestRetransmit(dummy_request()));
         assert!(actions.is_empty());
         assert_eq!(nist.state, NistState::Trying);
@@ -879,7 +989,7 @@ mod tests {
 
     #[test]
     fn nist_trying_to_proceeding() {
-        let mut nist = Nist::new(Transport::Udp, TimerConfig::default());
+        let mut nist = nist_no_auto_100(Transport::Udp);
         let response = dummy_response(100, "Trying");
         let actions = nist.process(NistEvent::TuProvisional(response));
         assert_eq!(nist.state, NistState::Proceeding);
@@ -888,7 +998,7 @@ mod tests {
 
     #[test]
     fn nist_trying_to_completed_udp() {
-        let mut nist = Nist::new(Transport::Udp, TimerConfig::default());
+        let mut nist = nist_no_auto_100(Transport::Udp);
         let response = dummy_response(200, "OK");
         let actions = nist.process(NistEvent::TuFinal(response));
         assert_eq!(nist.state, NistState::Completed);
@@ -898,7 +1008,7 @@ mod tests {
 
     #[test]
     fn nist_trying_to_completed_tcp_immediate_terminate() {
-        let mut nist = Nist::new(Transport::Reliable, TimerConfig::default());
+        let mut nist = nist_no_auto_100(Transport::Reliable);
         let response = dummy_response(200, "OK");
         let actions = nist.process(NistEvent::TuFinal(response));
         assert_eq!(nist.state, NistState::Terminated);
@@ -908,7 +1018,7 @@ mod tests {
 
     #[test]
     fn nist_proceeding_retransmits_last_response() {
-        let mut nist = Nist::new(Transport::Udp, TimerConfig::default());
+        let mut nist = nist_no_auto_100(Transport::Udp);
         nist.process(NistEvent::TuProvisional(dummy_response(100, "Trying")));
         let actions = nist.process(NistEvent::RequestRetransmit(dummy_request()));
         assert!(has_send(&actions));
@@ -916,7 +1026,7 @@ mod tests {
 
     #[test]
     fn nist_completed_retransmits_final() {
-        let mut nist = Nist::new(Transport::Udp, TimerConfig::default());
+        let mut nist = nist_no_auto_100(Transport::Udp);
         nist.process(NistEvent::TuFinal(dummy_response(200, "OK")));
         assert_eq!(nist.state, NistState::Completed);
         let actions = nist.process(NistEvent::RequestRetransmit(dummy_request()));
@@ -925,7 +1035,7 @@ mod tests {
 
     #[test]
     fn nist_timer_j_terminates() {
-        let mut nist = Nist::new(Transport::Udp, TimerConfig::default());
+        let mut nist = nist_no_auto_100(Transport::Udp);
         nist.process(NistEvent::TuFinal(dummy_response(200, "OK")));
         let actions = nist.process(NistEvent::TimerJ);
         assert_eq!(nist.state, NistState::Terminated);
@@ -934,7 +1044,7 @@ mod tests {
 
     #[test]
     fn nist_full_lifecycle_trying_proceeding_completed_terminated() {
-        let mut nist = Nist::new(Transport::Udp, TimerConfig::default());
+        let mut nist = nist_no_auto_100(Transport::Udp);
         assert_eq!(nist.state, NistState::Trying);
 
         nist.process(NistEvent::TuProvisional(dummy_response(100, "Trying")));
@@ -945,6 +1055,156 @@ mod tests {
 
         nist.process(NistEvent::TimerJ);
         assert_eq!(nist.state, NistState::Terminated);
+    }
+
+    // ----- Auto-100 Trying behavior -----
+
+    fn nist_auto_100(transport: Transport) -> (Nist, Vec<Action>) {
+        let timers = TimerConfig {
+            auto_100_trying: true,
+            auto_100_delay: std::time::Duration::from_millis(50),
+            ..TimerConfig::default()
+        };
+        Nist::new(dummy_request(), transport, timers)
+    }
+
+    #[test]
+    fn nist_auto_100_initial_actions_include_timer() {
+        let (nist, actions) = nist_auto_100(Transport::Udp);
+        assert_eq!(nist.state, NistState::Trying);
+        let started = actions.iter().find_map(|a| match a {
+            Action::StartTimer(TimerName::Trying100, d) => Some(*d),
+            _ => None,
+        });
+        assert_eq!(started, Some(std::time::Duration::from_millis(50)));
+    }
+
+    #[test]
+    fn nist_auto_100_disabled_no_initial_timer() {
+        let timers = TimerConfig {
+            auto_100_trying: false,
+            ..TimerConfig::default()
+        };
+        let (_nist, actions) = Nist::new(dummy_request(), Transport::Udp, timers);
+        assert!(!has_timer(&actions, TimerName::Trying100));
+    }
+
+    #[test]
+    fn nist_auto_100_fires_when_tu_silent() {
+        let (mut nist, _) = nist_auto_100(Transport::Udp);
+        let actions = nist.process(NistEvent::Trying100Fired);
+        assert_eq!(nist.state, NistState::Proceeding);
+        let response = actions.iter().find_map(|a| match a {
+            Action::SendMessage(message) => Some(message),
+            _ => None,
+        }).expect("expected SendMessage");
+        match &response.start_line {
+            StartLine::Response(status_line) => {
+                assert_eq!(status_line.status_code, 100);
+                assert_eq!(status_line.reason_phrase, "Trying");
+            }
+            _ => panic!("expected response start line"),
+        }
+        // RFC 3261 §8.2.6.2 mandatories must be echoed from the request.
+        assert!(response.headers.get("Via").is_some());
+        assert!(response.headers.from().is_some());
+        assert!(response.headers.to().is_some());
+        assert!(response.headers.call_id().is_some());
+        assert!(response.headers.cseq().is_some());
+        // last_response is set so Proceeding's RequestRetransmit arm
+        // retransmits the 100 (RFC 3261 §17.2.2).
+        assert!(nist.last_response.is_some());
+    }
+
+    #[test]
+    fn nist_auto_100_cancelled_by_tu_provisional() {
+        let (mut nist, _) = nist_auto_100(Transport::Udp);
+        let actions = nist.process(NistEvent::TuProvisional(dummy_response(180, "Ringing")));
+        assert_eq!(nist.state, NistState::Proceeding);
+        assert!(has_cancel_timer(&actions, TimerName::Trying100));
+        assert!(has_send(&actions));
+    }
+
+    #[test]
+    fn nist_auto_100_cancelled_by_tu_final() {
+        let (mut nist, _) = nist_auto_100(Transport::Udp);
+        let actions = nist.process(NistEvent::TuFinal(dummy_response(200, "OK")));
+        assert_eq!(nist.state, NistState::Completed);
+        assert!(has_cancel_timer(&actions, TimerName::Trying100));
+        assert!(has_send(&actions));
+        assert!(has_timer(&actions, TimerName::J));
+    }
+
+    #[test]
+    fn nist_auto_100_noop_after_state_advance() {
+        let (mut nist, _) = nist_auto_100(Transport::Udp);
+        // TU answers fast — auto-100 timer fires late.
+        nist.process(NistEvent::TuFinal(dummy_response(200, "OK")));
+        let actions = nist.process(NistEvent::Trying100Fired);
+        assert!(actions.is_empty());
+    }
+
+    // ----- UAS To-tag auto-stamping (RFC 3261 §8.2.6.2) -----
+
+    /// Extract `;tag=` from the To header of the most recent `SendMessage`.
+    fn sent_to_tag(actions: &[Action]) -> Option<String> {
+        actions.iter().rev().find_map(|a| match a {
+            Action::SendMessage(message) => message.headers.to().and_then(|to| {
+                NameAddr::parse(to).ok().and_then(|na| na.tag)
+            }),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn nist_uas_to_tag_stamped_on_final_when_missing() {
+        let mut nist = nist_no_auto_100(Transport::Udp);
+        // dummy_response builds a To header without a tag.
+        let actions = nist.process(NistEvent::TuFinal(dummy_response(202, "Accepted")));
+        let tag = sent_to_tag(&actions).expect("response should carry a To-tag");
+        assert!(tag.starts_with("siphon-"));
+        assert_eq!(nist.uas_to_tag.as_deref(), Some(tag.as_str()));
+    }
+
+    #[test]
+    fn nist_uas_to_tag_preserves_existing_tag() {
+        let mut nist = nist_no_auto_100(Transport::Udp);
+        let mut response = dummy_response(200, "OK");
+        response.headers.set("To", "<sip:example.com>;tag=preset-tag-123".to_string());
+        let actions = nist.process(NistEvent::TuFinal(response));
+        assert_eq!(sent_to_tag(&actions).as_deref(), Some("preset-tag-123"));
+        // Cache stays empty — script supplied the tag, we never generated one.
+        assert!(nist.uas_to_tag.is_none());
+    }
+
+    #[test]
+    fn nist_uas_to_tag_same_across_provisional_and_final() {
+        let mut nist = nist_no_auto_100(Transport::Udp);
+        let prov_actions = nist.process(NistEvent::TuProvisional(dummy_response(180, "Ringing")));
+        let final_actions = nist.process(NistEvent::TuFinal(dummy_response(200, "OK")));
+        let prov_tag = sent_to_tag(&prov_actions).expect("provisional must have tag");
+        let final_tag = sent_to_tag(&final_actions).expect("final must have tag");
+        assert_eq!(prov_tag, final_tag, "RFC 3261 §8.2.6.2: same tag across all responses");
+    }
+
+    #[test]
+    fn nist_uas_to_tag_retx_preserves_tag() {
+        let mut nist = nist_no_auto_100(Transport::Udp);
+        let final_actions = nist.process(NistEvent::TuFinal(dummy_response(200, "OK")));
+        let original_tag = sent_to_tag(&final_actions).expect("final must have tag");
+        // Retx request → state machine returns the cached last_response unchanged.
+        let retx_actions = nist.process(NistEvent::RequestRetransmit(dummy_request()));
+        let retx_tag = sent_to_tag(&retx_actions).expect("retx must repeat the tagged response");
+        assert_eq!(original_tag, retx_tag);
+    }
+
+    #[test]
+    fn nist_auto_100_response_has_no_to_tag() {
+        // RFC 3261 §8.2.6.2: 100 Trying is the only response exempted.
+        let (mut nist, _) = nist_auto_100(Transport::Udp);
+        let actions = nist.process(NistEvent::Trying100Fired);
+        assert_eq!(sent_to_tag(&actions), None);
+        assert!(nist.uas_to_tag.is_none());
     }
 
     // =======================================================================
@@ -966,6 +1226,36 @@ mod tests {
         assert_eq!(ist.state, IstState::Accepted);
         assert!(has_send(&actions));
         assert!(has_terminated(&actions));
+    }
+
+    #[test]
+    fn ist_uas_to_tag_stamped_on_2xx_when_missing() {
+        // RFC 3261 §8.2.6.2: INVITE 2xx (dialog-creating) MUST carry a tag.
+        let mut ist = Ist::new(Transport::Udp, TimerConfig::default());
+        let actions = ist.process(IstEvent::Tu2xx(dummy_response(200, "OK")));
+        let tag = sent_to_tag(&actions).expect("INVITE 2xx must carry a To-tag");
+        assert!(tag.starts_with("siphon-"));
+        assert_eq!(ist.uas_to_tag.as_deref(), Some(tag.as_str()));
+    }
+
+    #[test]
+    fn ist_uas_to_tag_same_across_provisional_and_2xx() {
+        let mut ist = Ist::new(Transport::Udp, TimerConfig::default());
+        let prov_actions = ist.process(IstEvent::TuProvisional(dummy_response(180, "Ringing")));
+        let final_actions = ist.process(IstEvent::Tu2xx(dummy_response(200, "OK")));
+        let prov_tag = sent_to_tag(&prov_actions).expect("180 must carry a To-tag");
+        let final_tag = sent_to_tag(&final_actions).expect("200 must carry a To-tag");
+        assert_eq!(prov_tag, final_tag);
+    }
+
+    #[test]
+    fn ist_uas_to_tag_preserves_existing_tag() {
+        let mut ist = Ist::new(Transport::Udp, TimerConfig::default());
+        let mut response = dummy_response(200, "OK");
+        response.headers.set("To", "<sip:bob@biloxi.com>;tag=script-set-tag".to_string());
+        let actions = ist.process(IstEvent::Tu2xx(response));
+        assert_eq!(sent_to_tag(&actions).as_deref(), Some("script-set-tag"));
+        assert!(ist.uas_to_tag.is_none());
     }
 
     #[test]

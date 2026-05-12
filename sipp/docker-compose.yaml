@@ -274,6 +274,124 @@ services:
     profiles:
       - presence
 
+  # ── NIST auto-100 Trying test ──────────────────────────────────────────────
+  # Sends a MESSAGE that the UAS deliberately stalls 500 ms before answering.
+  # The proxy's NIST auto-100 timer (default 200 ms) must fire and produce a
+  # 100 Trying upstream; the UAC's scenario requires the 100 before the 200.
+
+  # Register alice with Contact pointing to 172.20.0.36:5060 (slow UAS)
+  sipp-message-auto100-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.38
+    entrypoint:
+      - sipp
+      - "172.20.0.10:5060"
+      - -sf
+      - /sipp/scenarios/register_alice_contact.xml
+      - -inf
+      - /sipp/scenarios/message_auto100_contact.csv
+      - -s
+      - alice
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - auto100
+
+  # Slow MESSAGE UAS at 172.20.0.36:5060 — pauses 500 ms before 200 OK
+  sipp-message-auto100-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-message-auto100-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.36
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/message_auto100_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+    profiles:
+      - auto100
+
+  # UAC — requires 100 Trying from proxy before the upstream UAS's 200 OK
+  sipp-message-auto100-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-message-auto100-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.37
+    entrypoint:
+      - sipp
+      - "172.20.0.10:5060"
+      - -sf
+      - /sipp/scenarios/message_auto100.xml
+      - -s
+      - alice
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "15"
+      - -trace_err
+    profiles:
+      - auto100
+
+  # ── UAS To-tag stamping test ───────────────────────────────────────────────
+  # Sends MESSAGE to an unregistered user; siphon's script replies 404 itself
+  # so the response is fully script-built. Asserts the 404's To header carries
+  # a non-empty tag (RFC 3261 §8.2.6.2 — UAS MUST add To-tag on every response
+  # except 100 Trying).
+  sipp-message-404-to-tag:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.39
+    entrypoint:
+      - sipp
+      - "172.20.0.10:5060"
+      - -sf
+      - /sipp/scenarios/message_404_to_tag.xml
+      - -s
+      - nobody
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "10"
+      - -trace_err
+    profiles:
+      - auto100
+
   # ── PUBLISH test (RFC 3903 presence publication) ───────────────────────────
 
   sipp-publish:

@@ -378,7 +378,14 @@ pub async fn run(
         tx_config.map(|t| t.timeout_secs as u64).unwrap_or(5),
     );
 
-    let timer_config = TimerConfig::default();
+    let timer_config = {
+        let mut config = TimerConfig::default();
+        if let Some(tx) = tx_config {
+            config.auto_100_trying = tx.auto_emit_100_trying;
+            config.auto_100_delay = std::time::Duration::from_millis(tx.auto_emit_100_trying_delay_ms);
+        }
+        config
+    };
     let transaction_manager = Arc::new(TransactionManager::new(timer_config));
 
     let dns_resolver = Arc::new(match SipResolver::from_system() {
@@ -1541,6 +1548,7 @@ fn fire_expired_timers(state: &DispatcherState) {
             TimerName::G => Some(ServerEvent::Ist(IstEvent::TimerG)),
             TimerName::H => Some(ServerEvent::Ist(IstEvent::TimerH)),
             TimerName::I => Some(ServerEvent::Ist(IstEvent::TimerI)),
+            TimerName::Trying100 => Some(ServerEvent::Nist(NistEvent::Trying100Fired)),
             _ => None,
         };
 

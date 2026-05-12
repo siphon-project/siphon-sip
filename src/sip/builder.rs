@@ -137,6 +137,43 @@ impl Default for SipMessageBuilder {
     }
 }
 
+/// Build a minimal response from `request` containing only the headers RFC 3261
+/// §8.2.6.2 marks as mandatory (Via, From, To, Call-ID, CSeq) plus
+/// `Content-Length: 0`. Used by transaction state machines that need to emit a
+/// response without the dispatcher-side decoration — e.g. the NIST auto-100-Trying path.
+pub fn build_response_skeleton(request: &SipMessage, status_code: u16, reason: &str) -> SipMessage {
+    let mut builder = SipMessageBuilder::new().response(status_code, reason.to_string());
+
+    if let Some(vias) = request.headers.get_all("Via") {
+        for via in vias {
+            builder = builder.via(via.clone());
+        }
+    }
+    if let Some(from) = request.headers.from() {
+        builder = builder.from(from.clone());
+    }
+    if let Some(to) = request.headers.to() {
+        builder = builder.to(to.clone());
+    }
+    if let Some(call_id) = request.headers.call_id() {
+        builder = builder.call_id(call_id.clone());
+    }
+    if let Some(cseq) = request.headers.cseq() {
+        builder = builder.cseq(cseq.clone());
+    }
+    builder = builder.content_length(0);
+
+    builder.build().unwrap_or_else(|_| SipMessage {
+        start_line: StartLine::Response(StatusLine {
+            version: Version::sip_2_0(),
+            status_code,
+            reason_phrase: reason.to_string(),
+        }),
+        headers: SipHeaders::new(),
+        body: Vec::new(),
+    })
+}
+
 impl SipMessage {
     /// Convert SIP message to wire format
     pub fn to_bytes(&self) -> Vec<u8> {

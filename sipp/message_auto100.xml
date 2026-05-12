@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  MESSAGE UAC that expects siphon's NIST auto-100 Trying timer to fire.
+
+  Sends a MESSAGE and asserts the proxy emits 100 Trying *before* the
+  upstream UAS's final 200 OK. Pairs with message_auto100_uas.xml which
+  delays its 200 OK by 500 ms; the proxy's auto-100 timer (200 ms) must
+  produce the provisional so retrans="500" never fires on the UAC.
+
+  retrans="500" is left in place so a missing 100 Trying surfaces as a
+  retransmit count > 0 in sipp's stats — a regression signal.
+
+  Run: sipp -sf message_auto100.xml -s user <proxy>:<port>
+-->
+<scenario name="MESSAGE (auto-100 Trying)">
+
+  <send retrans="500">
+    <![CDATA[
+MESSAGE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:sender@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 MESSAGE
+Contact: <sip:sender@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Type: text/plain
+Content-Length: [len]
+
+auto-100 trying smoke test
+]]>
+  </send>
+
+  <!-- Required: the proxy's NIST auto-100 timer must fire (~200 ms). -->
+  <recv response="100" rtd="true" />
+
+  <!-- Then the upstream UAS's delayed final. -->
+  <recv response="200" />
+
+</scenario>
