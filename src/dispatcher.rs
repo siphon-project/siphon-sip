@@ -5598,23 +5598,35 @@ fn cancel_other_fork_branches(
             continue;
         }
         if let Some(client_branch) = session.get_client_branch(client_key) {
-            // Build a CANCEL for this branch
-            let cancel_branch = TransactionKey::generate_branch();
+            // RFC 3261 §9.1 — the CANCEL on each branch MUST share the
+            // topmost Via branch siphon used when sending the INVITE
+            // downstream on that branch (which IS client_key.branch),
+            // and the same CSeq sequence number as the INVITE.  Build
+            // a synthetic outbound-INVITE view (clone of the inbound
+            // request with topmost Via swapped for siphon's per-branch
+            // Via), then run it through build_cancel_from_invite which
+            // enforces every other RFC-§9.1 invariant (single Via, CSeq
+            // method=CANCEL, no body, no body-bearing headers).
             let transport_str = format!("{}", client_branch.transport);
-            let via_value = format!(
+            let siphon_via = format!(
                 "SIP/2.0/{} {}:{};branch={}",
                 transport_str.to_uppercase(),
                 state.via_host(&client_branch.transport),
                 state.via_port(&client_branch.transport),
-                cancel_branch,
+                client_key.branch,
             );
-
-            // Build minimal CANCEL from original request
-            let mut cancel = session.original_request.clone();
-            if let StartLine::Request(ref mut rl) = cancel.start_line {
-                rl.method = crate::sip::message::Method::Cancel;
-            }
-            cancel.headers.set("Via", via_value);
+            let mut as_outbound_invite = session.original_request.clone();
+            as_outbound_invite.headers.set("Via", siphon_via);
+            let cancel = match build_cancel_from_invite(&as_outbound_invite) {
+                Some(c) => c,
+                None => {
+                    warn!(
+                        client_key = %client_key,
+                        "fork: failed to build CANCEL from outbound INVITE view"
+                    );
+                    continue;
+                }
+            };
 
             let data = Bytes::from(cancel.to_bytes());
 
@@ -5901,6 +5913,86 @@ fn handle_cancel_via_session(
 // B2BUA CANCEL handling
 // ---------------------------------------------------------------------------
 
+/// Build a CANCEL for an outbound INVITE per RFC 3261 §9.1.
+///
+/// The CANCEL MUST share the topmost Via branch and CSeq sequence number
+/// of the request being cancelled — that is the contract that lets the
+/// downstream UAS (and every proxy on the path) match the CANCEL to the
+/// in-progress server transaction of the INVITE.  Building a CANCEL with
+/// a fresh branch, or with the wrong CSeq number, makes every proxy hop
+/// return 481 Call/Transaction Does Not Exist and the UAS keeps ringing.
+///
+/// The caller passes the outbound INVITE as siphon put it on the wire —
+/// for B2BUA that's [Leg::b_leg_invite]; for proxy fork it's a clone of
+/// the inbound request with the topmost Via swapped for siphon's
+/// per-branch Via.
+///
+/// Other headers (From, To, Call-ID, R-URI, Max-Forwards, Route) are
+/// preserved verbatim from the INVITE.  Content-Length is forced to 0;
+/// the body is dropped.  Everything else (Contact, Allow, Supported,
+/// PAI, Session-Expires, SDP, …) is stripped — CANCEL is hop-by-hop and
+/// carries no payload.
+fn build_cancel_from_invite(invite: &SipMessage) -> Option<SipMessage> {
+    // Method swap: INVITE → CANCEL on the request line.
+    let mut cancel = invite.clone();
+    let request_uri = match &mut cancel.start_line {
+        StartLine::Request(rl) => {
+            rl.method = crate::sip::message::Method::Cancel;
+            rl.request_uri.clone()
+        }
+        StartLine::Response(_) => return None,
+    };
+    let _ = request_uri; // touched only to enforce the variant guard above
+
+    // CSeq: keep the INVITE's sequence number, swap the method to CANCEL
+    // (RFC 3261 §9.1 — "MUST contain the same value for the sequence
+    //  number as was present in the request being cancelled, but the
+    //  method parameter MUST be equal to CANCEL").
+    let cseq_seq = invite
+        .headers
+        .cseq()?
+        .split_whitespace()
+        .next()?
+        .to_string();
+    cancel.headers.set("CSeq", format!("{} CANCEL", cseq_seq));
+
+    // Topmost Via only.  The stashed B-leg INVITE has exactly one Via
+    // (siphon overwrites Via on B-leg INVITE build), so set_all with a
+    // single value is fine — but be defensive in case the assumption
+    // ever drifts.
+    if let Some(vias) = invite.headers.get_all("Via") {
+        if let Some(top) = vias.first() {
+            cancel.headers.set("Via", top.clone());
+        }
+    }
+
+    // Drop the payload — CANCEL never carries a body.
+    cancel.body.clear();
+    cancel.headers.set("Content-Length", "0".to_string());
+
+    // Strip headers that have no place on a CANCEL.  We keep:
+    //   Via (topmost only — set above)
+    //   From, To, Call-ID, CSeq, Max-Forwards, Route
+    //   Content-Length
+    // Everything else is dropped per RFC 3261 §9.1 + §20 (CANCEL is
+    // hop-by-hop, carries no offer/answer, no dialog-establishing data).
+    const KEEP: &[&str] = &[
+        "via", "from", "to", "call-id", "cseq",
+        "max-forwards", "route", "content-length",
+    ];
+    let to_remove: Vec<String> = cancel
+        .headers
+        .iter()
+        .map(|(name, _)| name.clone())
+        .filter(|n| !KEEP.contains(&n.as_str()))
+        .collect();
+    for name in to_remove {
+        cancel.headers.remove(&name);
+    }
+
+    Some(cancel)
+}
+
 /// Handle CANCEL for a B2BUA call — cancel all pending B-legs.
 fn handle_b2bua_cancel(
     inbound: InboundMessage,
@@ -5921,7 +6013,13 @@ fn handle_b2bua_cancel(
         }
     };
 
-    let call = match state.call_actors.get_call(&call_id) {
+    // We need a mutable handle: per-leg we either (a) send the CANCEL
+    // immediately from the stashed B-leg INVITE, or (b) flag the leg
+    // with pending_cancel=true so the CANCEL is emitted the moment
+    // b2bua_send_b_leg_invite finishes stashing the INVITE (race
+    // between the upstream CANCEL and the script's call.dial() actually
+    // putting the B-leg INVITE on the wire).
+    let mut call = match state.call_actors.get_call_mut(&call_id) {
         Some(c) => c,
         None => return,
     };
@@ -5945,58 +6043,50 @@ fn handle_b2bua_cancel(
         state,
     );
 
-    // Send CANCEL to all pending B-legs
-    for b_leg in &call.b_legs {
-        let cancel_branch = TransactionKey::generate_branch();
-        let b_transport = b_leg.transport.transport;
-        let via_value = format!(
-            "SIP/2.0/{} {}:{};branch={}",
-            format!("{}", b_transport).to_uppercase(),
-            state.via_host(&b_transport),
-            state.via_port(&b_transport),
-            cancel_branch,
-        );
-
-        // Build CANCEL for the B-leg (same Request-URI as the B-leg INVITE)
-        let cancel_uri = match parse_uri_standalone(&b_leg.dialog.target_uri.clone().unwrap_or_default()) {
-            Ok(uri) => uri,
-            Err(_) => continue,
-        };
-        let cancel_request = SipMessageBuilder::new()
-            .request(crate::sip::message::Method::Cancel, cancel_uri)
-            .via(via_value)
-            .header("Call-ID", b_leg.dialog.call_id.clone())
-            .content_length(0);
-
-        // Copy From (with B-leg From-tag), To, CSeq from original
-        let cancel_msg = if let Some(from) = message.headers.from() {
-            // Rewrite From-tag from A-leg to B-leg
-            let b_from = from.replace(
-                &format!("tag={}", call.a_leg.dialog.remote_tag.as_deref().unwrap_or("")),
-                &format!("tag={}", b_leg.dialog.local_tag),
-            );
-            cancel_request.from(b_from)
-        } else {
-            cancel_request
-        };
-        let cancel_msg = if let Some(to) = message.headers.to() {
-            cancel_msg.to(to.clone())
-        } else {
-            cancel_msg
-        };
-        // CSeq for CANCEL uses same sequence number but CANCEL method
-        let cancel_msg = if let Some(cseq_raw) = message.headers.cseq() {
-            if let Some(seq_num) = cseq_raw.split_whitespace().next() {
-                cancel_msg.cseq(format!("{} CANCEL", seq_num))
-            } else {
-                cancel_msg
+    // Send CANCEL to all pending B-legs.
+    //
+    // RFC 3261 §9.1 — the CANCEL on each B-leg MUST share the *B-leg
+    // INVITE*'s topmost Via branch and CSeq sequence number, NOT the
+    // inbound A-leg CANCEL's.  Rebuild from the stashed B-leg INVITE
+    // ([Leg::b_leg_invite], populated at the end of
+    // [b2bua_send_b_leg_invite]).  Legs whose INVITE hasn't been sent
+    // yet get marked pending_cancel; the CANCEL drains automatically
+    // once the stash lands.
+    let mut bleg_targets: Vec<(SipMessage, Transport, SocketAddr)> = Vec::new();
+    for b_leg in call.b_legs.iter_mut() {
+        match b_leg.b_leg_invite.as_ref() {
+            Some(invite_arc) => {
+                let invite = match invite_arc.lock() {
+                    Ok(guard) => guard.clone(),
+                    Err(_) => {
+                        warn!(call_id = %call_id, "B2BUA CANCEL: b_leg_invite mutex poisoned, skipping leg");
+                        continue;
+                    }
+                };
+                match build_cancel_from_invite(&invite) {
+                    Some(cancel_msg) => {
+                        bleg_targets.push((
+                            cancel_msg,
+                            b_leg.transport.transport,
+                            b_leg.transport.remote_addr,
+                        ));
+                    }
+                    None => {
+                        warn!(call_id = %call_id, "B2BUA CANCEL: failed to build CANCEL from stashed INVITE");
+                    }
+                }
             }
-        } else {
-            cancel_msg
-        };
-
-        if let Ok(cancel_built) = cancel_msg.build() {
-            send_b2bua_to_bleg(cancel_built, b_leg.transport.transport, b_leg.transport.remote_addr, state);
+            None => {
+                // Race: CANCEL arrived before this B-leg's INVITE was
+                // actually sent.  Defer — b2bua_send_b_leg_invite drains
+                // pending_cancel after stashing b_leg_invite.
+                debug!(
+                    call_id = %call_id,
+                    leg_id = %b_leg.id,
+                    "B2BUA CANCEL: deferred (b_leg_invite not yet stashed)"
+                );
+                b_leg.pending_cancel = true;
+            }
         }
     }
 
@@ -6008,6 +6098,12 @@ fn handle_b2bua_cancel(
     // Send 487 Request Terminated to A-leg for the original INVITE
     let a_leg = call.a_leg.clone();
     drop(call);
+
+    // Emit the prepared CANCELs after dropping the call lock so the
+    // outbound path doesn't reenter the DashMap.
+    for (cancel_msg, b_transport, b_dest) in bleg_targets {
+        send_b2bua_to_bleg(cancel_msg, b_transport, b_dest, state);
+    }
 
     let response_487 = build_response(&message, 487, "Request Terminated", state.server_header.as_deref(), &[]);
     send_message(
@@ -6620,12 +6716,45 @@ fn b2bua_send_b_leg_invite(
     // SDP back to the B-leg. Increment B-leg local CSeq after sending the
     // initial INVITE (CSeq 1 is now used); subsequent requests (re-INVITE,
     // BYE, 401/407 retry) use CSeq >= 2.
+    //
+    // Also drain a deferred CANCEL on this leg, if one was queued by
+    // handle_b2bua_cancel while the INVITE was still being assembled
+    // (RFC 3261 §9.1 — CANCEL must share the INVITE's Via branch + CSeq
+    // seq, so we can only emit it after the INVITE is on the wire and
+    // its hygiene-processed form is stashed).
     let stored_invite = Arc::new(Mutex::new(b_leg_invite));
-    if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-        if let Some(b_leg) = call.b_legs.last_mut() {
-            b_leg.dialog.local_cseq += 1;
-            b_leg.b_leg_invite = Some(stored_invite);
-        }
+    let deferred_cancel: Option<(SipMessage, Transport, SocketAddr)> =
+        if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+            let result = if let Some(b_leg) = call.b_legs.last_mut() {
+                b_leg.dialog.local_cseq += 1;
+                b_leg.b_leg_invite = Some(stored_invite.clone());
+                if b_leg.pending_cancel {
+                    b_leg.pending_cancel = false;
+                    match stored_invite.lock() {
+                        Ok(guard) => build_cancel_from_invite(&guard).map(|c| (
+                            c,
+                            b_leg.transport.transport,
+                            b_leg.transport.remote_addr,
+                        )),
+                        Err(_) => {
+                            warn!(call_id = %call_id, "B2BUA: pending CANCEL drain — stored INVITE mutex poisoned");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            result
+        } else {
+            None
+        };
+
+    if let Some((cancel_msg, b_transport, b_dest)) = deferred_cancel {
+        debug!(call_id = %call_id, "B2BUA: draining deferred CANCEL after INVITE stash");
+        send_b2bua_to_bleg(cancel_msg, b_transport, b_dest, state);
     }
 }
 
@@ -10658,6 +10787,139 @@ a=rtpmap:8 PCMA/8000\r\n";
         let response = build_response(&invite, 487, "Request Terminated", None, &[]);
         assert_eq!(response.status_code(), Some(487));
         assert!(response.headers.cseq().unwrap().contains("INVITE"));
+    }
+
+    // --- build_cancel_from_invite (RFC 3261 §9.1) ---
+
+    fn b_leg_invite_sample() -> SipMessage {
+        // Realistic B-leg INVITE as siphon would put it on the wire after
+        // hygiene: single topmost Via, B-leg Call-ID, fresh From-tag,
+        // To unchanged from the original RURI shape, Route set, SDP body.
+        SipMessageBuilder::new()
+            .request(
+                Method::Invite,
+                SipUri::new("ims.example.com".to_string())
+                    .with_user("5111".to_string()),
+            )
+            .via("SIP/2.0/UDP siphon.example.com:6060;branch=z9hG4bK-bleg-INVITE-BRANCH".to_string())
+            .to("<sip:5111@ims.example.com>".to_string())
+            .from("<sip:+31621376327@siphon.example.com>;tag=b2bua-from-tag-XYZ".to_string())
+            .call_id("b2b-call-id-bleg".to_string())
+            .cseq("1 INVITE".to_string())
+            .max_forwards(70)
+            .header("Route", "<sip:icscf.example.com:5060;lr>".to_string())
+            .header("Contact", "<sip:siphon@siphon.example.com:6060>".to_string())
+            .header("Allow", "INVITE,ACK,BYE,CANCEL".to_string())
+            .header("Supported", "timer,100rel".to_string())
+            .header("Session-Expires", "1800".to_string())
+            .header("Content-Type", "application/sdp".to_string())
+            .body(b"v=0\r\no=- 0 0 IN IP4 1.2.3.4\r\n".to_vec())
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn cancel_preserves_invite_via_branch() {
+        let invite = b_leg_invite_sample();
+        let cancel = build_cancel_from_invite(&invite).unwrap();
+        let via = cancel.headers.via().unwrap();
+        assert!(
+            via.contains("branch=z9hG4bK-bleg-INVITE-BRANCH"),
+            "CANCEL Via must reuse the INVITE branch (RFC 3261 §9.1): {via}",
+        );
+    }
+
+    #[test]
+    fn cancel_preserves_invite_cseq_number() {
+        let invite = b_leg_invite_sample();
+        let cancel = build_cancel_from_invite(&invite).unwrap();
+        let cseq = cancel.headers.cseq().unwrap();
+        assert_eq!(
+            cseq, "1 CANCEL",
+            "CANCEL CSeq must keep INVITE's sequence number and swap method to CANCEL",
+        );
+    }
+
+    #[test]
+    fn cancel_keeps_from_to_callid_verbatim() {
+        let invite = b_leg_invite_sample();
+        let cancel = build_cancel_from_invite(&invite).unwrap();
+        assert_eq!(
+            cancel.headers.from().unwrap(),
+            "<sip:+31621376327@siphon.example.com>;tag=b2bua-from-tag-XYZ",
+        );
+        assert_eq!(
+            cancel.headers.to().unwrap(),
+            "<sip:5111@ims.example.com>",
+        );
+        assert_eq!(cancel.headers.call_id().unwrap(), "b2b-call-id-bleg");
+    }
+
+    #[test]
+    fn cancel_request_line_method_is_cancel_with_invite_ruri() {
+        let invite = b_leg_invite_sample();
+        let cancel = build_cancel_from_invite(&invite).unwrap();
+        match &cancel.start_line {
+            StartLine::Request(rl) => {
+                assert_eq!(rl.method, Method::Cancel);
+                assert_eq!(rl.request_uri.user.as_deref(), Some("5111"));
+                assert_eq!(rl.request_uri.host, "ims.example.com");
+            }
+            StartLine::Response(_) => panic!("expected request"),
+        }
+    }
+
+    #[test]
+    fn cancel_strips_body_and_body_bearing_headers() {
+        let invite = b_leg_invite_sample();
+        let cancel = build_cancel_from_invite(&invite).unwrap();
+        assert!(cancel.body.is_empty(), "CANCEL must carry no body");
+        assert_eq!(cancel.headers.content_length(), Some(0));
+        assert!(
+            !cancel.headers.has("Content-Type"),
+            "CANCEL must not carry Content-Type"
+        );
+        assert!(
+            !cancel.headers.has("Contact"),
+            "CANCEL is hop-by-hop — Contact must be stripped"
+        );
+        assert!(
+            !cancel.headers.has("Allow"),
+            "CANCEL must not carry Allow"
+        );
+        assert!(
+            !cancel.headers.has("Supported"),
+            "CANCEL must not carry Supported"
+        );
+        assert!(
+            !cancel.headers.has("Session-Expires"),
+            "CANCEL must not carry Session-Expires"
+        );
+    }
+
+    #[test]
+    fn cancel_keeps_route_set() {
+        let invite = b_leg_invite_sample();
+        let cancel = build_cancel_from_invite(&invite).unwrap();
+        assert_eq!(
+            cancel.headers.get("Route").map(String::as_str),
+            Some("<sip:icscf.example.com:5060;lr>"),
+            "CANCEL must follow the same Route set as the INVITE it cancels",
+        );
+    }
+
+    #[test]
+    fn cancel_keeps_max_forwards() {
+        let invite = b_leg_invite_sample();
+        let cancel = build_cancel_from_invite(&invite).unwrap();
+        assert_eq!(cancel.headers.max_forwards(), Some(70));
+    }
+
+    #[test]
+    fn cancel_returns_none_for_response_input() {
+        // Defensive: build_cancel_from_invite must reject responses.
+        let response = build_response(&b_leg_invite_sample(), 100, "Trying", None, &[]);
+        assert!(build_cancel_from_invite(&response).is_none());
     }
 
     // --- Transaction integration tests ---

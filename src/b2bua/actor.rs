@@ -346,6 +346,14 @@ pub struct Leg {
     /// hygiene-processed B-leg INVITE rather than the raw A-leg INVITE
     /// (which would leak A-leg headers, identity, and Record-Routes).
     pub b_leg_invite: Option<Arc<Mutex<SipMessage>>>,
+    /// Inbound A-leg CANCEL arrived before this B-leg's INVITE was
+    /// actually sent (b_leg_invite stash hadn't landed yet — race
+    /// between the script's call.dial() actioning the outbound INVITE
+    /// and the upstream CANCEL on the A-leg).  When set, the moment
+    /// b_leg_invite gets stashed in b2bua_send_b_leg_invite the deferred
+    /// CANCEL is emitted immediately so RFC 3261 §9.1 correlation
+    /// (same Via branch + CSeq seq as the INVITE being cancelled) holds.
+    pub pending_cancel: bool,
 }
 
 impl Leg {
@@ -368,6 +376,7 @@ impl Leg {
             pending_reinvite: false,
             prack_acked_rseq: None,
             b_leg_invite: None,
+            pending_cancel: false,
         }
     }
 
@@ -391,6 +400,7 @@ impl Leg {
             pending_reinvite: false,
             prack_acked_rseq: None,
             b_leg_invite: None,
+            pending_cancel: false,
         }
     }
 }

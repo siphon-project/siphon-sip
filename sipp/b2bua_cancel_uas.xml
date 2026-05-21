@@ -6,15 +6,40 @@
   Receive INVITE → 180 Ringing → receive CANCEL → 200 (CANCEL) → 487 (INVITE)
 
   Simulates a slow-ringing endpoint that gets cancelled.
+
+  RFC 3261 §9.1 correlation assertions:
+    * The CANCEL's topmost Via branch MUST equal the INVITE's topmost Via
+      branch (so the UAS can match the CANCEL to the in-progress server
+      transaction of the INVITE).
+    * The CANCEL's CSeq sequence number MUST equal the INVITE's CSeq
+      sequence number (method swapped to CANCEL).
+  Without these, every proxy hop returns 481 Call/Transaction Does Not
+  Exist and the UAS never knows to stop ringing.
+
+  These assertions exist because earlier B2BUA CANCEL code emitted a
+  fresh branch and copied the A-leg CANCEL's CSeq number — both wrong
+  per RFC 3261 §9.1.
 -->
 <scenario name="B2BUA CANCEL UAS">
 
-  <!-- Receive INVITE from B2BUA (B-leg) -->
-  <recv request="INVITE" crlf="true" />
+  <!-- Receive INVITE from B2BUA (B-leg).  Capture the topmost Via
+       branch and the CSeq sequence number so we can assert that the
+       follow-up CANCEL is correlated correctly per RFC 3261 §9.1. -->
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp="branch=([^;&gt;\r\n ]+)"
+            search_in="hdr" header="Via:"
+            assign_to="junk,invite_branch" />
+      <ereg regexp="^([0-9]+)"
+            search_in="hdr" header="CSeq:"
+            assign_to="junk,invite_cseq_num" />
+    </action>
+  </recv>
 
   <!-- Send 180 Ringing (keep ringing so the UAC has time to CANCEL) -->
   <send>
     <![CDATA[
+
 SIP/2.0 180 Ringing
 [last_Via:]
 [last_From:]
@@ -27,12 +52,23 @@ Content-Length: 0
 ]]>
   </send>
 
-  <!-- Expect CANCEL from B2BUA -->
-  <recv request="CANCEL" />
+  <!-- Expect CANCEL from B2BUA.  Assert the correlation invariants:
+       same Via branch as the INVITE, same CSeq sequence number. -->
+  <recv request="CANCEL">
+    <action>
+      <ereg regexp="branch=\[$invite_branch\]"
+            search_in="hdr" header="Via:"
+            check_it="true" assign_to="junk" />
+      <ereg regexp="^\[$invite_cseq_num\] CANCEL"
+            search_in="hdr" header="CSeq:"
+            check_it="true" assign_to="junk" />
+    </action>
+  </recv>
 
   <!-- Respond 200 OK to CANCEL -->
   <send>
     <![CDATA[
+
 SIP/2.0 200 OK
 [last_Via:]
 [last_From:]
@@ -44,15 +80,18 @@ Content-Length: 0
 ]]>
   </send>
 
-  <!-- Respond 487 Request Terminated for the original INVITE -->
+  <!-- Respond 487 Request Terminated for the original INVITE.  Use the
+       captured INVITE CSeq number so we don't echo the CANCEL's CSeq
+       (which would be N CANCEL, not N INVITE). -->
   <send>
     <![CDATA[
+
 SIP/2.0 487 Request Terminated
 [last_Via:]
 [last_From:]
 [last_To:];tag=[pid]SIPpTag01[call_number]
 [last_Call-ID:]
-CSeq: 1 INVITE
+CSeq: [$invite_cseq_num] INVITE
 Content-Length: 0
 
 ]]>
