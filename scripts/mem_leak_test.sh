@@ -21,6 +21,9 @@
 #   invite    — INVITE → 200 → ACK → BYE → 200 (proxy/B2BUA call path)
 #   register  — auth'd REGISTER churn (registrar + REGISTER dispatch path,
 #               which fires @registrar.on_change — the original prod leak path)
+#   subscribe — SUBSCRIBE-and-abandon with a short expiry; the abandoned
+#               subscribe_state dialogs must be reaped by the L1 sweep
+#               (siphon_subscribe_dialogs -> 0)
 #
 # Proxy mode loads scripts/leak_test_script.py, which adds @registrar.on_change
 # and @timer.every handlers so those dispatch paths are exercised too.
@@ -53,6 +56,7 @@ cleanup() {
     pkill -f "invite_uac" 2>/dev/null || true
     pkill -f "invite_uas" 2>/dev/null || true
     pkill -f "register.xml" 2>/dev/null || true
+    pkill -f "subscribe_abandon" 2>/dev/null || true
     pkill -9 -f "target/release/siphon" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -142,6 +146,16 @@ burst_register() {
     while pgrep -f "register.xml" > /dev/null 2>&1; do sleep 1; done
     [ -f /tmp/leak_reg.csv ] && tail -1 /tmp/leak_reg.csv | awk -F';' '{print $18+0}' || echo 0
 }
+burst_subscribe() {
+    # SUBSCRIBE-and-abandon churn — each creates a short-expiry subscribe_state
+    # dialog. Abandoned (no un-SUBSCRIBE), they must be reaped by the L1 sweep,
+    # so siphon_subscribe_dialogs must return to 0 after the idle window.
+    sipp -sf sipp/subscribe_abandon_uac.xml "$PROXY" -m "$CALLS_PER_CYCLE" -r "$CPS" -t "$SIPP_T" \
+        -i "$UAC_IP" -p "$UAC_PORT" -s presence \
+        -trace_stat -stf /tmp/leak_sub.csv -fd 1 > /dev/null 2>&1 || true
+    while pgrep -f "subscribe_abandon_uac.xml" > /dev/null 2>&1; do sleep 1; done
+    [ -f /tmp/leak_sub.csv ] && tail -1 /tmp/leak_sub.csv | awk -F';' '{print $18+0}' || echo 0
+}
 
 echo ""
 echo "[*] Warm-up (invite + register), then idle ${IDLE_SECS}s ..."
@@ -153,36 +167,38 @@ echo "[=] baseline: allocated=$((ALLOC_BASE/1048576)) MB  python_blocks=$PY_BASE
 echo ""
 
 FAILED_TOTAL=0; LEAK=0
-for scenario in invite register; do
+for scenario in invite register subscribe; do
     echo "--- scenario: $scenario ---"
     for cycle in $(seq 1 "$CYCLES"); do
         f=$("burst_$scenario")
         FAILED_TOTAL=$((FAILED_TOTAL + ${f:-0}))
         sleep "$IDLE_SECS"
         alloc=$(read_gauge memory_allocated_bytes); pyb=$(read_gauge python_allocated_blocks)
-        dialog=$(read_gauge proxy_dialog_sessions)
+        dialog=$(read_gauge proxy_dialog_sessions); subs=$(read_gauge subscribe_dialogs)
         da=$(( (alloc - ALLOC_BASE) / 1048576 )); dp=$(( pyb - PY_BASE ))
-        [ "${dialog:-0}" -ne 0 ] && LEAK=1
-        printf "  %-9s cyc %d/%d: allocated=%d MB (Δ%+d)  python_blocks=%s (Δ%+d)  dialog=%s  failed=%s\n" \
-            "$scenario" "$cycle" "$CYCLES" "$((alloc/1048576))" "$da" "${pyb:-?}" "$dp" "${dialog:-?}" "${f:-0}"
+        # Both dialog stores must drain to 0 after the idle window.
+        { [ "${dialog:-0}" -ne 0 ] || [ "${subs:-0}" -ne 0 ]; } && LEAK=1
+        printf "  %-9s cyc %d/%d: allocated=%d MB (Δ%+d)  python_blocks=%s (Δ%+d)  dialog=%s  subs=%s  failed=%s\n" \
+            "$scenario" "$cycle" "$CYCLES" "$((alloc/1048576))" "$da" "${pyb:-?}" "$dp" "${dialog:-?}" "${subs:-?}" "${f:-0}"
     done
 done
 
 ALLOC_FIN=$(read_gauge memory_allocated_bytes); PY_FIN=$(read_gauge python_allocated_blocks)
-DIALOG_FIN=$(read_gauge proxy_dialog_sessions)
+DIALOG_FIN=$(read_gauge proxy_dialog_sessions); SUBS_FIN=$(read_gauge subscribe_dialogs)
 ALLOC_GROWTH=$(( (ALLOC_FIN - ALLOC_BASE) / 1048576 )); PY_GROWTH=$(( PY_FIN - PY_BASE ))
 
 echo ""
 echo "--- Results ---"
 echo "  jemalloc allocated:  $((ALLOC_BASE/1048576)) → $((ALLOC_FIN/1048576)) MB  (Δ ${ALLOC_GROWTH}, budget ${ALLOC_BUDGET_MB})"
 echo "  python blocks:       $PY_BASE → $PY_FIN  (Δ ${PY_GROWTH}, budget ${PYBLOCKS_BUDGET})"
-echo "  dialog_sessions:     final=$DIALOG_FIN (must be 0)    failed calls: $FAILED_TOTAL"
+echo "  dialog_sessions:     final=$DIALOG_FIN    subscribe_dialogs: final=$SUBS_FIN   (both must be 0)"
+echo "  failed calls:        $FAILED_TOTAL"
 echo ""
 
 STATUS=0
 [ "$FAILED_TOTAL" -ne 0 ] && { echo "=== FAIL: $FAILED_TOTAL failed calls ==="; STATUS=1; }
-{ [ "$LEAK" -ne 0 ] || [ "${DIALOG_FIN:-1}" -ne 0 ]; } && { echo "=== FAIL: dialog_sessions did not drain to 0 ==="; STATUS=1; }
+{ [ "$LEAK" -ne 0 ] || [ "${DIALOG_FIN:-1}" -ne 0 ] || [ "${SUBS_FIN:-1}" -ne 0 ]; } && { echo "=== FAIL: a dialog store did not drain to 0 (dialog=$DIALOG_FIN subs=$SUBS_FIN) ==="; STATUS=1; }
 [ "$ALLOC_GROWTH" -gt "$ALLOC_BUDGET_MB" ] && { echo "=== FAIL: jemalloc allocated grew ${ALLOC_GROWTH} MB (Rust leak) ==="; STATUS=1; }
 [ "$PY_GROWTH" -gt "$PYBLOCKS_BUDGET" ] && { echo "=== FAIL: python blocks grew ${PY_GROWTH} (Python leak) ==="; STATUS=1; }
-[ "$STATUS" -eq 0 ] && echo "=== PASS: rust+python allocations flat, dialog drains to 0, 0 failed ==="
+[ "$STATUS" -eq 0 ] && echo "=== PASS: rust+python allocations flat, dialog+subscribe stores drain to 0, 0 failed ==="
 exit $STATUS

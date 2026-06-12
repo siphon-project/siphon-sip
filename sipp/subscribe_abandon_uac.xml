@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+<!--
+  Minimal SUBSCRIBE-and-abandon scenario for the memory-leak test.
+
+  Sends a SUBSCRIBE with a short Expires, expects 200, then stops WITHOUT
+  un-subscribing. The notifier (siphon, via the leak-test script) creates a
+  subscribe_state dialog; because the subscriber abandons it, the dialog must
+  be reaped by the L1 sweep once it expires (`siphon_subscribe_dialogs` -> 0).
+-->
+<scenario name="SUBSCRIBE abandon">
+  <send retrans="500">
+    <![CDATA[
+
+SUBSCRIBE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:watcher@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 SUBSCRIBE
+Contact: <sip:watcher@[local_ip]:[local_port];transport=[transport]>
+Event: presence
+Expires: 10
+Accept: application/pidf+xml
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+  <!-- Abandon: no un-SUBSCRIBE. The dialog is left for the L1 sweep to reap. -->
+</scenario>

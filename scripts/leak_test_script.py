@@ -31,6 +31,17 @@ def route(request):
         registrar.save(request)
         return
 
+    if request.method == "SUBSCRIBE":
+        # Create a short-expiry subscribe_state dialog and accept it. The leak
+        # test abandons these (no un-SUBSCRIBE), so the L1 sweep must reap them
+        # once they expire — exercising SubscribeStore::sweep_stale end to end.
+        try:
+            proxy.subscribe_state.create(request, expires=10)
+        except Exception as error:
+            log.warn(f"subscribe_state.create failed: {error}")
+        request.reply(200, "OK")
+        return
+
     if not request.ruri.user:
         request.reply(484, "Address Incomplete")
         return
