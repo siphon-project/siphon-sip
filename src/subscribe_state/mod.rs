@@ -15,6 +15,7 @@
 //! the script to hand-roll Redis keys.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
@@ -119,6 +120,21 @@ pub struct SubscribeStore {
     dialogs: DashMap<String, SubscribeDialog>,
     /// ``(cache_manager, cache_name)`` when configured.
     cache: Option<(Arc<CacheManager>, String)>,
+}
+
+/// Process-wide subscribe-dialog store, installed at startup so background
+/// tasks (the dispatcher cleanup tick) can reach it without going through the
+/// Python namespace singleton.
+static GLOBAL_STORE: OnceLock<Arc<SubscribeStore>> = OnceLock::new();
+
+/// Install the global store. Idempotent (first writer wins).
+pub fn set_global_store(store: Arc<SubscribeStore>) {
+    let _ = GLOBAL_STORE.set(store);
+}
+
+/// Borrow the installed global store, if any.
+pub fn global_store() -> Option<Arc<SubscribeStore>> {
+    GLOBAL_STORE.get().cloned()
 }
 
 impl SubscribeStore {
@@ -237,6 +253,29 @@ impl SubscribeStore {
         self.dialogs.len()
     }
 
+    /// Reap expired or terminated dialogs from the L1 store, returning the
+    /// number removed.  A subscriber that vanishes without an un-SUBSCRIBE
+    /// would otherwise pin its `SubscribeDialog` in L1 forever: the L2 cache
+    /// expires via its own TTL, but L1 has no such reaper.  Call periodically
+    /// (the dispatcher does so on its cleanup tick).
+    pub fn sweep_stale(&self) -> usize {
+        // Collect ids first, then remove: holding a DashMap iterator (shard
+        // read lock) while removing (shard write lock) on the same map can
+        // deadlock.
+        let stale: Vec<String> = self
+            .dialogs
+            .iter()
+            .filter(|entry| entry.terminated || entry.remaining_secs() == 0)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for id in &stale {
+            // L1-only: an expired L2 entry ages out via its own TTL, and a
+            // terminated dialog already had its L2 key deleted by `remove`.
+            self.dialogs.remove(id);
+        }
+        stale.len()
+    }
+
     /// Find a dialog by its three identity tags. Used to correlate an
     /// in-dialog NOTIFY (received via `@proxy.on_request("NOTIFY")`)
     /// back to the outbound SUBSCRIBE we sent that established the
@@ -315,6 +354,34 @@ mod tests {
         store.remove("abc");
         assert!(store.get("abc").await.is_none());
         assert_eq!(store.local_count(), 0);
+    }
+
+    #[test]
+    fn sweep_reaps_expired_and_terminated_only() {
+        let store = SubscribeStore::new();
+        store.put(sample_dialog("fresh")); // expires_secs 3600 — survives
+
+        let mut expired = sample_dialog("expired");
+        expired.expires_secs = 0; // remaining_secs() == 0
+        store.put(expired);
+
+        let mut terminated = sample_dialog("terminated");
+        terminated.terminated = true; // reaped even though not expired
+        store.put(terminated);
+
+        assert_eq!(store.local_count(), 3);
+        let removed = store.sweep_stale();
+        assert_eq!(removed, 2, "expired + terminated must be reaped");
+        assert_eq!(store.local_count(), 1, "the live dialog must remain");
+    }
+
+    #[test]
+    fn sweep_keeps_live_dialogs() {
+        let store = SubscribeStore::new();
+        store.put(sample_dialog("a"));
+        store.put(sample_dialog("b"));
+        assert_eq!(store.sweep_stale(), 0);
+        assert_eq!(store.local_count(), 2);
     }
 
     #[tokio::test]

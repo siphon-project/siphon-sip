@@ -1718,9 +1718,17 @@ fn sweep_stale_entries(state: &DispatcherState) {
     let expired_uac = state.uac_sender.sweep_stale(ttl) as u64;
     let uac_pending = state.uac_sender.pending_count();
     let dialog_sessions = state.session_store.dialog_key_count();
+    // Reap expired/abandoned SUBSCRIBE dialogs from the L1 store (L2 expires
+    // via its own TTL; L1 has no reaper, so a subscriber that vanishes without
+    // an un-SUBSCRIBE would otherwise pin its dialog forever).
+    let (expired_subs, subscribe_dialogs) = match crate::subscribe_state::global_store() {
+        Some(store) => (store.sweep_stale() as u64, store.local_count()),
+        None => (0, 0),
+    };
     if let Some(metrics) = crate::metrics::try_metrics() {
         metrics.uac_pending_requests.set(uac_pending as i64);
         metrics.proxy_dialog_sessions.set(dialog_sessions as i64);
+        metrics.subscribe_dialogs.set(subscribe_dialogs as i64);
     }
     // Refresh allocator memory gauges (jemalloc live/resident/retained bytes)
     // so operators can alert on `siphon_memory_allocated_bytes` growth — the
@@ -1729,10 +1737,11 @@ fn sweep_stale_entries(state: &DispatcherState) {
     crate::metrics::update_memory_stats();
     crate::metrics::update_python_stats();
 
-    if expired_sessions > 0 || expired_uac > 0 {
+    if expired_sessions > 0 || expired_uac > 0 || expired_subs > 0 {
         info!(
             expired_sessions,
             expired_uac,
+            expired_subs,
             uac_pending,
             sessions = state.session_store.session_count(),
             transactions = state.transaction_manager.count(),

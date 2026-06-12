@@ -652,6 +652,10 @@ impl SiphonServer {
                 }
             }
             let store_arc = Arc::new(store);
+            // Install the global handle so the dispatcher's cleanup tick can
+            // sweep expired/abandoned subscribe dialogs out of L1 (which, unlike
+            // L2, has no TTL reaper of its own).
+            crate::subscribe_state::set_global_store(Arc::clone(&store_arc));
             pyo3::Python::attach(|python| {
                 let namespace =
                     crate::script::api::subscribe_state::PySubscribeState::new(
