@@ -141,6 +141,32 @@ impl PyReply {
         Ok(message.headers.call_id().cloned())
     }
 
+    /// Message body as bytes, or None if empty.
+    ///
+    /// Mirrors `request.body` so SDP-handling scripts can read a response
+    /// body symmetrically (e.g. `answer = reply.body` in a `@proxy.on_reply`
+    /// media-authorization handler).
+    #[getter]
+    fn body(&self) -> PyResult<Option<Vec<u8>>> {
+        let message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        if message.body.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(message.body.clone()))
+        }
+    }
+
+    /// Content-Type header value.
+    #[getter]
+    fn content_type(&self) -> PyResult<Option<String>> {
+        let message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        Ok(message.headers.content_type().cloned())
+    }
+
     /// Check if a header exists.
     fn has_header(&self, name: &str) -> PyResult<bool> {
         let message = self.message.lock().map_err(|error| {
@@ -441,6 +467,48 @@ mod tests {
         let reply = PyReply::new(message);
 
         assert!(!reply.has_body("application/sdp").unwrap());
+    }
+
+    #[test]
+    fn body_returns_bytes_when_present() {
+        let mut response = make_response(200, "OK");
+        response.headers.set("Content-Type", "application/sdp".to_string());
+        response.body = b"v=0\r\no=- 0 0 IN IP4 10.0.0.1\r\n".to_vec();
+
+        let message = Arc::new(Mutex::new(response));
+        let reply = PyReply::new(message);
+
+        assert_eq!(
+            reply.body().unwrap(),
+            Some(b"v=0\r\no=- 0 0 IN IP4 10.0.0.1\r\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn body_is_none_when_empty() {
+        let message = Arc::new(Mutex::new(make_response(200, "OK")));
+        let reply = PyReply::new(message);
+
+        assert_eq!(reply.body().unwrap(), None);
+    }
+
+    #[test]
+    fn content_type_getter() {
+        let mut response = make_response(200, "OK");
+        response.headers.set("Content-Type", "application/sdp".to_string());
+
+        let message = Arc::new(Mutex::new(response));
+        let reply = PyReply::new(message);
+
+        assert_eq!(reply.content_type().unwrap(), Some("application/sdp".to_string()));
+    }
+
+    #[test]
+    fn content_type_none_when_absent() {
+        let message = Arc::new(Mutex::new(make_response(200, "OK")));
+        let reply = PyReply::new(message);
+
+        assert_eq!(reply.content_type().unwrap(), None);
     }
 
     #[test]
