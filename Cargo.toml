@@ -117,6 +117,10 @@ regex = "1"
 # almost entirely without any code changes.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
+# Read jemalloc's internal stats (live allocated / resident / retained bytes)
+# to expose as Prometheus gauges — `allocated` is the precise leak signal
+# (actual live bytes, unlike RSS which includes allocator retention).
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 
 # Netlink — used by `src/ipsec/netlink.rs` to install XFRM SAs/policies
 # without the `ip xfrm` shell-out (3GPP TS 33.203 P-CSCF role).  The crate

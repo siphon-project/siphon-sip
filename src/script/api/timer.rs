@@ -148,7 +148,7 @@ def make_decorator(seconds, name, jitter):
 
             // Fire the callback inside Python::attach, then pop the registry
             // entry so a subsequent set() under the same key works cleanly.
-            tokio::task::spawn_blocking(move || {
+            crate::script::py_executor::run(move || {
                 pyo3::Python::attach(|python| {
                     let callable = handler.bind(python);
                     match callable.call1((key_clone.as_str(),)) {
@@ -167,8 +167,7 @@ def make_decorator(seconds, name, jitter):
 
                 scheduler.timers.remove(&key_clone);
             })
-            .await
-            .ok();
+            .await;
         });
 
         self.scheduler.timers.insert(key.clone(), join_handle);

@@ -391,6 +391,16 @@ pub struct ScriptConfig {
     /// the number of available CPUs (clamped to at least 1).
     #[serde(default)]
     pub async_pool_size: Option<usize>,
+    /// Size of the synchronous Python executor pool used to run *sync*
+    /// script-handler invocations.  Each worker is a fixed, never-reaped
+    /// OS thread with a persistent Python attach — see `script::py_executor`
+    /// for why this is needed (the free-threaded-CPython mimalloc heap leak
+    /// on the elastic `spawn_blocking` pool).  Defaults to 2× the number of
+    /// available CPUs (clamped to at least 2): the hot inbound path runs here,
+    /// and 2× restores the burst headroom the elastic pool gave at the
+    /// throughput ceiling.  Lower it on memory-constrained, low-traffic NFs.
+    #[serde(default)]
+    pub sync_pool_size: Option<usize>,
 }
 
 fn default_script_path() -> String {
@@ -403,6 +413,7 @@ impl Default for ScriptConfig {
             path: default_script_path(),
             reload: default_reload(),
             async_pool_size: None,
+            sync_pool_size: None,
         }
     }
 }

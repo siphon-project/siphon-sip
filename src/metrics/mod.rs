@@ -64,6 +64,16 @@ pub struct SiphonMetrics {
     // --- Transaction gauges ---
     pub transactions_active: IntGauge,
 
+    /// In-flight UAC requests (NAT keepalive / health probe) awaiting a
+    /// response.  Climbs without bound if pending entries are not swept —
+    /// watch this to confirm the sweep is keeping the `UacSender` map drained.
+    pub uac_pending_requests: IntGauge,
+
+    /// Live proxy dialog-key entries (one per INVITE awaiting/within its 2xx
+    /// ACK window).  Returns to ~0 when call setup is idle; a monotonic climb
+    /// means completed-call dialog keys are leaking (`by_dialog_key`).
+    pub proxy_dialog_sessions: IntGauge,
+
     // --- Registration gauges ---
     pub registrations_active: IntGauge,
 
@@ -79,6 +89,21 @@ pub struct SiphonMetrics {
 
     // --- Uptime ---
     pub uptime_seconds: Gauge,
+
+    // --- Memory (jemalloc stats — the precise leak signal) ---
+    /// Live bytes allocated by the application (`jemalloc stats.allocated`).
+    /// Steady growth under constant load is a real leak — unlike RSS, this
+    /// excludes allocator retention/fragmentation.  Alert on this.
+    pub memory_allocated_bytes: IntGauge,
+    /// Physical pages backing the allocator (`stats.resident`) — RSS-like.
+    pub memory_resident_bytes: IntGauge,
+    /// Bytes in active pages (`stats.active`).
+    pub memory_active_bytes: IntGauge,
+    /// Virtual memory retained by the allocator, not returned to the OS
+    /// (`stats.retained`).  Explains RSS sitting above `allocated`.
+    pub memory_retained_bytes: IntGauge,
+    /// Total mapped bytes (`stats.mapped`).
+    pub memory_mapped_bytes: IntGauge,
 
     // --- Script execution ---
     pub script_executions_total: IntCounterVec,
@@ -114,6 +139,16 @@ impl SiphonMetrics {
         let transactions_active = IntGauge::new(
             "siphon_transactions_active",
             "Number of active SIP transactions",
+        )?;
+
+        let uac_pending_requests = IntGauge::new(
+            "siphon_uac_pending_requests",
+            "In-flight UAC requests (NAT keepalive / health probe) awaiting a response",
+        )?;
+
+        let proxy_dialog_sessions = IntGauge::new(
+            "siphon_proxy_dialog_sessions",
+            "Live proxy dialog-key entries (INVITEs within their 2xx ACK window)",
         )?;
 
         let registrations_active = IntGauge::new(
@@ -152,6 +187,27 @@ impl SiphonMetrics {
         let uptime_seconds = Gauge::new(
             "siphon_uptime_seconds",
             "Time since SIPhon process started",
+        )?;
+
+        let memory_allocated_bytes = IntGauge::new(
+            "siphon_memory_allocated_bytes",
+            "Live bytes allocated by the application (jemalloc stats.allocated) — the leak signal",
+        )?;
+        let memory_resident_bytes = IntGauge::new(
+            "siphon_memory_resident_bytes",
+            "Physical pages backing the allocator (jemalloc stats.resident)",
+        )?;
+        let memory_active_bytes = IntGauge::new(
+            "siphon_memory_active_bytes",
+            "Bytes in active pages (jemalloc stats.active)",
+        )?;
+        let memory_retained_bytes = IntGauge::new(
+            "siphon_memory_retained_bytes",
+            "Virtual memory retained by the allocator, not returned to the OS (jemalloc stats.retained)",
+        )?;
+        let memory_mapped_bytes = IntGauge::new(
+            "siphon_memory_mapped_bytes",
+            "Total mapped bytes (jemalloc stats.mapped)",
         )?;
 
         let script_executions_total = IntCounterVec::new(
@@ -218,12 +274,19 @@ impl SiphonMetrics {
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(responses_total.clone()))?;
         registry.register(Box::new(transactions_active.clone()))?;
+        registry.register(Box::new(uac_pending_requests.clone()))?;
+        registry.register(Box::new(proxy_dialog_sessions.clone()))?;
         registry.register(Box::new(registrations_active.clone()))?;
         registry.register(Box::new(dialogs_active.clone()))?;
         registry.register(Box::new(connections_active.clone()))?;
         registry.register(Box::new(request_duration_seconds.clone()))?;
         registry.register(Box::new(transaction_duration_seconds.clone()))?;
         registry.register(Box::new(uptime_seconds.clone()))?;
+        registry.register(Box::new(memory_allocated_bytes.clone()))?;
+        registry.register(Box::new(memory_resident_bytes.clone()))?;
+        registry.register(Box::new(memory_active_bytes.clone()))?;
+        registry.register(Box::new(memory_retained_bytes.clone()))?;
+        registry.register(Box::new(memory_mapped_bytes.clone()))?;
         registry.register(Box::new(script_executions_total.clone()))?;
         registry.register(Box::new(script_errors_total.clone()))?;
         registry.register(Box::new(diameter_peers_connected.clone()))?;
@@ -240,12 +303,19 @@ impl SiphonMetrics {
             requests_total,
             responses_total,
             transactions_active,
+            uac_pending_requests,
+            proxy_dialog_sessions,
             registrations_active,
             dialogs_active,
             connections_active,
             request_duration_seconds,
             transaction_duration_seconds,
             uptime_seconds,
+            memory_allocated_bytes,
+            memory_resident_bytes,
+            memory_active_bytes,
+            memory_retained_bytes,
+            memory_mapped_bytes,
             script_executions_total,
             script_errors_total,
             diameter_peers_connected,
@@ -275,6 +345,44 @@ pub fn encode_metrics() -> String {
     }
     String::from_utf8(buffer).unwrap_or_default()
 }
+
+/// Refresh the jemalloc memory-stat gauges from the allocator's internal
+/// counters.  Call periodically (the dispatcher does so on its cleanup tick).
+/// No-op when metrics aren't initialised or jemalloc isn't the allocator.
+///
+/// `memory_allocated_bytes` is the one to alert on: it is actual live bytes,
+/// so steady growth under constant load is a real leak — independent of RSS,
+/// which also moves with allocator retention and fragmentation.
+#[cfg(not(target_env = "msvc"))]
+pub fn update_memory_stats() {
+    let Some(metrics) = metrics() else {
+        return;
+    };
+    // jemalloc snapshots stats at epoch advance; without this the reads are
+    // stale (often zero) on the first call.
+    if tikv_jemalloc_ctl::epoch::advance().is_err() {
+        return;
+    }
+    if let Ok(value) = tikv_jemalloc_ctl::stats::allocated::read() {
+        metrics.memory_allocated_bytes.set(value as i64);
+    }
+    if let Ok(value) = tikv_jemalloc_ctl::stats::resident::read() {
+        metrics.memory_resident_bytes.set(value as i64);
+    }
+    if let Ok(value) = tikv_jemalloc_ctl::stats::active::read() {
+        metrics.memory_active_bytes.set(value as i64);
+    }
+    if let Ok(value) = tikv_jemalloc_ctl::stats::retained::read() {
+        metrics.memory_retained_bytes.set(value as i64);
+    }
+    if let Ok(value) = tikv_jemalloc_ctl::stats::mapped::read() {
+        metrics.memory_mapped_bytes.set(value as i64);
+    }
+}
+
+/// No-op on MSVC, where jemalloc (and thus its stats) is not the allocator.
+#[cfg(target_env = "msvc")]
+pub fn update_memory_stats() {}
 
 // ---------------------------------------------------------------------------
 // Tests

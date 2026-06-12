@@ -340,6 +340,30 @@ impl SiphonServer {
             tokio::runtime::Handle::current(),
         );
 
+        // Spin up the synchronous Python executor pool — a fixed set of
+        // never-reaped OS threads that all `Python::attach` handler
+        // invocations route through instead of tokio's elastic
+        // `spawn_blocking` pool.  Without this, reaped blocking threads orphan
+        // their pinned free-threaded-CPython mimalloc heap (~2 MB each) — the
+        // anonymous-heap leak under steady SIP signalling.  See
+        // `script::py_executor` for the full story.
+        //
+        // Default to 2× CPUs: the hot inbound path runs here, and the elastic
+        // `spawn_blocking` pool this replaces absorbed bursts by spawning extra
+        // threads.  A fixed pool sized to just `num_cpus` adds queue latency at
+        // the throughput ceiling (≈28k cps → sipp retransmits), so 2× restores
+        // that burst headroom.  Idle workers are cheap (a per-thread Python heap
+        // only materialises under load); memory-constrained low-traffic NFs can
+        // lower `script.sync_pool_size`.
+        let sync_pool_size = config
+            .script
+            .sync_pool_size
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() * 2));
+        crate::script::py_executor::PyExecutor::install(
+            sync_pool_size,
+            tokio::runtime::Handle::current(),
+        );
+
         dispatcher::inject_python_singletons(&config);
         let pre_rtpengine = dispatcher::init_rtpengine(&config);
 
@@ -1180,7 +1204,7 @@ impl SiphonServer {
                         State(state): State<SbiNotifState>,
                         Json(body): Json<crate::sbi::npcf::PcfEventNotification>,
                     ) -> axum::http::StatusCode {
-                        let _ = tokio::task::spawn_blocking(move || {
+                        let _ = crate::script::py_executor::run(move || {
                             pyo3::Python::attach(|python| {
                                 use pyo3::types::PyAnyMethods;
                                 let engine_state = state.engine.state();

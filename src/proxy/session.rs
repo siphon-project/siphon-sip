@@ -17,7 +17,7 @@ use dashmap::DashMap;
 use pyo3::prelude::*;
 
 use crate::proxy::fork::ForkAggregator;
-use crate::sip::message::SipMessage;
+use crate::sip::message::{Method, SipMessage};
 use crate::transaction::key::TransactionKey;
 use crate::transport::{ConnectionId, Transport};
 
@@ -184,7 +184,7 @@ impl ProxySessionStore {
     pub fn insert(&self, session: ProxySession) -> Arc<RwLock<ProxySession>> {
         let server_key = session.server_key.clone();
         let client_keys: Vec<TransactionKey> = session.client_keys.clone();
-        let dialog_key = Self::dialog_key_from_message(&session.original_request);
+        let dialog_key = Self::invite_dialog_key(&session.original_request);
         let session_arc = Arc::new(RwLock::new(session));
 
         for client_key in &client_keys {
@@ -222,12 +222,12 @@ impl ProxySessionStore {
     /// stranding the call as "response for unknown branch".
     pub fn insert_for_fork(&self, session: ProxySession) -> Arc<RwLock<ProxySession>> {
         let server_key = session.server_key.clone();
-        let dialog_key = Self::dialog_key_from_message(&session.original_request);
+        let dialog_key = Self::invite_dialog_key(&session.original_request);
         let session_arc = Arc::new(RwLock::new(session));
         if let Some(dk) = dialog_key {
-            // Same rationale as `insert()` above: do not overwrite an existing
-            // dialog-key entry.  The first INVITE for a `(Call-ID, From-tag)`
-            // owns the dialog; later in-dialog requests must not displace it.
+            // Only an INVITE reaches here (see `invite_dialog_key`).  Keep
+            // `or_insert_with` so a re-INVITE that arrives before the original
+            // dialog-key entry was aged out doesn't displace it.
             self.by_dialog_key
                 .entry(dk)
                 .or_insert_with(|| Arc::clone(&session_arc));
@@ -377,7 +377,7 @@ impl ProxySessionStore {
             if let Some(first) = client_keys.first() {
                 if let Some(session_ref) = self.by_client_key.get(first) {
                     if let Ok(session) = session_ref.value().read() {
-                        if let Some(dk) = Self::dialog_key_from_message(&session.original_request) {
+                        if let Some(dk) = Self::invite_dialog_key(&session.original_request) {
                             self.by_dialog_key.remove(&dk);
                         }
                     }
@@ -447,7 +447,34 @@ impl ProxySessionStore {
         for server_key in &stale_server_keys {
             self.remove_by_server_key(server_key);
         }
-        count
+
+        // Age out orphaned `by_dialog_key` entries.  On a completed call the
+        // 2xx final response drives `remove_client_key`, which drops the
+        // session's `by_client_key` rows but deliberately leaves the
+        // `by_dialog_key` entry alive so the end-to-end 2xx ACK can still be
+        // routed (`get_by_dialog_key` → `handle_ack_via_session`).  The loop
+        // above can only discover sessions that still have a `by_client_key`
+        // row, so it never reaches these orphans — without this pass each one
+        // pins a full cloned INVITE (`ProxySession::original_request`) for the
+        // process lifetime, an unbounded per-answered-call heap leak that is
+        // invisible to `session_count()` (which counts `server_to_clients`).
+        // The 2xx ACK always lands within the transaction timeout, so aging
+        // these by the same `ttl` (measured from `created_at`) is safe — after
+        // that window the dialog-key entry is dead weight (in-dialog requests
+        // route via loose routing, not `by_dialog_key`).
+        let mut stale_dialog_keys = Vec::new();
+        for entry in self.by_dialog_key.iter() {
+            if let Ok(session) = entry.value().read() {
+                if now.duration_since(session.created_at) > ttl {
+                    stale_dialog_keys.push(entry.key().clone());
+                }
+            }
+        }
+        for dialog_key in &stale_dialog_keys {
+            self.by_dialog_key.remove(dialog_key);
+        }
+
+        count + stale_dialog_keys.len()
     }
 
     /// Number of sessions (counted by unique server keys).
@@ -458,6 +485,15 @@ impl ProxySessionStore {
     /// Number of client key entries.
     pub fn client_key_count(&self) -> usize {
         self.by_client_key.len()
+    }
+
+    /// Number of dialog-key entries (Call-ID + From-tag → session).
+    ///
+    /// Distinct from [`session_count`](Self::session_count): a completed call's
+    /// `by_dialog_key` entry outlives its `server_to_clients` row (kept for 2xx
+    /// ACK routing), so this is the count to watch for the dialog-key leak.
+    pub fn dialog_key_count(&self) -> usize {
+        self.by_dialog_key.len()
     }
 
     /// Build a dialog key (Call-ID + From-tag) from a SIP message.
@@ -471,6 +507,25 @@ impl ProxySessionStore {
             .flatten()
             .and_then(|na| na.tag)?;
         Some(format!("{}\0{}", call_id, from_tag))
+    }
+
+    /// Dialog key, but only for INVITE requests.
+    ///
+    /// `by_dialog_key` exists solely to route the end-to-end 2xx ACK, and only
+    /// an INVITE's 2xx is ACKed.  Populating it for non-INVITE in-dialog
+    /// requests (BYE, UPDATE, …) is both unnecessary (they are loose-routed)
+    /// and a leak: each such request builds its own per-transaction
+    /// `ProxySession`, and after its client key is removed on the final
+    /// response its `by_dialog_key` entry is orphaned exactly like the INVITE's
+    /// was.  Restricting population to INVITE also subsumes the older
+    /// `or_insert_with` race guard — a BYE can no longer touch the entry at all,
+    /// so it cannot displace the INVITE's mid-call.
+    fn invite_dialog_key(msg: &SipMessage) -> Option<String> {
+        if matches!(msg.method(), Some(Method::Invite)) {
+            Self::dialog_key_from_message(msg)
+        } else {
+            None
+        }
     }
 }
 
@@ -492,13 +547,15 @@ mod tests {
     use crate::sip::uri::SipUri;
 
     fn dummy_request() -> SipMessage {
+        // INVITE so `by_dialog_key` is populated (it is INVITE-only — see
+        // `invite_dialog_key`); the store keys themselves are method-agnostic.
         SipMessageBuilder::new()
-            .request(Method::Options, SipUri::new("example.com".to_string()))
+            .request(Method::Invite, SipUri::new("example.com".to_string()))
             .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-srv".to_string())
             .to("<sip:example.com>".to_string())
             .from("<sip:user@example.com>;tag=abc".to_string())
             .call_id("session-test".to_string())
-            .cseq("1 OPTIONS".to_string())
+            .cseq("1 INVITE".to_string())
             .content_length(0)
             .build()
             .unwrap()
@@ -704,6 +761,88 @@ mod tests {
         let swept = store.sweep_stale(std::time::Duration::from_secs(3600));
         assert_eq!(swept, 0);
         assert_eq!(store.session_count(), 1);
+    }
+
+    /// Regression: a completed call leaves an orphaned `by_dialog_key` entry
+    /// (kept for 2xx ACK routing) that the by_client_key-driven sweep can't
+    /// reach.  Without the dedicated age-out pass it pins a cloned INVITE for
+    /// the process lifetime — an unbounded, un-gauged per-answered-call leak.
+    #[test]
+    fn store_sweep_reclaims_orphaned_dialog_key_after_completed_call() {
+        let store = ProxySessionStore::new();
+        let session_arc = store.insert(make_session());
+
+        assert_eq!(store.client_key_count(), 1);
+        assert_eq!(store.session_count(), 1);
+        assert_eq!(store.dialog_key_count(), 1);
+
+        // 2xx final response → remove_client_key drops by_client_key and
+        // server_to_clients but deliberately keeps by_dialog_key for the ACK.
+        assert!(store.remove_client_key(&client_key("1")));
+        assert_eq!(store.client_key_count(), 0);
+        assert_eq!(store.session_count(), 0);
+        // Orphaned dialog-key entry — invisible to session_count().
+        assert_eq!(store.dialog_key_count(), 1);
+
+        // Backdate creation past the ACK window so the sweep ages it out.
+        session_arc.write().unwrap().created_at =
+            std::time::Instant::now() - std::time::Duration::from_secs(60);
+
+        let removed = store.sweep_stale(std::time::Duration::from_secs(32));
+        assert_eq!(removed, 1, "orphaned dialog key must be reclaimed");
+        assert_eq!(store.dialog_key_count(), 0);
+    }
+
+    /// A non-INVITE request (in-dialog BYE/UPDATE/etc.) must NOT create a
+    /// dialog-key entry — only an INVITE's 2xx is ACKed via `by_dialog_key`.
+    /// Otherwise each in-dialog request would orphan its own `ProxySession`.
+    #[test]
+    fn store_non_invite_does_not_create_dialog_key() {
+        let bye = SipMessageBuilder::new()
+            .request(Method::Bye, SipUri::new("example.com".to_string()))
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-bye".to_string())
+            .to("<sip:example.com>;tag=xyz".to_string())
+            .from("<sip:user@example.com>;tag=abc".to_string())
+            .call_id("bye-test".to_string())
+            .cseq("2 BYE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        let mut session = ProxySession::new(
+            server_key(),
+            source_addr(),
+            local_addr(),
+            ConnectionId::default(),
+            Transport::Udp,
+            bye,
+            false,
+        );
+        session.add_client_key(client_key("1"));
+
+        let store = ProxySessionStore::new();
+        store.insert(session);
+
+        assert_eq!(store.session_count(), 1);
+        assert_eq!(
+            store.dialog_key_count(),
+            0,
+            "non-INVITE request must not create a by_dialog_key entry"
+        );
+    }
+
+    /// The dialog-key entry must survive a sweep while still fresh, so the
+    /// end-to-end 2xx ACK can be routed via `get_by_dialog_key`.
+    #[test]
+    fn store_sweep_keeps_fresh_dialog_key_for_ack_routing() {
+        let store = ProxySessionStore::new();
+        store.insert(make_session());
+        store.remove_client_key(&client_key("1"));
+        assert_eq!(store.dialog_key_count(), 1);
+
+        // Just created — must NOT be aged out (the ACK may still be in flight).
+        let removed = store.sweep_stale(std::time::Duration::from_secs(32));
+        assert_eq!(removed, 0);
+        assert_eq!(store.dialog_key_count(), 1);
     }
 
     #[test]

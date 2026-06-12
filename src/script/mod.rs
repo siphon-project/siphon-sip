@@ -5,5 +5,6 @@ pub mod api;
 pub mod async_pool;
 pub mod engine;
 pub mod handle;
+pub mod py_executor;
 
 pub use handle::{HandlerHandle, ScriptHandle};

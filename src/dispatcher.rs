@@ -630,7 +630,7 @@ pub async fn run(
                 let state_ref = Arc::clone(&state_for_events);
 
                 // Invoke Python handlers in a blocking context
-                tokio::task::spawn_blocking(move || {
+                crate::script::py_executor::run(move || {
                     let engine_state = state_ref.engine.state();
                     let handlers =
                         engine_state.handlers_for(&HandlerKind::RegistrarOnChange);
@@ -678,8 +678,7 @@ pub async fn run(
                         }
                     });
                 })
-                .await
-                .ok();
+                .await;
             }
         });
     }
@@ -726,7 +725,7 @@ pub async fn run(
                 let state_ref = Arc::clone(&state_for_events);
 
                 // Invoke Python handlers in a blocking context
-                tokio::task::spawn_blocking(move || {
+                crate::script::py_executor::run(move || {
                     let engine_state = state_ref.engine.state();
                     let handlers =
                         engine_state.handlers_for(&HandlerKind::RegistrantOnChange);
@@ -774,8 +773,7 @@ pub async fn run(
                         }
                     });
                 })
-                .await
-                .ok();
+                .await;
             }
         });
     }
@@ -1508,7 +1506,7 @@ pub async fn run(
                         }
                         let state_ref = Arc::clone(&state_for_events);
                         let dtmf_clone = dtmf.clone();
-                        tokio::task::spawn_blocking(move || {
+                        crate::script::py_executor::run(move || {
                             let engine_state = state_ref.engine.state();
                             let handlers = engine_state
                                 .dtmf_handlers(&dtmf_clone.call_id, &dtmf_clone.from_tag);
@@ -1543,8 +1541,7 @@ pub async fn run(
                                 }
                             });
                         })
-                        .await
-                        .ok();
+                        .await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::Unknown { event, call_id, .. } => {
                         tracing::debug!(
@@ -1564,9 +1561,11 @@ pub async fn run(
         let state = Arc::clone(&state);
 
         // Both requests and responses may invoke Python handlers
-        // (on_request and on_reply), so use spawn_blocking for both
-        // to avoid starving the tokio worker pool with GIL contention.
-        tokio::task::spawn_blocking(move || {
+        // (on_request and on_reply), so dispatch on the fixed Python executor
+        // pool rather than tokio's elastic blocking pool — the latter reaps
+        // idle threads mid-process and orphans their pinned free-threaded
+        // CPython mimalloc heap (~2 MB each).  See `script::py_executor`.
+        crate::script::py_executor::spawn(move || {
             handle_inbound(inbound, &state);
         });
     }
@@ -1711,9 +1710,28 @@ fn sweep_stale_entries(state: &DispatcherState) {
     let ttl = state.transaction_timeout;
     let expired_sessions = state.session_store.sweep_stale(ttl) as u64;
 
-    if expired_sessions > 0 {
+    // Expire UAC pending requests whose response never arrived. Callers
+    // (NAT keepalive, gateway health probe, proxy.send_request) apply a short
+    // receiver timeout and drop the receiver, but that does not remove the
+    // pending entry — only a matching response or this sweep does. Without it
+    // the map grows by one stranded oneshot::Sender per unanswered probe.
+    let expired_uac = state.uac_sender.sweep_stale(ttl) as u64;
+    let uac_pending = state.uac_sender.pending_count();
+    let dialog_sessions = state.session_store.dialog_key_count();
+    if let Some(metrics) = crate::metrics::try_metrics() {
+        metrics.uac_pending_requests.set(uac_pending as i64);
+        metrics.proxy_dialog_sessions.set(dialog_sessions as i64);
+    }
+    // Refresh allocator memory gauges (jemalloc live/resident/retained bytes)
+    // so operators can alert on `siphon_memory_allocated_bytes` growth — the
+    // precise, RSS-noise-free leak signal.
+    crate::metrics::update_memory_stats();
+
+    if expired_sessions > 0 || expired_uac > 0 {
         info!(
             expired_sessions,
+            expired_uac,
+            uac_pending,
             sessions = state.session_store.session_count(),
             transactions = state.transaction_manager.count(),
             "stale entry cleanup"

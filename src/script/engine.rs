@@ -850,7 +850,7 @@ async fn timer_loop(
 
         let timer_name = name.clone();
         let callback = callable.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = crate::script::py_executor::try_run(move || {
             Python::attach(|python| {
                 let bound = callback.bind(python);
                 match bound.call0() {
@@ -873,12 +873,8 @@ async fn timer_loop(
         })
         .await;
 
-        if let Err(error) = result {
-            if error.is_cancelled() {
-                debug!(name = %name, "timer cancelled");
-                break;
-            }
-            warn!(name = %name, %error, "timer task panicked");
+        if result.is_err() {
+            warn!(name = %name, "timer callback panicked");
         }
     }
 }
@@ -1125,6 +1121,7 @@ async def route(request):
             path: "/nonexistent/script.py".to_owned(),
             reload: ReloadMode::Auto,
             async_pool_size: None,
+            sync_pool_size: None,
         };
         let result = ScriptEngine::new(&config);
         assert!(result.is_err());
@@ -1150,6 +1147,7 @@ def route(request):
             path: file.path().to_str().unwrap().to_owned(),
             reload: ReloadMode::Auto,
             async_pool_size: None,
+            sync_pool_size: None,
         };
         let engine = ScriptEngine::new(&config).unwrap();
         assert_eq!(engine.state().handlers.len(), 1);
@@ -1197,6 +1195,7 @@ def route(request):
             path: file.path().to_str().unwrap().to_owned(),
             reload: ReloadMode::Auto,
             async_pool_size: None,
+            sync_pool_size: None,
         };
         let engine = ScriptEngine::new(&config).unwrap();
         assert_eq!(engine.state().handlers.len(), 1);

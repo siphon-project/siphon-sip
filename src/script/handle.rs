@@ -146,7 +146,7 @@ impl ScriptHandle {
         let callable = Python::attach(|py| handler.callable.clone_ref(py));
         let is_async = handler.is_async;
 
-        let join = tokio::task::spawn_blocking(move || {
+        let join = crate::script::py_executor::try_run(move || {
             Python::attach(|py| -> PyResult<Py<PyAny>> {
                 let bound_callable = callable.bind(py);
                 let bound_args: Vec<Bound<'_, PyAny>> =
@@ -164,8 +164,8 @@ impl ScriptHandle {
 
         match join {
             Ok(result) => result,
-            Err(join_err) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                format!("script handler dispatch panicked: {join_err}"),
+            Err(_panic) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "script handler dispatch panicked".to_string(),
             )),
         }
     }
@@ -195,6 +195,7 @@ mod tests {
                 path: file.path().to_str().unwrap().to_owned(),
                 reload: crate::config::ReloadMode::Sighup,
                 async_pool_size: None,
+                sync_pool_size: None,
             })
             .unwrap(),
         )

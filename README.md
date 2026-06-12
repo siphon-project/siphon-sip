@@ -586,32 +586,37 @@ Reference machine: AMD Ryzen AI 9 HX 370 (24 logical cores), 128 GB RAM, Linux 6
 
 | Mode  | Transport | Test                  | Peak CPS | Peak CPU% | Peak RSS |
 |-------|-----------|-----------------------|---------:|----------:|---------:|
-| Proxy | UDP       | `1000 250 1`          |      250 |       15% |     63 MB |
-| Proxy | UDP       | `5000 1000 4`         |    1 000 |       44% |    121 MB |
-| Proxy | UDP       | `20000 5000 4`        |    4 964 |      273% |    344 MB |
-| Proxy | UDP       | `40000 10000 8`       |    9 928 |      444% |    617 MB |
-| Proxy | TCP       | `1000 250 1`          |      250 |       15% |     53 MB |
-| Proxy | TCP       | `5000 1000 4`         |    1 000 |       41% |     76 MB |
-| Proxy | TCP       | `20000 5000 4`        |    4 960 |      172% |    162 MB |
-| Proxy | TCP       | `40000 10000 8`       |    9 936 |      390% |    269 MB |
-| B2BUA | UDP       | `1000 250 1`          |      250 |       16% |     54 MB |
-| B2BUA | UDP       | `5000 1000 4`         |    1 004 |       50% |     68 MB |
-| B2BUA | UDP       | `20000 5000 4`        |    4 960 |      221% |    116 MB |
-| B2BUA | UDP       | `40000 10000 8`       |    9 920 |      493% |    185 MB |
-| B2BUA | TCP       | `1000 250 1`          |      250 |       13% |     52 MB |
-| B2BUA | TCP       | `5000 1000 4`         |    1 004 |       48% |     72 MB |
-| B2BUA | TCP       | `20000 5000 4`        |    4 964 |      196% |    119 MB |
-| B2BUA | TCP       | `40000 10000 8`       |    9 952 |      407% |    152 MB |
+| Proxy | UDP       | `1000 250 1`          |      250 |       20% |    114 MB |
+| Proxy | UDP       | `5000 1000 4`         |    1 004 |       57% |    190 MB |
+| Proxy | UDP       | `20000 5000 4`        |    4 964 |      208% |    465 MB |
+| Proxy | UDP       | `40000 10000 8`       |    9 888 |      370% |    836 MB |
+| Proxy | TCP       | `1000 250 1`          |      250 |       19% |     92 MB |
+| Proxy | TCP       | `5000 1000 4`         |    1 004 |       47% |    121 MB |
+| Proxy | TCP       | `20000 5000 4`        |    4 960 |      161% |    220 MB |
+| Proxy | TCP       | `40000 10000 8`       |    9 928 |      323% |    356 MB |
+| B2BUA | UDP       | `1000 250 1`          |      250 |       20% |    106 MB |
+| B2BUA | UDP       | `5000 1000 4`         |    1 004 |       53% |    121 MB |
+| B2BUA | UDP       | `20000 5000 4`        |    4 948 |      190% |    140 MB |
+| B2BUA | UDP       | `40000 10000 8`       |    9 912 |      358% |    162 MB |
+| B2BUA | TCP       | `1000 250 1`          |      250 |       20% |    100 MB |
+| B2BUA | TCP       | `5000 1000 4`         |    1 004 |       50% |    111 MB |
+| B2BUA | TCP       | `20000 5000 4`        |    4 972 |      173% |    130 MB |
+| B2BUA | TCP       | `40000 10000 8`       |    9 912 |      321% |    150 MB |
 
 ### Headroom
 
-Above the design target of 10 000 cps, siphon stays clean well past 2× the spec:
+Above the design target of 10 000 cps, siphon stays clean well past 2× the
+spec. Routing Python handlers through a fixed worker pool (instead of tokio's
+elastic `spawn_blocking` path) cut scheduling overhead and lifted the clean
+ceiling from ~28k to ~32k cps, at lower CPU than before:
 
 | Test (proxy UDP, free-threaded) | Peak CPS | Peak CPU% | Peak RSS |
 |---------------------------------|---------:|----------:|---------:|
-| `100000 20000 20`               |   19 840 |    1 014% |   1.4 GB |
-| `120000 24000 24`               |   23 856 |    1 224% |   1.9 GB |
-| `140000 28000 28`               |   27 944 |    1 349% |   2.4 GB |
+| `140000 28000 28`               |   27 916 |      957% |   2.7 GB |
+| `160000 32000 32`               |   31 904 |    1 052% |   3.0 GB |
+
+Beyond ~32k the benchmark rig (64 SIPp processes on a 24-core box) saturates
+before siphon does — siphon still has CPU headroom at that point.
 
 ## Roadmap
 

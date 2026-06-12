@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -79,6 +80,10 @@ pub enum UacResult {
 /// A pending UAC request awaiting a response.
 struct PendingRequest {
     sender: oneshot::Sender<UacResult>,
+    /// When this entry was registered. The sweep expires entries older than
+    /// the transaction timeout (RFC 3261 Timer F) so a probe whose response
+    /// never arrives does not strand its `oneshot::Sender` forever.
+    inserted_at: Instant,
 }
 
 /// UAC sender — generates and sends outbound SIP requests.
@@ -241,7 +246,10 @@ impl UacSender {
         };
 
         let (sender, receiver) = oneshot::channel();
-        self.pending.insert(branch.clone(), PendingRequest { sender });
+        self.pending.insert(
+            branch.clone(),
+            PendingRequest { sender, inserted_at: Instant::now() },
+        );
 
         debug!(
             destination = %destination,
@@ -339,7 +347,10 @@ impl UacSender {
             source_local_addr: None,
         };
 
-        self.pending.insert(branch.clone(), PendingRequest { sender });
+        self.pending.insert(
+            branch.clone(),
+            PendingRequest { sender, inserted_at: Instant::now() },
+        );
 
         debug!(
             destination = %destination,
@@ -395,10 +406,43 @@ impl UacSender {
         }
     }
 
-    /// Clean up timed-out pending requests.
-    /// Called periodically by the dispatcher's sweep task.
+    /// Number of in-flight UAC requests awaiting a response.
+    ///
+    /// Surfaced as the `siphon_uac_pending_requests` gauge. A steadily rising
+    /// value means responses are not being matched and the sweep is not
+    /// keeping up (or is not wired in) — the classic keepalive/probe leak.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Expire pending requests older than `max_age`, signalling `Timeout` to
+    /// any still-listening receiver. Returns the number of entries removed.
+    ///
+    /// Callers apply their own short receiver timeout (e.g. 5 s) and then drop
+    /// the `oneshot::Receiver`, but dropping the receiver does **not** remove
+    /// the `pending` entry — only a matching response ([`match_response`]) or
+    /// this sweep does. Without it, every probe to a peer that never answers
+    /// (NAT keepalive of an asleep UE, health probe of a down trunk) strands
+    /// one entry plus its `oneshot::Sender` forever. The dispatcher's periodic
+    /// cleanup task calls this with the transaction timeout (RFC 3261 Timer F,
+    /// 32 s) as `max_age`.
+    pub fn sweep_stale(&self, max_age: Duration) -> usize {
+        let now = Instant::now();
+        // Collect stale keys first, then remove: holding a DashMap iterator
+        // (shard read lock) while calling remove (shard write lock) on the
+        // same map can deadlock.
+        let stale: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|entry| now.duration_since(entry.value().inserted_at) > max_age)
+            .map(|entry| entry.key().clone())
+            .collect();
+        for branch in &stale {
+            if let Some((_, pending)) = self.pending.remove(branch) {
+                let _ = pending.sender.send(UacResult::Timeout);
+            }
+        }
+        stale.len()
     }
 
     /// Expire a specific pending request by branch (called on timeout).
@@ -538,6 +582,81 @@ mod tests {
         );
 
         assert_eq!(sender.pending_count(), 2);
+    }
+
+    #[test]
+    fn sweep_stale_removes_expired_and_signals_timeout() {
+        let (sender, _rxs) = make_uac_sender();
+
+        // Simulate a probe whose response never arrives: the caller would have
+        // dropped its receiver after a short timeout, but the pending entry
+        // would linger forever without the sweep. Keep the receiver alive here
+        // so we can observe the Timeout signal.
+        let mut receiver = sender.send_options(
+            "10.0.0.1:5060".parse().unwrap(),
+            Transport::Udp,
+            SipUri::new("10.0.0.1".to_string()),
+        );
+        assert_eq!(sender.pending_count(), 1);
+
+        // Backdate the entry past the transaction timeout (RFC 3261 Timer F).
+        let branch = sender.pending.iter().next().unwrap().key().clone();
+        sender.pending.get_mut(&branch).unwrap().inserted_at =
+            Instant::now() - Duration::from_secs(40);
+
+        let removed = sender.sweep_stale(Duration::from_secs(32));
+        assert_eq!(removed, 1);
+        assert_eq!(sender.pending_count(), 0);
+
+        // The stranded receiver is signalled Timeout, not left dangling.
+        let result = receiver.try_recv().unwrap();
+        assert!(matches!(result, UacResult::Timeout));
+    }
+
+    #[test]
+    fn sweep_stale_keeps_fresh_entries() {
+        let (sender, _rxs) = make_uac_sender();
+
+        let _receiver = sender.send_options(
+            "10.0.0.1:5060".parse().unwrap(),
+            Transport::Udp,
+            SipUri::new("10.0.0.1".to_string()),
+        );
+        assert_eq!(sender.pending_count(), 1);
+
+        // Just sent — well within the max age, so the sweep must not touch it.
+        let removed = sender.sweep_stale(Duration::from_secs(32));
+        assert_eq!(removed, 0);
+        assert_eq!(sender.pending_count(), 1);
+    }
+
+    #[test]
+    fn sweep_stale_removes_only_expired_among_many() {
+        let (sender, _rxs) = make_uac_sender();
+
+        // Three pending probes; backdate two of them.
+        for index in 1..=3 {
+            let _receiver = sender.send_options(
+                format!("10.0.0.{index}:5060").parse().unwrap(),
+                Transport::Udp,
+                SipUri::new(format!("10.0.0.{index}")),
+            );
+        }
+        assert_eq!(sender.pending_count(), 3);
+
+        let branches: Vec<String> = sender
+            .pending
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        for branch in branches.iter().take(2) {
+            sender.pending.get_mut(branch).unwrap().inserted_at =
+                Instant::now() - Duration::from_secs(40);
+        }
+
+        let removed = sender.sweep_stale(Duration::from_secs(32));
+        assert_eq!(removed, 2);
+        assert_eq!(sender.pending_count(), 1);
     }
 
     #[test]
