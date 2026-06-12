@@ -104,6 +104,12 @@ pub struct SiphonMetrics {
     pub memory_retained_bytes: IntGauge,
     /// Total mapped bytes (`stats.mapped`).
     pub memory_mapped_bytes: IntGauge,
+    /// Currently-allocated CPython memory blocks (`sys.getallocatedblocks()`).
+    /// Python objects use CPython's own allocator (mimalloc on free-threaded
+    /// builds), NOT jemalloc — so this is the leak signal for the *Python* side
+    /// (script globals, leaked `Py<>` references) that `memory_allocated_bytes`
+    /// cannot see. Steady growth at a flat, completed-call workload is a leak.
+    pub python_allocated_blocks: IntGauge,
 
     // --- Script execution ---
     pub script_executions_total: IntCounterVec,
@@ -209,6 +215,10 @@ impl SiphonMetrics {
             "siphon_memory_mapped_bytes",
             "Total mapped bytes (jemalloc stats.mapped)",
         )?;
+        let python_allocated_blocks = IntGauge::new(
+            "siphon_python_allocated_blocks",
+            "Currently-allocated CPython memory blocks (sys.getallocatedblocks) — the Python-side leak signal",
+        )?;
 
         let script_executions_total = IntCounterVec::new(
             Opts::new("siphon_script_executions_total", "Total Python script handler executions"),
@@ -287,6 +297,7 @@ impl SiphonMetrics {
         registry.register(Box::new(memory_active_bytes.clone()))?;
         registry.register(Box::new(memory_retained_bytes.clone()))?;
         registry.register(Box::new(memory_mapped_bytes.clone()))?;
+        registry.register(Box::new(python_allocated_blocks.clone()))?;
         registry.register(Box::new(script_executions_total.clone()))?;
         registry.register(Box::new(script_errors_total.clone()))?;
         registry.register(Box::new(diameter_peers_connected.clone()))?;
@@ -316,6 +327,7 @@ impl SiphonMetrics {
             memory_active_bytes,
             memory_retained_bytes,
             memory_mapped_bytes,
+            python_allocated_blocks,
             script_executions_total,
             script_errors_total,
             diameter_peers_connected,
@@ -383,6 +395,25 @@ pub fn update_memory_stats() {
 /// No-op on MSVC, where jemalloc (and thus its stats) is not the allocator.
 #[cfg(target_env = "msvc")]
 pub fn update_memory_stats() {}
+
+/// Refresh the Python-side allocation gauge from `sys.getallocatedblocks()`.
+///
+/// Python objects live in CPython's own allocator (mimalloc on free-threaded
+/// builds), which jemalloc — and therefore [`update_memory_stats`] — cannot
+/// see. This is the leak signal for the Python side: a script accumulating
+/// objects, or a leaked `Py<>` reference. Cheap; called on the cleanup tick.
+pub fn update_python_stats() {
+    let Some(metrics) = metrics() else {
+        return;
+    };
+    use pyo3::prelude::*;
+    let result = pyo3::Python::attach(|python| -> PyResult<i64> {
+        python.import("sys")?.call_method0("getallocatedblocks")?.extract()
+    });
+    if let Ok(blocks) = result {
+        metrics.python_allocated_blocks.set(blocks);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests

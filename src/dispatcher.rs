@@ -1724,8 +1724,10 @@ fn sweep_stale_entries(state: &DispatcherState) {
     }
     // Refresh allocator memory gauges (jemalloc live/resident/retained bytes)
     // so operators can alert on `siphon_memory_allocated_bytes` growth — the
-    // precise, RSS-noise-free leak signal.
+    // precise, RSS-noise-free leak signal.  Also refresh the Python-side block
+    // count (jemalloc can't see CPython's allocator) for Python leak detection.
     crate::metrics::update_memory_stats();
+    crate::metrics::update_python_stats();
 
     if expired_sessions > 0 || expired_uac > 0 {
         info!(
