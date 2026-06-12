@@ -19,12 +19,16 @@
 #
 # Scenarios (extend freely — each just needs a *_burst function):
 #   invite    — INVITE → 200 → ACK → BYE → 200 (proxy/B2BUA call path)
-#   register  — auth'd REGISTER churn (registrar + REGISTER dispatch path)
+#   register  — auth'd REGISTER churn (registrar + REGISTER dispatch path,
+#               which fires @registrar.on_change — the original prod leak path)
 #
-# NOTE on coverage: this drives the core dispatch/proxy/registrar paths. It
-# does NOT yet exercise feature-specific stores that require a script using
-# them (subscribe_state, registrar.on_change handlers, diameter, rtpengine),
-# nor SUBSCRIBE/MESSAGE relay — those are future scenarios/scripts.
+# Proxy mode loads scripts/leak_test_script.py, which adds @registrar.on_change
+# and @timer.every handlers so those dispatch paths are exercised too.
+#
+# NOTE on coverage: this covers the core dispatch/proxy/registrar paths plus
+# the on_change + timer handler paths. It does NOT yet exercise SUBSCRIBE/
+# MESSAGE relay, or feature stores that need a script driving them
+# (subscribe_state, diameter, rtpengine) — those are future scenarios.
 #
 # Usage:
 #   ./scripts/mem_leak_test.sh [cycles] [calls_per_cycle] [cps] [idle_secs]
@@ -86,9 +90,13 @@ fi
 echo "[+] build ok"
 
 MODE="${MODE:-proxy}"
+# Proxy mode runs a richer script than proxy_default.py so the test also
+# exercises the @registrar.on_change and @timer.every dispatch paths (the
+# on_change path is the original prod leak surface).
+LEAK_SCRIPT="${LEAK_SCRIPT:-scripts/leak_test_script.py}"
 CONFIG_FILE="/tmp/siphon_leak_${MODE}.yaml"
 case "$MODE" in
-    proxy) cp siphon.yaml "$CONFIG_FILE" ;;
+    proxy) sed "s|scripts/proxy_default.py|$LEAK_SCRIPT|" siphon.yaml > "$CONFIG_FILE" ;;
     b2bua) sed 's|scripts/proxy_default.py|scripts/b2bua_default.py|' siphon.yaml > "$CONFIG_FILE" ;;
     *) echo "FAIL: unknown MODE='$MODE'"; exit 1 ;;
 esac

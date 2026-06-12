@@ -389,7 +389,12 @@ impl ScriptEngine {
                 jitter_secs,
             } = handler.kind
             {
-                let callable = handler.callable.clone();
+                // Attach before cloning the Py callback — `restart_timers`
+                // runs outside any attach scope (server startup / hot reload),
+                // and on free-threaded Python cloning a `Py<>` while detached
+                // panics ("Cannot clone pointer into Python heap without the
+                // thread being attached"), crashing any `@timer.every` script.
+                let callable = Python::attach(|python| handler.callable.clone_ref(python));
                 let is_async = handler.is_async;
                 let timer_name = name.clone();
                 let interval = interval_secs;
