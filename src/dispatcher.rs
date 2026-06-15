@@ -9662,6 +9662,15 @@ fn handle_b2bua_reinvite(
             forwarded.headers.set("Contact", contact.clone());
         }
 
+        // In-dialog requests follow the dialog route set (RFC 3261 §12.2.1.1):
+        // send to the route-set first hop, not the cached INVITE next-hop. In an
+        // IMS topology the INVITE was sent to a non-Record-Routing I-CSCF while
+        // the dialog routes via the S-CSCF, so the cached leg destination is the
+        // wrong target for an in-dialog re-INVITE (mirrors the PRACK/ACK/BYE
+        // paths). Falls back to the cached destination when there is no route set.
+        let (send_dest, send_transport) =
+            resolve_in_dialog_destination(&target_route_set, state, destination, transport);
+
         // Track the re-INVITE branch → call_id for response routing.
         // Encode the direction so the response handler knows where to relay.
         // Store the originator's Via(s) so we can restore them on the response.
@@ -9675,16 +9684,16 @@ fn handle_b2bua_reinvite(
             direction.to_string(),
             branch.clone(),
             LegTransport {
-                remote_addr: destination,
+                remote_addr: send_dest,
                 connection_id: ConnectionId::default(),
-                transport,
+                transport: send_transport,
             },
         );
         reinvite_leg.stored_vias = originator_vias;
         reinvite_leg.stored_cseq = message.headers.cseq().map(|c| c.to_string());
         state.call_actors.add_b_leg(&call_id, reinvite_leg);
 
-        send_b2bua_to_bleg(forwarded, transport, destination, state);
+        send_b2bua_to_bleg(forwarded, send_transport, send_dest, state);
 
         // Increment the target leg's local CSeq after sending the re-INVITE
         if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
@@ -9942,6 +9951,15 @@ fn handle_b2bua_update(
             forwarded.headers.set("Contact", contact.clone());
         }
 
+        // In-dialog requests follow the dialog route set (RFC 3261 §12.2.1.1):
+        // send to the route-set first hop, not the cached INVITE next-hop. In an
+        // IMS topology the INVITE was sent to a non-Record-Routing I-CSCF while
+        // the dialog routes via the S-CSCF, so the cached leg destination is the
+        // wrong target for an in-dialog UPDATE (mirrors the PRACK/ACK/BYE paths).
+        // Falls back to the cached destination when there is no route set.
+        let (send_dest, send_transport) =
+            resolve_in_dialog_destination(&target_route_set, state, destination, transport);
+
         // Track the UPDATE branch under "update:" so the response handler
         // routes the cross-leg response correctly without colliding with a
         // concurrent re-INVITE on the same dialog.
@@ -9955,16 +9973,16 @@ fn handle_b2bua_update(
             direction.to_string(),
             branch.clone(),
             LegTransport {
-                remote_addr: destination,
+                remote_addr: send_dest,
                 connection_id: ConnectionId::default(),
-                transport,
+                transport: send_transport,
             },
         );
         update_leg.stored_vias = originator_vias;
         update_leg.stored_cseq = message.headers.cseq().map(|c| c.to_string());
         state.call_actors.add_b_leg(&call_id, update_leg);
 
-        send_b2bua_to_bleg(forwarded, transport, destination, state);
+        send_b2bua_to_bleg(forwarded, send_transport, send_dest, state);
 
         // Bump local CSeq on the target leg after sending.
         if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
