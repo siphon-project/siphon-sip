@@ -10,10 +10,71 @@ pub mod netlink;
 
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
+
+/// Grace added on top of an SA's hard lifetime before the sweeper reaps
+/// its in-memory `associations` entry (RFC 3261 Timer F = 64·T1 = 64 s).
+///
+/// The kernel reaps the four XFRM states + four policies on the SA hard
+/// lifetime directly; this grace only governs when `sweep_expired` drops
+/// the manager's bookkeeping entry (and best-effort re-deletes the kernel
+/// objects, which are usually already gone).  Matching the 64 s Timer F
+/// window used elsewhere in the codebase keeps the in-memory view alive
+/// just long enough for any in-flight re-REGISTER to refresh the SA
+/// rather than race the sweep.
+const SA_SWEEP_GRACE_SECS: u64 = 64;
+
+/// Compute the wall-clock instant after which `sweep_expired` may reap an
+/// SA pair's in-memory entry.  For an SA with a hard lifetime this is
+/// `now + lifetime + grace`; an SA created with no hard lifetime
+/// (`None` — intentionally permanent, dev/test) is never swept by this
+/// path, so it gets a far-future instant.
+fn compute_sa_expires_at(hard_lifetime_secs: Option<u64>) -> Instant {
+    match hard_lifetime_secs {
+        Some(secs) => {
+            let total = secs.saturating_add(SA_SWEEP_GRACE_SECS);
+            Instant::now()
+                .checked_add(Duration::from_secs(total))
+                .unwrap_or_else(far_future_instant)
+        }
+        // No kernel-enforced expiry → never swept by the expiry path.
+        None => far_future_instant(),
+    }
+}
+
+/// A far-future `Instant` used as the "never sweep" sentinel.  ~100 years
+/// out — well past any realistic process lifetime, and saturating-add
+/// guards against overflow on platforms with a near-`now` epoch.
+fn far_future_instant() -> Instant {
+    Instant::now()
+        .checked_add(Duration::from_secs(100 * 365 * 24 * 60 * 60))
+        .unwrap_or_else(Instant::now)
+}
+
+/// Global `IpsecManager` handle, set once at server bootstrap so
+/// background sweeps (the dispatcher's 30 s cleanup tick) can reach the
+/// same manager the script API uses.  Mirrors
+/// `subscribe_state::set_global_store` / `global_store`.
+static GLOBAL_MANAGER: OnceLock<Arc<IpsecManager>> = OnceLock::new();
+
+/// Register the process-wide `IpsecManager`.  Idempotent — the first
+/// caller wins; later calls are ignored (returns the already-set handle
+/// via the `Err`-side of `OnceLock::set` being swallowed).  Called once
+/// where the manager is constructed during server startup.
+pub fn set_global_manager(manager: Arc<IpsecManager>) {
+    let _ = GLOBAL_MANAGER.set(manager);
+}
+
+/// Fetch the process-wide `IpsecManager`, if one has been registered.
+/// Returns `None` when IPsec is not configured (no P-CSCF role).
+pub fn global_manager() -> Option<Arc<IpsecManager>> {
+    GLOBAL_MANAGER.get().cloned()
+}
 
 // ---------------------------------------------------------------------------
 // Local helpers — HMAC-SHA-256, hex encoding, IPv4/IPv6 prefix length.
@@ -348,6 +409,18 @@ pub struct SecurityAssociationPair {
     /// deployments or tests; a mismatched pin silently drops every
     /// frame the UE sends on the other transport.
     pub protocol: SaProtocol,
+    /// Wall-clock instant after which the background sweeper
+    /// (`IpsecManager::sweep_expired`) may reap this pair's in-memory
+    /// entry and best-effort re-delete its kernel objects.
+    ///
+    /// Computed in `create_sa_pair` from `hard_lifetime_secs` plus
+    /// `SA_SWEEP_GRACE_SECS` (RFC 3261 Timer F).  An SA created with no
+    /// hard lifetime gets a far-future instant and is never swept by the
+    /// expiry path (intentionally permanent — dev/test).  An ACTIVE
+    /// registration re-REGISTERs before this deadline, which replaces the
+    /// pair with a fresh `expires_at`, so only truly-abandoned UEs are
+    /// reaped.
+    pub expires_at: Instant,
 }
 
 // ---------------------------------------------------------------------------
@@ -569,10 +642,16 @@ impl IpsecManager {
     /// 4. UE:port_us → PCSCF:port_pc, SPI=spi_pc (inbound replies)
     pub async fn create_sa_pair(
         &self,
-        sa: SecurityAssociationPair,
+        mut sa: SecurityAssociationPair,
     ) -> Result<(), IpsecError> {
         let key = Self::contact_key(&sa.ue_addr, sa.ue_port_c);
         let proto = sa.protocol;
+
+        // Stamp the authoritative sweep deadline from the SA's own hard
+        // lifetime (+ grace).  Computed here, ignoring whatever the caller
+        // pre-set, so the in-memory entry always agrees with the kernel
+        // hard-lifetime that the four states/policies were installed with.
+        sa.expires_at = compute_sa_expires_at(sa.hard_lifetime_secs);
 
         // SA1: UE:port_uc → PCSCF:port_ps, SPI=spi_ps (inbound to P-CSCF server)
         self.add_sa(
@@ -610,32 +689,42 @@ impl IpsecManager {
             proto, sa.hard_lifetime_secs,
         ).await?;
 
+        // Policies get the SAME hard lifetime as the states (above).
+        // Without this, XFRM policies have no kernel-enforced expiry and
+        // an abandoned UE that never de-registers/refreshes leaks all four
+        // forever; the states reap on hard-lifetime but the policies don't.
+        // Threading the lifetime through makes the policies self-reap on
+        // the same deadline (3GPP TS 33.203 §7.4) — and restart-orphaned
+        // policies from a prior process self-reap too, so no startup flush
+        // is needed.  `None` preserves the old permanent-policy behaviour.
+        let policy_lifetime = sa.hard_lifetime_secs;
+
         // Policy 1 (in): UE:port_uc → PCSCF:port_ps
         self.add_policy(
             &sa.ue_addr, sa.ue_port_c,
             &sa.pcscf_addr, sa.pcscf_port_s,
-            PolicyDir::In, sa.spi_ps, proto,
+            PolicyDir::In, sa.spi_ps, proto, policy_lifetime,
         ).await?;
 
         // Policy 2 (out): PCSCF:port_ps → UE:port_uc
         self.add_policy(
             &sa.pcscf_addr, sa.pcscf_port_s,
             &sa.ue_addr, sa.ue_port_c,
-            PolicyDir::Out, sa.spi_uc, proto,
+            PolicyDir::Out, sa.spi_uc, proto, policy_lifetime,
         ).await?;
 
         // Policy 3 (out): PCSCF:port_pc → UE:port_us
         self.add_policy(
             &sa.pcscf_addr, sa.pcscf_port_c,
             &sa.ue_addr, sa.ue_port_s,
-            PolicyDir::Out, sa.spi_us, proto,
+            PolicyDir::Out, sa.spi_us, proto, policy_lifetime,
         ).await?;
 
         // Policy 4 (in): UE:port_us → PCSCF:port_pc
         self.add_policy(
             &sa.ue_addr, sa.ue_port_s,
             &sa.pcscf_addr, sa.pcscf_port_c,
-            PolicyDir::In, sa.spi_pc, proto,
+            PolicyDir::In, sa.spi_pc, proto, policy_lifetime,
         ).await?;
 
         info!(
@@ -859,8 +948,18 @@ impl IpsecManager {
 
         // Mirror the new value into the cached SecurityAssociationPair so
         // any subsequent inspection (or downstream re-pin) sees the
-        // tightened limit.  Re-insert under the same key.
+        // tightened limit.  Re-insert under the same key.  Also refresh
+        // the sweep deadline so the in-memory entry reaps in step with the
+        // re-pinned hard lifetime — without this an SA installed with the
+        // UE's 600000 s ask but re-pinned down to the granted Expires
+        // would keep its old far-out `expires_at` and never sweep on time.
+        // The kernel preserves `add_time` across UPDSA so its true expiry
+        // is `original_install + new_lifetime`; the install→repin gap is
+        // sub-second, so computing from `now` here is conservatively close
+        // (slightly later) and the kernel still reaps states/policies on
+        // the exact deadline regardless.
         sa.hard_lifetime_secs = hard_lifetime_secs;
+        sa.expires_at = compute_sa_expires_at(hard_lifetime_secs);
         self.associations.insert(key, sa);
         Ok(())
     }
@@ -868,6 +967,84 @@ impl IpsecManager {
     /// Number of active SA pairs.
     pub fn active_count(&self) -> usize {
         self.associations.len()
+    }
+
+    /// Collect the contact keys of every SA pair whose sweep deadline
+    /// (`expires_at`) has already passed.
+    ///
+    /// Split out from [`sweep_expired`] so the selection logic is unit-
+    /// testable without `CAP_NET_ADMIN` / a live kernel netlink socket.
+    /// Snapshots into a `Vec` so the caller can `remove` while iterating
+    /// without holding a DashMap shard guard across the delete (avoids the
+    /// iterator/remove deadlock).
+    fn expired_keys(&self, now: Instant) -> Vec<String> {
+        self.associations
+            .iter()
+            .filter_map(|entry| {
+                if entry.value().expires_at <= now {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Sweep abandoned SA pairs whose own hard lifetime (+ grace) has
+    /// elapsed, tearing down their kernel states/policies and dropping the
+    /// in-memory entry.  Returns the number of pairs reaped.
+    ///
+    /// This is the background-cleanup counterpart to the re-REGISTER /
+    /// de-REGISTER paths (`cleanup_other_pairs_for_ue` / `delete_sa_pair`),
+    /// which only fire when the UE comes back.  A UE that registers once
+    /// and then vanishes (crash, radio loss, never refreshes) would
+    /// otherwise leak its four states + four policies + one map entry
+    /// forever.  Ageing on each pair's `expires_at` — its own SA lifetime
+    /// plus `SA_SWEEP_GRACE_SECS` — means an ACTIVE registration, which
+    /// re-REGISTERs and reinstalls a fresh SA (new `expires_at`) before the
+    /// deadline, is never disturbed; only truly-abandoned pairs pass their
+    /// `expires_at`.
+    ///
+    /// Collect-then-delete: snapshots the expired keys first (`expired_keys`)
+    /// then deletes each, so we never `remove` while holding a DashMap
+    /// iterator guard.  Per-victim kernel-delete failures are logged but
+    /// never propagated — `delete_sa_pair` removes the in-memory entry
+    /// before any kernel call, so the manager's view stays authoritative
+    /// even when the kernel objects were already reaped on hard-lifetime
+    /// (the common case, since the kernel deadline precedes the grace).
+    pub async fn sweep_expired(&self) -> usize {
+        let victims = self.expired_keys(Instant::now());
+        if victims.is_empty() {
+            return 0;
+        }
+
+        let mut reaped = 0usize;
+        for key in victims {
+            // Re-read the entry to recover the UE address/port for
+            // delete_sa_pair; if it vanished between snapshot and now
+            // (concurrent re-REGISTER teardown), skip it.
+            let (ue_addr, ue_port_c) = match self.associations.get(&key) {
+                Some(entry) => {
+                    let sa = entry.value();
+                    (sa.ue_addr, sa.ue_port_c)
+                }
+                None => continue,
+            };
+            if let Err(error) = self.delete_sa_pair(&ue_addr, ue_port_c).await {
+                tracing::warn!(
+                    ue = %ue_addr,
+                    ue_port_c,
+                    %error,
+                    "IPsec: abandoned SA sweep — kernel delete failed (in-memory entry already removed)"
+                );
+            }
+            reaped += 1;
+        }
+
+        if reaped > 0 {
+            info!(reaped, "IPsec: swept abandoned SA pairs past their hard lifetime");
+        }
+        reaped
     }
 
     /// Check if a UE has an active SA pair.
@@ -1070,6 +1247,7 @@ impl IpsecManager {
         direction: PolicyDir,
         spi: u32,
         protocol: SaProtocol,
+        hard_lifetime_secs: Option<u64>,
     ) -> Result<(), IpsecError> {
         match self.backend {
             #[cfg(target_os = "linux")]
@@ -1086,6 +1264,7 @@ impl IpsecManager {
                     netlink_dir,
                     spi,
                     protocol.as_u8(),
+                    hard_lifetime_secs,
                 )
                 .await
             }
@@ -1106,6 +1285,7 @@ impl IpsecManager {
                     dir_str,
                     spi,
                     protocol,
+                    hard_lifetime_secs,
                 )
                 .await
             }
@@ -1322,6 +1502,7 @@ impl IpsecManager {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn xfrm_policy_add(
         source: &IpAddr,
         source_port: u16,
@@ -1330,6 +1511,7 @@ impl IpsecManager {
         direction: &str,
         spi: u32,
         protocol: SaProtocol,
+        hard_lifetime_secs: Option<u64>,
     ) -> Result<(), IpsecError> {
         let source_cidr = format!("{}/{}", source, host_prefix(source));
         let destination_cidr = format!("{}/{}", destination, host_prefix(destination));
@@ -1339,10 +1521,11 @@ impl IpsecManager {
         let destination_str = destination.to_string();
         let spi_str = format!("0x{:x}", spi);
         let proto_str = protocol.as_str();
+        let lifetime_secs_str;
 
         // `proto X` must precede `sport`/`dport` per the iproute2 UPSPEC
         // grammar — see xfrm_sa_add for the same ordering constraint.
-        let args = vec![
+        let mut args = vec![
             "xfrm", "policy", "add",
             "src", &source_cidr,
             "dst", &destination_cidr,
@@ -1357,6 +1540,17 @@ impl IpsecManager {
             "spi", &spi_str,
             "mode", "transport",
         ];
+
+        // Optional hard lifetime — mirrors xfrm_sa_add so a policy reaps
+        // on the same deadline as its states.  `limit time-hard <secs>`
+        // sets xfrm_userpolicy_info.lft.hard_add_expires_seconds.
+        if let Some(secs) = hard_lifetime_secs {
+            lifetime_secs_str = secs.to_string();
+            args.push("limit");
+            args.push("time-hard");
+            args.push(&lifetime_secs_str);
+        }
+
         Self::run_ip_command(&args).await
     }
 
@@ -1644,6 +1838,7 @@ mod tests {
             integrity_key: "cafebabe".to_string(),
             hard_lifetime_secs: None,
             protocol: SaProtocol::Udp,
+            expires_at: Instant::now(),
         };
         let cloned = sa.clone();
         assert_eq!(cloned.spi_uc, 10000);
@@ -1730,6 +1925,7 @@ mod tests {
             integrity_key: "00112233445566778899aabbccddeeff".to_string(),
             hard_lifetime_secs: Some(3600),
             protocol: SaProtocol::Any,
+            expires_at: compute_sa_expires_at(Some(3600)),
         }
     }
 
@@ -1846,5 +2042,77 @@ mod tests {
         manager.cleanup_other_pairs_for_ue(&unknown_ue, 6500).await;
 
         assert_eq!(manager.active_count(), 0);
+    }
+
+    /// A pair with a hard lifetime gets a finite sweep deadline; one with
+    /// no hard lifetime is parked far in the future and is never reaped by
+    /// the expiry path.
+    #[test]
+    fn compute_sa_expires_at_finite_for_lifetime_and_far_for_none() {
+        let now = Instant::now();
+        let with_lifetime = compute_sa_expires_at(Some(3600));
+        // now + 3600 + grace, comfortably in the future but not far-future.
+        assert!(with_lifetime > now);
+        assert!(with_lifetime < now + Duration::from_secs(3600 + SA_SWEEP_GRACE_SECS + 60));
+
+        let none = compute_sa_expires_at(None);
+        // ~100 years out — well past the lifetime-based deadline.
+        assert!(none > now + Duration::from_secs(10 * 365 * 24 * 60 * 60));
+    }
+
+    /// `sweep_expired` reaps only pairs whose `expires_at` has passed; a
+    /// fresh pair (deadline in the future) survives.  Mirrors the
+    /// abandoned-UE scenario: a UE registers once and vanishes, so its SA
+    /// passes its own hard-lifetime+grace deadline and is swept, while an
+    /// actively-refreshing UE keeps a future deadline and is left alone.
+    #[tokio::test]
+    async fn sweep_expired_reaps_only_past_deadline_pairs() {
+        let manager = IpsecManager::with_partition(XfrmBackend::IpCommand, 60000, 1024);
+        let abandoned: IpAddr = "192.0.2.60".parse().unwrap();
+        let active: IpAddr = "192.0.2.61".parse().unwrap();
+
+        // Abandoned UE: deadline already in the past.
+        let mut stale = test_sa_pair(abandoned, 6601, 10000);
+        stale.expires_at = Instant::now() - Duration::from_secs(1);
+        insert_test_pair(&manager, stale);
+
+        // Active UE: a fresh SA whose deadline is comfortably in the
+        // future (as if it just re-REGISTERed).
+        let fresh = test_sa_pair(active, 6701, 10004);
+        // test_sa_pair already sets expires_at = now + 3600 + grace.
+        insert_test_pair(&manager, fresh);
+
+        assert_eq!(manager.active_count(), 2);
+
+        let reaped = manager.sweep_expired().await;
+        assert_eq!(reaped, 1, "exactly the one past-deadline pair is reaped");
+
+        // The abandoned pair's map entry is gone; the active one survives.
+        assert!(
+            !manager.has_sa(&abandoned, 6601),
+            "abandoned SA past its deadline must be swept"
+        );
+        assert!(
+            manager.has_sa(&active, 6701),
+            "actively-refreshing SA with a future deadline must be left alone"
+        );
+        assert_eq!(manager.active_count(), 1);
+    }
+
+    /// `sweep_expired` on an empty / all-fresh manager reaps nothing.
+    #[tokio::test]
+    async fn sweep_expired_no_op_when_nothing_is_due() {
+        let manager = IpsecManager::with_partition(XfrmBackend::IpCommand, 60000, 1024);
+        assert_eq!(manager.sweep_expired().await, 0);
+
+        // A single fresh pair (far-future deadline because it has no hard
+        // lifetime) is not swept.
+        let mut permanent = test_sa_pair("192.0.2.62".parse().unwrap(), 6801, 10000);
+        permanent.hard_lifetime_secs = None;
+        permanent.expires_at = compute_sa_expires_at(None);
+        insert_test_pair(&manager, permanent);
+
+        assert_eq!(manager.sweep_expired().await, 0);
+        assert_eq!(manager.active_count(), 1);
     }
 }

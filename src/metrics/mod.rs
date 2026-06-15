@@ -79,6 +79,12 @@ pub struct SiphonMetrics {
     /// are leaking (L1 has no TTL; the sweep reaps them).
     pub subscribe_dialogs: IntGauge,
 
+    /// Live P-CSCF IPsec SA pairs in the `IpsecManager` (one per registered
+    /// UE binding; each backs 4 XFRM states + 4 policies).  A monotonic climb
+    /// under a steady REGISTER/expire workload means abandoned-UE SAs are
+    /// leaking — the sweep reaps them on their own hard-lifetime + grace.
+    pub ipsec_sa_pairs: IntGauge,
+
     // --- Registration gauges ---
     pub registrations_active: IntGauge,
 
@@ -165,6 +171,11 @@ impl SiphonMetrics {
         let subscribe_dialogs = IntGauge::new(
             "siphon_subscribe_dialogs",
             "Live SUBSCRIBE dialogs in the L1 subscribe_state store",
+        )?;
+
+        let ipsec_sa_pairs = IntGauge::new(
+            "siphon_ipsec_sa_pairs",
+            "Live P-CSCF IPsec SA pairs in the IpsecManager (4 XFRM states + 4 policies each)",
         )?;
 
         let registrations_active = IntGauge::new(
@@ -297,6 +308,7 @@ impl SiphonMetrics {
         registry.register(Box::new(uac_pending_requests.clone()))?;
         registry.register(Box::new(proxy_dialog_sessions.clone()))?;
         registry.register(Box::new(subscribe_dialogs.clone()))?;
+        registry.register(Box::new(ipsec_sa_pairs.clone()))?;
         registry.register(Box::new(registrations_active.clone()))?;
         registry.register(Box::new(dialogs_active.clone()))?;
         registry.register(Box::new(connections_active.clone()))?;
@@ -328,6 +340,7 @@ impl SiphonMetrics {
             uac_pending_requests,
             proxy_dialog_sessions,
             subscribe_dialogs,
+            ipsec_sa_pairs,
             registrations_active,
             dialogs_active,
             connections_active,

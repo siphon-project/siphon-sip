@@ -582,6 +582,10 @@ impl SiphonServer {
             let manager = Arc::new(crate::ipsec::IpsecManager::with_partition(
                 backend, spi_start, spi_count,
             ));
+            // Register the process-wide handle so the dispatcher's 30 s
+            // cleanup tick can sweep abandoned SA pairs (states + policies +
+            // map entry) once they pass their own hard-lifetime + grace.
+            crate::ipsec::set_global_manager(Arc::clone(&manager));
             info!(
                 backend = ?backend,
                 spi_start,

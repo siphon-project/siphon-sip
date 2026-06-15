@@ -1136,6 +1136,9 @@ impl PyIpsec {
                 integrity_key,
                 hard_lifetime_secs: expires_secs,
                 protocol: sa_protocol,
+                // Placeholder — create_sa_pair recomputes the authoritative
+                // sweep deadline from hard_lifetime_secs + grace.
+                expires_at: std::time::Instant::now(),
             };
             manager
                 .create_sa_pair(sa.clone())
@@ -1671,6 +1674,7 @@ mod tests {
             integrity_key: "deadbeefdeadbeefdeadbeefdeadbeef".into(),
             hard_lifetime_secs: Some(600_000),
             protocol: SaProtocol::Udp,
+            expires_at: std::time::Instant::now(),
         };
         let params = PySecurityServerParams {
             mechanism: "ipsec-3gpp".into(),
@@ -1722,6 +1726,7 @@ mod tests {
             integrity_key: "cafebabecafebabecafebabecafebabe".into(),
             hard_lifetime_secs: Some(600_000),
             protocol: SaProtocol::Udp,
+            expires_at: std::time::Instant::now(),
         };
         let params = PySecurityServerParams {
             mechanism: "ipsec-3gpp".into(),
@@ -1769,6 +1774,7 @@ mod tests {
             integrity_key: "11111111111111111111111111111111".into(),
             hard_lifetime_secs: None,
             protocol: SaProtocol::Udp,
+            expires_at: std::time::Instant::now(),
         };
         let params = PySecurityServerParams {
             mechanism: "ipsec-3gpp".into(),
@@ -1806,6 +1812,7 @@ mod tests {
             integrity_key: "deadbeef".into(),
             hard_lifetime_secs: None,
             protocol: SaProtocol::Tcp,
+            expires_at: std::time::Instant::now(),
         };
         let handle = PySAHandle::from_sa(&sa);
         assert_eq!(handle.protocol, "tcp");
@@ -1830,6 +1837,7 @@ mod tests {
             integrity_key: "deadbeefdeadbeefdeadbeefdeadbeef".into(),
             hard_lifetime_secs: None,
             protocol: SaProtocol::Udp,
+            expires_at: std::time::Instant::now(),
         }
     }
 

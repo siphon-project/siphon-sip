@@ -567,7 +567,7 @@ pub async fn run(
                         fire_expired_timers(&state);
                     }
                     _ = cleanup_interval.tick() => {
-                        sweep_stale_entries(&state);
+                        sweep_stale_entries(&state).await;
                     }
                 }
             }
@@ -1720,7 +1720,7 @@ fn process_timer_actions(
 const ORPHAN_CALL_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 /// Sweep stale proxy sessions.
-fn sweep_stale_entries(state: &DispatcherState) {
+async fn sweep_stale_entries(state: &DispatcherState) {
     let now = std::time::Instant::now();
     let ttl = state.transaction_timeout;
     let expired_sessions = state.session_store.sweep_stale(ttl) as u64;
@@ -1774,10 +1774,31 @@ fn sweep_stale_entries(state: &DispatcherState) {
         presence.expire_stale();
     }
 
+    // Reap expired registrar bindings + emit RegistrationEvent::Expired. Only
+    // removes entries whose own `expires` already elapsed, so an actively-
+    // refreshing binding (future expires) is never disturbed. In production
+    // nothing else calls this, so without it expired AoRs would pin memory
+    // until the next REGISTER for the same AoR.
+    let expired_registrations = match crate::script::api::registrar_arc() {
+        Some(reg) => reg.expire_stale() as u64,
+        None => 0,
+    };
+
+    // Sweep abandoned P-CSCF IPsec SA pairs whose own hard lifetime + grace
+    // has elapsed (tears down the 4 XFRM states + 4 policies + the in-memory
+    // entry). An ACTIVE registration re-REGISTERs and reinstalls a fresh SA
+    // (new expires_at) before this deadline, so only truly-abandoned UEs are
+    // reaped. None when no P-CSCF/ipsec role is configured.
+    let (expired_ipsec_sas, ipsec_sa_pairs) = match crate::ipsec::global_manager() {
+        Some(manager) => (manager.sweep_expired().await as u64, manager.active_count()),
+        None => (0, 0),
+    };
+
     if let Some(metrics) = crate::metrics::try_metrics() {
         metrics.uac_pending_requests.set(uac_pending as i64);
         metrics.proxy_dialog_sessions.set(dialog_sessions as i64);
         metrics.subscribe_dialogs.set(subscribe_dialogs as i64);
+        metrics.ipsec_sa_pairs.set(ipsec_sa_pairs as i64);
     }
     // Refresh allocator memory gauges (jemalloc live/resident/retained bytes)
     // so operators can alert on `siphon_memory_allocated_bytes` growth — the
@@ -1792,6 +1813,8 @@ fn sweep_stale_entries(state: &DispatcherState) {
         || expired_calls > 0
         || expired_rf > 0
         || expired_recordings > 0
+        || expired_registrations > 0
+        || expired_ipsec_sas > 0
     {
         info!(
             expired_sessions,
@@ -1800,6 +1823,8 @@ fn sweep_stale_entries(state: &DispatcherState) {
             expired_calls,
             expired_rf,
             expired_recordings,
+            expired_registrations,
+            expired_ipsec_sas,
             uac_pending,
             sessions = state.session_store.session_count(),
             transactions = state.transaction_manager.count(),

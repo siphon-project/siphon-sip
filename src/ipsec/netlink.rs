@@ -279,10 +279,11 @@ fn encode_xfrm_userpolicy_info(
     destination_port: u16,
     direction: u8,
     selector_proto: u8,
+    hard_lifetime_secs: Option<u64>,
     out: &mut Vec<u8>,
 ) {
     encode_xfrm_selector(source, source_port, destination, destination_port, selector_proto, out);
-    encode_xfrm_lifetime_cfg(None, out);
+    encode_xfrm_lifetime_cfg(hard_lifetime_secs, out);
     encode_xfrm_lifetime_cur(out);
     out.extend_from_slice(&0u32.to_ne_bytes()); // priority
     out.extend_from_slice(&0u32.to_ne_bytes()); // index
@@ -538,6 +539,12 @@ pub async fn del_sa(daddr: &IpAddr, spi: u32) -> Result<(), IpsecError> {
 ///
 /// `selector_proto` must match the corresponding SA's selector, otherwise
 /// the kernel will not bind the SA template to incoming/outgoing packets.
+///
+/// `hard_lifetime_secs` mirrors the value threaded into the matching SA via
+/// [`add_sa`].  When `Some`, the kernel installs `xfrm_userpolicy_info.lft.
+/// hard_add_expires_seconds` so the policy self-reaps on the same deadline
+/// as its states.  When `None` the policy lives until explicitly deleted —
+/// keep this for caller-managed lifetimes (dev/test, permanent SAs).
 #[allow(clippy::too_many_arguments)]
 pub async fn add_policy(
     source: &IpAddr,
@@ -547,6 +554,7 @@ pub async fn add_policy(
     direction: PolicyDirection,
     spi: u32,
     selector_proto: u8,
+    hard_lifetime_secs: Option<u64>,
 ) -> Result<(), IpsecError> {
     let mut payload = Vec::with_capacity(256);
     encode_xfrm_userpolicy_info(
@@ -556,6 +564,7 @@ pub async fn add_policy(
         destination_port,
         direction.as_u8(),
         selector_proto,
+        hard_lifetime_secs,
         &mut payload,
     );
     let mut tmpl = Vec::with_capacity(64);
@@ -853,9 +862,51 @@ mod tests {
             5066,
             XFRM_POLICY_OUT,
             IPPROTO_UDP,
+            None,
             &mut out,
         );
         assert_eq!(out.len(), 168);
+    }
+
+    #[test]
+    fn xfrm_userpolicy_info_encodes_hard_lifetime() {
+        // The embedded xfrm_lifetime_cfg starts right after the 56-byte
+        // selector, so its hard_add_expires_seconds field sits at offset
+        // 56 + 40 = 96 (5th u64 of the lifetime_cfg).  When a hard
+        // lifetime is requested it must be honoured — this is what makes
+        // an abandoned UE's policies self-reap on the same deadline as
+        // its states (kernel reads xfrm_userpolicy_info.lft.hard_*).
+        let mut with_lifetime = Vec::new();
+        encode_xfrm_userpolicy_info(
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            5060,
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            5066,
+            XFRM_POLICY_OUT,
+            IPPROTO_UDP,
+            Some(3600),
+            &mut with_lifetime,
+        );
+        let hard_add =
+            u64::from_ne_bytes(with_lifetime[96..104].try_into().unwrap());
+        assert_eq!(hard_add, 3600);
+
+        // None must keep the legacy "no expiry" (0) encoding so
+        // caller-managed lifetimes stay permanent.
+        let mut no_lifetime = Vec::new();
+        encode_xfrm_userpolicy_info(
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            5060,
+            &IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            5066,
+            XFRM_POLICY_OUT,
+            IPPROTO_UDP,
+            None,
+            &mut no_lifetime,
+        );
+        let hard_add_none =
+            u64::from_ne_bytes(no_lifetime[96..104].try_into().unwrap());
+        assert_eq!(hard_add_none, 0);
     }
 
     /// Selector proto byte lives at offset 44 inside the 56-byte
@@ -923,6 +974,7 @@ mod tests {
             5066,
             XFRM_POLICY_OUT,
             IPPROTO_TCP,
+            None,
             &mut out,
         );
         assert_eq!(out[SELECTOR_PROTO_OFFSET], 6);
@@ -969,6 +1021,7 @@ mod tests {
             5066,
             XFRM_POLICY_OUT,
             0, // SaProtocol::Any.as_u8()
+            None,
             &mut out,
         );
         assert_eq!(

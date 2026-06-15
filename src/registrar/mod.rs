@@ -1412,7 +1412,14 @@ impl Registrar {
     }
 
     /// Run a garbage-collection pass: remove expired contacts from all AoRs.
-    pub fn expire_stale(&self) {
+    /// Reap expired bindings, cascade-clear AS contacts left orphaned by
+    /// an expired UE, and emit [`RegistrationEvent::Expired`] for every
+    /// AoR that drained to empty.  Only removes entries whose own
+    /// `expires` has already elapsed, so it is safe to run on a periodic
+    /// tick — an actively-refreshing binding has a future `expires` and is
+    /// never touched.  Returns the number of AoRs reaped (drained to
+    /// empty) so callers can log/meter the sweep.
+    pub fn expire_stale(&self) -> usize {
         let mut empty_aors = Vec::new();
         let mut tokens_to_remove: Vec<String> = Vec::new();
         for mut entry in self.bindings.iter_mut() {
@@ -1453,6 +1460,7 @@ impl Registrar {
             self.bindings.remove(aor);
             self.emit_event(RegistrationEvent::Expired { aor: aor.clone() });
         }
+        empty_aors.len()
     }
 }
 
