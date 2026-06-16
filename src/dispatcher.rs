@@ -4001,10 +4001,19 @@ struct RelayTarget {
     transport: Option<Transport>,
 }
 
-fn resolve_target(uri_string: &str, resolver: &SipResolver) -> Option<RelayTarget> {
+/// Resolve a SIP target URI to its full ordered candidate set (RFC 3263).
+///
+/// A bare `IP:port` short-circuits to a single candidate. A SIP URI is resolved
+/// via DNS (SRV → A/AAAA); the order is the resolver's RFC 3263 §4.2 /
+/// RFC 2782 selection (A/AAAA Fisher-Yates shuffled per call, SRV
+/// weighted-random), so a caller that wants a single target takes
+/// `.into_iter().next()` — see [`resolve_target`]. In-dialog connection reuse
+/// ([`resolve_in_dialog_flow_uri`]) needs the *whole* set to test whether the
+/// dialog's established peer is still among the next hop's members.
+fn resolve_candidates(uri_string: &str, resolver: &SipResolver) -> Vec<RelayTarget> {
     // Try as bare IP:port first (cheapest check)
     if let Ok(addr) = uri_string.parse::<SocketAddr>() {
-        return Some(RelayTarget { address: addr, transport: None });
+        return vec![RelayTarget { address: addr, transport: None }];
     }
 
     // Try parsing as a full SIP URI
@@ -4021,22 +4030,36 @@ fn resolve_target(uri_string: &str, resolver: &SipResolver) -> Option<RelayTarge
             ))
         });
 
-        return results.into_iter().next().map(|r| {
-            let transport = r.transport.as_deref()
-                .or(transport_hint.as_deref())
-                .and_then(|t| match t.to_lowercase().as_str() {
-                    "tcp" => Some(Transport::Tcp),
-                    "tls" => Some(Transport::Tls),
-                    "udp" => Some(Transport::Udp),
-                    "ws" => Some(Transport::WebSocket),
-                    "wss" => Some(Transport::WebSocketSecure),
-                    _ => None,
-                });
-            RelayTarget { address: r.address, transport }
-        });
+        return results
+            .into_iter()
+            .map(|r| {
+                let transport = r
+                    .transport
+                    .as_deref()
+                    .or(transport_hint.as_deref())
+                    .and_then(|t| match t.to_lowercase().as_str() {
+                        "tcp" => Some(Transport::Tcp),
+                        "tls" => Some(Transport::Tls),
+                        "udp" => Some(Transport::Udp),
+                        "ws" => Some(Transport::WebSocket),
+                        "wss" => Some(Transport::WebSocketSecure),
+                        _ => None,
+                    });
+                RelayTarget { address: r.address, transport }
+            })
+            .collect();
     }
 
-    None
+    Vec::new()
+}
+
+/// Resolve a SIP target URI to a single send destination (RFC 3263).
+///
+/// Returns the first candidate from [`resolve_candidates`] — the resolver has
+/// already applied RFC 3263 §4.2 / RFC 2782 ordering, so "first" is a fresh
+/// weighted-random / shuffled pick on every call.
+fn resolve_target(uri_string: &str, resolver: &SipResolver) -> Option<RelayTarget> {
+    resolve_candidates(uri_string, resolver).into_iter().next()
 }
 
 /// Send a relayed request to a resolved target, using the connection pool for
@@ -4557,68 +4580,51 @@ fn first_route_uri(route_set: &[String]) -> Option<String> {
         .map(|entry| entry.uri.to_string())
 }
 
-/// Resolve the destination for an in-dialog request per RFC 3261 §12.2.1.1
-/// and §16.12. When `route_set` is non-empty, the first Route URI is the next
-/// hop (after DNS resolution per RFC 3263) — NOT the Request-URI and NOT the
-/// cached destination of the original INVITE. Falls back to the cached
-/// `(addr, transport)` only when the route set is empty or resolution fails.
+/// Resolve the destination for a B2BUA in-dialog request per RFC 3261
+/// §12.2.1.1 / §16.12, preferring the dialog's established connection
+/// (RFC 5923) — see [`resolve_in_dialog_flow_uri`] for the full reasoning.
 ///
-/// This matters whenever Record-Route adds intermediaries on the response path
-/// that aren't the original next-hop — for IMS calls the 200 OK comes back
-/// through I-CSCF (which doesn't Record-Route per TS 24.229 §5.3.2), so the
-/// cached INVITE destination is I-CSCF while the route-set first hop is
-/// S-CSCF. Sending in-dialog requests to the cached destination produces 404
-/// from the wrong node.
+/// The next hop is the first `Route` URI of the dialog route set (or the cached
+/// remote target when the route set is empty). When that next hop still
+/// resolves to the peer the dialog was established with (`fallback_addr`'s IP),
+/// the cached address/transport are returned so the existing send reuses the
+/// established connection rather than re-resolving — which, since the RFC 3263
+/// §4.2 A/AAAA shuffle, can land on a different member of a load-balanced trunk
+/// that holds no dialog state. It still follows the route set to a genuinely
+/// different next hop (e.g. an IMS S-CSCF reached via the route set while the
+/// INVITE traversed a non-Record-Routing I-CSCF — TS 24.229 §5.3.2).
+///
+/// The B2BUA send sites already supply the leg's `connection_id` to
+/// [`send_message`] (A-leg, where an inbound connection can only be reached by
+/// reuse) or reuse the outbound pool connection by address via
+/// [`send_b2bua_to_bleg`] (B-leg), so this returns just `(addr, transport)`.
 fn resolve_in_dialog_destination(
     route_set: &[String],
     state: &DispatcherState,
     fallback_addr: SocketAddr,
     fallback_transport: Transport,
 ) -> (SocketAddr, Transport) {
-    match first_route_uri(route_set) {
-        Some(uri) => resolve_next_hop(&uri, state, fallback_addr, fallback_transport),
-        None => (fallback_addr, fallback_transport),
-    }
+    let next_hop = first_route_uri(route_set);
+    let (destination, transport, _connection_id) = resolve_in_dialog_flow_uri(
+        next_hop.as_deref(),
+        &state.dns_resolver,
+        fallback_addr,
+        fallback_transport,
+        ConnectionId::default(),
+    );
+    (destination, transport)
 }
 
-/// Resolve a single next-hop URI (RFC 3263) to a send destination, applying the
-/// IPsec SA transport pin and falling back to the cached `(addr, transport)`
-/// when resolution fails.
-///
-/// Shared by the in-dialog request paths that route by the dialog route set
-/// rather than the cached INVITE next-hop: the B2BUA re-INVITE/UPDATE
-/// ([`resolve_in_dialog_destination`]) and the proxy end-to-end 2xx ACK
-/// ([`handle_ack_via_session`]). In an IMS topology the INVITE is forwarded to
-/// a non-Record-Routing hop (an I-CSCF, a transparent iFC AS) while the dialog
-/// routes via another (the S-CSCF / P-CSCF), so the cached next-hop and the
-/// dialog route set diverge — in-dialog requests must follow the route set.
-fn resolve_next_hop(
-    next_hop_uri: &str,
-    state: &DispatcherState,
-    fallback_addr: SocketAddr,
-    fallback_transport: Transport,
-) -> (SocketAddr, Transport) {
-    let (destination, mut transport) = match resolve_target(next_hop_uri, &state.dns_resolver) {
-        Some(target) => (target.address, target.transport.unwrap_or(fallback_transport)),
-        None => {
-            warn!(
-                next_hop = %next_hop_uri,
-                "failed to resolve in-dialog next hop — falling back to cached destination",
-            );
-            (fallback_addr, fallback_transport)
-        }
-    };
-
-    // IPsec SA transport pin (3GPP TS 33.203 §7.2).  When the
-    // destination matches a registered UE binding, the SA's pinned
-    // protocol (UDP vs TCP) overrides whatever the dialog route set
-    // or cached transport selected.  In-dialog requests (BYE, UPDATE,
-    // in-dialog re-INVITE, end-to-end 2xx ACK) often arrive with a
-    // Route URI / cached Contact that lacks `;transport=`, and the
-    // kernel XFRM selector silently drops every protected frame whose
-    // upper-layer protocol doesn't match.  Returns `None` for non-IPsec
-    // deployments and ordinary destinations — zero impact when no
-    // IpsecManager is wired.
+/// Pin the outbound transport to a matching IPsec SA's protocol
+/// (3GPP TS 33.203 §7.2).  When `destination` matches a registered UE binding,
+/// the SA's pinned protocol (UDP vs TCP) overrides whatever the dialog route
+/// set or cached transport selected.  In-dialog requests (BYE, UPDATE,
+/// in-dialog re-INVITE, end-to-end 2xx ACK) often arrive with a Route URI /
+/// cached Contact that lacks `;transport=`, and the kernel XFRM selector
+/// silently drops every protected frame whose upper-layer protocol doesn't
+/// match.  No-op for non-IPsec deployments and ordinary destinations — zero
+/// impact when no IpsecManager is wired.
+fn ipsec_pin_transport(destination: SocketAddr, transport: Transport) -> Transport {
     if matches!(transport, Transport::Udp | Transport::Tcp) {
         if let Some((_, sa_transport)) =
             crate::script::api::ipsec::outbound_for(destination, transport)
@@ -4630,12 +4636,78 @@ fn resolve_next_hop(
                     to = %sa_transport,
                     "IPsec: pinning in-dialog transport to SA protocol",
                 );
-                transport = sa_transport;
+                return sa_transport;
             }
         }
     }
+    transport
+}
 
-    (destination, transport)
+/// Test whether an in-dialog request should reuse the dialog's established
+/// connection (RFC 5923) instead of opening one to a freshly-resolved next hop.
+///
+/// Reuse when the established peer's IP is among the next hop's resolved
+/// candidates — IP-only, because the cached address carries the peer's *source*
+/// port (an ephemeral port for an inbound connection, or the pooled outbound
+/// socket's peer), not its SIP listening port — or when nothing resolved (the
+/// established peer is then the best available target). Returns `false` only
+/// when the next hop points at a genuinely different peer (e.g. an IMS S-CSCF
+/// reached via the dialog route set while the INVITE was forwarded to a
+/// non-Record-Routing I-CSCF).
+fn established_peer_in_candidates(cached_ip: std::net::IpAddr, candidates: &[RelayTarget]) -> bool {
+    candidates.is_empty() || candidates.iter().any(|target| target.address.ip() == cached_ip)
+}
+
+/// Resolve the destination for an in-dialog request, preferring the dialog's
+/// established connection (RFC 5923) when the next hop still resolves to the
+/// peer the dialog was established with.
+///
+/// On a connection-oriented transport to a multi-member peer behind one DNS
+/// name (a load-balanced Record-Route), the next hop resolves to several
+/// siblings; since the RFC 3263 §4.2 A/AAAA shuffle picks one at random per
+/// call, a fresh resolution can land on a member that holds no dialog state, so
+/// an in-dialog BYE/re-INVITE/UPDATE hits the wrong node and the far leg is
+/// never released / the request is never applied. RFC 5923 says to send
+/// in-dialog traffic over the connection the dialog was established on; we do
+/// exactly that whenever the established peer is still one of the next hop's
+/// resolved members.
+///
+/// Returns `(destination, transport, connection_id)`. On the reuse path the
+/// connection_id is the cached one, so [`send_message_from`] routes over the
+/// live connection (and the per-transport outbound distributor falls back to
+/// the pool against the *same member's* address if it has since closed). On the
+/// fresh-resolution path it is [`ConnectionId::default`] (open / pool a new
+/// connection). The IPsec transport pin is applied to the final destination in
+/// both cases.
+fn resolve_in_dialog_flow_uri(
+    next_hop_uri: Option<&str>,
+    resolver: &SipResolver,
+    cached_addr: SocketAddr,
+    cached_transport: Transport,
+    cached_connection_id: ConnectionId,
+) -> (SocketAddr, Transport, ConnectionId) {
+    let (destination, transport, connection_id) = match next_hop_uri {
+        // No next hop (empty route set) → the cached peer IS the remote target
+        // (RFC 3261 §12.2.1.1); reuse its connection.
+        None => (cached_addr, cached_transport, cached_connection_id),
+        Some(uri) => {
+            let candidates = resolve_candidates(uri, resolver);
+            if established_peer_in_candidates(cached_addr.ip(), &candidates) {
+                (cached_addr, cached_transport, cached_connection_id)
+            } else {
+                // Genuinely different next hop (IMS route-set divergence) —
+                // resolve fresh and open/pool a new connection.
+                let target = &candidates[0];
+                (
+                    target.address,
+                    target.transport.unwrap_or(cached_transport),
+                    ConnectionId::default(),
+                )
+            }
+        }
+    };
+
+    (destination, ipsec_pin_transport(destination, transport), connection_id)
 }
 
 /// Flatten Record-Route header lines into one URI per entry.
@@ -6104,27 +6176,30 @@ fn handle_ack_via_session(
             // a new request routed by the *dialog route set*, NOT retraced along
             // the INVITE's forward path. After popping our own Route, the next
             // hop is the top remaining Route URI, or the Request-URI when the
-            // route set is empty (RFC 3261 §16.12) — never the cached
-            // `client_branch.destination`. For an INVITE forwarded through a hop
-            // that did not Record-Route (a transparent iFC AS, an IMS I-CSCF),
-            // the cached branch destination and the dialog route set diverge;
-            // sending to the cached destination retraces the INVITE path and the
-            // ACK never reaches the UAS, so the dialog is left unconfirmed. This
-            // is the proxy-mode sibling of the B2BUA in-dialog route-set fix.
-            // `resolve_next_hop` falls back to the cached branch only when
-            // resolution fails, so non-routed dialogs (loopback baseline) are
-            // unaffected.
+            // route set is empty (RFC 3261 §16.12). For an INVITE forwarded
+            // through a hop that did not Record-Route (a transparent iFC AS, an
+            // IMS I-CSCF), the cached branch destination and the dialog route set
+            // diverge; sending to the cached destination retraces the INVITE
+            // path and the ACK never reaches the UAS. This is the proxy-mode
+            // sibling of the B2BUA in-dialog route-set fix.
+            //
+            // `resolve_in_dialog_flow_uri` keeps the established connection
+            // (RFC 5923) whenever the route-set next hop still resolves to the
+            // member the INVITE was relayed to (`client_branch`): re-resolving a
+            // load-balanced trunk domain would, since the RFC 3263 §4.2 shuffle,
+            // pick a sibling member at random and `send_to_target` would then ACK
+            // the wrong node (or reuse an unrelated keepalive connection to it).
+            // It falls back to the cached branch on resolution failure, so
+            // non-routed dialogs (loopback baseline) are unaffected.
             let next_hop_uri =
                 ack_next_hop_uri(&ack_downstream.headers, &ack_downstream.start_line);
-            let (destination, out_transport) = match next_hop_uri.as_deref() {
-                Some(uri) => resolve_next_hop(
-                    uri,
-                    state,
-                    client_branch.destination,
-                    client_branch.transport,
-                ),
-                None => (client_branch.destination, client_branch.transport),
-            };
+            let (destination, out_transport, ack_connection_id) = resolve_in_dialog_flow_uri(
+                next_hop_uri.as_deref(),
+                &state.dns_resolver,
+                client_branch.destination,
+                client_branch.transport,
+                client_branch.connection_id,
+            );
 
             // Add our Via on top (preserving existing Vias), reflecting the
             // transport we will actually send over.
@@ -6146,7 +6221,7 @@ fn handle_ack_via_session(
 
             // Send to the resolved dialog next hop. `send_to_target` picks the
             // right connection per transport (TCP/TLS pool, UDP outbound + IPsec
-            // source), using the cached branch as the UDP fallback connection.
+            // source), using the established connection as the UDP fallback.
             let target = RelayTarget {
                 address: destination,
                 transport: Some(out_transport),
@@ -6155,7 +6230,7 @@ fn handle_ack_via_session(
                 data,
                 &target,
                 client_branch.transport,
-                client_branch.connection_id,
+                ack_connection_id,
                 state,
             );
         }
@@ -11492,6 +11567,107 @@ a=rtpmap:8 PCMA/8000\r\n";
     async fn resolve_target_unresolvable_domain() {
         let resolver = test_resolver();
         assert!(resolve_target("sip:alice@this-domain-should-not-exist-xyzzy.invalid", &resolver).is_none());
+    }
+
+    // --- In-dialog connection reuse (RFC 5923) ---
+
+    fn candidate(addr: &str) -> RelayTarget {
+        RelayTarget { address: addr.parse().unwrap(), transport: None }
+    }
+
+    #[test]
+    fn established_peer_in_candidates_ip_match() {
+        // Load-balanced trunk: the established peer's IP is one of the members
+        // the route-set domain resolves to → reuse the established connection.
+        let candidates = [candidate("198.51.100.26:5061"), candidate("198.51.100.34:5061")];
+        let cached = "198.51.100.26:5061".parse::<SocketAddr>().unwrap();
+        assert!(established_peer_in_candidates(cached.ip(), &candidates));
+    }
+
+    #[test]
+    fn established_peer_in_candidates_ip_match_ignores_port() {
+        // The cached address carries the peer's source / ephemeral port while a
+        // candidate carries the SIP listening port — the match must be IP-only.
+        let candidates = [candidate("198.51.100.26:5061")];
+        let cached = "198.51.100.26:41897".parse::<SocketAddr>().unwrap();
+        assert!(established_peer_in_candidates(cached.ip(), &candidates));
+    }
+
+    #[test]
+    fn established_peer_not_in_candidates() {
+        // IMS divergence: the route set points at the S-CSCF while the
+        // established peer is the I-CSCF the INVITE traversed → resolve fresh.
+        let candidates = [candidate("203.0.113.20:5060")]; // S-CSCF
+        let icscf = "203.0.113.10:5060".parse::<SocketAddr>().unwrap();
+        assert!(!established_peer_in_candidates(icscf.ip(), &candidates));
+    }
+
+    #[test]
+    fn established_peer_in_empty_candidates() {
+        // Resolution failure: nothing to compare against, so the established
+        // peer is the best available target → reuse.
+        let cached = "203.0.113.7:5060".parse::<SocketAddr>().unwrap();
+        assert!(established_peer_in_candidates(cached.ip(), &[]));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_dialog_flow_none_next_hop_reuses_cached() {
+        // Empty route set → the cached peer is the remote target; reuse it
+        // verbatim, including the connection_id.
+        let resolver = test_resolver();
+        let cached = "10.1.2.3:6000".parse::<SocketAddr>().unwrap();
+        let connection_id = ConnectionId(42);
+        let (destination, transport, out_connection_id) =
+            resolve_in_dialog_flow_uri(None, &resolver, cached, Transport::Tls, connection_id);
+        assert_eq!(destination, cached);
+        assert_eq!(transport, Transport::Tls);
+        assert_eq!(out_connection_id, connection_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_dialog_flow_reuses_established_member_over_resolved_port() {
+        // Next hop is a literal IP equal to the established peer but on its SIP
+        // listening port, while the cached address is the same peer on its
+        // source port. RFC 5923: keep the established connection (cached address
+        // + connection_id), not the re-resolved listening-port address. This is
+        // the load-balanced-trunk fix in miniature.
+        let resolver = test_resolver();
+        let cached = "192.0.2.50:33333".parse::<SocketAddr>().unwrap();
+        let connection_id = ConnectionId(7);
+        let (destination, transport, out_connection_id) = resolve_in_dialog_flow_uri(
+            Some("sip:192.0.2.50:5061;transport=tls"),
+            &resolver,
+            cached,
+            Transport::Tls,
+            connection_id,
+        );
+        assert_eq!(destination, cached, "must keep the established peer's connection address");
+        assert_eq!(transport, Transport::Tls);
+        assert_eq!(out_connection_id, connection_id, "must reuse the established connection_id");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_dialog_flow_resolves_fresh_for_divergent_next_hop() {
+        // Next hop is a genuinely different peer than the established one (IMS
+        // S-CSCF via the route set vs the I-CSCF the INVITE traversed): resolve
+        // fresh and drop the established connection_id so a new connection is
+        // opened/pooled.
+        let resolver = test_resolver();
+        let cached = "203.0.113.10:5060".parse::<SocketAddr>().unwrap(); // I-CSCF (established)
+        let connection_id = ConnectionId(7);
+        let (destination, _transport, out_connection_id) = resolve_in_dialog_flow_uri(
+            Some("sip:203.0.113.20:5060"), // S-CSCF (route set)
+            &resolver,
+            cached,
+            Transport::Udp,
+            connection_id,
+        );
+        assert_eq!(destination, "203.0.113.20:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            out_connection_id,
+            ConnectionId::default(),
+            "fresh resolution must not reuse the established connection_id",
+        );
     }
 
     // --- CANCEL tests ---
