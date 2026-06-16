@@ -171,7 +171,18 @@ for scenario in invite register subscribe; do
     echo "--- scenario: $scenario ---"
     for cycle in $(seq 1 "$CYCLES"); do
         f=$("burst_$scenario")
-        FAILED_TOTAL=$((FAILED_TOTAL + ${f:-0}))
+        # The default B2BUA script (b2bua_default.py) is call-only and has no
+        # SUBSCRIBE handler, so it correctly silent-drops SUBSCRIBE (no 2xx) —
+        # SIPp counts those as "failed", but they are the expected outcome, not
+        # a fault. We still run the subscribe scenario in b2bua mode for its
+        # leak value: silent-dropped requests must not strand server
+        # transactions (the reap-on-drop fix), which the allocated/gauge gates
+        # below verify. So gate this case on memory only, not on failed calls.
+        if [ "$scenario" = "subscribe" ] && [ "$MODE" = "b2bua" ]; then
+            echo "    (b2bua: SUBSCRIBE unhandled by design — ${f:-0} expected drops, gating on leak only)"
+        else
+            FAILED_TOTAL=$((FAILED_TOTAL + ${f:-0}))
+        fi
         sleep "$IDLE_SECS"
         alloc=$(read_gauge memory_allocated_bytes); pyb=$(read_gauge python_allocated_blocks)
         dialog=$(read_gauge proxy_dialog_sessions); subs=$(read_gauge subscribe_dialogs)
