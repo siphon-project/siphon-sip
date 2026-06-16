@@ -4523,30 +4523,50 @@ fn resolve_in_dialog_destination(
     fallback_addr: SocketAddr,
     fallback_transport: Transport,
 ) -> (SocketAddr, Transport) {
-    let (destination, mut transport) = if let Some(uri_str) = first_route_uri(route_set) {
-        if let Some(target) = resolve_target(&uri_str, &state.dns_resolver) {
-            (target.address, target.transport.unwrap_or(fallback_transport))
-        } else {
+    match first_route_uri(route_set) {
+        Some(uri) => resolve_next_hop(&uri, state, fallback_addr, fallback_transport),
+        None => (fallback_addr, fallback_transport),
+    }
+}
+
+/// Resolve a single next-hop URI (RFC 3263) to a send destination, applying the
+/// IPsec SA transport pin and falling back to the cached `(addr, transport)`
+/// when resolution fails.
+///
+/// Shared by the in-dialog request paths that route by the dialog route set
+/// rather than the cached INVITE next-hop: the B2BUA re-INVITE/UPDATE
+/// ([`resolve_in_dialog_destination`]) and the proxy end-to-end 2xx ACK
+/// ([`handle_ack_via_session`]). In an IMS topology the INVITE is forwarded to
+/// a non-Record-Routing hop (an I-CSCF, a transparent iFC AS) while the dialog
+/// routes via another (the S-CSCF / P-CSCF), so the cached next-hop and the
+/// dialog route set diverge — in-dialog requests must follow the route set.
+fn resolve_next_hop(
+    next_hop_uri: &str,
+    state: &DispatcherState,
+    fallback_addr: SocketAddr,
+    fallback_transport: Transport,
+) -> (SocketAddr, Transport) {
+    let (destination, mut transport) = match resolve_target(next_hop_uri, &state.dns_resolver) {
+        Some(target) => (target.address, target.transport.unwrap_or(fallback_transport)),
+        None => {
             warn!(
-                route = %route_set[0],
-                "B2BUA: failed to resolve in-dialog Route — falling back to cached destination",
+                next_hop = %next_hop_uri,
+                "failed to resolve in-dialog next hop — falling back to cached destination",
             );
             (fallback_addr, fallback_transport)
         }
-    } else {
-        (fallback_addr, fallback_transport)
     };
 
     // IPsec SA transport pin (3GPP TS 33.203 §7.2).  When the
     // destination matches a registered UE binding, the SA's pinned
     // protocol (UDP vs TCP) overrides whatever the dialog route set
     // or cached transport selected.  In-dialog requests (BYE, UPDATE,
-    // in-dialog re-INVITE) often arrive with a Route URI / cached
-    // Contact that lacks `;transport=`, and the kernel XFRM selector
-    // silently drops every protected frame whose upper-layer protocol
-    // doesn't match.  Returns `None` for non-IPsec deployments and
-    // ordinary destinations — zero impact when no IpsecManager is
-    // wired.
+    // in-dialog re-INVITE, end-to-end 2xx ACK) often arrive with a
+    // Route URI / cached Contact that lacks `;transport=`, and the
+    // kernel XFRM selector silently drops every protected frame whose
+    // upper-layer protocol doesn't match.  Returns `None` for non-IPsec
+    // deployments and ordinary destinations — zero impact when no
+    // IpsecManager is wired.
     if matches!(transport, Transport::Udp | Transport::Tcp) {
         if let Some((_, sa_transport)) =
             crate::script::api::ipsec::outbound_for(destination, transport)
@@ -4556,7 +4576,7 @@ fn resolve_in_dialog_destination(
                     %destination,
                     from = %transport,
                     to = %sa_transport,
-                    "IPsec: pinning B2BUA in-dialog transport to SA protocol",
+                    "IPsec: pinning in-dialog transport to SA protocol",
                 );
                 transport = sa_transport;
             }
@@ -5972,6 +5992,20 @@ fn handle_cancel(
 // ProxySession-based ACK (2xx) handling
 // ---------------------------------------------------------------------------
 
+/// Determine the next-hop URI for an end-to-end 2xx ACK after the proxy has
+/// popped its own Route (RFC 3261 §16.12): the top remaining Route URI, or the
+/// Request-URI when the route set is empty.
+///
+/// This is what makes the ACK follow the dialog route set rather than the
+/// cached INVITE forward path. Returns `None` only for a non-request message
+/// (an ACK is always a request, so this is a defensive guard).
+fn ack_next_hop_uri(headers: &SipHeaders, start_line: &StartLine) -> Option<String> {
+    core::next_hop_from_route(headers).or_else(|| match start_line {
+        StartLine::Request(request_line) => Some(request_line.request_uri.to_string()),
+        _ => None,
+    })
+}
+
 /// Handle ACK for 2xx responses by relaying it downstream via the ProxySession.
 ///
 /// ACK for 2xx is end-to-end (RFC 3261 §13.2.2.4): the proxy must relay it
@@ -5997,28 +6031,81 @@ fn handle_ack_via_session(
         if let Some(client_branch) = session.get_client_branch(client_key) {
             let mut ack_downstream = message.clone();
 
-            // Pop our own Route entry (loose routing — RFC 3261 §16.12)
+            // Consume our own Route entries (loose routing — RFC 3261 §16.4 /
+            // §16.12), mirroring the script-side loose_route() that the
+            // in-dialog BYE/UPDATE path uses. Pop the top Route, then any
+            // additional Routes that also point to us — a doubly-Record-Routed
+            // dialog (transport bridging, e.g. an IMS P-CSCF/S-CSCF spanning
+            // UDP and TCP) leaves two consecutive self-Routes, and consuming
+            // only the top would leave our own second Route as the apparent
+            // next hop (a routing loop). `pop_local_routes` matches the same
+            // `local_domains` loose_route() does, so the ACK consumes exactly
+            // the self-Routes the BYE on this dialog already consumes.
             if core::check_loose_route(&ack_downstream.headers) {
                 core::pop_top_route(&mut ack_downstream.headers);
+                if !state.local_domains.is_empty() {
+                    core::pop_local_routes(&mut ack_downstream.headers, &state.local_domains);
+                }
             }
 
-            // Add our Via on top (preserving existing Vias)
-            let transport_str = format!("{}", client_branch.transport);
+            // The 2xx ACK is end-to-end (RFC 3261 §13.2.2.4 / §17.1.1.3): it is
+            // a new request routed by the *dialog route set*, NOT retraced along
+            // the INVITE's forward path. After popping our own Route, the next
+            // hop is the top remaining Route URI, or the Request-URI when the
+            // route set is empty (RFC 3261 §16.12) — never the cached
+            // `client_branch.destination`. For an INVITE forwarded through a hop
+            // that did not Record-Route (a transparent iFC AS, an IMS I-CSCF),
+            // the cached branch destination and the dialog route set diverge;
+            // sending to the cached destination retraces the INVITE path and the
+            // ACK never reaches the UAS, so the dialog is left unconfirmed. This
+            // is the proxy-mode sibling of the B2BUA in-dialog route-set fix.
+            // `resolve_next_hop` falls back to the cached branch only when
+            // resolution fails, so non-routed dialogs (loopback baseline) are
+            // unaffected.
+            let next_hop_uri =
+                ack_next_hop_uri(&ack_downstream.headers, &ack_downstream.start_line);
+            let (destination, out_transport) = match next_hop_uri.as_deref() {
+                Some(uri) => resolve_next_hop(
+                    uri,
+                    state,
+                    client_branch.destination,
+                    client_branch.transport,
+                ),
+                None => (client_branch.destination, client_branch.transport),
+            };
+
+            // Add our Via on top (preserving existing Vias), reflecting the
+            // transport we will actually send over.
+            let transport_str = format!("{out_transport}");
             core::add_via(
                 &mut ack_downstream.headers,
                 &transport_str,
-                &state.via_host(&client_branch.transport),
-                Some(state.via_port(&client_branch.transport)),
+                &state.via_host(&out_transport),
+                Some(state.via_port(&out_transport)),
             );
 
             let data = Bytes::from(ack_downstream.to_bytes());
             debug!(
                 client_key = %client_key,
-                destination = %client_branch.destination,
-                "relaying ACK for 2xx downstream via session"
+                %destination,
+                transport = %out_transport,
+                "relaying ACK for 2xx downstream via dialog route set"
             );
 
-            send_outbound(data, client_branch.transport, client_branch.destination, client_branch.connection_id, state);
+            // Send to the resolved dialog next hop. `send_to_target` picks the
+            // right connection per transport (TCP/TLS pool, UDP outbound + IPsec
+            // source), using the cached branch as the UDP fallback connection.
+            let target = RelayTarget {
+                address: destination,
+                transport: Some(out_transport),
+            };
+            send_to_target(
+                data,
+                &target,
+                client_branch.transport,
+                client_branch.connection_id,
+                state,
+            );
         }
     }
 }
@@ -10587,6 +10674,109 @@ mod tests {
         ];
         let uri = first_route_uri(&route_set);
         assert_eq!(uri.as_deref(), Some("sip:first.example.com;lr"));
+    }
+
+    fn ack_request_with_route(route: Option<&str>) -> SipMessage {
+        let ruri = parse_uri_standalone("sip:5111@100.65.0.2:7000").unwrap();
+        let mut builder = SipMessageBuilder::new()
+            .request(Method::Ack, ruri)
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-e2e-ack".to_string())
+            .to("<sip:5111@ims.example.com>;tag=uas-tag".to_string())
+            .from("<sip:trunk@example.com>;tag=uac-tag".to_string())
+            .call_id("ack-e2e-route-set".to_string())
+            .cseq("1 ACK".to_string())
+            .content_length(0);
+        if let Some(route) = route {
+            builder = builder.header("Route", route.to_string());
+        }
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn ack_next_hop_prefers_remaining_route_over_ruri() {
+        // The end-to-end 2xx ACK must follow the dialog route set: when a Route
+        // remains (after the proxy popped its own), that Route is the next hop —
+        // NOT the Request-URI (the UE Contact) and NOT the cached INVITE branch.
+        let ack = ack_request_with_route(Some(
+            "<sip:172.16.0.101:5060;transport=udp;lr>, <sip:172.16.0.101:5060;transport=tcp;lr>",
+        ));
+        let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("ACK has a next hop");
+        let parsed = parse_uri_standalone(&next_hop).unwrap();
+        assert_eq!(parsed.host, "172.16.0.101");
+        assert_eq!(parsed.port, Some(5060));
+        assert_ne!(
+            parsed.host, "100.65.0.2",
+            "must not short-circuit the ACK to the Request-URI when a Route remains",
+        );
+    }
+
+    #[test]
+    fn ack_next_hop_falls_back_to_ruri_when_route_set_empty() {
+        // No Route header → the next hop is the Request-URI (the remote target),
+        // resolved per RFC 3261 §16.12 — still derived from the message, never
+        // the cached INVITE branch destination.
+        let ack = ack_request_with_route(None);
+        let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line);
+        let ruri = parse_uri_standalone("sip:5111@100.65.0.2:7000").unwrap();
+        assert_eq!(next_hop, Some(ruri.to_string()));
+    }
+
+    #[test]
+    fn ack_2xx_follows_route_set_after_popping_self() {
+        // Field regression (siphon as S-CSCF): the 2xx ACK arrives with a route
+        // set of [S-CSCF (self), P-CSCF]. After loose-routing pops our own top
+        // Route, the next hop is the P-CSCF — not the cached INVITE branch (which
+        // pointed at a non-Record-Routing MMTel-AS) and not the UE Contact in the
+        // Request-URI. The cached-branch path mis-delivered the ACK so the UAS
+        // never confirmed the dialog.
+        let mut ack = ack_request_with_route(Some(
+            "<sip:172.16.0.121:6060;lr>, <sip:172.16.0.101:5060;transport=udp;lr>",
+        ));
+
+        // Mirror handle_ack_via_session: pop our own (top) Route entry.
+        assert!(core::check_loose_route(&ack.headers));
+        core::pop_top_route(&mut ack.headers);
+
+        let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("next hop");
+        let parsed = parse_uri_standalone(&next_hop).unwrap();
+        assert_eq!(
+            parsed.host, "172.16.0.101",
+            "ACK must follow the dialog route set to the P-CSCF",
+        );
+        assert_eq!(parsed.port, Some(5060));
+        assert_ne!(
+            parsed.host, "100.65.0.2",
+            "ACK must not short-circuit to the UE Contact in the Request-URI",
+        );
+    }
+
+    #[test]
+    fn ack_2xx_consumes_double_self_record_route_then_follows_route_set() {
+        // Transport-bridging double Record-Route: siphon appears twice at the
+        // top of the dialog route set, followed by the real next hop (P-CSCF).
+        // Consuming only the top self-Route would leave our own second Route as
+        // the apparent next hop — a routing loop. The ACK must consume both
+        // self-Routes (via pop_local_routes) and forward to the P-CSCF, exactly
+        // as loose_route() does for the in-dialog BYE on this dialog.
+        let local_domains = vec!["172.16.0.121".to_string()];
+        let mut ack = ack_request_with_route(Some(
+            "<sip:172.16.0.121:6060;transport=tcp;lr>, \
+             <sip:172.16.0.121:6060;transport=udp;lr>, \
+             <sip:172.16.0.101:5060;transport=udp;lr>",
+        ));
+
+        // Mirror handle_ack_via_session's route consumption.
+        assert!(core::check_loose_route(&ack.headers));
+        core::pop_top_route(&mut ack.headers);
+        core::pop_local_routes(&mut ack.headers, &local_domains);
+
+        let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("next hop");
+        let parsed = parse_uri_standalone(&next_hop).unwrap();
+        assert_eq!(
+            parsed.host, "172.16.0.101",
+            "ACK must skip our own double Record-Route and follow the route set",
+        );
+        assert_eq!(parsed.port, Some(5060));
     }
 
     #[test]

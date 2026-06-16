@@ -22,7 +22,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Sequential forking | Implemented | `request.fork(strategy="sequential")` | |
 | Record-Route / Loose Route | **Production** | `request.record_route()` | Mid-dialog routing proven |
 | CANCEL propagation | **Production** | Core | Matched to transaction automatically |
-| In-dialog sequential routing | **Production** | `request.loose_route()` | |
+| In-dialog sequential routing | **Production** | `request.loose_route()` | End-to-end 2xx ACK follows the dialog route set (top remaining Route after self-consumption, else R-URI), not the cached INVITE next-hop — correct through non-Record-Routing hops (transparent iFC AS, I-CSCF). Validated proxy/B2BUA × UDP/TCP, 0 failures/retransmits |
 | Call transfer (REFER, RFC 3515) | Implemented | B2BUA `@b2bua.on_refer` | |
 | Session timers (RFC 4028) | Implemented | `session_timer:` | UAC/UAS/B2BUA refresher modes |
 | PRACK (RFC 3262) | Implemented | Core | Reliable provisional responses; B2BUA terminates 100rel per-leg — auto-PRACKs a reliable-provisional B-leg and strips `Require:100rel`/`RSeq` toward a non-100rel A-leg (framework-auto, preset-independent) |
