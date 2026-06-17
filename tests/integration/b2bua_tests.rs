@@ -299,6 +299,122 @@ fn b2bua_full_call_lifecycle() {
 }
 
 // ---------------------------------------------------------------------------
+// B2BUA auth/422 retry supersede: the retry INVITE must replace the failed
+// B-leg in place, not append a second leg. Otherwise a caller CANCEL during
+// alerting fans out to the dead pre-auth transaction too (→ a spurious 481,
+// RFC 3261 §9.1) on top of the live one.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn b2bua_auth_retry_supersedes_failed_leg_for_single_cancel() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("b2b-supersede@test"));
+
+    // CSeq-1 INVITE (no creds) went out and drew a 401. Its leg carries the
+    // pre-auth INVITE, stashed so a CANCEL can be rebuilt from it.
+    let cseq1 = concat!(
+        "INVITE sip:bob@10.0.0.2:5060 SIP/2.0\r\n",
+        "Via: SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bK-cseq1-687e\r\n",
+        "Max-Forwards: 70\r\n",
+        "From: <sip:alice@10.0.0.1>;tag=alice-tag\r\n",
+        "To: <sip:bob@10.0.0.2>\r\n",
+        "Call-ID: b2b-supersede@test\r\n",
+        "CSeq: 1 INVITE\r\n",
+        "Content-Length: 0\r\n",
+        "\r\n",
+    );
+    let cseq1_invite = parse_sip_message(cseq1).expect("cseq1 fixture parses").1;
+    let mut leg1 = Leg::new_b_leg(
+        generate_call_id(),
+        generate_tag(),
+        "sip:bob@10.0.0.2:5060".to_string(),
+        "z9hG4bK-cseq1-687e".to_string(),
+        TransportInfo {
+            remote_addr: "10.0.0.2:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        },
+    );
+    leg1.b_leg_invite = Some(Arc::new(Mutex::new(cseq1_invite)));
+    store.add_b_leg(&call_id, leg1);
+    assert_eq!(
+        store.call_id_for_branch("z9hG4bK-cseq1-687e"),
+        Some(call_id.clone())
+    );
+
+    // The 401 retry: same dialog, new branch + CSeq, Authorization added. It
+    // supersedes the failed leg in place at index 0 (what the dispatcher does
+    // via replace_b_leg + spawn_b_leg_actor_at).
+    let cseq2 = concat!(
+        "INVITE sip:bob@10.0.0.2:5060 SIP/2.0\r\n",
+        "Via: SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bK-cseq2-4a39\r\n",
+        "Max-Forwards: 70\r\n",
+        "From: <sip:alice@10.0.0.1>;tag=alice-tag\r\n",
+        "To: <sip:bob@10.0.0.2>\r\n",
+        "Call-ID: b2b-supersede@test\r\n",
+        "CSeq: 2 INVITE\r\n",
+        "Authorization: Digest username=\"alice\", realm=\"trunk\", nonce=\"abc\"\r\n",
+        "Content-Length: 0\r\n",
+        "\r\n",
+    );
+    let cseq2_invite = parse_sip_message(cseq2).expect("cseq2 fixture parses").1;
+    let mut leg2 = Leg::new_b_leg(
+        generate_call_id(),
+        generate_tag(),
+        "sip:bob@10.0.0.2:5060".to_string(),
+        "z9hG4bK-cseq2-4a39".to_string(),
+        TransportInfo {
+            remote_addr: "10.0.0.2:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        },
+    );
+    leg2.b_leg_invite = Some(Arc::new(Mutex::new(cseq2_invite)));
+    assert!(store.replace_b_leg(&call_id, 0, leg2));
+
+    // The dead pre-auth branch no longer routes; the retry branch does.
+    assert!(store.call_id_for_branch("z9hG4bK-cseq1-687e").is_none());
+    assert_eq!(
+        store.call_id_for_branch("z9hG4bK-cseq2-4a39"),
+        Some(call_id.clone())
+    );
+
+    // Single-CANCEL invariant: handle_b2bua_cancel builds one CANCEL per leg
+    // that carries a stashed b_leg_invite. Exactly one such leg must remain,
+    // on the live CSeq-2 branch — never the dead CSeq-1 one.
+    let call = store.get_call(&call_id).expect("call exists");
+    let cancelable_vias: Vec<String> = call
+        .b_legs
+        .iter()
+        .filter_map(|leg| leg.b_leg_invite.as_ref())
+        .map(|invite| {
+            invite
+                .lock()
+                .unwrap()
+                .headers
+                .get("Via")
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(call.b_legs.len(), 1, "retry must supersede, not append");
+    assert_eq!(
+        cancelable_vias.len(),
+        1,
+        "exactly one CANCEL would be sent"
+    );
+    assert!(
+        cancelable_vias[0].contains("z9hG4bK-cseq2-4a39"),
+        "the single CANCEL must target the live CSeq-2 branch, got: {}",
+        cancelable_vias[0]
+    );
+    assert!(
+        !cancelable_vias[0].contains("z9hG4bK-cseq1-687e"),
+        "no CANCEL must target the dead CSeq-1 branch"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // B2BUA error propagation: B-leg failure → call cleanup
 // ---------------------------------------------------------------------------
 

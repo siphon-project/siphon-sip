@@ -674,6 +674,37 @@ impl CallActor {
         }
     }
 
+    /// Supersede a B-leg in place (e.g. a 401/407 digest or RFC 4028 422
+    /// session-timer retry resends the INVITE on a fresh branch).
+    ///
+    /// RFC 3261 §9.1: the failed attempt's INVITE client transaction is
+    /// complete once it has received a final response and been ACKed, so the
+    /// retry is the *same* logical B-leg continuing with new credentials /
+    /// Session-Expires — NOT a new fork branch. Appending instead (the old
+    /// behaviour) leaves the dead leg in `b_legs`, so a later CANCEL fans out
+    /// to its already-final-responded transaction as well as the live one
+    /// (→ a spurious 481 Call/Transaction Does Not Exist).
+    ///
+    /// Replaces the leg at `index`, resets its status to `Trying`, and clears
+    /// the actor handle — dropping the old [`LegHandle`] closes the previous
+    /// [`LegActor`]'s channel so it exits on its own (the same implicit
+    /// cleanup [`remove_b_leg`](Self::remove_b_leg) relies on). Keeps the
+    /// `b_legs` / `b_leg_status` / `b_leg_handles` parallel vectors aligned.
+    ///
+    /// Returns the superseded leg's Via branch (so the caller can re-point the
+    /// routing registry from the old branch to the new one), or `None` if
+    /// `index` is out of range.
+    pub fn replace_b_leg(&mut self, index: usize, leg: Leg) -> Option<String> {
+        if index < self.b_legs.len() {
+            let old_branch = std::mem::replace(&mut self.b_legs[index], leg).branch;
+            self.b_leg_status[index] = BLegStatus::Trying;
+            self.b_leg_handles[index] = None;
+            Some(old_branch)
+        } else {
+            None
+        }
+    }
+
     /// Get the winning B-leg (if any).
     pub fn winning_b_leg(&self) -> Option<&Leg> {
         self.winner.and_then(|i| self.b_legs.get(i))
@@ -898,6 +929,33 @@ impl CallActorStore {
             true
         } else {
             false
+        }
+    }
+
+    /// Supersede a B-leg in place and re-point the routing registry from the
+    /// old branch to the new one.
+    ///
+    /// Used by the 401/407 (RFC 3261 §9.1) and 422 (RFC 4028) retry paths: the
+    /// retry continues the same logical B-leg rather than forking a new one, so
+    /// a later CANCEL fans out to the live transaction only. See
+    /// [`CallActor::replace_b_leg`]. The dialog Call-ID is unchanged (the retry
+    /// reuses it), so the Call-ID registration is left untouched. Returns true
+    /// on success, false if the call or `index` is unknown.
+    pub fn replace_b_leg(&self, call_id: &str, index: usize, leg: Leg) -> bool {
+        let new_branch = leg.branch.clone();
+        let old_branch = match self.calls.get_mut(call_id) {
+            Some(mut call) => call.replace_b_leg(index, leg),
+            None => return false,
+        };
+        match old_branch {
+            Some(old) => {
+                if old != new_branch {
+                    self.registry.remove_branch(&old);
+                }
+                self.registry.register_branch(&new_branch, call_id);
+                true
+            }
+            None => false,
         }
     }
 
@@ -1637,6 +1695,48 @@ mod tests {
     }
 
     #[test]
+    fn call_actor_replace_b_leg_supersedes_in_place() {
+        // 401/407/422 retry: the retry INVITE supersedes the failed leg at the
+        // same index rather than appending a second leg. The parallel vectors
+        // stay aligned, the slot's status resets to Trying, its actor handle is
+        // cleared, and the old branch is returned for registry re-pointing.
+        let mut call = CallActor::new(make_a_leg());
+        call.add_b_leg(make_b_leg(0)); // CSeq-1 leg, branch z9hG4bK-bleg0
+        call.add_b_leg(make_b_leg(1)); // an unrelated fork branch
+
+        // The failed CSeq-1 leg got a final response, and we parked a handle on it.
+        call.b_leg_status[0] = BLegStatus::Failed(401);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<LegMessage>(1);
+        call.b_leg_handles[0] = Some(LegHandle {
+            id: call.b_legs[0].id.clone(),
+            side: LegSide::B,
+            tx,
+        });
+
+        // Build the retry leg on a fresh branch and supersede index 0.
+        let retry = Leg::new_b_leg(
+            "b2b-bleg0".to_string(),
+            "sb-bleg0".to_string(),
+            "sip:bob0@10.0.0.2".to_string(),
+            "z9hG4bK-bleg0-retry".to_string(),
+            test_transport(),
+        );
+        let old_branch = call.replace_b_leg(0, retry);
+
+        assert_eq!(old_branch.as_deref(), Some("z9hG4bK-bleg0"));
+        assert_eq!(call.b_legs.len(), 2); // superseded, not appended
+        assert_eq!(call.b_legs[0].branch, "z9hG4bK-bleg0-retry"); // live branch
+        assert_eq!(call.b_leg_status[0], BLegStatus::Trying); // status reset
+        assert!(call.b_leg_handles[0].is_none()); // old actor handle cleared
+        // The unrelated fork branch at index 1 is untouched.
+        assert_eq!(call.b_legs[1].branch, "z9hG4bK-bleg1");
+
+        // Out-of-range supersede is a no-op returning None.
+        assert_eq!(call.replace_b_leg(99, make_b_leg(7)), None);
+        assert_eq!(call.b_legs.len(), 2);
+    }
+
+    #[test]
     fn call_actor_losers() {
         let mut call = CallActor::new(make_a_leg());
         call.add_b_leg(make_b_leg(0));
@@ -1886,6 +1986,46 @@ mod tests {
         assert!(store.call_id_for_branch(&b_branch).is_none());
         assert!(store.find_by_sip_call_id(&b_cid).is_none());
         assert!(store.find_by_sip_call_id("call-1@10.0.0.1").is_none());
+    }
+
+    #[test]
+    fn store_replace_b_leg_repoints_registry() {
+        // Superseding a B-leg must move the routing registry from the old
+        // branch to the retry branch: responses to the retry INVITE route to
+        // this call, and the dead pre-auth branch no longer resolves (so a
+        // stray retransmit on it can't re-enter the call with a stale leg).
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        let original = make_b_leg(0);
+        let old_branch = original.branch.clone();
+        store.add_b_leg(&call_id, original);
+        assert_eq!(store.call_id_for_branch(&old_branch), Some(call_id.clone()));
+
+        let retry = Leg::new_b_leg(
+            "b2b-bleg0".to_string(),
+            "sb-bleg0".to_string(),
+            "sip:bob0@10.0.0.2".to_string(),
+            "z9hG4bK-bleg0-retry".to_string(),
+            test_transport(),
+        );
+        assert!(store.replace_b_leg(&call_id, 0, retry));
+
+        // Exactly one leg survives, on the retry branch.
+        let call = store.get_call(&call_id).expect("call exists");
+        assert_eq!(call.b_legs.len(), 1);
+        assert_eq!(call.b_legs[0].branch, "z9hG4bK-bleg0-retry");
+        drop(call);
+
+        // Registry now resolves the retry branch, not the dead one.
+        assert_eq!(
+            store.call_id_for_branch("z9hG4bK-bleg0-retry"),
+            Some(call_id.clone())
+        );
+        assert!(store.call_id_for_branch(&old_branch).is_none());
+
+        // Superseding an unknown call or out-of-range index is a no-op.
+        assert!(!store.replace_b_leg("nope", 0, make_b_leg(9)));
+        assert!(!store.replace_b_leg(&call_id, 99, make_b_leg(9)));
     }
 
     #[test]

@@ -7678,6 +7678,26 @@ fn spawn_b_leg_actor(call_id: &str, b_leg: &Leg, state: &DispatcherState) {
     }
 }
 
+/// Spawn a [`LegActor`] for a B-leg whose slot is at an explicit `index`.
+///
+/// Like [`spawn_b_leg_actor`] but stores the handle at `index` rather than the
+/// last B-leg. Used by the 401/407 and 422 retry paths, which *supersede* the
+/// failed leg in place (via `CallActorStore::replace_b_leg`) instead of
+/// appending — so the retry's actor handle must land on the same slot the
+/// retry leg occupies.
+fn spawn_b_leg_actor_at(call_id: &str, b_leg: &Leg, index: usize, state: &DispatcherState) {
+    if let Some(call) = state.call_actors.get_call(call_id) {
+        if let Some(event_tx) = &call.event_tx {
+            let (actor, handle) = LegActor::new(b_leg.clone(), event_tx.clone());
+            drop(call);
+            tokio::spawn(actor.run());
+            if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+                call.set_b_leg_handle(index, handle);
+            }
+        }
+    }
+}
+
 /// Extract the `expires=` parameter value from a Contact header value.
 ///
 /// Skips URI parameters inside angle brackets so that only Contact-level
@@ -9177,7 +9197,7 @@ fn handle_b2bua_response(
                                     None,
                                 );
 
-                                let b_leg = Leg::new_b_leg(
+                                let mut b_leg = Leg::new_b_leg(
                                     retry_call_id,
                                     retry_from_tag,
                                     target_uri.clone(),
@@ -9188,8 +9208,29 @@ fn handle_b2bua_response(
                                         transport,
                                     },
                                 );
-                                state.call_actors.add_b_leg(call_id, b_leg.clone());
-                                spawn_b_leg_actor(call_id, &b_leg, state);
+                                // Stash the retry INVITE so a caller CANCEL during
+                                // alerting can rebuild the CANCEL from it (RFC 3261
+                                // §9.1 — same Via branch + CSeq). The original 422'd
+                                // leg's stash is discarded by the in-place supersede
+                                // below; without re-stashing here the live retry
+                                // transaction would be left un-cancellable.
+                                b_leg.b_leg_invite = Some(Arc::new(Mutex::new(retry.clone())));
+
+                                // RFC 4028: the 422'd INVITE transaction is complete,
+                                // so the higher-Session-Expires retry continues the
+                                // same logical B-leg — supersede in place rather than
+                                // append (see the 401/407 path for why appending
+                                // strands a dead leg that a later CANCEL hits).
+                                match b_leg_index {
+                                    Some(idx) => {
+                                        state.call_actors.replace_b_leg(call_id, idx, b_leg.clone());
+                                        spawn_b_leg_actor_at(call_id, &b_leg, idx, state);
+                                    }
+                                    None => {
+                                        state.call_actors.add_b_leg(call_id, b_leg.clone());
+                                        spawn_b_leg_actor(call_id, &b_leg, state);
+                                    }
+                                }
 
                                 let data = Bytes::from(retry.to_bytes());
                                 send_to_target(data, &relay_target, transport, ConnectionId::default(), state);
@@ -9423,8 +9464,27 @@ fn handle_b2bua_response(
                                 // (e.g. nonce stale) rebuilds from the right snapshot.
                                 b_leg.b_leg_invite = Some(Arc::new(Mutex::new(retry.clone())));
 
-                                state.call_actors.add_b_leg(call_id, b_leg.clone());
-                                spawn_b_leg_actor(call_id, &b_leg, state);
+                                // RFC 3261 §9.1: the CSeq-1 INVITE transaction is
+                                // complete after its 401/407 + ACK, so the retry is
+                                // the *same* logical B-leg continuing with credentials
+                                // — supersede the failed leg in place rather than
+                                // appending. Appending leaves the dead leg in
+                                // `b_legs`, so a later CANCEL fans out to its
+                                // already-final-responded transaction too (→ a
+                                // spurious 481). `b_leg_index` is the slot the
+                                // challenged response matched; it is always Some here
+                                // (a B-leg response only reaches this path with a
+                                // matched leg), but fall back to append defensively.
+                                match b_leg_index {
+                                    Some(idx) => {
+                                        state.call_actors.replace_b_leg(call_id, idx, b_leg.clone());
+                                        spawn_b_leg_actor_at(call_id, &b_leg, idx, state);
+                                    }
+                                    None => {
+                                        state.call_actors.add_b_leg(call_id, b_leg.clone());
+                                        spawn_b_leg_actor(call_id, &b_leg, state);
+                                    }
+                                }
 
                                 let data = Bytes::from(retry.to_bytes());
                                 send_to_target(data, &relay_target, transport, ConnectionId::default(), state);
