@@ -3722,6 +3722,26 @@ fn handle_response(
         }
     }
 
+    // Post-CANCEL glare (RFC 3261 §9.1): a 2xx that raced an outbound CANCEL.
+    // handle_b2bua_cancel removed the call (unregistering the B-leg branch), so
+    // this 2xx no longer resolves above. ACK it (§13.2.2.4) and BYE it (§15) via
+    // the captured leg so the callee stops retransmitting and the dialog it just
+    // established is released.
+    if (200..300).contains(&status_code) {
+        if let Some(cseq_raw) = message.headers.get("CSeq") {
+            if cseq_raw.contains("INVITE") {
+                if let Some(sip_call_id) = message.headers.call_id() {
+                    if let Some((leg, first_2xx)) =
+                        state.call_actors.zombie_cancelled_for_2xx(sip_call_id)
+                    {
+                        handle_zombie_cancelled_2xx(leg, first_2xx, &message, state);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     // Parse CSeq once for both transaction processing and session routing.
     let sent_by = TransactionKey::format_sent_by(&top_via.host, top_via.port);
     let client_txn_key = message.headers.get("CSeq")
@@ -6918,8 +6938,15 @@ fn handle_b2bua_cancel(
     );
 
     state.call_actors.set_state(&call_id, CallState::Terminated);
-    // remove_call sends Shutdown to any remaining actors and cleans up registry
-    state.call_actors.remove_call(&call_id);
+    // remove_call_after_cancel sends Shutdown to remaining actors, cleans the
+    // registry, and preserves still-pending B-legs as zombie-cancelled entries
+    // so a 2xx that raced this CANCEL (RFC 3261 §9.1) can still be ACKed + BYEd
+    // by handle_response → handle_zombie_cancelled_2xx instead of being dropped
+    // as an unknown branch (which leaves the callee retransmitting 200 OK then
+    // BYEing the half-open dialog).
+    if state.call_actors.remove_call_after_cancel(&call_id) {
+        schedule_zombie_cancelled_cleanup(state.call_actors.clone());
+    }
     state.call_event_receivers.remove(&call_id);
 }
 
@@ -9637,6 +9664,123 @@ fn schedule_zombie_reinvite_cleanup(call_actors: &crate::b2bua::actor::CallActor
                 zombie_map.remove(&key);
             }
         });
+    }
+}
+
+/// Expire post-CANCEL glare entries after 32 s (Timer H / 64·T1).
+///
+/// Unlike [`schedule_zombie_reinvite_cleanup`], this removes from the *shared*
+/// store via the `Arc` rather than from a `DashMap` clone, so entries that
+/// never see a racing 2xx (the CANCEL won the race) are still reaped.
+fn schedule_zombie_cancelled_cleanup(call_actors: Arc<crate::b2bua::actor::CallActorStore>) {
+    let keys: Vec<String> = call_actors
+        .zombie_cancelled
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect();
+    if keys.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(32)).await;
+        for key in keys {
+            call_actors.zombie_cancelled.remove(&key);
+        }
+    });
+}
+
+/// Build an ACK for a 2xx INVITE response on a B2BUA B-leg (RFC 3261 §13.2.2.4).
+///
+/// The ACK for a 2xx is its own transaction: a fresh Via branch, R-URI set to
+/// the response's Contact (the remote target), and the INVITE's CSeq number
+/// with method ACK. From / To / Call-ID are echoed from the 2xx (its To already
+/// carries the remote tag).
+fn build_b2bua_ack_for_2xx(
+    response: &SipMessage,
+    transport: Transport,
+    state: &DispatcherState,
+) -> Option<SipMessage> {
+    let request_uri = response.headers.get("Contact")
+        .map(|c| crate::b2bua::actor::extract_contact_uri(c))
+        .and_then(|u| parse_uri_standalone(&u).ok())
+        .unwrap_or_else(|| SipUri::new("invalid".to_string()));
+    let transport_str = format!("{}", transport).to_uppercase();
+    let cseq_num = response.headers.cseq()
+        .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
+        .unwrap_or_else(|| "1".to_string());
+    let from = response.headers.from().cloned().unwrap_or_default();
+    let to = response.headers.to().cloned().unwrap_or_default();
+    let call_id = response.headers.call_id().map(|s| s.to_string()).unwrap_or_default();
+    match SipMessageBuilder::new()
+        .request(Method::Ack, request_uri)
+        .via(format!(
+            "SIP/2.0/{} {}:{};branch={}",
+            transport_str,
+            state.via_host(&transport),
+            state.via_port(&transport),
+            TransactionKey::generate_branch(),
+        ))
+        .from(from.to_string())
+        .to(to.to_string())
+        .call_id(call_id)
+        .cseq(format!("{} ACK", cseq_num))
+        .header("Max-Forwards", "70".to_string())
+        .content_length(0)
+        .build()
+    {
+        Ok(ack) => Some(ack),
+        Err(error) => {
+            warn!("B2BUA: failed to build ACK for raced 2xx: {error}");
+            None
+        }
+    }
+}
+
+/// Handle a 2xx that raced an outbound CANCEL (RFC 3261 §9.1 glare).
+///
+/// The callee answered the B-leg INVITE before our CANCEL landed, so the 2xx
+/// established a dialog even though the call is gone. ACK it (§13.2.2.4) to stop
+/// the 200 OK retransmissions, then — on the first 2xx only — BYE it (§15) to
+/// release the session. All dialog state comes from the captured leg plus this
+/// response (the remote tag / Contact were unknown when the INVITE was CANCELled).
+fn handle_zombie_cancelled_2xx(
+    mut leg: crate::b2bua::actor::Leg,
+    first_2xx: bool,
+    response: &SipMessage,
+    state: &DispatcherState,
+) {
+    let transport = leg.transport.transport;
+    let destination = leg.transport.remote_addr;
+
+    // ACK the 2xx on every match — a lost ACK leaves the callee retransmitting.
+    if let Some(ack) = build_b2bua_ack_for_2xx(response, transport, state) {
+        send_b2bua_to_bleg(ack, transport, destination, state);
+    }
+
+    if !first_2xx {
+        return; // retransmit — re-ACK only; the BYE already went out.
+    }
+
+    // Fill the remote dialog identity from the 2xx (unknown at CANCEL time).
+    if let Some(tag) = crate::b2bua::actor::extract_to_tag(response) {
+        leg.dialog.remote_tag = Some(tag);
+    }
+    if let Some(contact) = response.headers.get("Contact") {
+        leg.dialog.remote_contact = Some(crate::b2bua::actor::extract_contact_uri(contact));
+    }
+    // The BYE CSeq must exceed the INVITE's; derive it from the 2xx's CSeq.
+    let invite_cseq = response.headers.cseq()
+        .and_then(|c| c.split_whitespace().next())
+        .and_then(|n| n.parse::<u32>().ok())
+        .unwrap_or(leg.dialog.local_cseq);
+    leg.dialog.local_cseq = invite_cseq.saturating_add(1);
+
+    if let Some(bye) = build_b2bua_bye(&leg, state) {
+        send_b2bua_to_bleg(bye, transport, destination, state);
+        debug!(
+            sip_call_id = %leg.dialog.call_id,
+            "B2BUA: ACK+BYE for a 2xx that raced our CANCEL (RFC 3261 §9.1 glare)"
+        );
     }
 }
 

@@ -870,6 +870,27 @@ pub struct ZombieReInviteEntry {
     pub transport: Transport,
 }
 
+/// Post-teardown state for a B-leg whose INVITE was CANCELled but might still
+/// be answered (RFC 3261 §9.1 glare): the callee put a 2xx on the wire before
+/// our CANCEL arrived. That 2xx still establishes a dialog, which the B2BUA
+/// MUST ACK (§13.2.2.4) and then BYE (§15) to release. `handle_b2bua_cancel`
+/// removes the call — unregistering the B-leg branch — so the racing 2xx would
+/// otherwise be dropped as "unknown branch"; this entry lets `handle_response`
+/// catch it and clean the dialog up.
+///
+/// Keyed by B-leg SIP Call-ID. Auto-expires after 32 seconds (Timer H).
+#[derive(Debug, Clone)]
+pub struct ZombieCancelledLeg {
+    /// The cancelled B-leg's dialog + transport, used to build the ACK and BYE.
+    /// `remote_tag` / `remote_contact` are filled from the racing 2xx at
+    /// handling time (they were unknown when the INVITE was CANCELled).
+    pub leg: Leg,
+    /// Whether the BYE has already been sent. The first racing 2xx triggers
+    /// ACK + BYE; later 200 OK retransmits re-ACK only (so a lost ACK still
+    /// gets retried) without emitting a second BYE.
+    pub byed: bool,
+}
+
 /// Manages all active B2BUA calls.
 ///
 /// Stores `CallActor` instances in a concurrent map, indexed by internal
@@ -882,6 +903,9 @@ pub struct CallActorStore {
     pub registry: LegRegistry,
     /// Post-teardown re-INVITE ACK absorber, keyed by B-leg SIP Call-ID.
     pub zombie_reinvites: DashMap<String, ZombieReInviteEntry>,
+    /// Post-CANCEL glare absorber (RFC 3261 §9.1): a 2xx that raced our CANCEL
+    /// is ACKed + BYEd here, keyed by B-leg SIP Call-ID.
+    pub zombie_cancelled: DashMap<String, ZombieCancelledLeg>,
 }
 
 impl CallActorStore {
@@ -890,6 +914,7 @@ impl CallActorStore {
             calls: DashMap::new(),
             registry: LegRegistry::new(),
             zombie_reinvites: DashMap::new(),
+            zombie_cancelled: DashMap::new(),
         }
     }
 
@@ -1250,6 +1275,54 @@ impl CallActorStore {
     /// Remove a zombie re-INVITE entry.
     pub fn remove_zombie_reinvite(&self, sip_call_id: &str) {
         self.zombie_reinvites.remove(sip_call_id);
+    }
+
+    /// Tear down a CANCELled call, but first preserve every still-pending
+    /// B-leg (INVITE sent, no final response yet — status `Trying`/`Ringing`)
+    /// as a [`ZombieCancelledLeg`] so a 2xx that raced the CANCEL
+    /// (RFC 3261 §9.1) can still be ACKed (§13.2.2.4) and BYEd (§15) after the
+    /// call is gone. Used by `handle_b2bua_cancel` in place of `remove_call`.
+    ///
+    /// Returns true if any zombie-cancelled entries were captured (so the
+    /// caller can schedule their expiry).
+    pub fn remove_call_after_cancel(&self, call_id: &str) -> bool {
+        let mut captured = false;
+        if let Some(call) = self.calls.get(call_id) {
+            for (index, b_leg) in call.b_legs.iter().enumerate() {
+                let pending = matches!(
+                    call.b_leg_status.get(index),
+                    Some(BLegStatus::Trying) | Some(BLegStatus::Ringing)
+                );
+                // Only legs whose INVITE actually went on the wire can answer.
+                if pending && b_leg.b_leg_invite.is_some() {
+                    self.zombie_cancelled.insert(
+                        b_leg.dialog.call_id.clone(),
+                        ZombieCancelledLeg {
+                            leg: b_leg.clone(),
+                            byed: false,
+                        },
+                    );
+                    captured = true;
+                }
+            }
+        }
+        self.remove_call(call_id);
+        captured
+    }
+
+    /// Resolve a racing 2xx to a CANCELled B-leg by SIP Call-ID.
+    ///
+    /// Returns the captured leg plus a `first_2xx` flag: the first racing 2xx
+    /// for a Call-ID returns `(leg, true)` so the caller sends ACK + BYE; later
+    /// 200 OK retransmits return `(leg, false)` so the caller re-ACKs only (a
+    /// lost ACK still gets retried) without a second BYE. The entry stays until
+    /// the 32 s cleanup so retransmits keep matching.
+    pub fn zombie_cancelled_for_2xx(&self, sip_call_id: &str) -> Option<(Leg, bool)> {
+        self.zombie_cancelled.get_mut(sip_call_id).map(|mut entry| {
+            let first_2xx = !entry.byed;
+            entry.byed = true;
+            (entry.leg.clone(), first_2xx)
+        })
     }
 
     /// Iterate over all active calls (for session timer sweep).
@@ -2026,6 +2099,57 @@ mod tests {
         // Superseding an unknown call or out-of-range index is a no-op.
         assert!(!store.replace_b_leg("nope", 0, make_b_leg(9)));
         assert!(!store.replace_b_leg(&call_id, 99, make_b_leg(9)));
+    }
+
+    #[test]
+    fn store_remove_call_after_cancel_zombifies_pending_legs() {
+        // A CANCELled call's still-pending B-leg (INVITE on the wire, status
+        // Trying) must survive teardown as a zombie-cancelled entry so a 2xx
+        // that raced the CANCEL can be ACKed + BYEd. A leg whose INVITE never
+        // went out (no stash) must not.
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+
+        let mut sent_leg = make_b_leg(0);
+        let sent_cid = sent_leg.dialog.call_id.clone();
+        let invite = crate::sip::builder::SipMessageBuilder::new()
+            .request(
+                crate::sip::message::Method::Invite,
+                crate::sip::uri::SipUri::new("10.0.0.2".to_string()),
+            )
+            .via("SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bK-b0".to_string())
+            .from("<sip:alice@10.0.0.1>;tag=a".to_string())
+            .to("<sip:bob@10.0.0.2>".to_string())
+            .call_id(sent_cid.clone())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        sent_leg.b_leg_invite = Some(Arc::new(Mutex::new(invite)));
+        store.add_b_leg(&call_id, sent_leg);
+
+        // A second B-leg whose INVITE never went on the wire (no stash).
+        let unsent_leg = make_b_leg(1);
+        let unsent_cid = unsent_leg.dialog.call_id.clone();
+        store.add_b_leg(&call_id, unsent_leg);
+
+        let captured = store.remove_call_after_cancel(&call_id);
+        assert!(captured, "the sent, still-pending leg should be zombified");
+        assert_eq!(store.count(), 0, "the call itself is removed");
+
+        // The sent leg resolves as a zombie; the unsent one does not.
+        let (leg, first) = store
+            .zombie_cancelled_for_2xx(&sent_cid)
+            .expect("zombie present for the sent leg");
+        assert!(first, "the first racing 2xx triggers ACK + BYE");
+        assert_eq!(leg.dialog.call_id, sent_cid);
+        assert!(store.zombie_cancelled_for_2xx(&unsent_cid).is_none());
+
+        // A retransmitted 2xx for the same Call-ID re-ACKs only (no second BYE).
+        let (_leg, second) = store
+            .zombie_cancelled_for_2xx(&sent_cid)
+            .expect("entry stays until the 32s cleanup");
+        assert!(!second, "a retransmit must not trigger a second BYE");
     }
 
     #[test]
