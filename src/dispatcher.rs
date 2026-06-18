@@ -8026,6 +8026,40 @@ fn spawn_b_leg_actor_at(call_id: &str, b_leg: &Leg, index: usize, state: &Dispat
     }
 }
 
+/// Receive the next B-leg response classification from the shared per-call
+/// event channel, discarding stale `CallEvent::Terminated` notifications.
+///
+/// Every [`LegActor`] emits `CallEvent::Terminated` as it falls out of its run
+/// loop. A 401/407/422 outbound retry supersedes the failed B-leg in place
+/// (`CallActorStore::replace_b_leg`), which drops the old leg's actor handle;
+/// that actor then exits and pushes a `Terminated` onto the SHARED per-call
+/// channel — the very channel the dispatcher block-recvs for each response's
+/// classification.
+///
+/// `Terminated` is a lifecycle notification, never a response classification,
+/// and nothing else consumes this channel. Taking one here as though it
+/// classified the response just handed to the live actor desyncs the stream by
+/// one: the next 200 OK then reads the previous 18x's `Provisional` event, so
+/// the 2xx is misclassified as provisional — `set_winner` and the deferred
+/// B-leg ACK are skipped, the trunk's 200 OK is never ACKed, and it retransmits
+/// until the dialog collapses (BYE storm ~5 s after answer). Filtering
+/// `Terminated` out restores the strict one-response/one-classification
+/// invariant the caller relies on.
+///
+/// The caller block-recvs only after a successful `try_send` of the response to
+/// the live actor, so exactly one non-`Terminated` classification event is
+/// always forthcoming and this loop terminates.
+fn recv_b_leg_classification_event(
+    rx: &mut tokio::sync::mpsc::Receiver<CallEvent>,
+) -> Option<CallEvent> {
+    loop {
+        match rx.blocking_recv() {
+            Some(CallEvent::Terminated { .. }) => continue,
+            other => return other,
+        }
+    }
+}
+
 /// Extract the `expires=` parameter value from a Contact header value.
 ///
 /// Skips URI parameters inside angle brackets so that only Contact-level
@@ -8785,8 +8819,12 @@ fn handle_b2bua_response(
             Ok(()) => {
                 // Temporarily extract receiver to block on it.
                 // Safe: dispatcher processes messages sequentially.
+                // Skip stale CallEvent::Terminated from a superseded leg's
+                // actor (401/407/422 retry → replace_b_leg) — see
+                // recv_b_leg_classification_event for why consuming one here
+                // would misclassify the B-leg 200 OK as provisional.
                 if let Some((_, mut rx)) = state.call_event_receivers.remove(call_id) {
-                    let event = rx.blocking_recv();
+                    let event = recv_b_leg_classification_event(&mut rx);
                     state.call_event_receivers.insert(call_id.to_string(), rx);
                     event
                 } else {
@@ -12497,6 +12535,103 @@ a=rtpmap:8 PCMA/8000\r\n";
         // CSeq number echoes the INVITE; method becomes ACK.
         assert_eq!(ack.headers.cseq().unwrap(), "1 ACK");
         assert_eq!(ack.headers.call_id().unwrap(), "b2b-aaaa-bbbb");
+    }
+
+    /// Regression: an outbound INVITE to an authenticating trunk draws a 401,
+    /// is ACKed, and re-sent with credentials on a new branch + CSeq. The retry
+    /// supersedes the failed B-leg in place (`replace_b_leg`), dropping the old
+    /// leg's actor handle — so that actor exits and emits `CallEvent::Terminated`
+    /// onto the SHARED per-call event channel. The dispatcher block-recvs that
+    /// channel to classify each response; consuming the stale `Terminated` as a
+    /// classification desynced the stream so the live retry leg's 200 OK was
+    /// read as the previous 18x's `Provisional` event. That skipped
+    /// `set_winner` + the deferred B-leg ACK, leaving the trunk's 200 OK unacked
+    /// until the dialog collapsed (BYE storm ~5 s after answer).
+    ///
+    /// `recv_b_leg_classification_event` must skip the stale `Terminated` and
+    /// return the live leg's `Answered` for the 200 OK.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn b_leg_200_classifies_as_answered_after_auth_retry_supersede() {
+        use crate::b2bua::actor::{Leg, LegActor, LegMessage, TransportInfo as LegTransport};
+        use crate::transport::{ConnectionId, Transport};
+
+        // The shared per-call channel, mirroring CallActor.event_tx and the
+        // dispatcher's call_event_receivers entry.
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<CallEvent>(64);
+
+        let transport = LegTransport {
+            remote_addr: "10.0.0.2:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        };
+
+        // CSeq-1 B-leg: drew the 401 and is now superseded. Dropping its handle
+        // closes the actor's mailbox, so the actor exits and pushes a
+        // CallEvent::Terminated onto the shared channel — the stale event that
+        // used to desync the classifier.
+        let cseq1 = Leg::new_b_leg(
+            "b2b-supersede-desync@test".to_string(),
+            "from-tag-1".to_string(),
+            "sip:bob@10.0.0.2:5060".to_string(),
+            "z9hG4bK-cseq1-desync".to_string(),
+            transport.clone(),
+        );
+        let (actor1, handle1) = LegActor::new(cseq1, event_tx.clone());
+        let actor1_task = tokio::spawn(actor1.run());
+        drop(handle1);
+        // Await the old actor so its Terminated is on the channel ahead of the
+        // live leg's Answered — the ordering that triggered the bug.
+        actor1_task.await.unwrap();
+
+        // CSeq-2 B-leg (the live retry). Its 200 OK must classify as Answered.
+        let cseq2 = Leg::new_b_leg(
+            "b2b-supersede-desync@test".to_string(),
+            "from-tag-2".to_string(),
+            "sip:bob@10.0.0.2:5060".to_string(),
+            "z9hG4bK-cseq2-desync".to_string(),
+            transport.clone(),
+        );
+        let (actor2, handle2) = LegActor::new(cseq2, event_tx.clone());
+        let actor2_task = tokio::spawn(actor2.run());
+
+        let ok_200 = parse_sip_message(concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/UDP 10.0.0.9:5060;branch=z9hG4bK-cseq2-desync\r\n",
+            "From: <sip:alice@10.0.0.1>;tag=from-tag-2\r\n",
+            "To: <sip:bob@10.0.0.2>;tag=uas-2\r\n",
+            "Call-ID: b2b-supersede-desync@test\r\n",
+            "CSeq: 2 INVITE\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ))
+        .expect("200 OK fixture parses")
+        .1;
+        handle2
+            .tx
+            .send(LegMessage::SipInbound {
+                message: ok_200,
+                source: transport,
+            })
+            .await
+            .unwrap();
+
+        // The channel now holds [Terminated (stale), Answered]. The classifier
+        // must skip Terminated and return Answered; the pre-fix code returned
+        // Terminated, which the dispatcher misreads as a non-answer.
+        let event = tokio::task::spawn_blocking(move || {
+            recv_b_leg_classification_event(&mut event_rx)
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            matches!(event, Some(CallEvent::Answered { .. })),
+            "200 OK on the live retry leg must classify as Answered, not the \
+             stale Terminated from the superseded leg; got {event:?}"
+        );
+
+        handle2.tx.send(LegMessage::Shutdown).await.ok();
+        let _ = actor2_task.await;
     }
 
     fn test_resolver() -> SipResolver {
