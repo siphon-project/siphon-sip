@@ -616,6 +616,13 @@ pub struct CallActor {
     /// challenges are absorbed by the per-leg [`Leg::auth_challenged`] guard
     /// before they reach the counter, so the cap reflects real attempts.
     pub auth_retry_count: u32,
+    /// Wall-clock deadline by which this call must be answered, set from the
+    /// script's `call.fork(timeout=…)` / `call.dial(timeout=…)` when the B-leg
+    /// INVITE(s) go out. The orphan sweep fails the call (CANCEL pending legs,
+    /// `@b2bua.on_failure`, `408` to the A-leg, teardown) once this passes while
+    /// the call is still un-answered. `None` = no application timeout (the 24h
+    /// orphan backstop still applies).
+    pub answer_deadline: Option<std::time::Instant>,
 }
 
 impl CallActor {
@@ -643,6 +650,7 @@ impl CallActor {
             resolved_header_policy: None,
             a_leg_supports_100rel: false,
             auth_retry_count: 0,
+            answer_deadline: None,
         }
     }
 
@@ -1367,6 +1375,31 @@ impl CallActorStore {
             self.remove_call(&call_id);
         }
         removed
+    }
+
+    /// Set the answer deadline for a call (from `call.fork`/`dial` `timeout=`).
+    pub fn set_answer_deadline(&self, call_id: &str, deadline: std::time::Instant) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.answer_deadline = Some(deadline);
+        }
+    }
+
+    /// Internal call IDs of calls that have blown their answer deadline while
+    /// still un-answered (`Calling`/`Ringing`).
+    ///
+    /// Does NOT remove them — the dispatcher runs the full timeout teardown
+    /// (CANCEL pending legs, `@b2bua.on_failure`, `408` to the A-leg) which
+    /// needs the call state and the Python engine. Answered/terminated calls
+    /// and calls without a deadline are skipped, so a long answered call (whose
+    /// `created_at` is old but which is past `Answered`) is never touched.
+    pub fn take_timed_out_calls(&self, now: std::time::Instant) -> Vec<String> {
+        self.calls.iter()
+            .filter(|entry| {
+                matches!(entry.state, CallState::Calling | CallState::Ringing)
+                    && entry.answer_deadline.is_some_and(|deadline| now >= deadline)
+            })
+            .map(|entry| entry.id.clone())
+            .collect()
     }
 }
 
@@ -2159,6 +2192,41 @@ mod tests {
         assert_eq!(store.sweep_stale(std::time::Duration::from_secs(60)), 0);
         assert_eq!(store.sweep_stale(std::time::Duration::ZERO), 1);
         assert_eq!(store.count(), 0);
+    }
+
+    #[test]
+    fn take_timed_out_calls_only_unanswered_past_deadline() {
+        // The answer-timeout sweep must select only calls that are still
+        // un-answered AND past their deadline — never an answered call, a call
+        // whose deadline is in the future, or one with no deadline. And it must
+        // not remove anything (the dispatcher runs the teardown).
+        let store = CallActorStore::new();
+        let now = std::time::Instant::now();
+        let past = now - std::time::Duration::from_secs(1);
+        let future = now + std::time::Duration::from_secs(60);
+
+        // Un-answered (Calling), deadline already passed → timed out.
+        let stuck = store.create_call(make_a_leg());
+        store.set_answer_deadline(&stuck, past);
+
+        // Un-answered, deadline still in the future → not yet.
+        let waiting = store.create_call(make_a_leg());
+        store.set_answer_deadline(&waiting, future);
+
+        // Answered, deadline passed → never (it answered; lives until BYE).
+        let answered = store.create_call(make_a_leg());
+        store.set_answer_deadline(&answered, past);
+        store.add_b_leg(&answered, make_b_leg(0));
+        store.set_winner(&answered, 0);
+
+        // No deadline → only the 24h orphan backstop applies.
+        let no_deadline = store.create_call(make_a_leg());
+
+        let timed_out = store.take_timed_out_calls(now);
+        assert_eq!(timed_out, vec![stuck.clone()]);
+        // Nothing was removed.
+        assert_eq!(store.count(), 4);
+        let _ = (waiting, answered, no_deadline);
     }
 
     // --- LegRegistry tests ---

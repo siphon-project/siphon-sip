@@ -1756,6 +1756,14 @@ async fn sweep_stale_entries(state: &DispatcherState) {
         store.sweep_stale(ORPHAN_CALL_TTL);
     }
 
+    // B2BUA answer-timeout: fail calls still un-answered past their
+    // fork/dial `timeout=` deadline with a 408 (CANCEL pending legs, fire
+    // @b2bua.on_failure, respond to the A-leg). Without this a non-responding
+    // B-leg would only be caught by the 24h orphan backstop below.
+    for timed_out in state.call_actors.take_timed_out_calls(now) {
+        fail_b2bua_call_on_timeout(&timed_out, state);
+    }
+
     // B2BUA call actors — ages by CallActor::created_at (set once at creation,
     // never refreshed), returns the number reaped.
     let expired_calls = state.call_actors.sweep_stale(ORPHAN_CALL_TTL) as u64;
@@ -1881,6 +1889,47 @@ impl LivenessDeregCtx {
             dereg_mode: state.registrar_liveness.dereg_mode,
         }
     }
+
+    /// Build the funnel context from process globals, for the flow-failure
+    /// close-drain task (`server.rs`) which has no `DispatcherState`.  Returns
+    /// `None` if the registrar / UAC / resolver globals aren't installed yet.
+    fn from_globals(dereg_mode: crate::config::LivenessDeregMode) -> Option<Self> {
+        Some(Self {
+            registrar: crate::script::api::registrar_arc()?.clone(),
+            ipsec_manager: crate::ipsec::global_manager(),
+            uac_sender: crate::script::api::proxy_utils::uac_sender()?.clone(),
+            dns_resolver: crate::script::api::proxy_utils::send_resolver()?.clone(),
+            dereg_mode,
+        })
+    }
+}
+
+/// Run the network-dereg cascade for bindings removed by the **flow-failure**
+/// close path (`server.rs` drain task).  Under `network_dereg`, a P-CSCF cache
+/// binding (one carrying a `flow_token`) additionally synthesizes an
+/// `Expires: 0` REGISTER toward the S-CSCF via its stored Service-Route, so
+/// the registrar of record clears it too — matching the SA-idle path.  No-op
+/// under `local_only`, or when none of the removed bindings is a P-CSCF cache
+/// binding.  The local removal + `on_change` cascade already happened in
+/// `unregister_flow_collect`; this adds only the upstream de-REGISTER.
+pub(crate) async fn liveness_flow_failure_network_dereg(
+    removed: Vec<(crate::registrar::Aor, crate::registrar::Contact)>,
+    dereg_mode: crate::config::LivenessDeregMode,
+) {
+    if dereg_mode != crate::config::LivenessDeregMode::NetworkDereg
+        || !removed.iter().any(|(_, contact)| contact.flow_token.is_some())
+    {
+        return;
+    }
+    let context = match LivenessDeregCtx::from_globals(dereg_mode) {
+        Some(context) => context,
+        None => return,
+    };
+    for (aor, contact) in removed {
+        if contact.flow_token.is_some() {
+            send_liveness_network_dereg(&context, &aor, &contact.uri.to_string()).await;
+        }
+    }
 }
 
 /// Part B.4 — an abandoned UE's SA pair was just reaped from the kernel;
@@ -1959,25 +2008,29 @@ async fn sweep_registrar_liveness(state: &DispatcherState) {
         liveness.keepalive_interval_secs as u64 * liveness.idle_multiplier.max(1) as u64;
     let probe_timeout = std::time::Duration::from_millis(liveness.probe_timeout_ms);
     let context = LivenessDeregCtx::from_state(state, registrar);
+    let mut total = 0usize;
+    let mut ipsec_protected = 0usize;
     let mut suspects = 0usize;
 
     for (aor, contact) in context.registrar.all_contacts() {
-        // UDP only — stream transports are covered by flow-failure dereg.
-        if !contact
-            .source_transport
-            .as_deref()
-            .is_some_and(|transport| transport.eq_ignore_ascii_case("udp"))
-        {
-            continue;
-        }
+        total += 1;
         let ue_addr = match contact.source_addr {
             Some(addr) => addr,
             None => continue,
         };
+        // Any IPsec-protected binding is eligible — UDP *or* TCP/TLS/WS.  The
+        // XFRM SA use-time is the authoritative liveness signal regardless of
+        // SIP transport: a Gm registration over TCP whose UE silently dies
+        // (radio loss, no FIN/RST) is invisible to flow-failure dereg until
+        // the CRLF-keepalive timeout (minutes), but its SA goes stale at the
+        // same rate as a UDP UE's.  Matching on the SA (by UE IP) also
+        // naturally excludes non-IPsec bindings, which have no use-time signal
+        // and rely on flow-failure (Part A) alone.
         let row = match sa_by_ip.get(&ue_addr.ip()) {
             Some(row) => row,
             None => continue, // not an IPsec-protected UE
         };
+        ipsec_protected += 1;
 
         // Most recent inbound activity across the two inbound SAs (the SAs the
         // UE's keepalive / MO requests land on).
@@ -1997,23 +2050,36 @@ async fn sweep_registrar_liveness(state: &DispatcherState) {
             continue; // recently active
         }
 
-        // Suspect.  Resolve the IPsec egress pin (source addr/transport) now,
-        // then detach the probe so a slow UE can't stall the sweep.
+        // Suspect.  Probe over the binding's *actual* transport — for a stream
+        // binding the OPTIONS rides the captured inbound connection, so a dead
+        // half-open socket simply yields no answer within probe_timeout.
+        // Detach so a slow UE can't stall the sweep.
         suspects += 1;
+        let binding_transport = transport_from_name(contact.source_transport.as_deref());
         debug!(
             aor = %aor,
             ue = %ue_addr,
+            transport = %binding_transport,
             idle_secs = now.saturating_sub(last_active),
             idle_window,
             "registrar liveness: binding idle past window — probing with OPTIONS"
         );
         let (source_local_addr, transport) =
-            crate::script::api::ipsec::outbound_for(ue_addr, Transport::Udp).unwrap_or_else(|| {
-                (
-                    contact.inbound_local_addr.unwrap_or(ue_addr),
-                    Transport::Udp,
-                )
-            });
+            crate::script::api::ipsec::outbound_for(ue_addr, binding_transport).unwrap_or((
+                contact.inbound_local_addr.unwrap_or(ue_addr),
+                binding_transport,
+            ));
+        // Stream: ride the captured inbound connection (a dead half-open socket
+        // times out → dereg).  UDP routes by source_local_addr, so the sentinel
+        // id is correct there.
+        let connection_id = if matches!(transport, Transport::Udp) {
+            ConnectionId::default()
+        } else {
+            contact
+                .inbound_connection_id
+                .map(ConnectionId)
+                .unwrap_or_default()
+        };
         let context = context.clone();
         let aor = aor.clone();
         let contact = contact.clone();
@@ -2026,20 +2092,38 @@ async fn sweep_registrar_liveness(state: &DispatcherState) {
                 ue_port_c,
                 source_local_addr,
                 transport,
+                connection_id,
                 probe_timeout,
             )
             .await;
         });
     }
 
-    if suspects > 0 {
-        debug!(suspects, "registrar liveness: idle sweep flagged suspect UDP+IPsec bindings");
+    // Census so an operator can see why a dead UE is (or isn't) being reaped.
+    debug!(
+        contacts = total,
+        ipsec_protected,
+        idle_suspect = suspects,
+        idle_window_secs = idle_window,
+        "registrar liveness: idle sweep census"
+    );
+}
+
+/// Map a stored `source_transport` string to a `Transport` (defaults to UDP).
+fn transport_from_name(name: Option<&str>) -> Transport {
+    match name.map(|n| n.to_ascii_lowercase()).as_deref() {
+        Some("tcp") => Transport::Tcp,
+        Some("tls") => Transport::Tls,
+        Some("ws") => Transport::WebSocket,
+        Some("wss") => Transport::WebSocketSecure,
+        _ => Transport::Udp,
     }
 }
 
 /// Send one OPTIONS over the captured flow (with a single retry); if the UE
 /// answers, leave the binding alone — its response refreshed the SA use-time.
 /// On no answer, run the dereg funnel.
+#[allow(clippy::too_many_arguments)]
 async fn liveness_probe_then_dereg(
     context: LivenessDeregCtx,
     aor: String,
@@ -2047,6 +2131,7 @@ async fn liveness_probe_then_dereg(
     ue_port_c: u16,
     source_local_addr: SocketAddr,
     transport: Transport,
+    connection_id: ConnectionId,
     probe_timeout: std::time::Duration,
 ) {
     let destination = match contact.source_addr {
@@ -2060,7 +2145,7 @@ async fn liveness_probe_then_dereg(
             destination,
             source_local_addr,
             transport,
-            ConnectionId::default(),
+            connection_id,
             request_uri.clone(),
         );
         if let Ok(Ok(crate::uac::UacResult::Response(_))) =
@@ -6984,6 +7069,165 @@ fn handle_b2bua_cancel(
     state.call_event_receivers.remove(&call_id);
 }
 
+/// Arm the answer-timeout for a B2BUA call from a `call.fork`/`call.dial`
+/// `timeout=` (seconds).
+///
+/// `timeout == 0` disables the application timeout (the 24h orphan sweep stays
+/// the only backstop). Otherwise the orphan sweep fails the call if it is still
+/// un-answered `timeout` seconds from now — see [`fail_b2bua_call_on_timeout`].
+fn set_b2bua_answer_deadline(call_id: &str, timeout_secs: u32, state: &DispatcherState) {
+    if timeout_secs == 0 {
+        return;
+    }
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
+    state.call_actors.set_answer_deadline(call_id, deadline);
+}
+
+/// Fail a B2BUA call whose answer deadline passed while it was still
+/// un-answered — the B-leg never produced a final 2xx (dead/partitioned trunk,
+/// or a B-leg that silently went away).
+///
+/// Mirrors the B-leg error teardown in [`handle_b2bua_response`]: CANCEL every
+/// pending B-leg (RFC 3261 §9.1), fire `@b2bua.on_failure(call, 408, …)`, send
+/// `408 Request Timeout` to the A-leg, then tear the call down via
+/// [`CallActorStore::remove_call_after_cancel`] (so a 2xx that raced our CANCEL
+/// is still ACK+BYEd). Driven from [`sweep_stale_entries`].
+fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
+    // Snapshot everything needed, then drop the DashMap ref before the CANCEL
+    // sends, Python, and the A-leg response.
+    let (a_leg, a_leg_invite, cancel_targets, handle_txs) =
+        match state.call_actors.get_call(call_id) {
+            Some(call) => {
+                // Re-check under the lock: the call may have answered or started
+                // tearing down between take_timed_out_calls and here.
+                if !matches!(call.state, CallState::Calling | CallState::Ringing) {
+                    return;
+                }
+                let mut targets: Vec<(SipMessage, Transport, SocketAddr)> = Vec::new();
+                for b_leg in &call.b_legs {
+                    if let Some(invite_arc) = b_leg.b_leg_invite.as_ref() {
+                        if let Ok(invite) = invite_arc.lock() {
+                            if let Some(cancel_msg) = build_cancel_from_invite(&invite) {
+                                targets.push((
+                                    cancel_msg,
+                                    b_leg.transport.transport,
+                                    b_leg.transport.remote_addr,
+                                ));
+                            }
+                        }
+                    }
+                }
+                let handle_txs: Vec<_> = call
+                    .b_leg_handles
+                    .iter()
+                    .flatten()
+                    .map(|handle| handle.tx.clone())
+                    .collect();
+                (
+                    call.a_leg.clone(),
+                    call.a_leg_invite.clone(),
+                    targets,
+                    handle_txs,
+                )
+            }
+            None => return,
+        };
+
+    warn!(
+        call_id = %call_id,
+        "B2BUA: answer timeout — no final response from B-leg, failing call with 408",
+    );
+
+    // CANCEL each pending B-leg transaction (RFC 3261 §9.1).
+    for (cancel_msg, transport, dest) in cancel_targets {
+        send_b2bua_to_bleg(cancel_msg, transport, dest, state);
+    }
+    for tx in &handle_txs {
+        let _ = tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
+    }
+
+    // Fire @b2bua.on_failure(call, 408, "Request Timeout").
+    if let Some(invite_arc) = &a_leg_invite {
+        let engine_state = state.engine.state();
+        let handlers = engine_state.handlers_for(&HandlerKind::B2buaFailure);
+        if !handlers.is_empty() {
+            let py_call = PyCall::new(
+                call_id.to_string(),
+                Arc::clone(invite_arc),
+                a_leg.transport.remote_addr.ip().to_string(),
+            );
+            Python::attach(|python| {
+                let call_obj = match Py::new(python, py_call) {
+                    Ok(obj) => obj,
+                    Err(error) => {
+                        error!("failed to create PyCall for timeout on_failure: {error}");
+                        return;
+                    }
+                };
+                for handler in &handlers {
+                    let callable = handler.callable.bind(python);
+                    match callable.call1((call_obj.bind(python), 408u16, "Request Timeout")) {
+                        Ok(ret) => {
+                            if handler.is_async {
+                                if let Err(error) = run_coroutine(python, &ret) {
+                                    error!("async B2BUA timeout on_failure handler error: {error}");
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            error!("B2BUA timeout on_failure handler error: {error}");
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    // Send 408 Request Timeout to the A-leg (final response to its INVITE).
+    if let Some(invite_arc) = &a_leg_invite {
+        if let Ok(invite) = invite_arc.lock() {
+            let mut response =
+                build_response(&invite, 408, "Request Timeout", state.server_header.as_deref(), &[]);
+            // Carry the UAS To-tag we assigned the A-leg dialog (the A-leg saw it
+            // on our 1xx) so the final response terminates the same dialog.
+            if let Some(to) = response.headers.to() {
+                let to_with_tag =
+                    crate::b2bua::actor::ensure_tag(to, Some(&a_leg.dialog.local_tag));
+                response.headers.set("To", to_with_tag);
+            }
+            send_message(
+                response,
+                a_leg.transport.transport,
+                a_leg.transport.remote_addr,
+                a_leg.transport.connection_id,
+                state,
+            );
+        }
+    }
+
+    // RTPEngine safety-net cleanup (mirrors the B-leg failure path).
+    let a_sip_call_id = a_leg.dialog.call_id.clone();
+    if let (Some(rtpengine_set), Some(media_sessions)) =
+        (&state.rtpengine_set, &state.rtpengine_sessions)
+    {
+        if let Some(session) = media_sessions.remove(&a_sip_call_id) {
+            let set = Arc::clone(rtpengine_set);
+            tokio::spawn(async move {
+                if let Err(error) = set.delete(&session.call_id, &session.from_tag).await {
+                    warn!(call_id = %session.call_id, "safety-net RTPEngine delete failed (timeout): {error}");
+                }
+            });
+        }
+    }
+
+    // Tear down, preserving still-pending legs for a 2xx that races the CANCEL.
+    if state.call_actors.remove_call_after_cancel(call_id) {
+        schedule_zombie_cancelled_cleanup(state.call_actors.clone());
+    }
+    state.call_event_receivers.remove(call_id);
+}
+
 // ---------------------------------------------------------------------------
 // B2BUA handlers
 // ---------------------------------------------------------------------------
@@ -7312,7 +7556,7 @@ fn handle_b2bua_invite(
             state.call_actors.remove_call(&call_id);
             state.call_event_receivers.remove(&call_id);
         }
-        CallAction::Dial { target, next_hop, timeout: _ } => {
+        CallAction::Dial { target, next_hop, timeout } => {
             debug!(
                 call_id = %call_id,
                 target = %target,
@@ -7327,8 +7571,9 @@ fn handle_b2bua_invite(
                 &inbound,
                 state,
             );
+            set_b2bua_answer_deadline(&call_id, timeout, state);
         }
-        CallAction::Fork { targets, strategy: _, timeout: _ } => {
+        CallAction::Fork { targets, strategy: _, timeout } => {
             debug!(call_id = %call_id, targets = ?targets, "B2BUA: forking B-legs");
             for target in &targets {
                 b2bua_send_b_leg_invite(
@@ -7340,6 +7585,7 @@ fn handle_b2bua_invite(
                     state,
                 );
             }
+            set_b2bua_answer_deadline(&call_id, timeout, state);
         }
         CallAction::Terminate => {
             debug!(call_id = %call_id, "B2BUA: terminate on invite (unusual)");
@@ -11458,6 +11704,21 @@ mod tests {
             "missing From with liveness tag:\n{wire}"
         );
         assert!(wire.contains("CSeq: 1 REGISTER"), "missing CSeq:\n{wire}");
+    }
+
+    #[test]
+    fn transport_from_name_maps_known_transports_else_udp() {
+        assert!(matches!(transport_from_name(Some("tcp")), Transport::Tcp));
+        assert!(matches!(transport_from_name(Some("TLS")), Transport::Tls));
+        assert!(matches!(transport_from_name(Some("ws")), Transport::WebSocket));
+        assert!(matches!(
+            transport_from_name(Some("WSS")),
+            Transport::WebSocketSecure
+        ));
+        assert!(matches!(transport_from_name(Some("udp")), Transport::Udp));
+        // Unknown / absent transport falls back to UDP.
+        assert!(matches!(transport_from_name(None), Transport::Udp));
+        assert!(matches!(transport_from_name(Some("sctp")), Transport::Udp));
     }
 
     #[test]
