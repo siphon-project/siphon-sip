@@ -2161,7 +2161,7 @@ async fn liveness_probe_then_dereg(
         &aor,
         &contact,
         Some(ue_port_c),
-        "udp+ipsec idle (no OPTIONS answer)",
+        "ipsec idle (no OPTIONS answer)",
     )
     .await;
 }
@@ -2250,7 +2250,7 @@ async fn send_liveness_network_dereg(context: &LivenessDeregCtx, aor: &str, cont
             return;
         }
     };
-    debug!(aor = %aor, %destination, "registrar liveness: sending network de-REGISTER (Expires: 0)");
+    info!(aor = %aor, %destination, "registrar liveness: sending network de-REGISTER (Expires: 0) to S-CSCF");
     context
         .uac_sender
         .send_request(register, destination, Transport::Udp);
@@ -2285,6 +2285,26 @@ fn build_dereg_register(
         .as_ref()
         .map(|uri| uri.host.clone())
         .unwrap_or_else(|| destination.ip().to_string());
+    // The S-CSCF skips the IMS-AKA re-challenge on a re-/de-REGISTER only when
+    // it arrives integrity-protected (TS 24.229 §5.4.1.2.2): a real UE de-REG
+    // rides the IPsec SA and the P-CSCF stamps `integrity-protected="ip-assoc-yes"`
+    // (§5.2.6.3).  This synthesized de-REGISTER asserts that same protection on
+    // the (now-torn-down) SA's behalf — the P-CSCF *was* the entity holding the
+    // SA — so it must carry the marker; without it the S-CSCF challenges
+    // (401/403) and the de-registration never completes (no SAR
+    // User-Deregistration, no AS 3rd-party de-REGISTER, no terminated NOTIFY).
+    // The S-CSCF keys the skip on the marker substring + `is_registered(pub_id)`
+    // (pub_id from To/From, not the Authorization username), so the digest
+    // fields are placeholders.
+    let username = aor_uri
+        .as_ref()
+        .and_then(|uri| uri.user.clone())
+        .map(|user| format!("{user}@{domain}"))
+        .unwrap_or_else(|| domain.clone());
+    let authorization = format!(
+        "Digest username=\"{username}\", realm=\"{domain}\", nonce=\"\", \
+         uri=\"sip:{domain}\", response=\"\", integrity-protected=\"ip-assoc-yes\""
+    );
     let request_uri = SipUri::new(domain);
 
     let branch = format!("z9hG4bK-liveness-{}", uuid::Uuid::new_v4());
@@ -2305,6 +2325,7 @@ fn build_dereg_register(
         .call_id(call_id)
         .cseq("1 REGISTER".to_string())
         .max_forwards(70)
+        .header("Authorization", authorization)
         .header("Contact", format!("<{contact_uri}>;expires=0"))
         .header("Expires", "0".to_string());
 
@@ -11704,6 +11725,17 @@ mod tests {
             "missing From with liveness tag:\n{wire}"
         );
         assert!(wire.contains("CSeq: 1 REGISTER"), "missing CSeq:\n{wire}");
+        // Must carry the integrity-protected marker so the S-CSCF skips the
+        // IMS-AKA re-challenge (TS 24.229 §5.4.1.2.2) and actually completes
+        // the de-registration.
+        assert!(
+            wire.contains("integrity-protected=\"ip-assoc-yes\""),
+            "missing integrity-protected marker in Authorization:\n{wire}"
+        );
+        assert!(
+            wire.contains("Authorization: Digest username=\"alice@example.com\""),
+            "Authorization username should be the IMPI-shaped public id:\n{wire}"
+        );
     }
 
     #[test]
