@@ -5489,7 +5489,8 @@ fn build_b2bua_ack_for_non2xx(
     branch: &str,
     target_uri: Option<&str>,
     downstream_transport: Transport,
-    local_addr: SocketAddr,
+    via_host: &str,
+    via_port: u16,
 ) -> SipMessage {
     let request_uri = target_uri
         .and_then(|uri| parse_uri_standalone(uri).ok())
@@ -5498,12 +5499,21 @@ fn build_b2bua_ack_for_non2xx(
     let mut builder = SipMessageBuilder::new()
         .request(Method::Ack, request_uri);
 
-    // Via: only our own hop with the client transaction branch
+    // Via: only our own hop with the client transaction branch.
+    //
+    // The sent-by host:port MUST equal the top Via of the INVITE this ACK
+    // acknowledges (RFC 3261 §17.1.1.3).  The trunk's server transaction keys
+    // its ACK match on (branch, sent-by host:port, method) per §17.2.3, so the
+    // host:port has to be the *advertised* address the INVITE went out with
+    // (state.via_host/via_port) — NOT the raw bind address.  When this used
+    // `local_addr`, an ACK with an internal sent-by reached a trunk that had
+    // only ever seen the advertised one; the ACK never matched, so the trunk
+    // kept retransmitting its 401/4xx on Timer G until the credentialed retry
+    // happened to succeed.
     let transport_str = format!("{}", downstream_transport).to_uppercase();
-    let host = format_sip_host(&local_addr.ip().to_string());
     builder = builder.via(format!(
         "SIP/2.0/{} {}:{};branch={}",
-        transport_str, host, local_addr.port(), branch
+        transport_str, via_host, via_port, branch
     ));
 
     // From: same as in the response (which echoes the B-leg INVITE's From)
@@ -9640,7 +9650,8 @@ fn handle_b2bua_response(
                         branch,
                         b_leg_target.as_deref(),
                         b_transport,
-                        state.local_addr,
+                        &state.via_host(&b_transport),
+                        state.via_port(&b_transport),
                     );
                     send_b2bua_to_bleg(ack, b_transport, b_dest, state);
                 }
@@ -9683,7 +9694,8 @@ fn handle_b2bua_response(
                                     branch,
                                     b_leg_target.as_deref(),
                                     b_transport,
-                                    state.local_addr,
+                                    &state.via_host(&b_transport),
+                                    state.via_port(&b_transport),
                                 );
                                 send_b2bua_to_bleg(ack, b_transport, b_dest, state);
                             }
@@ -9921,7 +9933,8 @@ fn handle_b2bua_response(
                 branch,
                 b_leg_target.as_deref(),
                 b_transport,
-                state.local_addr,
+                &state.via_host(&b_transport),
+                state.via_port(&b_transport),
             );
             send_b2bua_to_bleg(ack, b_transport, b_dest, state);
         }
@@ -12493,11 +12506,18 @@ a=rtpmap:8 PCMA/8000\r\n";
     /// 401-retry path returned without ever building this ACK, so the trunk
     /// kept retransmitting the challenge. The ACK must reuse the original
     /// INVITE's Via branch (hop-by-hop) and carry the UAS To-tag from the 401.
+    ///
+    /// Critically, the ACK's Via sent-by host:port must be the *advertised*
+    /// address the INVITE went out with — not the internal bind address — or
+    /// the trunk's server transaction can't match the ACK (RFC 3261 §17.2.3)
+    /// and keeps retransmitting its 401 on Timer G.  The caller passes
+    /// `state.via_host`/`via_port` (advertised); behind NAT/edge that differs
+    /// from the bind address.
     #[test]
     fn build_b2bua_ack_for_401_uses_invite_branch_and_response_to_tag() {
         let response = SipMessageBuilder::new()
             .response(401, "Unauthorized".to_string())
-            .via("SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-orig".to_string())
+            .via("SIP/2.0/UDP 203.0.113.7:5060;branch=z9hG4bK-orig".to_string())
             .from("<sip:alice@siphon.example.org>;tag=b-leg-from".to_string())
             .to("<sip:bob@trunk.example.net>;tag=uas-12345".to_string())
             .call_id("b2b-aaaa-bbbb".to_string())
@@ -12506,13 +12526,18 @@ a=rtpmap:8 PCMA/8000\r\n";
             .build()
             .unwrap();
 
-        let local_addr: SocketAddr = "192.0.2.10:5060".parse().unwrap();
+        // Advertised (public) address the B-leg INVITE used in its Via.  An
+        // internal bind address (e.g. 10.x) would be a *different* value — the
+        // regression was that the ACK leaked the internal one.
+        let advertised_host = "203.0.113.7";
+        let advertised_port = 5060;
         let ack = build_b2bua_ack_for_non2xx(
             &response,
             "z9hG4bK-orig",
             Some("sip:bob@trunk.example.net"),
             Transport::Udp,
-            local_addr,
+            advertised_host,
+            advertised_port,
         );
 
         // Method line is ACK to the dial target.
@@ -12524,10 +12549,11 @@ a=rtpmap:8 PCMA/8000\r\n";
             _ => panic!("expected an ACK request line"),
         }
 
-        // Same Via branch as the INVITE it acknowledges (RFC 3261 §17.1.1.3).
+        // Same Via branch as the INVITE it acknowledges, and the advertised
+        // sent-by host:port (RFC 3261 §17.1.1.3 / §17.2.3).
         assert_eq!(
             ack.headers.via().unwrap(),
-            "SIP/2.0/UDP 192.0.2.10:5060;branch=z9hG4bK-orig"
+            "SIP/2.0/UDP 203.0.113.7:5060;branch=z9hG4bK-orig"
         );
         // To header carries the UAS tag from the 401 — without it the trunk's
         // server transaction would not match the ACK.
@@ -13343,23 +13369,25 @@ a=rtpmap:8 PCMA/8000\r\n";
             .build()
             .unwrap();
 
-        let local_addr: SocketAddr = "10.0.0.1:5060".parse().unwrap();
         let ack = build_b2bua_ack_for_non2xx(
             &response,
             "z9hG4bK-b2b-branch",
             Some("sip:bob@10.0.0.2:5060"),
             Transport::Udp,
-            local_addr,
+            "198.51.100.20",
+            5060,
         );
 
         assert!(ack.is_request());
         let bytes = String::from_utf8(ack.to_bytes()).unwrap();
         assert!(bytes.starts_with("ACK sip:bob@10.0.0.2:5060 SIP/2.0\r\n"));
 
-        // Via uses our branch (same as client transaction)
+        // Via uses our branch (same as client transaction) and the advertised
+        // sent-by host:port supplied by the caller (state.via_host/via_port).
         let via = ack.headers.via().unwrap();
         assert!(via.contains("z9hG4bK-b2b-branch"));
         assert!(via.contains("UDP"));
+        assert!(via.contains("198.51.100.20:5060"));
 
         // From/To/Call-ID from the response
         assert!(ack.headers.from().unwrap().contains("b-leg-ftag"));
