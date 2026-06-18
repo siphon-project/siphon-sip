@@ -1417,12 +1417,22 @@ impl Registrar {
     /// an unknown id is an O(1) no-op — scanner/transient connections never
     /// registered, so they were never indexed.
     pub fn unregister_flow(&self, connection_id: u64) -> usize {
+        self.unregister_flow_collect(connection_id).len()
+    }
+
+    /// Like [`unregister_flow`](Self::unregister_flow) but returns the
+    /// `(aor, contact)` of every binding it removed, so the caller can run the
+    /// network-dereg cascade — e.g. a P-CSCF synthesizing an `Expires: 0`
+    /// REGISTER toward the S-CSCF under `dereg_mode: network_dereg`.  The
+    /// per-AoR `service_routes` are deliberately **not** cleared here, so the
+    /// caller can still resolve the upstream next hop after removal.
+    pub fn unregister_flow_collect(&self, connection_id: u64) -> Vec<(Aor, Contact)> {
         let aors = match self.connection_index.remove(&connection_id) {
             Some((_, aors)) => aors,
-            None => return 0,
+            None => return Vec::new(),
         };
 
-        let mut removed_total = 0usize;
+        let mut removed: Vec<(Aor, Contact)> = Vec::new();
         let mut tokens_to_remove: Vec<String> = Vec::new();
         let mut deregistered: Vec<String> = Vec::new();
         let mut emptied_count: i64 = 0;
@@ -1444,19 +1454,26 @@ impl Registrar {
                     // another path.  Harmless: nothing to deregister.
                     None => continue,
                 };
-                let before = entry.value().len();
-                entry.value_mut().retain(|c| {
-                    let drop_contact = c.inbound_connection_id == Some(connection_id)
-                        && is_stream_transport(c.source_transport.as_deref());
+                // Partition into kept vs removed so the caller gets the dropped
+                // bindings (for the network-dereg cascade), harvesting their
+                // tokens along the way.
+                let contacts = std::mem::take(entry.value_mut());
+                let before = contacts.len();
+                let mut kept = Vec::with_capacity(before);
+                for contact in contacts {
+                    let drop_contact = contact.inbound_connection_id == Some(connection_id)
+                        && is_stream_transport(contact.source_transport.as_deref());
                     if drop_contact {
-                        if let Some(token) = &c.flow_token {
+                        if let Some(token) = &contact.flow_token {
                             tokens_to_remove.push(token.clone());
                         }
+                        removed.push((aor.clone(), contact));
+                    } else {
+                        kept.push(contact);
                     }
-                    !drop_contact
-                });
-                removed_total += before - entry.value().len();
-                changed = entry.value().len() < before;
+                }
+                changed = kept.len() < before;
+                *entry.value_mut() = kept;
                 // Cascade-clear orphaned AS records once no UE binding survives.
                 let any_ue_left = entry
                     .value()
@@ -1494,7 +1511,7 @@ impl Registrar {
             self.emit_event(RegistrationEvent::Deregistered { aor });
         }
 
-        removed_total
+        removed
     }
 
     /// Look up contacts by `+sip.instance` for an AoR (GRUU resolution).
@@ -1824,6 +1841,53 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(!registrar.is_registered("sip:stream@example.com"));
         assert!(registrar.is_registered("sip:udp@example.com"));
+    }
+
+    #[test]
+    fn unregister_flow_collect_returns_removed_bindings_and_keeps_service_route() {
+        let registrar = Registrar::default();
+        // A P-CSCF cache binding: stream transport, flow_token, on connection 77.
+        registrar
+            .save_full(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "c-a".into(),
+                1,
+                Some("192.0.2.10:5060".parse().unwrap()),
+                Some("tcp".to_string()),
+                None,
+                None,
+                vec![],
+                FlowCapture {
+                    flow_token: Some("tok-1".into()),
+                    inbound_local_addr: None,
+                    inbound_connection_id: Some(77),
+                },
+                Vec::new(),
+            )
+            .unwrap();
+        registrar.set_service_routes("sip:alice@example.com", vec!["<sip:scscf;lr>".into()]);
+
+        let removed = registrar.unregister_flow_collect(77);
+        assert_eq!(removed.len(), 1);
+        let (aor, contact) = &removed[0];
+        assert_eq!(aor, "sip:alice@example.com");
+        assert_eq!(
+            contact.flow_token.as_deref(),
+            Some("tok-1"),
+            "removed binding must carry the flow_token so the cascade can target a P-CSCF cache"
+        );
+        assert!(!registrar.is_registered("sip:alice@example.com"));
+        // Service-Route survives removal so the network-dereg can still resolve
+        // the upstream S-CSCF next hop.
+        assert_eq!(
+            registrar.service_routes("sip:alice@example.com"),
+            vec!["<sip:scscf;lr>".to_string()]
+        );
+        // Idempotent: the index entry is consumed.
+        assert!(registrar.unregister_flow_collect(77).is_empty());
     }
 
     #[test]

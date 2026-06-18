@@ -892,17 +892,25 @@ impl SiphonServer {
                     dereg_mode = ?liveness.dereg_mode,
                     "registrar liveness ENABLED — flow-failure dereg (TCP/TLS/WS/WSS) + UDP+IPsec idle sweep active"
                 );
+                let dereg_mode = liveness.dereg_mode;
                 let (close_tx, close_rx) = flume::unbounded::<u64>();
                 tokio::spawn(async move {
                     while let Ok(connection_id) = close_rx.recv_async().await {
                         if let Some(registrar) = crate::script::api::registrar_arc() {
-                            let removed = registrar.unregister_flow(connection_id);
-                            if removed > 0 {
+                            let removed = registrar.unregister_flow_collect(connection_id);
+                            if !removed.is_empty() {
                                 tracing::info!(
                                     connection_id,
-                                    removed,
+                                    removed = removed.len(),
                                     "registrar liveness: flow-failure deregistration (stream connection closed)"
                                 );
+                                // Cascade to the registrar of record: under
+                                // network_dereg, a P-CSCF cache binding also
+                                // de-REGISTERs (Expires: 0) toward the S-CSCF.
+                                crate::dispatcher::liveness_flow_failure_network_dereg(
+                                    removed, dereg_mode,
+                                )
+                                .await;
                             }
                         }
                     }
