@@ -90,6 +90,38 @@ script:
   # Timer routes: use @timer.every(seconds=N) in scripts for periodic callbacks.
   # No YAML config needed — all parameters are per-decorator in the script.
   # See examples/timer_example.py for usage patterns.
+  #
+  # --- Handler executor pool (see docs/handler-execution-model.md) ---
+  # Sync SIP handlers run on an ELASTIC pool of persistently-attached Python
+  # threads: it starts at sync_pool_size (always-on core) and grows on demand to
+  # sync_pool_max under load, then never shrinks. A handler that performs
+  # blocking I/O (HTTP/Diameter digest auth, an on_change notify) pins a worker
+  # for the whole call, so the pool grows to absorb concurrent blocking handlers
+  # instead of starving the engine.
+  #
+  # sync_pool_size: <int>          # core (always-on) threads. Default: max(8, 2 x CPUs).
+  # sync_pool_max: <int>           # elastic ceiling. Default: max(32, 4 x core).
+  #                                # Each grown worker costs ~2 MB of persistent
+  #                                # Python heap, so peak memory ~= sync_pool_max
+  #                                # x 2 MB. Lower it on memory-constrained NFs
+  #                                # (and prefer auth.http.cache_ttl_secs, which
+  #                                # keeps a storm from ever needing to grow).
+  # async_pool_size: <int>         # asyncio driver threads. Default: CPUs.
+  # executor_queue_capacity: 1024  # max queued handler jobs before load-shed
+  #                                # (drop + retransmit). Bounds memory under
+  #                                # overload. Raise on high-throughput NFs.
+  # handler_stall_abort_secs: 30   # liveness watchdog: abort the process (so a
+  #                                # supervisor restarts it) only if the pool is
+  #                                # at its thread cap with every worker busy and
+  #                                # zero completions for this long. 0 disables
+  #                                # it. The default 30 is 6x the 5 s HTTP-auth
+  #                                # timeout, so transient slowness never trips
+  #                                # it. A hung-but-alive SIP engine never
+  #                                # recovers on its own — this converts an
+  #                                # indefinite outage into a restart.
+  # Observability: siphon_pyexec_inflight / _queue_depth / _pool_size / _pool_max
+  # / _jobs_completed_total / _jobs_shed_total on /metrics. Alert on a sustained
+  # _jobs_shed_total rate or pool_size pinned at pool_max while saturated.
 
 # ---------------------------------------------------------------------------
 # Registrar
@@ -245,7 +277,15 @@ auth:
   #   url: "http://127.0.0.1:8000/sip/auth/{username}"
   #   timeout_ms: 2000
   #   connect_timeout_ms: 500
-  #   ha1: true   # true = response body is pre-hashed HA1 hex string
+  #   ha1: true            # true = response body is pre-hashed HA1 hex string
+  #   cache_ttl_secs: 300  # cache a successful lookup per-username for this long
+  #                        # (0 = disabled, the default). Each uncached digest
+  #                        # verification makes a BLOCKING HTTP fetch that pins a
+  #                        # handler-pool worker, so a registration storm without
+  #                        # caching can exhaust the pool. Credentials rarely
+  #                        # change, so a non-zero TTL is recommended in
+  #                        # production; a change propagates after <= cache_ttl_secs.
+  #                        # Hits are counted by siphon_auth_ha1_cache_hits_total.
 
 # ---------------------------------------------------------------------------
 # Security — rate limiting, scanner blocking, trust lists

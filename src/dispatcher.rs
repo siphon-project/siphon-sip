@@ -640,7 +640,7 @@ pub async fn run(
                 let state_ref = Arc::clone(&state_for_events);
 
                 // Invoke Python handlers in a blocking context
-                crate::script::py_executor::run(move || {
+                let _ = crate::script::py_executor::try_run(move || {
                     let engine_state = state_ref.engine.state();
                     let handlers =
                         engine_state.handlers_for(&HandlerKind::RegistrarOnChange);
@@ -735,7 +735,7 @@ pub async fn run(
                 let state_ref = Arc::clone(&state_for_events);
 
                 // Invoke Python handlers in a blocking context
-                crate::script::py_executor::run(move || {
+                let _ = crate::script::py_executor::try_run(move || {
                     let engine_state = state_ref.engine.state();
                     let handlers =
                         engine_state.handlers_for(&HandlerKind::RegistrantOnChange);
@@ -1516,7 +1516,7 @@ pub async fn run(
                         }
                         let state_ref = Arc::clone(&state_for_events);
                         let dtmf_clone = dtmf.clone();
-                        crate::script::py_executor::run(move || {
+                        let _ = crate::script::py_executor::try_run(move || {
                             let engine_state = state_ref.engine.state();
                             let handlers = engine_state
                                 .dtmf_handlers(&dtmf_clone.call_id, &dtmf_clone.from_tag);

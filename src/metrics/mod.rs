@@ -126,6 +126,39 @@ pub struct SiphonMetrics {
     pub script_executions_total: IntCounterVec,
     pub script_errors_total: IntCounter,
 
+    // --- Synchronous Python executor pool (handler dispatch) ---
+    /// Live worker-thread count of the synchronous Python executor pool. The
+    /// pool is elastic: this grows from the core size toward `pyexec_pool_max`
+    /// under load and never shrinks. Saturation = `pyexec_inflight == pyexec_pool_size`.
+    pub pyexec_pool_size: IntGauge,
+    /// Configured hard ceiling on executor worker threads. When `pyexec_pool_size`
+    /// reaches this and stays saturated, the pool can no longer absorb more
+    /// blocking handlers — the watchdog's abort condition.
+    pub pyexec_pool_max: IntGauge,
+    /// Handler jobs currently executing on a pool worker. Pinned at
+    /// `pyexec_pool_size` means the pool is fully saturated — every worker is
+    /// busy and new work is queueing. Sampled by the pool watchdog.
+    pub pyexec_inflight: IntGauge,
+    /// Handler jobs waiting in the pool's bounded queue. A sustained climb means
+    /// handlers are not draining fast enough (blocking I/O, a wedged backend).
+    /// Sampled by the pool watchdog.
+    pub pyexec_queue_depth: IntGauge,
+    /// Handler jobs completed by the pool. With `pyexec_inflight` pinned at the
+    /// pool size, a flat `completed` rate is the precise signal that the pool
+    /// has wedged (zero forward progress) — what the watchdog aborts on.
+    pub pyexec_jobs_completed_total: IntCounter,
+    /// Handler jobs shed because the pool's bounded queue was full (load-shed
+    /// under overload). Non-zero means inbound work was dropped; the SIP client
+    /// retransmits. Alert on a sustained rate.
+    pub pyexec_jobs_shed_total: IntCounter,
+
+    // --- Auth (HTTP backend) ---
+    /// HTTP-auth credential lookups served from the in-process HA1 cache
+    /// instead of a blocking backend fetch (`auth.http.cache_ttl_secs`). A high
+    /// hit ratio is what keeps a registration storm from translating 1:1 into
+    /// blocking HTTP on the executor pool.
+    pub auth_ha1_cache_hits_total: IntCounter,
+
     // --- Diameter ---
     pub diameter_peers_connected: IntGauge,
     pub diameter_requests_total: IntCounterVec,
@@ -251,6 +284,36 @@ impl SiphonMetrics {
             "Total Python script execution errors",
         )?;
 
+        let pyexec_pool_size = IntGauge::new(
+            "siphon_pyexec_pool_size",
+            "Live worker threads in the synchronous Python executor pool (elastic; grows to pool_max)",
+        )?;
+        let pyexec_pool_max = IntGauge::new(
+            "siphon_pyexec_pool_max",
+            "Configured hard ceiling on synchronous Python executor worker threads",
+        )?;
+        let pyexec_inflight = IntGauge::new(
+            "siphon_pyexec_inflight",
+            "Handler jobs currently executing on a Python executor pool worker",
+        )?;
+        let pyexec_queue_depth = IntGauge::new(
+            "siphon_pyexec_queue_depth",
+            "Handler jobs waiting in the Python executor pool's bounded queue",
+        )?;
+        let pyexec_jobs_completed_total = IntCounter::new(
+            "siphon_pyexec_jobs_completed_total",
+            "Total handler jobs completed by the Python executor pool",
+        )?;
+        let pyexec_jobs_shed_total = IntCounter::new(
+            "siphon_pyexec_jobs_shed_total",
+            "Total handler jobs shed because the Python executor pool queue was full",
+        )?;
+
+        let auth_ha1_cache_hits_total = IntCounter::new(
+            "siphon_auth_ha1_cache_hits_total",
+            "Total HTTP-auth credential lookups served from the in-process HA1 cache",
+        )?;
+
         let diameter_peers_connected = IntGauge::new(
             "siphon_diameter_peers_connected",
             "Number of currently connected Diameter peers",
@@ -323,6 +386,13 @@ impl SiphonMetrics {
         registry.register(Box::new(python_allocated_blocks.clone()))?;
         registry.register(Box::new(script_executions_total.clone()))?;
         registry.register(Box::new(script_errors_total.clone()))?;
+        registry.register(Box::new(pyexec_pool_size.clone()))?;
+        registry.register(Box::new(pyexec_pool_max.clone()))?;
+        registry.register(Box::new(pyexec_inflight.clone()))?;
+        registry.register(Box::new(pyexec_queue_depth.clone()))?;
+        registry.register(Box::new(pyexec_jobs_completed_total.clone()))?;
+        registry.register(Box::new(pyexec_jobs_shed_total.clone()))?;
+        registry.register(Box::new(auth_ha1_cache_hits_total.clone()))?;
         registry.register(Box::new(diameter_peers_connected.clone()))?;
         registry.register(Box::new(diameter_requests_total.clone()))?;
         registry.register(Box::new(diameter_request_errors_total.clone()))?;
@@ -355,6 +425,13 @@ impl SiphonMetrics {
             python_allocated_blocks,
             script_executions_total,
             script_errors_total,
+            pyexec_pool_size,
+            pyexec_pool_max,
+            pyexec_inflight,
+            pyexec_queue_depth,
+            pyexec_jobs_completed_total,
+            pyexec_jobs_shed_total,
+            auth_ha1_cache_hits_total,
             diameter_peers_connected,
             diameter_requests_total,
             diameter_request_errors_total,

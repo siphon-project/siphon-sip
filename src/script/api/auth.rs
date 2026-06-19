@@ -30,6 +30,23 @@ struct ImsAuthVector {
     ik: Option<Vec<u8>>,
 }
 
+/// A cached HTTP-auth credential lookup (HA1 hex when `http.ha1`, else the
+/// plaintext password), with the wall-clock instant it was fetched so the TTL
+/// can be checked on read.
+#[derive(Debug, Clone)]
+struct CachedHa1 {
+    /// The backend response body — used verbatim as today's fetch result.
+    value: String,
+    /// When this entry was fetched, for TTL expiry.
+    fetched_at: std::time::Instant,
+}
+
+/// Whether a cache entry of the given age is still within its TTL.
+/// Pure so the boundary is unit-testable without touching the clock.
+fn is_cache_fresh(age: std::time::Duration, ttl: std::time::Duration) -> bool {
+    age < ttl
+}
+
 /// Global store for pending IMS auth vectors — keyed by nonce string.
 /// Populated on the first REGISTER (401 challenge), consumed on the second
 /// REGISTER (credential verification).
@@ -58,6 +75,12 @@ pub struct PyAuth {
     http_config: Option<HttpAuthConfig>,
     /// Shared reqwest client for HTTP auth lookups.
     http_client: Option<reqwest::Client>,
+    /// In-process TTL cache of successful HTTP credential lookups, keyed by
+    /// username. `Some` only when `auth.http.cache_ttl_secs > 0`. Flattens a
+    /// registration storm: repeated REGISTERs for the same subscriber reuse the
+    /// cached HA1/password instead of each making a blocking backend fetch that
+    /// pins a Python-executor worker.
+    http_ha1_cache: Option<Arc<DashMap<String, CachedHa1>>>,
 }
 
 impl PyAuth {
@@ -74,6 +97,7 @@ impl PyAuth {
             aka_credentials: Arc::new(HashMap::new()),
             http_config: None,
             http_client: None,
+            http_ha1_cache: None,
         }
     }
 
@@ -87,6 +111,7 @@ impl PyAuth {
             aka_credentials: Arc::new(HashMap::new()),
             http_config: None,
             http_client: None,
+            http_ha1_cache: None,
         }
     }
 
@@ -105,6 +130,13 @@ impl PyAuth {
             .timeout(std::time::Duration::from_millis(config.timeout_ms))
             .build()
             .map_err(|error| format!("failed to build reqwest client for HTTP auth: {error}"))?;
+        // Only allocate the cache when caching is enabled — `cache_ttl_secs == 0`
+        // keeps the per-request blocking-fetch behaviour.
+        self.http_ha1_cache = if config.cache_ttl_secs > 0 {
+            Some(Arc::new(DashMap::new()))
+        } else {
+            None
+        };
         self.http_config = Some(config);
         self.http_client = Some(client);
         Ok(())
@@ -764,32 +796,25 @@ impl PyAuth {
             }
         };
 
-        let url = http_config.url.replace("{username}", &fields.username);
-        debug!(url = %url, username = %fields.username, "HTTP auth lookup");
-
-        // Block on the async HTTP request (we're called from sync Python context)
-        let response = match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(client.get(&url).send())
-        }) {
-            Ok(resp) => resp,
-            Err(e) => {
-                warn!(error = %e, url = %url, "HTTP auth request failed");
-                return false;
+        // Serve from the TTL cache when possible — this is what keeps a
+        // registration storm for the same subscribers from translating 1:1 into
+        // blocking HTTP fetches that each pin a Python-executor worker.
+        let body = match self.cached_credential(&fields.username, http_config.cache_ttl_secs) {
+            Some(cached) => {
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.auth_ha1_cache_hits_total.inc();
+                }
+                debug!(username = %fields.username, "HTTP auth: HA1 cache hit");
+                cached
             }
-        };
-
-        if !response.status().is_success() {
-            debug!(status = %response.status(), username = %fields.username, "HTTP auth: user not found");
-            return false;
-        }
-
-        let body = match tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(response.text())
-        }) {
-            Ok(b) => b.trim().to_string(),
-            Err(e) => {
-                warn!(error = %e, "HTTP auth: failed to read response body");
-                return false;
+            None => {
+                let fetched = match self.fetch_http_credential(http_config, client, &fields.username)
+                {
+                    Some(body) => body,
+                    None => return false,
+                };
+                self.store_credential(&fields.username, &fetched);
+                fetched
             }
         };
 
@@ -812,6 +837,78 @@ impl PyAuth {
         let valid = fields.verify(&ha1, method);
         debug!(username = %fields.username, valid, "HTTP auth digest verification");
         valid
+    }
+
+    /// Return a cached credential body for `username` if caching is enabled and
+    /// the entry is still within `ttl_secs`. Expired entries miss (and are left
+    /// for the next fetch to overwrite).
+    fn cached_credential(&self, username: &str, ttl_secs: u64) -> Option<String> {
+        if ttl_secs == 0 {
+            return None;
+        }
+        let cache = self.http_ha1_cache.as_ref()?;
+        let entry = cache.get(username)?;
+        if is_cache_fresh(
+            entry.fetched_at.elapsed(),
+            std::time::Duration::from_secs(ttl_secs),
+        ) {
+            Some(entry.value.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Store a successful credential lookup in the TTL cache. No-op when caching
+    /// is disabled.
+    fn store_credential(&self, username: &str, value: &str) {
+        if let Some(cache) = self.http_ha1_cache.as_ref() {
+            cache.insert(
+                username.to_string(),
+                CachedHa1 {
+                    value: value.to_string(),
+                    fetched_at: std::time::Instant::now(),
+                },
+            );
+        }
+    }
+
+    /// Blocking HTTP fetch of the credential body for `username`. Returns `None`
+    /// on any failure (request error, non-success status, body read error) — the
+    /// caller then rejects the digest without caching anything.
+    fn fetch_http_credential(
+        &self,
+        http_config: &HttpAuthConfig,
+        client: &reqwest::Client,
+        username: &str,
+    ) -> Option<String> {
+        let url = http_config.url.replace("{username}", username);
+        debug!(url = %url, username = %username, "HTTP auth lookup");
+
+        // Block on the async HTTP request (we're called from sync Python context).
+        let response = match tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(client.get(&url).send())
+        }) {
+            Ok(resp) => resp,
+            Err(error) => {
+                warn!(error = %error, url = %url, "HTTP auth request failed");
+                return None;
+            }
+        };
+
+        if !response.status().is_success() {
+            debug!(status = %response.status(), username = %username, "HTTP auth: user not found");
+            return None;
+        }
+
+        match tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(response.text())
+        }) {
+            Ok(body) => Some(body.trim().to_string()),
+            Err(error) => {
+                warn!(error = %error, "HTTP auth: failed to read response body");
+                None
+            }
+        }
     }
 }
 
@@ -1529,5 +1626,59 @@ mod tests {
     fn extract_auts_missing_returns_none() {
         let auth = r#"Digest username="alice",realm="test",nonce="abc",response="def""#;
         assert!(extract_digest_param(auth, "auts").is_none());
+    }
+
+    fn http_auth_with_cache(cache_ttl_secs: u64) -> PyAuth {
+        let mut auth = PyAuth::empty();
+        auth.set_backend_type(AuthBackendType::Http);
+        auth.set_http_config(HttpAuthConfig {
+            url: "http://127.0.0.1:9/sip/auth/{username}".to_string(),
+            timeout_ms: 100,
+            connect_timeout_ms: 100,
+            ha1: true,
+            cache_ttl_secs,
+        })
+        .unwrap();
+        auth
+    }
+
+    #[test]
+    fn cache_freshness_boundary() {
+        use std::time::Duration;
+        assert!(is_cache_fresh(Duration::from_secs(0), Duration::from_secs(300)));
+        assert!(is_cache_fresh(Duration::from_secs(299), Duration::from_secs(300)));
+        // At and beyond the TTL the entry is stale.
+        assert!(!is_cache_fresh(Duration::from_secs(300), Duration::from_secs(300)));
+        assert!(!is_cache_fresh(Duration::from_secs(400), Duration::from_secs(300)));
+    }
+
+    #[test]
+    fn ha1_cache_miss_then_store_then_hit() {
+        let auth = http_auth_with_cache(300);
+
+        // Cold: nothing stored yet.
+        assert!(auth.cached_credential("alice", 300).is_none());
+
+        // After a successful lookup is stored, it hits within the TTL.
+        auth.store_credential("alice", "deadbeefcafe");
+        assert_eq!(
+            auth.cached_credential("alice", 300).as_deref(),
+            Some("deadbeefcafe")
+        );
+
+        // A ttl of 0 always misses (caching disabled for this call).
+        assert!(auth.cached_credential("alice", 0).is_none());
+    }
+
+    #[test]
+    fn ha1_cache_not_allocated_when_ttl_zero() {
+        let auth = http_auth_with_cache(0);
+        assert!(
+            auth.http_ha1_cache.is_none(),
+            "no cache map should be allocated when cache_ttl_secs is 0"
+        );
+        // store_credential is a no-op and lookups always miss.
+        auth.store_credential("alice", "x");
+        assert!(auth.cached_credential("alice", 300).is_none());
     }
 }

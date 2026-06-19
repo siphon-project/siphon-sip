@@ -405,10 +405,49 @@ pub struct ScriptConfig {
     /// throughput ceiling.  Lower it on memory-constrained, low-traffic NFs.
     #[serde(default)]
     pub sync_pool_size: Option<usize>,
+    /// Hard ceiling on synchronous Python executor worker threads. The pool is
+    /// elastic — it starts at `sync_pool_size` (the always-on core) and grows
+    /// on demand up to this when every worker is busy, then never shrinks. This
+    /// restores the burst headroom blocking-I/O handlers need (a handful of
+    /// concurrent blocking REGISTERs no longer wedge the engine) without the
+    /// free-threaded-CPython heap leak that reaping caused. Each grown worker
+    /// costs ~2 MB of persistent Python heap, so the pool's memory ceiling is
+    /// roughly `sync_pool_max × 2 MB` — lower it on memory-constrained NFs.
+    /// Defaults to `max(32, 4 × sync_pool_size)`; clamped to at least
+    /// `sync_pool_size`.
+    #[serde(default)]
+    pub sync_pool_max: Option<usize>,
+    /// Seconds the synchronous Python executor pool may show *zero forward
+    /// progress while fully saturated* before SIPhon aborts the process so a
+    /// supervisor (`restart: always`, systemd) restarts it.  Guards against a
+    /// handler that blocks every worker indefinitely (a thread-unsafe HTTP
+    /// client wedging, a backend that never returns, a lock held forever):
+    /// without it the process stays alive but serves no SIP, and a
+    /// restart-on-exit policy never fires because the process never exits.
+    /// Defaults to 30 (6× the default 5 s HTTP-auth timeout, so transient
+    /// backend slowness never trips it); `0` disables the watchdog.  See
+    /// `script::py_executor`.
+    #[serde(default = "default_handler_stall_abort_secs")]
+    pub handler_stall_abort_secs: u64,
+    /// Maximum number of handler jobs that may queue for the synchronous
+    /// Python executor pool before new inbound work is shed (dropped — the SIP
+    /// client retransmits).  Bounds memory under overload so a stuck pool can
+    /// no longer grow the queue without limit.  Defaults to 1024; raise it on
+    /// high-throughput NFs so normal bursts never shed.  Clamped to at least 1.
+    #[serde(default = "default_executor_queue_capacity")]
+    pub executor_queue_capacity: usize,
 }
 
 fn default_script_path() -> String {
     String::new()
+}
+
+fn default_handler_stall_abort_secs() -> u64 {
+    30
+}
+
+fn default_executor_queue_capacity() -> usize {
+    1024
 }
 
 impl Default for ScriptConfig {
@@ -418,6 +457,9 @@ impl Default for ScriptConfig {
             reload: default_reload(),
             async_pool_size: None,
             sync_pool_size: None,
+            sync_pool_max: None,
+            handler_stall_abort_secs: default_handler_stall_abort_secs(),
+            executor_queue_capacity: default_executor_queue_capacity(),
         }
     }
 }
@@ -866,6 +908,16 @@ pub struct HttpAuthConfig {
     /// If false, it is a plaintext password (SIPhon hashes it internally).
     #[serde(default)]
     pub ha1: bool,
+    /// TTL (seconds) for caching a successful credential lookup keyed by
+    /// username. `0` (the default) disables caching — every digest
+    /// verification performs a blocking HTTP fetch, so a registration storm
+    /// translates 1:1 into blocking calls on the fixed Python executor pool.
+    /// Set this (e.g. `300`) so repeated REGISTERs for the same subscriber
+    /// reuse the cached HA1/password instead of re-hitting the backend.
+    /// Credentials rarely change, so a non-zero TTL is the recommended
+    /// production setting; a change propagates after at most `cache_ttl_secs`.
+    #[serde(default)]
+    pub cache_ttl_secs: u64,
 }
 
 fn default_http_timeout_ms() -> u64 {
@@ -2488,6 +2540,78 @@ auth:
         assert!(http.url.contains("{username}"));
         assert_eq!(http.timeout_ms, 2000);
         assert!(http.ha1);
+        // HA1 caching is opt-in: absent `cache_ttl_secs` defaults to 0 (disabled),
+        // preserving the per-request blocking-fetch behaviour.
+        assert_eq!(http.cache_ttl_secs, 0);
+    }
+
+    #[test]
+    fn parses_auth_http_cache_ttl() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+auth:
+  realm: "example.com"
+  backend: http
+  http:
+    url: "http://127.0.0.1:8000/sip/auth/{username}"
+    cache_ttl_secs: 300
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let http = config.auth.http.unwrap();
+        assert_eq!(http.cache_ttl_secs, 300);
+    }
+
+    #[test]
+    fn script_executor_defaults_and_overrides() {
+        // Defaults: watchdog at 30 s, bounded queue at 1024, pool sizes auto.
+        let default_script = ScriptConfig::default();
+        assert_eq!(default_script.handler_stall_abort_secs, 30);
+        assert_eq!(default_script.executor_queue_capacity, 1024);
+        assert_eq!(default_script.sync_pool_size, None);
+        assert_eq!(default_script.sync_pool_max, None);
+
+        // Defaults survive a YAML that omits the executor knobs.
+        let minimal = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+        let config = Config::from_str(minimal).unwrap();
+        assert_eq!(config.script.handler_stall_abort_secs, 30);
+        assert_eq!(config.script.executor_queue_capacity, 1024);
+
+        // Explicit overrides parse, including disabling the watchdog (0).
+        let overridden = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+  sync_pool_size: 16
+  sync_pool_max: 128
+  handler_stall_abort_secs: 0
+  executor_queue_capacity: 4096
+"#;
+        let config = Config::from_str(overridden).unwrap();
+        assert_eq!(config.script.sync_pool_size, Some(16));
+        assert_eq!(config.script.sync_pool_max, Some(128));
+        assert_eq!(config.script.handler_stall_abort_secs, 0);
+        assert_eq!(config.script.executor_queue_capacity, 4096);
     }
 
     #[test]

@@ -148,7 +148,7 @@ def make_decorator(seconds, name, jitter):
 
             // Fire the callback inside Python::attach, then pop the registry
             // entry so a subsequent set() under the same key works cleanly.
-            crate::script::py_executor::run(move || {
+            let _ = crate::script::py_executor::try_run(move || {
                 pyo3::Python::attach(|python| {
                     let callable = handler.bind(python);
                     match callable.call1((key_clone.as_str(),)) {

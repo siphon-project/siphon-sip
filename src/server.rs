@@ -348,20 +348,49 @@ impl SiphonServer {
         // anonymous-heap leak under steady SIP signalling.  See
         // `script::py_executor` for the full story.
         //
-        // Default to 2× CPUs: the hot inbound path runs here, and the elastic
-        // `spawn_blocking` pool this replaces absorbed bursts by spawning extra
-        // threads.  A fixed pool sized to just `num_cpus` adds queue latency at
-        // the throughput ceiling (≈28k cps → sipp retransmits), so 2× restores
-        // that burst headroom.  Idle workers are cheap (a per-thread Python heap
-        // only materialises under load); memory-constrained low-traffic NFs can
-        // lower `script.sync_pool_size`.
-        let sync_pool_size = config
+        // The pool is ELASTIC: `core_threads` always-on workers, growing on
+        // demand to `max_threads` when every worker is busy, then never
+        // shrinking. This is the proper fix for the regression where moving
+        // inbound dispatch off tokio's elastic `spawn_blocking` pool onto a
+        // FIXED pool removed the burst valve — a blocking-I/O handler (HTTP /
+        // Diameter digest auth, an `on_change` notify) pins a worker for the
+        // whole call, so on a small box a couple of concurrent blocking
+        // REGISTERs exhausted the fixed pool and wedged the engine. Growth-on-
+        // demand restores the headroom; never-reaping keeps the persistent
+        // free-threaded-CPython attach from leaking (the reason the pool stopped
+        // using `spawn_blocking`).
+        //
+        // core default = max(8, 2×CPUs): the always-on baseline. The floor of 8
+        // matters on small containers — a `cpus: 0.5` box reports
+        // `available_parallelism() == 1`, which 2× alone would make a 2-thread
+        // baseline. max default = max(32, 4×core): the burst ceiling. Each grown
+        // worker costs ~2 MB of persistent Python heap, so peak memory is
+        // ~max_threads × 2 MB — lower `script.sync_pool_max` on memory-
+        // constrained NFs (and prefer `auth.http.cache_ttl_secs`, which keeps
+        // the storm from ever needing to grow).
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let core_threads = config.script.sync_pool_size.unwrap_or((cpus * 2).max(8));
+        let max_threads = config
             .script
-            .sync_pool_size
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() * 2));
+            .sync_pool_max
+            .unwrap_or((core_threads * 4).max(32))
+            .max(core_threads);
+        // Bound the queue (load-shed under overload instead of unbounded growth)
+        // and arm the liveness watchdog (abort + supervisor-restart only if the
+        // pool reaches the cap and still wedges). `handler_stall_abort_secs == 0`
+        // disables the watchdog.
+        let executor_config = crate::script::py_executor::ExecutorConfig {
+            core_threads,
+            max_threads,
+            queue_capacity: config.script.executor_queue_capacity,
+            stall_abort: match config.script.handler_stall_abort_secs {
+                0 => None,
+                secs => Some(std::time::Duration::from_secs(secs)),
+            },
+        };
         crate::script::py_executor::PyExecutor::install(
-            sync_pool_size,
             tokio::runtime::Handle::current(),
+            executor_config,
         );
 
         dispatcher::inject_python_singletons(&config);
@@ -1304,7 +1333,7 @@ impl SiphonServer {
                         State(state): State<SbiNotifState>,
                         Json(body): Json<crate::sbi::npcf::PcfEventNotification>,
                     ) -> axum::http::StatusCode {
-                        let _ = crate::script::py_executor::run(move || {
+                        let _ = crate::script::py_executor::try_run(move || {
                             pyo3::Python::attach(|python| {
                                 use pyo3::types::PyAnyMethods;
                                 let engine_state = state.engine.state();

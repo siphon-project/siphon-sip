@@ -196,6 +196,9 @@ mod tests {
                 reload: crate::config::ReloadMode::Sighup,
                 async_pool_size: None,
                 sync_pool_size: None,
+                sync_pool_max: None,
+                handler_stall_abort_secs: 30,
+                executor_queue_capacity: 1024,
             })
             .unwrap(),
         )

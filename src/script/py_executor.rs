@@ -42,50 +42,140 @@ use std::any::Any;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::oneshot;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// A unit of work submitted to the pool. The closure is fully self-contained —
 /// it captures whatever it needs (including any result channel).
 type Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// Tunables for the synchronous Python executor pool.
+#[derive(Clone, Copy, Debug)]
+pub struct ExecutorConfig {
+    /// Always-on worker threads, spawned at startup. Clamped to at least 1.
+    pub core_threads: usize,
+    /// Hard ceiling on worker threads. The pool grows from `core_threads` up to
+    /// this on demand — whenever a job is submitted with every worker busy and
+    /// room under the cap — and **never shrinks**. Never-reaping is exactly what
+    /// keeps the persistent free-threaded-CPython attach from leaking (the
+    /// reason the pool stopped using tokio's elastic `spawn_blocking`), while
+    /// growth-on-demand restores the headroom that blocking handlers (HTTP /
+    /// Diameter auth, an `on_change` notify) need so a handful of concurrent
+    /// blocking calls can't starve the engine. Clamped to at least `core_threads`.
+    pub max_threads: usize,
+    /// Maximum number of jobs that may queue before submission sheds (the queue
+    /// is bounded, so an at-capacity pool can no longer grow it without limit).
+    /// Clamped to at least 1.
+    pub queue_capacity: usize,
+    /// Abort the process when the pool shows *zero forward progress while at the
+    /// thread cap* for at least this long, so a supervisor restarts it. `None`
+    /// disables the liveness watchdog (the background thread still publishes
+    /// queue-depth / in-flight metrics).
+    pub stall_abort: Option<Duration>,
+}
+
+impl Default for ExecutorConfig {
+    fn default() -> Self {
+        Self {
+            core_threads: 8,
+            max_threads: 32,
+            queue_capacity: 1024,
+            stall_abort: Some(Duration::from_secs(30)),
+        }
+    }
+}
+
+/// Live, lock-free counters shared between the worker threads (which mutate
+/// them), `submit` (which reads `idle`/`total` to decide whether to grow), and
+/// the watchdog thread. `inflight`/`completed` are the watchdog's forward-progress
+/// signal; all are published to Prometheus by the watchdog off the hot path.
+#[derive(Default)]
+struct PoolMetrics {
+    /// Jobs currently executing on a worker thread.
+    inflight: AtomicUsize,
+    /// Total jobs completed (monotonic). A flat value while the pool is at its
+    /// thread cap with every worker busy is the precise "pool wedged" signal.
+    completed: AtomicU64,
+    /// Workers currently parked in `recv()` waiting for a job. `0` means every
+    /// worker is busy, so a new submission should grow the pool (up to the cap).
+    idle: AtomicUsize,
+    /// Live worker threads. Grows from `core_threads` to `max_threads` on
+    /// demand; never shrinks (never-reaped, so no heap leak).
+    total: AtomicUsize,
+}
+
+/// Outcome of submitting a job to the bounded queue.
+enum SubmitResult {
+    /// Job was enqueued.
+    Submitted,
+    /// Queue was full — job dropped (load-shed under overload).
+    Full,
+    /// Channel closed (pool shutting down) — job dropped.
+    Closed,
+}
 
 /// Process-wide pool, installed once at server startup. Submission helpers
 /// fall back to `tokio::task::spawn_blocking` when no pool is installed (tests
 /// / CLI helpers), so behaviour is unchanged off the server path.
 static GLOBAL: OnceLock<Arc<PyExecutor>> = OnceLock::new();
 
-/// Fixed pool of persistently-attached Python worker threads.
+/// Interval at which the background grower checks for a backlog to absorb. The
+/// growth latency under a sudden blocking burst is at most this; fast handlers
+/// keep the queue empty so the pool never grows and this is pure overhead-free
+/// idle sleeping.
+const GROWER_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Elastic, capped, never-reaped pool of persistently-attached Python worker
+/// threads. Grows from `core_threads` to `max_threads` under load.
 pub struct PyExecutor {
-    /// Job queue. `Option` so [`Drop`] can close the channel (drop the only
-    /// sender) before joining the worker threads.
+    /// Bounded job queue. `Option` so [`Drop`] can close the channel (drop the
+    /// only sender) before joining the worker threads.
     sender: StdMutex<Option<flume::Sender<Job>>>,
-    /// Worker thread handles, joined on drop.
-    threads: StdMutex<Vec<JoinHandle<()>>>,
-    size: usize,
+    /// Worker thread handles (core + grown), joined on drop. Shared with the
+    /// grower thread, which appends a handle each time it adds a worker.
+    threads: Arc<StdMutex<Vec<JoinHandle<()>>>>,
+    /// Background grower thread handle, joined on drop. `None` for a non-elastic
+    /// pool (`core == max`), which needs no grower.
+    grower: StdMutex<Option<JoinHandle<()>>>,
+    /// Liveness watchdog / metrics-sampler thread handle, joined on drop.
+    watchdog: StdMutex<Option<JoinHandle<()>>>,
+    /// Set on drop so the background threads exit their sleep loops.
+    shutdown: Arc<AtomicBool>,
+    /// In-flight / completed / idle / total counters (shared with workers,
+    /// grower, and watchdog).
+    metrics: Arc<PoolMetrics>,
+    /// Hard ceiling on worker threads.
+    max_threads: usize,
 }
 
 impl PyExecutor {
-    /// Install the global pool with `size` worker threads, each entering
-    /// `tokio_handle` for its lifetime. Idempotent — subsequent calls return
-    /// the already-installed pool (the loser of an install race tears its own
-    /// threads down). `size` is clamped to at least 1.
+    /// Install the global pool, each worker entering `tokio_handle` for its
+    /// lifetime. Idempotent — subsequent calls return the already-installed pool
+    /// (the loser of an install race tears its own threads down).
     ///
     /// `tokio_handle` **must outlive the process / test binary** — every worker
     /// holds an `EnterGuard` for it for its whole life (same requirement as
     /// [`crate::script::async_pool::AsyncPool::install`]). In production pass
     /// the bootstrap runtime's `Handle::current()`.
-    pub fn install(size: usize, tokio_handle: TokioHandle) -> Arc<PyExecutor> {
+    pub fn install(tokio_handle: TokioHandle, config: ExecutorConfig) -> Arc<PyExecutor> {
         if let Some(existing) = GLOBAL.get() {
             return Arc::clone(existing);
         }
-        let size = size.max(1);
-        let pool = Arc::new(PyExecutor::spawn(size, tokio_handle));
+        let pool = Arc::new(PyExecutor::spawn(tokio_handle, config));
         match GLOBAL.set(Arc::clone(&pool)) {
             Ok(()) => {
-                info!(size, "synchronous Python executor pool initialised");
+                info!(
+                    core_threads = config.core_threads.max(1),
+                    max_threads = config.max_threads.max(config.core_threads.max(1)),
+                    queue_capacity = config.queue_capacity.max(1),
+                    stall_abort_secs = config.stall_abort.map(|d| d.as_secs()),
+                    "synchronous Python executor pool initialised (elastic)"
+                );
                 pool
             }
             Err(_) => {
@@ -102,50 +192,236 @@ impl PyExecutor {
         GLOBAL.get().cloned()
     }
 
-    /// Number of worker threads. Stable for the process lifetime.
+    /// Current live worker-thread count (grows from core toward max under load).
     pub fn size(&self) -> usize {
-        self.size
+        self.metrics.total.load(Ordering::Relaxed)
     }
 
-    fn spawn(size: usize, tokio_handle: TokioHandle) -> Self {
-        let (sender, receiver) = flume::unbounded::<Job>();
-        let mut threads = Vec::with_capacity(size);
-        for index in 0..size {
+    /// Hard ceiling on worker threads.
+    pub fn max_size(&self) -> usize {
+        self.max_threads
+    }
+
+    fn spawn(tokio_handle: TokioHandle, config: ExecutorConfig) -> Self {
+        let core_threads = config.core_threads.max(1);
+        let max_threads = config.max_threads.max(core_threads);
+        let capacity = config.queue_capacity.max(1);
+        let (sender, receiver) = flume::bounded::<Job>(capacity);
+        let metrics = Arc::new(PoolMetrics::default());
+
+        let threads: Arc<StdMutex<Vec<JoinHandle<()>>>> =
+            Arc::new(StdMutex::new(Vec::with_capacity(core_threads)));
+        for index in 0..core_threads {
+            let handle = spawn_worker(
+                index,
+                receiver.clone(),
+                tokio_handle.clone(),
+                Arc::clone(&metrics),
+            );
+            if let Ok(mut guard) = threads.lock() {
+                guard.push(handle);
+            }
+        }
+
+        // Publish the static ceiling + initial live count so dashboards can
+        // compute saturation (`pyexec_inflight / pyexec_pool_size`) immediately.
+        if let Some(registry) = crate::metrics::try_metrics() {
+            registry.pyexec_pool_max.set(max_threads as i64);
+            registry.pyexec_pool_size.set(core_threads as i64);
+        }
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        // Background grower: the elasticity that the fixed pool removed. On a
+        // short interval it adds workers (up to the cap, never reaped) to cover
+        // any queue backlog the current workers can't absorb — so a burst of
+        // *blocking* handlers grows the pool instead of starving the engine.
+        // Driven off a dedicated thread, not at submit time, so growth never
+        // depends on submission timing or CPU scheduling of the hot path.
+        // Skipped entirely for a non-elastic pool (`core == max`).
+        let grower = if max_threads > core_threads {
             let receiver = receiver.clone();
             let tokio_handle = tokio_handle.clone();
-            let thread = std::thread::Builder::new()
-                .name(format!("siphon-pyexec-{index}"))
-                .spawn(move || worker_main(index, receiver, tokio_handle))
-                .expect("failed to spawn Python executor thread");
-            threads.push(thread);
-        }
+            let threads = Arc::clone(&threads);
+            let metrics = Arc::clone(&metrics);
+            let shutdown = Arc::clone(&shutdown);
+            Some(
+                std::thread::Builder::new()
+                    .name("siphon-pyexec-grower".to_string())
+                    .spawn(move || {
+                        run_grower(
+                            receiver,
+                            tokio_handle,
+                            threads,
+                            metrics,
+                            max_threads,
+                            GROWER_INTERVAL,
+                            shutdown,
+                        )
+                    })
+                    .expect("failed to spawn Python executor grower thread"),
+            )
+        } else {
+            None
+        };
+
+        // Liveness watchdog + metrics sampler on a dedicated OS thread. It only
+        // sleeps and reads atomics / the queue length, so it can never be
+        // blocked by a lock a wedged handler holds — that is the whole point:
+        // it stays alive to fail the process fast when every worker is stuck.
+        let watchdog = {
+            let metrics = Arc::clone(&metrics);
+            let receiver = receiver.clone();
+            let shutdown = Arc::clone(&shutdown);
+            let params = WatchdogParams {
+                max_threads,
+                stall_abort: config.stall_abort,
+                check_interval: Duration::from_secs(1),
+            };
+            let on_stall: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {
+                // SIGABRT, not exit(): never run destructors here — they could
+                // deadlock on the very lock a wedged handler is holding. abort()
+                // also leaves a core for post-mortem and gives a non-zero exit
+                // so `restart: always` / systemd restart the process.
+                std::process::abort();
+            });
+            std::thread::Builder::new()
+                .name("siphon-pyexec-watchdog".to_string())
+                .spawn(move || run_watchdog(metrics, receiver, params, shutdown, on_stall))
+                .expect("failed to spawn Python executor watchdog thread")
+        };
+
         Self {
             sender: StdMutex::new(Some(sender)),
-            threads: StdMutex::new(threads),
-            size,
+            threads,
+            grower: StdMutex::new(grower),
+            watchdog: StdMutex::new(Some(watchdog)),
+            shutdown,
+            metrics,
+            max_threads,
         }
     }
 
-    /// Submit a job. Returns `false` if the channel is closed (pool shutting
-    /// down).
-    fn submit(&self, job: Job) -> bool {
+    /// Submit a job to the bounded queue without blocking the caller. Elastic
+    /// growth is handled off-thread by the grower, so `submit` is just a
+    /// non-blocking enqueue.
+    fn submit(&self, job: Job) -> SubmitResult {
         match self.sender.lock() {
             Ok(guard) => match guard.as_ref() {
-                Some(sender) => sender.send(job).is_ok(),
-                None => false,
+                Some(sender) => match sender.try_send(job) {
+                    Ok(()) => SubmitResult::Submitted,
+                    Err(flume::TrySendError::Full(_)) => SubmitResult::Full,
+                    Err(flume::TrySendError::Disconnected(_)) => SubmitResult::Closed,
+                },
+                None => SubmitResult::Closed,
             },
-            Err(_) => false,
+            Err(_) => SubmitResult::Closed,
+        }
+    }
+}
+
+/// Spawn a core worker at startup, reserving its `total` slot. Panics on spawn
+/// failure (a startup failure is fatal). On-demand growth uses [`run_grower`].
+fn spawn_worker(
+    index: usize,
+    receiver: flume::Receiver<Job>,
+    tokio_handle: TokioHandle,
+    metrics: Arc<PoolMetrics>,
+) -> JoinHandle<()> {
+    metrics.total.fetch_add(1, Ordering::Relaxed);
+    std::thread::Builder::new()
+        .name(format!("siphon-pyexec-{index}"))
+        .spawn(move || worker_loop(index, receiver, tokio_handle, metrics))
+        .expect("failed to spawn Python executor thread")
+}
+
+/// Workers to add to cover the current backlog: the queued jobs the idle
+/// workers can't immediately take, capped by the room under `max_threads`.
+/// Pure so the policy is unit-testable without threads or a clock.
+fn grow_deficit(queue_len: usize, idle: usize, total: usize, max_threads: usize) -> usize {
+    if total >= max_threads {
+        return 0;
+    }
+    queue_len.saturating_sub(idle).min(max_threads - total)
+}
+
+/// Background grower: on every `check_interval`, add enough never-reaped workers
+/// to absorb the queue backlog, up to `max_threads`. Decoupling growth from the
+/// submit path makes it robust to submission timing and CPU scheduling — a
+/// stranded backlog is always picked up within one interval. Runs until
+/// `shutdown` is set (on pool drop).
+fn run_grower(
+    receiver: flume::Receiver<Job>,
+    tokio_handle: TokioHandle,
+    threads: Arc<StdMutex<Vec<JoinHandle<()>>>>,
+    metrics: Arc<PoolMetrics>,
+    max_threads: usize,
+    check_interval: Duration,
+    shutdown: Arc<AtomicBool>,
+) {
+    loop {
+        std::thread::sleep(check_interval);
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let queue_len = receiver.len();
+        let idle = metrics.idle.load(Ordering::Relaxed);
+        let total = metrics.total.load(Ordering::Relaxed);
+        let grow_n = grow_deficit(queue_len, idle, total, max_threads);
+
+        for _ in 0..grow_n {
+            // Reserve a slot atomically; never overshoot the cap even if another
+            // path raced us (defensive — `grow_deficit` already bounds it).
+            let reserved = metrics.total.fetch_add(1, Ordering::Relaxed);
+            if reserved >= max_threads {
+                metrics.total.fetch_sub(1, Ordering::Relaxed);
+                break;
+            }
+            let receiver = receiver.clone();
+            let tokio_handle = tokio_handle.clone();
+            let worker_metrics = Arc::clone(&metrics);
+            match std::thread::Builder::new()
+                .name(format!("siphon-pyexec-{reserved}"))
+                .spawn(move || worker_loop(reserved, receiver, tokio_handle, worker_metrics))
+            {
+                Ok(thread) => {
+                    if let Ok(mut guard) = threads.lock() {
+                        guard.push(thread);
+                    }
+                    debug!(
+                        index = reserved,
+                        total = metrics.total.load(Ordering::Relaxed),
+                        "grew Python executor pool under load"
+                    );
+                }
+                Err(error) => {
+                    metrics.total.fetch_sub(1, Ordering::Relaxed);
+                    error!(%error, "failed to grow Python executor pool");
+                    break;
+                }
+            }
         }
     }
 }
 
 impl Drop for PyExecutor {
     fn drop(&mut self) {
-        // Close the channel so workers' `recv()` returns `Err` and they exit.
-        // Normally never runs in production (the pool lives in `OnceLock`); it
-        // only matters for the transient `Arc` an install-race loser holds.
+        // Stop the watchdog's sleep loop and close the channel so workers'
+        // `recv()` returns `Err` and they exit. Normally never runs in
+        // production (the pool lives in `OnceLock`); it only matters for the
+        // transient `Arc` an install-race loser holds.
+        self.shutdown.store(true, Ordering::Relaxed);
         if let Ok(mut guard) = self.sender.lock() {
             guard.take();
+        }
+        // Join the grower first so it can't spawn a new worker after we've taken
+        // the worker-handle vector.
+        let grower = self.grower.lock().ok().and_then(|mut t| t.take());
+        if let Some(grower) = grower {
+            if grower.join().is_err() {
+                error!("Python executor grower thread panicked during shutdown");
+            }
         }
         let threads = self
             .threads
@@ -157,10 +433,135 @@ impl Drop for PyExecutor {
                 error!("Python executor worker thread panicked during shutdown");
             }
         }
+        let watchdog = self.watchdog.lock().ok().and_then(|mut t| t.take());
+        if let Some(watchdog) = watchdog {
+            if watchdog.join().is_err() {
+                error!("Python executor watchdog thread panicked during shutdown");
+            }
+        }
     }
 }
 
-fn worker_main(index: usize, receiver: flume::Receiver<Job>, tokio_handle: TokioHandle) {
+/// Tuning for [`run_watchdog`].
+struct WatchdogParams {
+    /// Thread cap — the pool can still grow below this, so it is only truly
+    /// wedged once `total` has reached `max_threads` and stops completing work.
+    max_threads: usize,
+    /// Stall threshold; `None` = sample metrics only, never abort.
+    stall_abort: Option<Duration>,
+    /// Sleep between samples.
+    check_interval: Duration,
+}
+
+/// Sample the pool every `check_interval`: publish live thread count / queue-depth
+/// / in-flight / completed to Prometheus, and — when `stall_abort` is set — fire
+/// `on_stall` (in production: abort the process) once the pool has shown **zero
+/// forward progress while at the thread cap with every worker busy** for `stall_abort`.
+///
+/// Keying on "at the cap" (not just "busy") is what makes this correct for an
+/// elastic pool: a busy-but-below-cap pool is not wedged, it just needs to grow.
+/// Only when every one of `max_threads` workers is blocked and nothing completes
+/// is the pool unrecoverable (e.g. all workers hung on a deadlocked backend).
+///
+/// Runs on a dedicated OS thread that never takes a lock or touches Python, so
+/// a handler that wedges every worker (or holds a lock forever) cannot stall
+/// the watchdog itself.
+fn run_watchdog(
+    metrics: Arc<PoolMetrics>,
+    receiver: flume::Receiver<Job>,
+    params: WatchdogParams,
+    shutdown: Arc<AtomicBool>,
+    on_stall: Arc<dyn Fn() + Send + Sync>,
+) {
+    let mut stalled_for = Duration::ZERO;
+    let mut last_completed = metrics.completed.load(Ordering::Relaxed);
+    let mut last_published = last_completed;
+
+    loop {
+        std::thread::sleep(params.check_interval);
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let inflight = metrics.inflight.load(Ordering::Relaxed);
+        let total = metrics.total.load(Ordering::Relaxed);
+        let queue_depth = receiver.len();
+        let completed = metrics.completed.load(Ordering::Relaxed);
+
+        // Publish snapshots off the hot path.
+        if let Some(registry) = crate::metrics::try_metrics() {
+            registry.pyexec_inflight.set(inflight as i64);
+            registry.pyexec_pool_size.set(total as i64);
+            registry.pyexec_queue_depth.set(queue_depth as i64);
+            let delta = completed.saturating_sub(last_published);
+            if delta > 0 {
+                registry.pyexec_jobs_completed_total.inc_by(delta);
+                last_published = completed;
+            }
+        }
+
+        let Some(threshold) = params.stall_abort else {
+            last_completed = completed;
+            continue;
+        };
+
+        // Wedged ⟺ the pool is at its thread cap, every worker is busy, AND not
+        // one job has completed since the last sample. A pool below the cap can
+        // still grow, so it is never "wedged"; a pool churning fast jobs advances
+        // `completed` each tick, so it never accumulates. Only a fully-grown pool
+        // where every worker is blocked indefinitely trips this.
+        let at_cap = params.max_threads > 0 && total >= params.max_threads;
+        let saturated = at_cap && inflight >= total;
+        if saturated && completed == last_completed {
+            stalled_for += params.check_interval;
+            if stalled_for >= threshold {
+                error!(
+                    inflight,
+                    total,
+                    queue_depth,
+                    max_threads = params.max_threads,
+                    stalled_secs = stalled_for.as_secs(),
+                    "Python executor pool wedged: at the thread cap with every \
+                     worker busy and zero completions for the stall window — \
+                     aborting so a supervisor restarts the process (a hung-but- \
+                     alive SIP engine never recovers on its own)"
+                );
+                on_stall();
+                // Reach here only in tests (production aborted above). Reset so
+                // the injected action fires at most once per stall episode.
+                stalled_for = Duration::ZERO;
+            }
+        } else {
+            stalled_for = Duration::ZERO;
+        }
+        last_completed = completed;
+    }
+}
+
+/// Record a shed (queue-full) event: bump the Prometheus counter and emit a
+/// rate-limited warning (the metric carries the precise count; the log is a
+/// breadcrumb that avoids flooding under sustained overload).
+fn record_shed() {
+    if let Some(registry) = crate::metrics::try_metrics() {
+        registry.pyexec_jobs_shed_total.inc();
+    }
+    static SHED_WARN_COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = SHED_WARN_COUNT.fetch_add(1, Ordering::Relaxed);
+    if n == 0 || n % 5000 == 0 {
+        warn!(
+            shed_total_since_start = n + 1,
+            "Python executor queue full — shedding handler job (pool saturated; \
+             SIP client will retransmit)"
+        );
+    }
+}
+
+fn worker_loop(
+    index: usize,
+    receiver: flume::Receiver<Job>,
+    tokio_handle: TokioHandle,
+    metrics: Arc<PoolMetrics>,
+) {
     // Hold the bootstrap runtime context for this thread's lifetime so that
     // blocking Rust-API callbacks invoked from script handlers reach a live
     // reactor (`Handle::current()` / `block_in_place`). Dropped only when the
@@ -183,11 +584,28 @@ fn worker_main(index: usize, receiver: flume::Receiver<Job>, tokio_handle: Tokio
         let _tstate = pyo3::ffi::PyEval_SaveThread();
     }
 
-    while let Ok(job) = receiver.recv() {
+    loop {
+        // Mark this worker idle while it waits for a job, so `submit` can tell
+        // when every worker is busy and the pool should grow.
+        metrics.idle.fetch_add(1, Ordering::Relaxed);
+        let job = receiver.recv();
+        metrics.idle.fetch_sub(1, Ordering::Relaxed);
+        let Ok(job) = job else {
+            break; // channel closed → pool shutting down
+        };
+
+        // `inflight`/`completed` bracket the job so the watchdog can tell a
+        // saturated-but-progressing pool from a wedged one. A few relaxed atomics
+        // per job — negligible on the hot path; the Prometheus counters are
+        // updated off-thread by the watchdog from these.
+        metrics.inflight.fetch_add(1, Ordering::Relaxed);
         // Backstop: a panicking job must never take down the worker thread (the
         // submission wrappers already isolate panics, but defend in depth so a
         // raw job can't shrink the pool).
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+        metrics.inflight.fetch_sub(1, Ordering::Relaxed);
+        metrics.completed.fetch_add(1, Ordering::Relaxed);
+        if outcome.is_err() {
             error!(worker = index, "Python executor job panicked");
         }
     }
@@ -228,12 +646,16 @@ where
                 // that's fine — the work still ran.
                 let _ = sender.send(result);
             });
-            if !pool.submit(job) {
-                return Err(boxed_message("Python executor channel closed"));
+            match pool.submit(job) {
+                SubmitResult::Submitted => receiver
+                    .await
+                    .unwrap_or_else(|_| Err(boxed_message("Python executor worker dropped"))),
+                SubmitResult::Full => {
+                    record_shed();
+                    Err(boxed_message("Python executor queue full — load shed"))
+                }
+                SubmitResult::Closed => Err(boxed_message("Python executor channel closed")),
             }
-            receiver
-                .await
-                .unwrap_or_else(|_| Err(boxed_message("Python executor worker dropped")))
         }
         None => {
             // No pool (tests / CLI): preserve the old blocking-pool behaviour.
@@ -259,8 +681,12 @@ where
             let job: Job = Box::new(move || {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
             });
-            if !pool.submit(job) {
-                error!("Python executor channel closed — dropping fire-and-forget job");
+            match pool.submit(job) {
+                SubmitResult::Submitted => {}
+                SubmitResult::Full => record_shed(),
+                SubmitResult::Closed => {
+                    error!("Python executor channel closed — dropping fire-and-forget job");
+                }
             }
         }
         None => {
@@ -303,7 +729,18 @@ mod tests {
 
     fn ensure_pool() -> Arc<PyExecutor> {
         pyo3::Python::initialize();
-        PyExecutor::install(3, test_runtime().handle().clone())
+        // Disable the abort-watchdog on the *shared global* pool — a false
+        // positive would kill the whole test binary. The watchdog logic is
+        // covered in isolation by `watchdog_*` below.
+        PyExecutor::install(
+            test_runtime().handle().clone(),
+            ExecutorConfig {
+                core_threads: 3,
+                max_threads: 3,
+                queue_capacity: 1024,
+                stall_abort: None,
+            },
+        )
     }
 
     #[test]
@@ -462,5 +899,387 @@ mod tests {
                  (budget {budget_kb} KB ≈ {PER_HANDLER_BUDGET_BYTES} bytes/handler) — likely a leak",
             );
         });
+    }
+
+    fn noop_job() -> Job {
+        Box::new(|| {})
+    }
+
+    #[test]
+    fn grow_deficit_policy() {
+        // No backlog beyond idle capacity → no growth.
+        assert_eq!(grow_deficit(0, 0, 2, 8), 0);
+        assert_eq!(grow_deficit(2, 2, 2, 8), 0);
+        assert_eq!(grow_deficit(1, 4, 2, 8), 0);
+        // Backlog the idle workers can't take → grow to cover it.
+        assert_eq!(grow_deficit(3, 0, 2, 8), 3);
+        assert_eq!(grow_deficit(5, 1, 2, 8), 4);
+        // Growth is capped by the room under max_threads.
+        assert_eq!(grow_deficit(100, 0, 6, 8), 2);
+        assert_eq!(grow_deficit(100, 0, 8, 8), 0);
+        assert_eq!(grow_deficit(100, 0, 9, 8), 0);
+    }
+
+    /// The bounded queue sheds once full instead of growing without bound: with
+    /// a non-elastic pool (core == max == 1) whose single worker is pinned on a
+    /// blocking job, the next `queue_capacity` jobs queue and everything beyond
+    /// is reported `Full` (load-shed).
+    #[test]
+    fn bounded_queue_sheds_when_full() {
+        pyo3::Python::initialize();
+        let pool = PyExecutor::spawn(
+            test_runtime().handle().clone(),
+            ExecutorConfig {
+                core_threads: 1,
+                max_threads: 1,
+                queue_capacity: 2,
+                stall_abort: None,
+            },
+        );
+
+        // Job A pins the only worker until we unblock it.
+        let (unblock_tx, unblock_rx) = std::sync::mpsc::channel::<()>();
+        let blocker: Job = Box::new(move || {
+            let _ = unblock_rx.recv();
+        });
+        assert!(matches!(pool.submit(blocker), SubmitResult::Submitted));
+
+        // Wait until the worker has actually picked A up (inflight == 1), so the
+        // queue is empty and the capacity accounting below is deterministic.
+        let mut picked = false;
+        for _ in 0..200 {
+            if pool.metrics.inflight.load(Ordering::Relaxed) == 1 {
+                picked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(picked, "worker never picked up the blocking job");
+
+        // Queue capacity is 2: the next two fit, the rest shed.
+        let r_b = pool.submit(noop_job());
+        let r_c = pool.submit(noop_job());
+        let r_d = pool.submit(noop_job());
+        let r_e = pool.submit(noop_job());
+
+        // Unblock before asserting so a failed assert can't hang Drop's join.
+        let _ = unblock_tx.send(());
+
+        assert!(matches!(r_b, SubmitResult::Submitted), "B should enqueue");
+        assert!(matches!(r_c, SubmitResult::Submitted), "C should enqueue");
+        assert!(matches!(r_d, SubmitResult::Full), "D should shed (queue full)");
+        assert!(matches!(r_e, SubmitResult::Full), "E should shed (queue full)");
+
+        drop(pool);
+    }
+
+    /// `inflight` returns to 0 and `completed` counts every job — including one
+    /// that panics (the worker catches it and still records completion).
+    #[test]
+    fn inflight_and_completed_track_jobs_including_panics() {
+        pyo3::Python::initialize();
+        let pool = PyExecutor::spawn(
+            test_runtime().handle().clone(),
+            ExecutorConfig {
+                core_threads: 2,
+                max_threads: 2,
+                queue_capacity: 64,
+                stall_abort: None,
+            },
+        );
+
+        const JOBS: u64 = 32;
+        for index in 0..JOBS {
+            let job: Job = if index == 7 {
+                Box::new(|| panic!("boom — must not break accounting"))
+            } else {
+                noop_job()
+            };
+            assert!(matches!(pool.submit(job), SubmitResult::Submitted));
+        }
+
+        let mut done = false;
+        for _ in 0..400 {
+            if pool.metrics.completed.load(Ordering::Relaxed) >= JOBS {
+                done = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(done, "pool did not complete all jobs");
+        assert_eq!(
+            pool.metrics.inflight.load(Ordering::Relaxed),
+            0,
+            "every worker must be idle once the batch drains"
+        );
+
+        drop(pool);
+    }
+
+    /// Watchdog positive: a pool that is at its thread cap with every worker
+    /// busy and zero completions for the stall window fires the abort action.
+    #[test]
+    fn watchdog_fires_when_pool_wedged() {
+        let metrics = Arc::new(PoolMetrics::default());
+        // Simulate a fully-grown 1-thread pool whose only worker is wedged:
+        // at the cap (total == max), busy, never completes.
+        metrics.total.store(1, Ordering::Relaxed);
+        metrics.inflight.store(1, Ordering::Relaxed);
+
+        let (_keep_alive_sender, receiver) = flume::bounded::<Job>(8);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_for_action = Arc::clone(&fired);
+        let on_stall: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            fired_for_action.store(true, Ordering::Relaxed);
+        });
+
+        let params = WatchdogParams {
+            max_threads: 1,
+            stall_abort: Some(Duration::from_millis(150)),
+            check_interval: Duration::from_millis(50),
+        };
+
+        let metrics_for_thread = Arc::clone(&metrics);
+        let shutdown_for_thread = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            run_watchdog(
+                metrics_for_thread,
+                receiver,
+                params,
+                shutdown_for_thread,
+                on_stall,
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            fired.load(Ordering::Relaxed),
+            "watchdog must fire when every worker is busy with zero completions"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+    }
+
+    /// Watchdog negative: a pool that keeps completing jobs (even while fully
+    /// busy) never trips, so transient backend slowness can't abort the process.
+    #[test]
+    fn watchdog_does_not_fire_while_progressing() {
+        let metrics = Arc::new(PoolMetrics::default());
+        metrics.total.store(1, Ordering::Relaxed);
+        metrics.inflight.store(1, Ordering::Relaxed);
+
+        let (_keep_alive_sender, receiver) = flume::bounded::<Job>(8);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_for_action = Arc::clone(&fired);
+        let on_stall: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            fired_for_action.store(true, Ordering::Relaxed);
+        });
+
+        // Bump `completed` faster than the watchdog samples, so no tick ever
+        // sees zero forward progress.
+        let metrics_for_progress = Arc::clone(&metrics);
+        let shutdown_for_progress = Arc::clone(&shutdown);
+        let progress = std::thread::spawn(move || {
+            while !shutdown_for_progress.load(Ordering::Relaxed) {
+                metrics_for_progress.completed.fetch_add(1, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let params = WatchdogParams {
+            max_threads: 1,
+            stall_abort: Some(Duration::from_millis(150)),
+            check_interval: Duration::from_millis(50),
+        };
+        let metrics_for_thread = Arc::clone(&metrics);
+        let shutdown_for_thread = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            run_watchdog(
+                metrics_for_thread,
+                receiver,
+                params,
+                shutdown_for_thread,
+                on_stall,
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            !fired.load(Ordering::Relaxed),
+            "watchdog must not fire while the pool keeps completing jobs"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+        let _ = progress.join();
+    }
+
+    /// Watchdog must NOT fire while the pool can still grow: every current
+    /// worker busy with zero completions is fine if `total < max_threads`,
+    /// because the next submit will add a worker. Only an at-cap wedge is fatal.
+    #[test]
+    fn watchdog_does_not_fire_below_cap() {
+        let metrics = Arc::new(PoolMetrics::default());
+        // One thread, busy, no completions — but the cap is 4, so the pool is
+        // not wedged, it just hasn't grown yet.
+        metrics.total.store(1, Ordering::Relaxed);
+        metrics.inflight.store(1, Ordering::Relaxed);
+
+        let (_keep_alive_sender, receiver) = flume::bounded::<Job>(8);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_for_action = Arc::clone(&fired);
+        let on_stall: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            fired_for_action.store(true, Ordering::Relaxed);
+        });
+
+        let params = WatchdogParams {
+            max_threads: 4,
+            stall_abort: Some(Duration::from_millis(150)),
+            check_interval: Duration::from_millis(50),
+        };
+        let metrics_for_thread = Arc::clone(&metrics);
+        let shutdown_for_thread = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            run_watchdog(
+                metrics_for_thread,
+                receiver,
+                params,
+                shutdown_for_thread,
+                on_stall,
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(
+            !fired.load(Ordering::Relaxed),
+            "watchdog must not fire while the pool is below its thread cap (can still grow)"
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+    }
+
+    /// **Regression guard for commit 1c541e3** — the fixed (non-elastic) pool
+    /// let `core`-many concurrent *blocking* handlers starve every other
+    /// handler, wedging the engine. The pool must GROW past its core size so a
+    /// new handler still runs while more-than-core handlers block. This test
+    /// fails on a non-elastic pool (the canary would queue forever) and passes
+    /// on the elastic one.
+    #[test]
+    fn pool_grows_under_blocking_load() {
+        pyo3::Python::initialize();
+        let pool = PyExecutor::spawn(
+            test_runtime().handle().clone(),
+            ExecutorConfig {
+                core_threads: 2,
+                max_threads: 8,
+                queue_capacity: 64,
+                stall_abort: None,
+            },
+        );
+
+        // Occupy more workers than the core size with handlers that block until
+        // released (busy-park, minimal CPU).
+        const BLOCKERS: usize = 4; // > core_threads (2)
+        let release = Arc::new(AtomicBool::new(false));
+        for _ in 0..BLOCKERS {
+            let release = Arc::clone(&release);
+            let blocker: Job = Box::new(move || {
+                while !release.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            });
+            assert!(matches!(pool.submit(blocker), SubmitResult::Submitted));
+        }
+
+        // A canary handler must still run despite all BLOCKERS being stuck —
+        // which is only possible if the pool grew past its core size.
+        let canary_ran = Arc::new(AtomicBool::new(false));
+        let canary_flag = Arc::clone(&canary_ran);
+        let canary: Job = Box::new(move || {
+            canary_flag.store(true, Ordering::Relaxed);
+        });
+        assert!(matches!(pool.submit(canary), SubmitResult::Submitted));
+
+        let mut ran = false;
+        for _ in 0..300 {
+            if canary_ran.load(Ordering::Relaxed) {
+                ran = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let grown_to = pool.size();
+
+        // Release blockers before asserting so a failed assert can't hang Drop.
+        release.store(true, Ordering::Relaxed);
+
+        assert!(
+            ran,
+            "canary handler must run despite {BLOCKERS} blocking handlers — the \
+             pool must grow past its core size (this is the 1c541e3 regression)"
+        );
+        assert!(
+            grown_to >= BLOCKERS + 1,
+            "pool must grow to absorb {BLOCKERS} blockers + the canary; grew to {grown_to}"
+        );
+
+        drop(pool);
+    }
+
+    /// The pool grows only up to `max_threads` and never shrinks afterwards
+    /// (never-reaped → the persistent free-threaded-CPython attach can't leak).
+    #[test]
+    fn pool_caps_at_max_and_never_reaps() {
+        pyo3::Python::initialize();
+        let pool = PyExecutor::spawn(
+            test_runtime().handle().clone(),
+            ExecutorConfig {
+                core_threads: 1,
+                max_threads: 3,
+                queue_capacity: 64,
+                stall_abort: None,
+            },
+        );
+
+        // Submit far more blockers than the cap to force growth to the ceiling.
+        let release = Arc::new(AtomicBool::new(false));
+        for _ in 0..10 {
+            let release = Arc::clone(&release);
+            let blocker: Job = Box::new(move || {
+                while !release.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            });
+            let _ = pool.submit(blocker);
+        }
+
+        // Total must reach — and never exceed — max_threads.
+        let mut capped = false;
+        for _ in 0..300 {
+            let total = pool.size();
+            assert!(total <= 3, "pool must never exceed max_threads; saw {total}");
+            if total == 3 {
+                capped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(capped, "pool should have grown to max_threads under heavy load");
+
+        // Drain and confirm the pool does NOT shrink (no reaping → no leak).
+        release.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            pool.size(),
+            3,
+            "pool must not shrink after load subsides (workers are never reaped)"
+        );
+
+        drop(pool);
     }
 }

@@ -74,7 +74,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 |---------|-----------|--------|-------|
 | Digest auth — 401 (UAS) | **Production** | `auth.require_digest()` | REGISTER challenges |
 | Digest auth — 407 (proxy) | **Production** | `auth.require_proxy_digest()` | INVITE challenges |
-| HTTP backend (HA1 lookup) | **Production** | `auth.backend: http` | REST credential lookup |
+| HTTP backend (HA1 lookup) | **Production** | `auth.backend: http` | REST credential lookup; optional per-username TTL cache (`auth.http.cache_ttl_secs`) flattens registration storms so repeat REGISTERs skip the blocking fetch |
 | Static users backend | Implemented | `auth.backend: static` | Inline config credentials |
 | Diameter Cx backend (HSS) | **Production** | `auth.backend: diameter_cx` | 3GPP TS 29.228 |
 | AKA / AKAv1-MD5 (HSS-backed) | **Production** | `auth.require_ims_digest()` | 3GPP TS 33.203 via Cx MAR/MAA |
@@ -222,6 +222,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Timer routes | Implemented | `@timer.every()`, `timer.set()`/`cancel()` | Periodic callbacks via Tokio; one-shot cancellable timers keyed by string |
 | Mock SDK for testing | Implemented | `siphon-sdk` | Test scripts without Rust binary |
 | Extension API (host namespaces, tasks, custom handler kinds) | Implemented | `extensions:`, `register_namespace`/`register_task`, `_siphon_registry.register("custom.kind", …)` | Open extension surface for custom transports / sinks; `ScriptHandle::handlers_for` + `call_handler` dispatch into script handlers from host extensions |
+| Elastic handler pool (grow + bounded queue + watchdog) | **Production** | `script.sync_pool_size` / `sync_pool_max`, `executor_queue_capacity`, `handler_stall_abort_secs` | Pool grows core→max under blocking load and never reaps (no wedge, no heap leak); bounded queue load-sheds at the cap; liveness watchdog aborts (→ supervisor restart) only if at-cap and fully wedged. Regression-guarded by `pool_grows_under_blocking_load`. Metrics: `siphon_pyexec_*`. See [handler-execution-model.md](handler-execution-model.md) |
 
 ## Dialog Management
 

@@ -1127,6 +1127,9 @@ async def route(request):
             reload: ReloadMode::Auto,
             async_pool_size: None,
             sync_pool_size: None,
+            sync_pool_max: None,
+            handler_stall_abort_secs: 30,
+            executor_queue_capacity: 1024,
         };
         let result = ScriptEngine::new(&config);
         assert!(result.is_err());
@@ -1153,6 +1156,9 @@ def route(request):
             reload: ReloadMode::Auto,
             async_pool_size: None,
             sync_pool_size: None,
+            sync_pool_max: None,
+            handler_stall_abort_secs: 30,
+            executor_queue_capacity: 1024,
         };
         let engine = ScriptEngine::new(&config).unwrap();
         assert_eq!(engine.state().handlers.len(), 1);
@@ -1201,6 +1207,9 @@ def route(request):
             reload: ReloadMode::Auto,
             async_pool_size: None,
             sync_pool_size: None,
+            sync_pool_max: None,
+            handler_stall_abort_secs: 30,
+            executor_queue_capacity: 1024,
         };
         let engine = ScriptEngine::new(&config).unwrap();
         assert_eq!(engine.state().handlers.len(), 1);
