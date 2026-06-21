@@ -50,8 +50,24 @@ pub async fn listen(
     tokio::spawn(async move {
         while let Ok(outbound) = outbound_rx.recv_async().await {
             if let Some(sender) = connection_map_clone.get(&outbound.connection_id) {
-                if let Err(e) = sender.send(outbound.data).await {
-                    warn!("TCP outbound send failed for connection {:?}: {}", outbound.connection_id, e);
+                // Non-blocking: NEVER park in `send().await` here. This task is the
+                // single outbound distributor and it holds the `connection_map`
+                // shard read guard for the whole `if let`. A non-reading peer
+                // fills its bounded channel; an awaiting send would then park
+                // holding the guard — stalling outbound for every connection
+                // (head-of-line) and blocking the accept loop's `insert` on the
+                // same shard (accept stops, backlog fills, engine wedges).
+                // `try_send` keeps the guard for only the synchronous send and
+                // sheds for a backed-up (stuck) peer — it will retransmit or its
+                // connection will close.
+                match sender.try_send(outbound.data) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!("TCP outbound dropped: connection {:?} send buffer full (slow/stuck peer)", outbound.connection_id);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        warn!("TCP outbound dropped: connection {:?} closed", outbound.connection_id);
+                    }
                 }
             } else if let Some(ref pool) = pool {
                 match pool.send_tcp(outbound.destination, outbound.data).await {

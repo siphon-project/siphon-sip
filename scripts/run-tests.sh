@@ -31,6 +31,7 @@ RUN_B2BUA=false
 RUN_GATEWAY=false
 RUN_AUTO100=false
 RUN_HTTP_AUTH=false
+RUN_WEDGE=false
 SKIP_RUST=false
 
 for arg in "$@"; do
@@ -44,9 +45,10 @@ for arg in "$@"; do
     --gateway)    RUN_GATEWAY=true ;;
     --auto100)    RUN_AUTO100=true ;;
     --http-auth)  RUN_HTTP_AUTH=true ;;
+    --wedge)      RUN_WEDGE=true ;;
     --skip-rust)  SKIP_RUST=true ;;
     --help|-h)
-      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--reinvite] [--b2bua] [--gateway] [--auto100] [--http-auth] [--skip-rust]"
+      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--reinvite] [--b2bua] [--gateway] [--auto100] [--http-auth] [--wedge] [--skip-rust]"
       exit 0
       ;;
     *)
@@ -232,7 +234,19 @@ if [[ "$RUN_HTTP_AUTH" == true ]]; then
     up --abort-on-container-exit --exit-code-from sipp-onchange-load \
     mock-http-auth siphon-onchange sipp-onchange-load
   docker compose -f "$COMPOSE_FILE" --profile http-auth rm -sf \
-    mock-http-auth siphon-onchange sipp-onchange-load 2>/dev/null || true
+    mock-http-auth siphon-onchange sipp-onchange-load 2>/dev/nu
+    ll || true
+fi
+
+# ── Outbound-drain wedge regression (optional) ───────────────────────────────
+# A single non-reading peer (toll-fraud scanner that never ACKs its 401s, or a
+# stream peer whose far end stalls) must not be able to stall the per-listener
+# outbound distributor. Pre-fix, send().await on the full bounded channel parked
+# the drain while it held the connection-map shard guard, stalling ALL outbound
+# and blocking accept(). run_sipp tolerates 255; this is a hard exit 1 on wedge.
+if [[ "$RUN_WEDGE" == true ]]; then
+  echo "=== outbound-drain wedge regression (non-reading peer @ cpus 0.5) ==="
+  run_sipp bash scripts/wedge_test.sh
 fi
 
 echo ""

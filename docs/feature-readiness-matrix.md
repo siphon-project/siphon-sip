@@ -32,15 +32,15 @@ This document tracks the maturity of every SIPhon feature across three readiness
 
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
-| TCP | **Production** | `listen.tcp` | AS-facing; RFC 3261 §18.3 stream framing with Content-Length extraction; outbound distributor falls back to the `ConnectionPool` when an `OutboundMessage` arrives without a matching inbound connection (covers UAC fire-and-forget paths like in-dialog NOTIFY from `subscribe_state.notify()` whose Route header points at a destination with no live inbound socket — previously the message was built but silently dropped at the connection-map lookup) |
-| TLS | **Production** | `listen.tls` | Subscriber-facing, TLS 1.3 validated; RFC 3261 §18.3 stream framing |
+| TCP | **Production** | `listen.tcp` | AS-facing; RFC 3261 §18.3 stream framing with Content-Length extraction; outbound distributor falls back to the `ConnectionPool` when an `OutboundMessage` arrives without a matching inbound connection (covers UAC fire-and-forget paths like in-dialog NOTIFY from `subscribe_state.notify()` whose Route header points at a destination with no live inbound socket — previously the message was built but silently dropped at the connection-map lookup). **Wedge-hardened (all stream transports):** the per-listener outbound distributor routes with a non-blocking `try_send` instead of `send().await`. A single non-reading peer (toll-fraud scanner that never ACKs its 401s, or a stream peer whose far end stalls) fills its bounded per-connection channel; an awaiting send parked there while holding the `connection_map` shard read guard, stalling outbound for **every** connection (head-of-line) and blocking the accept loop's `insert` on the same shard — accept stops, the backlog fills, the engine wedges (no logs) until restart. `try_send` keeps the guard only for the synchronous send and sheds a backed-up peer. Reproduced + regression-guarded black-box on a real container at `--cpus 0.5` by `scripts/wedge_test.sh` (`run-tests.sh --wedge`) — probe times out pre-fix, answered post-fix |
+| TLS | **Production** | `listen.tls` | Subscriber-facing, TLS 1.3 validated; RFC 3261 §18.3 stream framing; outbound distributor wedge-hardened with non-blocking `try_send` (see TCP) |
 | TLS 1.3 | **Production** | `tls.method: TLSv1_3` | |
 | TLS 1.2 | Implemented | `tls.method: TLSv1_2` | |
 | mTLS (client cert verification) | Implemented | `tls.verify_client: true` | |
 | UDP | **Production** | `listen.udp` | |
-| WebSocket (WS) | Implemented | `listen.ws` | RFC 7118, browser/WebRTC clients |
-| Secure WebSocket (WSS) | Implemented | `listen.wss` | |
-| SCTP | Implemented | `listen.sctp` | RFC 4168, IMS inter-node |
+| WebSocket (WS) | Implemented | `listen.ws` | RFC 7118, browser/WebRTC clients; outbound distributor wedge-hardened with non-blocking `try_send` (see TCP) |
+| Secure WebSocket (WSS) | Implemented | `listen.wss` | Outbound distributor wedge-hardened with non-blocking `try_send` (see TCP) |
+| SCTP | Implemented | `listen.sctp` | RFC 4168, IMS inter-node; outbound distributor wedge-hardened with non-blocking `try_send` (see TCP) |
 | Per-socket advertised address | **Production** | `listen.tls[].advertise` | |
 | Global advertised address | Implemented | `advertised_address:` | Fallback for 0.0.0.0 binds |
 | DSCP/ToS marking | Implemented | `listen.dscp` | RFC 4594 signaling QoS; default CS3 (24); per-listener override |

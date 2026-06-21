@@ -1,0 +1,15 @@
+# Config for the outbound-drain wedge regression test (scripts/wedge_test.sh).
+# Minimal TCP listener + a script that replies to everything with a large body,
+# so a single non-reading peer can back up its per-connection outbound buffer.
+# No rate limiting / failed-auth ban here — we WANT every request answered so the
+# buffer fills; the test proves the drain keeps serving OTHER connections anyway.
+listen:
+  tcp:
+    - "0.0.0.0:5060"
+domain:
+  local: ["127.0.0.1", "0.0.0.0"]
+script:
+  path: "/etc/siphon/test_scripts/wedge.py"
+log:
+  level: warn
+  format: pretty

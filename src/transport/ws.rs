@@ -139,8 +139,20 @@ fn spawn_outbound_dispatcher(
     tokio::spawn(async move {
         while let Ok(outbound) = outbound_rx.recv_async().await {
             if let Some(sender) = connection_map.get(&outbound.connection_id) {
-                if let Err(error) = sender.send(outbound.data).await {
-                    warn!("{} outbound send failed for connection {:?}: {}", label, outbound.connection_id, error);
+                // Non-blocking: NEVER park in `send().await` here (see tcp.rs for
+                // the full rationale). Awaiting a send to a non-reading peer's full
+                // bounded channel would park this single distributor while holding
+                // the `connection_map` shard guard — stalling all outbound and
+                // blocking accept's `insert` on the same shard. `try_send` sheds
+                // for a backed-up (stuck) peer instead.
+                match sender.try_send(outbound.data) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!("{} outbound dropped: connection {:?} send buffer full (slow/stuck peer)", label, outbound.connection_id);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        warn!("{} outbound dropped: connection {:?} closed", label, outbound.connection_id);
+                    }
                 }
             } else {
                 debug!("{} outbound: connection {:?} not found (may have closed)", label, outbound.connection_id);

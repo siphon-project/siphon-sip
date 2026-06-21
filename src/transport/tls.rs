@@ -222,8 +222,21 @@ pub async fn listen(
     tokio::spawn(async move {
         while let Ok(outbound) = outbound_rx.recv_async().await {
             if let Some(sender) = connection_map_clone.get(&outbound.connection_id) {
-                if let Err(error) = sender.send(outbound.data).await {
-                    warn!("TLS outbound send failed for connection {:?}: {}", outbound.connection_id, error);
+                // Non-blocking: NEVER park in `send().await` here (see tcp.rs for
+                // the full rationale). This single outbound distributor holds the
+                // `connection_map` shard read guard across this `if let`; an
+                // awaiting send to a non-reading peer's full bounded channel would
+                // park here, stalling outbound for every connection and blocking
+                // accept's `insert` on the same shard — the wedge. `try_send`
+                // sheds for a backed-up (stuck) peer instead.
+                match sender.try_send(outbound.data) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!("TLS outbound dropped: connection {:?} send buffer full (slow/stuck peer)", outbound.connection_id);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        warn!("TLS outbound dropped: connection {:?} closed", outbound.connection_id);
+                    }
                 }
             } else if let Some(ref pool) = pool {
                 // No existing connection — create outbound TLS via pool
