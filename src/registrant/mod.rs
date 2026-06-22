@@ -973,6 +973,23 @@ impl RegistrantManager {
             .and_then(|entry| entry.ue_ipsec.as_ref().and_then(|i| i.security_server.clone()))
     }
 
+    /// Components for the UE→P-CSCF SA flow, used to build a `Flow` the B2BUA
+    /// can dial over for MO calls: `(pcscf_addr, pcscf_port_s, ue_port_c)`.
+    /// Returns `None` until the handshake recorded a Security-Server (i.e.
+    /// `pcscf_port_s` is set). The MO B-leg sends to `pcscf_addr:pcscf_port_s`
+    /// sourced from `ue_port_c`, so it rides the established SA.
+    pub fn ue_flow_components(&self, aor: &str) -> Option<(IpAddr, u16, u16)> {
+        self.entries.get(aor).and_then(|entry| {
+            entry.ue_ipsec.as_ref().and_then(|ipsec| {
+                if ipsec.pcscf_port_s == 0 {
+                    None
+                } else {
+                    Some((entry.destination.ip(), ipsec.pcscf_port_s, ipsec.ue_port_c))
+                }
+            })
+        })
+    }
+
     /// Build the four-SA descriptor to install for this entry's UE side.
     /// Returns `None` until both an AKA challenge (CK/IK) and a Security-Server
     /// answer have been recorded.

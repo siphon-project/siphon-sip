@@ -37,6 +37,11 @@ pub enum CallAction {
         /// (RFC 5626 §5.3 connection reuse — the only way to reach a WebSocket
         /// callee, RFC 7118 §5) instead of DNS-resolving `target`/`next_hop`.
         flow: Option<super::registrar::PyFlow>,
+        /// Route header set prepended to the B-leg INVITE (after the A-leg
+        /// Route/Record-Route are stripped). Used to carry the captured IMS
+        /// Service-Route on MO calls so they traverse the originating S-CSCF
+        /// (RFC 3608). Each entry is a full route value, e.g. `<sip:scscf;lr>`.
+        route: Vec<String>,
         timeout: u32,
     },
     /// Fork to multiple targets.
@@ -649,7 +654,8 @@ impl PyCall {
     ///         copy=["X-Operator-Tag"],
     ///         strip=["History-Info"],
     ///     )
-    #[pyo3(signature = (uri, timeout=30, next_hop=None, flow=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new()))]
+    #[pyo3(signature = (uri, timeout=30, next_hop=None, flow=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), route=Vec::new()))]
+    #[allow(clippy::too_many_arguments)]
     fn dial(
         &mut self,
         uri: &str,
@@ -660,11 +666,13 @@ impl PyCall {
         copy: Vec<String>,
         strip: Vec<String>,
         translate: Vec<(String, String)>,
+        route: Vec<String>,
     ) {
         self.action = CallAction::Dial {
             target: uri.to_string(),
             next_hop: next_hop.map(String::from),
             flow,
+            route,
             timeout,
         };
         self.update_header_policy_input(header_policy, copy, strip, translate);
@@ -930,18 +938,42 @@ mod tests {
     fn call_dial() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
-        call.dial("sip:bob@10.0.0.2:5060", 30, None, None, None, vec![], vec![], vec![]);
+        call.dial("sip:bob@10.0.0.2:5060", 30, None, None, None, vec![], vec![], vec![], vec![]);
         assert_eq!(
             call.action(),
             &CallAction::Dial {
                 target: "sip:bob@10.0.0.2:5060".to_string(),
                 next_hop: None,
                 flow: None,
+                route: vec![],
                 timeout: 30,
             }
         );
         // No policy kwargs → no input captured (existing scripts pay zero cost)
         assert!(call.header_policy_input().is_none());
+    }
+
+    #[test]
+    fn call_dial_with_route() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        call.dial(
+            "sip:5112@ims.mnc01.mcc001.3gppnetwork.org",
+            30,
+            None,
+            None,
+            None,
+            vec![],
+            vec![],
+            vec![],
+            vec!["<sip:scscf.ims.mnc01.mcc001.3gppnetwork.org:6060;lr>".to_string()],
+        );
+        match call.action() {
+            CallAction::Dial { route, .. } => {
+                assert_eq!(route, &vec!["<sip:scscf.ims.mnc01.mcc001.3gppnetwork.org:6060;lr>".to_string()]);
+            }
+            other => panic!("expected Dial, got {other:?}"),
+        }
     }
 
     #[test]
@@ -957,6 +989,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            vec![],
         );
         assert_eq!(
             call.action(),
@@ -964,6 +997,7 @@ mod tests {
                 target: "sip:5112@ims.mnc088.mcc204.3gppnetwork.org".to_string(),
                 next_hop: Some("sip:172.16.0.111:4060".to_string()),
                 flow: None,
+                route: vec![],
                 timeout: 30,
             }
         );
@@ -982,6 +1016,7 @@ mod tests {
             vec!["X-Operator-Tag".to_string()],
             vec!["History-Info".to_string()],
             vec![("Diversion".to_string(), "rfc7044".to_string())],
+            vec![],
         );
         let input = call.header_policy_input().expect("policy input must be captured");
         assert_eq!(input.policy_name.as_deref(), Some("ims-trust-domain-boundary@2026"));

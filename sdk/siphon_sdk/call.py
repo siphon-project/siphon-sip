@@ -211,6 +211,7 @@ class Call:
         copy: Optional[list[str]] = None,
         strip: Optional[list[str]] = None,
         translate: Optional[list[tuple[str, str]]] = None,
+        route: Optional[list[str]] = None,
     ) -> None:
         """Dial a single B-leg target.
 
@@ -247,6 +248,12 @@ class Call:
                 pairs.  ``op_name`` is one of: ``"rfc7044"`` /
                 ``"diversion-to-history-info"`` (translate ``Diversion``
                 per RFC 7044).  Unknown ops are logged and dropped.
+            route: Route header set prepended to the B-leg INVITE *after* the
+                A-leg Route/Record-Route are stripped.  Carries the captured
+                IMS Service-Route on MO calls so the request traverses the
+                originating S-CSCF (RFC 3608).  Each entry is a full route
+                value, e.g. ``"<sip:scscf.ims.example.com:6060;lr>"`` — pass
+                the list returned by ``registration.service_route(impu)``.
 
         Example::
 
@@ -283,6 +290,7 @@ class Call:
                 "copy": copy or [],
                 "strip": strip or [],
                 "translate": translate or [],
+                "route": route or [],
             },
         ))
 

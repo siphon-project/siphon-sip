@@ -233,6 +233,44 @@ impl PyRegistration {
     fn count(&self) -> usize {
         self.inner.len()
     }
+
+    /// The Service-Route set (RFC 3608) the S-CSCF granted this AoR on the
+    /// 200 OK — the Route a B2BUA prepends to MO requests so they traverse the
+    /// originating S-CSCF. Empty until the registration succeeds.
+    fn service_route(&self, aor: &str) -> Vec<String> {
+        self.inner.service_route(aor)
+    }
+
+    /// The P-Associated-URI list (implicit registration set) for this AoR.
+    fn associated_uris(&self, aor: &str) -> Vec<String> {
+        self.inner.associated_uris(aor)
+    }
+
+    /// A `Flow` over the established UE→P-CSCF IPsec SA for MO B2BUA calls.
+    ///
+    /// Pass the result to ``call.dial(flow=...)``: the B-leg INVITE is sent to
+    /// the P-CSCF protected server port sourced from the UE protected client
+    /// port, so it rides the SA. `ue_ip` is siphon's own address on the SA
+    /// (the IP its protected ports are bound to). Returns ``None`` until the
+    /// sec-agree handshake has completed (no Security-Server recorded yet).
+    fn flow(&self, aor: &str, ue_ip: &str) -> PyResult<Option<crate::script::api::registrar::PyFlow>> {
+        let ue_ip: std::net::IpAddr = ue_ip.parse().map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err(format!("ue_ip '{ue_ip}' is not an IP address"))
+        })?;
+        Ok(self
+            .inner
+            .ue_flow_components(aor)
+            .map(|(pcscf_addr, pcscf_port_s, ue_port_c)| {
+                crate::script::api::registrar::PyFlow {
+                    transport: "udp".to_string(),
+                    // dial(flow=) routes to source_addr, sourced from local_addr.
+                    source_addr: std::net::SocketAddr::new(pcscf_addr, pcscf_port_s),
+                    local_addr: std::net::SocketAddr::new(ue_ip, ue_port_c),
+                    // UDP egress is selected by source_local_addr, not conn id.
+                    connection_id: 0,
+                }
+            }))
+    }
 }
 
 /// Parse an initial SQN_MS from a 12-hex-char string into 6 bytes.

@@ -2674,6 +2674,34 @@ class MockRegistration:
         """Number of configured registrations."""
         return len(self._entries)
 
+    def service_route(self, aor: str) -> list[str]:
+        """The captured Service-Route set (RFC 3608) for an AoR — the Route a
+        B2BUA prepends to MO calls so they traverse the originating S-CSCF.
+        Empty in the mock unless populated on the entry dict by a test."""
+        entry = self._entries.get(aor)
+        return list(entry.get("service_route", [])) if entry else []
+
+    def associated_uris(self, aor: str) -> list[str]:
+        """The P-Associated-URI list (implicit registration set) for an AoR."""
+        entry = self._entries.get(aor)
+        return list(entry.get("associated_uris", [])) if entry else []
+
+    def flow(self, aor: str, ue_ip: str):
+        """A :class:`Flow` over the UE→P-CSCF IPsec SA for MO ``call.dial``.
+
+        Real runtime returns ``None`` until the sec-agree handshake completes;
+        the mock returns a Flow whenever the entry was added with
+        ``ipsec=True`` (so MO handlers can be unit-tested), else ``None``.
+        """
+        entry = self._entries.get(aor)
+        if not entry or not entry.get("ipsec"):
+            return None
+        from .types import Flow
+        return Flow(
+            transport="udp",
+            local_addr=f"{ue_ip}:{entry.get('ue_port_c')}",
+        )
+
     @staticmethod
     def on_change(fn: Callable) -> Callable:
         """Register a handler for outbound registration state changes.

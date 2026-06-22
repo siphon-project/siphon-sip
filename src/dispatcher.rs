@@ -7942,12 +7942,13 @@ fn handle_b2bua_invite(
             state.call_actors.remove_call(&call_id);
             state.call_event_receivers.remove(&call_id);
         }
-        CallAction::Dial { target, next_hop, flow, timeout } => {
+        CallAction::Dial { target, next_hop, flow, route, timeout } => {
             debug!(
                 call_id = %call_id,
                 target = %target,
                 next_hop = ?next_hop,
                 flow = flow.is_some(),
+                routes = route.len(),
                 "B2BUA: dialling B-leg",
             );
             b2bua_send_b_leg_invite(
@@ -7955,6 +7956,7 @@ fn handle_b2bua_invite(
                 &target,
                 next_hop.as_deref(),
                 flow.as_ref(),
+                &route,
                 &message_guard,
                 &inbound,
                 state,
@@ -7969,6 +7971,7 @@ fn handle_b2bua_invite(
                     target,
                     None,
                     flows.get(index).and_then(|f| f.as_ref()),
+                    &[],
                     &message_guard,
                     &inbound,
                     state,
@@ -8013,11 +8016,13 @@ fn handle_b2bua_invite(
 /// wire destination instead of `target_uri` — IMS edge use-case where the
 /// R-URI must carry the canonical home-domain IMPU but the message has to
 /// be routed via a fixed next-hop (BGCF, I-CSCF, outbound proxy, …).
+#[allow(clippy::too_many_arguments)]
 fn b2bua_send_b_leg_invite(
     call_id: &str,
     target_uri: &str,
     next_hop: Option<&str>,
     flow: Option<&crate::script::api::registrar::PyFlow>,
+    b_leg_route: &[String],
     original_request: &SipMessage,
     _inbound: &InboundMessage,
     state: &DispatcherState,
@@ -8081,6 +8086,13 @@ fn b2bua_send_b_leg_invite(
     // the Digest hash).
     b_leg_invite.headers.remove("Record-Route");
     b_leg_invite.headers.remove("Route");
+
+    // Script-supplied Route set (`call.dial(route=[…])`) — the captured IMS
+    // Service-Route on MO calls, prepended here *after* the A-leg Route strip so
+    // the B-leg traverses the originating S-CSCF (RFC 3608 / TS 24.229).
+    if !b_leg_route.is_empty() {
+        b_leg_invite.headers.set_all("Route", b_leg_route.to_vec());
+    }
 
     // Replace Via with our own (set preserves header position)
     b_leg_invite.headers.set("Via", via_value);

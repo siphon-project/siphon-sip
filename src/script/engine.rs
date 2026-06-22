@@ -1424,6 +1424,7 @@ def new_call(call):
                     target: "sip:bob@10.0.0.2:5060".to_string(),
                     next_hop: None,
                     flow: None,
+                    route: vec![],
                     timeout: 30,
                 }
             );
