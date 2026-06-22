@@ -159,6 +159,14 @@ pub struct SiphonMetrics {
     /// blocking HTTP on the executor pool.
     pub auth_ha1_cache_hits_total: IntCounter,
 
+    // --- Security / abuse (failed_auth_ban scanner protection) ---
+    /// Source IPs currently auto-banned. Pruned periodically; trusted_cidrs are
+    /// never counted. Alert on a sustained rise to spot a scanning campaign.
+    pub banned_ips: IntGauge,
+    /// Total failures recorded toward the auto-ban: auth challenges that were not
+    /// followed by a success, plus non-ACK INVITE server-transaction timeouts.
+    pub auth_failures_total: IntCounter,
+
     // --- Diameter ---
     pub diameter_peers_connected: IntGauge,
     pub diameter_requests_total: IntCounterVec,
@@ -314,6 +322,16 @@ impl SiphonMetrics {
             "Total HTTP-auth credential lookups served from the in-process HA1 cache",
         )?;
 
+        let banned_ips = IntGauge::new(
+            "siphon_banned_ips",
+            "Source IPs currently auto-banned by failed_auth_ban scanner protection",
+        )?;
+
+        let auth_failures_total = IntCounter::new(
+            "siphon_auth_failures_total",
+            "Total failures recorded toward the auto-ban (auth challenges without a subsequent success + non-ACK INVITE server-transaction timeouts)",
+        )?;
+
         let diameter_peers_connected = IntGauge::new(
             "siphon_diameter_peers_connected",
             "Number of currently connected Diameter peers",
@@ -393,6 +411,8 @@ impl SiphonMetrics {
         registry.register(Box::new(pyexec_jobs_completed_total.clone()))?;
         registry.register(Box::new(pyexec_jobs_shed_total.clone()))?;
         registry.register(Box::new(auth_ha1_cache_hits_total.clone()))?;
+        registry.register(Box::new(banned_ips.clone()))?;
+        registry.register(Box::new(auth_failures_total.clone()))?;
         registry.register(Box::new(diameter_peers_connected.clone()))?;
         registry.register(Box::new(diameter_requests_total.clone()))?;
         registry.register(Box::new(diameter_request_errors_total.clone()))?;
@@ -432,6 +452,8 @@ impl SiphonMetrics {
             pyexec_jobs_completed_total,
             pyexec_jobs_shed_total,
             auth_ha1_cache_hits_total,
+            banned_ips,
+            auth_failures_total,
             diameter_peers_connected,
             diameter_requests_total,
             diameter_request_errors_total,

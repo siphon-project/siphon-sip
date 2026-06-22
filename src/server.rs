@@ -790,6 +790,41 @@ impl SiphonServer {
         // --- Build transport ACL ---
         let transport_acl = build_transport_acl(&config);
 
+        // --- Auto-ban (failed_auth_ban scanner protection) ---
+        // Opt-in: only installed when configured. Once installed, the auth path
+        // (challenge/success), the dispatcher (non-ACK INVITE Timer H), and the
+        // transport ACL (is_allowed) all reach it via crate::security::auto_ban().
+        if let Some(ref sec) = config.security {
+            if let Some(ref fab) = sec.failed_auth_ban {
+                let store = Arc::new(crate::security::AutoBanStore::new(
+                    fab.threshold,
+                    fab.window_secs,
+                    fab.ban_duration_secs,
+                    &sec.trusted_cidrs,
+                ));
+                crate::security::set_auto_ban(Arc::clone(&store));
+                info!(
+                    threshold = fab.threshold,
+                    window_secs = fab.window_secs,
+                    ban_duration_secs = fab.ban_duration_secs,
+                    trusted_cidrs = sec.trusted_cidrs.len(),
+                    "failed_auth_ban scanner protection enabled"
+                );
+                // Periodic prune (bounds memory under scanner churn) + publish the
+                // banned_ips gauge authoritatively each tick.
+                tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+                    loop {
+                        ticker.tick().await;
+                        store.prune();
+                        if let Some(metrics) = crate::metrics::try_metrics() {
+                            metrics.banned_ips.set(store.active_bans() as i64);
+                        }
+                    }
+                });
+            }
+        }
+
         // --- Transport channels ---
         let (inbound_tx, inbound_rx) = flume::unbounded();
         let (tcp_outbound_tx, tcp_outbound_rx) = flume::unbounded::<transport::OutboundMessage>();

@@ -104,7 +104,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Rate limiting (per source IP) | **Production** | `security.rate_limit` | Window + ban duration |
 | Scanner UA blocking | **Production** | `security.scanner_block` | sipvicious, friendly-scanner, etc. |
 | Trusted CIDRs (bypass rate limit) | **Production** | `security.trusted_cidrs` | |
-| Failed auth ban | **Production** | `security.failed_auth_ban` | Threshold + ban duration |
+| Failed auth ban (auto-ban) | **Production** | `security.failed_auth_ban` | Per-source-IP auto-ban for toll-fraud scanners. A "failure" = an auth challenge (401/407) not followed by a success **or** a non-ACK INVITE server-transaction timeout (RFC 3261 §17.2.1 Timer H — the scanner sends INVITE, gets 401, never ACKs). A successful auth resets the source's count, so a legit challenge→succeed client never accumulates. `threshold` failures within `window_secs` → ban for `ban_duration_secs` (default 10 / 600 / 3600). `trusted_cidrs` are exempt (own infra: BGCF/trunks/monitoring). Enforced at **accept/recv** on every transport via `TransportAcl::is_allowed` (dropped before any SIP parsing) — only client-transaction (relay-target) timeouts are deliberately *not* counted, so a non-answering trunk is never banned. Process-global store (`crate::security::AutoBanStore`, opt-in), lazy ban-expiry + 60s prune. Metrics: `siphon_banned_ips`, `siphon_auth_failures_total`. Unit-tested (`security::tests`) |
 | APIBan integration | **Production** | `security.apiban` | Community IP blocklist polling |
 | IP ACLs (allow/deny CIDR lists) | Implemented | Transport-level ACL | |
 | Preloaded Route rejection | **Production** | Script logic | Anti-abuse for Route header |

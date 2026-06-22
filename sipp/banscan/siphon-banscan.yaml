@@ -1,0 +1,18 @@
+# Config for the failed_auth_ban regression test (scripts/banscan_test.sh).
+# Low threshold so a few unauthenticated REGISTERs trip the ban quickly; no
+# trusted_cidrs so the loopback test client CAN be banned.
+listen:
+  tcp:
+    - "0.0.0.0:5060"
+domain:
+  local: ["127.0.0.1", "0.0.0.0"]
+script:
+  path: "/etc/siphon/test_scripts/banscan.py"
+security:
+  failed_auth_ban:
+    threshold: 3
+    window_secs: 600
+    ban_duration_secs: 60
+log:
+  level: warn
+  format: pretty

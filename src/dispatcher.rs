@@ -1601,6 +1601,26 @@ fn fire_expired_timers(state: &DispatcherState) {
     });
 
     for entry in fired {
+        // Non-ACK INVITE auto-ban signal. Timer H is the INVITE *server*
+        // transaction timeout (RFC 3261 §17.2.1 — a non-2xx final was sent and no
+        // ACK arrived within 64*T1). That is exactly the toll-fraud-scanner
+        // pattern: the peer sent an INVITE, got the 401/403, and walked away
+        // without ACKing. `entry.destination` is the UAC (the source), so this can
+        // only ever count against the originator — never a downstream relay/trunk
+        // (whose failures would surface as ICT Timer B, deliberately not counted).
+        if matches!(entry.name, TimerName::H) {
+            if let (Some(ban), Some(dest)) =
+                (crate::security::auto_ban(), entry.destination)
+            {
+                if ban.record_failure(dest.ip()) {
+                    warn!(source = %dest.ip(), "auto-ban: source banned (non-ACK INVITE timeout)");
+                }
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.auth_failures_total.inc();
+                }
+            }
+        }
+
         let event = match entry.name {
             // Server transaction timers
             TimerName::J => Some(ServerEvent::Nist(NistEvent::TimerJ)),

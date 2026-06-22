@@ -53,6 +53,16 @@ impl TransportAcl {
 
     /// Returns `true` if the source IP is permitted.
     pub fn is_allowed(&self, source: IpAddr) -> bool {
+        // Runtime auto-ban (failed_auth_ban scanner protection) — O(1) lookup,
+        // checked before the static lists like APIBAN. The store exempts
+        // trusted_cidrs internally. Process-global (mirrors metrics) rather than an
+        // injected field, so this is a no-op until the feature is configured.
+        if let Some(ban) = crate::security::auto_ban() {
+            if ban.is_banned(source) {
+                return false;
+            }
+        }
+
         // Check APIBAN blocklist first (O(1) hash lookup)
         if let Some(apiban) = &self.apiban_deny {
             if apiban.contains(&source) {

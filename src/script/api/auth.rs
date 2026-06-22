@@ -573,9 +573,33 @@ impl PyAuth {
                 guard.headers.remove("Proxy-Authorization");
                 drop(guard);
 
+                // Valid credentials — clear any accrued auto-ban failure count so
+                // a legit client that challenges-then-succeeds never accumulates.
+                if let Some(ban) = crate::security::auto_ban() {
+                    if let Ok(source) = request.source_ip_str().parse::<std::net::IpAddr>() {
+                        ban.record_success(source);
+                    }
+                }
+
                 Ok(true)
             }
             _ => {
+                // No / invalid credentials — a challenge is being issued. Count it
+                // toward the auto-ban: a scanner that never authenticates (the
+                // toll-fraud pattern: REGISTER/INVITE without creds, repeatedly)
+                // accumulates failures, while a legit client is reset by the
+                // record_success above. trusted_cidrs are exempt inside the store.
+                if let Some(ban) = crate::security::auto_ban() {
+                    if let Ok(source) = request.source_ip_str().parse::<std::net::IpAddr>() {
+                        if ban.record_failure(source) {
+                            tracing::warn!(source = %source, "auto-ban: source banned (repeated auth challenges)");
+                        }
+                    }
+                }
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.auth_failures_total.inc();
+                }
+
                 // Send challenge
                 let reason = if challenge_code == 401 {
                     "Unauthorized"

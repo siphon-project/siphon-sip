@@ -32,6 +32,7 @@ pub mod ifc;
 pub mod ipsec;
 pub mod li;
 pub mod sbi;
+pub mod security;
 pub mod server;
 pub mod siprec;
 pub mod stir;

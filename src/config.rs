@@ -996,8 +996,21 @@ pub struct ScannerBlockConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct FailedAuthBanConfig {
+    /// Number of failures (auth challenges without a subsequent success, or
+    /// non-ACK INVITE server-transaction timeouts) within `window_secs` from a
+    /// single source IP before it is banned.
     pub threshold: u32,
+    /// Sliding window (seconds) over which failures are counted. A source that
+    /// authenticates successfully has its failure count reset, so a legit client
+    /// that challenges-then-succeeds never accumulates. Default: 600 (10 min).
+    #[serde(default = "default_failed_auth_window_secs")]
+    pub window_secs: u32,
+    /// How long a ban lasts (seconds) before the source IP is allowed again.
     pub ban_duration_secs: u32,
+}
+
+fn default_failed_auth_window_secs() -> u32 {
+    600
 }
 
 // ---------------------------------------------------------------------------
@@ -2730,6 +2743,8 @@ security:
         assert_eq!(sec.trusted_cidrs, vec!["10.0.0.0/8"]);
         let fab = sec.failed_auth_ban.unwrap();
         assert_eq!(fab.threshold, 10);
+        assert_eq!(fab.ban_duration_secs, 300);
+        assert_eq!(fab.window_secs, 600); // serde default when omitted
     }
 
     #[test]

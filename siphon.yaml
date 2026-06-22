@@ -303,12 +303,18 @@ auth:
 #       - "VaxSip"
 #       - "sipcli"
 #
-#   trusted_cidrs:              # bypass rate limiting (AS, monitoring)
-#     - "10.0.0.0/8"
+#   trusted_cidrs:              # never rate-limited and never auto-banned
+#     - "10.0.0.0/8"            # own infra: AS, BGCF, trunks, monitoring
 #
-#   failed_auth_ban:            # block IP after N failed auth attempts
-#     threshold: 10
-#     ban_duration_secs: 300
+#   failed_auth_ban:            # auto-ban scanners at accept (TCP/TLS/UDP/WS/SCTP)
+#     threshold: 10             # failures within window_secs before a ban
+#     window_secs: 600          # sliding window for counting failures (default 600)
+#     ban_duration_secs: 3600   # how long the ban lasts (then auto-expires)
+#     # A "failure" = an auth challenge (401/407) not followed by a successful
+#     # auth, OR a non-ACK INVITE server-transaction timeout (the toll-fraud
+#     # scanner pattern). A successful auth resets the source's counter, so a
+#     # legit client that challenges-then-succeeds never accumulates.
+#     # trusted_cidrs are exempt. Banned IPs are dropped before any SIP parsing.
 #
 #   apiban:                     # APIBAN community blocklist (apiban.org)
 #     api_key: "your-api-key"   # get a free key at apiban.org

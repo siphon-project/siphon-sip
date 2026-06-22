@@ -32,6 +32,7 @@ RUN_GATEWAY=false
 RUN_AUTO100=false
 RUN_HTTP_AUTH=false
 RUN_WEDGE=false
+RUN_BANSCAN=false
 SKIP_RUST=false
 
 for arg in "$@"; do
@@ -46,9 +47,10 @@ for arg in "$@"; do
     --auto100)    RUN_AUTO100=true ;;
     --http-auth)  RUN_HTTP_AUTH=true ;;
     --wedge)      RUN_WEDGE=true ;;
+    --banscan)    RUN_BANSCAN=true ;;
     --skip-rust)  SKIP_RUST=true ;;
     --help|-h)
-      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--reinvite] [--b2bua] [--gateway] [--auto100] [--http-auth] [--wedge] [--skip-rust]"
+      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--reinvite] [--b2bua] [--gateway] [--auto100] [--http-auth] [--wedge] [--banscan] [--skip-rust]"
       exit 0
       ;;
     *)
@@ -247,6 +249,14 @@ fi
 if [[ "$RUN_WEDGE" == true ]]; then
   echo "=== outbound-drain wedge regression (non-reading peer @ cpus 0.5) ==="
   run_sipp bash scripts/wedge_test.sh
+fi
+
+# ── failed_auth_ban auto-ban regression (optional) ───────────────────────────
+# A scanner that repeatedly fails auth must be banned at accept (dropped before
+# SIP parsing). Hard exit 1 if the second connection still gets a 401.
+if [[ "$RUN_BANSCAN" == true ]]; then
+  echo "=== failed_auth_ban auto-ban regression (scanner banned at accept) ==="
+  run_sipp bash scripts/banscan_test.sh
 fi
 
 echo ""
