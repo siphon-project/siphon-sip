@@ -1139,6 +1139,8 @@ impl PyIpsec {
                 // Placeholder — create_sa_pair recomputes the authoritative
                 // sweep deadline from hard_lifetime_secs + grace.
                 expires_at: std::time::Instant::now(),
+                // This namespace is the P-CSCF (network) side.
+                role: crate::ipsec::SaRole::PCscf,
             };
             manager
                 .create_sa_pair(sa.clone())
@@ -1675,6 +1677,7 @@ mod tests {
             hard_lifetime_secs: Some(600_000),
             protocol: SaProtocol::Udp,
             expires_at: std::time::Instant::now(),
+            role: crate::ipsec::SaRole::PCscf,
         };
         let params = PySecurityServerParams {
             mechanism: "ipsec-3gpp".into(),
@@ -1727,6 +1730,7 @@ mod tests {
             hard_lifetime_secs: Some(600_000),
             protocol: SaProtocol::Udp,
             expires_at: std::time::Instant::now(),
+            role: crate::ipsec::SaRole::PCscf,
         };
         let params = PySecurityServerParams {
             mechanism: "ipsec-3gpp".into(),
@@ -1775,6 +1779,7 @@ mod tests {
             hard_lifetime_secs: None,
             protocol: SaProtocol::Udp,
             expires_at: std::time::Instant::now(),
+            role: crate::ipsec::SaRole::PCscf,
         };
         let params = PySecurityServerParams {
             mechanism: "ipsec-3gpp".into(),
@@ -1813,6 +1818,7 @@ mod tests {
             hard_lifetime_secs: None,
             protocol: SaProtocol::Tcp,
             expires_at: std::time::Instant::now(),
+            role: crate::ipsec::SaRole::PCscf,
         };
         let handle = PySAHandle::from_sa(&sa);
         assert_eq!(handle.protocol, "tcp");
@@ -1838,6 +1844,7 @@ mod tests {
             hard_lifetime_secs: None,
             protocol: SaProtocol::Udp,
             expires_at: std::time::Instant::now(),
+            role: crate::ipsec::SaRole::PCscf,
         }
     }
 

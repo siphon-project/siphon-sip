@@ -8,6 +8,8 @@ pub mod milenage;
 #[cfg(target_os = "linux")]
 pub mod netlink;
 
+pub mod ue;
+
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -187,6 +189,34 @@ pub(crate) enum PolicyDir {
     Out,
 }
 
+/// Which end of the sec-agree association siphon is installing SAs for.
+///
+/// The four SA *states* (transforms) are identical regardless of role — both
+/// ends install the same `(src, dst, spi)` transforms because they describe
+/// the same encrypted packets on the wire. The four XFRM *policies* differ:
+/// a flow the P-CSCF sees as inbound is outbound from the UE's vantage, and
+/// vice versa. [`SaRole::policy_dir`] encodes that mirror so one
+/// `create_sa_pair`/`delete_sa_pair` serves both roles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SaRole {
+    /// Network side (P-CSCF): UE→net flows are inbound, net→UE are outbound.
+    #[default]
+    PCscf,
+    /// UE side (soft-UE registering into IMS): the directions invert.
+    Ue,
+}
+
+impl SaRole {
+    /// The XFRM policy direction for a flow, given whether the UE is the
+    /// flow's source. The UE's view is the exact mirror of the P-CSCF's.
+    pub(crate) fn policy_dir(self, src_is_ue: bool) -> PolicyDir {
+        match (self, src_is_ue) {
+            (SaRole::PCscf, true) | (SaRole::Ue, false) => PolicyDir::In,
+            (SaRole::PCscf, false) | (SaRole::Ue, true) => PolicyDir::Out,
+        }
+    }
+}
+
 /// Upper-layer protocol pinned into the XFRM selector for an SA pair —
 /// determines which inner-protocol frames the SA applies to.  IMS IPsec
 /// supports both ESP-over-UDP (the common deployment) and ESP-over-TCP
@@ -286,6 +316,28 @@ impl EncryptionAlgorithm {
             Self::DesEde3Cbc => 24,
         }
     }
+
+    /// The `ealg=` token used on the RFC 3329 / TS 33.203 Security-Client /
+    /// Security-Server line (distinct from the `ip xfrm` and Display names).
+    pub fn sec_agree_name(&self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::AesCbc128 => "aes-cbc",
+            Self::DesEde3Cbc => "des-ede3-cbc",
+        }
+    }
+
+    /// Parse a Security-Server/Client `ealg=` token back into the enum.
+    /// An absent `ealg` is treated by callers as `Null`; this only maps
+    /// present tokens. Returns `None` for unknown tokens.
+    pub fn from_sec_agree_name(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "null" => Some(Self::Null),
+            "aes-cbc" => Some(Self::AesCbc128),
+            "des-ede3-cbc" => Some(Self::DesEde3Cbc),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for EncryptionAlgorithm {
@@ -338,6 +390,27 @@ impl IntegrityAlgorithm {
             Self::HmacMd5 => 16,
             Self::HmacSha1 => 20,
             Self::HmacSha256 => 32,
+        }
+    }
+
+    /// The `alg=` token used on the RFC 3329 / TS 33.203 Security-Client /
+    /// Security-Server line (distinct from the `ip xfrm` and Display names).
+    pub fn sec_agree_name(&self) -> &'static str {
+        match self {
+            Self::HmacMd5 => "hmac-md5-96",
+            Self::HmacSha1 => "hmac-sha-1-96",
+            Self::HmacSha256 => "hmac-sha-256-128",
+        }
+    }
+
+    /// Parse a Security-Server/Client `alg=` token back into the enum.
+    /// Returns `None` for unknown tokens.
+    pub fn from_sec_agree_name(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "hmac-md5-96" => Some(Self::HmacMd5),
+            "hmac-sha-1-96" => Some(Self::HmacSha1),
+            "hmac-sha-256-128" => Some(Self::HmacSha256),
+            _ => None,
         }
     }
 }
@@ -421,6 +494,10 @@ pub struct SecurityAssociationPair {
     /// pair with a fresh `expires_at`, so only truly-abandoned UEs are
     /// reaped.
     pub expires_at: Instant,
+    /// Whether siphon is the network (P-CSCF) or the UE for this pair.
+    /// Determines the four policy directions in `create_sa_pair` /
+    /// `delete_sa_pair`; the SA states are identical either way.
+    pub role: SaRole,
 }
 
 /// A row of the SA-liveness snapshot ([`IpsecManager::liveness_snapshot`]):
@@ -718,32 +795,37 @@ impl IpsecManager {
         // is needed.  `None` preserves the old permanent-policy behaviour.
         let policy_lifetime = sa.hard_lifetime_secs;
 
-        // Policy 1 (in): UE:port_uc → PCSCF:port_ps
+        // Policy directions mirror by role: a UE-sourced flow is the P-CSCF's
+        // `In` and the UE's `Out` (and vice versa). `policy_dir(src_is_ue)`
+        // encodes that, so this block serves both ends.
+        let role = sa.role;
+
+        // Policy 1: UE:port_uc → PCSCF:port_ps (UE-sourced)
         self.add_policy(
             &sa.ue_addr, sa.ue_port_c,
             &sa.pcscf_addr, sa.pcscf_port_s,
-            PolicyDir::In, sa.spi_ps, proto, policy_lifetime,
+            role.policy_dir(true), sa.spi_ps, proto, policy_lifetime,
         ).await?;
 
-        // Policy 2 (out): PCSCF:port_ps → UE:port_uc
+        // Policy 2: PCSCF:port_ps → UE:port_uc (P-CSCF-sourced)
         self.add_policy(
             &sa.pcscf_addr, sa.pcscf_port_s,
             &sa.ue_addr, sa.ue_port_c,
-            PolicyDir::Out, sa.spi_uc, proto, policy_lifetime,
+            role.policy_dir(false), sa.spi_uc, proto, policy_lifetime,
         ).await?;
 
-        // Policy 3 (out): PCSCF:port_pc → UE:port_us
+        // Policy 3: PCSCF:port_pc → UE:port_us (P-CSCF-sourced)
         self.add_policy(
             &sa.pcscf_addr, sa.pcscf_port_c,
             &sa.ue_addr, sa.ue_port_s,
-            PolicyDir::Out, sa.spi_us, proto, policy_lifetime,
+            role.policy_dir(false), sa.spi_us, proto, policy_lifetime,
         ).await?;
 
-        // Policy 4 (in): UE:port_us → PCSCF:port_pc
+        // Policy 4: UE:port_us → PCSCF:port_pc (UE-sourced)
         self.add_policy(
             &sa.ue_addr, sa.ue_port_s,
             &sa.pcscf_addr, sa.pcscf_port_c,
-            PolicyDir::In, sa.spi_pc, proto, policy_lifetime,
+            role.policy_dir(true), sa.spi_pc, proto, policy_lifetime,
         ).await?;
 
         info!(
@@ -759,6 +841,26 @@ impl IpsecManager {
 
         self.associations.insert(key, sa);
         Ok(())
+    }
+
+    /// Create the UE-side IPsec SAs for an outbound IMS registration.
+    ///
+    /// Identical kernel transforms to [`create_sa_pair`], but the four XFRM
+    /// policies are installed with inverted directions (a UE-sourced flow is
+    /// `Out`, a P-CSCF-sourced flow is `In`). Forces [`SaRole::Ue`] regardless
+    /// of the role pre-set on `sa`, so the registrant can't accidentally
+    /// install network-side policies.
+    ///
+    /// `sa.ue_addr`/`ue_port_c`/`ue_port_s`/`spi_uc`/`spi_us` are the UE's own
+    /// (what it offered in Security-Client); `pcscf_*`/`spi_pc`/`spi_ps` come
+    /// from the P-CSCF's Security-Server answer. Keys are CK (encryption) and
+    /// the IK-derived integrity key — same derivation as the network side.
+    pub async fn create_ue_sa_pair(
+        &self,
+        mut sa: SecurityAssociationPair,
+    ) -> Result<(), IpsecError> {
+        sa.role = SaRole::Ue;
+        self.create_sa_pair(sa).await
     }
 
     /// Delete IPsec SAs and SPs for a UE.
@@ -778,28 +880,30 @@ impl IpsecManager {
             self.del_sa(&sa.ue_addr, &sa.pcscf_addr, sa.spi_pc).await?;
 
             // Delete policies (best-effort — ignore errors on cleanup).
-            // The selector proto must match what was used at install time
-            // — kernel keys policies on the full selector including the
-            // upper-layer protocol number.
+            // The selector proto AND direction must match what was used at
+            // install time — kernel keys policies on the full selector
+            // including the upper-layer protocol and direction. Direction
+            // mirrors by role, same as create_sa_pair.
+            let role = sa.role;
             self.del_policy(
                 &sa.ue_addr, sa.ue_port_c,
                 &sa.pcscf_addr, sa.pcscf_port_s,
-                PolicyDir::In, proto,
+                role.policy_dir(true), proto,
             ).await.ok();
             self.del_policy(
                 &sa.pcscf_addr, sa.pcscf_port_c,
                 &sa.ue_addr, sa.ue_port_s,
-                PolicyDir::Out, proto,
+                role.policy_dir(false), proto,
             ).await.ok();
             self.del_policy(
                 &sa.ue_addr, sa.ue_port_s,
                 &sa.pcscf_addr, sa.pcscf_port_c,
-                PolicyDir::In, proto,
+                role.policy_dir(true), proto,
             ).await.ok();
             self.del_policy(
                 &sa.pcscf_addr, sa.pcscf_port_s,
                 &sa.ue_addr, sa.ue_port_c,
-                PolicyDir::Out, proto,
+                role.policy_dir(false), proto,
             ).await.ok();
 
             info!(ue = %ue_addr, ue_port_c, "IPsec: SA pair deleted");
@@ -1912,6 +2016,55 @@ mod tests {
     }
 
     #[test]
+    fn sa_role_policy_dir_mirrors_between_ends() {
+        // A UE-sourced flow is the P-CSCF's inbound and the UE's outbound;
+        // a P-CSCF-sourced flow is the reverse. The two roles are exact
+        // mirrors — that is what makes one create/delete serve both.
+        assert_eq!(SaRole::PCscf.policy_dir(true), PolicyDir::In);
+        assert_eq!(SaRole::PCscf.policy_dir(false), PolicyDir::Out);
+        assert_eq!(SaRole::Ue.policy_dir(true), PolicyDir::Out);
+        assert_eq!(SaRole::Ue.policy_dir(false), PolicyDir::In);
+
+        for src_is_ue in [true, false] {
+            assert_ne!(
+                SaRole::PCscf.policy_dir(src_is_ue),
+                SaRole::Ue.policy_dir(src_is_ue),
+                "UE and P-CSCF must disagree on every flow's direction"
+            );
+        }
+    }
+
+    #[test]
+    fn sa_role_default_is_pcscf() {
+        assert_eq!(SaRole::default(), SaRole::PCscf);
+    }
+
+    /// Root-gated: installs the UE-side four SAs + four (inverted-direction)
+    /// policies against the real kernel, then tears them down. Requires
+    /// CAP_NET_ADMIN; skipped in CI. Run with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires root / CAP_NET_ADMIN for XFRM"]
+    async fn create_ue_sa_pair_installs_and_deletes() {
+        let manager = IpsecManager::new();
+        let ue_addr: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 50));
+        let mut sa = test_sa_pair(ue_addr, 6100, 20000);
+        // role is forced to Ue inside create_ue_sa_pair regardless.
+        sa.role = SaRole::PCscf;
+
+        manager
+            .create_ue_sa_pair(sa)
+            .await
+            .expect("UE SA pair installs");
+        assert_eq!(manager.active_count(), 1);
+
+        manager
+            .delete_sa_pair(&ue_addr, 6100)
+            .await
+            .expect("UE SA pair deletes");
+        assert_eq!(manager.active_count(), 0);
+    }
+
+    #[test]
     fn security_association_pair_clone() {
         let sa = SecurityAssociationPair {
             ue_addr: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
@@ -1931,6 +2084,7 @@ mod tests {
             hard_lifetime_secs: None,
             protocol: SaProtocol::Udp,
             expires_at: Instant::now(),
+            role: SaRole::PCscf,
         };
         let cloned = sa.clone();
         assert_eq!(cloned.spi_uc, 10000);
@@ -2018,6 +2172,7 @@ mod tests {
             hard_lifetime_secs: Some(3600),
             protocol: SaProtocol::Any,
             expires_at: compute_sa_expires_at(Some(3600)),
+            role: SaRole::PCscf,
         }
     }
 
