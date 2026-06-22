@@ -1379,6 +1379,7 @@ def new_call(call):
                 &crate::script::api::call::CallAction::Dial {
                     target: "sip:bob@10.0.0.2:5060".to_string(),
                     next_hop: None,
+                    flow: None,
                     timeout: 30,
                 }
             );

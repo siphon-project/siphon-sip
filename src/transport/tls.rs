@@ -19,7 +19,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
 use crate::config::TlsServerConfig;
-use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
+use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, StreamConnections, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
 use crate::transport::acl::TransportAcl;
 use crate::transport::crlf_keepalive::{drain_leading_crlf_keepalives, CrlfPongTracker};
 use crate::transport::pool::ConnectionPool;
@@ -204,7 +204,7 @@ pub async fn listen(
     outbound_rx: flume::Receiver<OutboundMessage>,
     connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
     acl: Arc<TransportAcl>,
-    addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
+    stream_connections: StreamConnections,
     tos: Option<u32>,
     pool: Option<Arc<ConnectionPool>>,
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
@@ -308,7 +308,7 @@ pub async fn listen(
                     let acceptor = (**acceptor.load()).clone();
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
-                    let addr_map = addr_map.clone();
+                    let stream_connections = stream_connections.clone();
                     let crlf_pong_tracker = crlf_pong_tracker.clone();
                     let close_tx = close_tx.clone();
 
@@ -335,7 +335,7 @@ pub async fn listen(
                         // responses back over the same connection.
                         let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
                         connection_map.insert(connection_id, outbound_tx.clone());
-                        addr_map.insert(remote_addr, connection_id);
+                        stream_connections.register(remote_addr, Transport::Tls, connection_id);
                         let keepalive_writer = outbound_tx;
 
                         // Read task with idle timeout and SIP stream framing (RFC 3261 §18.3)
@@ -412,7 +412,7 @@ pub async fn listen(
                         }
 
                         connection_map.remove(&connection_id);
-                        addr_map.remove(&remote_addr);
+                        stream_connections.unregister(&remote_addr);
                         // RFC 5626 §4.2.2 flow failure: notify the registrar so
                         // it can deregister any binding that arrived on this
                         // connection.  Best-effort.
@@ -553,7 +553,7 @@ mod tests {
             outbound_rx,
             Arc::clone(&connection_map),
             test_acl(),
-            Arc::new(DashMap::new()),
+            StreamConnections::new(),
             None,
             None,
             None,
@@ -604,7 +604,7 @@ mod tests {
             outbound_rx,
             Arc::clone(&connection_map),
             test_acl(),
-            Arc::new(DashMap::new()),
+            StreamConnections::new(),
             None,
             None,
             None,
@@ -670,7 +670,7 @@ mod tests {
         let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
-        let addr_map: Arc<DashMap<SocketAddr, ConnectionId>> = Arc::new(DashMap::new());
+        let stream_connections = StreamConnections::new();
 
         listen(
             bound_addr,
@@ -679,7 +679,7 @@ mod tests {
             outbound_rx,
             Arc::clone(&connection_map),
             test_acl(),
-            Arc::clone(&addr_map),
+            stream_connections.clone(),
             None,
             None,
             None,
@@ -721,12 +721,16 @@ mod tests {
         let connection_id = message.connection_id;
         let remote_addr = message.remote_addr;
         assert!(connection_map.contains_key(&connection_id));
-        // Verify addr_map is populated for connection reuse
-        assert!(
-            addr_map.contains_key(&remote_addr),
-            "addr_map should track TLS connection by remote address"
+        // Verify the registry is populated for connection reuse (tagged TLS).
+        assert_eq!(
+            stream_connections.reuse(remote_addr, Transport::Tls),
+            Some(connection_id),
+            "stream registry should track the TLS connection by remote address"
         );
-        assert_eq!(*addr_map.get(&remote_addr).unwrap(), connection_id);
+        assert_eq!(
+            stream_connections.get(&remote_addr),
+            Some((Transport::Tls, connection_id)),
+        );
 
         // Drop the client
         drop(tls_stream);
@@ -738,9 +742,10 @@ mod tests {
             !connection_map.contains_key(&connection_id),
             "connection should have been cleaned up after client drop"
         );
-        assert!(
-            !addr_map.contains_key(&remote_addr),
-            "addr_map should be cleaned up after client drop"
+        assert_eq!(
+            stream_connections.reuse(remote_addr, Transport::Tls),
+            None,
+            "stream registry should be cleaned up after client drop"
         );
     }
 }

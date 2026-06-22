@@ -31,7 +31,7 @@ use crate::uac::resolve_via_addr;
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::message::{Method, SipMessage};
 use crate::sip::uri::SipUri;
-use crate::transport::{ConnectionId, OutboundMessage, OutboundRouter, Transport};
+use crate::transport::{ConnectionId, OutboundMessage, OutboundRouter, StreamConnections, Transport};
 
 // ---------------------------------------------------------------------------
 // Events
@@ -664,7 +664,7 @@ pub async fn registration_loop(
     advertised_addrs: HashMap<Transport, String>,
     advertised_address: Option<String>,
     hep_sender: Option<Arc<HepSender>>,
-    tls_addr_map: Option<Arc<dashmap::DashMap<SocketAddr, ConnectionId>>>,
+    stream_connections: Option<StreamConnections>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let tick_interval = Duration::from_secs(5);
@@ -673,16 +673,19 @@ pub async fn registration_loop(
         tokio::select! {
             _ = tokio::time::sleep(tick_interval) => {
                 // Detect connection loss on connection-oriented transports
-                // (TLS/TCP/SCTP).  The pool removes dead connections from
-                // tls_addr_map; if the registrar destination is gone, force
+                // (TLS/TCP/SCTP).  The pool removes dead connections from the
+                // stream registry; if the registrar destination is gone, force
                 // an immediate re-register instead of waiting for the
-                // refresh timer.
-                if let Some(ref addr_map) = tls_addr_map {
+                // refresh timer.  The lookup is transport-filtered so an
+                // unrelated WS/WSS UE sharing the trunk's IP can't mask a dead
+                // trunk connection (preserves the pre-unification TLS-only
+                // membership semantics exactly).
+                if let Some(ref stream_connections) = stream_connections {
                     let stale: Vec<String> = manager.entries.iter()
                         .filter(|entry| {
                             entry.state == RegistrantState::Registered
                                 && matches!(entry.transport, Transport::Tls | Transport::Tcp | Transport::Sctp)
-                                && !addr_map.iter().any(|e| e.key().ip() == entry.destination.ip())
+                                && !stream_connections.has_ip_transport(entry.destination.ip(), entry.transport)
                         })
                         .map(|entry| entry.aor.clone())
                         .collect();

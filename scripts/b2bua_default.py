@@ -36,8 +36,12 @@ def new_call(call):
         return
 
     log.info(f"Forking {call.from_uri} -> {len(contacts)} contact(s)")
+    # Pass the Contact objects: for a binding this process accepted, fork()
+    # routes the B-leg INVITE over its captured inbound flow — RFC 5626 §5.3
+    # connection reuse, the only way to reach a WebSocket callee (RFC 7118 §5).
+    # Non-local contacts fall back to URI routing.
     call.fork(
-        [c.uri for c in contacts],
+        contacts,
         strategy="parallel",
         timeout=30,
     )

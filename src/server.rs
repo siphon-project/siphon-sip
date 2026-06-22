@@ -978,9 +978,15 @@ impl SiphonServer {
             tcp_entries.push((addr, tos, entry.dscp().or(global_dscp)));
         }
 
-        // TLS maps — created before pool so pool can register connections for reuse.
-        let tls_addr_map: Arc<dashmap::DashMap<std::net::SocketAddr, transport::ConnectionId>> =
-            Arc::new(dashmap::DashMap::new());
+        // Stream-connection registry — created before the pool/listeners so all
+        // stream transports (TLS, WS, WSS) and the pool register here, and the
+        // dispatcher can reuse an inbound connection for MT routing (the only
+        // way to reach a WebSocket UE; RFC 7118 §5 / RFC 5626 §5.3).  Supersedes
+        // the former TLS-only `tls_addr_map`.
+        let stream_connections = transport::StreamConnections::new();
+        // Publish it process-globally so the Python `Flow.is_alive` getter can
+        // do a real liveness lookup against the live connection set.
+        crate::script::api::set_stream_connections(stream_connections.clone());
         let tls_connection_map: Arc<dashmap::DashMap<transport::ConnectionId, tokio::sync::mpsc::Sender<bytes::Bytes>>> =
             Arc::new(dashmap::DashMap::new());
 
@@ -999,7 +1005,7 @@ impl SiphonServer {
             inbound_tx.clone(),
             pool_local_addr,
             pool_tos,
-            Some(Arc::clone(&tls_addr_map)),
+            Some(stream_connections.clone()),
             crlf_pong_tracker.clone(),
         ));
 
@@ -1024,7 +1030,7 @@ impl SiphonServer {
                 }
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting TLS transport");
-                transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map), Arc::clone(&transport_acl), Arc::clone(&tls_addr_map), tos, Some(Arc::clone(&connection_pool)), crlf_pong_tracker.clone(), connection_close_tx.clone()).await;
+                transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map), Arc::clone(&transport_acl), stream_connections.clone(), tos, Some(Arc::clone(&connection_pool)), crlf_pong_tracker.clone(), connection_close_tx.clone()).await;
             }
         }
 
@@ -1044,7 +1050,7 @@ impl SiphonServer {
             }
             let tos = resolve_tos(entry);
             info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting WS transport");
-            transport::ws::listen(addr, inbound_tx.clone(), ws_outbound_rx.clone(), Arc::clone(&ws_connection_map), Arc::clone(&transport_acl), tos, connection_close_tx.clone()).await;
+            transport::ws::listen(addr, inbound_tx.clone(), ws_outbound_rx.clone(), Arc::clone(&ws_connection_map), Arc::clone(&transport_acl), stream_connections.clone(), tos, connection_close_tx.clone()).await;
         }
 
         // WSS
@@ -1064,7 +1070,7 @@ impl SiphonServer {
                 }
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting WSS transport");
-                transport::ws::listen_secure(addr, tls_config, inbound_tx.clone(), wss_outbound_rx.clone(), Arc::clone(&wss_connection_map), Arc::clone(&transport_acl), tos, connection_close_tx.clone()).await;
+                transport::ws::listen_secure(addr, tls_config, inbound_tx.clone(), wss_outbound_rx.clone(), Arc::clone(&wss_connection_map), Arc::clone(&transport_acl), stream_connections.clone(), tos, connection_close_tx.clone()).await;
             }
         }
 
@@ -1277,7 +1283,7 @@ impl SiphonServer {
         // and the channel must stay open for the lifetime of the process.
 
         // --- Outbound registration ---
-        let registrant_manager = init_registrant(&config, &outbound_senders, local_addr, &listen_addrs, &advertised_addrs, &hep_sender, Arc::clone(&tls_addr_map), product_name, product_version);
+        let registrant_manager = init_registrant(&config, &outbound_senders, local_addr, &listen_addrs, &advertised_addrs, &hep_sender, stream_connections.clone(), product_name, product_version);
 
         // --- LI tasks ---
         spawn_li_tasks(li_state, &config);
@@ -1419,7 +1425,7 @@ impl SiphonServer {
                         keepalive_config.clone(),
                         Arc::clone(registrar),
                         Arc::clone(&uac_sender),
-                        Arc::clone(&tls_addr_map),
+                        stream_connections.clone(),
                     );
                 }
             }
@@ -1477,7 +1483,7 @@ impl SiphonServer {
             registrant_manager,
             ipsec_manager,
             config.ipsec.clone(),
-            tls_addr_map,
+            stream_connections,
             registrar_event_rx,
             diameter_incoming_rx,
             rtpengine_events_rx,
@@ -2022,7 +2028,7 @@ fn init_registrant(
     listen_addrs: &std::collections::HashMap<transport::Transport, std::net::SocketAddr>,
     advertised_addrs: &std::collections::HashMap<transport::Transport, String>,
     hep_sender: &Option<Arc<HepSender>>,
-    tls_addr_map: Arc<dashmap::DashMap<std::net::SocketAddr, transport::ConnectionId>>,
+    stream_connections: transport::StreamConnections,
     product_name: &str,
     product_version: &str,
 ) -> Option<Arc<crate::registrant::RegistrantManager>> {
@@ -2104,7 +2110,7 @@ fn init_registrant(
     let loop_advertised_addrs = advertised_addrs.clone();
     let loop_advertised_address = config.advertised_address.clone();
     let loop_hep_sender = hep_sender.clone();
-    let loop_tls_addr_map = Some(tls_addr_map);
+    let loop_stream_connections = Some(stream_connections);
     tokio::spawn(async move {
         crate::registrant::registration_loop(
             loop_manager,
@@ -2114,7 +2120,7 @@ fn init_registrant(
             loop_advertised_addrs,
             loop_advertised_address,
             loop_hep_sender,
-            loop_tls_addr_map,
+            loop_stream_connections,
             shutdown_rx,
         ).await;
     });

@@ -40,7 +40,7 @@ use crate::transaction::state::{
 use crate::transaction::{TransactionManager, ServerEvent, ClientEvent};
 use crate::transaction::timer::TimerConfig;
 use crate::hep::HepSender;
-use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, OutboundRouter, Transport};
+use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, OutboundRouter, StreamConnections, Transport};
 use crate::transport::pool::ConnectionPool;
 use crate::uac::UacSender;
 
@@ -138,10 +138,13 @@ struct DispatcherState {
     registrar_liveness: crate::config::RegistrarLivenessConfig,
     /// Outbound TCP/TLS connection pool for relay to new destinations.
     connection_pool: Arc<ConnectionPool>,
-    /// Reverse map: TLS remote SocketAddr → ConnectionId for connection reuse.
-    /// Populated by the TLS listener; used by send_to_target to reuse inbound
-    /// TLS connections when relaying to registered endpoints (like OpenSIPS).
-    tls_addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
+    /// Unified stream-connection registry: peer SocketAddr → (Transport,
+    /// ConnectionId).  Populated by the TLS/WS/WSS listeners (inbound) and the
+    /// connection pool (outbound TLS); used by `send_to_target` to reuse an
+    /// existing connection when relaying to a registered endpoint (like
+    /// OpenSIPS), and — for WebSocket — the only way to reach the UE at all
+    /// (RFC 7118 §5 / RFC 5626 §5.3).
+    stream_connections: StreamConnections,
     /// Automatically rewrite Contact URI in responses with the observed source
     /// address (from `nat.fix_contact` config).
     nat_fix_contact: bool,
@@ -346,7 +349,7 @@ pub async fn run(
     registrant_manager: Option<Arc<crate::registrant::RegistrantManager>>,
     ipsec_manager: Option<Arc<crate::ipsec::IpsecManager>>,
     ipsec_config: Option<crate::config::IpsecConfig>,
-    tls_addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
+    stream_connections: StreamConnections,
     registrar_event_rx: Option<tokio::sync::broadcast::Receiver<crate::registrar::RegistrationEvent>>,
     diameter_incoming_rx: tokio::sync::mpsc::Receiver<(
         crate::diameter::peer::IncomingRequest,
@@ -499,7 +502,7 @@ pub async fn run(
         ipsec_config,
         registrar_liveness: config.registrar.liveness.clone(),
         connection_pool,
-        tls_addr_map,
+        stream_connections,
         nat_fix_contact: config.nat.as_ref().map(|n| n.fix_contact).unwrap_or(false),
         sdp_name: config.media.as_ref()
             .and_then(|m| m.sdp_name.clone())
@@ -2983,7 +2986,7 @@ fn handle_request(
                 flow.as_ref(),
             );
         }
-        RequestAction::Fork { targets, strategy } => {
+        RequestAction::Fork { targets, flows, strategy } => {
             if targets.is_empty() {
                 warn!("fork with empty targets list");
                 let response = build_response(&message_guard, 500, "No Targets", state.server_header.as_deref(), &[]);
@@ -3000,6 +3003,7 @@ fn handle_request(
                 relay_fork_request(
                     &message_guard,
                     targets,
+                    flows,
                     fork_strategy,
                     record_routed,
                     &inbound,
@@ -3392,6 +3396,7 @@ fn relay_request(
 fn relay_fork_request(
     message: &SipMessage,
     targets: &[String],
+    flows: &[Option<crate::script::api::registrar::PyFlow>],
     strategy: crate::proxy::fork::ForkStrategy,
     record_routed: bool,
     inbound: &InboundMessage,
@@ -3421,8 +3426,9 @@ fn relay_fork_request(
     let srv_key = match server_key {
         Some(key) => key.clone(),
         None => {
-            // Fall back to single-target relay if no server transaction
-            relay_request(message, targets.first().map(|s| s.as_str()), record_routed, inbound, None, state, None, None, None, None, None);
+            // Fall back to single-target relay if no server transaction —
+            // carry the first branch's flow so a single WS contact still routes.
+            relay_request(message, targets.first().map(|s| s.as_str()), record_routed, inbound, None, state, None, None, None, None, flows.first().and_then(|f| f.as_ref()));
             return;
         }
     };
@@ -3437,6 +3443,7 @@ fn relay_fork_request(
         record_routed,
     );
     session.fork_aggregator = Some(Arc::clone(&aggregator));
+    session.fork_flows = flows.to_vec();
 
     // Determine which branches to start now
     let branches_to_start: Vec<usize> = match strategy {
@@ -3463,6 +3470,7 @@ fn relay_fork_request(
             &srv_key,
             &session_arc,
             &aggregator,
+            flows.get(branch_index).and_then(|f| f.as_ref()),
             state,
         );
     }
@@ -3482,18 +3490,35 @@ fn relay_fork_branch(
     server_key: &TransactionKey,
     session_arc: &Arc<RwLock<ProxySession>>,
     aggregator: &Arc<std::sync::Mutex<crate::proxy::fork::ForkAggregator>>,
+    flow: Option<&crate::script::api::registrar::PyFlow>,
     state: &DispatcherState,
 ) {
-    // Resolve target
-    let relay_target = match resolve_target(target, &state.dns_resolver) {
-        Some(t) => t,
-        None => {
-            warn!(target = %target, branch = branch_index, "fork: cannot resolve target");
-            return;
-        }
+    // Resolve the branch destination + transport: over the captured inbound flow
+    // (RFC 5626 §5.3 connection reuse — the only way back to a WebSocket UE,
+    // RFC 7118 §5) when one is attached, else by DNS-resolving the target URI.
+    let (destination, outbound_transport) = if let Some(flow) = flow {
+        let transport = match flow.transport.as_str() {
+            "udp" => Transport::Udp,
+            "tcp" => Transport::Tcp,
+            "tls" => Transport::Tls,
+            "ws" => Transport::WebSocket,
+            "wss" => Transport::WebSocketSecure,
+            other => {
+                warn!(target = %target, branch = branch_index, transport = %other, "fork: unknown flow transport");
+                return;
+            }
+        };
+        (flow.source_addr, transport)
+    } else {
+        let relay_target = match resolve_target(target, &state.dns_resolver) {
+            Some(t) => t,
+            None => {
+                warn!(target = %target, branch = branch_index, "fork: cannot resolve target");
+                return;
+            }
+        };
+        (relay_target.address, relay_target.transport.unwrap_or(inbound.transport))
     };
-    let destination = relay_target.address;
-    let outbound_transport = relay_target.transport.unwrap_or(inbound.transport);
 
     // Loop detection — check all listen addresses (including per-transport)
     if state.is_own_address(&destination) {
@@ -3592,8 +3617,26 @@ fn relay_fork_branch(
         }
     };
 
-    // Send via pool for TCP/TLS, direct channel for UDP
-    let connection_id = send_to_target(data, &relay_target, inbound.transport, inbound.connection_id, state);
+    // Send: over the captured flow (direct OutboundMessage, bypassing DNS/pool
+    // — mirrors the relay(flow=...) path) when one is attached, else via the
+    // normal resolver/pool path.
+    let connection_id = if let Some(flow) = flow {
+        let outbound_message = OutboundMessage {
+            connection_id: ConnectionId(flow.connection_id),
+            transport: outbound_transport,
+            destination,
+            data,
+            source_local_addr: Some(flow.local_addr),
+        };
+        let cid = outbound_message.connection_id;
+        if let Err(error) = state.outbound.send(outbound_message) {
+            error!(branch = %branch, destination = %destination, transport = %outbound_transport, "fork: flow send failed: {error}");
+        }
+        cid
+    } else {
+        let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport) };
+        send_to_target(data, &relay_target, inbound.transport, inbound.connection_id, state)
+    };
 
     debug!(
         branch = %branch,
@@ -3601,6 +3644,7 @@ fn relay_fork_branch(
         branch_index = branch_index,
         destination = %destination,
         transport = %outbound_transport,
+        flow = flow.is_some(),
         "fork: sent branch"
     );
 
@@ -4658,18 +4702,12 @@ fn send_to_target(
             }
         }
         Transport::Tls => {
-            // TLS connection reuse: find an existing inbound TLS connection
-            // to the destination (like OpenSIPS connection reuse).
-            // First try exact SocketAddr match, then fall back to IP-only match
-            // (handles NAT where Contact URI port differs from source port).
-            let connection_id = state.tls_addr_map.get(&destination).map(|r| *r.value())
-                .or_else(|| {
-                    // IP-only fallback: find any TLS connection from the same IP
-                    let target_ip = destination.ip();
-                    state.tls_addr_map.iter()
-                        .find(|entry| entry.key().ip() == target_ip)
-                        .map(|entry| *entry.value())
-                });
+            // TLS connection reuse: find an existing inbound (or pool-created
+            // outbound) TLS connection to the destination (like OpenSIPS
+            // connection reuse).  `reuse` tries an exact SocketAddr match, then
+            // an IP-only fallback (handles NAT where the Contact-URI port
+            // differs from the source port), filtered to TLS.
+            let connection_id = state.stream_connections.reuse(destination, Transport::Tls);
 
             if let Some(connection_id) = connection_id {
                 let outbound_message = OutboundMessage {
@@ -4711,6 +4749,53 @@ fn send_to_target(
                         error!(destination = %destination, "TLS pool send failed: {error}");
                         ConnectionId::default()
                     }
+                }
+            }
+        }
+        Transport::WebSocket | Transport::WebSocketSecure => {
+            // WebSocket connection reuse is *mandatory*: the connection is
+            // client-initiated and can never be re-opened by the server
+            // (RFC 7118 §5 / RFC 5626 §5.3).  Look up the live connection for
+            // this UE (exact, then IP-only fallback, filtered to this WS/WSS
+            // transport).
+            //
+            // This URI-relay path only fires when the target resolved to the
+            // UE's real address — the primary WS MT path is the captured-flow
+            // path (`relay(flow=...)` / forked flow), which bypasses
+            // `send_to_target` entirely.  On a miss we DROP (return the
+            // sentinel `ConnectionId::default()`) instead of falling back to
+            // `fallback_connection_id` (the inbound caller's connection): the
+            // UE is simply unreachable, and echoing the request back to the
+            // sender — the pre-fix behaviour of the `_` arm — is exactly the
+            // bug being closed.
+            match state.stream_connections.reuse(destination, transport) {
+                Some(connection_id) => {
+                    let outbound_message = OutboundMessage {
+                        connection_id,
+                        transport,
+                        destination,
+                        data,
+                        source_local_addr: None,
+                    };
+                    if let Err(error) = state.outbound.send(outbound_message) {
+                        error!(destination = %destination, %transport, "WS/WSS connection reuse send failed: {error}");
+                    } else {
+                        debug!(
+                            destination = %destination,
+                            connection_id = ?connection_id,
+                            %transport,
+                            "relayed via WS/WSS connection reuse"
+                        );
+                    }
+                    connection_id
+                }
+                None => {
+                    warn!(
+                        destination = %destination,
+                        %transport,
+                        "no live WS/WSS connection to reuse — dropping (client-initiated transport cannot be dialed; use relay(flow=...) for MT routing)"
+                    );
+                    ConnectionId::default()
                 }
             }
         }
@@ -6583,7 +6668,7 @@ fn start_next_fork_branch(
     server_key: &TransactionKey,
     state: &DispatcherState,
 ) {
-    let (original_request, record_routed, source_addr, connection_id, transport, agg) = {
+    let (original_request, record_routed, source_addr, connection_id, transport, agg, branch_flow) = {
         let session = match session_arc.read() {
             Ok(s) => s,
             Err(_) => return,
@@ -6595,6 +6680,7 @@ fn start_next_fork_branch(
             session.connection_id,
             session.transport,
             session.fork_aggregator.clone(),
+            session.fork_flows.get(next_index).cloned().flatten(),
         )
     };
 
@@ -6628,6 +6714,7 @@ fn start_next_fork_branch(
             server_key,
             &session_arc,
             &agg,
+            branch_flow.as_ref(),
             state,
         );
     }
@@ -7646,30 +7733,33 @@ fn handle_b2bua_invite(
             state.call_actors.remove_call(&call_id);
             state.call_event_receivers.remove(&call_id);
         }
-        CallAction::Dial { target, next_hop, timeout } => {
+        CallAction::Dial { target, next_hop, flow, timeout } => {
             debug!(
                 call_id = %call_id,
                 target = %target,
                 next_hop = ?next_hop,
+                flow = flow.is_some(),
                 "B2BUA: dialling B-leg",
             );
             b2bua_send_b_leg_invite(
                 &call_id,
                 &target,
                 next_hop.as_deref(),
+                flow.as_ref(),
                 &message_guard,
                 &inbound,
                 state,
             );
             set_b2bua_answer_deadline(&call_id, timeout, state);
         }
-        CallAction::Fork { targets, strategy: _, timeout } => {
+        CallAction::Fork { targets, flows, strategy: _, timeout } => {
             debug!(call_id = %call_id, targets = ?targets, "B2BUA: forking B-legs");
-            for target in &targets {
+            for (index, target) in targets.iter().enumerate() {
                 b2bua_send_b_leg_invite(
                     &call_id,
                     target,
                     None,
+                    flows.get(index).and_then(|f| f.as_ref()),
                     &message_guard,
                     &inbound,
                     state,
@@ -7718,28 +7808,45 @@ fn b2bua_send_b_leg_invite(
     call_id: &str,
     target_uri: &str,
     next_hop: Option<&str>,
+    flow: Option<&crate::script::api::registrar::PyFlow>,
     original_request: &SipMessage,
     _inbound: &InboundMessage,
     state: &DispatcherState,
 ) {
-    // Resolve the wire destination from next_hop when set, else from target.
-    // R-URI construction below still uses target_uri unconditionally — this
-    // is the whole point of the split.
-    let routing_uri = next_hop.unwrap_or(target_uri);
-    let relay_target = match resolve_target(routing_uri, &state.dns_resolver) {
-        Some(t) => t,
-        None => {
-            warn!(
-                call_id = %call_id,
-                target = %target_uri,
-                next_hop = ?next_hop,
-                "B2BUA: cannot resolve destination",
-            );
-            return;
-        }
+    // Resolve the wire destination: over the captured inbound flow (RFC 5626
+    // §5.3 connection reuse — the only way to reach a WebSocket callee, RFC
+    // 7118 §5) when one is attached, else from next_hop when set, else from
+    // target.  R-URI construction below still uses target_uri unconditionally —
+    // that split is the whole point of next_hop.
+    let (destination, outbound_transport) = if let Some(flow) = flow {
+        let transport = match flow.transport.as_str() {
+            "udp" => Transport::Udp,
+            "tcp" => Transport::Tcp,
+            "tls" => Transport::Tls,
+            "ws" => Transport::WebSocket,
+            "wss" => Transport::WebSocketSecure,
+            other => {
+                warn!(call_id = %call_id, transport = %other, "B2BUA: unknown flow transport");
+                return;
+            }
+        };
+        (flow.source_addr, transport)
+    } else {
+        let routing_uri = next_hop.unwrap_or(target_uri);
+        let relay_target = match resolve_target(routing_uri, &state.dns_resolver) {
+            Some(t) => t,
+            None => {
+                warn!(
+                    call_id = %call_id,
+                    target = %target_uri,
+                    next_hop = ?next_hop,
+                    "B2BUA: cannot resolve destination",
+                );
+                return;
+            }
+        };
+        (relay_target.address, relay_target.transport.unwrap_or(Transport::Udp))
     };
-    let destination = relay_target.address;
-    let outbound_transport = relay_target.transport.unwrap_or(Transport::Udp);
 
     // Build a new INVITE for the B-leg
     let branch = TransactionKey::generate_branch();
@@ -7944,7 +8051,7 @@ fn b2bua_send_b_leg_invite(
         branch.clone(),
         LegTransport {
             remote_addr: destination,
-            connection_id: ConnectionId::default(),
+            connection_id: flow.map(|f| ConnectionId(f.connection_id)).unwrap_or_default(),
             transport: outbound_transport,
         },
     );
@@ -7973,8 +8080,24 @@ fn b2bua_send_b_leg_invite(
 
     let data = Bytes::from(b_leg_invite.to_bytes());
 
-    // Send via pool for TCP/TLS, direct channel for UDP
-    send_to_target(data, &relay_target, outbound_transport, ConnectionId::default(), state);
+    // Send: over the captured flow (direct OutboundMessage, bypassing DNS/pool —
+    // mirrors the proxy relay(flow=...) path) when one is attached, else via the
+    // resolver/pool path.
+    if let Some(flow) = flow {
+        let outbound_message = OutboundMessage {
+            connection_id: ConnectionId(flow.connection_id),
+            transport: outbound_transport,
+            destination,
+            data,
+            source_local_addr: Some(flow.local_addr),
+        };
+        if let Err(error) = state.outbound.send(outbound_message) {
+            error!(call_id = %call_id, destination = %destination, transport = %outbound_transport, "B2BUA: flow send failed: {error}");
+        }
+    } else {
+        let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport) };
+        send_to_target(data, &relay_target, outbound_transport, ConnectionId::default(), state);
+    }
 
     // Persist the fully hygiene-processed B-leg INVITE on the leg.
     // The 401/407 auto-retry path rebuilds the retry from this — rebuilding

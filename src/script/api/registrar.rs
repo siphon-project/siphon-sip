@@ -73,23 +73,37 @@ impl PyFlow {
     /// just means the next datagram will land on a UE that may or
     /// may not still be listening.
     ///
-    /// For stream transports (TCP/TLS/WS/WSS) the flow is alive only
-    /// while the accepted connection that delivered the REGISTER is
-    /// still open on this process.  An accurate cross-transport check
-    /// requires wiring the per-listener `connection_map`s into a
-    /// shared registry; until that lands, this returns ``True`` for
-    /// stream transports too — scripts should defend against the
-    /// silent-drop case via :attr:`Contact.is_local` before calling
-    /// ``request.relay(flow=...)``.
+    /// For stream transports (TCP/TLS/WS/WSS) this is a real liveness
+    /// check against the process-global stream-connection registry:
+    /// ``True`` only while the *exact* accepted connection that
+    /// delivered the REGISTER is still open on **this** process.  A UE
+    /// that reconnected (new connection id) or whose socket closed
+    /// reports ``False``.  When the registry isn't wired (unit tests /
+    /// headless contexts) it stays conservatively ``True``.
+    /// Cross-instance bindings should additionally be gated on
+    /// :attr:`Contact.is_local` before ``request.relay(flow=...)``.
     #[getter]
     fn is_alive(&self) -> bool {
-        // Conservative: treat all flows as live.  When the dispatcher
-        // can't find the connection at send time, the message is
-        // silently dropped (logged) — same failure mode as a closed
-        // socket on any other path.  When the cross-transport
-        // connection registry lands, this becomes a real DashMap
-        // lookup against the right per-transport map.
-        true
+        if self.transport == "udp" {
+            return true;
+        }
+        let transport = match self.transport.as_str() {
+            "tcp" => crate::transport::Transport::Tcp,
+            "tls" => crate::transport::Transport::Tls,
+            "ws" => crate::transport::Transport::WebSocket,
+            "wss" => crate::transport::Transport::WebSocketSecure,
+            _ => return true, // unknown transport — stay conservative
+        };
+        match crate::script::api::stream_connections() {
+            Some(registry) => registry.is_alive(
+                self.source_addr,
+                transport,
+                crate::transport::ConnectionId(self.connection_id),
+            ),
+            // Registry not wired (unit tests / headless) — conservative,
+            // matching the pre-registry behaviour.
+            None => true,
+        }
     }
 
     fn __repr__(&self) -> String {
@@ -287,6 +301,21 @@ impl PyContact {
         Self::from_rust_contact_with_registrar(contact, None)
     }
 
+    /// `(uri, flow)` for flow-aware `request.fork()` / `call.fork()`.
+    ///
+    /// The captured flow is only surfaced when this binding was accepted by the
+    /// **local** process (`is_local`); a binding restored from a shared backend
+    /// on another instance carries a `connection_id` that is meaningless here,
+    /// so it falls back to URI routing.  The URI is always the Contact URI.
+    pub fn fork_target(&self) -> (String, Option<PyFlow>) {
+        let flow = if self.is_local_value {
+            self.flow_value.clone()
+        } else {
+            None
+        };
+        (self.uri_string.clone(), flow)
+    }
+
     /// Same as [`from_rust_contact`] but resolves `is_local` against the
     /// running registrar's instance identity when one is available.
     pub fn from_rust_contact_with_registrar(
@@ -464,22 +493,21 @@ impl PyRegistrar {
         let source_addr = request.source_socket_addr();
         let source_transport = Some(request.transport_name().to_string());
 
-        // Capture the inbound flow.  `inbound_local_addr` is only needed for
-        // token-keyed MT routing (it drives flow-relay), so it stays gated on
-        // `flow_token` to keep `Contact.flow` behaviour unchanged for ordinary
-        // bindings.  `inbound_connection_id` is captured **always**, though:
-        // it's what RFC 5626 §4.2.2 flow-failure deregistration
-        // (`registrar.liveness`) uses to find this binding when its stream
-        // connection closes.  Harmless for UDP — `unregister_flow` and the
-        // connection index both gate on a stream transport, so a UDP binding's
-        // deterministic id is never acted on.
+        // Capture the inbound flow for every binding this process accepts —
+        // `inbound_local_addr` + `inbound_connection_id` together let
+        // `Contact.flow` drive RFC 5626 §5.3 connection reuse on the MT side
+        // (`request.relay(flow=...)` / `fork`), which is the *only* way to
+        // reach a WebSocket UE (RFC 7118 §5).  Previously `inbound_local_addr`
+        // was gated on `flow_token`, so a plain `registrar.save()` left
+        // `Contact.flow == None` and WS MT routing silently failed.  Capturing
+        // it unconditionally is additive: scripts that ignore `contact.flow`
+        // are unaffected, and cross-instance staleness is guarded by
+        // `Contact.is_local` (the relay path only uses a flow for bindings the
+        // local process holds).  `inbound_connection_id` was already captured
+        // always (RFC 5626 §4.2.2 flow-failure deregistration relies on it).
         let flow_capture = crate::registrar::FlowCapture {
             flow_token: flow_token.clone(),
-            inbound_local_addr: if flow_token.is_some() {
-                request.inbound_local_addr()
-            } else {
-                None
-            },
+            inbound_local_addr: request.inbound_local_addr(),
             inbound_connection_id: request.inbound_connection_id_u64(),
         };
 
@@ -689,17 +717,13 @@ impl PyRegistrar {
         let source_addr = request.source_socket_addr();
         let source_transport = Some(request.transport_name().to_string());
 
-        // Capture the inbound flow.  `inbound_local_addr` stays gated on
-        // `flow_token` (token-keyed MT routing only); `inbound_connection_id`
-        // is captured always so RFC 5626 §4.2.2 flow-failure deregistration
-        // can find this binding when its stream connection closes.
+        // Capture the inbound flow unconditionally (same rationale as `save()`):
+        // `inbound_local_addr` + `inbound_connection_id` populate `Contact.flow`
+        // so RFC 5626 §5.3 connection reuse works on the MT side without
+        // requiring `flow_token`.  Additive and guarded by `Contact.is_local`.
         let flow_capture = crate::registrar::FlowCapture {
             flow_token: flow_token.clone(),
-            inbound_local_addr: if flow_token.is_some() {
-                request.inbound_local_addr()
-            } else {
-                None
-            },
+            inbound_local_addr: request.inbound_local_addr(),
             inbound_connection_id: request.inbound_connection_id_u64(),
         };
 
@@ -1317,6 +1341,52 @@ mod tests {
         // A flow failure on connection 4242 deregisters the binding.
         assert_eq!(registrar.unregister_flow(4242), 1);
         assert!(!registrar.is_registered("sip:alice@example.com"));
+    }
+
+    #[test]
+    fn save_without_token_populates_contact_flow_for_stream() {
+        // RFC 5626 §5.3 connection reuse: a plain `registrar.save()` (no
+        // flow_token) must still expose `Contact.flow` so the MT side can
+        // `relay(flow=...)` back over the captured connection.  Before the
+        // unconditional-capture fix, `inbound_local_addr` was gated on
+        // flow_token and `Contact.flow` came back `None`, silently breaking
+        // WS/WSS MT routing.
+        let registrar = make_registrar();
+        let uri = SipUri::new("example.com".to_string());
+        let message = SipMessageBuilder::new()
+            .request(Method::Register, uri)
+            .via("SIP/2.0/WSS 10.0.0.1:5060;branch=z9hG4bK-reg".to_string())
+            .to("<sip:bob@example.com>".to_string())
+            .from("<sip:bob@example.com>;tag=reg-tag".to_string())
+            .call_id("reg-call@host".to_string())
+            .cseq("1 REGISTER".to_string())
+            .header("Contact", "<sip:bob@df7jal23ls0d.invalid;transport=wss>".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        let mut request = PyRequest::new(
+            Arc::new(Mutex::new(message)),
+            "wss".to_string(),
+            "10.0.0.1".to_string(),
+            50000,
+        );
+        request.set_inbound_flow("127.0.0.1:443".parse().unwrap(), 4242);
+        let py_reg = PyRegistrar::new(Arc::clone(&registrar));
+
+        // No flow_token — the plain residential/WebRTC path.
+        py_reg.save(&mut request, false, vec![], None).unwrap();
+
+        let contacts = py_reg.lookup_str("sip:bob@example.com");
+        assert_eq!(contacts.len(), 1);
+        let flow = contacts[0]
+            .flow()
+            .expect("Contact.flow must be populated without flow_token");
+        assert_eq!(flow.transport, "wss");
+        assert_eq!(flow.source_addr.to_string(), "10.0.0.1:50000");
+        assert_eq!(flow.local_addr.to_string(), "127.0.0.1:443");
+        assert_eq!(flow.connection_id, 4242);
+        // No token was passed, so flow_token stays absent.
+        assert_eq!(contacts[0].flow_token(), None);
     }
 
     #[test]
@@ -2025,6 +2095,72 @@ mod tests {
         assert_eq!(flow.local_addr.to_string(), "127.0.0.1:5066");
         assert_eq!(flow.connection_id, 0xc0ffee);
         assert_eq!(py.flow_token(), Some("tok"));
+    }
+
+    #[test]
+    fn flow_is_alive_udp_true_and_stream_conservative_without_registry() {
+        // UDP: always alive (listener socket survives; deterministic id).
+        let udp = PyFlow {
+            transport: "udp".into(),
+            source_addr: "10.0.0.1:5060".parse().unwrap(),
+            local_addr: "127.0.0.1:5060".parse().unwrap(),
+            connection_id: 1,
+        };
+        assert!(udp.is_alive());
+        // Stream transport with no process-global registry wired (the unit-test
+        // context): stays conservatively alive, matching pre-registry behaviour.
+        // The registry-backed liveness path is covered by
+        // `transport::tests::stream_connections_is_alive_tracks_exact_triple`.
+        let wss = PyFlow {
+            transport: "wss".into(),
+            source_addr: "10.0.0.1:50000".parse().unwrap(),
+            local_addr: "127.0.0.1:443".parse().unwrap(),
+            connection_id: 2,
+        };
+        assert!(wss.is_alive());
+    }
+
+    #[test]
+    fn fork_target_surfaces_flow_only_for_local_binding() {
+        // The safety guard: fork/relay route over a captured flow ONLY for a
+        // binding this process holds (is_local).  A cross-instance binding
+        // (is_local=false) falls back to URI routing — its connection_id is
+        // meaningless on this process.
+        let contact = Contact {
+            uri: SipUri::new("df7jal23ls0d.invalid".to_string()).with_user("bob".into()),
+            q: 1.0,
+            registered_at: std::time::Instant::now(),
+            expires: std::time::Duration::from_secs(3600),
+            call_id: "c1".into(),
+            cseq: 1,
+            source_addr: Some("10.0.0.1:50000".parse().unwrap()),
+            source_transport: Some("wss".into()),
+            sip_instance: None,
+            reg_id: None,
+            path: vec![],
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: None,
+            inbound_local_addr: Some("127.0.0.1:443".parse().unwrap()),
+            inbound_connection_id: Some(0xc0ffee),
+            params: Vec::new(),
+            kind: crate::registrar::ContactKind::Ue,
+        };
+        let mut py = PyContact::from_rust_contact(&contact);
+
+        // Non-local → flow withheld, URI carried for DNS routing.
+        py.is_local_value = false;
+        let (uri, flow) = py.fork_target();
+        assert!(flow.is_none(), "non-local binding must not surface its flow");
+        assert!(uri.contains("bob@df7jal23ls0d.invalid"));
+
+        // Local → flow surfaced for connection reuse.
+        py.is_local_value = true;
+        let (_, flow) = py.fork_target();
+        let flow = flow.expect("local binding must surface its captured flow");
+        assert_eq!(flow.transport, "wss");
+        assert_eq!(flow.connection_id, 0xc0ffee);
     }
 
     #[test]

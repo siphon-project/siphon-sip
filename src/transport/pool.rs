@@ -22,7 +22,7 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
 use crate::transport::{
-    ConnectionId, InboundMessage, Transport,
+    ConnectionId, InboundMessage, StreamConnections, Transport,
     configure_tcp_socket, next_connection_id,
 };
 use crate::transport::crlf_keepalive::{drain_leading_crlf_keepalives, CrlfPongTracker};
@@ -63,10 +63,11 @@ pub struct ConnectionPool {
     tos: Option<u32>,
     /// TLS connector for outbound TLS connections.
     tls_connector: TlsConnector,
-    /// TLS address map — registers outbound TLS pool connections so the
+    /// Unified stream-connection registry — the pool registers the outbound
+    /// TLS connections it creates here (tagged `Transport::Tls`) so the
     /// dispatcher can reuse them for inbound routing (e.g., INVITEs to
     /// registered trunks). Like OpenSIPS connection reuse.
-    tls_addr_map: Option<Arc<DashMap<SocketAddr, ConnectionId>>>,
+    stream_connections: Option<StreamConnections>,
     /// RFC 5626 §4.4.1 pong tracker — populated when siphon's own keepalive
     /// prober is running.  Read tasks always answer peer pings regardless
     /// (RFC contract), but only notify the tracker on pong when it's set.
@@ -136,7 +137,7 @@ impl ConnectionPool {
         inbound_tx: flume::Sender<InboundMessage>,
         local_addr: SocketAddr,
         tos: Option<u32>,
-        tls_addr_map: Option<Arc<DashMap<SocketAddr, ConnectionId>>>,
+        stream_connections: Option<StreamConnections>,
         crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
     ) -> Self {
         Self {
@@ -146,7 +147,7 @@ impl ConnectionPool {
             local_addr,
             tos,
             tls_connector: TlsConnector::from(build_outbound_tls_config()),
-            tls_addr_map,
+            stream_connections,
             crlf_pong_tracker,
         }
     }
@@ -440,10 +441,11 @@ impl ConnectionPool {
         // Register in the shared connection map
         self.connection_map.insert(connection_id, write_tx.clone());
 
-        // Register in TLS addr_map so the dispatcher can reuse this connection
-        // for inbound routing (e.g., INVITEs to registered trunks).
-        if let Some(ref addr_map) = self.tls_addr_map {
-            addr_map.insert(destination, connection_id);
+        // Register in the stream-connection registry so the dispatcher can
+        // reuse this connection for inbound routing (e.g., INVITEs to
+        // registered trunks).
+        if let Some(ref stream_connections) = self.stream_connections {
+            stream_connections.register(destination, Transport::Tls, connection_id);
         }
 
         debug!(
@@ -458,7 +460,7 @@ impl ConnectionPool {
         let inbound_tx = self.inbound_tx.clone();
         let conn_map = self.connection_map.clone();
         let connections = self.connections.clone();
-        let tls_addr_map = self.tls_addr_map.clone();
+        let stream_connections = self.stream_connections.clone();
         let key_for_cleanup = key;
         let keepalive_writer = write_tx.clone();
         let crlf_pong_tracker = self.crlf_pong_tracker.clone();
@@ -505,8 +507,8 @@ impl ConnectionPool {
                                 error!("pool: TLS inbound enqueue failed: {}", error);
                                 conn_map.remove(&connection_id);
                                 connections.remove(&key_for_cleanup);
-                                if let Some(ref addr_map) = tls_addr_map {
-                                    addr_map.remove(&destination);
+                                if let Some(ref stream_connections) = stream_connections {
+                                    stream_connections.unregister(&destination);
                                 }
                                 return;
                             }
@@ -520,8 +522,8 @@ impl ConnectionPool {
             }
             conn_map.remove(&connection_id);
             connections.remove(&key_for_cleanup);
-            if let Some(ref addr_map) = tls_addr_map {
-                addr_map.remove(&destination);
+            if let Some(ref stream_connections) = stream_connections {
+                stream_connections.unregister(&destination);
             }
         });
 

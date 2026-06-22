@@ -101,8 +101,15 @@ pub enum RequestAction {
         flow: Option<super::registrar::PyFlow>,
     },
     /// Fork to multiple targets.
+    ///
+    /// `flows` is parallel to `targets`: when `flows[i]` is `Some`, that branch
+    /// is sent over the captured inbound flow (RFC 5626 §5.3 connection reuse —
+    /// the only way to reach a WebSocket UE) instead of DNS-resolving the URI.
+    /// A flow is only attached for a `Contact` the local process accepted
+    /// (`Contact.is_local`); bare-string targets always carry `None`.
     Fork {
         targets: Vec<String>,
+        flows: Vec<Option<super::registrar::PyFlow>>,
         strategy: String,
     },
 }
@@ -815,12 +822,34 @@ impl PyRequest {
     }
 
     /// Fork to multiple targets.
+    ///
+    /// Each target is either a bare URI string or a `Contact` (from
+    /// `registrar.lookup()`).  When it is a `Contact` that the local process
+    /// accepted (`Contact.is_local`), the branch is routed over that binding's
+    /// captured inbound flow — RFC 5626 §5.3 connection reuse, mandatory for
+    /// WebSocket UEs (RFC 7118 §5).  Bare strings (and non-local contacts) are
+    /// DNS-resolved as before.
     #[pyo3(signature = (targets, strategy="parallel"))]
-    fn fork(&mut self, targets: Vec<String>, strategy: &str) {
+    fn fork(&mut self, targets: Vec<Bound<'_, PyAny>>, strategy: &str) -> PyResult<()> {
+        let mut target_uris: Vec<String> = Vec::with_capacity(targets.len());
+        let mut flows: Vec<Option<super::registrar::PyFlow>> = Vec::with_capacity(targets.len());
+        for item in targets {
+            if let Ok(contact) = item.extract::<PyRef<super::registrar::PyContact>>() {
+                let (uri, flow) = contact.fork_target();
+                target_uris.push(uri);
+                flows.push(flow);
+            } else {
+                // Bare URI string (or anything string-coercible).
+                target_uris.push(item.extract::<String>()?);
+                flows.push(None);
+            }
+        }
         self.action = RequestAction::Fork {
-            targets,
+            targets: target_uris,
+            flows,
             strategy: strategy.to_string(),
         };
+        Ok(())
     }
 
     /// Mark that Record-Route should be inserted.
@@ -1719,18 +1748,23 @@ mod tests {
 
     #[test]
     fn fork_sets_action() {
-        let mut request = make_request();
-        request.fork(
-            vec!["sip:a@host".to_string(), "sip:b@host".to_string()],
-            "sequential",
-        );
-        assert_eq!(
-            *request.action(),
-            RequestAction::Fork {
-                targets: vec!["sip:a@host".to_string(), "sip:b@host".to_string()],
-                strategy: "sequential".to_string(),
-            }
-        );
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let mut request = make_request();
+            let targets: Vec<Bound<'_, PyAny>> = vec![
+                pyo3::types::PyString::new(py, "sip:a@host").into_any(),
+                pyo3::types::PyString::new(py, "sip:b@host").into_any(),
+            ];
+            request.fork(targets, "sequential").unwrap();
+            assert_eq!(
+                *request.action(),
+                RequestAction::Fork {
+                    targets: vec!["sip:a@host".to_string(), "sip:b@host".to_string()],
+                    flows: vec![None, None],
+                    strategy: "sequential".to_string(),
+                }
+            );
+        });
     }
 
     #[test]

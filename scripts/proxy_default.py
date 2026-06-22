@@ -60,4 +60,9 @@ def route(request):
         return
 
     request.record_route()
-    request.fork([c.uri for c in contacts])
+    # Pass the Contact objects (not just .uri): for a binding this process
+    # accepted, fork() routes over its captured inbound flow — RFC 5626 §5.3
+    # connection reuse, which is the only way to reach a WebSocket UE
+    # (RFC 7118 §5).  Cross-instance / non-local contacts fall back to URI
+    # routing automatically.
+    request.fork(contacts)

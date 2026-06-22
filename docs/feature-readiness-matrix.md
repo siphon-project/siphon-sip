@@ -38,8 +38,8 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | TLS 1.2 | Implemented | `tls.method: TLSv1_2` | |
 | mTLS (client cert verification) | Implemented | `tls.verify_client: true` | |
 | UDP | **Production** | `listen.udp` | |
-| WebSocket (WS) | Implemented | `listen.ws` | RFC 7118, browser/WebRTC clients; outbound distributor wedge-hardened with non-blocking `try_send` (see TCP) |
-| Secure WebSocket (WSS) | Implemented | `listen.wss` | Outbound distributor wedge-hardened with non-blocking `try_send` (see TCP) |
+| WebSocket (WS) | Implemented | `listen.ws` | RFC 7118, browser/WebRTC clients; outbound distributor wedge-hardened with non-blocking `try_send` (see TCP). MT routing (INVITE → WS-registered UE) works via RFC 5626 §5.3 connection reuse: every binding captures its inbound flow (no `flow_token=` needed), `registrar.lookup()` returns it as `contact.flow`, and `request.fork(contacts)` / `request.relay(flow=)` / `call.fork(contacts)` / `call.dial(flow=)` route over the captured connection on both proxy and B2BUA. Connections register in a unified cross-transport `StreamConnections` registry (also backs `Flow.is_alive`); `send_to_target` has a WS/WSS arm that reuses the connection and drops (no caller-echo) on miss. |
+| Secure WebSocket (WSS) | Implemented | `listen.wss` | Outbound distributor wedge-hardened with non-blocking `try_send` (see TCP). MT routing via connection reuse — same flow-based path as WS (see the WS row). |
 | SCTP | Implemented | `listen.sctp` | RFC 4168, IMS inter-node; outbound distributor wedge-hardened with non-blocking `try_send` (see TCP) |
 | Per-socket advertised address | **Production** | `listen.tls[].advertise` | |
 | Global advertised address | Implemented | `advertised_address:` | Fallback for 0.0.0.0 binds |

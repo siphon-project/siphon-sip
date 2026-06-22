@@ -33,11 +33,21 @@ pub enum CallAction {
         /// the IMPU shape on R-URI while routing through a fixed next-hop —
         /// IMS BGCF/I-CSCF, outbound proxy, edge-NAT bridge, etc.).
         next_hop: Option<String>,
+        /// When set, the B-leg INVITE is sent over this captured inbound flow
+        /// (RFC 5626 §5.3 connection reuse — the only way to reach a WebSocket
+        /// callee, RFC 7118 §5) instead of DNS-resolving `target`/`next_hop`.
+        flow: Option<super::registrar::PyFlow>,
         timeout: u32,
     },
     /// Fork to multiple targets.
+    ///
+    /// `flows` is parallel to `targets`: a `Some` entry routes that branch over
+    /// the captured inbound flow (connection reuse) instead of resolving the
+    /// URI.  Only attached for a `Contact` the local process accepted
+    /// (`Contact.is_local`).
     Fork {
         targets: Vec<String>,
+        flows: Vec<Option<super::registrar::PyFlow>>,
         strategy: String,
         timeout: u32,
     },
@@ -639,12 +649,13 @@ impl PyCall {
     ///         copy=["X-Operator-Tag"],
     ///         strip=["History-Info"],
     ///     )
-    #[pyo3(signature = (uri, timeout=30, next_hop=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new()))]
+    #[pyo3(signature = (uri, timeout=30, next_hop=None, flow=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new()))]
     fn dial(
         &mut self,
         uri: &str,
         timeout: u32,
         next_hop: Option<&str>,
+        flow: Option<super::registrar::PyFlow>,
         header_policy: Option<&str>,
         copy: Vec<String>,
         strip: Vec<String>,
@@ -653,6 +664,7 @@ impl PyCall {
         self.action = CallAction::Dial {
             target: uri.to_string(),
             next_hop: next_hop.map(String::from),
+            flow,
             timeout,
         };
         self.update_header_policy_input(header_policy, copy, strip, translate);
@@ -660,25 +672,43 @@ impl PyCall {
 
     /// Fork to multiple targets.
     ///
-    /// `header_policy` / `copy` / `strip` / `translate` apply to every
-    /// branch of the fork — per-branch policy is a follow-up enhancement.
+    /// Each target is a bare URI string or a `Contact` (from
+    /// `registrar.lookup()`).  A `Contact` the local process accepted
+    /// (`Contact.is_local`) routes its branch over the captured inbound flow —
+    /// connection reuse, mandatory for WebSocket callees (RFC 7118 §5 / RFC
+    /// 5626 §5.3).  `header_policy` / `copy` / `strip` / `translate` apply to
+    /// every branch — per-branch policy is a follow-up enhancement.
     #[pyo3(signature = (targets, strategy="parallel", timeout=30, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new()))]
     fn fork(
         &mut self,
-        targets: Vec<String>,
+        targets: Vec<Bound<'_, PyAny>>,
         strategy: &str,
         timeout: u32,
         header_policy: Option<&str>,
         copy: Vec<String>,
         strip: Vec<String>,
         translate: Vec<(String, String)>,
-    ) {
+    ) -> PyResult<()> {
+        let mut target_uris: Vec<String> = Vec::with_capacity(targets.len());
+        let mut flows: Vec<Option<super::registrar::PyFlow>> = Vec::with_capacity(targets.len());
+        for item in targets {
+            if let Ok(contact) = item.extract::<PyRef<super::registrar::PyContact>>() {
+                let (uri, flow) = contact.fork_target();
+                target_uris.push(uri);
+                flows.push(flow);
+            } else {
+                target_uris.push(item.extract::<String>()?);
+                flows.push(None);
+            }
+        }
         self.action = CallAction::Fork {
-            targets,
+            targets: target_uris,
+            flows,
             strategy: strategy.to_string(),
             timeout,
         };
         self.update_header_policy_input(header_policy, copy, strip, translate);
+        Ok(())
     }
 
     /// Terminate the call (send BYE to both legs).
@@ -900,12 +930,13 @@ mod tests {
     fn call_dial() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
-        call.dial("sip:bob@10.0.0.2:5060", 30, None, None, vec![], vec![], vec![]);
+        call.dial("sip:bob@10.0.0.2:5060", 30, None, None, None, vec![], vec![], vec![]);
         assert_eq!(
             call.action(),
             &CallAction::Dial {
                 target: "sip:bob@10.0.0.2:5060".to_string(),
                 next_hop: None,
+                flow: None,
                 timeout: 30,
             }
         );
@@ -922,6 +953,7 @@ mod tests {
             30,
             Some("sip:172.16.0.111:4060"),
             None,
+            None,
             vec![],
             vec![],
             vec![],
@@ -931,6 +963,7 @@ mod tests {
             &CallAction::Dial {
                 target: "sip:5112@ims.mnc088.mcc204.3gppnetwork.org".to_string(),
                 next_hop: Some("sip:172.16.0.111:4060".to_string()),
+                flow: None,
                 timeout: 30,
             }
         );
@@ -943,6 +976,7 @@ mod tests {
         call.dial(
             "sip:bob@10.0.0.2:5060",
             30,
+            None,
             None,
             Some("ims-trust-domain-boundary@2026"),
             vec!["X-Operator-Tag".to_string()],
@@ -961,43 +995,42 @@ mod tests {
 
     #[test]
     fn call_fork() {
-        let message = Arc::new(Mutex::new(make_invite()));
-        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
-        call.fork(
-            vec!["sip:bob@10.0.0.2".to_string(), "sip:bob@10.0.0.3".to_string()],
-            "parallel",
-            30,
-            None,
-            vec![],
-            vec![],
-            vec![],
-        );
-        assert_eq!(
-            call.action(),
-            &CallAction::Fork {
-                targets: vec!["sip:bob@10.0.0.2".to_string(), "sip:bob@10.0.0.3".to_string()],
-                strategy: "parallel".to_string(),
-                timeout: 30,
-            }
-        );
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let message = Arc::new(Mutex::new(make_invite()));
+            let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+            let targets: Vec<Bound<'_, PyAny>> = vec![
+                pyo3::types::PyString::new(py, "sip:bob@10.0.0.2").into_any(),
+                pyo3::types::PyString::new(py, "sip:bob@10.0.0.3").into_any(),
+            ];
+            call.fork(targets, "parallel", 30, None, vec![], vec![], vec![]).unwrap();
+            assert_eq!(
+                call.action(),
+                &CallAction::Fork {
+                    targets: vec!["sip:bob@10.0.0.2".to_string(), "sip:bob@10.0.0.3".to_string()],
+                    flows: vec![None, None],
+                    strategy: "parallel".to_string(),
+                    timeout: 30,
+                }
+            );
+        });
     }
 
     #[test]
     fn call_fork_with_header_policy() {
-        let message = Arc::new(Mutex::new(make_invite()));
-        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
-        call.fork(
-            vec!["sip:bob@10.0.0.2".to_string(), "sip:bob@10.0.0.3".to_string()],
-            "parallel",
-            30,
-            Some("sip-trunk-edge@2026"),
-            vec![],
-            vec!["X-Internal-Tag".to_string()],
-            vec![],
-        );
-        let input = call.header_policy_input().expect("policy input must be captured");
-        assert_eq!(input.policy_name.as_deref(), Some("sip-trunk-edge@2026"));
-        assert_eq!(input.deltas_strip, vec!["X-Internal-Tag".to_string()]);
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let message = Arc::new(Mutex::new(make_invite()));
+            let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+            let targets: Vec<Bound<'_, PyAny>> = vec![
+                pyo3::types::PyString::new(py, "sip:bob@10.0.0.2").into_any(),
+                pyo3::types::PyString::new(py, "sip:bob@10.0.0.3").into_any(),
+            ];
+            call.fork(targets, "parallel", 30, Some("sip-trunk-edge@2026"), vec![], vec!["X-Internal-Tag".to_string()], vec![]).unwrap();
+            let input = call.header_policy_input().expect("policy input must be captured");
+            assert_eq!(input.policy_name.as_deref(), Some("sip-trunk-edge@2026"));
+            assert_eq!(input.deltas_strip, vec!["X-Internal-Tag".to_string()]);
+        });
     }
 
     #[test]

@@ -142,6 +142,22 @@ pub fn registrar_arc() -> Option<&'static std::sync::Arc<crate::registrar::Regis
     REGISTRAR_ARC.get()
 }
 
+/// The unified stream-connection registry — stored so `Flow.is_alive` can do a
+/// real cross-transport liveness lookup (is this UE's stream connection still
+/// open on this process?).  Set once at server startup.
+static STREAM_CONNECTIONS: OnceLock<crate::transport::StreamConnections> = OnceLock::new();
+
+/// Get the shared stream-connection registry.  `None` in unit tests / headless
+/// contexts that never wired transports — callers stay conservative there.
+pub fn stream_connections() -> Option<&'static crate::transport::StreamConnections> {
+    STREAM_CONNECTIONS.get()
+}
+
+/// Set the shared stream-connection registry (idempotent — first writer wins).
+pub fn set_stream_connections(registry: crate::transport::StreamConnections) {
+    let _ = STREAM_CONNECTIONS.set(registry);
+}
+
 /// Store Rust-backed singletons for injection into the siphon module.
 ///
 /// Must be called once at startup, before any user script is loaded.

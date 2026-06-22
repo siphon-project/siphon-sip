@@ -18,7 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::net::{TcpStream, UdpSocket};
 
-use siphon::transport::{ConnectionId, OutboundMessage, Transport};
+use siphon::transport::{ConnectionId, OutboundMessage, StreamConnections, Transport};
 use siphon::transport::{udp, tcp, tls, ws};
 use siphon::transport::acl::TransportAcl;
 
@@ -416,8 +416,7 @@ async fn tls_roundtrip() {
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
         Arc::new(DashMap::new());
 
-    let addr_map: Arc<DashMap<SocketAddr, ConnectionId>> = Arc::new(DashMap::new());
-    tls::listen(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), addr_map, None, None, None, None).await;
+    tls::listen(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None, None, None).await;
     tokio::time::sleep(SETTLE).await;
 
     // Build a TLS client that trusts our self-signed cert
@@ -479,7 +478,7 @@ async fn ws_roundtrip() {
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
         Arc::new(DashMap::new());
 
-    ws::listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None, None).await;
+    ws::listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None).await;
     tokio::time::sleep(SETTLE).await;
 
     // Client: connect via WebSocket
@@ -543,7 +542,7 @@ async fn wss_roundtrip() {
     let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
         Arc::new(DashMap::new());
 
-    ws::listen_secure(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None, None).await;
+    ws::listen_secure(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None).await;
     tokio::time::sleep(SETTLE).await;
 
     // Manual TLS connect then WebSocket upgrade
@@ -623,7 +622,7 @@ async fn multi_transport_shared_inbound_channel() {
     // Start all three transports with the same inbound_tx
     udp::listen(udp_addr, inbound_tx.clone(), udp_outbound_rx, test_acl(), None).await;
     tcp::listen(tcp_addr, inbound_tx.clone(), tcp_outbound_rx, Arc::clone(&tcp_connection_map), test_acl(), None, None, None, None).await;
-    ws::listen(ws_addr, inbound_tx.clone(), ws_outbound_rx, Arc::clone(&ws_connection_map), test_acl(), None, None).await;
+    ws::listen(ws_addr, inbound_tx.clone(), ws_outbound_rx, Arc::clone(&ws_connection_map), test_acl(), StreamConnections::new(), None, None).await;
     drop(inbound_tx); // Only transport workers hold clones now
     tokio::time::sleep(SETTLE).await;
 

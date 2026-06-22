@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::NatKeepaliveConfig;
 use crate::registrar::Registrar;
-use crate::transport::{ConnectionId, Transport};
+use crate::transport::{ConnectionId, StreamConnections, Transport};
 use crate::uac::UacSender;
 
 /// Tracks consecutive failure count per contact.
@@ -54,7 +54,7 @@ pub fn spawn_keepalive(
     config: NatKeepaliveConfig,
     registrar: Arc<Registrar>,
     uac_sender: Arc<UacSender>,
-    tls_addr_map: Arc<DashMap<SocketAddr, ConnectionId>>,
+    stream_connections: StreamConnections,
 ) {
     if !config.enabled {
         info!("NAT keepalive disabled");
@@ -76,24 +76,30 @@ pub fn spawn_keepalive(
 
         loop {
             tick.tick().await;
-            ping_all_contacts(&registrar, &uac_sender, &tls_addr_map, &tracker, threshold).await;
+            ping_all_contacts(&registrar, &uac_sender, &stream_connections, &tracker, threshold).await;
         }
     });
 }
 
-/// Look up a TLS connection ID from the addr_map (exact match, then IP-only fallback).
+/// Look up a live TLS connection id for `addr` (exact source-address match,
+/// filtered to `Transport::Tls`).  Preserves the pre-unification TLS-only
+/// `tls_addr_map` exact-match semantics — a WS/WSS UE at the same address is
+/// never returned for a TLS keepalive.
 fn lookup_tls_connection(
-    tls_addr_map: &DashMap<SocketAddr, ConnectionId>,
+    stream_connections: &StreamConnections,
     addr: SocketAddr,
 ) -> Option<ConnectionId> {
-    tls_addr_map.get(&addr).map(|r| *r.value())
+    stream_connections
+        .get(&addr)
+        .filter(|(transport, _)| *transport == Transport::Tls)
+        .map(|(_, connection_id)| connection_id)
 }
 
 /// Send OPTIONS pings to all registered contacts with a source address.
 async fn ping_all_contacts(
     registrar: &Registrar,
     uac_sender: &UacSender,
-    tls_addr_map: &DashMap<SocketAddr, ConnectionId>,
+    stream_connections: &StreamConnections,
     tracker: &FailureTracker,
     threshold: u32,
 ) {
@@ -133,7 +139,7 @@ async fn ping_all_contacts(
         // for NAT'd TLS clients. Instead, look up the connection in tls_addr_map
         // and send directly on it.
         if transport == Transport::Tls {
-            if let Some(connection_id) = lookup_tls_connection(tls_addr_map, source_addr) {
+            if let Some(connection_id) = lookup_tls_connection(stream_connections, source_addr) {
                 debug!(
                     aor = %aor,
                     source_addr = %source_addr,
@@ -164,14 +170,14 @@ async fn ping_all_contacts(
                     }
                 }
             } else {
-                let map_entries: Vec<String> = tls_addr_map.iter()
-                    .map(|entry| format!("{}→{:?}", entry.key(), entry.value()))
+                let map_entries: Vec<String> = stream_connections.entries().iter()
+                    .map(|(addr, transport, connection_id)| format!("{addr}→{transport:?}/{connection_id:?}"))
                     .collect();
                 warn!(
                     aor = %aor,
                     contact = %contact_uri_string,
                     source_addr = %source_addr,
-                    tls_addr_map = ?map_entries,
+                    stream_connections = ?map_entries,
                     "keepalive: no TLS connection found for source_addr"
                 );
                 record_keepalive_failure(registrar, tracker, &aor, &contact_uri_string, &tracker_key, threshold);
@@ -271,7 +277,7 @@ mod tests {
     async fn ping_deregisters_after_threshold() {
         let registrar = make_registrar();
         let (uac_sender, _rxs) = make_uac_sender();
-        let tls_addr_map = Arc::new(DashMap::new());
+        let stream_connections = StreamConnections::new();
 
         let source: SocketAddr = "192.168.1.100:50000".parse().unwrap();
 
@@ -292,7 +298,7 @@ mod tests {
         // Each call to ping_all_contacts will send OPTIONS and wait 5s for response,
         // which will timeout since nobody is answering.
         // Use threshold=1 to avoid long test.
-        ping_all_contacts(&registrar, &uac_sender, &tls_addr_map, &tracker, 1).await;
+        ping_all_contacts(&registrar, &uac_sender, &stream_connections, &tracker, 1).await;
 
         // After 1 failure with threshold=1, contact should be removed
         assert!(!registrar.is_registered("sip:alice@example.com"));
@@ -302,7 +308,7 @@ mod tests {
     async fn ping_skips_contacts_without_source_addr() {
         let registrar = make_registrar();
         let (uac_sender, _rxs) = make_uac_sender();
-        let tls_addr_map = Arc::new(DashMap::new());
+        let stream_connections = StreamConnections::new();
 
         // Contact without source_addr
         registrar
@@ -314,7 +320,7 @@ mod tests {
             .unwrap();
 
         let tracker = FailureTracker::new();
-        ping_all_contacts(&registrar, &uac_sender, &tls_addr_map, &tracker, 1).await;
+        ping_all_contacts(&registrar, &uac_sender, &stream_connections, &tracker, 1).await;
 
         // Contact should still be registered — it was skipped
         assert!(registrar.is_registered("sip:alice@example.com"));

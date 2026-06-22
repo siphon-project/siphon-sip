@@ -10,7 +10,7 @@ from __future__ import annotations
 import uuid
 from typing import Optional, Union
 
-from siphon_sdk.types import Action, Contact, MediaHandle, SipUri
+from siphon_sdk.types import Action, Contact, Flow, MediaHandle, SipUri
 from siphon_sdk.request import _parse_uri
 
 
@@ -206,6 +206,7 @@ class Call:
         uri: str,
         timeout: int = 30,
         next_hop: Optional[str] = None,
+        flow: Optional["Flow"] = None,
         header_policy: Optional[str] = None,
         copy: Optional[list[str]] = None,
         strip: Optional[list[str]] = None,
@@ -220,6 +221,12 @@ class Call:
                 INVITE's R-URI is still built from ``uri`` (so the called
                 party / IMPU shape is preserved), but the message is sent
                 to ``next_hop``.  Mirrors ``proxy.send_request(next_hop=...)``.
+            flow: Captured inbound :class:`Flow` (typically ``contact.flow``
+                from ``registrar.lookup()``).  When set, the B-leg INVITE is
+                sent over that connection — RFC 5626 §5.3 connection reuse,
+                mandatory for a WebSocket callee (RFC 7118 §5) whose Contact
+                URI is unresolvable.  Bypasses DNS resolution of
+                ``uri``/``next_hop``; guard on ``contact.is_local`` first.
             header_policy: Qualified preset name selecting which header
                 policy the framework applies when building the B-leg
                 INVITE and forwarding responses back to the A-leg.
@@ -271,6 +278,7 @@ class Call:
             timeout=timeout,
             next_hop=next_hop,
             extras={
+                "flow": flow,
                 "header_policy": header_policy,
                 "copy": copy or [],
                 "strip": strip or [],
@@ -291,7 +299,12 @@ class Call:
         """Fork to multiple B-leg targets.
 
         Args:
-            targets: List of URI strings or :class:`Contact` objects.
+            targets: List of URI strings or :class:`Contact` objects.  Pass
+                ``Contact`` objects (not just ``.uri``) so a binding this
+                process accepted (``contact.is_local``) routes its branch over
+                the captured inbound flow — RFC 5626 §5.3 connection reuse,
+                mandatory for a WebSocket callee (RFC 7118 §5).  Non-local
+                contacts fall back to URI routing.
             strategy: ``"parallel"`` (ring all, first answer wins) or
                       ``"sequential"`` (try in order).
             timeout: Per-branch INVITE timeout in seconds.
@@ -302,7 +315,8 @@ class Call:
         Example::
 
             contacts = registrar.lookup(call.ruri)
-            call.fork([c.uri for c in contacts], strategy="parallel", timeout=30)
+            # Pass Contact objects so WebSocket callees route over their flow.
+            call.fork(contacts, strategy="parallel", timeout=30)
         """
         uris = [t.uri if isinstance(t, Contact) else str(t) for t in targets]
         self._actions.append(Action(

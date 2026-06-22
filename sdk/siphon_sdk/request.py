@@ -375,14 +375,20 @@ class Request:
         """Fork the request to multiple targets.
 
         Args:
-            targets: List of URI strings or :class:`Contact` objects.
+            targets: List of URI strings or :class:`Contact` objects.  Pass
+                ``Contact`` objects (not just ``.uri``) so a binding this
+                process accepted (``contact.is_local``) routes its branch over
+                the captured inbound flow — RFC 5626 §5.3 connection reuse,
+                the only way to reach a WebSocket UE (RFC 7118 §5).  Non-local
+                contacts fall back to URI routing.
             strategy: ``"parallel"`` (all at once, first 2xx wins) or
                       ``"sequential"`` (try in q-value order, next on failure).
 
         Example::
 
             contacts = registrar.lookup(request.ruri)
-            request.fork([c.uri for c in contacts])
+            # Pass Contact objects so a WebSocket UE routes over its flow.
+            request.fork(contacts)
             request.fork(["sip:a@host", "sip:b@host"], strategy="sequential")
         """
         uris = [t.uri if isinstance(t, Contact) else str(t) for t in targets]

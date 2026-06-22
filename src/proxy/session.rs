@@ -68,6 +68,14 @@ pub struct ProxySession {
     pub client_branches: HashMap<TransactionKey, ClientBranch>,
     /// Fork aggregator for multi-target forking (None for single-target relay).
     pub fork_aggregator: Option<Arc<Mutex<ForkAggregator>>>,
+    /// Captured inbound flow per fork branch, parallel to the aggregator's
+    /// branches.  `Some` means that branch is routed over the captured
+    /// connection (RFC 5626 §5.3 connection reuse — the only way to reach a
+    /// WebSocket UE) instead of DNS-resolving the URI.  Stored on the session so
+    /// sequential forking (`start_next_fork_branch`) can recover the flow for
+    /// branches started after the first.  `PyFlow` is plain data (no
+    /// `Py<PyAny>`), so cloning it off the dispatcher thread is sound.
+    pub fork_flows: Vec<Option<crate::script::api::registrar::PyFlow>>,
     /// Maps client transaction key → branch index in the ForkAggregator.
     pub branch_index_map: HashMap<TransactionKey, usize>,
     /// Whether `record_route()` was called by the script.
@@ -96,6 +104,7 @@ impl ProxySession {
             client_keys: Vec::new(),
             client_branches: HashMap::new(),
             fork_aggregator: None,
+            fork_flows: Vec::new(),
             branch_index_map: HashMap::new(),
             source_addr,
             inbound_local_addr,

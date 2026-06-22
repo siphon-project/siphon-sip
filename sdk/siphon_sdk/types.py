@@ -102,12 +102,14 @@ class Flow:
         """Whether the flow is still usable.
 
         For UDP, always ``True``: the listener socket survives any
-        individual exchange.  For stream transports, ``True`` only while
-        the accepted connection is still open on this process.
+        individual exchange.  For stream transports (TCP/TLS/WS/WSS), the
+        real implementation returns ``True`` only while the *exact* accepted
+        connection that delivered the REGISTER is still open on this process
+        — a real lookup against the unified stream-connection registry (see
+        PyFlow.is_alive in src/script/api/registrar.rs).  A UE that
+        reconnected, or whose socket closed, reports ``False``.
 
-        The mock implementation always returns ``True``; the real one
-        will gate on the per-listener connection registry once that's
-        wired (see PyFlow.is_alive in src/script/api/registrar.rs).
+        The mock always returns ``True`` (no live connections to track).
         """
         return True
 
@@ -158,10 +160,13 @@ class Contact:
 
     flow: Optional[Flow] = None
     """Captured inbound flow (``Flow`` view).  Pass to
-    ``request.relay(flow=...)`` for Path-token MT routing.  ``None``
-    when the binding lacks a complete flow capture (no ``flow_token=``
-    on save, or a stream-transport binding whose connection_id isn't
-    available)."""
+    ``request.relay(flow=...)`` / ``request.fork(contacts)`` /
+    ``call.dial(flow=...)`` for RFC 5626 §5.3 connection reuse — the only
+    way to reach a WebSocket UE (RFC 7118 §5).  Populated for *any* binding
+    this process accepted (no ``flow_token=`` required); ``None`` only for a
+    binding restored cross-instance whose local listener / connection id
+    aren't available here.  Guard on :attr:`is_local` before routing over
+    it."""
 
     params: list = field(default_factory=list)
     """Contact-header parameters preserved from the originating REGISTER
