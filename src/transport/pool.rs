@@ -35,6 +35,20 @@ use crate::transport::tcp::extract_sip_message_length;
 /// be torn down so the next send creates a fresh one.
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Fail-fast timeout for outbound TCP/TLS connection establishment.
+///
+/// An ESP-over-TCP IPsec MT send must leave from the fixed protected source
+/// port (`pcscf_port_c`, TS 33.203 SA #3), so it can never fall back to an
+/// ephemeral port.  When the UE's SA pair has been torn down (idle-liveness
+/// dereg) the SYN goes nowhere and the kernel emits no RST — `connect()` would
+/// otherwise block forever, stranding the PyExecutor worker that drove the
+/// relay.  With work pending and zero completions for 30 s the script-executor
+/// watchdog aborts the whole process (see `script/py_executor.rs`).  Bounding
+/// the connect at 5 s (≥6× under the watchdog window, under SIP Timer F = 32 s)
+/// turns a doomed send into a fast `Err` the caller already handles, instead of
+/// a process abort.
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Key for a pooled connection: destination address + transport type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PoolKey {
@@ -51,6 +65,15 @@ struct PoolEntry {
 /// Connection pool for outbound TCP/TLS connections.
 pub struct ConnectionPool {
     connections: Arc<DashMap<PoolKey, PoolEntry>>,
+    /// Per-destination establishment locks.  Concurrent first-sends to the same
+    /// destination must coalesce onto a single connection: an ESP-over-TCP
+    /// IPsec send binds the fixed source port `pcscf_port_c`, so a second
+    /// concurrent `bind`/`connect` to the same `(src, dst)` 4-tuple fails
+    /// `EADDRNOTAVAIL`/`EADDRINUSE`.  The first caller establishes under the
+    /// lock; the rest wait, re-check, and reuse.  Entries are pruned once no
+    /// waiter remains so the map stays bounded even as a UE's `port_us` rotates
+    /// each re-AKA.
+    connect_locks: Arc<DashMap<PoolKey, Arc<tokio::sync::Mutex<()>>>>,
     /// Shared connection map (same one used by inbound connections).
     /// Pooled connections are also registered here so responses can be
     /// routed back via the same connection_id.
@@ -72,6 +95,10 @@ pub struct ConnectionPool {
     /// prober is running.  Read tasks always answer peer pings regardless
     /// (RFC contract), but only notify the tracker on pong when it's set.
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
+    /// Fail-fast establishment timeout (defaults to [`TCP_CONNECT_TIMEOUT`]).
+    /// A field rather than a bare const so tests can drive a short value and
+    /// exercise the timeout branch in milliseconds.
+    connect_timeout: Duration,
 }
 
 /// Build a permissive TLS client config that accepts any server certificate.
@@ -142,6 +169,7 @@ impl ConnectionPool {
     ) -> Self {
         Self {
             connections: Arc::new(DashMap::new()),
+            connect_locks: Arc::new(DashMap::new()),
             connection_map,
             inbound_tx,
             local_addr,
@@ -149,6 +177,7 @@ impl ConnectionPool {
             tls_connector: TlsConnector::from(build_outbound_tls_config()),
             stream_connections,
             crlf_pong_tracker,
+            connect_timeout: TCP_CONNECT_TIMEOUT,
         }
     }
 
@@ -200,7 +229,8 @@ impl ConnectionPool {
             transport: Transport::Tcp,
         };
 
-        // Try existing connection first
+        // Fast path: reuse a live pooled connection without taking the
+        // per-destination establishment lock.
         if let Some(entry) = self.connections.get(&key) {
             if !entry.sender.is_closed()
                 && entry.sender.send(data.clone()).await.is_ok()
@@ -212,6 +242,55 @@ impl ConnectionPool {
             self.connections.remove(&key);
         }
 
+        // Coalesce concurrent establishment to this destination onto a single
+        // connection.  A second concurrent connect from the fixed IPsec source
+        // port would `bind`/`connect` the same `(src, dst)` 4-tuple and fail
+        // `EADDRNOTAVAIL`/`EADDRINUSE`; instead the first caller establishes
+        // under the lock while the rest wait and reuse the result.
+        let connect_lock = self
+            .connect_locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let result = {
+            let _establish_guard = connect_lock.lock().await;
+            // Re-check: a peer may have established the connection while we
+            // were waiting for the lock.
+            if let Some(entry) = self.connections.get(&key) {
+                if !entry.sender.is_closed()
+                    && entry.sender.send(data.clone()).await.is_ok()
+                {
+                    Ok(entry.connection_id)
+                } else {
+                    drop(entry);
+                    self.connections.remove(&key);
+                    self.establish_tcp_connection(key, bind_addr, destination, data)
+                        .await
+                }
+            } else {
+                self.establish_tcp_connection(key, bind_addr, destination, data)
+                    .await
+            }
+        };
+        // Drop our per-destination lock once no waiter remains (map ref + our
+        // local clone == 2).  Keeps `connect_locks` bounded even as a UE's
+        // `port_us` rotates each re-AKA.
+        self.connect_locks
+            .remove_if(&key, |_, lock| Arc::strong_count(lock) <= 2);
+        result
+    }
+
+    /// Establish a fresh outbound TCP connection to `destination`, bound to
+    /// `bind_addr`, send `data`, and register the connection in the pool.
+    /// Called by [`Self::send_tcp_inner`] while it holds the per-destination
+    /// establishment lock, so concurrent sends coalesce onto one connection.
+    async fn establish_tcp_connection(
+        &self,
+        key: PoolKey,
+        bind_addr: SocketAddr,
+        destination: SocketAddr,
+        data: Bytes,
+    ) -> Result<ConnectionId, std::io::Error> {
         // Create new connection.  Default bind (`port 0`) lets the OS
         // pick an ephemeral port — required for non-IPsec destinations
         // because binding to the exact listen port causes EADDRNOTAVAIL
@@ -248,14 +327,36 @@ impl ConnectionPool {
             );
             e
         })?;
-        let stream = socket.connect(destination).await.map_err(|e| {
-            warn!(
-                bind_addr = %bind_addr,
-                destination = %destination,
-                "pool: TCP connect failed: {e}"
-            );
-            e
-        })?;
+        // Fail-fast: a torn-down IPsec SA gives no SYN-ACK and no RST, so an
+        // un-bounded connect would block the calling worker forever (and trip
+        // the script-executor watchdog → process abort).  Bound it.
+        let stream = match tokio::time::timeout(self.connect_timeout, socket.connect(destination))
+            .await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
+                warn!(
+                    bind_addr = %bind_addr,
+                    destination = %destination,
+                    "pool: TCP connect failed: {e}"
+                );
+                return Err(e);
+            }
+            Err(_) => {
+                warn!(
+                    bind_addr = %bind_addr,
+                    destination = %destination,
+                    timeout = ?self.connect_timeout,
+                    "pool: TCP connect timed out — no SYN-ACK and no RST \
+                     (likely a torn-down IPsec SA); failing fast so the caller \
+                     is not stranded"
+                );
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "TCP connect timed out",
+                ));
+            }
+        };
         configure_tcp_socket(&stream, self.tos);
 
         let connection_id = next_connection_id();
@@ -422,14 +523,46 @@ impl ConnectionPool {
         // Create new TCP connection, then wrap with TLS handshake.
         // Unlike TCP pool connections we do NOT bind to a specific local port —
         // the TLS listen port (5061) is for inbound only; outbound uses ephemeral.
-        let tcp_stream = tokio::net::TcpStream::connect(destination).await?;
+        //
+        // Fail-fast on both the TCP connect and the TLS handshake: an
+        // unreachable or silently-dropping peer would otherwise block the
+        // calling worker indefinitely (same wedge class as the TCP path).
+        let tcp_stream = match tokio::time::timeout(
+            self.connect_timeout,
+            tokio::net::TcpStream::connect(destination),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                warn!(destination = %destination, timeout = ?self.connect_timeout, "pool: TLS TCP connect timed out");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "TLS TCP connect timed out",
+                ));
+            }
+        };
         configure_tcp_socket(&tcp_stream, self.tos);
 
         // TLS handshake — use the destination IP as SNI
         let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(
             destination.ip().to_string()
         ).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-        let tls_stream = self.tls_connector.connect(server_name, tcp_stream).await?;
+        let tls_stream = match tokio::time::timeout(
+            self.connect_timeout,
+            self.tls_connector.connect(server_name, tcp_stream),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                warn!(destination = %destination, timeout = ?self.connect_timeout, "pool: TLS handshake timed out");
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "TLS handshake timed out",
+                ));
+            }
+        };
 
         let connection_id = next_connection_id();
         let local_addr = tls_stream.get_ref().0.local_addr().unwrap_or(self.local_addr);
@@ -779,5 +912,127 @@ mod tests {
             "send_tcp_from must bind to the requested source port"
         );
         assert_eq!(peer.ip(), source_addr.ip());
+    }
+
+    #[tokio::test]
+    async fn connect_fails_fast_to_blackhole() {
+        // A torn-down IPsec SA gives a connect with no SYN-ACK and no RST.
+        // The pool MUST fail fast (bounded by `connect_timeout`) instead of
+        // stranding the calling worker forever — that strand is exactly what
+        // trips the script-executor watchdog into aborting the process.
+        ensure_crypto_provider();
+
+        let connection_map = Arc::new(DashMap::new());
+        let (inbound_tx, _inbound_rx) = flume::unbounded();
+        let mut pool = ConnectionPool::new(
+            connection_map,
+            inbound_tx,
+            "127.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
+            None,
+        );
+        // Short timeout so the test exercises the timeout branch in ms.
+        pool.connect_timeout = Duration::from_millis(150);
+
+        // RFC 5737 TEST-NET-1 — reserved and unrouted, so the SYN is dropped
+        // (→ timeout) or rejected as unreachable.  Either way the call must
+        // return `Err` quickly and never hang.
+        let blackhole: SocketAddr = "192.0.2.1:5060".parse().unwrap();
+        let source: SocketAddr = "0.0.0.0:0".parse().unwrap();
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            pool.send_tcp_from(source, blackhole, Bytes::from_static(b"PING")),
+        )
+        .await;
+
+        // The outer 2 s guard must NOT fire — the inner connect failed fast.
+        let inner = outcome.expect("send_tcp_from hung past 2s — connect was not bounded");
+        assert!(inner.is_err(), "connect to a black-hole must return Err, not succeed");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "connect must fail fast, not strand the caller"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_sends_coalesce_onto_one_connection() {
+        // Concurrent first-sends to the same destination from the fixed IPsec
+        // source port must coalesce onto ONE connection.  Without coalescing
+        // the 2nd+ concurrent connect re-binds/re-connects the identical
+        // (src, dst) 4-tuple and fails EADDRNOTAVAIL/EADDRINUSE — the
+        // re-REGISTER-path storm in the field report.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        ensure_crypto_provider();
+
+        // Reserve a fixed source port (the role `pcscf_port_c` plays at
+        // runtime); drop it so `send_tcp_from` can rebind it via SO_REUSEADDR.
+        let bind_socket = tokio::net::TcpSocket::new_v4().unwrap();
+        bind_socket.set_reuseaddr(true).unwrap();
+        bind_socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let source_addr = bind_socket.local_addr().unwrap();
+        drop(bind_socket);
+
+        // Server accepts connections and holds each open past the test window.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_clone = accepted.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((socket, _)) = listener.accept().await {
+                    accepted_clone.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        drop(socket);
+                    });
+                }
+            }
+        });
+
+        let connection_map = Arc::new(DashMap::new());
+        let (inbound_tx, _inbound_rx) = flume::unbounded();
+        let pool = Arc::new(ConnectionPool::new(
+            connection_map,
+            inbound_tx,
+            "127.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
+            None,
+        ));
+
+        // Fire N concurrent sends from the same fixed source.
+        let mut handles = Vec::new();
+        for i in 0..8u32 {
+            let pool = pool.clone();
+            handles.push(tokio::spawn(async move {
+                pool.send_tcp_from(source_addr, server_addr, Bytes::from(format!("PING {i}")))
+                    .await
+            }));
+        }
+
+        let mut ids = Vec::new();
+        for handle in handles {
+            let id = handle
+                .await
+                .unwrap()
+                .expect("every coalesced send must succeed (no EADDRNOTAVAIL)");
+            ids.push(id);
+        }
+
+        // All coalesced onto one connection.
+        let first = ids[0];
+        assert!(
+            ids.iter().all(|id| *id == first),
+            "all concurrent sends must share one connection_id"
+        );
+        assert_eq!(pool.active_connections(), 1, "exactly one pooled connection");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "server accepted more than one connection — establishment did not coalesce"
+        );
     }
 }
