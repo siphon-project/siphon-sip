@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "siphon-sdk"
-version = "0.4.32"
+version = "0.4.33"
 description = "Mock library and type stubs for SIPhon SIP proxy/B2BUA scripts — enables unit testing and LLM-assisted script authoring"
 readme = "README.md"
 license = "MIT"

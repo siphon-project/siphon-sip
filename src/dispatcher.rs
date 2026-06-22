@@ -8535,6 +8535,27 @@ fn handle_registrant_response(
                 );
             }
 
+            // IPsec: tighten the kernel SA hard-lifetime from the placeholder
+            // installed on the 401 path down to the registrar's granted Expires
+            // (+ RFC 3261 Timer F grace), so the SAs track the registration
+            // lifetime (TS 33.203 §7.4).
+            if is_aka && registrant.is_ipsec_entry(&aor) {
+                if let (Some(ipsec_manager), Some(ue_port_c)) =
+                    (state.ipsec_manager.clone(), registrant.ue_protected_client_port(&aor))
+                {
+                    let ue_addr = state.local_addr.ip();
+                    let hard_lifetime = (expires as u64) + 32;
+                    tokio::spawn(async move {
+                        if let Err(error) = ipsec_manager
+                            .update_sa_pair_lifetime(&ue_addr, ue_port_c, Some(hard_lifetime))
+                            .await
+                        {
+                            warn!(%error, "IPsec UE: failed to tighten SA lifetime");
+                        }
+                    });
+                }
+            }
+
             registrant.handle_success(&aor, expires);
         }
         401 | 407 => {
@@ -8555,6 +8576,16 @@ fn handle_registrant_response(
             };
 
             if let Some(challenge) = crate::auth::parse_challenge(&challenge_raw) {
+                // IMS AKA + IPsec sec-agree: parse the P-CSCF's Security-Server,
+                // build the protected re-REGISTER (which stashes CK/IK), install
+                // the UE SAs, then send over the SA. The install MUST precede the
+                // send so the kernel encrypts the protected REGISTER — both run
+                // ordered inside one spawned task (TS 33.203 §7.4).
+                if is_aka && registrant.is_ipsec_entry(&aor) {
+                    handle_registrant_ipsec_challenge(registrant, message, &aor, &challenge, status_code, state);
+                    return;
+                }
+
                 // IMS AKA entries run Milenage over the RAND/AUTN in the nonce;
                 // carrier-trunk entries use password digest. The IMS challenge
                 // always arrives as a 401 (WWW-Authenticate).
@@ -8565,6 +8596,7 @@ fn handle_registrant_response(
                         &state.listen_addrs,
                         &challenge,
                         registrant.default_interval,
+                        None,
                     )
                 } else {
                     registrant.build_register_with_auth(
@@ -8592,6 +8624,111 @@ fn handle_registrant_response(
             registrant.handle_failure(&aor, status_code);
         }
     }
+}
+
+/// Handle a 401 challenge for an IPsec sec-agree (UE) registration.
+///
+/// Records the P-CSCF's Security-Server answer, builds the protected
+/// re-REGISTER (which stashes CK/IK on the entry), then installs the four UE
+/// SAs and sends the REGISTER over them. The SA install and the send run
+/// ordered inside one spawned task so the kernel encrypts the protected
+/// REGISTER (3GPP TS 33.203 §7.4) — sourced from the UE protected client port
+/// so the outbound XFRM selector matches.
+fn handle_registrant_ipsec_challenge(
+    registrant: &Arc<crate::registrant::RegistrantManager>,
+    message: &SipMessage,
+    aor: &str,
+    challenge: &crate::auth::DigestChallenge,
+    status_code: u16,
+    state: &DispatcherState,
+) {
+    match message.headers.get("Security-Server").cloned() {
+        Some(server_raw) => match crate::ipsec::parse_security_client(&server_raw) {
+            Some(server) => registrant.store_security_server(aor, &server, &server_raw),
+            None => {
+                warn!(aor = %aor, "IPsec UE: unparseable Security-Server, failing registration");
+                registrant.handle_failure(aor, status_code);
+                return;
+            }
+        },
+        None => {
+            warn!(aor = %aor, "IPsec UE: 401 without Security-Server, failing registration");
+            registrant.handle_failure(aor, status_code);
+            return;
+        }
+    }
+
+    // build_register_aka stashes CK/IK and targets the P-CSCF protected server
+    // port; the Security-Verify echoes the Security-Server recorded above.
+    let verify = registrant.security_server_value(aor);
+    let built = registrant.build_register_aka(
+        aor,
+        state.local_addr,
+        &state.listen_addrs,
+        challenge,
+        registrant.default_interval,
+        verify.as_deref(),
+    );
+    let (retry_message, destination, transport) = match built {
+        Some((retry_message, _branch, destination, transport)) => (retry_message, destination, transport),
+        None => {
+            registrant.handle_failure(aor, status_code);
+            return;
+        }
+    };
+
+    let ue_addr = state.local_addr.ip();
+    let pcscf_addr = destination.ip();
+    let ue_port_c = registrant.ue_protected_client_port(aor).unwrap_or(0);
+    // Placeholder lifetime; tightened to the granted Expires on the 200 OK.
+    let sa = registrant.ue_sa_pair(
+        aor,
+        ue_addr,
+        pcscf_addr,
+        Some(registrant.default_interval as u64),
+        crate::ipsec::SaProtocol::Any,
+    );
+
+    let ipsec_manager = match state.ipsec_manager.clone() {
+        Some(manager) => manager,
+        None => {
+            warn!(aor = %aor, "IPsec UE: no IpsecManager configured, failing registration");
+            registrant.handle_failure(aor, status_code);
+            return;
+        }
+    };
+
+    let source = std::net::SocketAddr::new(ue_addr, ue_port_c);
+    let data = bytes::Bytes::from(retry_message.to_bytes());
+    let outbound = state.outbound.clone();
+    let registrant_task = Arc::clone(registrant);
+    let aor_task = aor.to_string();
+
+    tokio::spawn(async move {
+        let sa = match sa {
+            Some(sa) => sa,
+            None => {
+                warn!(aor = %aor_task, "IPsec UE: missing CK/IK or Security-Server, protected REGISTER not sent");
+                registrant_task.handle_failure(&aor_task, 0);
+                return;
+            }
+        };
+        if let Err(error) = ipsec_manager.create_ue_sa_pair(sa).await {
+            warn!(aor = %aor_task, %error, "IPsec UE: SA install failed, protected REGISTER not sent");
+            registrant_task.handle_failure(&aor_task, 0);
+            return;
+        }
+        let outbound_message = crate::transport::OutboundMessage {
+            connection_id: crate::transport::ConnectionId::default(),
+            transport,
+            destination,
+            data,
+            source_local_addr: Some(source),
+        };
+        if let Err(error) = outbound.send(outbound_message) {
+            warn!(aor = %aor_task, %error, "IPsec UE: failed to send protected REGISTER");
+        }
+    });
 }
 
 /// Expand a route-set header (Service-Route, P-Associated-URI, Path) into its

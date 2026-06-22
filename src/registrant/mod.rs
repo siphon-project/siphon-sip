@@ -28,6 +28,13 @@ use tracing::{debug, info, warn};
 use crate::auth::{
     self, DigestChallenge, DigestCredentials, NonceCounter,
 };
+use std::net::IpAddr;
+
+use crate::ipsec::{
+    EncryptionAlgorithm, IntegrityAlgorithm, IpsecManager, SaProtocol, SaRole,
+    SecurityAssociationPair, SecurityClient,
+};
+use crate::ipsec::ue::{build_security_client, UeSecurityOffer};
 use crate::hep::HepSender;
 use crate::uac::resolve_via_addr;
 use crate::sip::builder::SipMessageBuilder;
@@ -117,6 +124,151 @@ impl fmt::Display for AuthMode {
     }
 }
 
+/// UE-side IPsec sec-agree parameters for an AKA registration (3GPP TS 33.203).
+///
+/// `ue_port_c`/`ue_port_s` are the UE's protected client/server ports — they
+/// must be declared as `listen.udp` entries so siphon can source the protected
+/// REGISTER from `ue_port_c` and receive MT requests on `ue_port_s`. The
+/// transform (`aalg`/`ealg`) is what the UE offers in Security-Client.
+///
+/// `spi_uc`/`spi_us` and `ck`/`ik` are per-handshake runtime state: SPIs are
+/// freshly allocated each initial REGISTER (and echoed in Security-Client), and
+/// CK/IK are filled from the AKA challenge before the SAs are installed.
+#[derive(Debug, Clone)]
+pub struct UeIpsec {
+    /// UE protected client port (also a `listen.udp` listener).
+    pub ue_port_c: u16,
+    /// UE protected server port (also a `listen.udp` listener).
+    pub ue_port_s: u16,
+    /// Offered integrity algorithm.
+    pub aalg: IntegrityAlgorithm,
+    /// Offered encryption algorithm (`Null` for integrity-only).
+    pub ealg: EncryptionAlgorithm,
+    /// UE client SPI for the current handshake (0 before the first offer).
+    pub spi_uc: u32,
+    /// UE server SPI for the current handshake (0 before the first offer).
+    pub spi_us: u32,
+    /// Cipher key from the most recent successful AKA challenge (SA encryption).
+    pub ck: Option<[u8; 16]>,
+    /// Integrity key from the most recent successful AKA challenge (SA integrity).
+    pub ik: Option<[u8; 16]>,
+
+    // --- P-CSCF answer (from the 401's Security-Server) ---
+    /// P-CSCF protected client port.
+    pub pcscf_port_c: u16,
+    /// P-CSCF protected server port — destination for the protected REGISTER.
+    pub pcscf_port_s: u16,
+    /// P-CSCF client SPI.
+    pub spi_pc: u32,
+    /// P-CSCF server SPI.
+    pub spi_ps: u32,
+    /// Raw Security-Server value, echoed verbatim in Security-Verify.
+    pub security_server: Option<String>,
+}
+
+impl UeIpsec {
+    /// Build from configured ports + transform; runtime fields start empty.
+    pub fn new(
+        ue_port_c: u16,
+        ue_port_s: u16,
+        aalg: IntegrityAlgorithm,
+        ealg: EncryptionAlgorithm,
+    ) -> Self {
+        Self {
+            ue_port_c,
+            ue_port_s,
+            aalg,
+            ealg,
+            spi_uc: 0,
+            spi_us: 0,
+            ck: None,
+            ik: None,
+            pcscf_port_c: 0,
+            pcscf_port_s: 0,
+            spi_pc: 0,
+            spi_ps: 0,
+            security_server: None,
+        }
+    }
+
+    /// The Security-Client offer for the current SPIs/ports/transform.
+    pub fn offer(&self) -> UeSecurityOffer {
+        UeSecurityOffer::new(
+            self.aalg,
+            self.ealg,
+            self.spi_uc,
+            self.spi_us,
+            self.ue_port_c,
+            self.ue_port_s,
+        )
+    }
+
+    /// Record the P-CSCF's Security-Server answer for the current handshake.
+    ///
+    /// Adopts the P-CSCF's chosen transform for the SA (it selects from the
+    /// UE's offer; falls back to the offered algorithm if the token is
+    /// unrecognised) and stashes the raw value for the Security-Verify echo.
+    pub fn record_server_answer(&mut self, server: &SecurityClient, raw: &str) {
+        self.pcscf_port_c = server.port_c;
+        self.pcscf_port_s = server.port_s;
+        self.spi_pc = server.spi_c;
+        self.spi_ps = server.spi_s;
+        if let Some(alg) = IntegrityAlgorithm::from_sec_agree_name(&server.algorithm) {
+            self.aalg = alg;
+        }
+        if let Some(ealg_token) = server.ealg.as_deref() {
+            if let Some(ealg) = EncryptionAlgorithm::from_sec_agree_name(ealg_token) {
+                self.ealg = ealg;
+            }
+        }
+        self.security_server = Some(raw.to_string());
+    }
+
+    /// Construct the four-SA descriptor for `create_ue_sa_pair`, deriving the
+    /// ESP keys from CK (encryption) and IK (integrity). Returns `None` until
+    /// both an AKA challenge (CK/IK) and a Security-Server answer have landed.
+    pub fn sa_pair(
+        &self,
+        ue_addr: IpAddr,
+        pcscf_addr: IpAddr,
+        hard_lifetime_secs: Option<u64>,
+        protocol: SaProtocol,
+    ) -> Option<SecurityAssociationPair> {
+        let ck = self.ck?;
+        let ik = self.ik?;
+        if self.security_server.is_none() {
+            return None;
+        }
+        let integrity_key = IpsecManager::derive_integrity_key(self.aalg, &ik)?;
+        let encryption_key = if self.ealg == EncryptionAlgorithm::Null {
+            String::new()
+        } else {
+            crate::ipsec::bytes_to_hex(&ck)
+        };
+        Some(SecurityAssociationPair {
+            ue_addr,
+            pcscf_addr,
+            ue_port_c: self.ue_port_c,
+            ue_port_s: self.ue_port_s,
+            pcscf_port_c: self.pcscf_port_c,
+            pcscf_port_s: self.pcscf_port_s,
+            spi_uc: self.spi_uc,
+            spi_us: self.spi_us,
+            spi_pc: self.spi_pc,
+            spi_ps: self.spi_ps,
+            ealg: self.ealg,
+            aalg: self.aalg,
+            encryption_key,
+            integrity_key: crate::ipsec::bytes_to_hex(&integrity_key),
+            hard_lifetime_secs,
+            protocol,
+            // Recomputed authoritatively inside create_ue_sa_pair.
+            expires_at: Instant::now(),
+            role: SaRole::Ue,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entry
 // ---------------------------------------------------------------------------
@@ -179,6 +331,12 @@ pub struct RegistrantEntry {
     pub associated_uris: Vec<String>,
     /// Path header set (RFC 3327) returned by the registrar.
     pub path: Vec<String>,
+
+    /// UE IPsec sec-agree parameters (3GPP TS 33.203). `Some` when this AKA
+    /// registration must establish IPsec SAs with the P-CSCF; the initial
+    /// REGISTER then carries Security-Client and the protected re-REGISTER
+    /// carries Security-Verify. `None` = AKA without IPsec (test cores).
+    pub ue_ipsec: Option<UeIpsec>,
 }
 
 impl RegistrantEntry {
@@ -215,6 +373,7 @@ impl RegistrantEntry {
             service_route: Vec::new(),
             associated_uris: Vec::new(),
             path: Vec::new(),
+            ue_ipsec: None,
         }
     }
 
@@ -227,6 +386,13 @@ impl RegistrantEntry {
         self.auth_mode = AuthMode::Aka;
         self.aka = Some(credentials);
         self.sqn_ms = initial_sqn;
+        self
+    }
+
+    /// Enable IPsec sec-agree for this (AKA) registration (3GPP TS 33.203).
+    /// Only meaningful together with [`with_aka`](Self::with_aka).
+    pub fn with_ipsec(mut self, ipsec: UeIpsec) -> Self {
+        self.ue_ipsec = Some(ipsec);
         self
     }
 
@@ -264,6 +430,10 @@ pub struct RegistrantManager {
     user_agent_header: Option<String>,
     /// Broadcast channel for registrant state change events.
     event_sender: broadcast::Sender<RegistrantEvent>,
+    /// Monotonic counter for UE-side IPsec SPIs (sec-agree). Each initial
+    /// REGISTER that offers IPsec consumes a pair. Seeded high so it never
+    /// overlaps a co-resident P-CSCF's SPI range.
+    ue_spi_counter: AtomicU32,
 }
 
 impl RegistrantManager {
@@ -281,7 +451,18 @@ impl RegistrantManager {
             max_retry_interval,
             user_agent_header,
             event_sender,
+            ue_spi_counter: AtomicU32::new(Self::UE_SPI_BASE),
         }
+    }
+
+    /// Base for UE IPsec SPI allocation — `0x20000000`, far above any P-CSCF
+    /// SPI partition, so a single host can run both roles without collisions.
+    const UE_SPI_BASE: u32 = 0x2000_0000;
+
+    /// Allocate a fresh `(spi_uc, spi_us)` pair for a UE sec-agree offer.
+    pub fn allocate_ue_spi_pair(&self) -> (u32, u32) {
+        let first = self.ue_spi_counter.fetch_add(2, Ordering::Relaxed);
+        (first, first.wrapping_add(1))
     }
 
     /// Subscribe to registrant state change events.
@@ -437,6 +618,26 @@ impl RegistrantManager {
             );
         }
 
+        // IMS IPsec sec-agree: the initial (unprotected) REGISTER offers the
+        // UE's transform, freshly allocated SPIs, and protected ports in
+        // Security-Client, and demands the extension via Require/Proxy-Require
+        // (RFC 3329 / TS 33.203 §7.2). The 401 answers with Security-Server.
+        // Deregistration (expires == 0) rides the existing SA and does not
+        // re-offer.
+        if expires > 0 && entry.ue_ipsec.is_some() {
+            let (spi_uc, spi_us) = self.allocate_ue_spi_pair();
+            if let Some(ipsec) = entry.ue_ipsec.as_mut() {
+                ipsec.spi_uc = spi_uc;
+                ipsec.spi_us = spi_us;
+                let security_client = build_security_client(&ipsec.offer());
+                builder = builder
+                    .header("Security-Client", security_client)
+                    .header("Require", "sec-agree".to_string())
+                    .header("Proxy-Require", "sec-agree".to_string())
+                    .header("Supported", "path".to_string());
+            }
+        }
+
         let message = builder.build();
 
         let destination = entry.destination;
@@ -570,6 +771,7 @@ impl RegistrantManager {
         listen_addrs: &HashMap<Transport, SocketAddr>,
         challenge: &DigestChallenge,
         expires: u32,
+        security_verify: Option<&str>,
     ) -> Option<(SipMessage, String, SocketAddr, Transport)> {
         let mut entry = self.entries.get_mut(aor)?;
 
@@ -584,8 +786,14 @@ impl RegistrantManager {
 
         let (res, auts): (Vec<u8>, Option<String>) =
             match aka::aka_challenge(&credentials, &rand, &autn, &entry.sqn_ms) {
-                aka::AkaOutcome::Success { res, sqn, .. } => {
+                aka::AkaOutcome::Success { res, ck, ik, sqn } => {
                     entry.sqn_ms = sqn;
+                    // Stash CK/IK so the dispatcher can derive the IPsec SA
+                    // keys before sending the protected REGISTER (Phase 2).
+                    if let Some(ipsec) = entry.ue_ipsec.as_mut() {
+                        ipsec.ck = Some(ck);
+                        ipsec.ik = Some(ik);
+                    }
                     (res, None)
                 }
                 aka::AkaOutcome::SyncFailure { auts } => {
@@ -658,9 +866,32 @@ impl RegistrantManager {
             builder = builder.header("User-Agent", user_agent.clone());
         }
 
+        // IPsec sec-agree: on the protected re-REGISTER, echo the P-CSCF's
+        // Security-Server verbatim in Security-Verify and repeat Security-Client
+        // (RFC 3329 §2.4 / TS 33.203 §7.4). This REGISTER egresses over the SA
+        // the dispatcher installs from the stashed CK/IK.
+        if let Some(verify) = security_verify {
+            builder = builder.header("Security-Verify", verify.to_string());
+            if let Some(ipsec) = entry.ue_ipsec.as_ref() {
+                builder = builder
+                    .header("Security-Client", build_security_client(&ipsec.offer()))
+                    .header("Require", "sec-agree".to_string())
+                    .header("Proxy-Require", "sec-agree".to_string());
+            }
+        }
+
         let message = builder.build();
-        let destination = entry.destination;
         let transport = entry.transport;
+
+        // The protected REGISTER goes to the P-CSCF's protected server port
+        // (from Security-Server), not the default SIP port the initial REGISTER
+        // used. Without a recorded answer, fall back to the default destination.
+        let destination = match entry.ue_ipsec.as_ref() {
+            Some(ipsec) if security_verify.is_some() && ipsec.pcscf_port_s != 0 => {
+                SocketAddr::new(entry.destination.ip(), ipsec.pcscf_port_s)
+            }
+            _ => entry.destination,
+        };
 
         match message {
             Ok(message) => Some((message, branch, destination, transport)),
@@ -707,6 +938,58 @@ impl RegistrantManager {
             .get(aor)
             .map(|entry| entry.associated_uris.clone())
             .unwrap_or_default()
+    }
+
+    /// Whether this entry negotiates IPsec sec-agree (UE side).
+    pub fn is_ipsec_entry(&self, aor: &str) -> bool {
+        self.entries
+            .get(aor)
+            .map(|entry| entry.ue_ipsec.is_some())
+            .unwrap_or(false)
+    }
+
+    /// The UE's protected client port — the source the protected REGISTER and
+    /// subsequent protected traffic egress from. `None` for non-IPsec entries.
+    pub fn ue_protected_client_port(&self, aor: &str) -> Option<u16> {
+        self.entries
+            .get(aor)
+            .and_then(|entry| entry.ue_ipsec.as_ref().map(|ipsec| ipsec.ue_port_c))
+    }
+
+    /// Record the P-CSCF's Security-Server answer (from the 401) on the entry,
+    /// so the protected REGISTER can echo it and the SA keys can be derived.
+    pub fn store_security_server(&self, aor: &str, server: &SecurityClient, raw: &str) {
+        if let Some(mut entry) = self.entries.get_mut(aor) {
+            if let Some(ipsec) = entry.ue_ipsec.as_mut() {
+                ipsec.record_server_answer(server, raw);
+            }
+        }
+    }
+
+    /// The raw Security-Server value to echo in Security-Verify, if recorded.
+    pub fn security_server_value(&self, aor: &str) -> Option<String> {
+        self.entries
+            .get(aor)
+            .and_then(|entry| entry.ue_ipsec.as_ref().and_then(|i| i.security_server.clone()))
+    }
+
+    /// Build the four-SA descriptor to install for this entry's UE side.
+    /// Returns `None` until both an AKA challenge (CK/IK) and a Security-Server
+    /// answer have been recorded.
+    pub fn ue_sa_pair(
+        &self,
+        aor: &str,
+        ue_addr: IpAddr,
+        pcscf_addr: IpAddr,
+        hard_lifetime_secs: Option<u64>,
+        protocol: SaProtocol,
+    ) -> Option<SecurityAssociationPair> {
+        self.entries.get(aor).and_then(|entry| {
+            entry
+                .ue_ipsec
+                .as_ref()
+                .and_then(|ipsec| ipsec.sa_pair(ue_addr, pcscf_addr, hard_lifetime_secs, protocol))
+        })
     }
 
     /// Handle a successful 200 OK response.
@@ -1806,6 +2089,7 @@ mod tests {
             &HashMap::new(),
             &challenge,
             600000,
+            None,
         );
         assert!(result.is_some());
 
@@ -1837,6 +2121,7 @@ mod tests {
                 &HashMap::new(),
                 &challenge,
                 600000,
+                None,
             )
             .unwrap();
         let bytes = message.to_bytes();
@@ -1868,6 +2153,7 @@ mod tests {
                 &HashMap::new(),
                 &corrupted,
                 600000,
+                None,
             )
             .is_none());
     }
@@ -1909,6 +2195,187 @@ mod tests {
         assert_eq!(
             home_domain_from_aor("sip:user@host.com;transport=tcp"),
             "host.com"
+        );
+    }
+
+    fn make_aka_ipsec_entry(aor: &str) -> RegistrantEntry {
+        make_aka_entry(aor).with_ipsec(UeIpsec::new(
+            6100,
+            6101,
+            IntegrityAlgorithm::HmacSha1,
+            EncryptionAlgorithm::Null,
+        ))
+    }
+
+    #[test]
+    fn allocate_ue_spi_pair_is_monotonic_and_paired() {
+        let manager = make_manager();
+        let (a0, a1) = manager.allocate_ue_spi_pair();
+        let (b0, b1) = manager.allocate_ue_spi_pair();
+        assert_eq!(a1, a0 + 1);
+        assert_eq!(b1, b0 + 1);
+        assert_eq!(b0, a0 + 2);
+        // Seeded high so it can't collide with a P-CSCF SPI partition.
+        assert!(a0 >= 0x2000_0000);
+    }
+
+    #[test]
+    fn build_register_ipsec_emits_security_client() {
+        let manager = make_manager();
+        manager.add(make_aka_ipsec_entry(AKA_AOR));
+
+        let (message, _, _, _) = manager
+            .build_register(AKA_AOR, "127.0.0.1:5060".parse().unwrap(), &HashMap::new(), 600000)
+            .unwrap();
+        let bytes = message.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+
+        assert!(raw.contains("Security-Client: ipsec-3gpp"), "{raw}");
+        assert!(raw.contains("alg=hmac-sha-1-96"));
+        assert!(raw.contains("ealg=null"));
+        assert!(raw.contains("port-c=6100"));
+        assert!(raw.contains("port-s=6101"));
+        assert!(raw.contains("Require: sec-agree"));
+        assert!(raw.contains("Proxy-Require: sec-agree"));
+
+        // SPIs were allocated and stored on the entry, and appear in the header.
+        let entry = manager.entries.get(AKA_AOR).unwrap();
+        let ipsec = entry.ue_ipsec.as_ref().unwrap();
+        assert!(ipsec.spi_uc >= 0x2000_0000);
+        assert_eq!(ipsec.spi_us, ipsec.spi_uc + 1);
+        assert!(raw.contains(&format!("spi-c={}", ipsec.spi_uc)));
+        assert!(raw.contains(&format!("spi-s={}", ipsec.spi_us)));
+    }
+
+    #[test]
+    fn build_register_aka_without_ipsec_has_no_security_client() {
+        let manager = make_manager();
+        manager.add(make_aka_entry(AKA_AOR)); // AKA but no IPsec
+
+        let (message, _, _, _) = manager
+            .build_register(AKA_AOR, "127.0.0.1:5060".parse().unwrap(), &HashMap::new(), 600000)
+            .unwrap();
+        let bytes = message.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+        assert!(!raw.contains("Security-Client"), "{raw}");
+        assert!(!raw.contains("sec-agree"), "{raw}");
+    }
+
+    #[test]
+    fn deregister_does_not_reoffer_security_client() {
+        let manager = make_manager();
+        manager.add(make_aka_ipsec_entry(AKA_AOR));
+
+        // expires == 0 → de-REGISTER must not carry a fresh Security-Client.
+        let (message, _, _, _) = manager
+            .build_register(AKA_AOR, "127.0.0.1:5060".parse().unwrap(), &HashMap::new(), 0)
+            .unwrap();
+        let bytes = message.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+        assert!(!raw.contains("Security-Client"), "{raw}");
+    }
+
+    const SECURITY_SERVER: &str =
+        "ipsec-3gpp; alg=hmac-sha-1-96; ealg=null; spi-c=55555; spi-s=66666; port-c=5064; port-s=5066";
+
+    /// Drive the full UE handshake message flow: initial REGISTER (allocates UE
+    /// SPIs + Security-Client) → record Security-Server → protected REGISTER.
+    #[test]
+    fn build_register_aka_protected_carries_security_verify_and_targets_protected_port() {
+        let manager = make_manager();
+        manager.add(make_aka_ipsec_entry(AKA_AOR));
+        let local = "127.0.0.1:5060".parse().unwrap();
+
+        // Initial REGISTER allocates the UE SPIs (stored on the entry).
+        manager.build_register(AKA_AOR, local, &HashMap::new(), 600000).unwrap();
+
+        // Record the P-CSCF's Security-Server answer.
+        let server = crate::ipsec::parse_security_client(SECURITY_SERVER).unwrap();
+        manager.store_security_server(AKA_AOR, &server, SECURITY_SERVER);
+
+        // Protected re-REGISTER.
+        let challenge = build_aka_challenge("ff9bb4d0b607");
+        let (message, _, destination, _) = manager
+            .build_register_aka(AKA_AOR, local, &HashMap::new(), &challenge, 600000, Some(SECURITY_SERVER))
+            .unwrap();
+        let bytes = message.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+
+        assert!(raw.contains(&format!("Security-Verify: {SECURITY_SERVER}")), "{raw}");
+        // RFC 3329: Security-Client repeated on the protected request.
+        assert!(raw.contains("Security-Client: ipsec-3gpp"), "{raw}");
+        assert!(raw.contains("Authorization: Digest"));
+        // Protected REGISTER targets the P-CSCF protected server port (5066),
+        // not the initial 5060.
+        assert_eq!(destination.port(), 5066, "must target pcscf_port_s");
+
+        // CK/IK were stashed for the SA install.
+        let entry = manager.entries.get(AKA_AOR).unwrap();
+        let ipsec = entry.ue_ipsec.as_ref().unwrap();
+        assert!(ipsec.ck.is_some());
+        assert!(ipsec.ik.is_some());
+        assert_eq!(ipsec.spi_pc, 55555);
+        assert_eq!(ipsec.spi_ps, 66666);
+        assert_eq!(ipsec.pcscf_port_s, 5066);
+    }
+
+    #[test]
+    fn ue_sa_pair_built_after_challenge_and_server_answer() {
+        let manager = make_manager();
+        manager.add(make_aka_ipsec_entry(AKA_AOR));
+        let local = "127.0.0.1:5060".parse().unwrap();
+        manager.build_register(AKA_AOR, local, &HashMap::new(), 600000).unwrap();
+
+        let ue_addr: IpAddr = "127.0.0.1".parse().unwrap();
+        let pcscf_addr: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Before the server answer → no SA descriptor.
+        assert!(manager
+            .ue_sa_pair(AKA_AOR, ue_addr, pcscf_addr, Some(600000), SaProtocol::Any)
+            .is_none());
+
+        let server = crate::ipsec::parse_security_client(SECURITY_SERVER).unwrap();
+        manager.store_security_server(AKA_AOR, &server, SECURITY_SERVER);
+        // Still no CK/IK until a challenge runs.
+        assert!(manager
+            .ue_sa_pair(AKA_AOR, ue_addr, pcscf_addr, Some(600000), SaProtocol::Any)
+            .is_none());
+
+        // Run the challenge (stashes CK/IK).
+        let challenge = build_aka_challenge("ff9bb4d0b607");
+        manager
+            .build_register_aka(AKA_AOR, local, &HashMap::new(), &challenge, 600000, Some(SECURITY_SERVER))
+            .unwrap();
+
+        let sa = manager
+            .ue_sa_pair(AKA_AOR, ue_addr, pcscf_addr, Some(600000), SaProtocol::Any)
+            .expect("SA descriptor ready");
+        assert_eq!(sa.role, SaRole::Ue);
+        assert_eq!(sa.ue_addr, ue_addr);
+        assert_eq!(sa.pcscf_addr, pcscf_addr);
+        assert_eq!(sa.spi_pc, 55555);
+        assert_eq!(sa.spi_ps, 66666);
+        assert_eq!(sa.pcscf_port_s, 5066);
+        assert_eq!(sa.ue_port_c, 6100);
+        // NULL encryption → empty encryption key; HMAC-SHA-1 integrity key is
+        // the 128-bit IK zero-padded to 20 bytes (40 hex chars).
+        assert!(sa.encryption_key.is_empty());
+        assert_eq!(sa.integrity_key.len(), 40);
+        assert!(sa.integrity_key.ends_with("00000000"));
+    }
+
+    #[test]
+    fn ipsec_helpers_report_entry_state() {
+        let manager = make_manager();
+        manager.add(make_aka_ipsec_entry(AKA_AOR));
+        manager.add(make_aka_entry("sip:plain@ims.mnc01.mcc001.3gppnetwork.org"));
+
+        assert!(manager.is_ipsec_entry(AKA_AOR));
+        assert!(!manager.is_ipsec_entry("sip:plain@ims.mnc01.mcc001.3gppnetwork.org"));
+        assert_eq!(manager.ue_protected_client_port(AKA_AOR), Some(6100));
+        assert_eq!(
+            manager.ue_protected_client_port("sip:plain@ims.mnc01.mcc001.3gppnetwork.org"),
+            None
         );
     }
 

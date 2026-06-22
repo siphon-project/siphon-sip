@@ -18,7 +18,8 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::registrant::{RegistrantCredentials, RegistrantEntry, RegistrantManager};
+use crate::ipsec::{EncryptionAlgorithm, IntegrityAlgorithm};
+use crate::registrant::{RegistrantCredentials, RegistrantEntry, RegistrantManager, UeIpsec};
 use crate::transport::Transport;
 
 /// Python-visible registration namespace.
@@ -60,8 +61,15 @@ impl PyRegistration {
     ///     amf: Authentication Management Field as 4 hex chars (default "8000").
     ///     sqn: Initial stored sequence number SQN_MS as 12 hex chars
     ///         (default all-zeros — correct for a fresh soft-UE).
+    ///     ipsec: True to establish IPsec sec-agree with the P-CSCF
+    ///         (3GPP TS 33.203). Requires auth="aka", ue_port_c, ue_port_s.
+    ///     ue_port_c: UE protected client port (must also be a listen.udp port).
+    ///     ue_port_s: UE protected server port (must also be a listen.udp port).
+    ///     ipsec_alg: Offered integrity algorithm — "hmac-sha-1-96" (default),
+    ///         "hmac-md5-96", or "hmac-sha-256-128".
+    ///     ipsec_ealg: Offered encryption algorithm — "null" (default) or "aes-cbc".
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (aor, registrar, *, user, password="", interval=None, realm=None, contact=None, transport=None, auth=None, k=None, op=None, opc=None, amf=None, sqn=None))]
+    #[pyo3(signature = (aor, registrar, *, user, password="", interval=None, realm=None, contact=None, transport=None, auth=None, k=None, op=None, opc=None, amf=None, sqn=None, ipsec=false, ue_port_c=None, ue_port_s=None, ipsec_alg=None, ipsec_ealg=None))]
     fn add(
         &self,
         aor: &str,
@@ -78,6 +86,11 @@ impl PyRegistration {
         opc: Option<&str>,
         amf: Option<&str>,
         sqn: Option<&str>,
+        ipsec: bool,
+        ue_port_c: Option<u16>,
+        ue_port_s: Option<u16>,
+        ipsec_alg: Option<&str>,
+        ipsec_ealg: Option<&str>,
     ) -> PyResult<()> {
         let transport_type = match transport {
             Some("tcp") => Transport::Tcp,
@@ -147,6 +160,34 @@ impl PyRegistration {
                     })?;
             let initial_sqn = parse_sqn(sqn.unwrap_or("000000000000"))?;
             entry.with_aka(credentials, initial_sqn)
+        } else {
+            entry
+        };
+
+        // IPsec sec-agree (3GPP TS 33.203): the protected ports must also be
+        // declared as listen.udp entries so the protected REGISTER can egress
+        // from ue_port_c and MT requests arrive on ue_port_s.
+        let entry = if ipsec {
+            if entry.auth_mode != crate::registrant::AuthMode::Aka {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "ipsec=True requires auth='aka'",
+                ));
+            }
+            let port_c = ue_port_c.ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err("ipsec=True requires ue_port_c")
+            })?;
+            let port_s = ue_port_s.ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err("ipsec=True requires ue_port_s")
+            })?;
+            let alg_token = ipsec_alg.unwrap_or("hmac-sha-1-96");
+            let aalg = IntegrityAlgorithm::from_sec_agree_name(alg_token).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!("unknown ipsec_alg '{alg_token}'"))
+            })?;
+            let ealg_token = ipsec_ealg.unwrap_or("null");
+            let ealg = EncryptionAlgorithm::from_sec_agree_name(ealg_token).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!("unknown ipsec_ealg '{ealg_token}'"))
+            })?;
+            entry.with_ipsec(UeIpsec::new(port_c, port_s, aalg, ealg))
         } else {
             entry
         };
@@ -278,6 +319,41 @@ mod tests {
             opc,
             Some("b9b9"),
             None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_aka_ipsec(
+        py_reg: &PyRegistration,
+        ue_port_c: Option<u16>,
+        ue_port_s: Option<u16>,
+        auth: Option<&str>,
+    ) -> PyResult<()> {
+        py_reg.add(
+            AKA_AOR,
+            "sip:10.0.0.1:5060",
+            "001010000000001@ims.mnc01.mcc001.3gppnetwork.org",
+            "",
+            None,
+            None,
+            None,
+            None,
+            auth,
+            Some(AKA_K),
+            None,
+            Some(AKA_OPC),
+            Some("b9b9"),
+            None,
+            true,
+            ue_port_c,
+            ue_port_s,
+            None,
+            None,
         )
     }
 
@@ -342,12 +418,39 @@ mod tests {
                 None,
                 None,
                 None,
+                false,
+                None,
+                None,
+                None,
+                None,
             )
             .unwrap();
         assert_eq!(
             manager.auth_mode("sip:alice@carrier.com"),
             Some(crate::registrant::AuthMode::Digest)
         );
+    }
+
+    #[test]
+    fn py_registration_add_aka_ipsec_sets_ipsec_entry() {
+        let manager = make_manager();
+        let py_reg = PyRegistration::new(Arc::clone(&manager), "127.0.0.1:5060".parse().unwrap());
+
+        add_aka_ipsec(&py_reg, Some(6100), Some(6101), Some("aka")).unwrap();
+
+        assert!(manager.is_ipsec_entry(AKA_AOR));
+        assert_eq!(manager.ue_protected_client_port(AKA_AOR), Some(6100));
+    }
+
+    #[test]
+    fn py_registration_ipsec_requires_ports_and_aka() {
+        let manager = make_manager();
+        let py_reg = PyRegistration::new(Arc::clone(&manager), "127.0.0.1:5060".parse().unwrap());
+
+        // Missing ue_port_s.
+        assert!(add_aka_ipsec(&py_reg, Some(6100), None, Some("aka")).is_err());
+        // ipsec without auth='aka'.
+        assert!(add_aka_ipsec(&py_reg, Some(6100), Some(6101), None).is_err());
     }
 
     #[test]

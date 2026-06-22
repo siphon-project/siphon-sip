@@ -2562,7 +2562,10 @@ class MockRegistration:
             contact: Optional[str] = None, transport: Optional[str] = None,
             auth: Optional[str] = None, k: Optional[str] = None,
             op: Optional[str] = None, opc: Optional[str] = None,
-            amf: Optional[str] = None, sqn: Optional[str] = None) -> None:
+            amf: Optional[str] = None, sqn: Optional[str] = None,
+            ipsec: bool = False, ue_port_c: Optional[int] = None,
+            ue_port_s: Optional[int] = None, ipsec_alg: Optional[str] = None,
+            ipsec_ealg: Optional[str] = None) -> None:
         """Add a new outbound registration.
 
         Args:
@@ -2585,10 +2588,18 @@ class MockRegistration:
             amf: Authentication Management Field as 4 hex chars (default "8000").
             sqn: Initial stored sequence number SQN_MS as 12 hex chars
                 (default all-zeros — correct for a fresh soft-UE).
+            ipsec: True to establish IPsec sec-agree with the P-CSCF
+                (3GPP TS 33.203). Requires auth="aka", ue_port_c, ue_port_s.
+            ue_port_c: UE protected client port (must also be a listen.udp port).
+            ue_port_s: UE protected server port (must also be a listen.udp port).
+            ipsec_alg: Offered integrity algorithm — "hmac-sha-1-96" (default),
+                "hmac-md5-96", or "hmac-sha-256-128".
+            ipsec_ealg: Offered encryption algorithm — "null" (default) or "aes-cbc".
 
         Raises:
             ValueError: when auth="aka" but `k` or an operator key (`op`/`opc`)
-                is missing, mirroring the Rust binding.
+                is missing; or when ipsec=True without auth="aka" /
+                ue_port_c / ue_port_s — mirroring the Rust binding.
         """
         is_aka = auth is not None and auth.lower() == "aka"
         if is_aka:
@@ -2596,6 +2607,13 @@ class MockRegistration:
                 raise ValueError("auth='aka' requires the subscriber key `k`")
             if not op and not opc:
                 raise ValueError("auth='aka' requires either `op` or `opc`")
+        if ipsec:
+            if not is_aka:
+                raise ValueError("ipsec=True requires auth='aka'")
+            if ue_port_c is None:
+                raise ValueError("ipsec=True requires ue_port_c")
+            if ue_port_s is None:
+                raise ValueError("ipsec=True requires ue_port_s")
         self._entries[aor] = {
             "aor": aor,
             "registrar": registrar,
@@ -2611,6 +2629,11 @@ class MockRegistration:
             "opc": opc,
             "amf": amf or "8000",
             "sqn": sqn or "000000000000",
+            "ipsec": bool(ipsec),
+            "ue_port_c": ue_port_c,
+            "ue_port_s": ue_port_s,
+            "ipsec_alg": ipsec_alg or "hmac-sha-1-96",
+            "ipsec_ealg": ipsec_ealg or "null",
             "state": "registered",
             "expires_in": interval or 3600,
             "failure_count": 0,

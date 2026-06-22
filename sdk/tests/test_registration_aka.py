@@ -64,3 +64,30 @@ def test_add_digest_is_default_and_needs_no_aka_params():
     entry = registration._entries["sip:alice@carrier.com"]
     assert entry["auth"] == "digest"
     assert entry["k"] is None
+    assert entry["ipsec"] is False
+
+
+def test_add_aka_ipsec_records_ports_and_transform():
+    registration = _fresh_registration()
+    registration.add(AKA_AOR, PCSCF, user=IMPI, auth="aka", k=AKA_K, opc=AKA_OPC,
+                     ipsec=True, ue_port_c=6100, ue_port_s=6101)
+    entry = registration._entries[AKA_AOR]
+    assert entry["ipsec"] is True
+    assert entry["ue_port_c"] == 6100
+    assert entry["ue_port_s"] == 6101
+    assert entry["ipsec_alg"] == "hmac-sha-1-96"
+    assert entry["ipsec_ealg"] == "null"
+
+
+def test_ipsec_requires_aka():
+    registration = _fresh_registration()
+    with pytest.raises(ValueError, match="requires auth='aka'"):
+        registration.add("sip:alice@carrier.com", PCSCF, user="alice",
+                         password="x", ipsec=True, ue_port_c=6100, ue_port_s=6101)
+
+
+def test_ipsec_requires_both_ports():
+    registration = _fresh_registration()
+    with pytest.raises(ValueError, match="ue_port_s"):
+        registration.add(AKA_AOR, PCSCF, user=IMPI, auth="aka", k=AKA_K,
+                         opc=AKA_OPC, ipsec=True, ue_port_c=6100)
