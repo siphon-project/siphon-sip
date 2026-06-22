@@ -14,6 +14,18 @@ DOMAIN = "example.com"
 
 @proxy.on_request
 def route(request):
+    # Reject malformed / RFC 4475 torture traffic before doing any work.
+    # The Rust side already drops unparseable messages and auto-483s
+    # Max-Forwards==0; sanity_check adds the *semantic* checks on a message that
+    # parses: mandatory headers (Via/From/To/Call-ID/CSeq), CSeq method matching
+    # the request, and Content-Length matching the body. Scoped to out-of-dialog
+    # requests (in-dialog traffic belongs to a dialog siphon already tracks) and
+    # dropped silently (no response) so we don't fingerprint the server to
+    # fuzzers/scanners. If you interwork with non-compliant legacy UAs, scope
+    # this to untrusted sources only (e.g. `and not request.source_ip_in(TRUSTED)`).
+    if not request.in_dialog and not proxy.sanity_check(request):
+        return
+
     # Local OPTIONS ping (e.g. from SBC/gateway keepalive)
     if request.method == "OPTIONS" and request.ruri.is_local and not request.ruri.user:
         request.reply(200, "OK")
