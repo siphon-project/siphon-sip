@@ -65,3 +65,13 @@ async def reply_route(request, reply):
             log.info(f"RTPEngine answer for reply call_id={reply.call_id}")
 
     reply.relay()
+
+
+@proxy.on_cancel
+async def cancel_route(request):
+    # The INVITE was CANCELled before any final response. on_reply/on_failure
+    # never fire for a cancel — the proxy answers 487 at the transaction layer
+    # and the session is gone — so without this hook the media anchored on the
+    # INVITE offer above would linger until RTPEngine's own inactivity timeout.
+    await rtpengine.delete(request)
+    log.info(f"RTPEngine delete for CANCEL call_id={request.call_id}")

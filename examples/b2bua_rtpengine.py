@@ -48,3 +48,15 @@ async def on_bye(call, initiator):
     # Release RTPEngine session
     await rtpengine.delete(call)
     log.info(f"RTPEngine delete done for call {call.call_id}")
+
+
+@b2bua.on_cancel
+async def on_cancel(call):
+    # Caller hung up before the call was answered (Calling/Ringing). on_answer
+    # never ran and no BYE will follow, so on_bye won't fire — but the offer in
+    # on_invite already anchored media. on_failure only covers a B-leg *error*
+    # response, not a caller CANCEL (that is torn down in Rust), so this hook is
+    # the only place to release the RTPEngine session for an abandoned call.
+    log.info(f"B2BUA CANCEL: call {call.call_id} (unanswered)")
+    await rtpengine.delete(call)
+    log.info(f"RTPEngine delete done for cancelled call {call.call_id}")

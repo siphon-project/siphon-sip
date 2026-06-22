@@ -105,6 +105,32 @@ class _ProxyNamespace:
         return fn
 
     @staticmethod
+    def on_cancel(fn):
+        """
+        Register a handler for a CANCELled INVITE (RFC 3261 §9).
+
+        Fires once, with the original INVITE, when a relayed INVITE is
+        CANCELled before any final response — the one teardown that
+        neither ``on_reply`` nor ``on_failure`` ever delivers (the proxy
+        answers the CANCEL with 487 at the transaction layer and the call
+        is gone). Use it to release per-call resources that no BYE will
+        ever clear: Diameter Rx / N5 QoS sessions, rtpengine media
+        anchors, charging correlation maps.
+
+        It is fire-and-forget cleanup — it does not gate or alter the 487
+        sent to the UAC, so there is no ``relay()``/``reply()`` decision.
+
+        Usage:
+            @proxy.on_cancel
+            async def handle_cancel(request):
+                await _release_qos(request.call_id)
+                await rtpengine.delete(request)
+        """
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register("proxy.on_cancel", None, fn, is_async)
+        return fn
+
+    @staticmethod
     def on_register_reply(fn):
         """
         Register a handler for REGISTER replies.
@@ -176,6 +202,27 @@ class _B2buaNamespace:
         """Register handler for REFER (call transfer, RFC 3515)."""
         is_async = _asyncio.iscoroutinefunction(fn)
         _registry.register("b2bua.on_refer", None, fn, is_async)
+        return fn
+
+    @staticmethod
+    def on_cancel(fn):
+        """Register handler for a CANCELled call (RFC 3261 §9).
+
+        Fires once, with the Call object, when an unanswered call
+        (Calling/Ringing) is CANCELled — the teardown that ``on_failure``
+        (B-leg error) and ``on_bye`` (answered call) never cover. A 2xx
+        that wins the CANCEL/answer glare is ACK+BYE'd by the framework
+        and never delivers ``on_answer``, so this hook only ever sees a
+        genuinely abandoned call. Use it to release per-call resources
+        that no BYE will clear: rtpengine media anchors, QoS sessions.
+
+        Usage:
+            @b2bua.on_cancel
+            async def handle_cancel(call):
+                await rtpengine.delete(call)
+        """
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register("b2bua.on_cancel", None, fn, is_async)
         return fn
 
 

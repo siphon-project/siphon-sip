@@ -46,6 +46,11 @@ pub enum HandlerKind {
     ProxyReply,
     /// `@proxy.on_failure` — all branches failed.
     ProxyFailure,
+    /// `@proxy.on_cancel` — relayed INVITE was CANCELled before a final
+    /// response (RFC 3261 §9). Fires once per cancelled call with the
+    /// original INVITE so a script can release per-call resources
+    /// (Diameter Rx/N5 QoS, rtpengine media) that no BYE will ever clear.
+    ProxyCancel,
     /// `@proxy.on_register_reply` — REGISTER-specific reply handler.
     ProxyRegisterReply,
     /// `@b2bua.on_invite`
@@ -60,6 +65,11 @@ pub enum HandlerKind {
     B2buaBye,
     /// `@b2bua.on_refer` — call transfer (RFC 3515).
     B2buaRefer,
+    /// `@b2bua.on_cancel` — an unanswered call (Calling/Ringing) was
+    /// CANCELled. Fires once per call with the Call object so a B2BUA
+    /// script can release per-call resources (rtpengine media, QoS) that
+    /// no BYE will ever clear.
+    B2buaCancel,
     /// `@registrar.on_change` — registration state change callback.
     RegistrarOnChange,
     /// `@registration.on_change` — outbound registration state change callback.
@@ -748,6 +758,7 @@ fn extract_handlers(
             "proxy.on_request" => HandlerKind::ProxyRequest(filter),
             "proxy.on_reply" => HandlerKind::ProxyReply,
             "proxy.on_failure" => HandlerKind::ProxyFailure,
+            "proxy.on_cancel" => HandlerKind::ProxyCancel,
             "proxy.on_register_reply" => HandlerKind::ProxyRegisterReply,
             "b2bua.on_invite" => HandlerKind::B2buaInvite,
             "b2bua.on_early_media" => HandlerKind::B2buaEarlyMedia,
@@ -755,6 +766,7 @@ fn extract_handlers(
             "b2bua.on_failure" => HandlerKind::B2buaFailure,
             "b2bua.on_bye" => HandlerKind::B2buaBye,
             "b2bua.on_refer" => HandlerKind::B2buaRefer,
+            "b2bua.on_cancel" => HandlerKind::B2buaCancel,
             "registrar.on_change" => HandlerKind::RegistrarOnChange,
             "registration.on_change" => HandlerKind::RegistrantOnChange,
             "srs.on_invite" => HandlerKind::SrsOnInvite,
@@ -1116,6 +1128,38 @@ def ended(call, initiator):
         assert!(state.handlers_for(&HandlerKind::B2buaInvite).len() == 1);
         assert!(state.handlers_for(&HandlerKind::B2buaAnswer).len() == 1);
         assert!(state.handlers_for(&HandlerKind::B2buaBye).len() == 1);
+    }
+
+    #[test]
+    fn proxy_on_cancel_decorator_registers_handler() {
+        let source = r#"
+from siphon import proxy
+
+@proxy.on_cancel
+async def on_cancel(request):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 1);
+        assert_eq!(state.handlers[0].kind, HandlerKind::ProxyCancel);
+        assert!(state.handlers[0].is_async);
+        assert_eq!(state.handlers_for(&HandlerKind::ProxyCancel).len(), 1);
+    }
+
+    #[test]
+    fn b2bua_on_cancel_decorator_registers_handler() {
+        let source = r#"
+from siphon import b2bua
+
+@b2bua.on_cancel
+def on_cancel(call):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 1);
+        assert_eq!(state.handlers[0].kind, HandlerKind::B2buaCancel);
+        assert!(!state.handlers[0].is_async);
+        assert_eq!(state.handlers_for(&HandlerKind::B2buaCancel).len(), 1);
     }
 
     #[test]

@@ -1564,13 +1564,18 @@ class MockCache:
             return None
         return store.get(key)
 
-    async def store(self, name: str, key: str, value: str) -> bool:
-        """Store a value in a named cache.
+    async def store(
+        self, name: str, key: str, value: str, ttl: Optional[int] = None
+    ) -> bool:
+        """Store a value in a named cache with optional TTL.
 
         Args:
             name: Cache name.
             key: Cache key.
             value: Value to store.
+            ttl: Optional TTL in seconds. Mirrors the real ``cache.store``
+                signature; the mock is in-memory and does not expire keys,
+                so the value is accepted and ignored.
 
         Returns:
             ``True`` if stored, ``False`` if cache name unknown.

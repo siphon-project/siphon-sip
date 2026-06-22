@@ -34,20 +34,25 @@ Config: examples/ims_pcscf.yaml
 """
 import secrets
 
-from siphon import proxy, registrar, ipsec, diameter, qos, log, Transform
+from siphon import proxy, registrar, ipsec, diameter, qos, cache, log, Transform
 
 REALM = "ims.example.com"
 PCSCF_URI = f"sip:{REALM};lr"
 
-# Track Rx sessions per dialog (call_id -> rx_session_id).
-# Used to release QoS resources on BYE.
-rx_sessions = {}
-
-# Pending Path-tokens by Call-ID — minted on the initial REGISTER and
-# attached to the binding when the upstream 200 OK arrives.  Cleared on
-# 200 (consumed) or on REGISTER failure (timeout/4xx — we don't want to
-# leak the slot indefinitely; in production wire a TTL).
-pending_path_tokens: dict[str, str] = {}
+# Per-call state lives in a siphon `cache`, NEVER in a module-level dict.
+# A siphon script must not keep cross-request state in module globals: the
+# script is hot-reloaded on edit (inotify) — every global is wiped on
+# reload — runs across a pool of driver threads, and in production across
+# several P-CSCF replicas, so a `{}` at module scope is neither durable nor
+# shared. The cache is Rust-side: it survives script reloads, is safe under
+# free-threaded concurrency, and (Redis-backed) is visible to every replica
+# — so whichever instance sees the BYE/CANCEL can find the Rx session a
+# different instance's AAR created. Keys are the dialog Call-ID; entries
+# carry a TTL so a missed teardown self-heals instead of leaking forever.
+QOS_CACHE = "qos_sessions"          # call_id -> Diameter Rx session_id
+QOS_TTL_SECS = 14400                # 4h safety eviction (a call is far shorter)
+PATH_TOKEN_CACHE = "path_tokens"    # REGISTER Call-ID -> opaque Path token
+PATH_TOKEN_TTL_SECS = 64            # only spans REGISTER -> 200 OK (RFC 3261 Timer F)
 
 # Operator transform policy — first one acceptable to the UE wins.
 PREFERRED_TRANSFORMS = [
@@ -65,11 +70,15 @@ def _select_transform(offers):
     return None, None
 
 
-def on_invite_reply(request, reply):
+async def on_invite_reply(request, reply):
     """Called when an INVITE response arrives (on_reply callback).
 
     On 200 OK with SDP, request dedicated bearer via Rx AAR to PCRF.
     The PCRF provisions a dedicated EPS bearer through the PGW (Gx).
+
+    Async because the granted Rx session_id is written to the shared
+    cache (``await cache.store``) so the BYE / CANCEL teardown — possibly
+    on another replica — can release it.
     """
     if reply.status_code != 200:
         return
@@ -99,15 +108,44 @@ def on_invite_reply(request, reply):
         media_components=components,
     )
     if result:
-        rx_sessions[call_id] = result["session_id"]
+        await cache.store(QOS_CACHE, call_id, result["session_id"], ttl=QOS_TTL_SECS)
         log.info(f"Rx AAR success: session={result['session_id']} "
                  f"result_code={result['result_code']}")
     else:
         log.warn(f"Rx AAR failed for call {call_id}")
 
 
+async def _release_qos(call_id):
+    """Send Rx STR for a call's dedicated bearer, if one was reserved.
+
+    Shared by the BYE and CANCEL teardown paths. Idempotent: the cache
+    entry is deleted before the STR, so a stray second teardown (BYE after
+    CANCEL, or a retransmit) finds nothing and no-ops — no double-release.
+    """
+    session_id = await cache.fetch(QOS_CACHE, call_id)
+    if not session_id:
+        return
+    await cache.delete(QOS_CACHE, call_id)
+    if diameter.peer_count() > 0:
+        result = diameter.rx_str(session_id)
+        log.info(f"Rx STR for call {call_id}: result_code={result}")
+
+
+@proxy.on_cancel
+async def on_cancel_teardown(request):
+    """Release the Rx QoS bearer when an INVITE is CANCELled before answer.
+
+    A cancelled call never sends BYE, and the 487 the proxy returns is
+    generated at the transaction layer — it never reaches @proxy.on_reply —
+    so this is the only hook that fires for a cancel. Without it, every
+    abandoned VoLTE call leaks a dedicated bearer at the PCRF (an Rx session
+    with no matching STR). Mirrors the BYE teardown in handle_request.
+    """
+    await _release_qos(request.call_id)
+
+
 @proxy.on_request("REGISTER")
-def handle_register(request):
+async def handle_register(request):
     log.info(f"REGISTER from {request.from_uri} via {request.transport}")
 
     # Force UE to use security agreement (IPsec): reject REGISTER without
@@ -125,7 +163,7 @@ def handle_register(request):
     # so MT requests reach *this* P-CSCF instance in a multi-replica
     # deployment.
     token = secrets.token_urlsafe(16)
-    pending_path_tokens[request.call_id] = token
+    await cache.store(PATH_TOKEN_CACHE, request.call_id, token, ttl=PATH_TOKEN_TTL_SECS)
     request.add_pcscf_path(token)
     request.set_header("P-Visited-Network-ID", REALM)
 
@@ -154,7 +192,7 @@ async def handle_reply(request, reply):
         return
 
     if reply.status_code == 200:
-        _handle_200_register(request, reply)
+        await _handle_200_register(request, reply)
         reply.relay()
         return
 
@@ -218,7 +256,7 @@ async def _handle_401_register(request, reply):
     )
 
 
-def _handle_200_register(request, reply):
+async def _handle_200_register(request, reply):
     """Activate stashed SAs, cache binding with Path-token, store P-AU."""
     pending = ipsec.unstash(request.call_id)
     if pending is not None:
@@ -230,9 +268,11 @@ def _handle_200_register(request, reply):
 
     # Cache the binding locally with the Path-token so MT requests
     # carrying the token in the topmost Route can relay back over the
-    # captured inbound flow without consulting the Contact URI.
-    token = pending_path_tokens.pop(request.call_id, None)
+    # captured inbound flow without consulting the Contact URI.  The token
+    # was stashed in the shared cache on the REGISTER (handle_register).
+    token = await cache.fetch(PATH_TOKEN_CACHE, request.call_id)
     if token is not None:
+        await cache.delete(PATH_TOKEN_CACHE, request.call_id)
         try:
             registrar.save_proxy(request, reply, flow_token=token)
             log.info(f"200 REGISTER for {request.call_id}: binding cached with flow_token")
@@ -270,7 +310,7 @@ def handle_options(request):
 
 
 @proxy.on_request
-def handle_request(request):
+async def handle_request(request):
     if request.method in ("REGISTER", "OPTIONS", "SUBSCRIBE", "PUBLISH"):
         return  # handled above
 
@@ -287,11 +327,7 @@ def handle_request(request):
 
         # BYE — release Rx QoS resources (dedicated bearer teardown).
         if request.method == "BYE":
-            rx_session = rx_sessions.pop(request.call_id, None)
-            if rx_session and diameter.peer_count() > 0:
-                result = diameter.rx_str(rx_session)
-                log.info(f"Rx STR for call {request.call_id}: "
-                         f"result_code={result}")
+            await _release_qos(request.call_id)
 
         request.relay()
         return

@@ -122,6 +122,26 @@ transaction:
   invite_timeout_secs: 30
 
 # ---------------------------------------------------------------------------
+# Cache — Redis-backed per-call state for the script
+#
+# siphon scripts must NOT keep cross-request state in Python module globals:
+# they are wiped on hot-reload and not shared across replicas.  ims_pcscf.py
+# keeps its Rx-session and Path-token maps here instead, keyed by Call-ID, so
+# the BYE/CANCEL teardown still finds the state after a script reload — and,
+# with a shared Redis, even when it lands on a different P-CSCF replica than
+# the one that reserved the bearer.  The local LRU in front keeps the common
+# same-instance lookup off the wire.  Pairs with the Diameter Rx config in a
+# real deployment; without Redis the QoS bookkeeping simply no-ops.
+# ---------------------------------------------------------------------------
+cache:
+  - name: "qos_sessions"
+    url: "${REDIS_URL:-redis://127.0.0.1:6379}"
+    local_ttl_secs: 30
+  - name: "path_tokens"
+    url: "${REDIS_URL:-redis://127.0.0.1:6379}"
+    local_ttl_secs: 30
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 log:

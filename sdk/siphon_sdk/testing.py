@@ -452,6 +452,34 @@ class SipTestHarness:
 
         return ReplyResult(reply=reply, actions=list(reply.actions))
 
+    def send_cancel(self, request: Optional[Request] = None, **kwargs: Any) -> RequestResult:
+        """Dispatch a CANCEL teardown to ``@proxy.on_cancel`` handlers.
+
+        Simulates a relayed INVITE being CANCELled before any final response.
+        The handler receives the original INVITE ``request``. Fire-and-forget:
+        there is no reply/relay gating — assert on side effects (e.g.
+        ``harness.rtpengine`` deletes, ``harness.diameter`` Rx STR).
+
+        Args:
+            request: Original INVITE (auto-created with ``method="INVITE"`` if
+                ``None``).
+            **kwargs: Passed to the :class:`Request` constructor when
+                auto-creating.
+        """
+        if request is None:
+            request = Request(method="INVITE", **kwargs)
+
+        registry = mock_module.get_registry()
+        handlers = registry.get("proxy.on_cancel")
+
+        for fn, is_async in handlers:
+            if is_async:
+                self._loop.run_until_complete(fn(request))
+            else:
+                fn(request)
+
+        return RequestResult(request=request, actions=list(request.actions))
+
     def send_invite(self, call: Optional[Call] = None, **kwargs: Any) -> CallResult:
         """Send a B2BUA INVITE event.
 
@@ -556,6 +584,32 @@ class SipTestHarness:
                 self._loop.run_until_complete(fn(call, initiator))
             else:
                 fn(call, initiator)
+
+        return CallResult(call=call, actions=list(call.actions))
+
+    def send_call_cancel(self, call: Optional[Call] = None, **kwargs: Any) -> CallResult:
+        """Dispatch a CANCEL teardown to ``@b2bua.on_cancel`` handlers.
+
+        Simulates an unanswered call (Calling/Ringing) being CANCELled. The
+        handler receives the :class:`Call`. Fire-and-forget — assert on side
+        effects (e.g. ``harness.rtpengine`` deletes).
+
+        Args:
+            call: Call object (auto-created in ``state="ringing"`` if ``None``).
+            **kwargs: Passed to the :class:`Call` constructor when
+                auto-creating.
+        """
+        if call is None:
+            call = Call(state="ringing", **kwargs)
+
+        registry = mock_module.get_registry()
+        handlers = registry.get("b2bua.on_cancel")
+
+        for fn, is_async in handlers:
+            if is_async:
+                self._loop.run_until_complete(fn(call))
+            else:
+                fn(call)
 
         return CallResult(call=call, actions=list(call.actions))
 
