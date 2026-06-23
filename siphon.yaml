@@ -239,6 +239,16 @@ auth:
   realm: "example.com"
   backend: static   # static | http | database | diameter_cx
 
+  # Digest-nonce anti-replay (RFC 7616 §3.3). Nonces embed a timestamp and are
+  # rejected once older than nonce_ttl_secs, so a captured Authorization can no
+  # longer be replayed indefinitely.
+  # nonce_ttl_secs: 3600
+  # nonce_secret: "${SIP_NONCE_SECRET}"
+  #   Optional shared secret enabling HMAC integrity (reject nonces this cluster
+  #   never issued). MUST be identical on every instance behind the same SIP
+  #   domain (round-robin DNS) or cross-instance challenges re-issue. Omit for a
+  #   single instance; timestamp-only replay bounding still applies.
+
   # Static credentials (dev / bring-up only)
   users:
     alice: "secret"

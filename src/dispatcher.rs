@@ -6172,6 +6172,23 @@ pub fn inject_python_singletons(config: &Config) {
     let mut py_auth = PyAuth::new(realm_users, config.auth.realm.clone());
     py_auth.set_backend_type(config.auth.backend.clone());
 
+    // Digest-nonce anti-replay policy (RFC 7616 §3.3). The shared secret, when
+    // set, MUST be identical across instances behind the same SIP domain.
+    py_auth.set_nonce_policy(
+        config
+            .auth
+            .nonce_secret
+            .as_ref()
+            .map(|secret| secret.as_bytes().to_vec()),
+        config.auth.nonce_ttl_secs.unwrap_or(0),
+    );
+    if config.auth.nonce_secret.is_none() {
+        tracing::info!(
+            "digest nonce: timestamp-only (no auth.nonce_secret set); set a shared \
+             secret on all instances to reject foreign nonces"
+        );
+    }
+
     // Wire HTTP auth backend if configured
     if let Some(http_config) = &config.auth.http {
         if let Err(error) = py_auth.set_http_config(http_config.clone()) {

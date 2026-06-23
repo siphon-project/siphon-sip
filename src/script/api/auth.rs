@@ -81,6 +81,15 @@ pub struct PyAuth {
     /// cached HA1/password instead of each making a blocking backend fetch that
     /// pins a Python-executor worker.
     http_ha1_cache: Option<Arc<DashMap<String, CachedHa1>>>,
+    /// Optional shared secret for stateless-nonce HMAC integrity (RFC 7616
+    /// §3.3). When set, nonces the cluster did not issue are rejected. When
+    /// None, the nonce is timestamp-only — which still bounds digest replay to
+    /// `nonce_ttl_secs` and is safe across a round-robin cluster with no shared
+    /// state (the digest response still requires HA1, so nonce freshness alone
+    /// defeats captured-`Authorization` replay).
+    nonce_secret: Option<Arc<Vec<u8>>>,
+    /// Max age (seconds) of a digest nonce before it is rejected as stale.
+    nonce_ttl_secs: u64,
 }
 
 impl PyAuth {
@@ -98,6 +107,8 @@ impl PyAuth {
             http_config: None,
             http_client: None,
             http_ha1_cache: None,
+            nonce_secret: None,
+            nonce_ttl_secs: DEFAULT_NONCE_TTL_SECS,
         }
     }
 
@@ -112,6 +123,8 @@ impl PyAuth {
             http_config: None,
             http_client: None,
             http_ha1_cache: None,
+            nonce_secret: None,
+            nonce_ttl_secs: DEFAULT_NONCE_TTL_SECS,
         }
     }
 
@@ -150,6 +163,61 @@ impl PyAuth {
     /// Set AKA credentials for local Milenage auth.
     pub fn set_aka_credentials(&mut self, credentials: HashMap<String, AkaCredential>) {
         self.aka_credentials = Arc::new(credentials);
+    }
+
+    /// Configure the digest-nonce anti-replay policy.
+    ///
+    /// `secret` (when non-empty) enables HMAC integrity so a digest response
+    /// carrying a nonce the cluster never issued is rejected. It MUST be
+    /// identical on every instance behind the same SIP domain (round-robin DNS)
+    /// or cross-instance challenges re-issue (one extra round trip). `ttl_secs`
+    /// bounds the replay window; 0 keeps the default.
+    pub fn set_nonce_policy(&mut self, secret: Option<Vec<u8>>, ttl_secs: u64) {
+        self.nonce_secret = secret.filter(|s| !s.is_empty()).map(Arc::new);
+        if ttl_secs > 0 {
+            self.nonce_ttl_secs = ttl_secs;
+        }
+    }
+
+    /// Mint a digest challenge nonce: `{unix_secs:016x}.{tag}`, where `tag` is
+    /// an HMAC-SHA256 over the timestamp (when a secret is configured) or a
+    /// random value otherwise. The embedded timestamp lets any instance reject
+    /// a stale (replayed) nonce without shared state.
+    fn generate_nonce(&self) -> String {
+        let timestamp_hex = format!("{:016x}", now_unix_secs());
+        let tag = match &self.nonce_secret {
+            Some(secret) => hmac_sha256_hex(secret, timestamp_hex.as_bytes()),
+            None => format!("{:x}", uuid::Uuid::new_v4().as_simple()),
+        };
+        format!("{timestamp_hex}.{tag}")
+    }
+
+    /// Validate a nonce echoed back in an `Authorization` header: it must be a
+    /// well-formed `{timestamp}.{tag}`, no older than `nonce_ttl_secs` (and not
+    /// implausibly far in the future), and — when a secret is configured — carry
+    /// a matching HMAC tag. This is what turns digest auth from "replayable
+    /// forever" into "replayable for at most `nonce_ttl_secs`".
+    fn validate_nonce(&self, nonce: &str) -> bool {
+        let Some((timestamp_hex, tag)) = nonce.split_once('.') else {
+            return false;
+        };
+        let Ok(timestamp) = u64::from_str_radix(timestamp_hex, 16) else {
+            return false;
+        };
+        let now = now_unix_secs();
+        // Stale (replayed) or implausibly future-dated (>60s clock skew).
+        if now.saturating_sub(timestamp) > self.nonce_ttl_secs
+            || timestamp.saturating_sub(now) > 60
+        {
+            return false;
+        }
+        match &self.nonce_secret {
+            Some(secret) => {
+                let expected = hmac_sha256_hex(secret, timestamp_hex.as_bytes());
+                constant_time_eq(expected.as_bytes(), tag.as_bytes())
+            }
+            None => true,
+        }
     }
 }
 
@@ -614,7 +682,7 @@ impl PyAuth {
                 // MD5-only clients fall back to the first/last MD5 entry.
                 // We emit MD5 + SHA-256 + SHA-512-256 so a single challenge
                 // covers RFC 2617 and RFC 7616 implementations.
-                let nonce = generate_nonce();
+                let nonce = self.generate_nonce();
                 let header_name = if challenge_code == 401 {
                     "WWW-Authenticate"
                 } else {
@@ -733,7 +801,7 @@ impl PyAuth {
 
         let nonce = match hss_nonce {
             Some(bytes) => base64_encode(bytes),
-            None => generate_nonce(),
+            None => self.generate_nonce(),
         };
         // Per TS 33.203 §6.3, include CK and IK from the HSS MAA so the
         // P-CSCF can extract them for IPsec SA setup with the UE.
@@ -763,6 +831,17 @@ impl PyAuth {
 
     /// Validate credentials by dispatching to the configured backend.
     fn validate_credentials(&self, auth_value: &str, realm: &str, method: &str) -> bool {
+        // Anti-replay: reject a stale or forged nonce before any backend lookup
+        // (RFC 7616 §3.3). Without this, a captured `Authorization` replays
+        // forever. Applies to the static + HTTP backends; the IMS/AKA paths use
+        // single-use HSS vectors and never reach here.
+        match extract_nonce_field(auth_value) {
+            Some(nonce) if self.validate_nonce(&nonce) => {}
+            _ => {
+                debug!("auth: rejecting digest with missing/stale/invalid nonce");
+                return false;
+            }
+        }
         match self.backend_type {
             AuthBackendType::Static => self.validate_static(auth_value, realm, method),
             AuthBackendType::Http => self.validate_http(auth_value, realm, method),
@@ -1153,9 +1232,62 @@ fn encode_url_path_segment(value: &str) -> String {
     out
 }
 
-/// Generate a nonce for digest authentication challenges.
-fn generate_nonce() -> String {
-    format!("{:x}", uuid::Uuid::new_v4().as_simple())
+/// Default digest-nonce lifetime (seconds). Chosen comfortably above a typical
+/// re-REGISTER interval so nonce reuse (nc++) rarely forces a re-challenge,
+/// while still bounding captured-`Authorization` replay to one hour.
+const DEFAULT_NONCE_TTL_SECS: u64 = 3600;
+
+/// Current UNIX time in seconds (0 if the clock is before the epoch).
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// HMAC-SHA256(`key`, `message`) as a lowercase hex string. Hand-rolled over
+/// `sha2` (RFC 2104) to avoid adding an `hmac` dependency; used only for nonce
+/// integrity, so the small surface is acceptable.
+fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+    let mut block_key = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        let digest = Sha256::digest(key);
+        block_key[..digest.len()].copy_from_slice(&digest);
+    } else {
+        block_key[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for index in 0..BLOCK {
+        ipad[index] ^= block_key[index];
+        opad[index] ^= block_key[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_digest);
+    outer
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Constant-time byte-slice equality (no early return on first mismatch).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Extract the user part from a SIP From/To header value.
@@ -1365,7 +1497,9 @@ mod tests {
             _ => "wrong",
         };
         let realm = "example.com";
-        let nonce = "abc";
+        // A fresh timestamp-bound nonce — tests configure no secret, so
+        // validate_nonce checks freshness only and a current timestamp passes.
+        let nonce = format!("{:016x}.test", now_unix_secs());
         let digest_uri = "sip:example.com";
         let ha1 = md5_hex(&format!("{}:{}:{}", username, realm, password));
         let ha2 = md5_hex(&format!("REGISTER:{}", digest_uri));
@@ -1395,6 +1529,62 @@ mod tests {
             "10.0.0.1".to_string(),
             5060,
         )
+    }
+
+    #[test]
+    fn nonce_freshness_and_hmac_integrity() {
+        // No secret → freshness-only: a freshly minted nonce validates.
+        let auth = PyAuth::empty();
+        assert!(auth.validate_nonce(&auth.generate_nonce()));
+        // Stale (replayed) nonce rejected.
+        let stale = format!(
+            "{:016x}.x",
+            now_unix_secs().saturating_sub(DEFAULT_NONCE_TTL_SECS + 60)
+        );
+        assert!(!auth.validate_nonce(&stale));
+        // Malformed nonces rejected (no panic).
+        assert!(!auth.validate_nonce("abc"));
+        assert!(!auth.validate_nonce("nothex.tag"));
+
+        // With a shared secret → HMAC integrity enforced.
+        let mut signed = PyAuth::empty();
+        signed.set_nonce_policy(Some(b"shared-secret".to_vec()), 0);
+        let good = signed.generate_nonce();
+        assert!(signed.validate_nonce(&good));
+        let (timestamp, _) = good.split_once('.').unwrap();
+        // Tampered tag rejected.
+        assert!(!signed.validate_nonce(&format!("{timestamp}.deadbeef")));
+        // A nonce minted under a different secret is rejected (foreign nonce).
+        let mut other = PyAuth::empty();
+        other.set_nonce_policy(Some(b"different-secret".to_vec()), 0);
+        assert!(!signed.validate_nonce(&other.generate_nonce()));
+    }
+
+    #[test]
+    fn validate_credentials_rejects_stale_nonce_replay() {
+        // F5: a digest response that is *cryptographically valid* but carries a
+        // stale nonce (the captured-`Authorization` replay) must be rejected.
+        let auth = make_auth();
+        let ha1 = md5_hex("alice:example.com:pass123");
+        let ha2 = md5_hex("REGISTER:sip:example.com");
+
+        let build = |nonce: &str| {
+            let response = md5_hex(&format!("{ha1}:{nonce}:{ha2}"));
+            format!(
+                "Digest username=\"alice\", realm=\"example.com\", nonce=\"{nonce}\", \
+                 uri=\"sip:example.com\", response=\"{response}\""
+            )
+        };
+
+        let stale = format!(
+            "{:016x}.test",
+            now_unix_secs().saturating_sub(DEFAULT_NONCE_TTL_SECS + 100)
+        );
+        assert!(!auth.validate_credentials(&build(&stale), "example.com", "REGISTER"));
+
+        // The identical exchange with a fresh nonce authenticates.
+        let fresh = format!("{:016x}.test", now_unix_secs());
+        assert!(auth.validate_credentials(&build(&fresh), "example.com", "REGISTER"));
     }
 
     #[test]

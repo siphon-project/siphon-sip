@@ -644,6 +644,16 @@ pub struct AuthConfig {
     pub aka_credentials: std::collections::HashMap<String, AkaCredential>,
     pub http: Option<HttpAuthConfig>,
     pub diameter: Option<DiameterCxConfig>,
+    /// Shared secret for stateless digest-nonce HMAC integrity (RFC 7616 §3.3).
+    /// When set, a digest response carrying a nonce the cluster never issued is
+    /// rejected. MUST be identical on every instance behind the same SIP domain
+    /// (round-robin DNS). When unset, nonces are timestamp-only — still bounding
+    /// replay to `nonce_ttl_secs`, and safe across instances with no shared state.
+    #[serde(default)]
+    pub nonce_secret: Option<String>,
+    /// Digest-nonce lifetime in seconds (replay window). Default 3600.
+    #[serde(default)]
+    pub nonce_ttl_secs: Option<u64>,
 }
 
 /// AKA credential for a single subscriber (3GPP TS 35.206 Milenage).
@@ -671,6 +681,8 @@ impl Default for AuthConfig {
             aka_credentials: Default::default(),
             http: None,
             diameter: None,
+            nonce_secret: None,
+            nonce_ttl_secs: None,
         }
     }
 }
