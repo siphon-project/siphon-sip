@@ -292,6 +292,41 @@ impl PyRegistration {
                 }
             }))
     }
+
+    /// Decorator to register a handler for outbound-registration state changes.
+    ///
+    /// The handler receives (aor, event_type, state) where:
+    ///   - aor: str — Address of Record (e.g. "sip:trunk@carrier.com")
+    ///   - event_type: str — "registered", "refreshed", "failed", or "deregistered"
+    ///   - state: dict — {"expires_in": int, "failure_count": int,
+    ///     "registrar": str, "status_code": int (only present when
+    ///     event_type is "failed")}
+    ///
+    /// Mirrors `registrar.on_change`. The dispatcher invokes these handlers on
+    /// `RegistrantManager` state changes (`HandlerKind::RegistrantOnChange`).
+    /// Registering under the same `"registration.on_change"` key as the
+    /// pre-startup `_RegistrationStub` keeps both code paths consistent — the
+    /// stub had this method but the real Rust namespace did not, so once the
+    /// real namespace shadowed the stub (`registrant` configured) the decorator
+    /// raised `AttributeError`.
+    #[staticmethod]
+    fn on_change(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let asyncio = python.import("asyncio")?;
+        let is_async = asyncio
+            .call_method1("iscoroutinefunction", (func.bind(python),))?
+            .is_truthy()?;
+        let registry = python.import("_siphon_registry")?;
+        registry.call_method1(
+            "register",
+            (
+                "registration.on_change",
+                python.None(),
+                func.bind(python),
+                is_async,
+            ),
+        )?;
+        Ok(func)
+    }
 }
 
 /// Parse an initial SQN_MS from a 12-hex-char string into 6 bytes.
@@ -516,6 +551,57 @@ mod tests {
         assert!(add_aka_ipsec(&py_reg, Some(6100), None, Some("aka")).is_err());
         // ipsec without auth='aka'.
         assert!(add_aka_ipsec(&py_reg, Some(6100), Some(6101), None).is_err());
+    }
+
+    /// Regression: the real Rust `registration` namespace must expose
+    /// `on_change`, not just the pre-startup `_RegistrationStub`. Once a
+    /// `registrant` is configured the singleton shadows the stub, and a script
+    /// using `@registration.on_change` (e.g. the BGCF trunk-registration app)
+    /// hit `AttributeError` because the method lived only on the stub.
+    ///
+    /// Mirrors `subscribe_state::tests::rust_namespace_replaces_stub_when_singleton_set_first`.
+    #[test]
+    fn rust_namespace_has_on_change_when_singleton_set_first() {
+        use pyo3::Python;
+
+        Python::initialize();
+        Python::attach(|python| {
+            // Idempotent: another test may have populated the OnceLock already;
+            // we only need the real namespace bound when install runs.
+            let manager = make_manager();
+            let namespace = PyRegistration::new(manager, "127.0.0.1:5060".parse().unwrap());
+            let _ = crate::script::api::set_registration_singleton(python, namespace);
+
+            crate::script::api::ensure_registry(python).expect("ensure registry");
+            crate::script::api::install_siphon_module(python).expect("install siphon module");
+
+            let script = r#"
+import siphon
+import _siphon_registry
+
+ns = siphon.registration
+# The real Rust namespace must be bound, not the pre-startup stub.
+assert type(ns).__name__ != '_RegistrationStub', type(ns).__name__
+assert hasattr(ns, 'on_change'), 'on_change'
+
+# Exercise the decorator end-to-end — before the fix this raised
+# AttributeError on the real namespace.
+@ns.on_change
+def on_trunk_change(aor, event_type, state):
+    pass
+
+# Decorator returns the function unchanged...
+assert on_trunk_change.__name__ == 'on_trunk_change'
+# ...and registers under the registrant kind. Membership check only —
+# the registry is process-global and shared with parallel tests.
+kinds = [entry[0] for entry in _siphon_registry.entries()]
+assert 'registration.on_change' in kinds, kinds
+"#;
+            let assertions = std::ffi::CString::new(script).expect("CString");
+            python
+                .run(assertions.as_c_str(), None, None)
+                .expect("Rust registration namespace must expose on_change");
+        });
     }
 
     #[test]
