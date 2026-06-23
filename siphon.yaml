@@ -80,6 +80,10 @@ domain:
 #   private_key:  "/etc/siphon/tls/example.com.key"
 #   method: "TLSv1_3"     # TLSv1_2 | TLSv1_3
 #   verify_client: false  # true for mTLS (e.g. SIP trunks with mutual auth)
+#   client_ca: "/etc/siphon/tls/client-ca.pem"
+#     # PEM bundle of CA certs that client certs must chain to. REQUIRED when
+#     # verify_client is true (startup fails otherwise). Applies to listen.tls
+#     # and listen.wss (they share this block).
 
 # ---------------------------------------------------------------------------
 # Python script

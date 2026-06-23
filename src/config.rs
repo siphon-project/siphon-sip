@@ -957,9 +957,14 @@ pub struct TlsServerConfig {
     pub private_key: String,
     #[serde(default = "default_tls_method")]
     pub method: String,
-    /// If true, client certificates are required and verified.
+    /// If true, client certificates are required and verified against
+    /// `client_ca`. Requires `client_ca` to be set, else startup fails.
     #[serde(default)]
     pub verify_client: bool,
+    /// PEM bundle of CA certificates that client certificates must chain to,
+    /// used only when `verify_client` is true (mutual TLS).
+    #[serde(default)]
+    pub client_ca: Option<String>,
 }
 
 fn default_tls_method() -> String {

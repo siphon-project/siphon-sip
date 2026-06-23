@@ -675,6 +675,7 @@ fn generate_test_tls_config(directory: &tempfile::TempDir) -> siphon::config::Tl
         private_key: key_path.to_str().unwrap().to_string(),
         method: "TLSv1_3".to_string(),
         verify_client: false,
+        client_ca: None,
     }
 }
 

@@ -79,15 +79,72 @@ pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAccepto
             )
         })?;
 
-    let server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certificates, key)
-        .map_err(|error| {
+    // Honor `verify_client` (mutual TLS). Previously this was hardcoded to
+    // `with_no_client_auth()`, so the config option was silently ignored —
+    // setting `verify_client: true` gave false assurance. When enabled we
+    // require a client certificate that chains to `client_ca`; a missing CA is
+    // a hard startup error (fail closed) rather than a silent downgrade.
+    let builder = rustls::ServerConfig::builder();
+    let server_config = if tls_config.verify_client {
+        let ca_path = tls_config.client_ca.as_ref().ok_or_else(|| {
             io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("failed to build TLS server config: {}", error),
+                io::ErrorKind::InvalidInput,
+                "tls.verify_client is true but tls.client_ca (PEM CA bundle for \
+                 client certificates) is not set",
             )
         })?;
+        let ca_file = File::open(ca_path).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("failed to open client CA file '{ca_path}': {error}"),
+            )
+        })?;
+        let ca_certs: Vec<_> = certs(&mut BufReader::new(ca_file))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to parse client CA PEM: {error}"),
+                )
+            })?;
+        if ca_certs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "client CA file contains no certificates",
+            ));
+        }
+        let mut roots = rustls::RootCertStore::empty();
+        for ca in ca_certs {
+            roots.add(ca).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to add client CA to root store: {error}"),
+                )
+            })?;
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("failed to build client-certificate verifier: {error}"),
+                )
+            })?;
+        info!(client_ca = %ca_path, "mutual TLS enabled — client certificate required");
+        builder
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certificates, key)
+    } else {
+        builder
+            .with_no_client_auth()
+            .with_single_cert(certificates, key)
+    }
+    .map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to build TLS server config: {}", error),
+        )
+    })?;
 
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
@@ -464,6 +521,7 @@ mod tests {
             private_key: key_path.to_str().unwrap().to_string(),
             method: "TLSv1_3".to_string(),
             verify_client: false,
+            client_ca: None,
         }
     }
 
@@ -484,6 +542,7 @@ mod tests {
             private_key: "/nonexistent/key.pem".to_string(),
             method: "TLSv1_3".to_string(),
             verify_client: false,
+            client_ca: None,
         };
         let result = build_tls_acceptor(&tls_config);
         assert!(result.is_err());
@@ -526,9 +585,26 @@ mod tests {
             private_key: key_path.to_str().unwrap().to_string(),
             method: "TLSv1_3".to_string(),
             verify_client: false,
+            client_ca: None,
         };
         let result = build_tls_acceptor(&tls_config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn verify_client_without_ca_fails_closed() {
+        // mTLS: verify_client must be honored. Enabling it without a client_ca
+        // is a hard error (fail closed), never a silent no-client-auth downgrade.
+        ensure_crypto_provider();
+        let directory = tempfile::tempdir().unwrap();
+        let mut tls_config = write_test_cert(&directory);
+        tls_config.verify_client = true;
+        tls_config.client_ca = None;
+        let result = build_tls_acceptor(&tls_config);
+        assert!(
+            result.is_err(),
+            "verify_client=true without client_ca must fail closed"
+        );
     }
 
     #[tokio::test]
