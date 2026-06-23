@@ -27,6 +27,17 @@ fn digest_header(username: &str, password: &str, realm: &str, nonce: &str, uri: 
     )
 }
 
+/// A fresh timestamp-bound nonce accepted by the RFC 7616 §3.3 freshness check
+/// (tests run with no nonce secret, so freshness is the only gate). Matches the
+/// `{secs:016x}.tag` format minted by PyAuth::generate_nonce.
+fn fresh_nonce() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    format!("{secs:016x}.test")
+}
+
 fn make_register(auth_header: Option<&str>) -> PyRequest {
     let mut builder = SipMessageBuilder::new()
         .request(
@@ -132,7 +143,7 @@ fn proxy_digest_challenge_sets_407_reply() {
 #[test]
 fn valid_credentials_return_true() {
     let auth = make_auth("atlanta.com", &[("alice", "secret123")]);
-    let header = digest_header("alice", "secret123", "atlanta.com", "abc", "sip:atlanta.com", "REGISTER");
+    let header = digest_header("alice", "secret123", "atlanta.com", &fresh_nonce(), "sip:atlanta.com", "REGISTER");
     let mut request = make_register(Some(&header));
 
     let result = auth.challenge_www(&mut request, Some("atlanta.com")).unwrap();
@@ -157,7 +168,7 @@ fn check_credentials_without_header_returns_false() {
 #[test]
 fn check_credentials_with_valid_user_returns_true() {
     let auth = make_auth("atlanta.com", &[("alice", "secret123")]);
-    let header = digest_header("alice", "secret123", "atlanta.com", "abc", "sip:atlanta.com", "REGISTER");
+    let header = digest_header("alice", "secret123", "atlanta.com", &fresh_nonce(), "sip:atlanta.com", "REGISTER");
     let request = make_register(Some(&header));
 
     let result = auth.check_credentials(&request, Some("atlanta.com")).unwrap();
@@ -189,12 +200,12 @@ fn multi_realm_users() {
     let auth = PyAuth::new(realm_users, "realm1.com".to_string());
 
     // Bob is in realm1
-    let header = digest_header("bob", "pass1", "realm1.com", "abc", "sip:realm1.com", "REGISTER");
+    let header = digest_header("bob", "pass1", "realm1.com", &fresh_nonce(), "sip:realm1.com", "REGISTER");
     let request = make_register(Some(&header));
     assert!(auth.check_credentials(&request, Some("realm1.com")).unwrap());
 
     // Carol is in realm2 — static backend checks all realms regardless
-    let header = digest_header("carol", "pass2", "realm2.com", "abc", "sip:realm2.com", "REGISTER");
+    let header = digest_header("carol", "pass2", "realm2.com", &fresh_nonce(), "sip:realm2.com", "REGISTER");
     let request = make_register(Some(&header));
     assert!(auth.check_credentials(&request, Some("realm2.com")).unwrap());
 
