@@ -430,9 +430,20 @@ class _LiNamespace:
 # ---------------------------------------------------------------------------
 
 class _RegistrationNamespace:
-    """Outbound registration operations (stub)."""
+    """Outbound registration operations (stub).
 
-    def add(self, aor, registrar, *, user, password, interval=None, realm=None, contact=None, transport=None):
+    Replaced by the Rust-backed namespace when a ``registrant:`` block is
+    configured. NOTE: that replacement happens at server init AFTER the script
+    module is first loaded, so calling ``registration.add(...)`` at script
+    *top level* always lands on this stub — declare registrations in YAML
+    (``registrant.entries``) or call ``registration.add`` from a runtime
+    handler/timer instead.
+    """
+
+    def add(self, aor, registrar, *, user, password="", interval=None, realm=None,
+            contact=None, transport=None, auth=None, k=None, op=None, opc=None,
+            amf=None, sqn=None, ipsec=False, ue_port_c=None, ue_port_s=None,
+            ipsec_alg=None, ipsec_ealg=None):
         raise NotImplementedError("registration.add() not available — no registrant in config")
 
     def remove(self, aor):
@@ -449,6 +460,15 @@ class _RegistrationNamespace:
 
     def count(self):
         raise NotImplementedError("registration.count() not available — no registrant in config")
+
+    def service_route(self, aor):
+        raise NotImplementedError("registration.service_route() not available — no registrant in config")
+
+    def associated_uris(self, aor):
+        raise NotImplementedError("registration.associated_uris() not available — no registrant in config")
+
+    def flow(self, aor, ue_ip):
+        raise NotImplementedError("registration.flow() not available — no registrant in config")
 
     @staticmethod
     def on_change(fn):

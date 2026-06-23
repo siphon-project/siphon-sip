@@ -44,27 +44,23 @@ script:
 ipsec:
   backend: "${IPSEC_BACKEND:-netlink}"
 
-# An (empty) registrant block enables the outbound-registration manager and
-# its refresh loop. The binding is added at runtime by the script via
-# registration.add(...).
-#
-# Alternatively, declare the AKA + IPsec registration here in YAML and drop the
-# registration.add() call from the script (the @b2bua handlers still apply):
-#
-#   registrant:
-#     entries:
-#       - aor: "sip:001010000000001@ims.mnc01.mcc001.3gppnetwork.org"   # IMPU
-#         registrar: "sip:pcscf.ims.mnc01.mcc001.3gppnetwork.org:5060"  # P-CSCF
-#         user: "001010000000001@ims.mnc01.mcc001.3gppnetwork.org"      # IMPI
-#         auth: aka
-#         aka:
-#           k: "465b5ce8b199b49faa5f0a2ee238a6bc"   # replace with your USIM K
-#           opc: "cd63cb71954a9f4e48a5994e37a02baf" # (or `op:`); amf/sqn optional
-#         ipsec:
-#           ue_port_c: 6100        # must match the listen.udp ports above
-#           ue_port_s: 6101        # alg: hmac-sha-1-96 / ealg: null (defaults)
+# The IMS registration is declared here (NOT via registration.add() in the
+# script — the registration binding is installed after the script's top-level
+# code runs, so a module-level registration.add() would hit the unconfigured
+# stub). The script keeps the @b2bua bridge handlers, which read this binding
+# at call time via registration.flow()/service_route().
 registrant:
-  entries: []
+  entries:
+    - aor: "${IMPU:-sip:001010000000001@ims.mnc01.mcc001.3gppnetwork.org}"   # IMPU
+      registrar: "${PCSCF:-sip:pcscf.ims.mnc01.mcc001.3gppnetwork.org:5060}" # P-CSCF
+      user: "${IMPI:-001010000000001@ims.mnc01.mcc001.3gppnetwork.org}"      # IMPI
+      auth: aka
+      aka:
+        k: "${USIM_K:-465b5ce8b199b49faa5f0a2ee238a6bc}"    # replace with your USIM K
+        opc: "${USIM_OPC:-cd63cb71954a9f4e48a5994e37a02baf}" # (or use `op:`); amf/sqn optional
+      ipsec:
+        ue_port_c: 6100        # must match the listen.udp ports above
+        ue_port_s: 6101        # alg: hmac-sha-1-96 / ealg: null (defaults)
 
 log:
   level: info

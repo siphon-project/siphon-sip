@@ -1,6 +1,9 @@
 """Tests for the IMS UE B2BUA example (examples/ims_ue_b2bua.py).
 
-Exercises both bridge directions:
+The example declares its IMS-AKA + IPsec registration in YAML
+(`registrant.entries`), not in the script — so the SDK harness (which doesn't
+process YAML) stands in for it by registering through the mock. The script
+itself is just the bridge:
   - MT: an INVITE whose A-leg came from the P-CSCF is bridged to the tester.
   - MO: an INVITE from the tester is dialled toward the IMS over the UE SA
     flow, carrying the (mock-empty) Service-Route and a P-Preferred-Identity.
@@ -9,32 +12,44 @@ Uses the example's env defaults (3GPP test range MCC 001 / MNC 01).
 """
 import pytest
 
+from siphon_sdk import mock_module
 from siphon_sdk.testing import SipTestHarness
 
+PCSCF = "sip:pcscf.ims.mnc01.mcc001.3gppnetwork.org:5060"
 PCSCF_IP = "10.0.0.10"
 HOME = "ims.mnc01.mcc001.3gppnetwork.org"
 IMPU = f"sip:001010000000001@{HOME}"
+IMPI = f"001010000000001@{HOME}"
 TESTER = "sip:5555@10.0.0.100:5060"
+
+
+def _register():
+    """Stand in for the YAML `registrant.entries` declaration."""
+    registration = mock_module.get_registration()
+    registration._entries.clear()
+    registration.add(
+        IMPU, PCSCF, user=IMPI,
+        auth="aka",
+        k="465b5ce8b199b49faa5f0a2ee238a6bc",
+        opc="cd63cb71954a9f4e48a5994e37a02baf",
+        ipsec=True, ue_port_c=6100, ue_port_s=6101,
+    )
 
 
 @pytest.fixture
 def harness():
     h = SipTestHarness(local_domains=["10.0.0.20"])
     h.load_script("../examples/ims_ue_b2bua.py")
+    _register()
     yield h
     h.reset()
     h.close()
 
 
-def test_registration_added_with_ipsec(harness):
-    # The module-level registration.add(...) ran on script load.
-    reg = harness  # registration state lives on the mock singleton
-    from siphon_sdk import mock_module
-    entry = mock_module.get_registration()._entries[IMPU]
-    assert entry["auth"] == "aka"
-    assert entry["ipsec"] is True
-    assert entry["ue_port_c"] == 6100
-    assert entry["ue_port_s"] == 6101
+def test_script_loads_without_module_level_registration(harness):
+    # The script must NOT call registration.add at top level (it would hit the
+    # unconfigured stub at load time). Loading it should not raise.
+    assert mock_module.get_registration()._entries[IMPU]["ipsec"] is True
 
 
 def test_mt_call_bridges_to_tester(harness):
@@ -67,8 +82,6 @@ def test_mo_call_dials_ims_over_sa_flow(harness):
 
 def test_mo_call_rejected_when_not_registered(harness):
     # If the registration isn't up (no ipsec flow), MO is rejected 503.
-    from siphon_sdk import mock_module
-    # Drop the ipsec flag so registration.flow() returns None.
     mock_module.get_registration()._entries[IMPU]["ipsec"] = False
     result = harness.send_invite(source_ip="10.0.0.100", ruri="sip:1234@10.0.0.20")
     assert result.was_rejected

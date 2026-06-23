@@ -2847,6 +2847,24 @@ registrant:
         assert_eq!(ipsec.ealg, "null"); // default
     }
 
+    /// The shipped IMS UE B2BUA example config must actually parse (env vars
+    /// fall back to their `${VAR:-default}` defaults here). Guards against the
+    /// example silently rotting.
+    #[test]
+    fn example_ims_ue_b2bua_yaml_parses() {
+        let yaml = include_str!("../examples/ims_ue_b2bua.yaml");
+        let config = Config::from_str(yaml).expect("example yaml must parse");
+        let registrant = config.registrant.expect("registrant block");
+        assert_eq!(registrant.entries.len(), 1);
+        let ue = &registrant.entries[0];
+        assert_eq!(ue.auth.as_deref(), Some("aka"));
+        let aka = ue.aka.as_ref().expect("aka block");
+        assert_eq!(aka.k.len(), 32); // 128-bit K as hex
+        let ipsec = ue.ipsec.as_ref().expect("ipsec block");
+        assert_eq!(ipsec.ue_port_c, 6100);
+        assert_eq!(ipsec.ue_port_s, 6101);
+    }
+
     #[test]
     fn parses_security_config() {
         let yaml = r#"
