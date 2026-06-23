@@ -808,6 +808,17 @@ impl PyAuth {
             None => return false,
         };
 
+        // Bound the attacker-controlled username before it becomes a URL and an
+        // HA1-cache key: reject empty or absurdly long values so a flood of
+        // distinct crafted usernames can't grow the cache / URL unboundedly.
+        if fields.username.is_empty() || fields.username.len() > MAX_AUTH_USERNAME_LEN {
+            warn!(
+                username_len = fields.username.len(),
+                "rejecting HTTP auth: username empty or exceeds length limit"
+            );
+            return false;
+        }
+
         let (http_config, client) = match (&self.http_config, &self.http_client) {
             (Some(c), Some(cl)) => (c, cl),
             _ => {
@@ -901,7 +912,12 @@ impl PyAuth {
         client: &reqwest::Client,
         username: &str,
     ) -> Option<String> {
-        let url = http_config.url.replace("{username}", username);
+        // Percent-encode the attacker-controlled digest username before it lands
+        // in the URL path. Substituting it raw lets a crafted `username` break
+        // out of the `{username}` segment — `../../admin` (path traversal),
+        // `x?role=admin` (query injection), `x#frag` — into the auth backend.
+        let encoded_username = encode_url_path_segment(username);
+        let url = http_config.url.replace("{username}", &encoded_username);
         debug!(url = %url, username = %username, "HTTP auth lookup");
 
         // Release the interpreter for the whole blocking HTTP exchange — see
@@ -1110,6 +1126,33 @@ fn extract_username(auth_value: &str) -> Option<String> {
     }
 }
 
+/// Upper bound on a digest `username` we will look up. SIP usernames are short;
+/// anything longer is abuse (URL/cache-key amplification), not a real identity.
+const MAX_AUTH_USERNAME_LEN: usize = 255;
+
+/// Percent-encode `value` for safe use as a single URL path segment when it is
+/// substituted into the HTTP auth backend URL template (`.../sip/auth/{username}`).
+///
+/// Encodes every byte except RFC 3986 unreserved characters (`ALPHA / DIGIT /
+/// "-" / "." / "_" / "~"`), so an attacker-supplied digest `username` cannot
+/// break out of the `{username}` segment: `/` becomes `%2F` (no path traversal),
+/// `?` / `#` / `&` are encoded (no query/fragment injection). A correct HTTP
+/// backend percent-decodes the captured path param transparently.
+fn encode_url_path_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for &byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    out
+}
+
 /// Generate a nonce for digest authentication challenges.
 fn generate_nonce() -> String {
     format!("{:x}", uuid::Uuid::new_v4().as_simple())
@@ -1250,6 +1293,36 @@ mod tests {
     use crate::sip::message::Method;
     use crate::sip::uri::SipUri;
     use std::sync::Mutex;
+
+    #[test]
+    fn encode_url_path_segment_passes_through_plain_username() {
+        assert_eq!(encode_url_path_segment("alice"), "alice");
+        assert_eq!(encode_url_path_segment("user.name-1_a~b"), "user.name-1_a~b");
+    }
+
+    #[test]
+    fn encode_url_path_segment_neutralizes_path_traversal() {
+        // The injection F6 guards against: '/' must encode so a crafted username
+        // cannot escape the {username} segment.
+        let encoded = encode_url_path_segment("../../admin");
+        assert_eq!(encoded, "..%2F..%2Fadmin");
+        assert!(!encoded.contains('/'));
+    }
+
+    #[test]
+    fn encode_url_path_segment_neutralizes_query_and_fragment() {
+        assert_eq!(encode_url_path_segment("x?role=admin"), "x%3Frole%3Dadmin");
+        assert_eq!(encode_url_path_segment("x#frag"), "x%23frag");
+        assert_eq!(encode_url_path_segment("a b"), "a%20b");
+        // No raw URL-structural byte survives encoding (the only '%' is an escape).
+        let encoded = encode_url_path_segment("a&b=c/d?e#f");
+        for forbidden in ['&', '=', '/', '?', '#', ' '] {
+            assert!(
+                !encoded.contains(forbidden),
+                "encoded {encoded:?} still contains {forbidden:?}"
+            );
+        }
+    }
 
     fn make_auth() -> PyAuth {
         let mut realm_users = HashMap::new();
