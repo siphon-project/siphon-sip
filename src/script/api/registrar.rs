@@ -616,6 +616,11 @@ impl PyRegistrar {
                                 "too many contacts (max: {max})"
                             ))
                         }
+                        RegistrarError::InvalidAor => {
+                            pyo3::exceptions::PyValueError::new_err(
+                                "invalid AoR (unsafe storage key)".to_string(),
+                            )
+                        }
                     })?;
             }
         }
@@ -829,6 +834,11 @@ impl PyRegistrar {
                                 "too many contacts (max: {max})"
                             ))
                         }
+                        RegistrarError::InvalidAor => {
+                            pyo3::exceptions::PyValueError::new_err(
+                                "invalid AoR (unsafe storage key)".to_string(),
+                            )
+                        }
                     })?;
             }
         }
@@ -956,6 +966,11 @@ impl PyRegistrar {
                             pyo3::exceptions::PyValueError::new_err(format!(
                                 "too many contacts (max: {max})"
                             ))
+                        }
+                        RegistrarError::InvalidAor => {
+                            pyo3::exceptions::PyValueError::new_err(
+                                "invalid AoR (unsafe storage key)".to_string(),
+                            )
                         }
                     })?;
                 wrote = wrote || saved;

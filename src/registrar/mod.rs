@@ -587,6 +587,14 @@ impl Registrar {
         let primary = self.resolve_alias(aor);
         let aor = primary.as_str();
 
+        // Keyspace-safety invariant: never let a crafted AoR collide a contact
+        // binding into the reserved `state:` namespace or inject control chars
+        // into a storage key. See `is_aor_key_safe`.
+        if !is_aor_key_safe(aor) {
+            tracing::warn!(aor = %aor.escape_debug(), "rejecting REGISTER: unsafe AoR storage key");
+            return Err(RegistrarError::InvalidAor);
+        }
+
         if expires_secs > 0 && expires_secs < self.config.min_expires {
             return Err(RegistrarError::IntervalTooBrief {
                 min_expires: self.config.min_expires,
@@ -1746,6 +1754,9 @@ pub enum RegistrarError {
     IntervalTooBrief { min_expires: u32 },
     /// AoR already has max_contacts bindings.
     TooManyContacts { max: usize },
+    /// AoR is not safe to use as a storage key (collides with the reserved
+    /// `state:` namespace or contains control characters).
+    InvalidAor,
 }
 
 impl std::fmt::Display for RegistrarError {
@@ -1757,8 +1768,24 @@ impl std::fmt::Display for RegistrarError {
             RegistrarError::TooManyContacts { max } => {
                 write!(f, "too many contacts (max: {max})")
             }
+            RegistrarError::InvalidAor => {
+                write!(f, "invalid AoR (unsafe storage key)")
+            }
         }
     }
+}
+
+/// Whether an AoR is safe to use as a registrar storage key.
+///
+/// The Redis contact key is `{prefix}{aor}` and the auxiliary-state key is
+/// `{prefix}state:{aor}`. An AoR beginning with `state:` would collide a contact
+/// binding into the reserved state namespace (stealth binding / restore
+/// confusion); control characters enable log injection (the AoR is logged) and
+/// produce malformed keys. `normalize_aor` always prepends `sip:`/`sips:`, which
+/// already prevents the `state:` collision — this makes that invariant explicit
+/// and enforced at the write boundary so it cannot silently regress.
+pub fn is_aor_key_safe(aor: &str) -> bool {
+    !aor.starts_with("state:") && !aor.bytes().any(|byte| byte.is_ascii_control())
 }
 
 // ---------------------------------------------------------------------------
@@ -1771,6 +1798,21 @@ mod tests {
 
     fn contact_uri(user: &str, host: &str) -> SipUri {
         SipUri::new(host.to_string()).with_user(user.to_string())
+    }
+
+    #[test]
+    fn aor_key_safety_rejects_state_namespace_and_control_chars() {
+        // Normal AoRs (scheme-prefixed and bare) are safe.
+        assert!(is_aor_key_safe("sip:alice@example.com"));
+        assert!(is_aor_key_safe("sips:alice@example.com"));
+        assert!(is_aor_key_safe("alice@example.com"));
+        // Reserved aux-state namespace collision (F7): a contact key must never
+        // start with `state:`.
+        assert!(!is_aor_key_safe("state:victim@example.com"));
+        // Control characters (CR/LF/tab/NUL) — log injection + malformed keys.
+        assert!(!is_aor_key_safe("alice\r\n@example.com"));
+        assert!(!is_aor_key_safe("alice\t@example.com"));
+        assert!(!is_aor_key_safe("alice\0@example.com"));
     }
 
     /// Save a binding tagged with a transport + inbound connection id, the way
