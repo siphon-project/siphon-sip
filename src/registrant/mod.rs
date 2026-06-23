@@ -560,13 +560,7 @@ impl RegistrantManager {
         let cseq = entry.next_cseq();
         let branch = format!("z9hG4bK-reg-{}", uuid::Uuid::new_v4());
 
-        let request_uri: SipUri = SipUri::new(
-            entry
-                .registrar_uri
-                .strip_prefix("sip:")
-                .unwrap_or(&entry.registrar_uri)
-                .to_string(),
-        );
+        let request_uri = registrar_request_uri(&entry.registrar_uri);
 
         let contact = entry
             .contact_uri
@@ -680,7 +674,7 @@ impl RegistrantManager {
             .strip_prefix("sip:")
             .unwrap_or(&entry.registrar_uri)
             .to_string();
-        let request_uri = SipUri::new(request_uri_str.clone());
+        let request_uri = registrar_request_uri(&entry.registrar_uri);
 
         let contact = entry
             .contact_uri
@@ -821,7 +815,7 @@ impl RegistrantManager {
             .strip_prefix("sip:")
             .unwrap_or(&entry.registrar_uri)
             .to_string();
-        let request_uri = SipUri::new(request_uri_str.clone());
+        let request_uri = registrar_request_uri(&entry.registrar_uri);
 
         let contact = entry
             .contact_uri
@@ -1312,7 +1306,29 @@ fn default_contact_uri(username: &str, address: SocketAddr, transport: Transport
         Transport::WebSocketSecure => ";transport=wss",
         Transport::Sctp => ";transport=sctp",
     };
-    format!("sip:{}@{}{}", username, address, transport_param)
+    // For IMS the username is the IMPI (`user@home-domain`); the Contact
+    // userpart is just the `user` portion — otherwise we'd emit a malformed
+    // `sip:user@domain@ip:port` (two `@`). For a plain trunk username with no
+    // `@`, this is a no-op.
+    let user = username.split('@').next().unwrap_or(username);
+    format!("sip:{}@{}{}", user, address, transport_param)
+}
+
+/// Parse a registrar URI ("sip:host:port" or "sip:host") into the REGISTER
+/// Request-URI. Uses the full SIP-URI parser so host and port are split
+/// correctly — `SipUri::new("host:port")` would put the whole thing in the
+/// host field, and the IPv6 heuristic in `format_sip_host` would then bracket
+/// it (`sip:[172.16.0.101:5060]`), which breaks the registrar's DNS/relay.
+fn registrar_request_uri(registrar_uri: &str) -> SipUri {
+    crate::sip::parser::parse_uri_standalone(registrar_uri).unwrap_or_else(|_| {
+        SipUri::new(
+            registrar_uri
+                .strip_prefix("sip:")
+                .or_else(|| registrar_uri.strip_prefix("sips:"))
+                .unwrap_or(registrar_uri)
+                .to_string(),
+        )
+    })
 }
 
 /// Build the empty-response Authorization header the UE puts on its initial
@@ -2213,6 +2229,59 @@ mod tests {
             home_domain_from_aor("sip:user@host.com;transport=tcp"),
             "host.com"
         );
+    }
+
+    /// Regression: an IPv4:port registrar must produce a clean Request-URI
+    /// (no IPv6 brackets), and an IMPI username (user@domain) must produce a
+    /// single-`@` Contact. Both broke the live REGISTER (P-CSCF 502 + DNS fail).
+    #[test]
+    fn build_register_ip_registrar_and_impi_contact_are_well_formed() {
+        let manager = make_manager();
+        // 3GPP test range; IMPI username + IPv4:port registrar — the combo
+        // that produced `sip:[172.16.0.101:5060]` and `user@domain@ip`.
+        let credentials = aka::AkaCredentials::from_hex(
+            "465b5ce8b199b49faa5f0a2ee238a6bc",
+            None,
+            Some("cd63cb71954a9f4e48a5994e37a02baf"),
+            "b9b9",
+        )
+        .unwrap();
+        let aor = "sip:001019999999999@ims.mnc01.mcc001.3gppnetwork.org";
+        let entry = RegistrantEntry::new(
+            aor.to_string(),
+            "sip:172.16.0.101:5060".to_string(),
+            "172.16.0.101:5060".parse().unwrap(),
+            Transport::Udp,
+            RegistrantCredentials {
+                username: "001019999999999@ims.mnc01.mcc001.3gppnetwork.org".to_string(),
+                password: String::new(),
+                realm: Some("ims.mnc01.mcc001.3gppnetwork.org".to_string()),
+            },
+            3600,
+            None,
+        )
+        .with_aka(credentials, [0u8; 6]);
+        manager.add(entry);
+
+        let (message, _, _, _) = manager
+            .build_register(aor, "100.65.0.3:5060".parse().unwrap(), &HashMap::new(), 3600)
+            .unwrap();
+        let bytes = message.to_bytes();
+        let raw = String::from_utf8_lossy(&bytes);
+
+        // Request-URI: IPv4:port, no brackets.
+        assert!(
+            raw.starts_with("REGISTER sip:172.16.0.101:5060 SIP/2.0"),
+            "R-URI must not be bracketed: {raw}"
+        );
+        assert!(!raw.contains("sip:[172.16.0.101"), "{raw}");
+
+        // Contact: single @, userpart only (domain stripped).
+        assert!(
+            raw.contains("Contact: <sip:001019999999999@100.65.0.3:5060>"),
+            "Contact must be single-@: {raw}"
+        );
+        assert!(!raw.contains("3gppnetwork.org@100.65.0.3"), "{raw}");
     }
 
     fn make_aka_ipsec_entry(aor: &str) -> RegistrantEntry {
