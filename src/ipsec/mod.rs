@@ -2526,6 +2526,73 @@ mod tests {
         );
     }
 
+    /// Process-restart scenario: the kernel netns still holds the previous
+    /// incarnation's SAs + policies (the UE side reuses deterministic SPIs and
+    /// config-fixed protected ports, so the keys are byte-identical across
+    /// restarts), but the new process's `associations` map is EMPTY — so
+    /// `delete_sa_pair` finds nothing and can't clear them. This is the
+    /// `docker restart` EEXIST wedge. `create_sa_pair`'s upfront teardown keys
+    /// off the new SA (not the map), so it clears the orphans regardless and
+    /// still installs. Proves the fix covers restart, not just in-process
+    /// re-REGISTER.
+    #[tokio::test]
+    async fn create_sa_pair_clears_restart_orphans_despite_empty_map() {
+        let manager = IpsecManager::with_mock_kernel();
+        let ue: IpAddr = "192.0.2.90".parse().unwrap();
+        let sa = test_sa_pair(ue, 6100, 10000);
+
+        // Pre-seed the kernel with the exact eight keys this install produces
+        // (the restart-orphan collision set) and arm EEXIST-on-existing — the
+        // `NEWSA | EXCL` collision that wedges a restarted registrant.
+        {
+            let mut state = manager.mock();
+            state.reject_existing = true;
+            state.live.insert(format!("sa:{}:{}", sa.pcscf_addr, sa.spi_ps));
+            state.live.insert(format!("sa:{}:{}", sa.ue_addr, sa.spi_uc));
+            state.live.insert(format!("sa:{}:{}", sa.ue_addr, sa.spi_us));
+            state.live.insert(format!("sa:{}:{}", sa.pcscf_addr, sa.spi_pc));
+            state.live.insert(format!(
+                "policy:{}:{}->{}:{}:{}",
+                sa.ue_addr, sa.ue_port_c, sa.pcscf_addr, sa.pcscf_port_s,
+                policy_dir_str(sa.role.policy_dir(true))
+            ));
+            state.live.insert(format!(
+                "policy:{}:{}->{}:{}:{}",
+                sa.pcscf_addr, sa.pcscf_port_s, sa.ue_addr, sa.ue_port_c,
+                policy_dir_str(sa.role.policy_dir(false))
+            ));
+            state.live.insert(format!(
+                "policy:{}:{}->{}:{}:{}",
+                sa.pcscf_addr, sa.pcscf_port_c, sa.ue_addr, sa.ue_port_s,
+                policy_dir_str(sa.role.policy_dir(false))
+            ));
+            state.live.insert(format!(
+                "policy:{}:{}->{}:{}:{}",
+                sa.ue_addr, sa.ue_port_s, sa.pcscf_addr, sa.pcscf_port_c,
+                policy_dir_str(sa.role.policy_dir(true))
+            ));
+        }
+        assert_eq!(
+            manager.active_count(),
+            0,
+            "empty map is the restart precondition — delete_sa_pair is a no-op here"
+        );
+
+        let result = manager.create_sa_pair(sa).await;
+        assert!(
+            result.is_ok(),
+            "must clear the restart orphans and install despite the empty map, got {result:?}"
+        );
+        assert_eq!(manager.active_count(), 1);
+
+        let state = manager.mock();
+        assert_eq!(state.live.iter().filter(|k| k.starts_with("sa:")).count(), 4);
+        assert_eq!(
+            state.live.iter().filter(|k| k.starts_with("policy:")).count(),
+            4
+        );
+    }
+
     /// `delete_sa_pair` removes all eight kernel objects (four SAs + four
     /// policies) and the map entry. The best-effort teardown runs every delete
     /// independently — no `?`-chain that an early `ENOENT` could abort, leaking
