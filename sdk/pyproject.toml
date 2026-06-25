@@ -1,10 +1,18 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
-name = "siphon-sdk"
-version = "0.4.37"
+# Distribution renamed siphon-sdk -> siphon-sip so the pip name matches the
+# crate name (cargo add siphon-sip ↔ pip install siphon-sip). The import
+# package stays `siphon_sdk` (see [tool.hatch.build.targets.wheel]) to avoid
+# breaking existing `import siphon_sdk` test code.
+name = "siphon-sip"
+# Version comes from the git tag via hatch-vcs — there is intentionally no
+# `version =` line to hand-bump. The release tag (e.g. v1.0.0) is the single
+# source of truth, lockstep with the crate. This stops the per-change SDK
+# version churn.
+dynamic = ["version"]
 description = "Mock library and type stubs for SIPhon SIP proxy/B2BUA scripts — enables unit testing and LLM-assisted script authoring"
 readme = "README.md"
 license = "MIT"
@@ -29,8 +37,17 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/siphon-project/siphon"
-Documentation = "https://github.com/siphon-project/siphon/tree/master/sdk"
+Documentation = "https://github.com/siphon-project/siphon/tree/main/sdk"
 Repository = "https://github.com/siphon-project/siphon"
+
+# Version from the repo's git tags. `root = ".."` points hatch-vcs at the repo
+# root (this pyproject lives in sdk/). On a tagged commit (vX.Y.Z) the version
+# is X.Y.Z; between tags it's a dev version that is never published.
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+root = ".."
 
 [tool.hatch.build.targets.wheel]
 packages = ["siphon_sdk"]

@@ -15,8 +15,28 @@ permissions:
   packages: write
 
 jobs:
+  # ── Version gate ───────────────────────────────────────────────────────
+  # Lockstep versioning: the git tag is the single source of truth. Refuse to
+  # publish anything if Cargo.toml's version doesn't match the tag, so a stray
+  # in-tree bump can never ship a mismatched crate/image. The SDK takes its
+  # version from the tag directly (hatch-vcs), so it needs no separate check.
+  verify-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cargo.toml version must equal the tag
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "(.*)"/\1/')"
+          echo "tag=$tag_version cargo=$cargo_version"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::Cargo.toml version ($cargo_version) does not match tag ($tag_version) — bump Cargo.toml in the release commit (use scripts/cut-release.sh)."
+            exit 1
+          fi
+
   # ── Build release binary + packages ────────────────────────────────────
   build:
+    needs: verify-version
     strategy:
       matrix:
         include:
@@ -111,12 +131,16 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
+        with:
+          # hatch-vcs derives the version from the git tag; the default shallow
+          # clone hides tags/history and breaks version resolution.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
 
-      - name: Build and publish siphon-sdk
+      - name: Build and publish siphon-sip (SDK; version from tag via hatch-vcs)
         run: |
           pip install build twine
           cd sdk && python -m build
