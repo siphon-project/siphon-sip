@@ -23,6 +23,11 @@ use crate::transport::acl::TransportAcl;
 
 /// Handle a single WebSocket connection after the upgrade handshake.
 /// Generic over the underlying stream (plain TCP for WS, TLS for WSS).
+// The `accept_hdr_async` upgrade callback below must return the
+// tungstenite-dictated `Result<Response, ErrorResponse>`. Its Err variant
+// (`http::Response<Option<String>>`) is large, but the type is fixed by the
+// callback contract — it can't be boxed — so allow the lint here.
+#[allow(clippy::result_large_err)]
 async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     transport_variant: Transport,
