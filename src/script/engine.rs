@@ -921,6 +921,38 @@ thread_local! {
     static PYTHON_LOOP: RefCell<Option<Py<PyAny>>> = const { RefCell::new(None) };
 }
 
+/// Acquire — creating it on first use — this thread's persistent fallback
+/// asyncio loop (the legacy path used when no global async pool is installed).
+/// Reused across calls so `call_soon_threadsafe` targets stay valid for the
+/// lifetime of the thread (see [`PYTHON_LOOP`]).
+///
+/// Pulled out as a named helper so the per-thread caching can be unit-tested
+/// directly: the public [`run_coroutine`] entry point short-circuits to the
+/// global async pool when one is installed (a process-wide `OnceLock`), which
+/// would otherwise route around — and thus never populate — this fallback loop
+/// whenever a sibling test installs the pool.
+fn fallback_thread_loop(python: Python<'_>) -> PyResult<Py<PyAny>> {
+    PYTHON_LOOP.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        match slot.as_ref() {
+            Some(handle) => Ok(handle.clone_ref(python)),
+            None => {
+                let asyncio = python.import("asyncio")?;
+                let new_loop = asyncio.call_method0("new_event_loop")?;
+                // Bind this loop to the thread for any code path that still
+                // calls the (deprecated) `asyncio.get_event_loop()`.  The
+                // running-loop lookup used by `pyo3_async_runtimes` is set
+                // automatically by `run_until_complete`.
+                asyncio.call_method1("set_event_loop", (&new_loop,))?;
+                let unbound = new_loop.unbind();
+                let handle = unbound.clone_ref(python);
+                *slot = Some(unbound);
+                Ok(handle)
+            }
+        }
+    })
+}
+
 /// Run a Python coroutine to completion on this thread's persistent asyncio
 /// event loop.
 ///
@@ -960,26 +992,7 @@ pub(crate) fn run_coroutine_value(
     {
         return Ok(value);
     }
-    let loop_handle = PYTHON_LOOP.with(|cell| -> PyResult<Py<PyAny>> {
-        let mut slot = cell.borrow_mut();
-        let handle = match slot.as_ref() {
-            Some(handle) => handle.clone_ref(python),
-            None => {
-                let asyncio = python.import("asyncio")?;
-                let new_loop = asyncio.call_method0("new_event_loop")?;
-                // Bind this loop to the thread for any code path that still
-                // calls the (deprecated) `asyncio.get_event_loop()`.  The
-                // running-loop lookup used by `pyo3_async_runtimes` is set
-                // automatically by `run_until_complete`.
-                asyncio.call_method1("set_event_loop", (&new_loop,))?;
-                let unbound = new_loop.unbind();
-                let handle = unbound.clone_ref(python);
-                *slot = Some(unbound);
-                handle
-            }
-        };
-        Ok(handle)
-    })?;
+    let loop_handle = fallback_thread_loop(python)?;
 
     let bound_loop = loop_handle.bind(python);
     let result = tokio::task::block_in_place(|| {
@@ -2105,46 +2118,27 @@ mod async_runner_tests {
         assert_eq!(success.load(Ordering::Relaxed), total);
     }
 
-    /// A second `run_coroutine` call from the same thread must reuse the
-    /// already-cached event loop; tearing the loop down between calls is
-    /// exactly what creates the closed-loop race.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn run_coroutine_reuses_thread_local_loop() {
+    /// The fallback (no-pool) path must reuse the same per-thread asyncio
+    /// loop across calls; tearing the loop down between calls is exactly what
+    /// creates the closed-loop race.
+    ///
+    /// Exercises `fallback_thread_loop` directly rather than going through
+    /// `run_coroutine`: the public entry point short-circuits to the global
+    /// async pool when a sibling test has installed it (a process-wide
+    /// `OnceLock`), which would route around — and thus never populate — the
+    /// per-thread fallback loop this test verifies.  Both calls run on the
+    /// same thread inside one `Python::attach`, so they share the thread-local.
+    #[test]
+    fn fallback_loop_is_reused_across_calls() {
         Python::initialize();
-        Python::attach(install_test_module);
-        let factory: Arc<Py<PyAny>> = Arc::new(Python::attach(build_factory));
-
-        // Pin both invocations to the same Tokio blocking-pool thread so we
-        // are exercising the per-thread loop cache, not two distinct ones.
-        tokio::task::spawn_blocking(move || {
-            let first_loop_id = Python::attach(|python| {
-                let coro = factory.bind(python).call0().unwrap();
-                run_coroutine(python, &coro).expect("first run");
-                PYTHON_LOOP.with(|cell| {
-                    cell.borrow()
-                        .as_ref()
-                        .map(|handle| handle.bind(python).as_ptr() as usize)
-                        .expect("loop cached after first run")
-                })
-            });
-
-            let second_loop_id = Python::attach(|python| {
-                let coro = factory.bind(python).call0().unwrap();
-                run_coroutine(python, &coro).expect("second run");
-                PYTHON_LOOP.with(|cell| {
-                    cell.borrow()
-                        .as_ref()
-                        .map(|handle| handle.bind(python).as_ptr() as usize)
-                        .expect("loop still cached after second run")
-                })
-            });
-
+        Python::attach(|python| {
+            let first = fallback_thread_loop(python).expect("first fallback loop");
+            let second = fallback_thread_loop(python).expect("second fallback loop");
             assert_eq!(
-                first_loop_id, second_loop_id,
-                "the same per-thread asyncio loop must be reused across calls"
+                first.bind(python).as_ptr() as usize,
+                second.bind(python).as_ptr() as usize,
+                "the same per-thread fallback asyncio loop must be reused across calls"
             );
-        })
-        .await
-        .unwrap();
+        });
     }
 }

@@ -910,15 +910,23 @@ mod tests {
         });
     }
 
-    /// Leak test 3 — RSS must reach a steady state.  Run a warm-up
-    /// batch (allocator free-list grows), measure RSS, run an equal
-    /// batch, measure RSS again.  The delta amortised per handler
-    /// should be tiny.  10k handlers × <0.5KB/req gives plenty of
-    /// signal-to-noise on Linux glibc malloc.
+    /// Leak test 3 — live allocated bytes must reach a steady state.  Run a
+    /// warm-up batch (allocator free-lists, Python interp caches grow),
+    /// snapshot jemalloc `stats.allocated`, run an equal batch, snapshot
+    /// again.  The delta amortised per handler should be tiny.
     ///
-    /// Skipped on non-Linux because we can't read VmRSS without it.
+    /// Gates on jemalloc `allocated` (live bytes), **not** RSS.  jemalloc
+    /// retains freed pages, so RSS stays elevated under a constant,
+    /// completed-call workload even with zero leak — per CLAUDE.md, "RSS
+    /// alone is too noisy to gate on (jemalloc retains freed pages) — gate
+    /// on `allocated`".  `allocated` is the precise leak signal; RSS is
+    /// still printed for context.
+    ///
+    /// Skipped if jemalloc stats are unavailable.  jemalloc-gated because the
+    /// stats interface only exists when jemalloc is the global allocator.
+    #[cfg(not(target_env = "msvc"))]
     #[test]
-    fn pool_steady_state_rss_does_not_grow() {
+    fn pool_steady_state_allocated_does_not_grow() {
         test_runtime().block_on(async move {
             ensure_pool();
             let factory = Python::attach(|python| {
@@ -932,8 +940,19 @@ mod tests {
                 ))
             });
 
-            let Some(_) = read_rss_kb() else {
-                eprintln!("[pool_steady_state_rss_does_not_grow] no /proc/self/status — skipping");
+            // jemalloc snapshots its stats at epoch advance; without the
+            // advance the reads are stale.
+            fn allocated_bytes() -> Option<u64> {
+                tikv_jemalloc_ctl::epoch::advance().ok()?;
+                tikv_jemalloc_ctl::stats::allocated::read()
+                    .ok()
+                    .map(|value| value as u64)
+            }
+
+            let Some(_) = allocated_bytes() else {
+                eprintln!(
+                    "[pool_steady_state_allocated_does_not_grow] jemalloc stats unavailable — skipping"
+                );
                 return;
             };
 
@@ -949,7 +968,8 @@ mod tests {
             force_python_gc();
             flush_drivers().await;
 
-            let rss_baseline = read_rss_kb().unwrap();
+            let rss_baseline = read_rss_kb();
+            let allocated_baseline = allocated_bytes().unwrap();
 
             for _ in 0..BATCH {
                 let factory = Arc::clone(&factory);
@@ -959,15 +979,27 @@ mod tests {
             force_python_gc();
             flush_drivers().await;
 
-            let rss_after = read_rss_kb().unwrap();
-            let delta_kb = rss_after.saturating_sub(rss_baseline);
-            let budget_kb = (BATCH as u64 * PER_HANDLER_BUDGET_BYTES) / 1024;
+            let allocated_delta = allocated_bytes().unwrap().saturating_sub(allocated_baseline);
+            let budget_bytes = BATCH as u64 * PER_HANDLER_BUDGET_BYTES;
+
+            // RSS is logged for context only — jemalloc page retention makes
+            // it climb without a real leak, which is exactly why the gate is
+            // on `allocated` rather than RSS.
+            if let (Some(before), Some(after)) = (rss_baseline, read_rss_kb()) {
+                eprintln!(
+                    "[pool_steady_state_allocated_does_not_grow] RSS delta {} KB (context only) \
+                     vs allocated delta {} bytes (budget {} bytes)",
+                    after.saturating_sub(before),
+                    allocated_delta,
+                    budget_bytes,
+                );
+            }
 
             assert!(
-                delta_kb < budget_kb,
-                "RSS grew {} KB across {} steady-state handlers \
-                 (budget {} KB ≈ {} bytes/handler) — likely a leak",
-                delta_kb, BATCH, budget_kb, PER_HANDLER_BUDGET_BYTES,
+                allocated_delta < budget_bytes,
+                "jemalloc allocated grew {} bytes across {} steady-state handlers \
+                 (budget {} bytes ≈ {} bytes/handler) — likely a leak",
+                allocated_delta, BATCH, budget_bytes, PER_HANDLER_BUDGET_BYTES,
             );
         });
     }
