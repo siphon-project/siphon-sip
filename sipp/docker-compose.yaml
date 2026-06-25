@@ -756,7 +756,13 @@ services:
       - .:/sipp/scenarios:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.51
+        # Register bob FROM the same IP his Contact points to (the UAS, .52).
+        # The default B2BUA script forks over a local contact's captured inbound
+        # flow (RFC 5626 §5.3), so the flow's source must be where the UAS
+        # listens — otherwise the B-leg INVITE is routed to the register helper's
+        # address (which exits) instead of the UAS. Safe to share .52 with the
+        # UAS: the register runs `run --rm` and is gone before the UAS starts.
+        ipv4_address: 172.20.0.52
     entrypoint:
       - sipp
       - "172.20.0.50:5060"
@@ -1139,9 +1145,10 @@ services:
     profiles:
       - b2bua-failure
 
-  # Register bob pointing to failure UAS (172.20.0.54)
-  # Uses a different IP than deregister-bob to avoid server transaction
-  # branch collisions (SIPp PID-based branches can collide on same IP).
+  # Register bob FROM the failure UAS IP (172.20.0.54) so the captured inbound
+  # flow points where the failure UAS listens (see sipp-b2bua-register for why
+  # the register source must equal the UAS). Still a different IP than
+  # deregister-bob (.51), avoiding SIPp PID-based branch collisions on one IP.
   sipp-b2bua-register-failure:
     image: ctaloi/sipp:latest
     depends_on:
@@ -1151,7 +1158,7 @@ services:
       - .:/sipp/scenarios:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.56
+        ipv4_address: 172.20.0.54
     entrypoint:
       - sipp
       - "172.20.0.50:5060"
