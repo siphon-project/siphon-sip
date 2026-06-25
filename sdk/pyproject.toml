@@ -36,9 +36,9 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/siphon-project/siphon"
-Documentation = "https://github.com/siphon-project/siphon/tree/main/sdk"
-Repository = "https://github.com/siphon-project/siphon"
+Homepage = "https://github.com/siphon-project/siphon-sip"
+Documentation = "https://github.com/siphon-project/siphon-sip/tree/main/sdk"
+Repository = "https://github.com/siphon-project/siphon-sip"
 
 # Version from the repo's git tags. `root = ".."` points hatch-vcs at the repo
 # root (this pyproject lives in sdk/). On a tagged commit (vX.Y.Z) the version

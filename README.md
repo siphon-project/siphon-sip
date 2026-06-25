@@ -7,8 +7,8 @@
   <img src="https://img.shields.io/badge/Python_3.14t-3776AB?logo=python&logoColor=white" alt="Python 3.14t">
   <img src="https://img.shields.io/badge/Tokio-async-blue" alt="Tokio">
   <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License">
-  <a href="https://github.com/siphon-project/siphon/actions/workflows/ci.yaml">
-    <img src="https://github.com/siphon-project/siphon/actions/workflows/ci.yaml/badge.svg" alt="CI">
+  <a href="https://github.com/siphon-project/siphon-sip/actions/workflows/ci.yaml">
+    <img src="https://github.com/siphon-project/siphon-sip/actions/workflows/ci.yaml/badge.svg" alt="CI">
   </a>
 </p>
 
@@ -146,7 +146,7 @@ cargo install siphon-sip --features redis-backend,postgres-backend
 ### Option 2: Docker
 
 ```bash
-docker pull ghcr.io/siphon-project/siphon:latest
+docker pull ghcr.io/siphon-project/siphon-sip:latest
 
 # Or build locally
 docker build -t siphon .
@@ -165,7 +165,7 @@ sudo dpkg -i target/debian/siphon_*.deb
 
 This installs the binary to `/usr/bin/siphon`, the default config to `/etc/siphon/siphon.yaml`, example scripts to `/etc/siphon/scripts/`, and a systemd unit file.
 
-Pre-built `.deb` packages are also available from [GitHub Releases](https://github.com/siphon-project/siphon/releases).
+Pre-built `.deb` packages are also available from [GitHub Releases](https://github.com/siphon-project/siphon-sip/releases).
 
 ### Option 4: Fedora/RHEL/Rocky (.rpm)
 
@@ -179,12 +179,12 @@ cargo generate-rpm
 sudo rpm -i target/generate-rpm/siphon-*.rpm
 ```
 
-Pre-built `.rpm` packages are also available from [GitHub Releases](https://github.com/siphon-project/siphon/releases).
+Pre-built `.rpm` packages are also available from [GitHub Releases](https://github.com/siphon-project/siphon-sip/releases).
 
 ### From source
 
 ```bash
-git clone https://github.com/siphon-project/siphon.git
+git clone https://github.com/siphon-project/siphon-sip.git
 cd siphon
 
 # Build and install
