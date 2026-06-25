@@ -21,66 +21,61 @@ async fn spawn_mock_rtpengine() -> SocketAddr {
 
     tokio::spawn(async move {
         let mut buffer = BytesMut::zeroed(65535);
-        loop {
-            match socket.recv_from(&mut buffer).await {
-                Ok((size, source)) => {
-                    let data = &buffer[..size];
-                    let space = data.iter().position(|&b| b == b' ').unwrap();
-                    let cookie = std::str::from_utf8(&data[..space]).unwrap().to_string();
+        while let Ok((size, source)) = socket.recv_from(&mut buffer).await {
+            let data = &buffer[..size];
+            let space = data.iter().position(|&b| b == b' ').unwrap();
+            let cookie = std::str::from_utf8(&data[..space]).unwrap().to_string();
 
-                    let payload = &data[space + 1..];
-                    let command = bencode::decode_full_dict(payload).unwrap();
-                    let command_name = command.dict_get_str("command").unwrap_or("unknown");
+            let payload = &data[space + 1..];
+            let command = bencode::decode_full_dict(payload).unwrap();
+            let command_name = command.dict_get_str("command").unwrap_or("unknown");
 
-                    let response = match command_name {
-                        "ping" => BencodeValue::dict(vec![
-                            ("result", BencodeValue::string("pong")),
-                        ]),
-                        "offer" | "answer" => {
-                            // Rewrite SDP: replace c-line IP and m-line port.
-                            let rewritten_sdp = concat!(
-                                "v=0\r\n",
-                                "o=- 0 0 IN IP4 203.0.113.1\r\n",
-                                "s=-\r\n",
-                                "c=IN IP4 203.0.113.1\r\n",
-                                "t=0 0\r\n",
-                                "m=audio 30000 RTP/AVP 0 8 101\r\n",
-                                "a=rtpmap:0 PCMU/8000\r\n",
-                                "a=rtpmap:8 PCMA/8000\r\n",
-                                "a=rtpmap:101 telephone-event/8000\r\n",
-                            );
-                            BencodeValue::dict(vec![
-                                ("result", BencodeValue::string("ok")),
-                                ("sdp", BencodeValue::string(rewritten_sdp)),
-                            ])
-                        }
-                        "delete" => BencodeValue::dict(vec![
-                            ("result", BencodeValue::string("ok")),
-                        ]),
-                        "query" => BencodeValue::dict(vec![
-                            ("result", BencodeValue::string("ok")),
-                            ("totals", BencodeValue::dict(vec![
-                                ("RTP", BencodeValue::dict(vec![
-                                    ("packets", BencodeValue::from_integer(1000)),
-                                    ("bytes", BencodeValue::from_integer(160000)),
-                                ])),
-                            ])),
-                        ]),
-                        _ => BencodeValue::dict(vec![
-                            ("result", BencodeValue::string("error")),
-                            ("error-reason", BencodeValue::string("unknown command")),
-                        ]),
-                    };
-
-                    let encoded = bencode::encode(&response);
-                    let mut reply = Vec::new();
-                    reply.extend_from_slice(cookie.as_bytes());
-                    reply.push(b' ');
-                    reply.extend_from_slice(&encoded);
-                    let _ = socket.send_to(&reply, source).await;
+            let response = match command_name {
+                "ping" => BencodeValue::dict(vec![
+                    ("result", BencodeValue::string("pong")),
+                ]),
+                "offer" | "answer" => {
+                    // Rewrite SDP: replace c-line IP and m-line port.
+                    let rewritten_sdp = concat!(
+                        "v=0\r\n",
+                        "o=- 0 0 IN IP4 203.0.113.1\r\n",
+                        "s=-\r\n",
+                        "c=IN IP4 203.0.113.1\r\n",
+                        "t=0 0\r\n",
+                        "m=audio 30000 RTP/AVP 0 8 101\r\n",
+                        "a=rtpmap:0 PCMU/8000\r\n",
+                        "a=rtpmap:8 PCMA/8000\r\n",
+                        "a=rtpmap:101 telephone-event/8000\r\n",
+                    );
+                    BencodeValue::dict(vec![
+                        ("result", BencodeValue::string("ok")),
+                        ("sdp", BencodeValue::string(rewritten_sdp)),
+                    ])
                 }
-                Err(_) => break,
-            }
+                "delete" => BencodeValue::dict(vec![
+                    ("result", BencodeValue::string("ok")),
+                ]),
+                "query" => BencodeValue::dict(vec![
+                    ("result", BencodeValue::string("ok")),
+                    ("totals", BencodeValue::dict(vec![
+                        ("RTP", BencodeValue::dict(vec![
+                            ("packets", BencodeValue::from_integer(1000)),
+                            ("bytes", BencodeValue::from_integer(160000)),
+                        ])),
+                    ])),
+                ]),
+                _ => BencodeValue::dict(vec![
+                    ("result", BencodeValue::string("error")),
+                    ("error-reason", BencodeValue::string("unknown command")),
+                ]),
+            };
+
+            let encoded = bencode::encode(&response);
+            let mut reply = Vec::new();
+            reply.extend_from_slice(cookie.as_bytes());
+            reply.push(b' ');
+            reply.extend_from_slice(&encoded);
+            let _ = socket.send_to(&reply, source).await;
         }
     });
 

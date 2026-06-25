@@ -146,13 +146,6 @@ impl RfChargingService {
         self.manager.any_client().map(|c| c.peer().clone())
     }
 
-    fn baseline_ims(&self) -> ImsChargingData {
-        ImsChargingData {
-            node_functionality: self.node_functionality,
-            ..Default::default()
-        }
-    }
-
     /// Send ACR-START.  Returns a session handle that the caller stores
     /// alongside the call/dialog so subsequent INTERIM and STOP requests
     /// can use the same Session-Id and record-number sequence.  Returns
@@ -885,8 +878,7 @@ mod tests {
     #[test]
     fn service_disabled_when_config_disabled() {
         let manager = Arc::new(DiameterManager::new());
-        let mut cfg = RfConfig::default();
-        cfg.enabled = false;
+        let cfg = RfConfig { enabled: false, ..Default::default() };
         let service = RfChargingService::new(manager, cfg);
         assert!(!service.auto_emit_proxy());
         assert!(!service.auto_emit_b2bua());
@@ -896,8 +888,7 @@ mod tests {
     #[test]
     fn service_emits_when_enabled() {
         let manager = Arc::new(DiameterManager::new());
-        let mut cfg = RfConfig::default();
-        cfg.enabled = true;
+        let cfg = RfConfig { enabled: true, ..Default::default() };
         let service = RfChargingService::new(manager, cfg);
         assert!(service.auto_emit_proxy());
         assert!(service.auto_emit_b2bua());
@@ -907,9 +898,11 @@ mod tests {
     #[test]
     fn service_resolves_node_functionality() {
         let manager = Arc::new(DiameterManager::new());
-        let mut cfg = RfConfig::default();
-        cfg.enabled = true;
-        cfg.node_functionality = "scscf".into();
+        let cfg = RfConfig {
+            enabled: true,
+            node_functionality: "scscf".into(),
+            ..Default::default()
+        };
         let service = RfChargingService::new(manager, cfg);
         assert_eq!(service.node_functionality(), Some(NodeFunctionality::SCscf));
     }
@@ -917,9 +910,11 @@ mod tests {
     #[test]
     fn service_unknown_node_functionality_logs_and_returns_none() {
         let manager = Arc::new(DiameterManager::new());
-        let mut cfg = RfConfig::default();
-        cfg.enabled = true;
-        cfg.node_functionality = "totally-bogus".into();
+        let cfg = RfConfig {
+            enabled: true,
+            node_functionality: "totally-bogus".into(),
+            ..Default::default()
+        };
         let service = RfChargingService::new(manager, cfg);
         assert_eq!(service.node_functionality(), None);
     }

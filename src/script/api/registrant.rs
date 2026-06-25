@@ -72,6 +72,8 @@ impl PyRegistration {
     ///         instance tag.
     ///     ims_features: Contact feature tags to advertise so the S-CSCF
     ///         registers the implied services — any of "mmtel", "video", "smsip".
+    // Wide by necessity: outbound registration exposes the full carrier-trunk
+    // + AKA + IPsec credential set as keyword arguments to scripts.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (aor, registrar, *, user, password="", interval=None, realm=None, contact=None, transport=None, auth=None, k=None, op=None, opc=None, amf=None, sqn=None, ipsec=false, ue_port_c=None, ue_port_s=None, ipsec_alg=None, ipsec_ealg=None, imei=None, ims_features=None))]
     fn add(
@@ -390,7 +392,6 @@ mod tests {
     const AKA_K: &str = "465b5ce8b199b49faa5f0a2ee238a6bc";
     const AKA_OPC: &str = "cd63cb71954a9f4e48a5994e37a02baf";
 
-    #[allow(clippy::too_many_arguments)]
     fn add_aka(
         py_reg: &PyRegistration,
         k: Option<&str>,
@@ -423,7 +424,6 @@ mod tests {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn add_aka_ipsec(
         py_reg: &PyRegistration,
         ue_port_c: Option<u16>,

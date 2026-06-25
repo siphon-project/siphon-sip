@@ -1107,7 +1107,7 @@ mod tests {
             role_of_node: Some(NodeRole::OriginatingRole),
             ..Default::default()
         };
-        let encoded = data.encode_service_information();
+        let _encoded = data.encode_service_information();
         let wire = build_acr_like_wire_for_test(&data);
         let decoded = decode_diameter(&wire).unwrap();
         let svc = decoded.avps.get("Service-Information").unwrap();

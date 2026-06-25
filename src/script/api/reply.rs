@@ -335,17 +335,19 @@ impl PyReply {
     /// Raises:
     ///     ValueError: if ``code`` is outside 400–699.
     ///
-    /// Example::
+    /// Example:
     ///
-    ///     @proxy.on_reply
-    ///     async def on_reply(request, reply):
-    ///         if request.method == "INVITE" and reply.has_body("application/sdp"):
-    ///             authorized = await authorize_media(request, reply)
-    ///             if not authorized:
-    ///                 if reply.reject(503, "Media Authorization Failed"):
-    ///                     return            # 503 + CANCEL sent by siphon
-    ///                 log.warn("could not reject answered call; proceeding best-effort")
-    ///         reply.relay()
+    /// ```python,ignore
+    /// @proxy.on_reply
+    /// async def on_reply(request, reply):
+    ///     if request.method == "INVITE" and reply.has_body("application/sdp"):
+    ///         authorized = await authorize_media(request, reply)
+    ///         if not authorized:
+    ///             if reply.reject(503, "Media Authorization Failed"):
+    ///                 return            # 503 + CANCEL sent by siphon
+    ///             log.warn("could not reject answered call; proceeding best-effort")
+    ///     reply.relay()
+    /// ```
     #[pyo3(signature = (code, reason=None))]
     fn reject(&mut self, code: u16, reason: Option<&str>) -> PyResult<bool> {
         if !(400..=699).contains(&code) {

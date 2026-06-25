@@ -161,7 +161,6 @@ pub struct CcPayload {
 // ---------------------------------------------------------------------------
 
 /// Encode an IRI-PDU per ETSI TS 102 232-5, wrapped in a PS-PDU envelope.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_iri_pdu(
     liid: &str,
     correlation_id: &str,
@@ -355,7 +354,7 @@ mod tests {
         );
         assert_eq!(
             iri.sip_method,
-            Utf8String::try_from("INVITE").unwrap()
+            Utf8String::from("INVITE")
         );
         assert!(iri.status_code.is_none());
 
@@ -363,18 +362,18 @@ mod tests {
         assert_eq!(iri.originating_party.party_qualifier, PartyQualifier::Originating);
         assert_eq!(
             iri.originating_party.party_identity.sip_uri.as_ref().unwrap(),
-            &Utf8String::try_from("sip:alice@example.com").unwrap()
+            &Utf8String::from("sip:alice@example.com")
         );
         assert_eq!(iri.terminating_party.party_qualifier, PartyQualifier::Terminating);
         assert_eq!(
             iri.terminating_party.party_identity.sip_uri.as_ref().unwrap(),
-            &Utf8String::try_from("sip:bob@example.com").unwrap()
+            &Utf8String::from("sip:bob@example.com")
         );
 
         // Verify request URI
         assert_eq!(
             iri.request_uri.as_ref().unwrap(),
-            &Utf8String::try_from("sip:bob@example.com").unwrap()
+            &Utf8String::from("sip:bob@example.com")
         );
     }
 

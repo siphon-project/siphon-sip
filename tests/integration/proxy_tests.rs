@@ -4,7 +4,6 @@
 //! config → registrar wiring, and end-to-end message flows through the proxy pipeline.
 
 use siphon::sip::{SipMessageBuilder, SipUri, Method, parse_sip_message};
-use siphon::sip::headers::SipHeaders;
 use siphon::transaction::key::TransactionKey;
 use siphon::registrar::{Registrar, RegistrarConfig};
 use siphon::dialog::{Dialog, DialogStore, DialogState};

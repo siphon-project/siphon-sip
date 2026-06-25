@@ -99,11 +99,11 @@ fn weighted_selection_distribution() {
 
     // With weights 3:1 over 100 selections, expect ~75/25 with +-10% tolerance.
     assert!(
-        heavy_count >= 65 && heavy_count <= 85,
+        (65..=85).contains(&heavy_count),
         "heavy={heavy_count}, expected 65..85"
     );
     assert!(
-        light_count >= 15 && light_count <= 35,
+        (15..=35).contains(&light_count),
         "light={light_count}, expected 15..35"
     );
 }

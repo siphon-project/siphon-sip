@@ -937,7 +937,7 @@ mod tests {
     }
 
     fn has_action<F: Fn(&Action) -> bool>(actions: &[Action], predicate: F) -> bool {
-        actions.iter().any(|a| predicate(a))
+        actions.iter().any(predicate)
     }
 
     fn has_send(actions: &[Action]) -> bool {
@@ -1522,7 +1522,6 @@ mod tests {
         assert!(has_terminated(&actions));
     }
 
-    #[test]
     /// RFC 3261 §17.1.1.3: when the ACK for a non-2xx cannot be
     /// constructed (e.g. the response is malformed — no To header, no
     /// fallback possible), the transaction MUST report the error

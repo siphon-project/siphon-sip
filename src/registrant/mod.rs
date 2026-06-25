@@ -272,9 +272,7 @@ impl UeIpsec {
     ) -> Option<SecurityAssociationPair> {
         let ck = self.ck?;
         let ik = self.ik?;
-        if self.security_server.is_none() {
-            return None;
-        }
+        self.security_server.as_ref()?;
         let integrity_key = IpsecManager::derive_integrity_key(self.aalg, &ik)?;
         let encryption_key = if self.ealg == EncryptionAlgorithm::Null {
             String::new()

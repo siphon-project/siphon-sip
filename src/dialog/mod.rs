@@ -94,7 +94,6 @@ pub struct Dialog {
 
 impl Dialog {
     /// Create a new dialog from a UAC perspective (we sent the INVITE).
-    #[allow(clippy::too_many_arguments)]
     pub fn new_uac(
         call_id: String,
         local_tag: String,
@@ -121,7 +120,6 @@ impl Dialog {
     }
 
     /// Create a new dialog from a UAS perspective (we received the INVITE).
-    #[allow(clippy::too_many_arguments)]
     pub fn new_uas(
         call_id: String,
         local_tag: String,
@@ -487,7 +485,7 @@ mod tests {
         let id1 = dialog1.id.clone();
         store.insert(dialog1);
 
-        let dialog2_id = DialogId::new("call-456".into(), "a".into(), "b".into());
+        let _dialog2_id = DialogId::new("call-456".into(), "a".into(), "b".into());
         store.insert(Dialog::new_uac(
             "call-456".to_string(),
             "a".to_string(),

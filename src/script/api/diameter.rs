@@ -44,6 +44,14 @@
 //! diameter.rx_str("rx-sess-1")
 //! ```
 
+// The Rf charging builders (`build_ims_data`, `build_sms_data`, `rf_acr_*`)
+// carry the full TS 32.299 IMS/SMS-Information envelope — 20-40+ optional
+// protocol fields each — so `too_many_arguments` fires module-wide here even
+// at the raised threshold. Allow it for the whole module rather than scatter
+// per-function attributes; a params-struct refactor is the proper long-term
+// fix but is out of scope for lint hygiene.
+#![allow(clippy::too_many_arguments)]
+
 use std::sync::Arc;
 
 use pyo3::prelude::*;
@@ -51,7 +59,7 @@ use pyo3::types::PyDict;
 use tracing::warn;
 
 use crate::diameter::codec::{
-    self, encode_avp_address_ipv4, encode_avp_grouped, encode_avp_grouped_3gpp, encode_avp_octet,
+    encode_avp_address_ipv4, encode_avp_grouped, encode_avp_grouped_3gpp, encode_avp_octet,
     encode_avp_octet_3gpp, encode_avp_u32, encode_avp_u32_3gpp, encode_avp_u64, encode_avp_utf8,
     encode_avp_utf8_3gpp, encode_diameter_message, encode_vendor_specific_app_id, FLAG_PROXIABLE,
     FLAG_REQUEST,
@@ -353,7 +361,6 @@ impl PyDiameter {
 /// shouldn't also drop an empty IMS-Information envelope on the wire).
 /// Returns a `PyValueError` on unrecognized role / functionality strings
 /// so script errors fail loudly rather than silently dropping the AVP.
-#[allow(clippy::too_many_arguments)]
 fn build_ims_data(
     calling_party: Option<&str>,
     called_party: Option<&str>,
@@ -459,7 +466,6 @@ fn parse_optional_ip(label: &str, value: Option<&str>) -> PyResult<Option<std::n
 /// script that only passes IOIs gets IMS-Information (current behavior);
 /// a script that passes any SMS-specific kwarg gets SMS-Information with
 /// the shared fields propagated.
-#[allow(clippy::too_many_arguments)]
 fn build_sms_data(
     originator_address: Option<&str>,
     recipient_address: Option<&str>,
@@ -1714,7 +1720,6 @@ impl PyDiameter {
         user_name=None, cause_code=None,
         service_context_id=None, peer=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
     fn rf_acr_start<'py>(
         &self,
         python: Python<'py>,
@@ -1830,7 +1835,6 @@ impl PyDiameter {
         user_name=None, cause_code=None,
         service_context_id=None, peer=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
     fn rf_acr_interim<'py>(
         &self,
         python: Python<'py>,
@@ -1958,7 +1962,6 @@ impl PyDiameter {
         user_name=None, cause_code=None,
         service_context_id=None, peer=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
     fn rf_acr_stop<'py>(
         &self,
         python: Python<'py>,
@@ -2083,7 +2086,6 @@ impl PyDiameter {
         user_name=None, cause_code=None,
         service_context_id=None, peer=None,
     ))]
-    #[allow(clippy::too_many_arguments)]
     fn rf_acr_event<'py>(
         &self,
         python: Python<'py>,
@@ -2390,6 +2392,10 @@ pub(crate) fn custom_handler_kind(app_id: u32, command_code: u32) -> Option<Stri
 mod tests {
     use super::*;
     use crate::diameter::DiameterManager;
+
+    /// One decorator-registry entry as extracted in the tests:
+    /// `(event_key, command_name, handler, is_async, marker)`.
+    type RegistryEntry = (String, Option<String>, Py<PyAny>, bool, Py<PyAny>);
 
     #[test]
     fn empty_manager_no_peers() {
@@ -2860,8 +2866,7 @@ mod tests {
             }
 
             let entries = registry_mod.call_method0("entries").unwrap();
-            let entries: Vec<(String, Option<String>, Py<PyAny>, bool, Py<PyAny>)> =
-                entries.extract().unwrap();
+            let entries: Vec<RegistryEntry> = entries.extract().unwrap();
             assert_eq!(entries.len(), 3);
             for entry in &entries {
                 assert_eq!(entry.0, "diameter.on_command:S6c:Alert-Service-Centre");

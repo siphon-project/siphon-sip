@@ -7,14 +7,14 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use dashmap::DashMap;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use regex::Regex;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::warn;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -1011,6 +1011,7 @@ impl IfcStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn simple_ifc_xml() -> &'static str {
         concat!(

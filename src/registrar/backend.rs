@@ -493,7 +493,7 @@ mod redis_real {
 
         /// Get all connections (for operations that span all shards).
         fn all_connections(&self) -> Vec<redis::aio::MultiplexedConnection> {
-            self.connections.iter().cloned().collect()
+            self.connections.to_vec()
         }
     }
 
@@ -1693,7 +1693,7 @@ mod tests {
         };
         let remaining = stored.remaining_secs();
         // Should be ~100, not 9999
-        assert!(remaining <= 100 && remaining >= 98);
+        assert!((98..=100).contains(&remaining));
     }
 
     #[test]

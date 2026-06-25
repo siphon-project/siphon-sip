@@ -148,6 +148,18 @@ default = ["redis-backend", "postgres-backend"]
 redis-backend = ["dep:redis"]
 postgres-backend = ["dep:tokio-postgres"]
 
+# --- Lint policy ---
+# The codebase is clippy-clean (see `clippy.toml` for the one tuned threshold).
+# Locally these warn; CI runs `cargo clippy --all-targets -- -D warnings` to
+# turn any warning — clippy lint or rustc (unused, dead_code) — into a hard
+# failure, so the clean state can't regress. Deny is kept out of the manifest
+# so local `cargo build`/`test` stays ergonomic during iteration.
+[lints.rust]
+unused = "warn"
+
+[lints.clippy]
+all = "warn"
+
 [profile.release]
 strip = true
 opt-level = 3

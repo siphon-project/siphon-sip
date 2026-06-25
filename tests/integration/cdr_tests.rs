@@ -3,7 +3,6 @@
 //! Tests cover Cdr struct construction, builder pattern, JSON serialization,
 //! timestamp formatting, extra field flattening, and file backend writing.
 
-use std::collections::HashMap;
 
 use siphon::cdr::{Cdr, CdrBackendType, CdrConfig};
 
@@ -187,7 +186,7 @@ fn with_end_without_answer_has_zero_duration() {
 
 #[test]
 fn with_duration_overrides_computed_duration() {
-    let cdr = sample_cdr().with_answer().with_duration(300.0).with_end();
+    let _cdr = sample_cdr().with_answer().with_duration(300.0).with_end();
 
     // with_end overwrites duration_secs from answer_instant, but
     // with_duration was called before with_end, so with_end recalculates.

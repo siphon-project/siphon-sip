@@ -53,7 +53,7 @@ impl PyMetricsNamespace {
         let label_refs: Vec<&str> = label_names.iter().map(|s| s.as_str()).collect();
         self.custom
             .register_counter(name, help, &label_refs)
-            .map_err(|error| PyErr::new::<pyo3::exceptions::PyValueError, _>(error))?;
+            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
 
         Ok(PyCounter {
             custom: Arc::clone(&self.custom),
@@ -82,7 +82,7 @@ impl PyMetricsNamespace {
         let label_refs: Vec<&str> = label_names.iter().map(|s| s.as_str()).collect();
         self.custom
             .register_gauge(name, help, &label_refs)
-            .map_err(|error| PyErr::new::<pyo3::exceptions::PyValueError, _>(error))?;
+            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
 
         Ok(PyGauge {
             custom: Arc::clone(&self.custom),
@@ -114,7 +114,7 @@ impl PyMetricsNamespace {
         let bucket_values = buckets.unwrap_or_default();
         self.custom
             .register_histogram(name, help, &label_refs, bucket_values)
-            .map_err(|error| PyErr::new::<pyo3::exceptions::PyValueError, _>(error))?;
+            .map_err(PyErr::new::<pyo3::exceptions::PyValueError, _>)?;
 
         Ok(PyHistogram {
             custom: Arc::clone(&self.custom),
@@ -148,7 +148,7 @@ impl PyCounter {
         }
         self.custom
             .counter_inc(&self.name, &[], n)
-            .map_err(|error| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
     }
 
     /// Return a labeled child counter.
@@ -183,7 +183,7 @@ impl PyCounterChild {
             .collect();
         self.custom
             .counter_inc(&self.name, &pairs, n)
-            .map_err(|error| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
     }
 }
 
@@ -211,7 +211,7 @@ impl PyGauge {
         }
         self.custom
             .gauge_inc(&self.name, &[], n)
-            .map_err(|error| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
     }
 
     /// Decrement the gauge (no-label metrics only).
@@ -224,7 +224,7 @@ impl PyGauge {
         }
         self.custom
             .gauge_dec(&self.name, &[], n)
-            .map_err(|error| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
     }
 
     /// Set the gauge value (no-label metrics only).
@@ -236,7 +236,7 @@ impl PyGauge {
         }
         self.custom
             .gauge_set(&self.name, &[], value)
-            .map_err(|error| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
     }
 
     /// Return a labeled child gauge.
@@ -271,7 +271,7 @@ impl PyGaugeChild {
             .collect();
         self.custom
             .gauge_inc(&self.name, &pairs, n)
-            .map_err(|error| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
     }
 
     /// Decrement this labeled gauge.
@@ -284,7 +284,7 @@ impl PyGaugeChild {
             .collect();
         self.custom
             .gauge_dec(&self.name, &pairs, n)
-            .map_err(|error| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
     }
 
     /// Set this labeled gauge value.
@@ -296,7 +296,7 @@ impl PyGaugeChild {
             .collect();
         self.custom
             .gauge_set(&self.name, &pairs, value)
-            .map_err(|error| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
     }
 }
 
@@ -323,7 +323,7 @@ impl PyHistogram {
         }
         self.custom
             .histogram_observe(&self.name, &[], value)
-            .map_err(|error| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
     }
 
     /// Return a labeled child histogram.
@@ -357,7 +357,7 @@ impl PyHistogramChild {
             .collect();
         self.custom
             .histogram_observe(&self.name, &pairs, value)
-            .map_err(|error| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(error))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)
     }
 }
 

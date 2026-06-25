@@ -89,7 +89,10 @@ mod tests {
     #[test]
     fn result_type_works_with_ok() {
         let result: Result<i32> = Ok(42);
-        assert_eq!(result.unwrap(), 42);
+        match result {
+            Ok(value) => assert_eq!(value, 42),
+            Err(error) => panic!("expected Ok, got {error:?}"),
+        }
     }
 
     #[test]

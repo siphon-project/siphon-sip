@@ -267,11 +267,12 @@ impl SiphonServer {
                     // thread) can take the per-thread state without conflict
                     // — but the underlying PyThreadState remains cached, so
                     // mimalloc heap teardown is avoided.
-                    let tstate = pyo3::ffi::PyEval_SaveThread();
-                    std::mem::forget(tstate);
-                    // Don't call PyGILState_Release: we want the gstate
-                    // lifetime to match the OS thread.
-                    std::mem::forget(_gstate);
+                    //
+                    // Don't call PyGILState_Release / PyEval_RestoreThread:
+                    // that omission is what pins the state to the OS thread.
+                    // Both handles are Copy with no Drop, so no mem::forget is
+                    // needed — the bindings simply fall out of scope.
+                    let _tstate = pyo3::ffi::PyEval_SaveThread();
                 }
             })
             .build()
@@ -2118,12 +2119,14 @@ fn spawn_rf_register_emitter(
                 RegistrationEvent::Deregistered { aor } => (aor.clone(), -200),
                 RegistrationEvent::Expired { aor } => (aor.clone(), -487),
             };
-            let mut ims_data = ImsChargingData::default();
-            ims_data.calling_party = Some(aor.clone());
-            ims_data.sip_method = Some("REGISTER".to_string());
-            ims_data.role_of_node = Some(NodeRole::OriginatingRole);
-            ims_data.node_functionality = service.node_functionality();
-            ims_data.cause_code = Some(cause_code);
+            let ims_data = ImsChargingData {
+                calling_party: Some(aor.clone()),
+                sip_method: Some("REGISTER".to_string()),
+                role_of_node: Some(NodeRole::OriginatingRole),
+                node_functionality: service.node_functionality(),
+                cause_code: Some(cause_code),
+                ..Default::default()
+            };
             let _ = service.acr_event(ims_data, Some(aor)).await;
         }
         info!("rf: registrar ACR-EVENT emitter stopped");

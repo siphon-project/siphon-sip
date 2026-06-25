@@ -567,7 +567,7 @@ pub fn extract_address_from_uri(uri: &str) -> String {
         .unwrap_or(uri);
 
     // Strip user@ if present
-    let host_part = host_part.split('@').last().unwrap_or(host_part);
+    let host_part = host_part.split('@').next_back().unwrap_or(host_part);
 
     // Strip URI parameters (;transport=tls, ;lr, etc.)
     let host_port = host_part.split(';').next().unwrap_or(host_part);
@@ -1088,7 +1088,7 @@ mod tests {
         probe_group(&group, &uac_sender, 1, None, None).await;
 
         let status = group.status();
-        assert_eq!(status[0].1, false);
+        assert!(!status[0].1);
     }
 
     // --- Algorithm parsing ---

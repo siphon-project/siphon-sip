@@ -159,7 +159,6 @@ impl RtpEngineClient {
     /// plugins; G.711 and Opus prompts work without them.
     ///
     /// Returns the prompt duration in milliseconds, if the engine reports one.
-    #[allow(clippy::too_many_arguments)]
     pub async fn play_media(
         &self,
         call_id: &str,
@@ -229,7 +228,6 @@ impl RtpEngineClient {
     /// `code` is a single digit (`"0"`–`"9"`, `"*"`, `"#"`, `"A"`–`"D"`) or a
     /// string sequence. `volume_dbm0` is typically `-8` (the default used by
     /// rtpengine). `pause_ms` is the inter-tone gap when `code` is a sequence.
-    #[allow(clippy::too_many_arguments)]
     pub async fn play_dtmf(
         &self,
         call_id: &str,
@@ -772,7 +770,6 @@ impl RtpEngineSet {
     }
 
     /// Send a `play media` command to the affinity-bound instance.
-    #[allow(clippy::too_many_arguments)]
     pub async fn play_media(
         &self,
         call_id: &str,
@@ -800,7 +797,6 @@ impl RtpEngineSet {
     }
 
     /// Send a `play DTMF` command to the affinity-bound instance.
-    #[allow(clippy::too_many_arguments)]
     pub async fn play_dtmf(
         &self,
         call_id: &str,
@@ -1198,40 +1194,35 @@ mod tests {
 
         tokio::spawn(async move {
             let mut buffer = BytesMut::zeroed(65535);
-            loop {
-                match socket.recv_from(&mut buffer).await {
-                    Ok((size, source)) => {
-                        let data = &buffer[..size];
-                        let space = data.iter().position(|&b| b == b' ').unwrap();
-                        let cookie = std::str::from_utf8(&data[..space]).unwrap().to_string();
+            while let Ok((size, source)) = socket.recv_from(&mut buffer).await {
+                let data = &buffer[..size];
+                let space = data.iter().position(|&b| b == b' ').unwrap();
+                let cookie = std::str::from_utf8(&data[..space]).unwrap().to_string();
 
-                        let payload = &data[space + 1..];
-                        let command = bencode::decode_full_dict(payload).unwrap();
-                        let cmd_name = command.dict_get_str("command").unwrap_or("unknown");
+                let payload = &data[space + 1..];
+                let command = bencode::decode_full_dict(payload).unwrap();
+                let cmd_name = command.dict_get_str("command").unwrap_or("unknown");
 
-                        let response = if cmd_name == "ping" {
-                            BencodeValue::dict(vec![
-                                ("result", BencodeValue::string("pong")),
-                            ])
-                        } else {
-                            let mut pairs = vec![
-                                ("result", BencodeValue::string("ok")),
-                            ];
-                            if cmd_name == "offer" || cmd_name == "answer" || cmd_name == "subscribe request" || cmd_name == "subscribe answer" {
-                                pairs.push(("sdp", BencodeValue::string("v=0\r\nc=IN IP4 203.0.113.1\r\n")));
-                            }
-                            BencodeValue::dict(pairs)
-                        };
-
-                        let encoded = bencode::encode(&response);
-                        let mut reply = Vec::new();
-                        reply.extend_from_slice(cookie.as_bytes());
-                        reply.push(b' ');
-                        reply.extend_from_slice(&encoded);
-                        let _ = socket.send_to(&reply, source).await;
+                let response = if cmd_name == "ping" {
+                    BencodeValue::dict(vec![
+                        ("result", BencodeValue::string("pong")),
+                    ])
+                } else {
+                    let mut pairs = vec![
+                        ("result", BencodeValue::string("ok")),
+                    ];
+                    if cmd_name == "offer" || cmd_name == "answer" || cmd_name == "subscribe request" || cmd_name == "subscribe answer" {
+                        pairs.push(("sdp", BencodeValue::string("v=0\r\nc=IN IP4 203.0.113.1\r\n")));
                     }
-                    Err(_) => break,
-                }
+                    BencodeValue::dict(pairs)
+                };
+
+                let encoded = bencode::encode(&response);
+                let mut reply = Vec::new();
+                reply.extend_from_slice(cookie.as_bytes());
+                reply.push(b' ');
+                reply.extend_from_slice(&encoded);
+                let _ = socket.send_to(&reply, source).await;
             }
         });
 
@@ -1393,37 +1384,32 @@ mod tests {
 
         tokio::spawn(async move {
             let mut buffer = BytesMut::zeroed(65535);
-            loop {
-                match socket.recv_from(&mut buffer).await {
-                    Ok((size, source)) => {
-                        let data = &buffer[..size];
-                        let space = data.iter().position(|&b| b == b' ').unwrap();
-                        let cookie = std::str::from_utf8(&data[..space]).unwrap().to_string();
+            while let Ok((size, source)) = socket.recv_from(&mut buffer).await {
+                let data = &buffer[..size];
+                let space = data.iter().position(|&b| b == b' ').unwrap();
+                let cookie = std::str::from_utf8(&data[..space]).unwrap().to_string();
 
-                        let payload = &data[space + 1..];
-                        let command = bencode::decode_full_dict(payload).unwrap();
-                        let cmd_name = command.dict_get_str("command").unwrap_or("").to_string();
-                        captured_clone.lock().await.push(command);
+                let payload = &data[space + 1..];
+                let command = bencode::decode_full_dict(payload).unwrap();
+                let cmd_name = command.dict_get_str("command").unwrap_or("").to_string();
+                captured_clone.lock().await.push(command);
 
-                        let response = if cmd_name == "play media" {
-                            BencodeValue::dict(vec![
-                                ("result", BencodeValue::string("ok")),
-                                ("duration", BencodeValue::from_integer(12345)),
-                            ])
-                        } else {
-                            BencodeValue::dict(vec![
-                                ("result", BencodeValue::string("ok")),
-                            ])
-                        };
-                        let encoded = bencode::encode(&response);
-                        let mut reply = Vec::new();
-                        reply.extend_from_slice(cookie.as_bytes());
-                        reply.push(b' ');
-                        reply.extend_from_slice(&encoded);
-                        let _ = socket.send_to(&reply, source).await;
-                    }
-                    Err(_) => break,
-                }
+                let response = if cmd_name == "play media" {
+                    BencodeValue::dict(vec![
+                        ("result", BencodeValue::string("ok")),
+                        ("duration", BencodeValue::from_integer(12345)),
+                    ])
+                } else {
+                    BencodeValue::dict(vec![
+                        ("result", BencodeValue::string("ok")),
+                    ])
+                };
+                let encoded = bencode::encode(&response);
+                let mut reply = Vec::new();
+                reply.extend_from_slice(cookie.as_bytes());
+                reply.push(b' ');
+                reply.extend_from_slice(&encoded);
+                let _ = socket.send_to(&reply, source).await;
             }
         });
 

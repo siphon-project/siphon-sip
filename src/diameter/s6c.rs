@@ -34,18 +34,6 @@ fn optional_u32(avps: &serde_json::Value, name: &str) -> Option<u32> {
     avps.get(name).and_then(|v| v.as_u64()).map(|n| n as u32)
 }
 
-/// Decode an OctetString AVP that holds UTF-8 text (the codec hex-encodes
-/// it on the way out; we reverse that here for human-readable IMSIs etc.).
-fn octet_string_as_utf8(avps: &serde_json::Value, name: &str) -> Option<String> {
-    avps.get(name)
-        .and_then(|v| v.as_str())
-        .map(|hex_str| {
-            codec::hex::decode(hex_str)
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .unwrap_or_else(|| hex_str.to_string())
-        })
-}
-
 /// Decode an OctetString AVP that holds an ISDN-AddressString
 /// (TS 29.002 §17.7.8) — strip the optional ToN/NPI prefix and
 /// TBCD-decode the remainder back to an E.164 digit string. Used for
@@ -54,7 +42,7 @@ fn octet_string_as_utf8(avps: &serde_json::Value, name: &str) -> Option<String> 
 fn octet_string_as_isdn_address(avps: &serde_json::Value, name: &str) -> Option<String> {
     avps.get(name)
         .and_then(|v| v.as_str())
-        .and_then(|hex_str| codec::hex::decode(hex_str))
+        .and_then(codec::hex::decode)
         .map(|bytes| codec::decode_isdn_address_string(&bytes))
 }
 
@@ -96,11 +84,6 @@ impl S6cAnswerBuilder {
             AVP_FLAG_MANDATORY,
             &children,
         ));
-        self
-    }
-
-    fn raw_avps(mut self, data: &[u8]) -> Self {
-        self.avp_buf.extend_from_slice(data);
         self
     }
 

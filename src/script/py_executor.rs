@@ -1408,7 +1408,7 @@ mod tests {
              pool must grow past its core size (this is the 1c541e3 regression)"
         );
         assert!(
-            grown_to >= BLOCKERS + 1,
+            grown_to > BLOCKERS,
             "pool must grow to absorb {BLOCKERS} blockers + the canary; grew to {grown_to}"
         );
 

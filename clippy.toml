@@ -1,0 +1,10 @@
+# Clippy configuration for SIPhon.
+#
+# too-many-arguments-threshold: SIP / IMS / Diameter handlers legitimately
+# carry many protocol fields (AVPs, headers, transport coordinates), so the
+# default threshold of 7 produced ~70 false positives. Raise it to 12 — the
+# widest signature in the tree today (siprec start_recording) — so the lint
+# still flags genuinely-egregious signatures (13+) while accepting the
+# domain's inherently-wide protocol functions. This replaces the scattered
+# per-function `#[allow(clippy::too_many_arguments)]` attributes.
+too-many-arguments-threshold = 12

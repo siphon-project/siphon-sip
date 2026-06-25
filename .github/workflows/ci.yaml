@@ -32,6 +32,33 @@ jobs:
       - name: Run tests
         run: PYO3_PYTHON=python3.14 cargo test
 
+  # ── Clippy lint gate ────────────────────────────────────────────────────
+  # Mirrors the rust-tests build env (free-threaded Python 3.14 + libsctp-dev
+  # are needed for the crate to compile at all). `-D warnings` turns any
+  # clippy lint or rustc warning into a hard failure so the clippy-clean
+  # baseline cannot regress.
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python 3.14 (free-threaded)
+        uses: deadsnakes/action@v3.2.0
+        with:
+          python-version: "3.14-dev"
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsctp-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run clippy
+        run: PYO3_PYTHON=python3.14 cargo clippy --all-targets --all-features -- -D warnings
+
   # ── Python SDK tests ──────────────────────────────────────────────────
   sdk-tests:
     runs-on: ubuntu-latest

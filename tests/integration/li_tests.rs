@@ -10,7 +10,7 @@
 use siphon::config::{LawfulInterceptConfig, LiX1Config, LiX2Config, LiX3Config, LiSiprecConfig};
 use siphon::li::{IriEvent, IriEventType, LiManager, AuditOperation};
 use siphon::li::target::{DeliveryType, InterceptTarget, TargetIdentity};
-use siphon::li::x1::{self, X1State, ActivateTaskRequest, TargetStatusResponse, TargetListResponse};
+use siphon::li::x1::{self, X1State, TargetStatusResponse, TargetListResponse};
 use siphon::li::x2;
 use siphon::li::x3::X3Manager;
 use siphon::li::siprec::SiprecManager;
@@ -18,7 +18,6 @@ use siphon::li::asn1;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::io::AsyncReadExt;
@@ -707,7 +706,7 @@ async fn x1_full_crud_lifecycle() {
 #[tokio::test]
 async fn ip_based_intercept_match() {
     let config = full_li_config();
-    let (manager, mut iri_receiver, _audit_receiver) = LiManager::new(config, 1000);
+    let (manager, _iri_receiver, _audit_receiver) = LiManager::new(config, 1000);
 
     // Provision IP-based target
     manager.targets().activate(InterceptTarget {
@@ -749,7 +748,7 @@ async fn ip_based_intercept_match() {
 #[tokio::test]
 async fn multiple_leas_same_target() {
     let config = full_li_config();
-    let (manager, mut iri_receiver, _audit_receiver) = LiManager::new(config, 1000);
+    let (manager, _iri_receiver, _audit_receiver) = LiManager::new(config, 1000);
 
     // LEA 1
     manager.targets().activate(InterceptTarget {

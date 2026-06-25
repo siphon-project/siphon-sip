@@ -260,10 +260,10 @@ impl NamedCache {
                 .query_async::<u64>(&mut connection)
                 .await
             {
-                Ok(len) => return Some(len),
+                Ok(len) => Some(len),
                 Err(error) => {
                     warn!(key = key, "Redis RPUSH failed: {error}");
-                    return None;
+                    None
                 }
             }
         }
@@ -298,10 +298,10 @@ impl NamedCache {
                 .query_async(&mut connection)
                 .await;
             match result {
-                Ok((items, _)) => return items,
+                Ok((items, _)) => items,
                 Err(error) => {
                     warn!(key = key, "Redis list_pop_all failed: {error}");
-                    return Vec::new();
+                    Vec::new()
                 }
             }
         }
@@ -330,10 +330,10 @@ impl NamedCache {
                 .query_async::<i64>(&mut connection)
                 .await
             {
-                Ok(set) => return set == 1,
+                Ok(set) => set == 1,
                 Err(error) => {
                     warn!(key = key, "Redis EXPIRE failed: {error}");
-                    return false;
+                    false
                 }
             }
         }
@@ -365,10 +365,10 @@ impl NamedCache {
                 .query_async::<i64>(&mut connection)
                 .await
             {
-                Ok(present) => return present > 0,
+                Ok(present) => present > 0,
                 Err(error) => {
                     warn!(key = key, "Redis EXISTS failed: {error}");
-                    return false;
+                    false
                 }
             }
         }

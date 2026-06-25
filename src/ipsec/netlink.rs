@@ -24,8 +24,9 @@
 //! - `linux/xfrm.h` (kernel UAPI header)
 //! - `linux/netlink.h` (NETLINK_XFRM = 6)
 //! - `linux/rtnetlink.h` (NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL)
-
-#![cfg(target_os = "linux")]
+//!
+//! The whole module is gated on `target_os = "linux"` at its declaration in
+//! `ipsec/mod.rs`, so no inner `#![cfg]` is needed here.
 
 use std::collections::HashMap;
 use std::io;
@@ -53,10 +54,8 @@ const XFRM_MSG_DELPOLICY: u16 = 0x14;
 /// install time + new value (not "now + new value").
 const XFRM_MSG_UPDSA: u16 = 0x1a;
 
-const XFRMA_ALG_AUTH: u16 = 1;
 const XFRMA_ALG_CRYPT: u16 = 2;
 const XFRMA_TMPL: u16 = 5;
-const XFRMA_LTIME_VAL: u16 = 9;
 const XFRMA_ALG_AUTH_TRUNC: u16 = 20;
 
 const XFRM_MODE_TRANSPORT: u8 = 0;
@@ -73,9 +72,14 @@ const AF_INET: u16 = 2;
 const AF_INET6: u16 = 10;
 
 // IP protocol numbers.
-pub(crate) const IPPROTO_TCP: u8 = 6;
-pub(crate) const IPPROTO_UDP: u8 = 17;
 const IPPROTO_ESP: u8 = 50;
+// TCP/UDP protocol numbers are only referenced by the selector-encoding
+// tests below; production code passes the selector proto in from
+// `SaProtocol::as_u8()`.
+#[cfg(test)]
+const IPPROTO_TCP: u8 = 6;
+#[cfg(test)]
+const IPPROTO_UDP: u8 = 17;
 
 // Netlink message header flags (`linux/netlink.h`).
 const NLM_F_REQUEST: u16 = 1;
@@ -246,7 +250,6 @@ fn encode_xfrm_id(daddr: &IpAddr, spi: u32, proto: u8, out: &mut Vec<u8>) {
 }
 
 /// Encode `struct xfrm_usersa_info` — total 220 bytes on x86_64.
-#[allow(clippy::too_many_arguments)]
 fn encode_xfrm_usersa_info(
     source: &IpAddr,
     source_port: u16,
@@ -444,7 +447,6 @@ fn xfrm_enc_name(ealg: EncryptionAlgorithm) -> &'static str {
 /// IPsec, or `IPPROTO_TCP` (6) for ESP-over-TCP (TS 33.203 §7.2).  The
 /// kernel only applies this SA to inner-protocol frames matching the
 /// selector, so a UDP-pinned selector silently drops TCP IPsec frames.
-#[allow(clippy::too_many_arguments)]
 pub async fn add_sa(
     source: &IpAddr,
     source_port: u16,
@@ -503,7 +505,6 @@ pub async fn add_sa(
 /// `integrity_key` / `encryption_key` change between install and update,
 /// the kernel rekeys the SA mid-flight (correct behaviour, but rarely
 /// what scripts intend).
-#[allow(clippy::too_many_arguments)]
 pub async fn update_sa(
     source: &IpAddr,
     source_port: u16,
@@ -563,7 +564,6 @@ pub async fn del_sa(daddr: &IpAddr, spi: u32) -> Result<(), IpsecError> {
 /// hard_add_expires_seconds` so the policy self-reaps on the same deadline
 /// as its states.  When `None` the policy lives until explicitly deleted —
 /// keep this for caller-managed lifetimes (dev/test, permanent SAs).
-#[allow(clippy::too_many_arguments)]
 pub async fn add_policy(
     source: &IpAddr,
     source_port: u16,
@@ -661,7 +661,7 @@ async fn send_and_ack(msg_type: u16, extra_flags: u16, payload: &[u8]) -> Result
     // pool so we don't stall the dispatcher.  XFRM operations are slow
     // enough (~ms) that this is the right shape regardless.
     let result = tokio::task::spawn_blocking(move || -> io::Result<()> {
-        let mut socket = Socket::new(NETLINK_XFRM)?;
+        let socket = Socket::new(NETLINK_XFRM)?;
         let kernel_addr = SocketAddr::new(0, 0);
         socket.connect(&kernel_addr)?;
         let bytes_sent = socket.send(&buffer, 0)?;

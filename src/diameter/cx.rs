@@ -416,7 +416,6 @@ pub fn build_rta(
 }
 
 /// Encode an RTR (Registration-Termination-Request) — HSS-initiated push.
-#[allow(clippy::too_many_arguments)]
 pub fn build_rtr(
     origin_host: &str,
     origin_realm: &str,

@@ -397,7 +397,6 @@ pub fn format_authorization_header(
 /// base64-encoded re-synchronisation token), it is appended as the `auts=`
 /// directive so the registrar of record re-bases its sequence counter
 /// (RFC 3310 §3.4 / 3GPP TS 33.102 §6.3.3).
-#[allow(clippy::too_many_arguments)]
 pub fn format_aka_authorization_header(
     challenge: &DigestChallenge,
     username: &str,
@@ -470,7 +469,6 @@ fn derive_cnonce<'a>(
 
 /// Assemble the `Digest ...` Authorization header value from a precomputed
 /// response. Shared by the text-password and AKA-RES paths.
-#[allow(clippy::too_many_arguments)]
 fn build_authorization_header(
     username: &str,
     challenge: &DigestChallenge,

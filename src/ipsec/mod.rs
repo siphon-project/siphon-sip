@@ -232,6 +232,7 @@ impl SaRole {
 /// stamps `proto = 0` (kernel-side "match any inner protocol"), so the
 /// same SPI pair covers both transports without doubling kernel state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SaProtocol {
     /// IPPROTO_UDP (17).
     Udp,
@@ -239,6 +240,7 @@ pub enum SaProtocol {
     Tcp,
     /// "Any" — selector_proto=0 in XFRM, matches both TCP and UDP inner
     /// flows.  Default when the script doesn't pin a transport.
+    #[default]
     Any,
 }
 
@@ -271,11 +273,6 @@ impl SaProtocol {
     }
 }
 
-impl Default for SaProtocol {
-    fn default() -> Self {
-        SaProtocol::Any
-    }
-}
 
 impl std::fmt::Display for SaProtocol {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -635,17 +632,13 @@ impl std::error::Error for IpsecError {}
 /// on the netlink socket) or `/sbin/ip xfrm` shell-out (slower but
 /// works in any environment where ``ip`` itself works).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum XfrmBackend {
+    #[default]
     Netlink,
     IpCommand,
 }
 
-impl Default for XfrmBackend {
-    fn default() -> Self {
-        // Netlink is the production default; switch with `ipsec.backend: ip`.
-        Self::Netlink
-    }
-}
 
 /// Manages active IPsec SAs for UE registrations.
 ///
@@ -1337,7 +1330,6 @@ impl IpsecManager {
     // -----------------------------------------------------------------------
 
     /// Add an SA via the active backend.
-    #[allow(clippy::too_many_arguments)]
     async fn add_sa(
         &self,
         source: &IpAddr,
@@ -1408,7 +1400,6 @@ impl IpsecManager {
     /// IPCommand backend reuses the `xfrm_sa_add` path with `update`
     /// instead of `add` — iproute2 maps both to the same payload, only
     /// the netlink message type differs.
-    #[allow(clippy::too_many_arguments)]
     async fn update_sa_only(
         &self,
         source: &IpAddr,
@@ -1494,7 +1485,6 @@ impl IpsecManager {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn add_policy(
         &self,
         source: &IpAddr,
@@ -1621,7 +1611,6 @@ impl IpsecManager {
     // Legacy `ip xfrm` shell-out helpers — kept for the IpCommand backend.
     // -----------------------------------------------------------------------
 
-    #[allow(clippy::too_many_arguments)]
     async fn xfrm_sa_add(
         source: &IpAddr,
         source_port: u16,
@@ -1696,7 +1685,6 @@ impl IpsecManager {
     /// the kernel preserves `add_time`, so a tightened
     /// `limit time-hard` produces deadline = original install + new
     /// value, not now + new value.
-    #[allow(clippy::too_many_arguments)]
     async fn xfrm_sa_update(
         source: &IpAddr,
         source_port: u16,
@@ -1778,8 +1766,6 @@ impl IpsecManager {
         Self::run_ip_command(&args).await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     async fn xfrm_policy_add(
         source: &IpAddr,
         source_port: u16,

@@ -23,11 +23,13 @@ use crate::diameter::DiameterManager;
 #[derive(Debug, Clone)]
 struct ImsAuthVector {
     /// Expected response (SIP-Authorization / XRES) from the HSS.
+    ///
+    /// CK/IK (AVP 625/626) are not cached here — they are consumed at
+    /// challenge time via the `hss_ck`/`hss_ik` locals when building the
+    /// WWW-Authenticate, and the P-CSCF IPsec path re-extracts them from the
+    /// relayed 401 header via `reply.take_av()`. The verification REGISTER
+    /// only needs the expected response.
     expected_response: Vec<u8>,
-    /// Confidentiality key for IPsec (AVP 625).
-    ck: Option<Vec<u8>>,
-    /// Integrity key for IPsec (AVP 626).
-    ik: Option<Vec<u8>>,
 }
 
 /// A cached HTTP-auth credential lookup (HA1 hex when `http.ha1`, else the
@@ -347,7 +349,7 @@ impl PyAuth {
 
             // Normal verification: look up the stored XRES from the first MAR
             let nonce_str = extract_nonce_field(auth_value);
-            let found = nonce_str.as_ref().map_or(false, |n| ims_auth_store().contains_key(n));
+            let found = nonce_str.as_ref().is_some_and(|n| ims_auth_store().contains_key(n));
             tracing::debug!(
                 nonce_prefix = nonce_str.as_ref().map(|n| &n[..n.len().min(16)]),
                 found,
@@ -804,8 +806,6 @@ impl PyAuth {
             );
             ims_auth_store().insert(nonce_str, ImsAuthVector {
                 expected_response: expected_bytes.clone(),
-                ck: hss_ck.clone(),
-                ik: hss_ik.clone(),
             });
         }
 
@@ -1141,7 +1141,10 @@ fn parse_algorithm(value: Option<&str>) -> crate::auth::DigestAlgorithm {
     }
 }
 
-/// Compute MD5 hex digest of a string.
+/// Compute MD5 hex digest of a string. Test-only helper for building digest
+/// fixtures; production digest computation goes through `md5_ha1_aka` and the
+/// `crate::auth` digest engine.
+#[cfg(test)]
 fn md5_hex(input: &str) -> String {
     format!("{:x}", md5::compute(input.as_bytes()))
 }
@@ -1877,8 +1880,6 @@ mod tests {
 
         store.insert(nonce.clone(), ImsAuthVector {
             expected_response: vec![0xAA; 16],
-            ck: Some(vec![0xBB; 16]),
-            ik: Some(vec![0xCC; 16]),
         });
 
         // Verify it exists
@@ -1889,7 +1890,6 @@ mod tests {
         assert!(removed.is_some());
         let (_, vector) = removed.unwrap();
         assert_eq!(vector.expected_response, vec![0xAA; 16]);
-        assert_eq!(vector.ck.unwrap(), vec![0xBB; 16]);
 
         // Gone after consumption — prevents replay
         assert!(store.get(&nonce).is_none());

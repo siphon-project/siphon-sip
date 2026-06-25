@@ -122,17 +122,6 @@ impl AsyncPool {
         self.drivers.len()
     }
 
-    /// Test-only accessor that hands back fresh `Py` references to each
-    /// driver's asyncio loop so leak tests can call
-    /// `asyncio.all_tasks(loop)` on them.  Caller must hold `python`.
-    #[cfg(test)]
-    pub(crate) fn driver_loops(&self, python: Python<'_>) -> Vec<Py<PyAny>> {
-        self.drivers
-            .iter()
-            .map(|d| d.loop_obj.clone_ref(python))
-            .collect()
-    }
-
     fn spawn(size: usize, tokio_handle: TokioHandle) -> Self {
         let mut drivers = Vec::with_capacity(size);
         for index in 0..size {
@@ -268,11 +257,13 @@ fn driver_main(
     //
     // SAFETY: the gstate is intentionally leaked.  The OS thread runs for
     // the lifetime of the process; the gstate is reclaimed on thread exit.
+    // We never call PyGILState_Release / PyEval_RestoreThread — that omission
+    // is what keeps the per-thread state alive.  The returned handles are
+    // Copy (an enum + a raw pointer, no Drop), so they need no mem::forget;
+    // letting the bindings fall out of scope is a no-op by construction.
     unsafe {
-        let gstate = pyo3::ffi::PyGILState_Ensure();
-        let tstate = pyo3::ffi::PyEval_SaveThread();
-        std::mem::forget(tstate);
-        std::mem::forget(gstate);
+        let _gstate = pyo3::ffi::PyGILState_Ensure();
+        let _tstate = pyo3::ffi::PyEval_SaveThread();
     }
 
     // Phase 1: build the loop and hand a handle back to the spawning thread.

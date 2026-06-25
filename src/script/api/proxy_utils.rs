@@ -281,7 +281,6 @@ impl PyProxyUtils {
     /// )
     /// ```
     #[pyo3(signature = (method, ruri, headers=None, body=None, next_hop=None, wait_for_response=false, timeout_ms=2000))]
-    #[allow(clippy::too_many_arguments)]
     fn send_request<'py>(
         &self,
         python: Python<'py>,
@@ -1245,7 +1244,7 @@ mod tests {
         body_1.push_str("P-Visited-Network-ID: ims.mnc001.mcc001.3gppnetwork.org\r\n");
         // pad to 1809 bytes total to mirror the diagnostic body_len.
         while body_1.len() < 1809 - 4 {
-            body_1.push_str(".");
+            body_1.push('.');
         }
         body_1.push_str("\r\n\r\n");
         let body_1: &str = &body_1;

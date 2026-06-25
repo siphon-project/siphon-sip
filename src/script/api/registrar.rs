@@ -29,7 +29,7 @@ const PROXY_BINDING_GRACE_SECS: u32 = 32;
 /// REGISTER.  Treat as opaque from Python: scripts pass it back to
 /// `request.relay(flow=)` and read `is_alive` to defend against dead
 /// stream connections.
-#[pyclass(name = "Flow")]
+#[pyclass(name = "Flow", from_py_object)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PyFlow {
     /// Lowercase transport name ("udp", "tcp", "tls", "ws", "wss").
@@ -973,10 +973,7 @@ impl PyRegistrar {
                 // We do NOT special-case `+sip.instance` or `reg-id` for
                 // AS contacts — those are meaningful only on the UE side.
                 let params: Vec<(String, Option<String>)> = nameaddr
-                    .other_params
-                    .iter()
-                    .cloned()
-                    .collect();
+                    .other_params.to_vec();
 
                 let saved = self
                     .inner

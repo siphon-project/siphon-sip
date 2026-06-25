@@ -64,7 +64,7 @@ impl MediaLine {
             .iter()
             .filter_map(|line| line.strip_prefix("a="))
             .filter(|attr| attr_matches_name(attr, name))
-            .map(|attr| attr_extract_value(attr))
+            .map(attr_extract_value)
             .collect()
     }
 
@@ -112,7 +112,7 @@ impl MediaLine {
             .iter()
             .filter_map(|line| line.strip_prefix("a="))
             .find(|attr| attr_matches_name(attr, name))
-            .map(|attr| attr_extract_value(attr))
+            .map(attr_extract_value)
     }
 
     /// Set (replace first or append) an `a=` attribute.
@@ -349,7 +349,7 @@ impl SdpBody {
             .iter()
             .filter_map(|line| line.strip_prefix("a="))
             .find(|attr| attr_matches_name(attr, name))
-            .map(|attr| attr_extract_value(attr))
+            .map(attr_extract_value)
     }
 
     /// Get all session-level `a=` attribute values matching `name`.
@@ -358,7 +358,7 @@ impl SdpBody {
             .iter()
             .filter_map(|line| line.strip_prefix("a="))
             .filter(|attr| attr_matches_name(attr, name))
-            .map(|attr| attr_extract_value(attr))
+            .map(attr_extract_value)
             .collect()
     }
 

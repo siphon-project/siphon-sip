@@ -1542,7 +1542,7 @@ impl GatewayDestConfig {
         if let Some(pos) = uri_lower.find(";transport=") {
             let after = &uri_lower[pos + 11..];
             let end = after
-                .find(|c: char| c == ';' || c == '>' || c == ' ')
+                .find([';', '>', ' '])
                 .unwrap_or(after.len());
             return after[..end].to_string();
         }

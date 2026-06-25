@@ -216,7 +216,6 @@ impl UacSender {
     /// it leaves the right listener / matches the IPsec egress policy) and the
     /// Via reflects it; when `None`, behaviour is unchanged (Via from the
     /// configured listen address, `source_local_addr` unset).
-    #[allow(clippy::too_many_arguments)]
     fn send_options_on_connection_inner(
         &self,
         destination: SocketAddr,

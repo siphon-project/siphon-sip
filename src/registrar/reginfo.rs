@@ -689,7 +689,7 @@ mod tests {
         assert_eq!(body.registrations[0].contacts[0].event, ContactEvent::Registered);
 
         let xml = body.to_xml();
-        assert!(xml.contains("application/reginfo+xml") == false); // content type is separate
+        assert!(!xml.contains("application/reginfo+xml")); // content type is separate
         assert!(xml.contains("urn:ietf:params:xml:ns:reginfo"));
         assert!(xml.contains("version=\"0\""));
         assert!(xml.contains("state=\"full\""));

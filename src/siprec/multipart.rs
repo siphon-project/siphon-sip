@@ -38,13 +38,10 @@ pub fn extract_boundary(content_type: &str) -> Result<String, MultipartError> {
     let after_eq = &content_type[boundary_pos + 9..];
 
     // Strip optional quotes.
-    let boundary = if after_eq.starts_with('"') {
+    let boundary = if let Some(stripped) = after_eq.strip_prefix('"') {
         // Quoted boundary — find closing quote.
-        let end = after_eq[1..]
-            .find('"')
-            .map(|position| position + 1)
-            .unwrap_or(after_eq.len());
-        &after_eq[1..end]
+        let end = stripped.find('"').unwrap_or(stripped.len());
+        &stripped[..end]
     } else {
         // Unquoted — terminated by `;`, `,`, whitespace, or end of string.
         let end = after_eq

@@ -655,7 +655,6 @@ impl PyCall {
     ///         strip=["History-Info"],
     ///     )
     #[pyo3(signature = (uri, timeout=30, next_hop=None, flow=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), route=Vec::new()))]
-    #[allow(clippy::too_many_arguments)]
     fn dial(
         &mut self,
         uri: &str,

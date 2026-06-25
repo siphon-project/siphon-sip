@@ -396,7 +396,6 @@ impl PyRtpEngine {
     ///     The prompt duration in milliseconds if rtpengine reports one,
     ///     else ``None``.
     #[pyo3(signature = (target, file=None, blob=None, db_id=None, repeat=None, start_ms=None, duration_ms=None, to_tag=None))]
-    #[allow(clippy::too_many_arguments)]
     fn play_media<'py>(
         &self,
         python: Python<'py>,
@@ -473,7 +472,6 @@ impl PyRtpEngine {
     ///     pause_ms: Inter-tone gap when ``code`` is a sequence.
     ///     to_tag: Optional peer tag for MPTY scoping.
     #[pyo3(signature = (target, code, duration_ms=None, volume_dbm0=None, pause_ms=None, to_tag=None))]
-    #[allow(clippy::too_many_arguments)]
     fn play_dtmf<'py>(
         &self,
         python: Python<'py>,

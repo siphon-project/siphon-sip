@@ -25,6 +25,12 @@ use super::rtpengine::{extract_message, extract_sdp_body};
 #[pyclass(name = "QosNamespace")]
 pub struct PyQosNamespace;
 
+impl Default for PyQosNamespace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PyQosNamespace {
     pub fn new() -> Self {
         Self
@@ -371,7 +377,7 @@ mod tests {
                 .media_flows_from_sdp(python, offer.as_any(), answer.as_any(), "orig")
                 .unwrap();
             assert_eq!(result.len(), 1);
-            let component: Bound<'_, PyDict> = result.get_item(0).unwrap().downcast_into().unwrap();
+            let component: Bound<'_, PyDict> = result.get_item(0).unwrap().cast_into().unwrap();
             assert_eq!(
                 component.get_item("media_type").unwrap().unwrap().extract::<String>().unwrap(),
                 "audio"
@@ -380,11 +386,11 @@ mod tests {
                 .get_item("flows")
                 .unwrap()
                 .unwrap()
-                .downcast_into()
+                .cast_into()
                 .unwrap();
             assert_eq!(flows.len(), 2);
 
-            let rtp: Bound<'_, PyDict> = flows.get_item(0).unwrap().downcast_into().unwrap();
+            let rtp: Bound<'_, PyDict> = flows.get_item(0).unwrap().cast_into().unwrap();
             let rtp_descs: Vec<String> = rtp
                 .get_item("descriptions")
                 .unwrap()
@@ -401,7 +407,7 @@ mod tests {
                 "permit in 17 from 100.64.0.10 30000 to 100.65.0.2 50000"
             );
 
-            let rtcp: Bound<'_, PyDict> = flows.get_item(1).unwrap().downcast_into().unwrap();
+            let rtcp: Bound<'_, PyDict> = flows.get_item(1).unwrap().cast_into().unwrap();
             assert_eq!(
                 rtcp.get_item("usage").unwrap().unwrap().extract::<String>().unwrap(),
                 "rtcp"
@@ -429,14 +435,14 @@ mod tests {
             let result = ns
                 .media_flows_from_sdp(python, offer.as_any(), answer.as_any(), "term")
                 .unwrap();
-            let component: Bound<'_, PyDict> = result.get_item(0).unwrap().downcast_into().unwrap();
+            let component: Bound<'_, PyDict> = result.get_item(0).unwrap().cast_into().unwrap();
             let flows: Bound<'_, PyList> = component
                 .get_item("flows")
                 .unwrap()
                 .unwrap()
-                .downcast_into()
+                .cast_into()
                 .unwrap();
-            let rtp: Bound<'_, PyDict> = flows.get_item(0).unwrap().downcast_into().unwrap();
+            let rtp: Bound<'_, PyDict> = flows.get_item(0).unwrap().cast_into().unwrap();
             let rtp_descs: Vec<String> = rtp
                 .get_item("descriptions")
                 .unwrap()
@@ -485,12 +491,12 @@ mod tests {
                 .media_flows_from_sdp(python, offer.as_any(), answer.as_any(), "orig")
                 .unwrap();
             let component: Bound<'_, PyDict> =
-                result.get_item(0).unwrap().downcast_into().unwrap();
+                result.get_item(0).unwrap().cast_into().unwrap();
             let flows: Bound<'_, PyList> = component
                 .get_item("flows")
                 .unwrap()
                 .unwrap()
-                .downcast_into()
+                .cast_into()
                 .unwrap();
             assert_eq!(flows.len(), 1, "rtcp-mux should collapse to one flow");
         });
@@ -516,14 +522,14 @@ mod tests {
                 .media_flows_from_sdp(python, offer.as_any(), answer.as_any(), "orig")
                 .unwrap();
             let component: Bound<'_, PyDict> =
-                result.get_item(0).unwrap().downcast_into().unwrap();
+                result.get_item(0).unwrap().cast_into().unwrap();
             let flows: Bound<'_, PyList> = component
                 .get_item("flows")
                 .unwrap()
                 .unwrap()
-                .downcast_into()
+                .cast_into()
                 .unwrap();
-            let rtcp: Bound<'_, PyDict> = flows.get_item(1).unwrap().downcast_into().unwrap();
+            let rtcp: Bound<'_, PyDict> = flows.get_item(1).unwrap().cast_into().unwrap();
             let rtcp_descs: Vec<String> = rtcp
                 .get_item("descriptions")
                 .unwrap()
@@ -586,7 +592,7 @@ mod tests {
                 .media_flows_from_sdp(python, offer.as_any(), answer.as_any(), "orig")
                 .unwrap();
             let component: Bound<'_, PyDict> =
-                result.get_item(0).unwrap().downcast_into().unwrap();
+                result.get_item(0).unwrap().cast_into().unwrap();
             let status: String = component
                 .get_item("flow_status")
                 .unwrap()

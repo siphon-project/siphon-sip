@@ -120,7 +120,7 @@ impl PySubscribeState {
         // The SUBSCRIBE's To-tag is the notifier's (our) tag.  If the
         // SUBSCRIBE had no To-tag (first-in-dialog), we mint one now so
         // our NOTIFYs carry a stable tag.
-        let local_tag = extract_tag(&to_raw).unwrap_or_else(|| short_uuid());
+        let local_tag = extract_tag(&to_raw).unwrap_or_else(short_uuid);
 
         let local_uri = strip_nameaddr(&to_raw);
         let remote_uri = strip_nameaddr(&from_raw);
@@ -979,7 +979,6 @@ fn build_in_dialog_subscribe(
 /// sender / DNS resolver — the bug that motivated the extraction was the
 /// missing default Contact (RFC 6665 §4.1.2.1) which left notifiers
 /// without a dialog remote target and silently dropped every NOTIFY.
-#[allow(clippy::too_many_arguments)]
 fn build_outbound_subscribe(
     ruri: &str,
     ruri_parsed: crate::sip::uri::SipUri,

@@ -518,7 +518,6 @@ impl Registrar {
     /// NAT traversal routing — like OpenSIPS's `received_avp`. On lookup, the
     /// `PyContact.received` property returns a SIP URI built from this address,
     /// which scripts can use instead of the Contact URI to reach NATed clients.
-    #[allow(clippy::too_many_arguments)]
     pub fn save_with_source(
         &self,
         aor: &str,
@@ -540,6 +539,8 @@ impl Registrar {
     /// lives. Proxy-side caches that mirror an upstream registrar's grant
     /// should call [`save_full_uncapped`](Self::save_full_uncapped) instead,
     /// since the upstream is authoritative on lifetime.
+    // Wide by necessity: a contact binding carries the full RFC 3261 + IMS
+    // parameter set (q, expires, instance, flow token, aliases, …).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn save_full(
         &self,
@@ -574,6 +575,8 @@ impl Registrar {
     /// `min_expires` is still enforced (RFC 3261 §10.3 423 Interval Too
     /// Brief): callers must not save bindings shorter than the configured
     /// floor regardless of upstream grant.
+    // Wide by necessity: mirrors [`save_full`]'s full RFC 3261 + IMS contact
+    // parameter set, minus the local expires cap.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn save_full_uncapped(
         &self,
@@ -1267,7 +1270,6 @@ impl Registrar {
     }
 
     /// Save a contact binding with GRUU parameters (RFC 5627 + RFC 5626).
-    #[allow(clippy::too_many_arguments)]
     pub fn save_with_gruu(
         &self,
         aor: &str,
@@ -1827,7 +1829,6 @@ mod tests {
     /// Save a binding tagged with a transport + inbound connection id, the way
     /// a REGISTER arriving over a stream transport (or UDP) populates the flow
     /// reverse indexes.
-    #[allow(clippy::too_many_arguments)]
     fn save_flow(
         registrar: &Registrar,
         aor: &str,

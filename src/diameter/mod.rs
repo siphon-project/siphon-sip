@@ -341,7 +341,6 @@ impl DiameterClient {
 
     /// Send an SGd MT-Forward-Short-Message-Request (SMSC → MME) and
     /// return the TFA. `sm_rp_ui` is the SMS-DELIVER TPDU.
-    #[allow(clippy::too_many_arguments)]
     pub async fn send_tfr(
         &self,
         user_name: &str,

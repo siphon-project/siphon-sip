@@ -30,7 +30,7 @@ use crate::sip::headers::via::Via;
 use crate::sip::message::{Method, RequestLine, SipMessage, StartLine, StatusLine, Version};
 use crate::sip::headers::SipHeaders;
 use crate::sip::uri::SipUri;
-use crate::sip::parser::{parse_sip_message, parse_sip_message_bytes, parse_uri_standalone};
+use crate::sip::parser::{parse_sip_message_bytes, parse_uri_standalone};
 use crate::sip::uri::format_sip_host;
 use crate::transaction::key::TransactionKey;
 use crate::transaction::state::{
@@ -43,6 +43,15 @@ use crate::hep::HepSender;
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, OutboundRouter, StreamConnections, Transport};
 use crate::transport::pool::ConnectionPool;
 use crate::uac::UacSender;
+
+/// RTPEngine wiring produced by [`init_rtpengine`]: the engine set, the media
+/// session store, and the profile registry. Each component is present only
+/// when `media.rtpengine` is configured (otherwise all three are `None`).
+type RtpEngineComponents = (
+    Option<Arc<crate::rtpengine::client::RtpEngineSet>>,
+    Option<Arc<crate::rtpengine::session::MediaSessionStore>>,
+    Option<Arc<crate::rtpengine::ProfileRegistry>>,
+);
 
 /// A pending timer entry in the timer wheel.
 #[derive(Debug, Clone)]
@@ -329,6 +338,8 @@ impl DispatcherState {
 ///
 /// Reads inbound messages from transport, parses, invokes Python handlers,
 /// and sends responses back via the outbound channel.
+// Wide by necessity: the dispatcher loop is wired to every transport channel,
+// store, and engine handle at startup, exceeding the configured threshold.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     inbound_rx: flume::Receiver<InboundMessage>,
@@ -341,11 +352,7 @@ pub async fn run(
     hep_sender: Option<Arc<HepSender>>,
     uac_sender: Arc<UacSender>,
     connection_pool: Arc<ConnectionPool>,
-    pre_rtpengine: (
-        Option<Arc<crate::rtpengine::client::RtpEngineSet>>,
-        Option<Arc<crate::rtpengine::session::MediaSessionStore>>,
-        Option<Arc<crate::rtpengine::ProfileRegistry>>,
-    ),
+    pre_rtpengine: RtpEngineComponents,
     registrant_manager: Option<Arc<crate::registrant::RegistrantManager>>,
     ipsec_manager: Option<Arc<crate::ipsec::IpsecManager>>,
     ipsec_config: Option<crate::config::IpsecConfig>,
@@ -809,7 +816,7 @@ pub async fn run(
                             let rta = crate::diameter::cx::build_rta(
                                 &config.origin_host,
                                 &config.origin_realm,
-                                &incoming.avps.get("Session-Id")
+                                incoming.avps.get("Session-Id")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or(""),
                                 incoming.hop_by_hop,
@@ -847,8 +854,8 @@ pub async fn run(
                                 let py_reason_info: pyo3::Py<pyo3::PyAny> = match &reason_info {
                                     Some(info) => info.as_str().into_pyobject(python)
                                         .map(|s| s.into_any().into())
-                                        .unwrap_or_else(|_| python.None().into()),
-                                    None => python.None().into(),
+                                        .unwrap_or_else(|_| python.None()),
+                                    None => python.None(),
                                 };
 
                                 for handler in handlers {
@@ -931,18 +938,18 @@ pub async fn run(
                                 let py_session_id: pyo3::Py<pyo3::PyAny> = match &parsed.session_id {
                                     Some(sid) => sid.as_str().into_pyobject(python)
                                         .map(|s| s.into_any().into())
-                                        .unwrap_or_else(|_| python.None().into()),
-                                    None => python.None().into(),
+                                        .unwrap_or_else(|_| python.None()),
+                                    None => python.None(),
                                 };
                                 let py_abort_cause: pyo3::Py<pyo3::PyAny> = match parsed.abort_cause {
                                     Some(ac) => ac.into_pyobject(python)
                                         .map(|v| v.into_any().into())
-                                        .unwrap_or_else(|_| python.None().into()),
-                                    None => python.None().into(),
+                                        .unwrap_or_else(|_| python.None()),
+                                    None => python.None(),
                                 };
                                 let py_actions = pyo3::types::PyList::new(
                                     python,
-                                    parsed.specific_actions.iter().map(|a| *a),
+                                    parsed.specific_actions.iter().copied(),
                                 ).unwrap_or_else(|_| pyo3::types::PyList::empty(python));
 
                                 for handler in handlers {
@@ -1025,20 +1032,20 @@ pub async fn run(
                                 let py_session_id: pyo3::Py<pyo3::PyAny> = match &parsed.session_id {
                                     Some(sid) => sid.as_str().into_pyobject(python)
                                         .map(|s| s.into_any().into())
-                                        .unwrap_or_else(|_| python.None().into()),
-                                    None => python.None().into(),
+                                        .unwrap_or_else(|_| python.None()),
+                                    None => python.None(),
                                 };
                                 let py_abort_cause: pyo3::Py<pyo3::PyAny> = match parsed.abort_cause {
                                     Some(ac) => ac.into_pyobject(python)
                                         .map(|v| v.into_any().into())
-                                        .unwrap_or_else(|_| python.None().into()),
-                                    None => python.None().into(),
+                                        .unwrap_or_else(|_| python.None()),
+                                    None => python.None(),
                                 };
                                 let py_origin_host: pyo3::Py<pyo3::PyAny> = match &parsed.origin_host {
                                     Some(host) => host.as_str().into_pyobject(python)
                                         .map(|s| s.into_any().into())
-                                        .unwrap_or_else(|_| python.None().into()),
-                                    None => python.None().into(),
+                                        .unwrap_or_else(|_| python.None()),
+                                    None => python.None(),
                                 };
 
                                 for handler in handlers {
@@ -1139,8 +1146,8 @@ pub async fn run(
                                         .as_str()
                                         .into_pyobject(python)
                                         .map(|s| s.into_any().into())
-                                        .unwrap_or_else(|_| python.None().into()),
-                                    None => python.None().into(),
+                                        .unwrap_or_else(|_| python.None()),
+                                    None => python.None(),
                                 };
 
                                 for handler in handlers {
@@ -2146,7 +2153,6 @@ fn transport_from_name(name: Option<&str>) -> Transport {
 /// Send one OPTIONS over the captured flow (with a single retry); if the UE
 /// answers, leave the binding alone — its response refreshed the SA use-time.
 /// On no answer, run the dereg funnel.
-#[allow(clippy::too_many_arguments)]
 async fn liveness_probe_then_dereg(
     context: LivenessDeregCtx,
     aor: String,
@@ -3095,7 +3101,6 @@ fn handle_request(
 /// REGISTER.  Via host/port are derived from `flow.local_addr` so
 /// the UE's response routes back to the right port (load-bearing for
 /// IPSec sec-agree port pairs — 3GPP TS 33.203 §7.4).
-#[allow(clippy::too_many_arguments)]
 fn relay_request(
     message: &SipMessage,
     next_hop: Option<&str>,
@@ -3557,7 +3562,6 @@ fn relay_fork_request(
 ///
 /// Resolves the target, adds Via, sends the request, creates a client transaction,
 /// and registers the branch in the ProxySession.
-#[allow(clippy::too_many_arguments)]
 fn relay_fork_branch(
     message: &SipMessage,
     target: &str,
@@ -4552,7 +4556,6 @@ fn handle_response(
 ///
 /// `response_source` is the observed source address of the entity that sent
 /// this response (for `reply.fix_nated_contact()`).
-#[allow(clippy::too_many_arguments)]
 fn run_reply_handlers(
     message: SipMessage,
     status_code: u16,
@@ -5048,13 +5051,7 @@ fn send_to_target(
 ///
 /// Returns `(None, None)` when `media.rtpengine` is not configured.
 /// Also registers the Python `siphon.rtpengine` singleton for script use.
-pub fn init_rtpengine(
-    config: &Config,
-) -> (
-    Option<Arc<crate::rtpengine::client::RtpEngineSet>>,
-    Option<Arc<crate::rtpengine::session::MediaSessionStore>>,
-    Option<Arc<crate::rtpengine::ProfileRegistry>>,
-) {
+pub fn init_rtpengine(config: &Config) -> RtpEngineComponents {
     let media_config = match &config.media {
         Some(c) => c,
         None => return (None, None, None),
@@ -5643,14 +5640,6 @@ fn uac_route_set_from_record_routes(record_routes: &[String]) -> Vec<String> {
     routes
 }
 
-/// Sanitize a B2BUA response before forwarding it to the A-leg.
-///
-/// A proper B2BUA terminates and regenerates the dialog, so B-leg-specific
-/// headers must not leak to the A-leg. This function:
-/// - Replaces Contact with siphon's own address (critical for dialog routing)
-/// - Strips User-Agent (UAC header — not for responses), sets Server
-/// - Removes Allow, Allow-Events, Supported, Require
-/// - Strips B-leg-specific P-Asserted-Identity, P-Charging-Vector
 /// Resolve a script-supplied translate-op name (from `call.dial(translate=[(…, "rfc7044")])`)
 /// to a [`crate::b2bua::header_policy::TranslateOp`].  Returns `None` for
 /// unknown names; the caller is expected to log and skip.
@@ -5663,6 +5652,14 @@ fn parse_translate_op_name(name: &str) -> Option<crate::b2bua::header_policy::Tr
     }
 }
 
+/// Sanitize a B2BUA response before forwarding it to the A-leg.
+///
+/// A proper B2BUA terminates and regenerates the dialog, so B-leg-specific
+/// headers must not leak to the A-leg. This function:
+/// - Replaces Contact with siphon's own address (critical for dialog routing)
+/// - Strips User-Agent (UAC header — not for responses), sets Server
+/// - Removes Allow, Allow-Events, Supported, Require
+/// - Strips B-leg-specific P-Asserted-Identity, P-Charging-Vector
 fn sanitize_b2bua_response(
     response: &mut SipMessage,
     state: &DispatcherState,
@@ -5786,7 +5783,7 @@ fn sanitize_sdp_identity(body: &mut Vec<u8>, name: &str, addr: Option<&str>) {
                     // Optionally rewrite the address (last field)
                     if let Some(sdp_addr) = addr {
                         // Find the last space before the trailing \r\n
-                        let trimmed = after_username.trim_end_matches(|c| c == '\r' || c == '\n');
+                        let trimmed = after_username.trim_end_matches(['\r', '\n']);
                         if let Some(last_space) = trimmed.rfind(' ') {
                             let line_ending = &after_username[trimmed.len()..];
                             result.push_str("o=");
@@ -5818,7 +5815,7 @@ fn sanitize_sdp_identity(body: &mut Vec<u8>, name: &str, addr: Option<&str>) {
             } else if line.ends_with('\n') {
                 result.push_str("s=");
                 result.push_str(name);
-                result.push_str("\n");
+                result.push('\n');
             } else {
                 result.push_str("s=");
                 result.push_str(name);
@@ -5849,7 +5846,7 @@ fn fix_srs_answer_sdp_direction(body: &mut Vec<u8>) {
     }
     let mut result = String::with_capacity(text.len());
     for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(|c: char| c == '\r' || c == '\n');
+        let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed == "a=sendonly" {
             result.push_str("a=recvonly");
             result.push_str(&line[trimmed.len()..]);
@@ -6021,7 +6018,7 @@ fn send_message_from(
 /// Drain deferred messages queued by presence.notify() etc. during the handler
 /// and send each one via the UacSender.  Called after the reply/relay has been
 /// dispatched so ordering is preserved (RFC 3265 §3.1.6.2).
-fn flush_deferred_sends(state: &DispatcherState) {
+fn flush_deferred_sends(_state: &DispatcherState) {
     let deferred = crate::script::api::proxy_utils::drain_deferred_sends();
     if deferred.is_empty() {
         return;
@@ -6952,7 +6949,6 @@ fn cancel_fork_branches(
 /// the CANCEL still need to resolve to it (to be ACKed downstream and absorbed).
 /// Per-branch final cleanup (`remove_client_key`) and the session TTL sweep
 /// tear it down afterwards.
-#[allow(clippy::too_many_arguments)]
 fn reject_pending_invite(
     server_key: &TransactionKey,
     session_arc: &Arc<RwLock<ProxySession>>,
@@ -7074,7 +7070,7 @@ fn start_next_fork_branch(
             record_routed,
             &inbound_info,
             server_key,
-            &session_arc,
+            session_arc,
             &agg,
             branch_flow.as_ref(),
             state,
@@ -7935,7 +7931,7 @@ fn handle_b2bua_invite(
     // the attended-transfer semantics (the referrer expects the old dialog
     // to go away once this INVITE succeeds).
     if let Some(replaces_raw) = message.headers.get("Replaces") {
-        match crate::sip::headers::refer::parse_replaces(&replaces_raw) {
+        match crate::sip::headers::refer::parse_replaces(replaces_raw) {
             Ok(replaces) => {
                 match state.call_actors.find_call_by_replaces_dialog(
                     &replaces.call_id,
@@ -8029,12 +8025,12 @@ fn handle_b2bua_invite(
     if let Some(contact) = message.headers.get("Contact")
         .or_else(|| message.headers.get("m"))
     {
-        a_leg.dialog.remote_contact = Some(crate::b2bua::actor::extract_contact_uri(&contact));
+        a_leg.dialog.remote_contact = Some(crate::b2bua::actor::extract_contact_uri(contact));
     }
 
     // Store A-leg's remote AoR host (caller's From URI host) for in-dialog To headers.
     if let Some(from) = message.headers.from() {
-        let from_str = crate::b2bua::actor::extract_contact_uri(&from);
+        let from_str = crate::b2bua::actor::extract_contact_uri(from);
         if let Ok(parsed) = parse_uri_standalone(&from_str) {
             a_leg.dialog.remote_aor_host = Some(if let Some(port) = parsed.port {
                 format!("{}:{}", parsed.host, port)
@@ -8282,7 +8278,6 @@ fn handle_b2bua_invite(
 /// wire destination instead of `target_uri` — IMS edge use-case where the
 /// R-URI must carry the canonical home-domain IMPU but the message has to
 /// be routed via a fixed next-hop (BGCF, I-CSCF, outbound proxy, …).
-#[allow(clippy::too_many_arguments)]
 fn b2bua_send_b_leg_invite(
     call_id: &str,
     target_uri: &str,
@@ -8419,7 +8414,7 @@ fn b2bua_send_b_leg_invite(
         if let Some(at_pos) = new_from.find('@') {
             // Find the end of the host: first occurrence of '>', ':', or ';' after '@'
             let after_at = &new_from[at_pos + 1..];
-            let host_end = after_at.find(|c: char| c == '>' || c == ';' || c == ':')
+            let host_end = after_at.find(['>', ';', ':'])
                 .unwrap_or(after_at.len());
             let end_pos = at_pos + 1 + host_end;
             new_from = format!("{}{}{}", &new_from[..at_pos + 1], b2bua_host, &new_from[end_pos..]);
@@ -8457,7 +8452,7 @@ fn b2bua_send_b_leg_invite(
         if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
             if let Some(at_pos) = new_to.find('@') {
                 let after_at = &new_to[at_pos + 1..];
-                let host_end = after_at.find(|c: char| c == '>' || c == ';' || c == ':')
+                let host_end = after_at.find(['>', ';', ':'])
                     .unwrap_or(after_at.len());
                 let end_pos = at_pos + 1 + host_end;
                 let target_host = &target_parsed.host;
@@ -9262,7 +9257,7 @@ fn handle_b2bua_response(
                     // (RFC 3261 §12.2.1.1), with fallback to stored remote_contact.
                     let ack_uri = message.headers.get("Contact")
                         .or_else(|| message.headers.get("m"))
-                        .map(|c| crate::b2bua::actor::extract_contact_uri(&c))
+                        .map(|c| crate::b2bua::actor::extract_contact_uri(c))
                         .and_then(|u| parse_uri_standalone(&u).ok())
                         .or_else(|| if is_a2b {
                             b_leg_remote_contact.as_deref()
@@ -9364,7 +9359,7 @@ fn handle_b2bua_response(
                     message,
                     &a_leg.dialog.call_id,
                     b_ftag,
-                    &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                    a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
                     Some(&a_leg.dialog.local_tag),
                 );
             }
@@ -9458,7 +9453,7 @@ fn handle_b2bua_response(
                     // (RFC 3261 §12.2.1.1), with fallback to stored remote_contact.
                     let ack_uri = message.headers.get("Contact")
                         .or_else(|| message.headers.get("m"))
-                        .map(|c| crate::b2bua::actor::extract_contact_uri(&c))
+                        .map(|c| crate::b2bua::actor::extract_contact_uri(c))
                         .and_then(|u| parse_uri_standalone(&u).ok())
                         .or_else(|| if is_a2b {
                             b_leg_remote_contact.as_deref()
@@ -9594,21 +9589,19 @@ fn handle_b2bua_response(
                     message,
                     &a_leg.dialog.call_id,
                     b_ftag,
-                    &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                    a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
                     Some(&a_leg.dialog.local_tag),
                 );
             }
-        } else {
-            if let Some(call) = state.call_actors.get_call(call_id) {
-                if let Some(winner) = call.winner.and_then(|i| call.b_legs.get(i)) {
-                    crate::b2bua::actor::Dialog::rewrite_headers(
-                        message,
-                        &winner.dialog.call_id,
-                        a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
-                        &winner.dialog.local_tag,
-                        winner.dialog.remote_tag.as_deref(),
-                    );
-                }
+        } else if let Some(call) = state.call_actors.get_call(call_id) {
+            if let Some(winner) = call.winner.and_then(|i| call.b_legs.get(i)) {
+                crate::b2bua::actor::Dialog::rewrite_headers(
+                    message,
+                    &winner.dialog.call_id,
+                    a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                    &winner.dialog.local_tag,
+                    winner.dialog.remote_tag.as_deref(),
+                );
             }
         }
 
@@ -9757,7 +9750,7 @@ fn handle_b2bua_response(
                         .or_else(|| message.headers.get("m"))
                     {
                         b_leg.dialog.remote_contact = Some(
-                            crate::b2bua::actor::extract_contact_uri(&contact),
+                            crate::b2bua::actor::extract_contact_uri(contact),
                         );
                     }
                 }
@@ -9811,13 +9804,13 @@ fn handle_b2bua_response(
             );
             // Re-send ACK to B-leg to stop retransmissions
             if let Some((b_dest, b_transport)) = b_leg_dest {
-                if let Some((ref b_cid, ref b_ftag)) = b_leg_dialog {
+                if let Some((ref b_cid, _b_ftag)) = b_leg_dialog {
                     // Build a clean ACK from scratch — do NOT clone the 200 OK
                     // (cloning leaks response headers like User-Agent, Contact,
                     // Allow, Supported, etc. from the remote UA).
                     let request_uri = message.headers.get("Contact")
                         .or_else(|| message.headers.get("m"))
-                        .map(|c| crate::b2bua::actor::extract_contact_uri(&c))
+                        .map(|c| crate::b2bua::actor::extract_contact_uri(c))
                         .and_then(|u| parse_uri_standalone(&u).ok())
                         .or_else(|| b_leg_remote_contact.as_deref()
                             .and_then(|u| parse_uri_standalone(u).ok()))
@@ -10003,7 +9996,7 @@ fn handle_b2bua_response(
                 &mut response,
                 &a_leg.dialog.call_id,
                 b_ftag,
-                &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
                 Some(&a_leg.dialog.local_tag),
             );
             let _ = (b_cid,); // Call-ID already set by rewrite_dialog_headers
@@ -10089,7 +10082,7 @@ fn handle_b2bua_response(
             if let Some((ref b_cid, ref _b_ftag)) = b_leg_dialog {
                 let ack_uri = message.headers.get("Contact")
                     .or_else(|| message.headers.get("m"))
-                    .map(|c| crate::b2bua::actor::extract_contact_uri(&c))
+                    .map(|c| crate::b2bua::actor::extract_contact_uri(c))
                     .and_then(|u| parse_uri_standalone(&u).ok())
                     .or_else(|| b_leg_remote_contact.as_deref()
                         .and_then(|u| parse_uri_standalone(u).ok()))
@@ -10348,7 +10341,7 @@ fn handle_b2bua_response(
                 message,
                 &a_leg.dialog.call_id,
                 b_ftag,
-                &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
                 Some(&a_leg.dialog.local_tag),
             );
         }
@@ -10460,7 +10453,7 @@ fn handle_b2bua_response(
                                 crate::b2bua::actor::Dialog::rewrite_headers(
                                     &mut retry,
                                     &retry_call_id,
-                                    &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                                    a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
                                     &retry_from_tag,
                                     None,
                                 );
@@ -10851,7 +10844,7 @@ fn handle_b2bua_response(
                 message,
                 &a_leg.dialog.call_id,
                 b_ftag,
-                &a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
                 Some(&a_leg.dialog.local_tag),
             );
         }
@@ -11369,7 +11362,7 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
     // Rewrite From URI host to our advertised address (topology hiding)
     let b2bua_host = state.via_host(&b_leg.transport.transport);
     if let Some(from) = reinvite.headers.get("From").or_else(|| reinvite.headers.get("f")) {
-        reinvite.headers.set("From", crate::b2bua::actor::rewrite_uri_host(&from, &b2bua_host));
+        reinvite.headers.set("From", crate::b2bua::actor::rewrite_uri_host(from, &b2bua_host));
     }
 
     // Regenerate CSeq for B-leg dialog
@@ -11622,7 +11615,7 @@ fn handle_b2bua_reinvite(
     };
 
     // Per-leg Contact URIs for RURI and Contact rewriting (RFC 3261 §12.2.1.1)
-    let (target_remote_contact, target_local_contact, target_remote_aor_host) = if from_a_leg {
+    let (target_remote_contact, target_local_contact, _target_remote_aor_host) = if from_a_leg {
         // A→B: target is B-leg
         winner_b_leg.as_ref().map(|b| (b.dialog.remote_contact.clone(), b.dialog.local_contact.clone(), b.dialog.remote_aor_host.clone()))
             .unwrap_or((None, None, None))
@@ -12646,6 +12639,7 @@ fn handle_srs_bye(
 mod tests {
     use super::*;
     use crate::sip::message::Method;
+    use crate::sip::parser::parse_sip_message;
     use crate::sip::uri::SipUri;
     use crate::sip::builder::SipMessageBuilder;
 

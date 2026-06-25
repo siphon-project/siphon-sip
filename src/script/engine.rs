@@ -819,7 +819,7 @@ fn extract_handlers(
         let options = match &kind {
             HandlerKind::Custom { .. } => metadata
                 .as_ref()
-                .and_then(|m| m.downcast::<PyDict>().ok())
+                .and_then(|m| m.cast::<PyDict>().ok())
                 .map(|d| d.clone().unbind()),
             _ => None,
         };
@@ -1925,7 +1925,7 @@ def route(request):
     // Host-registered user namespaces
     // -----------------------------------------------------------------
 
-    use pyo3::prelude::*;
+    
 
     #[pyclass]
     struct UserNamespaceProbe {
@@ -2036,7 +2036,7 @@ mod async_runner_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use pyo3::prelude::*;
+    
     use pyo3::types::{PyAnyMethods, PyDict, PyDictMethods, PyModule, PyModuleMethods};
 
     /// Tokio-backed coroutine bridged to Python via

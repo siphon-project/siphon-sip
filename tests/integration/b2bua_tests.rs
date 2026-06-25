@@ -4,7 +4,7 @@
 //! registrar lookups for routing B2BUA calls, and transaction key handling.
 
 use siphon::b2bua::actor::{
-    CallActor, CallActorStore, CallEvent, CallState, Leg, LegActor, LegMessage, TransportInfo,
+    CallActor, CallActorStore, CallEvent, CallState, Leg, LegActor, TransportInfo,
     SessionTimerState, generate_call_id, generate_tag,
 };
 use siphon::b2bua::header_policy::{

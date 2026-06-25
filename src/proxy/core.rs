@@ -219,11 +219,7 @@ pub fn pop_local_routes(
     local_domains: &[String],
 ) -> Vec<RouteEntry> {
     let mut popped = Vec::new();
-    loop {
-        let route_raw = match headers.get("Route") {
-            Some(raw) => raw.clone(),
-            None => break,
-        };
+    while let Some(route_raw) = headers.get("Route").cloned() {
         let entries = match RouteEntry::parse_multi(&route_raw) {
             Ok(entries) if !entries.is_empty() => entries,
             _ => break,
@@ -263,7 +259,7 @@ pub fn next_hop_from_route(headers: &SipHeaders) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sip::headers::via::Via;
+    
 
     fn make_headers() -> SipHeaders {
         let mut headers = SipHeaders::new();

@@ -27,6 +27,12 @@ use super::rtpengine::{extract_message, extract_sdp_body, replace_body};
 #[pyclass(name = "SdpNamespace")]
 pub struct PySdpNamespace;
 
+impl Default for PySdpNamespace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PySdpNamespace {
     pub fn new() -> Self {
         Self

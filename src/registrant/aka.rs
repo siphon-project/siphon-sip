@@ -18,7 +18,7 @@
 use base64::Engine as _;
 use thiserror::Error;
 
-use crate::ipsec::milenage::{compute_auts, compute_opc, f1, f2345, f5star, hex_to_bytes};
+use crate::ipsec::milenage::{compute_auts, compute_opc, f1, f2345, hex_to_bytes};
 
 /// Standard base64 alphabet with padding — RFC 3310 §3.2 encodes the AKA
 /// nonce (and the UE's AUTS) with the standard alphabet, not base64url.
@@ -189,7 +189,7 @@ fn parse_fixed<const N: usize>(hex: &str, field: &'static str) -> Result<[u8; N]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ipsec::milenage::generate_vector_with_rand;
+    use crate::ipsec::milenage::{f5star, generate_vector_with_rand};
 
     // 3GPP TS 35.208 Test Set 1.
     const K_HEX: &str = "465b5ce8b199b49faa5f0a2ee238a6bc";

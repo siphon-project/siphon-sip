@@ -4,7 +4,7 @@ use nom::{
     IResult, Parser,
     bytes::complete::{tag, take_until, take_while, take_while1},
     character::complete::{char, space1, digit1, multispace0},
-    sequence::{preceded, terminated, delimited},
+    sequence::{preceded, delimited},
     multi::many0,
     combinator::{opt, map_res},
     branch::alt,
@@ -163,7 +163,7 @@ fn parse_uri(input: &str) -> IResult<&str, SipUri> {
     // before the @ delimiter. We must find @ first to correctly split user from host,
     // because ; within user-params (RFC 3966 phone-context) is NOT a URI param separator.
     // Only scan up to the first whitespace/> to avoid matching @ in a different context.
-    let uri_end = input.find(|c: char| matches!(c, ' ' | '\r' | '\n' | '>')).unwrap_or(input.len());
+    let uri_end = input.find([' ', '\r', '\n', '>']).unwrap_or(input.len());
     let uri_portion = &input[..uri_end];
     let (input, user, user_params) = if let Some(at_pos) = uri_portion.rfind('@') {
         let user_part = &input[..at_pos];

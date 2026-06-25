@@ -48,7 +48,7 @@ fn octet_string_as_utf8(avps: &serde_json::Value, name: &str) -> Option<String> 
 fn octet_string_as_isdn_address(avps: &serde_json::Value, name: &str) -> Option<String> {
     avps.get(name)
         .and_then(|v| v.as_str())
-        .and_then(|hex_str| codec::hex::decode(hex_str))
+        .and_then(codec::hex::decode)
         .map(|bytes| codec::decode_isdn_address_string(&bytes))
 }
 
@@ -57,7 +57,7 @@ fn octet_string_as_isdn_address(avps: &serde_json::Value, name: &str) -> Option<
 fn octet_string_as_bytes(avps: &serde_json::Value, name: &str) -> Option<Vec<u8>> {
     avps.get(name)
         .and_then(|v| v.as_str())
-        .and_then(|hex_str| codec::hex::decode(hex_str))
+        .and_then(codec::hex::decode)
 }
 
 // ---------------------------------------------------------------------------
@@ -85,11 +85,6 @@ impl SgdAnswerBuilder {
     fn result_code(mut self, result_code: u32) -> Self {
         self.avp_buf
             .extend_from_slice(&encode_avp_u32(avp::RESULT_CODE, result_code));
-        self
-    }
-
-    fn raw_avps(mut self, data: &[u8]) -> Self {
-        self.avp_buf.extend_from_slice(data);
         self
     }
 

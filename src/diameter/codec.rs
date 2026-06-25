@@ -421,7 +421,6 @@ pub fn encode_vendor_specific_app_id(vendor_id: u32, auth_app_id: u32) -> Vec<u8
 /// handler returns. Per-app typed answers stay in their own modules
 /// (`cx::build_uaa_*`, `s6c::build_ala_*`, etc.) — this builder is only
 /// for the open-extension path.
-#[allow(clippy::too_many_arguments)]
 pub fn encode_generic_answer(
     origin_host: &str,
     origin_realm: &str,

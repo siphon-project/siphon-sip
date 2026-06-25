@@ -331,7 +331,6 @@ pub fn build_notification_subscribe_answer(
 // ── PNR (Push-Notification-Request) ────────────────────────────────────────
 
 /// Build a Push-Notification-Request (HSS → AS).
-#[allow(clippy::too_many_arguments)]
 pub fn build_push_notification(
     origin_host: &str,
     origin_realm: &str,
@@ -425,7 +424,6 @@ fn encode_user_identity(public_identity: &str) -> Vec<u8> {
 }
 
 /// Build a User-Data-Request (AS → HSS) per TS 29.328 §6.1.1.
-#[allow(clippy::too_many_arguments)]
 pub fn build_user_data_request(
     config: &PeerConfig,
     session_id: &str,
@@ -459,7 +457,6 @@ pub fn build_user_data_request(
 }
 
 /// Build a Profile-Update-Request (AS → HSS) per TS 29.328 §6.1.3.
-#[allow(clippy::too_many_arguments)]
 pub fn build_profile_update_request(
     config: &PeerConfig,
     session_id: &str,
@@ -496,7 +493,6 @@ pub fn build_profile_update_request(
 }
 
 /// Build a Subscribe-Notifications-Request (AS → HSS) per TS 29.328 §6.1.5.
-#[allow(clippy::too_many_arguments)]
 pub fn build_subscribe_notifications_request(
     config: &PeerConfig,
     session_id: &str,

@@ -157,7 +157,7 @@ async fn unreachable_x5u_is_failed_strict_but_no_validation_permissive() {
         .unwrap();
     let verification = strict
         .verify(
-            &[signed.header_value.clone()],
+            std::slice::from_ref(&signed.header_value),
             Some("12155550112"),
             Some("12025550100"),
             now,

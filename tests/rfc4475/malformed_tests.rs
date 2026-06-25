@@ -13,7 +13,7 @@ fn test_missing_required_headers() {
                    \r\n";
 
     // Should either parse (with missing headers) or reject cleanly
-    let result = parse_sip_message(message);
+    let _result = parse_sip_message(message);
     // Parser may accept or reject - both are valid
     // The important thing is it doesn't panic
 }
@@ -28,9 +28,7 @@ fn test_invalid_sip_version() {
                    \r\n";
 
     // Should parse but version should be noted
-    let result = parse_sip_message(message);
-    if result.is_ok() {
-        let (_, msg) = result.unwrap();
+    if let Ok((_, msg)) = parse_sip_message(message) {
         if let siphon::sip::StartLine::Request(req) = &msg.start_line {
             assert_eq!(req.version.major, 3);
         }
@@ -47,9 +45,7 @@ fn test_invalid_status_code() {
                    \r\n";
 
     // Should parse but status code should be 999
-    let result = parse_sip_message(message);
-    if result.is_ok() {
-        let (_, msg) = result.unwrap();
+    if let Ok((_, msg)) = parse_sip_message(message) {
         assert_eq!(msg.status_code().unwrap(), 999);
     }
 }

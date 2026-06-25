@@ -1,4 +1,4 @@
-use siphon::sip::uri::{SipUri, format_sip_host, strip_ipv6_brackets};
+use siphon::sip::uri::SipUri;
 use siphon::sip::parse_sip_message;
 
 /// Test basic SIP URI parsing

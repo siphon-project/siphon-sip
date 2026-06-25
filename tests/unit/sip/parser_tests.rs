@@ -70,7 +70,7 @@ fn test_header_folding() {
 
     let result = parse_sip_message(message);
     match &result {
-        Ok((remaining, msg)) => {
+        Ok((_remaining, msg)) => {
             if let Some(via) = msg.headers.via() {
                 assert!(via.contains("received=192.0.2.1"), "Folded header should be parsed correctly. Via: {:?}", via);
             } else {

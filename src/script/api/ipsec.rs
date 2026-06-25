@@ -241,7 +241,7 @@ pub fn find_sa_for_ue(ue_addr: &IpAddr, ue_port: u16) -> Option<SecurityAssociat
 /// One UE-side IPsec proposal from a ``Security-Client`` header
 /// (3GPP TS 33.203 §6.1, RFC 3329).  A header may carry multiple
 /// comma-separated offers; each is exposed as one :class:`SecurityOffer`.
-#[pyclass(name = "SecurityOffer")]
+#[pyclass(name = "SecurityOffer", from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PySecurityOffer {
     /// Security mechanism, typically ``"ipsec-3gpp"``.
@@ -319,7 +319,7 @@ impl PySecurityOffer {
 ///
 /// All transforms install identical xfrm policies; only the algorithm
 /// IDs and key material change.
-#[pyclass(name = "Transform", eq, eq_int)]
+#[pyclass(name = "Transform", eq, eq_int, from_py_object)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PyTransform {
     /// HMAC-SHA-1-96 integrity, NULL encryption.
@@ -488,7 +488,7 @@ impl PyAuthVectorHandle {
 /// protected request.  Distinct from :class:`PendingSA` (which is
 /// script-owned and supports lifecycle transitions); this handle is
 /// purely informational — for logging, metrics, audit trail, etc.
-#[pyclass(name = "SAHandle")]
+#[pyclass(name = "SAHandle", from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PySAHandle {
     #[pyo3(get)]
@@ -564,7 +564,7 @@ impl PySAHandle {
 
 /// Snapshot of the chosen ``Security-Server`` parameters after
 /// :func:`siphon.ipsec.allocate` has run.  All fields are read-only.
-#[pyclass(name = "SecurityServerParams")]
+#[pyclass(name = "SecurityServerParams", from_py_object)]
 #[derive(Clone, Debug)]
 pub struct PySecurityServerParams {
     /// Always ``"ipsec-3gpp"`` in Phase 1.
@@ -1261,6 +1261,9 @@ pub fn parse_security_client_multi(value: &str, ue_addr: &str) -> Vec<PySecurity
         .collect()
 }
 
+/// A parsed (CK, IK) key pair extracted from an auth header — two 128-bit keys.
+type CkIkPair = ([u8; 16], [u8; 16]);
+
 /// Strip ``ck=…`` and ``ik=…`` parameters from a single auth header value
 /// (e.g. a ``Digest …`` ``WWW-Authenticate`` value).  Returns the rewritten
 /// header and the extracted (CK, IK) pair only when **both** parsed
@@ -1272,7 +1275,7 @@ pub fn parse_security_client_multi(value: &str, ue_addr: &str) -> Vec<PySecurity
 /// ``ik`` (case-insensitive), and rejoins the surviving tokens with
 /// ``", "`` separators.  Quoting style of untouched parameters is
 /// preserved byte-for-byte.
-pub fn strip_ck_ik(value: &str) -> (String, Option<([u8; 16], [u8; 16])>) {
+pub fn strip_ck_ik(value: &str) -> (String, Option<CkIkPair>) {
     let (scheme, rest) = match value.split_once(char::is_whitespace) {
         Some((scheme, rest)) => (scheme, rest),
         None => return (value.to_string(), None),

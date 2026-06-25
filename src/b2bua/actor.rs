@@ -68,6 +68,12 @@ pub enum LegSide {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LegId(pub String);
 
+impl Default for LegId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LegId {
     pub fn new() -> Self {
         Self(uuid::Uuid::new_v4().to_string())
@@ -199,7 +205,7 @@ impl Dialog {
 
         if let Some(new_tag) = new_to_tag {
             if let Some(to) = message.headers.get("To").or_else(|| message.headers.get("t")) {
-                if let Ok(mut name_addr) = crate::sip::headers::nameaddr::NameAddr::parse(&to) {
+                if let Ok(mut name_addr) = crate::sip::headers::nameaddr::NameAddr::parse(to) {
                     if name_addr.tag.is_some() {
                         name_addr.tag = if new_tag.is_empty() {
                             None
@@ -262,7 +268,7 @@ pub fn rewrite_uri_host(header_value: &str, new_host: &str) -> String {
     if let Some(at_pos) = header_value.find('@') {
         let after_at = &header_value[at_pos + 1..];
         let host_end = after_at
-            .find(|c: char| c == '>' || c == ';' || c == ':')
+            .find(['>', ';', ':'])
             .unwrap_or(after_at.len());
         let end_pos = at_pos + 1 + host_end;
         format!(
@@ -1039,11 +1045,10 @@ impl CallActorStore {
             let leg_matches = |leg: &Leg| {
                 leg.dialog.call_id == call_id
                     && leg.dialog.local_tag == to_tag
-                    && leg
+                    && (leg
                         .dialog
                         .remote_tag
-                        .as_deref()
-                        .map_or(false, |tag| tag == from_tag)
+                        .as_deref() == Some(from_tag))
             };
             if leg_matches(&call.a_leg) || call.b_legs.iter().any(leg_matches) {
                 return Some(entry.key().clone());
@@ -1099,7 +1104,7 @@ impl CallActorStore {
         let Some(leg) = call.b_legs.get_mut(b_leg_index) else {
             return false;
         };
-        if leg.prack_acked_rseq.map_or(false, |v| v >= rseq) {
+        if leg.prack_acked_rseq.is_some_and(|v| v >= rseq) {
             return false;
         }
         leg.prack_acked_rseq = Some(rseq);
@@ -1354,7 +1359,7 @@ impl CallActorStore {
                     early_only: false,
                 },
                 &entry.a_leg.dialog.call_id,
-                &entry.a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
+                entry.a_leg.dialog.remote_tag.as_deref().unwrap_or(""),
                 from_tag,
             ) {
                 return Some(entry.id.clone());
@@ -1414,7 +1419,15 @@ impl Default for CallActorStore {
 // ---------------------------------------------------------------------------
 
 /// Messages sent to a leg actor's mailbox (for async mode).
+///
+/// `large_enum_variant` is intentionally allowed: `SipInbound` is the hot,
+/// overwhelmingly-common variant (one per inbound SIP message on the leg),
+/// while `Cancel`/`Shutdown` are rare one-shots. Boxing `SipInbound.message`
+/// to shrink the enum would add a heap allocation to the hot path purely to
+/// save stack space on the rare variants — the opposite of what this lint
+/// optimizes for.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum LegMessage {
     /// A SIP message arrived from the network.
     SipInbound {
@@ -1935,13 +1948,13 @@ mod tests {
         store.set_winner(&call_id, 0);
 
         // First re-INVITE toward B-leg: flag was false, is now true.
-        assert_eq!(store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, true), false);
+        assert!(!store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, true));
         // Second (glare): flag was already true.
-        assert_eq!(store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, true), true);
+        assert!(store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, true));
         // Clear on completion.
-        assert_eq!(store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, false), true);
+        assert!(store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, false));
         // Now a new re-INVITE can start.
-        assert_eq!(store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, true), false);
+        assert!(!store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, true));
     }
 
     /// RFC 3891 §3 dialog lookup: find a call where one of its legs has
@@ -2072,9 +2085,9 @@ mod tests {
         store.add_b_leg(&call_id, make_b_leg(0));
         store.set_winner(&call_id, 0);
 
-        assert_eq!(store.set_pending_reinvite(&call_id, false, true), false);
+        assert!(!store.set_pending_reinvite(&call_id, false, true));
         // The A-leg flag should still be false.
-        assert_eq!(store.set_pending_reinvite(&call_id, true, true), false);
+        assert!(!store.set_pending_reinvite(&call_id, true, true));
     }
 
     #[test]

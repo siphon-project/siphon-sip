@@ -30,6 +30,12 @@ pub struct CrlfPongTracker {
     pong_seen: DashMap<ConnectionId, ()>,
 }
 
+impl Default for CrlfPongTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CrlfPongTracker {
     pub fn new() -> Self {
         Self {
