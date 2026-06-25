@@ -67,6 +67,10 @@ jobs:
         working-directory: sdk
     steps:
       - uses: actions/checkout@v4
+        with:
+          # hatch-vcs derives the SDK version from git tags, so the SDK
+          # build needs full history — a shallow clone hides the tags.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
