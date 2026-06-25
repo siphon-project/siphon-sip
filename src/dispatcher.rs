@@ -4084,7 +4084,7 @@ fn handle_response(
 
     if let Some(ref client_key) = client_txn_key {
         if let Some(session_arc) = state.session_store.get_by_client_key(client_key) {
-            let (source_addr, inbound_local_addr, connection_id, transport, server_key, fork_agg, branch_index, original_request, relay_on_reply, relay_on_failure, client_branch) = {
+            let (source_addr, inbound_local_addr, connection_id, transport, server_key, fork_agg, branch_index, original_request, relay_on_reply, relay_on_failure, client_branch, final_response_sent) = {
                 let session = match session_arc.read() {
                     Ok(s) => s,
                     Err(error) => {
@@ -4110,6 +4110,7 @@ fn handle_response(
                     relay_on_reply,
                     relay_on_failure,
                     session.client_branches.get(client_key).cloned(),
+                    session.final_response_sent,
                 )
             };
 
@@ -4146,11 +4147,31 @@ fn handle_response(
                 }
             }
 
+            // A reply-time `reply.reject()` already committed a final response
+            // upstream for this server transaction and CANCELled the pending
+            // branch(es).  This response is the straggler that CANCEL drew back
+            // (typically the `487` answering it, or a late provisional).  Any
+            // non-2xx final was ACKed downstream just above (and by the client
+            // transaction), so absorb it here — forwarding it would put a second
+            // final response on the wire to the UAC.  The single-target relay
+            // path has no fork aggregator to dedup, so this flag is the guard.
+            if final_response_sent {
+                debug!(
+                    status = status_code,
+                    branch = %branch,
+                    "absorbing straggler after reply-time reject (final already sent)"
+                );
+                if status_code >= 200 {
+                    state.session_store.remove_client_key(client_key);
+                }
+                return;
+            }
+
             // Strip our topmost Via before forwarding
             core::strip_top_via(&mut message.headers);
 
             // Run Python reply handlers
-            let (updated_message, should_forward) = run_reply_handlers(
+            let (updated_message, should_forward, reject_action) = run_reply_handlers(
                 message,
                 status_code,
                 &branch,
@@ -4162,6 +4183,29 @@ fn handle_response(
                 inbound_local_addr,
                 connection_id,
             );
+
+            // `reply.reject(code, reason)` from `@proxy.on_reply`: fail the
+            // in-progress INVITE.  Send the error upstream to the UAC and
+            // CANCEL the pending downstream branch(es).  Takes precedence over
+            // the relay/drop decision.  Only ever `Some` for a provisional
+            // (the PyReply method no-ops on a final), so this never races a
+            // real upstream 2xx.
+            if let Some((reject_code, reject_reason)) = reject_action {
+                reject_pending_invite(
+                    &server_key,
+                    &session_arc,
+                    reject_code,
+                    &reject_reason,
+                    &original_request,
+                    transport,
+                    source_addr,
+                    connection_id,
+                    inbound_local_addr,
+                    state,
+                );
+                return;
+            }
+
             if !should_forward {
                 state.session_store.remove_client_key(client_key);
                 return;
@@ -4177,13 +4221,13 @@ fn handle_response(
             if relay_on_reply.is_some() || (relay_on_failure.is_some() && status_code >= 400) {
                 let msg_arc = Arc::new(std::sync::Mutex::new(message));
                 let req_arc = Arc::new(std::sync::Mutex::new(original_request.clone()));
-                let (updated_msg, cb_forward): (Option<SipMessage>, bool) = Python::attach(|python| {
+                let (updated_msg, cb_forward, cb_reject): (Option<SipMessage>, bool, Option<(u16, String)>) = Python::attach(|python| {
                     let py_reply_obj = PyReply::new(Arc::clone(&msg_arc));
                     let py_reply = match Py::new(python, py_reply_obj) {
                         Ok(obj) => obj,
                         Err(error) => {
                             error!("failed to create PyReply for relay callback: {error}");
-                            return (None, true);
+                            return (None, true, None);
                         }
                     };
                     let py_req = {
@@ -4206,7 +4250,7 @@ fn handle_response(
                             Ok(obj) => obj,
                             Err(error) => {
                                 error!("failed to create PyRequest for relay callback: {error}");
-                                return (None, true);
+                                return (None, true, None);
                             }
                         }
                     };
@@ -4248,10 +4292,29 @@ fn handle_response(
                         }
                     }
 
-                    let forwarded = py_reply.borrow(python).was_forwarded();
-                    (None, forwarded)
+                    let reply_ref = py_reply.borrow(python);
+                    (None, reply_ref.was_forwarded(), reply_ref.reject_action())
                 });
                 let _ = updated_msg; // unused — message stays in msg_arc
+                // A per-relay on_reply callback can reject too (same contract as
+                // the global `@proxy.on_reply` handler) — fail the in-progress
+                // INVITE upstream + CANCEL downstream.  Reached only when the
+                // global handler did not already reject (that path returned).
+                if let Some((reject_code, reject_reason)) = cb_reject {
+                    reject_pending_invite(
+                        &server_key,
+                        &session_arc,
+                        reject_code,
+                        &reject_reason,
+                        &original_request,
+                        transport,
+                        source_addr,
+                        connection_id,
+                        inbound_local_addr,
+                        state,
+                    );
+                    return;
+                }
                 if !cb_forward {
                     state.session_store.remove_client_key(client_key);
                     return;
@@ -4479,8 +4542,13 @@ fn handle_response(
 
 /// Run `@proxy.on_reply` Python handlers on a response message.
 ///
-/// Returns `(message, forwarded)` — if `forwarded` is false, the script
-/// chose to drop the response (no `relay()` called).
+/// Returns `(message, forwarded, reject_action)`:
+/// - `forwarded` is false when the script chose to drop the response (no
+///   `relay()` called).
+/// - `reject_action` is `Some((code, reason))` when the script called
+///   `reply.reject(code, reason)` on a provisional — the caller then sends a
+///   final error upstream and CANCELs the pending downstream branch(es).  When
+///   set it takes precedence over `forwarded`.
 ///
 /// `response_source` is the observed source address of the entity that sent
 /// this response (for `reply.fix_nated_contact()`).
@@ -4496,7 +4564,7 @@ fn run_reply_handlers(
     response_source: SocketAddr,
     inbound_local_addr: SocketAddr,
     inbound_connection_id: ConnectionId,
-) -> (SipMessage, bool) {
+) -> (SipMessage, bool, Option<(u16, String)>) {
     // Automatic NAT Contact fixup on responses (nat.fix_contact: true).
     // Rewrites the Contact URI host:port with the observed source address
     // of the entity that sent this response — before Python handlers run,
@@ -4511,7 +4579,7 @@ fn run_reply_handlers(
     let reply_handlers = engine_state.handlers_for(&HandlerKind::ProxyReply);
 
     if reply_handlers.is_empty() {
-        return (message, true);
+        return (message, true, None);
     }
 
     let message_arc = Arc::new(std::sync::Mutex::new(message));
@@ -4539,19 +4607,19 @@ fn run_reply_handlers(
     py_request_obj.set_local_port(inbound_local_addr.port());
     py_request_obj.set_inbound_flow(inbound_local_addr, inbound_connection_id.0);
 
-    let forwarded = Python::attach(|python| {
+    let (forwarded, reject_action) = Python::attach(|python| {
         let py_reply = match Py::new(python, reply) {
             Ok(obj) => obj,
             Err(error) => {
                 error!("failed to create PyReply: {error}");
-                return true; // forward on error
+                return (true, None); // forward on error
             }
         };
         let py_request = match Py::new(python, py_request_obj) {
             Ok(obj) => obj,
             Err(error) => {
                 error!("failed to create PyRequest for reply handler: {error}");
-                return true;
+                return (true, None);
             }
         };
 
@@ -4563,22 +4631,22 @@ fn run_reply_handlers(
                     if handler.is_async {
                         if let Err(error) = run_coroutine(python, &ret) {
                             error!("async Python reply handler error: {error}");
-                            return true;
+                            return (true, None);
                         }
                     }
                 }
                 Err(error) => {
                     error!("Python reply handler error: {error}");
-                    return true; // forward on error to avoid silent drops
+                    return (true, None); // forward on error to avoid silent drops
                 }
             }
         }
 
-        let result = py_reply.borrow(python).was_forwarded();
-        result
+        let reply_ref = py_reply.borrow(python);
+        (reply_ref.was_forwarded(), reply_ref.reject_action())
     });
 
-    if !forwarded {
+    if reject_action.is_none() && !forwarded {
         debug!(
             status = status_code,
             branch = %branch,
@@ -4611,7 +4679,7 @@ fn run_reply_handlers(
         }
     };
 
-    (extracted, forwarded)
+    (extracted, forwarded, reject_action)
 }
 
 /// Fire `@proxy.on_cancel` handlers for a relayed INVITE that was CANCELled
@@ -6789,6 +6857,25 @@ fn cancel_other_fork_branches(
     server_key: &TransactionKey,
     state: &DispatcherState,
 ) {
+    cancel_fork_branches(server_key, Some(winning_key), state);
+}
+
+/// CANCEL the pending downstream branches of a proxy session.
+///
+/// `exclude` skips one branch — the branch that won (`Some(winning_key)`, used
+/// by fork aggregation when a 2xx/6xx settles the fork).  Pass `None` to CANCEL
+/// every branch, which is what a reply-time `reply.reject(code, reason)` needs:
+/// it aborts the whole in-progress INVITE, including the branch whose
+/// provisional triggered the reject.
+///
+/// RFC 3261 §9.1: each branch's CANCEL MUST carry the same topmost Via branch
+/// (and CSeq number) siphon used for that branch's INVITE, so we rebuild the
+/// per-branch outbound-INVITE view and run it through `build_cancel_from_invite`.
+fn cancel_fork_branches(
+    server_key: &TransactionKey,
+    exclude: Option<&TransactionKey>,
+    state: &DispatcherState,
+) {
     let session_arc = match state.session_store.get_by_server_key(server_key) {
         Some(arc) => arc,
         None => return,
@@ -6799,7 +6886,7 @@ fn cancel_other_fork_branches(
     };
 
     for client_key in &session.client_keys {
-        if client_key == winning_key {
+        if Some(client_key) == exclude {
             continue;
         }
         if let Some(client_branch) = session.get_client_branch(client_key) {
@@ -6843,6 +6930,96 @@ fn cancel_other_fork_branches(
 
             send_outbound(data, client_branch.transport, client_branch.destination, client_branch.connection_id, state);
         }
+    }
+}
+
+/// Fail an in-progress proxied INVITE from the reply context.
+///
+/// Driven by `reply.reject(code, reason)` in a `@proxy.on_reply` handler (the
+/// IMS P-CSCF media-authorization reject — N5/Rx fails at answer time, so the
+/// leg must be rejected with a SIP error rather than proceed medialess).
+///
+/// Two halves, in order:
+/// 1. Mark the session finalized *first* so any branch response that races in
+///    (the `487` the CANCEL draws back, or a late provisional) is absorbed by
+///    the straggler guard in `handle_response` rather than forwarded upstream.
+/// 2. CANCEL every pending downstream branch (RFC 3261 §9 — we have received a
+///    provisional, so CANCEL is well-formed), then send `code reason` upstream
+///    to the UAC through the server transaction so retransmission and ACK
+///    absorption are handled by the transaction layer.
+///
+/// The session is deliberately left in the store: the in-flight `487`(s) from
+/// the CANCEL still need to resolve to it (to be ACKed downstream and absorbed).
+/// Per-branch final cleanup (`remove_client_key`) and the session TTL sweep
+/// tear it down afterwards.
+#[allow(clippy::too_many_arguments)]
+fn reject_pending_invite(
+    server_key: &TransactionKey,
+    session_arc: &Arc<RwLock<ProxySession>>,
+    code: u16,
+    reason: &str,
+    original_request: &SipMessage,
+    transport: crate::transport::Transport,
+    source_addr: SocketAddr,
+    connection_id: ConnectionId,
+    inbound_local_addr: SocketAddr,
+    state: &DispatcherState,
+) {
+    // 1. Latch the finalized flag before anything goes on the wire.
+    match session_arc.write() {
+        Ok(mut session) => session.final_response_sent = true,
+        Err(error) => {
+            error!("proxy session lock poisoned during reject: {error}");
+            return;
+        }
+    }
+
+    // Hygiene: a rejected INVITE establishes no dialog, so its `by_dialog_key`
+    // entry (which exists only to route the end-to-end 2xx ACK) is now dead.
+    // Drop it so a stray/non-compliant ACK can't match this rejected call's
+    // dialog and reach the ACK relay path.  The client-key indices stay intact
+    // so the CANCEL's `487` straggler is still matched and absorbed.
+    state.session_store.remove_dialog_key(original_request);
+
+    info!(
+        server_key = %server_key,
+        code = code,
+        "reply-time reject: failing in-progress INVITE and cancelling downstream"
+    );
+
+    // 2a. CANCEL all pending downstream branches (no winner to exclude).
+    cancel_fork_branches(server_key, None, state);
+
+    // 2b. Build and send the error response upstream via the server
+    // transaction (handles retransmission + UAC-ACK absorption for INVITE).
+    let response = build_response(
+        original_request,
+        code,
+        reason,
+        state.server_header.as_deref(),
+        &[],
+    );
+
+    let event = ServerEvent::Ist(IstEvent::TuNon2xxFinal(response.clone()));
+    let mut sent_by_transaction = false;
+    if let Ok(actions) = state.transaction_manager.process_server_event(server_key, event) {
+        sent_by_transaction = actions.iter().any(|a| matches!(a, Action::SendMessage(_)));
+        process_timer_actions(
+            &actions,
+            server_key,
+            Some(source_addr),
+            Some(transport),
+            Some(connection_id),
+            Some(inbound_local_addr),
+            state,
+        );
+    }
+
+    if !sent_by_transaction {
+        // No live server transaction (or it emitted no SendMessage) — send the
+        // error directly, pinning the inbound listener's local address so an
+        // IPsec-protected response egresses on the right SA (TS 33.203 §7.4).
+        send_message_from(response, transport, source_addr, connection_id, Some(inbound_local_addr), state);
     }
 }
 
@@ -7064,6 +7241,23 @@ fn handle_ack_via_session(
                 client_branch.transport,
                 client_branch.connection_id,
             );
+
+            // Loop guard (RFC 3261 §16.3): never forward an ACK back to one of
+            // our own listen addresses.  A stray/misrouted 2xx ACK whose route
+            // set or R-URI resolves to us (e.g. a non-compliant UAC ACKing a
+            // final whose R-URI is the proxy, matched here by `by_dialog_key`)
+            // would otherwise be re-received and re-relayed, stacking a Via each
+            // hop until the datagram exceeds the UDP recv buffer and is dropped
+            // on a parse error.  ACK gets no response (RFC 3261 §17.1.1.3), so
+            // drop silently — mirroring the relay-path guard in `relay_request`.
+            if state.is_own_address(&destination) {
+                debug!(
+                    client_key = %client_key,
+                    %destination,
+                    "ACK to self via dialog route set — dropping (loop guard)"
+                );
+                continue;
+            }
 
             // Add our Via on top (preserving existing Vias), reflecting the
             // transport we will actually send over.

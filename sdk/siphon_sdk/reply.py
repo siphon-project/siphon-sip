@@ -168,6 +168,67 @@ class Reply:
         """Alias for :meth:`relay`."""
         self.relay()
 
+    def reject(self, code: int, reason: Optional[str] = None) -> bool:
+        """Reject an in-progress proxied INVITE from ``@proxy.on_reply``.
+
+        The proxy-side equivalent of the B2BUA's ``call.reject()`` — needed
+        because media authorization (``sbi.create_session`` /
+        ``diameter.rx_aar``) runs at answer time, when the negotiated SDP is
+        available, and a media-authorization failure must reject the leg rather
+        than proceed medialess.
+
+        Behaviour depends on the stage of the response this handler is running
+        for:
+
+        - **Provisional (1xx) — no final answer yet:** records the reject and
+          returns ``True``.  siphon then sends ``code reason`` upstream to the
+          UAC and CANCELs the pending downstream branch(es).  This is the clean
+          path — typically a reliable ``183 Session Progress`` in the VoLTE
+          preconditions / early-media flow, where the SDP answer rides the
+          provisional.
+        - **Final (>= 200) — UAS already answered:** a proxy cannot retract a
+          2xx, so this is a no-op and returns ``False``.  Branch on the return
+          value: log the failed authorization and :meth:`relay` to let the
+          answer through (best-effort, no dedicated bearer).
+
+        Takes precedence over :meth:`relay` / :meth:`forward` when it returns
+        ``True``.
+
+        Args:
+            code: SIP final-response code in the 400–699 range (e.g. ``503``).
+            reason: optional reason phrase; a sensible default is derived from
+                ``code`` when omitted.
+
+        Returns:
+            ``True`` if the reject was accepted (provisional stage — siphon will
+            send the error + CANCEL); ``False`` if it could not be applied (the
+            UAS already sent a final response).
+
+        Raises:
+            ValueError: if ``code`` is outside 400–699.
+
+        Example::
+
+            @proxy.on_reply
+            async def on_reply(request, reply):
+                if request.method == "INVITE" and reply.has_body("application/sdp"):
+                    if not await authorize_media(request, reply):
+                        if reply.reject(503, "Media Authorization Failed"):
+                            return            # 503 + CANCEL sent by siphon
+                        log.warn("could not reject answered call; proceeding best-effort")
+                reply.relay()
+        """
+        if not 400 <= code <= 699:
+            raise ValueError(
+                f"reply.reject() code must be a 400-699 SIP error code, got {code}"
+            )
+        # A proxy can only fail a leg before the UAS commits a final response.
+        if self._status_code >= 200:
+            return False
+        phrase = reason if reason is not None else _default_reject_reason(code)
+        self._actions.append(Action(kind="reject", status_code=code, reason=phrase))
+        return True
+
     # -- Test helpers ----------------------------------------------------------
 
     @property
@@ -179,6 +240,31 @@ class Reply:
     def last_action(self) -> Optional[Action]:
         """Most recent action, or ``None``."""
         return self._actions[-1] if self._actions else None
+
+
+_REJECT_REASONS = {
+    403: "Forbidden",
+    404: "Not Found",
+    408: "Request Timeout",
+    480: "Temporarily Unavailable",
+    486: "Busy Here",
+    488: "Not Acceptable Here",
+    500: "Server Internal Error",
+    503: "Service Unavailable",
+    600: "Busy Everywhere",
+    603: "Decline",
+}
+
+
+def _default_reject_reason(code: int) -> str:
+    """Default reason phrase for a reject code — mirrors the Rust side."""
+    if code in _REJECT_REASONS:
+        return _REJECT_REASONS[code]
+    if 400 <= code <= 499:
+        return "Client Error"
+    if 500 <= code <= 599:
+        return "Server Error"
+    return "Global Failure"
 
 
 def _split_top_level_commas(value: str) -> list[str]:

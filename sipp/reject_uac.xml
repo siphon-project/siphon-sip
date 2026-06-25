@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Reply-time reject — UAC (caller) side: INVITE -> 100(optional) -> 503 -> ACK.
+
+  Acceptance test for reply.reject() (the IMS P-CSCF media-authorization 503).
+  The proxy's @proxy.on_reply rejects on the downstream 183, so the caller must
+  receive the synthesised 503 and must NOT receive the 183 (early media is
+  suppressed). A leaked 183 arrives where 503 is expected -> SIPp "unexpected
+  message" -> non-zero exit. So this scenario fails if the early media leaks OR
+  if no 503 is produced.
+
+  Pairs with reject_uas.xml + reject_proxy.py + reject_test.yaml.
+
+  Native run (3 terminals, from the repo root):
+    1. PYO3_PYTHON=python3 ./target/debug/siphon -c sipp/reject_test.yaml
+    2. sipp -sf sipp/reject_uas.xml -i 127.0.0.2 -p 5061 -m 1
+    3. sipp -sf sipp/reject_uac.xml 127.0.0.1:5060 -i 127.0.0.50 -p 5062 -m 1
+
+  Expected: both UAC and UAS report 1 Successful call, 0 Failed, 0 Retrans,
+  0 Unexpected; siphon logs the reject and emits 0 WARN/ERROR.
+-->
+<scenario name="Reply-time reject UAC">
+
+  <send retrans="500">
+    <![CDATA[
+
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/reply-reject-test
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <!-- The proxy must turn the downstream 183 into a 503 toward the caller.
+       No 183 may reach here. -->
+  <recv response="503" rtd="true" />
+
+  <!-- ACK for the non-2xx final MUST reuse the INVITE's branch (RFC 3261
+       §17.1.1.3 — the ACK is part of the INVITE client transaction). The 503
+       echoes the INVITE's Via, so [last_Via:] carries the correct branch;
+       SIPp's [branch] would mint a fresh one per message index and the proxy's
+       server transaction would never match it (Timer H timeout). -->
+  <send>
+    <![CDATA[
+
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+[last_Via:]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

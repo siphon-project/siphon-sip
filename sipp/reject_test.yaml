@@ -1,0 +1,19 @@
+# Minimal proxy config for the reply.reject() acceptance scenario.
+# See sipp/reject_uac.xml for the full native run procedure.
+listen:
+  udp:
+    - "127.0.0.1:5060"
+
+domain:
+  local:
+    - "example.com"
+    - "127.0.0.1"
+
+advertised_address: "127.0.0.1"
+
+script:
+  path: "sipp/reject_proxy.py"
+  reload: sighup
+
+log:
+  level: info

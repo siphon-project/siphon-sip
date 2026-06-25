@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Reply-time reject — UAS (downstream) side:
+  INVITE -> 100 -> 183(SDP) -> recv CANCEL -> 200(CANCEL) -> 487(INVITE) -> recv ACK.
+
+  Drives the reply.reject() path: the proxy's @proxy.on_reply rejects on the
+  183, so the proxy CANCELs this leg. The 487 echoes the INVITE CSeq (1 INVITE,
+  hardcoded — the UAC sends at CSeq 1) per RFC 3261 §9.1; [last_CSeq:] after the
+  CANCEL recv would wrongly be "1 CANCEL". No <ereg> capture (this SIPp build
+  rejects captured-variable-in-regexp; see b2bua_cancel_uas.xml).
+
+  Pairs with reject_uac.xml + reject_proxy.py + reject_test.yaml (run procedure
+  in reject_uac.xml's header).
+-->
+<scenario name="Reply-time reject UAS">
+
+  <recv request="INVITE" crlf="true" />
+
+  <send>
+    <![CDATA[
+
+SIP/2.0 100 Trying
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- 183 Session Progress with SDP — early media. The proxy rejects HERE. -->
+  <send>
+    <![CDATA[
+
+SIP/2.0 183 Session Progress
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTagUAS[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:bob@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=bob 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <!-- Expect the CANCEL the proxy sends after reply.reject(). -->
+  <recv request="CANCEL" timeout="5000" />
+
+  <!-- 200 OK to the CANCEL (CANCEL's own CSeq). -->
+  <send>
+    <![CDATA[
+
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTagUAS[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- 487 Request Terminated for the INVITE (CSeq 1 INVITE, not the CANCEL). -->
+  <send retrans="500">
+    <![CDATA[
+
+SIP/2.0 487 Request Terminated
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTagUAS[call_number]
+[last_Call-ID:]
+CSeq: 1 INVITE
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Proxy ACKs the 487 (RFC 3261 §17.1.1.3). -->
+  <recv request="ACK" optional="true" timeout="5000" />
+
+</scenario>

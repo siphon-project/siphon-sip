@@ -86,6 +86,16 @@ pub struct ProxySession {
     pub on_reply_callback: Option<Py<PyAny>>,
     /// Per-relay on_failure Python callback (called with `(request, code, reason)`).
     pub on_failure_callback: Option<Py<PyAny>>,
+    /// Set once a final response has been committed upstream for this server
+    /// transaction by a reply-time reject (`reply.reject(code, reason)` from
+    /// `@proxy.on_reply`).  After a reject we send `code reason` to the UAC and
+    /// CANCEL the pending downstream branch(es); the CANCEL draws a `487` back
+    /// on each branch.  Without a fork aggregator (the single-target relay case,
+    /// e.g. the IMS P-CSCF), there is no `final_forwarded` guard, so this flag
+    /// is what tells the response path to ABSORB that straggler `487` (already
+    /// ACKed by the client transaction) instead of forwarding a second final
+    /// response upstream.
+    pub final_response_sent: bool,
 }
 
 impl ProxySession {
@@ -115,6 +125,7 @@ impl ProxySession {
             created_at: Instant::now(),
             on_reply_callback: None,
             on_failure_callback: None,
+            final_response_sent: false,
         }
     }
 
@@ -423,6 +434,24 @@ impl ProxySessionStore {
         }
     }
 
+    /// Drop only the `by_dialog_key` index entry for a request's dialog,
+    /// leaving the `by_client_key` / `server_to_clients` indices intact.
+    ///
+    /// Used when an INVITE is rejected from the reply path
+    /// (`reply.reject()` → no dialog is ever established): the `by_dialog_key`
+    /// entry exists solely to route the end-to-end 2xx ACK, which now can never
+    /// arrive, so it is dead.  Leaving it would let a stray/non-compliant ACK
+    /// (To-tag present, R-URI pointing at the proxy) match the rejected call's
+    /// dialog and reach `handle_ack_via_session`.  The client-key indices stay
+    /// so the CANCEL's `487` straggler is still matched and absorbed.
+    ///
+    /// No-op for non-INVITE requests (they create no `by_dialog_key` entry).
+    pub fn remove_dialog_key(&self, request: &SipMessage) {
+        if let Some(dialog_key) = Self::invite_dialog_key(request) {
+            self.by_dialog_key.remove(&dialog_key);
+        }
+    }
+
     /// Remove a single client key from the store.
     ///
     /// If the session has no remaining client keys, removes the session entirely.
@@ -634,6 +663,17 @@ mod tests {
         assert_eq!(session.client_keys.len(), 1);
         assert_eq!(session.source_addr, source_addr());
         assert!(!session.record_routed);
+        // A fresh session has not finalized a response — only a reply-time
+        // reject sets this.
+        assert!(!session.final_response_sent);
+    }
+
+    #[test]
+    fn final_response_sent_flag_toggles() {
+        let mut session = make_session();
+        assert!(!session.final_response_sent);
+        session.final_response_sent = true;
+        assert!(session.final_response_sent);
     }
 
     #[test]
@@ -1195,5 +1235,27 @@ mod tests {
         assert!(store.get_by_dialog_key("session-test", "abc").is_some());
         store.remove_by_server_key(&server_key());
         assert!(store.get_by_dialog_key("session-test", "abc").is_none());
+    }
+
+    #[test]
+    fn remove_dialog_key_drops_only_the_dialog_index() {
+        // reply.reject() hygiene: a rejected INVITE forms no dialog, so its
+        // by_dialog_key entry must be dropped — but the client-key index must
+        // survive so the CANCEL's 487 straggler is still matched and absorbed.
+        let store = ProxySessionStore::new();
+        let session = make_session();
+        let request = session.original_request.clone();
+        let client = client_key("1");
+        store.insert(session);
+
+        assert!(store.get_by_dialog_key("session-test", "abc").is_some());
+        assert!(store.get_by_client_key(&client).is_some());
+
+        store.remove_dialog_key(&request);
+
+        // Dialog index gone — a stray ACK can no longer match the dead dialog.
+        assert!(store.get_by_dialog_key("session-test", "abc").is_none());
+        // Client index intact — the 487 straggler still resolves to the session.
+        assert!(store.get_by_client_key(&client).is_some());
     }
 }
