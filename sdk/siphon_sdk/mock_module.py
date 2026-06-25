@@ -4508,13 +4508,19 @@ class MockSbi:
     def on_event(fn: Any) -> Any:
         """Register a handler for incoming PCF event notifications (N5).
 
-        Handler receives a dict with event notification data.
+        The handler receives the PCF's ``EventsNotification`` document
+        (TS 29.514 §5.6.2.6) verbatim as a dict — every field is preserved,
+        so the keys are the exact 3GPP wire names. Use ``evSubsUri`` to
+        correlate the event with the app-session you created, and ``evNotifs``
+        for the per-event list. Each entry's ``flows`` carries ``medCompN`` +
+        ``fNums`` (not flow descriptions).
 
         Example::
 
             @sbi.on_event
             def handle_pcf_event(event):
-                for notif in event.get("ev_notifs", []):
+                session_events_uri = event.get("evSubsUri")
+                for notif in event.get("evNotifs", []):
                     log.info(f"PCF event: {notif['event']}")
         """
         return fn

@@ -7,8 +7,13 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyType};
 use tracing::warn;
 
+use indexmap::IndexMap;
+
 use crate::sbi::nbsf::{BindingQuery, BsfClient, PcfBinding, Scheme};
-use crate::sbi::npcf::{AppSessionContext, MediaComponent, MediaSubComponent, NpcfClient};
+use crate::sbi::npcf::{
+    app_session_id_from_location, AppSessionContextReqData, MediaComponent, MediaSubComponent,
+    NpcfClient,
+};
 
 pyo3::create_exception!(
     siphon,
@@ -178,9 +183,9 @@ impl PySbi {
             None => Vec::new(),
         };
 
-        let context = AppSessionContext {
+        let request_data = AppSessionContextReqData {
             af_app_id: Some(af_app_id.to_string()),
-            media_components: components,
+            med_components: components_to_map(components),
             sip_call_id: sip_call_id.map(String::from),
             supi: supi.map(String::from),
             ue_ipv4: ue_ipv4.map(String::from),
@@ -194,14 +199,16 @@ impl PySbi {
         let client = Arc::clone(&self.client);
         let target = pcf_uri.map(String::from);
         let result = crate::script::detach_block_on(async move {
-            client.create_app_session(target.as_deref(), &context).await
+            client
+                .create_app_session(target.as_deref(), &request_data)
+                .await
         });
 
         match result {
             Ok(created) => {
                 let dict = PyDict::new(python);
-                dict.set_item("app_session_id", &created.response.app_session_id)?;
-                dict.set_item("authorized", created.response.authorized)?;
+                dict.set_item("app_session_id", &created.app_session_id)?;
+                dict.set_item("authorized", created.authorized)?;
                 dict.set_item("app_session_uri", created.location)?;
                 Ok(Some(dict))
             }
@@ -253,28 +260,22 @@ impl PySbi {
             None => Vec::new(),
         };
 
-        let context = AppSessionContext {
-            af_app_id: None,
-            media_components: components,
-            sip_call_id: None,
-            supi: None,
-            ue_ipv4: None,
-            ue_ipv6: None,
-            dnn: None,
-            ev_subsc: None,
-            notif_uri: None,
-            supp_feat: None,
+        let request_data = AppSessionContextReqData {
+            med_components: components_to_map(components),
+            ..Default::default()
         };
 
         let client = Arc::clone(&self.client);
         let sid = session_id.to_string();
-        let result = crate::script::detach_block_on(client.update_app_session(&sid, &context));
+        let result = crate::script::detach_block_on(client.update_app_session(&sid, &request_data));
 
         match result {
-            Ok(response) => {
+            Ok(()) => {
+                // The modify response (the updated AppSessionContext) carries no
+                // flat id; echo the bare id from the ref the caller passed.
                 let dict = PyDict::new(python);
-                dict.set_item("app_session_id", &response.app_session_id)?;
-                dict.set_item("authorized", response.authorized)?;
+                dict.set_item("app_session_id", app_session_id_from_location(session_id))?;
+                dict.set_item("authorized", true)?;
                 Ok(Some(dict))
             }
             Err(error) => {
@@ -388,11 +389,14 @@ fn media_type_to_sbi(s: &str) -> PyResult<String> {
 
 fn flow_status_to_sbi(s: &str) -> PyResult<String> {
     Ok(match s.to_ascii_lowercase().as_str() {
+        // TS 29.514 FlowStatus enum: the directional variants use hyphens
+        // ("ENABLED-UPLINK" / "ENABLED-DOWNLINK"), not underscores — an
+        // underscore value fails the PCF's enum parse and drops the status.
         "enabled" => "ENABLED",
         "disabled" => "DISABLED",
         "removed" => "REMOVED",
-        "enabled-up" | "enabled_uplink" | "enabled-uplink" => "ENABLED_UPLINK",
-        "enabled-down" | "enabled_downlink" | "enabled-downlink" => "ENABLED_DOWNLINK",
+        "enabled-up" | "enabled_uplink" | "enabled-uplink" => "ENABLED-UPLINK",
+        "enabled-down" | "enabled_downlink" | "enabled-downlink" => "ENABLED-DOWNLINK",
         other => {
             return Err(pyo3::exceptions::PyValueError::new_err(format!(
                 "unknown flow_status {other:?} (expected enabled|disabled|removed|enabled-up|enabled-down)"
@@ -414,6 +418,23 @@ fn flow_usage_to_sbi(s: &str) -> PyResult<String> {
         }
     }
     .to_string())
+}
+
+/// Collect parsed media components into the `medComponents` map keyed by each
+/// component's `medCompN` (TS 29.514 §5.6.2.3). Returns `None` for an empty
+/// list so the field is omitted from the request body entirely.
+fn components_to_map(
+    components: Vec<MediaComponent>,
+) -> Option<IndexMap<String, MediaComponent>> {
+    if components.is_empty() {
+        return None;
+    }
+    Some(
+        components
+            .into_iter()
+            .map(|component| (component.med_comp_n.to_string(), component))
+            .collect(),
+    )
 }
 
 /// Parse a Python list of dicts into a `Vec<sbi::npcf::MediaComponent>`.
@@ -459,22 +480,27 @@ fn parse_sbi_media_components(obj: &Bound<'_, PyAny>) -> PyResult<Vec<MediaCompo
             None => "ENABLED".to_string(),
         };
 
-        let codec_data: Option<String> = match component_dict.get_item("codec_data")? {
+        // TS 29.514 MediaComponent.codecs is an array (1–2 entries); the Python
+        // API still takes a single `codec_data`, so wrap it.
+        let codecs: Option<Vec<String>> = match component_dict.get_item("codec_data")? {
             Some(value) => {
                 // The Rx side stores codec data as raw bytes per RFC 4566 SDP
                 // octets; the SBI schema requires a string.  Decode lossily
                 // so call sites can pass bytes uniformly.
-                if let Ok(text) = value.extract::<String>() {
-                    Some(text)
+                let codec = if let Ok(text) = value.extract::<String>() {
+                    text
                 } else {
                     let raw: Vec<u8> = value.extract()?;
-                    Some(String::from_utf8_lossy(&raw).into_owned())
-                }
+                    String::from_utf8_lossy(&raw).into_owned()
+                };
+                Some(vec![codec])
             }
             None => None,
         };
 
-        let mut med_sub_comps: Vec<MediaSubComponent> = Vec::new();
+        // medSubComps is a map keyed by the sub-component's fNum (TS 29.514
+        // §5.6.2.7), not an array.
+        let mut med_sub_comps: IndexMap<String, MediaSubComponent> = IndexMap::new();
         if let Some(flows_obj) = component_dict.get_item("flows")? {
             let flows_list = flows_obj.cast::<PyList>().map_err(|_| {
                 pyo3::exceptions::PyTypeError::new_err(format!(
@@ -525,20 +551,23 @@ fn parse_sbi_media_components(obj: &Bound<'_, PyAny>) -> PyResult<Vec<MediaCompo
                     None => None,
                 };
 
-                med_sub_comps.push(MediaSubComponent {
-                    flow_number,
-                    flow_descriptions: descriptions,
-                    flow_status: flow_status_inner,
-                    flow_usage,
-                });
+                med_sub_comps.insert(
+                    flow_number.to_string(),
+                    MediaSubComponent {
+                        f_num: flow_number,
+                        f_descs: descriptions,
+                        f_status: flow_status_inner,
+                        flow_usage,
+                    },
+                );
             }
         }
 
         out.push(MediaComponent {
-            media_component_number: number,
-            media_type,
-            flow_status,
-            codec_data,
+            med_comp_n: number,
+            med_type: media_type,
+            f_status: flow_status,
+            codecs,
             med_sub_comps: if med_sub_comps.is_empty() {
                 None
             } else {
@@ -587,14 +616,16 @@ mod tests {
             let parsed = parse_sbi_media_components(list.as_any()).unwrap();
             assert_eq!(parsed.len(), 1);
             let component = &parsed[0];
-            assert_eq!(component.media_component_number, 1);
-            assert_eq!(component.media_type, "AUDIO");
-            assert_eq!(component.flow_status, "ENABLED");
+            assert_eq!(component.med_comp_n, 1);
+            assert_eq!(component.med_type, "AUDIO");
+            assert_eq!(component.f_status, "ENABLED");
             let subs = component.med_sub_comps.as_ref().unwrap();
             assert_eq!(subs.len(), 1);
-            assert_eq!(subs[0].flow_number, 1);
-            assert_eq!(subs[0].flow_usage.as_deref(), Some("RTCP"));
-            let descs = subs[0].flow_descriptions.as_ref().unwrap();
+            // Keyed by fNum.
+            let sub = &subs["1"];
+            assert_eq!(sub.f_num, 1);
+            assert_eq!(sub.flow_usage.as_deref(), Some("RTCP"));
+            let descs = sub.f_descs.as_ref().unwrap();
             assert_eq!(descs.len(), 2);
             assert!(descs[0].starts_with("permit out 17 from"));
         });
@@ -631,14 +662,72 @@ mod tests {
                 "MediaComponent JSON must include medSubComps: {json}"
             );
             assert!(
-                json.contains("flowDescriptions"),
-                "med_sub_comps[*].flowDescriptions must reach the wire: {json}"
+                json.contains("fDescs"),
+                "med_sub_comps[*].fDescs must reach the wire: {json}"
             );
+            // medCompN / fNum are the keys the PCF parses — a camelCase of the
+            // Rust field names would be ignored.
+            assert!(json.contains("medCompN"), "medCompN must be present: {json}");
+            assert!(json.contains("fNum"), "fNum must be present: {json}");
             assert!(json.contains("RTCP"), "Flow-Usage RTCP must survive: {json}");
             assert!(
                 json.contains("permit out 17 from 10.0.0.1 50001"),
                 "5-tuple Flow-Description must survive: {json}"
             );
+        });
+    }
+
+    #[test]
+    fn flow_status_directional_variants_use_hyphens() {
+        // TS 29.514 FlowStatus enum uses hyphens for the directional variants.
+        assert_eq!(flow_status_to_sbi("enabled-up").unwrap(), "ENABLED-UPLINK");
+        assert_eq!(
+            flow_status_to_sbi("enabled_downlink").unwrap(),
+            "ENABLED-DOWNLINK"
+        );
+        assert_eq!(flow_status_to_sbi("enabled").unwrap(), "ENABLED");
+        assert_eq!(flow_status_to_sbi("disabled").unwrap(), "DISABLED");
+    }
+
+    #[test]
+    fn components_to_map_keys_by_med_comp_n_and_omits_empty() {
+        assert!(components_to_map(vec![]).is_none());
+        let map = components_to_map(vec![
+            MediaComponent {
+                med_comp_n: 1,
+                med_type: "AUDIO".to_string(),
+                f_status: "ENABLED".to_string(),
+                codecs: None,
+                med_sub_comps: None,
+            },
+            MediaComponent {
+                med_comp_n: 2,
+                med_type: "VIDEO".to_string(),
+                f_status: "ENABLED".to_string(),
+                codecs: None,
+                med_sub_comps: None,
+            },
+        ])
+        .unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["1"].med_type, "AUDIO");
+        assert_eq!(map["2"].med_type, "VIDEO");
+    }
+
+    #[test]
+    fn parse_wraps_codec_data_into_codecs_array() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let component = PyDict::new(python);
+            component.set_item("number", 1u32).unwrap();
+            component.set_item("media_type", "audio").unwrap();
+            component.set_item("codec_data", "PCMU").unwrap();
+            let list = PyList::empty(python);
+            list.append(component).unwrap();
+            let parsed = parse_sbi_media_components(list.as_any()).unwrap();
+            assert_eq!(parsed[0].codecs.as_deref(), Some(&["PCMU".to_string()][..]));
+            let json = serde_json::to_string(&parsed[0]).unwrap();
+            assert!(json.contains("\"codecs\":[\"PCMU\"]"), "{json}");
         });
     }
 

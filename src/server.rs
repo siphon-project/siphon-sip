@@ -1485,7 +1485,7 @@ impl SiphonServer {
                 });
                 let engine_for_sbi = Arc::clone(&engine);
                 tokio::spawn(async move {
-                    use axum::{routing::post, extract::State, Json, Router};
+                    use axum::{routing::post, extract::State, Router};
 
                     #[derive(Clone)]
                     struct SbiNotifState {
@@ -1494,8 +1494,20 @@ impl SiphonServer {
 
                     async fn handle_pcf_notification(
                         State(state): State<SbiNotifState>,
-                        Json(body): Json<crate::sbi::npcf::PcfEventNotification>,
+                        body: axum::body::Bytes,
                     ) -> axum::http::StatusCode {
+                        // The full PCF document (TS 29.514 EventsNotification) is
+                        // handed to the script verbatim — never projected through a
+                        // typed struct (see pcf_notification_body_to_json).
+                        let json_str = match pcf_notification_body_to_json(&body) {
+                            Some(json_str) => json_str,
+                            None => {
+                                tracing::error!(
+                                    "PCF event notification body was not valid JSON"
+                                );
+                                return axum::http::StatusCode::BAD_REQUEST;
+                            }
+                        };
                         let _ = crate::script::py_executor::try_run(move || {
                             pyo3::Python::attach(|python| {
                                 use pyo3::types::PyAnyMethods;
@@ -1507,14 +1519,6 @@ impl SiphonServer {
                                     return;
                                 }
 
-                                // Convert PcfEventNotification to a Python dict via json.loads
-                                let json_str = match serde_json::to_string(&body) {
-                                    Ok(s) => s,
-                                    Err(error) => {
-                                        tracing::error!(%error, "failed to serialize PCF event");
-                                        return;
-                                    }
-                                };
                                 let py_dict: pyo3::Py<pyo3::PyAny> = {
                                     use pyo3::types::PyAnyMethods;
                                     match python.import("json")
@@ -2498,10 +2502,68 @@ fn build_transport_acl(config: &Config) -> Arc<transport::acl::TransportAcl> {
     }
 }
 
+/// Decode a PCF event-notification callback body (TS 29.514 `EventsNotification`)
+/// into the JSON string handed verbatim to `@sbi.on_event`.
+///
+/// The body is passed through **losslessly** — never projected through a typed
+/// Rust struct. `EventsNotification` is large and evolving (`evSubsUri`,
+/// `qosMonReports`, `succResourcAllocReports`, `accessType`, `plmnId`, …); a
+/// typed model would silently drop every field it doesn't list — including the
+/// required `evSubsUri` the script needs to correlate the event with a session —
+/// and an unmodelled inner shape (e.g. `flows` = `{medCompN, fNums}`, not
+/// `{flowId, …}`) would fail deserialization and `422` the entire callback,
+/// dropping the event. Returns `None` only when the body is not well-formed
+/// JSON.
+fn pcf_notification_body_to_json(raw: &[u8]) -> Option<String> {
+    // Validate it parses as JSON (rejecting genuine garbage with a 400), then
+    // re-emit — every key/value is preserved.
+    let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
+    serde_json::to_string(&value).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A real-shaped TS 29.514 `EventsNotification` (the body a PCF POSTs to the
+    /// AF callback) must reach the script with EVERY field intact. The old typed
+    /// projection both dropped `evSubsUri`/`succResourcAllocReports` and `422`'d
+    /// the whole callback because its `flows` model wanted `flowId` instead of
+    /// the spec's `{medCompN, fNums}`.
+    #[test]
+    fn pcf_notification_body_is_passed_through_losslessly() {
+        let body = r#"{
+            "evSubsUri": "http://pcf01:8080/npcf-policyauthorization/v1/app-sessions/sess-abc/events",
+            "evNotifs": [
+                {
+                    "event": "SUCCESSFUL_RESOURCES_ALLOCATION",
+                    "flows": [ { "medCompN": 1, "fNums": [1, 2] } ]
+                }
+            ],
+            "succResourcAllocReports": [ { "medComponents": {} } ]
+        }"#;
+        let out = pcf_notification_body_to_json(body.as_bytes())
+            .expect("well-formed JSON must decode");
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+
+        // evSubsUri — the correlation key — survives.
+        assert_eq!(
+            value["evSubsUri"].as_str(),
+            Some("http://pcf01:8080/npcf-policyauthorization/v1/app-sessions/sess-abc/events")
+        );
+        // The spec flow shape ({medCompN, fNums}) survives — would have 422'd before.
+        let flow = &value["evNotifs"][0]["flows"][0];
+        assert_eq!(flow["medCompN"].as_u64(), Some(1));
+        assert_eq!(flow["fNums"][1].as_u64(), Some(2));
+        // Fields outside the old typed model survive.
+        assert!(value.get("succResourcAllocReports").is_some());
+    }
+
+    #[test]
+    fn pcf_notification_body_rejects_non_json() {
+        assert!(pcf_notification_body_to_json(b"not json at all").is_none());
+    }
 
     #[test]
     fn register_task_records_in_order() {
