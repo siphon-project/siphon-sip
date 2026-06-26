@@ -290,7 +290,12 @@ impl NpcfClient {
     /// (`http(s)://…`, used verbatim — the replica-independent teardown path).
     pub async fn delete_app_session(&self, session_ref: &str) -> Result<(), SbiError> {
         let (url, target_apiroot) = self.resolve_session_request(session_ref);
-        let mut request = self.client.delete(&url);
+        // TS 29.514 §5.6.2.4: the Individual Application Session Context
+        // resource supports GET and PATCH only — there is no DELETE. Removal is
+        // a custom operation: POST {url}/delete (optional EventsSubscReqData
+        // body) returning 204 No Content. The target-apiRoot header still
+        // routes the POST to the originating PCF in indirect mode.
+        let mut request = self.client.post(format!("{url}/delete"));
         if let Some(ref apiroot) = target_apiroot {
             request = request.header(TARGET_APIROOT_HEADER, apiroot);
         }
@@ -929,5 +934,76 @@ mod tests {
             Some(1),
             "component keyed by medCompN: {body}"
         );
+    }
+
+    // --- Delete (TS 29.514 §5.6.2.4: POST {resource}/delete → 204) ---
+
+    /// A router that serves ONLY the spec-correct custom delete operation
+    /// (`POST .../app-sessions/sess-1/delete` → 204 No Content) and records the
+    /// `3gpp-Sbi-Target-apiRoot` header seen on it. The bare resource has no
+    /// `DELETE` route, so the pre-fix code (which issued `DELETE {resource}`)
+    /// would 404/405 here and the call would error.
+    fn delete_router(captured: Arc<Mutex<Vec<Option<String>>>>) -> axum::Router {
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+        axum::Router::new().route(
+            "/npcf-policyauthorization/v1/app-sessions/sess-1/delete",
+            post(move |headers: HeaderMap| {
+                let captured = Arc::clone(&captured);
+                async move {
+                    let target = headers
+                        .get("3gpp-sbi-target-apiroot")
+                        .and_then(|value| value.to_str().ok())
+                        .map(|value| value.to_string());
+                    captured.lock().unwrap().push(target);
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn delete_posts_to_delete_subresource_and_accepts_204() {
+        let captured: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let pcf = spawn_mock(delete_router(Arc::clone(&captured))).await;
+        let client = NpcfClient::new(&pcf, reqwest::Client::new());
+
+        client
+            .delete_app_session("sess-1")
+            .await
+            .expect("delete via POST {url}/delete must succeed on 204");
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            1,
+            "the custom delete operation must be hit exactly once"
+        );
+        assert!(
+            captured[0].is_none(),
+            "direct mode must not send 3gpp-Sbi-Target-apiRoot"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_indirect_sends_target_apiroot_on_delete_subresource() {
+        let captured: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let scp = spawn_mock(delete_router(Arc::clone(&captured))).await;
+        let client = NpcfClient::new(&scp, reqwest::Client::new())
+            .with_communication(crate::sbi::Communication::Indirect);
+
+        // Absolute app_session_uri at the originating PCF: in indirect mode the
+        // path routes through the SCP while the PCF apiRoot rides the
+        // target-apiRoot header — on the `/delete` POST, not a DELETE.
+        client
+            .delete_app_session(
+                "http://pcf01.5gc:8080/npcf-policyauthorization/v1/app-sessions/sess-1",
+            )
+            .await
+            .expect("indirect delete must succeed");
+
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].as_deref(), Some("http://pcf01.5gc:8080"));
     }
 }
