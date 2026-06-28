@@ -130,7 +130,7 @@ fn resolve_code(arg: &Bound<'_, PyAny>) -> PyResult<(u32, u32)> {
 // ── PyInboundPeer (req.peer) ────────────────────────────────────────────────
 
 /// Identity of the authenticated peer that sent the inbound request.
-#[pyclass(name = "DiameterInboundPeer")]
+#[pyclass(name = "DiameterInboundPeer", skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyInboundPeer {
     #[pyo3(get)]
@@ -146,8 +146,9 @@ pub struct PyInboundPeer {
 // ── PyPeer (backend, from a pool pick) ──────────────────────────────────────
 
 /// A backend peer chosen from a [`PyPeerPool`]. Truthy when its connection is
-/// `Open`. Pass to [`PyDiameterRequest::forward_to`].
-#[pyclass(name = "DiameterPeer")]
+/// `Open`. Pass to [`PyDiameterRequest::forward_to`] (so it must stay
+/// extractable from Python — opt into the `FromPyObject` derive explicitly).
+#[pyclass(name = "DiameterPeer", from_py_object)]
 #[derive(Clone)]
 pub struct PyPeer {
     pub(crate) client: Arc<DiameterClient>,

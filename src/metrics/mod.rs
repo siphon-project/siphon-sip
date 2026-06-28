@@ -726,15 +726,24 @@ mod tests {
         init().unwrap();
         let metrics = metrics().unwrap();
 
+        // These are process-global counters; other tests (e.g. peer
+        // request-timeout paths) bump the same series under the parallel test
+        // runner, so assert deltas from a baseline rather than absolute values.
+        let base_timeout = metrics
+            .diameter_request_errors_total
+            .with_label_values(&["timeout"])
+            .get();
+        let base_watchdog = metrics.diameter_watchdog_failures_total.get();
+
         metrics.diameter_request_errors_total.with_label_values(&["timeout"]).inc();
         metrics.diameter_request_errors_total.with_label_values(&["channel_dropped"]).inc();
         metrics.diameter_watchdog_failures_total.inc();
 
         assert_eq!(
             metrics.diameter_request_errors_total.with_label_values(&["timeout"]).get(),
-            1
+            base_timeout + 1
         );
-        assert_eq!(metrics.diameter_watchdog_failures_total.get(), 1);
+        assert_eq!(metrics.diameter_watchdog_failures_total.get(), base_watchdog + 1);
 
         let output = encode_metrics();
         assert!(output.contains("siphon_diameter_request_errors_total"));

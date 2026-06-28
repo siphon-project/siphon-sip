@@ -436,7 +436,7 @@ fn validate_request_filter(filter: &str) -> PyResult<()> {
 
 /// Python-visible event sink (`diameter.event_sink`). `emit(row: dict)`
 /// serializes via `json.dumps` and forwards to the Rust batch writer.
-#[pyclass(name = "DiameterEventSink")]
+#[pyclass(name = "DiameterEventSink", skip_from_py_object)]
 #[derive(Clone, Default)]
 pub struct PyEventSink {
     sink: Option<Arc<crate::diameter::event_sink::EventSink>>,
@@ -2593,10 +2593,6 @@ fn json_to_py<'py>(
 mod tests {
     use super::*;
     use crate::diameter::DiameterManager;
-
-    /// One decorator-registry entry as extracted in the tests:
-    /// `(event_key, command_name, handler, is_async, marker)`.
-    type RegistryEntry = (String, Option<String>, Py<PyAny>, bool, Py<PyAny>);
 
     #[test]
     fn empty_manager_no_peers() {

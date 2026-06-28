@@ -222,7 +222,6 @@ impl ServerHandshake {
 mod tests {
     use super::*;
     use crate::diameter::peer::PeerState;
-    use tokio::io::AsyncWriteExt as _;
 
     fn handshake_with(acl: SourceIpAcl, policy: OriginHostPolicy) -> ServerHandshake {
         ServerHandshake {

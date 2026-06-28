@@ -758,6 +758,19 @@ fn request_filter_score(
     }
 }
 
+/// Minimal tree carrying just the header fields of a malformed inbound request,
+/// so an error answer can echo its command/app/hbh/e2e.
+fn stub_message(incoming: &IncomingRequest) -> DiameterMsg {
+    DiameterMsg {
+        flags: crate::diameter::codec::FLAG_REQUEST | crate::diameter::codec::FLAG_PROXIABLE,
+        command_code: incoming.command_code,
+        application_id: incoming.application_id,
+        hop_by_hop: incoming.hop_by_hop,
+        end_to_end: incoming.end_to_end,
+        avps: vec![Avp::utf8(dictionary::avp::SESSION_ID, 0, "")],
+    }
+}
+
 #[cfg(test)]
 mod filter_tests {
     use super::*;
@@ -807,18 +820,5 @@ mod filter_tests {
         assert_eq!(request_filter_score(Some("Sh:PUR"), s6a, s6a_pur), None);
         assert_eq!(request_filter_score(Some("S6a:purge-ue"), s6a, s6a_pur), Some(2));
         assert_eq!(request_filter_score(Some("S6a:purge-ue"), sh, sh_pur), None);
-    }
-}
-
-/// Minimal tree carrying just the header fields of a malformed inbound request,
-/// so an error answer can echo its command/app/hbh/e2e.
-fn stub_message(incoming: &IncomingRequest) -> DiameterMsg {
-    DiameterMsg {
-        flags: crate::diameter::codec::FLAG_REQUEST | crate::diameter::codec::FLAG_PROXIABLE,
-        command_code: incoming.command_code,
-        application_id: incoming.application_id,
-        hop_by_hop: incoming.hop_by_hop,
-        end_to_end: incoming.end_to_end,
-        avps: vec![Avp::utf8(dictionary::avp::SESSION_ID, 0, "")],
     }
 }
