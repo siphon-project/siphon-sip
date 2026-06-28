@@ -13,8 +13,21 @@ env:
 
 jobs:
   # ── Rust unit + integration tests ────────────────────────────────────────
+  # Run twice: the default build (no SCTP — proves the crate compiles and the
+  # suite passes WITHOUT the libsctp system dependency) and the `sctp` feature
+  # (exercises the gated SIP/Diameter-over-SCTP transport code).
   rust-tests:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: default
+            flags: ""
+            sctp: false
+          - name: sctp
+            flags: "--features sctp"
+            sctp: true
+    name: rust-tests (${{ matrix.name }})
     steps:
       - uses: actions/checkout@v7
 
@@ -23,7 +36,8 @@ jobs:
         with:
           python-version: "3.14-dev"
 
-      - name: Install system dependencies
+      - name: Install SCTP system dependency
+        if: ${{ matrix.sctp }}
         run: sudo apt-get update && sudo apt-get install -y libsctp-dev
 
       - uses: dtolnay/rust-toolchain@stable
@@ -31,7 +45,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: PYO3_PYTHON=python3.14 cargo test
+        run: PYO3_PYTHON=python3.14 cargo test ${{ matrix.flags }}
 
   # ── Clippy lint gate ────────────────────────────────────────────────────
   # Mirrors the rust-tests build env (free-threaded Python 3.14 + libsctp-dev
@@ -57,7 +71,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run clippy
+      # Lint both feature configs: the default build (SCTP off — guards against
+      # unused imports/variables that only surface when the feature is disabled)
+      # and `--all-features` (SCTP on — compiles the gated libsctp code).
+      - name: Run clippy (default features)
+        run: PYO3_PYTHON=python3.14 cargo clippy --all-targets -- -D warnings
+
+      - name: Run clippy (all features)
         run: PYO3_PYTHON=python3.14 cargo clippy --all-targets --all-features -- -D warnings
 
   # ── Python SDK tests ──────────────────────────────────────────────────
@@ -221,9 +241,6 @@ jobs:
         uses: deadsnakes/action@v3.2.0
         with:
           python-version: "3.14-dev"
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsctp-dev
 
       - uses: dtolnay/rust-toolchain@nightly
 
