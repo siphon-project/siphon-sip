@@ -93,7 +93,7 @@ This isn't a replacement for Kamailio or OpenSIPS. It's what happens when someon
 | **TCP Transport** | RFC 3261 §18 | Unit tests, connection pool |
 | **TLS Transport** | RFC 5246 (TLS 1.3) | Unit tests |
 | **WebSocket (WS/WSS)** | RFC 7118 | Unit tests |
-| **SCTP Transport** | RFC 4168 | Unit tests |
+| **SCTP Transport** | RFC 4168 | Unit tests (opt-in `sctp` feature) |
 | **NAT Traversal (rport)** | RFC 3581 | Unit tests |
 | **Outbound / Flow Tokens** | RFC 5626 | Unit tests |
 | **DNS SRV/NAPTR** | RFC 3263 | Unit + integration tests |
@@ -146,6 +146,14 @@ cargo install siphon-sip
 cargo install siphon-sip --features redis-backend,postgres-backend
 ```
 
+**SCTP transport is off by default.** SIP/Diameter-over-SCTP (RFC 4168) links
+the `libsctp` system library and is Linux-only, so it is gated behind the `sctp`
+Cargo feature. Enable it explicitly (and install `libsctp-dev` first on Linux):
+
+```bash
+cargo install siphon-sip --features sctp
+```
+
 ### Option 2: Docker
 
 ```bash
@@ -154,6 +162,11 @@ docker pull ghcr.io/siphon-project/siphon-sip:latest
 # Or build locally
 docker build -t siphon .
 ```
+
+> **Note:** the published Docker image is the default build — it does **not**
+> include SCTP. If you need SIP/Diameter-over-SCTP, build a custom image with the
+> `sctp` feature (add `libsctp-dev`/`libsctp1` and `cargo build --features sctp`
+> to the [Dockerfile](Dockerfile)).
 
 ### Option 3: Debian/Ubuntu (.deb)
 

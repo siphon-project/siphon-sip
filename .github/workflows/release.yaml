@@ -64,9 +64,8 @@ jobs:
         with:
           python-version: "3.14-dev"
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsctp-dev
-
+      # Default release build excludes SCTP (the `sctp` Cargo feature is off by
+      # default), so no libsctp system dependency is needed here.
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -136,9 +135,8 @@ jobs:
         with:
           python-version: "3.14-dev"
 
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libsctp-dev
-
+      # `cargo publish` verifies with default features (SCTP off), so the
+      # libsctp system dependency is not required to publish.
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Authenticate to crates.io (OIDC Trusted Publishing)

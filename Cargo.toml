@@ -66,7 +66,12 @@ rustls-pki-types = { version = "1", features = ["std"] }
 webpki-roots = "1"
 tokio-tungstenite = "0.28"
 futures-util = "0.3"
-tokio-sctp = "0.2"
+# SIP-over-SCTP (RFC 4168) + Diameter-over-SCTP transport. Optional because it
+# links the `libsctp` system library (libsctp-dev to build, libsctp1 at runtime)
+# and needs the kernel SCTP module — most SIP proxy/B2BUA deployments never use
+# it. Gated behind the `sctp` feature (off by default); enable with
+# `--features sctp`.
+tokio-sctp = { version = "0.2", optional = true }
 http = "1"
 
 # Diameter AVP decoding
@@ -150,6 +155,13 @@ rcgen = "0.14"
 default = ["redis-backend", "postgres-backend"]
 redis-backend = ["dep:redis"]
 postgres-backend = ["dep:tokio-postgres"]
+# SIP-over-SCTP + Diameter-over-SCTP transport. Off by default because it pulls
+# the `libsctp` system library and kernel SCTP module; enable with
+# `--features sctp` (CI exercises this via `--all-features`). When disabled, the
+# `Transport::Sctp` enum variant still exists (config still parses), but no SCTP
+# listener is started and a configured `listen.sctp` block is ignored with a
+# loud warning; a Diameter peer with `transport: sctp` errors at connect time.
+sctp = ["dep:tokio-sctp"]
 
 # --- Lint policy ---
 # The codebase is clippy-clean (see `clippy.toml` for the one tuned threshold).
