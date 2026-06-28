@@ -34,7 +34,7 @@ use crate::diameter::server::{CerDecision, ServerHandshake, ServerIdentity};
 use crate::diameter::transport::DiameterListener;
 use crate::diameter::{forward, DiameterClient, DiameterManager};
 use crate::script::api::diameter_server::{PyDiameterAnswer, PyDiameterRequest, PyInboundPeer};
-use crate::script::engine::{run_coroutine_value, HandlerKind, ScriptEngine};
+use crate::script::engine::{run_coroutine_value, HandlerEntry, HandlerKind, ScriptEngine, ScriptState};
 
 /// Global cap on concurrently in-flight inbound requests being relayed.
 const MAX_INFLIGHT: usize = 512;
@@ -585,7 +585,10 @@ fn build_answer_via_handler(
     };
 
     let state = engine.state();
-    let handlers = state.handlers_for(&HandlerKind::DiameterOnRequest);
+    // Route to the most specific @diameter.on_request handler for this
+    // request's (application_id, command_code) — matched by code so the
+    // vocabulary stays consistent with decoration-time validation.
+    let selected = select_request_handler(&state, request_msg.application_id, request_msg.command_code);
     let no_route_answer = || {
         forward::build_answer(
             &request_msg,
@@ -596,7 +599,7 @@ fn build_answer_via_handler(
         )
     };
 
-    let Some(handler) = handlers.first() else {
+    let Some(handler) = selected else {
         let answer = no_route_answer();
         return AnswerOutcome {
             wire: answer.to_wire(),
@@ -700,6 +703,110 @@ fn build_answer_via_handler(
         wire,
         request_py: Some(request_py),
         answer_py: Some(answer_py),
+    }
+}
+
+/// Pick the single best `@diameter.on_request` handler for an inbound
+/// request's `(application_id, command_code)`. A request is answered by at most
+/// one handler, so the **most specific** filter wins: `App:CMD` (2) > `CMD` (1)
+/// > catch-all (0). Ties resolve to the earliest-registered handler.
+fn select_request_handler(
+    state: &ScriptState,
+    application_id: u32,
+    command_code: u32,
+) -> Option<&HandlerEntry> {
+    let mut best: Option<(u8, &HandlerEntry)> = None;
+    for (filter, handler) in state.diameter_request_handlers() {
+        if let Some(score) = request_filter_score(filter, application_id, command_code) {
+            // Strict `>` keeps the earliest-registered handler on ties.
+            if best.map_or(true, |(best_score, _)| score > best_score) {
+                best = Some((score, handler));
+            }
+        }
+    }
+    best.map(|(_, handler)| handler)
+}
+
+/// Score a `@diameter.on_request` filter against an inbound request's
+/// `(application_id, command_code)`, or `None` if it doesn't match. Resolves
+/// tokens via `command_code_by_name` / `app_id_by_name` — the same vocabulary
+/// `@on_request(...)` validates with — so validation and dispatch never drift.
+fn request_filter_score(
+    filter: Option<&str>,
+    application_id: u32,
+    command_code: u32,
+) -> Option<u8> {
+    let Some(filter) = filter else {
+        return Some(0); // catch-all
+    };
+    let (app_token, commands) = match filter.split_once(':') {
+        Some((app, commands)) => (Some(app.trim()), commands),
+        None => (None, filter),
+    };
+    let command_matches = commands
+        .split('|')
+        .any(|token| dictionary::command_code_by_name(token.trim()) == Some(command_code));
+    if !command_matches {
+        return None;
+    }
+    match app_token {
+        Some(app) => match dictionary::app_id_by_name(app) {
+            Some((_, app_id)) if app_id == application_id => Some(2),
+            _ => None,
+        },
+        None => Some(1),
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+    use crate::diameter::dictionary;
+
+    #[test]
+    fn request_filter_score_specificity() {
+        let s6a = dictionary::S6A_APP_ID;
+        let ulr = dictionary::CMD_UPDATE_LOCATION;
+        let air = dictionary::CMD_AUTHENTICATION_INFORMATION;
+
+        // Catch-all matches anything at the lowest score.
+        assert_eq!(request_filter_score(None, s6a, ulr), Some(0));
+        // Bare command (any app) → 1; non-matching command → None.
+        assert_eq!(request_filter_score(Some("ULR"), s6a, ulr), Some(1));
+        assert_eq!(request_filter_score(Some("ULR"), s6a, air), None);
+        // App-qualified → 2, and only for the right app.
+        assert_eq!(request_filter_score(Some("S6a:ULR"), s6a, ulr), Some(2));
+        assert_eq!(request_filter_score(Some("S6a:ULR"), dictionary::CX_APP_ID, ulr), None);
+        // Pipe sets + case/whitespace tolerance.
+        assert_eq!(request_filter_score(Some("ULR|AIR"), s6a, air), Some(1));
+        assert_eq!(request_filter_score(Some(" s6a : ulr | air "), s6a, air), Some(2));
+    }
+
+    #[test]
+    fn request_filter_score_is_case_insensitive() {
+        // App + command tokens lowercase through the dictionary, so any case
+        // works: S6A / S6a / s6a and ULR / ulr all resolve identically.
+        let s6a = dictionary::S6A_APP_ID;
+        let ulr = dictionary::CMD_UPDATE_LOCATION;
+        for filter in ["S6A:ULR", "S6a:ulr", "s6a:ULR", "s6a:ulr", "S6A:UlR"] {
+            assert_eq!(request_filter_score(Some(filter), s6a, ulr), Some(2), "{filter}");
+        }
+        for filter in ["ULR", "ulr", "Ulr"] {
+            assert_eq!(request_filter_score(Some(filter), s6a, ulr), Some(1), "{filter}");
+        }
+    }
+
+    #[test]
+    fn request_filter_score_disambiguates_pur_by_code() {
+        // Sh-PUR (307) vs S6a Purge-UE (321): distinct codes, distinct tokens.
+        let sh = dictionary::SH_APP_ID;
+        let s6a = dictionary::S6A_APP_ID;
+        let sh_pur = dictionary::CMD_SH_PROFILE_UPDATE;
+        let s6a_pur = dictionary::CMD_PURGE_UE;
+        assert_eq!(request_filter_score(Some("Sh:PUR"), sh, sh_pur), Some(2));
+        assert_eq!(request_filter_score(Some("Sh:PUR"), s6a, s6a_pur), None);
+        assert_eq!(request_filter_score(Some("S6a:purge-ue"), s6a, s6a_pur), Some(2));
+        assert_eq!(request_filter_score(Some("S6a:purge-ue"), sh, sh_pur), None);
     }
 }
 

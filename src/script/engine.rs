@@ -87,7 +87,10 @@ pub enum HandlerKind {
     /// `@diameter.on_inbound_cer` — server-mode (DRA) CER identity decision.
     DiameterOnInboundCer,
     /// `@diameter.on_request` — server-mode (DRA) inbound request dispatch.
-    DiameterOnRequest,
+    /// Optional filter: `None` = every command; `"ULR"` / `"ULR|AIR"` = those
+    /// commands (any application); `"S6a:ULR"` = app-qualified. Matched by
+    /// command **code** in `script::dra`, not by this string.
+    DiameterOnRequest(Option<String>),
     /// `@diameter.on_request_completed` — server-mode (DRA) post-answer hook.
     DiameterOnRequestCompleted,
     /// `@sbi.on_event` — incoming PCF event notification (N5).
@@ -161,6 +164,19 @@ impl ScriptState {
                 _ => false,
             })
             .collect()
+    }
+
+    /// All `@diameter.on_request` handlers with their (already-validated)
+    /// filter strings, in registration order. The diameter dispatch layer
+    /// (`script::dra`) scores these against the inbound request by command
+    /// **code** — not name — so the matching vocabulary stays consistent with
+    /// decoration-time validation, and the generic engine stays free of any
+    /// Diameter-dictionary coupling.
+    pub fn diameter_request_handlers(&self) -> impl Iterator<Item = (Option<&str>, &HandlerEntry)> {
+        self.handlers.iter().filter_map(|handler| match &handler.kind {
+            HandlerKind::DiameterOnRequest(filter) => Some((filter.as_deref(), handler)),
+            _ => None,
+        })
     }
 
     /// Return all `RtpEngineOnDtmf` handlers whose optional call-id/from-tag
@@ -766,7 +782,7 @@ fn extract_handlers(
             "srs.on_invite" => HandlerKind::SrsOnInvite,
             "srs.on_session_end" => HandlerKind::SrsOnSessionEnd,
             "diameter.on_inbound_cer" => HandlerKind::DiameterOnInboundCer,
-            "diameter.on_request" => HandlerKind::DiameterOnRequest,
+            "diameter.on_request" => HandlerKind::DiameterOnRequest(filter),
             "diameter.on_request_completed" => HandlerKind::DiameterOnRequestCompleted,
             "sbi.on_event" => HandlerKind::SbiOnEvent,
             "timer.every" => {

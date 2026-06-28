@@ -37,17 +37,27 @@ AVP_USER_NAME = 1            # IMSI
 AVP_VISITED_PLMN_ID = 1407
 
 
-@diameter.on_request
-async def handle(req):
-    """Serve inbound S6a requests as the HSS."""
-    if req.command_name == "AIR":
-        return _handle_air(req)
-    if req.command_name == "ULR":
-        return _handle_ulr(req)
-    if req.command_name == "PUR":
-        return req.answer(DIAMETER_SUCCESS)  # Purge-UE: nothing to return
-    # Anything else this node doesn't serve.
-    return req.reject(DIAMETER_UNABLE_TO_COMPLY, "command not served")
+# Per-command filters scope each handler (mirrors @proxy.on_request("INVITE")).
+# The app-qualified "<app>:<cmd>" form keeps these from matching the same
+# command code on another application; the most specific filter wins. App and
+# command names are case-insensitive — lowercase app names ("s6a", "cx", "sh",
+# …) match the config's `application:` convention. Names are validated at
+# decoration time, so a typo raises instead of silently never firing.
+# "purge-ue" (not "PUR") targets S6a Purge-UE (321) — "PUR" is Sh's
+# Profile-Update (307).
+@diameter.on_request("s6a:AIR")
+async def on_air(req):
+    return _handle_air(req)
+
+
+@diameter.on_request("s6a:ULR")
+async def on_ulr(req):
+    return _handle_ulr(req)
+
+
+@diameter.on_request("s6a:purge-ue")
+async def on_purge_ue(req):
+    return req.answer(DIAMETER_SUCCESS)  # Purge-UE: nothing to return
 
 
 def _handle_air(req):

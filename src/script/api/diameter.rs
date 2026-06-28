@@ -354,6 +354,86 @@ fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
     p == pattern.len()
 }
 
+/// Register a `@diameter.on_request` handler with an optional command filter
+/// (stored as the registry's filter field, mirroring `@proxy.on_request`).
+fn register_on_request(
+    python: Python<'_>,
+    func: &Bound<'_, PyAny>,
+    filter: Option<&str>,
+) -> PyResult<()> {
+    let asyncio = python.import("asyncio")?;
+    let is_async = asyncio
+        .call_method1("iscoroutinefunction", (func,))?
+        .is_truthy()?;
+    let registry = python.import("_siphon_registry")?;
+    let filter_obj: Bound<'_, PyAny> = match filter {
+        Some(value) => value.into_pyobject(python)?.into_any(),
+        None => python.None().into_bound(python),
+    };
+    registry.call_method1("register", ("diameter.on_request", filter_obj, func, is_async))?;
+    Ok(())
+}
+
+/// Build a decorator closure that registers its argument as a
+/// `@diameter.on_request` handler scoped by `filter`.
+fn make_on_request_decorator(
+    python: Python<'_>,
+    filter: Option<String>,
+) -> PyResult<Bound<'_, PyAny>> {
+    let closure = pyo3::types::PyCFunction::new_closure(
+        python,
+        None,
+        None,
+        move |args: &Bound<'_, pyo3::types::PyTuple>,
+              _kwargs: Option<&Bound<'_, PyDict>>|
+              -> PyResult<Py<PyAny>> {
+            let py = args.py();
+            let func = args.get_item(0)?;
+            register_on_request(py, &func, filter.as_deref())?;
+            Ok(func.unbind())
+        },
+    )?;
+    Ok(closure.into_any())
+}
+
+/// Validate a `@diameter.on_request` filter (`"App:CMD[|CMD…]"` or
+/// `"CMD[|CMD…]"`) at decoration time — unknown app/command names raise, so a
+/// typo fails loudly instead of registering a handler that never fires. Uses
+/// the same vocabulary (`command_code_by_name` / `app_id_by_name`) the dispatch
+/// resolves against.
+fn validate_request_filter(filter: &str) -> PyResult<()> {
+    let (app, commands) = match filter.split_once(':') {
+        Some((app, commands)) => (Some(app.trim()), commands),
+        None => (None, filter),
+    };
+    if let Some(app) = app {
+        if dictionary::app_id_by_name(app).is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown Diameter application in on_request filter: {app:?}"
+            )));
+        }
+    }
+    let mut saw_command = false;
+    for command in commands.split('|') {
+        let command = command.trim();
+        if command.is_empty() {
+            continue;
+        }
+        saw_command = true;
+        if dictionary::command_code_by_name(command).is_none() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown Diameter command in on_request filter: {command:?}"
+            )));
+        }
+    }
+    if !saw_command {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "empty on_request filter",
+        ));
+    }
+    Ok(())
+}
+
 /// Python-visible event sink (`diameter.event_sink`). `emit(row: dict)`
 /// serializes via `json.dumps` and forwards to the Rust batch writer.
 #[pyclass(name = "DiameterEventSink")]
@@ -1162,36 +1242,49 @@ impl PyDiameter {
 
     /// Register the server-mode (DRA) inbound-request dispatcher.
     ///
-    /// Called for every inbound request (R-bit set) from an authenticated
-    /// peer. Return ``req.reject(code)``, ``await req.forward_to(peer, …)``, or
-    /// ``None`` (→ the DRA answers DIAMETER_UNABLE_TO_DELIVER, 3002).
+    /// Called for inbound requests (R-bit set) from an authenticated peer.
+    /// Return ``req.reject(code)``, ``await req.forward_to(peer, …)``,
+    /// ``req.answer(code)``, or ``None`` (→ DIAMETER_UNABLE_TO_DELIVER, 3002).
+    ///
+    /// An optional filter scopes the handler to specific commands, mirroring
+    /// ``@proxy.on_request("INVITE")``:
+    ///   - bare ``@diameter.on_request`` — every command (the DRA relay catch-all)
+    ///   - ``@diameter.on_request("ULR")`` — that command, any application
+    ///   - ``@diameter.on_request("ULR|AIR")`` — several commands
+    ///   - ``@diameter.on_request("S6a:ULR")`` — app-qualified. The most specific
+    ///     matching handler wins (``App:CMD`` > ``CMD`` > catch-all).
+    /// App/command names are validated at decoration time (typos raise).
     ///
     /// ```python,ignore
-    /// @diameter.on_request
-    /// async def handle(req):
-    ///     pool = diameter.peer_pool(req.peer.tenant, _route(req).destinations)
-    ///     peer = pool.pick_round_robin()
-    ///     if peer is None:
-    ///         return req.reject(3002)
-    ///     return await req.forward_to(peer)
+    /// @diameter.on_request("S6a:ULR")
+    /// async def update_location(req):
+    ///     return req.answer(2001)
     /// ```
     #[staticmethod]
-    fn on_request(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
-        let asyncio = python.import("asyncio")?;
-        let is_async = asyncio
-            .call_method1("iscoroutinefunction", (func.bind(python),))?
-            .is_truthy()?;
-        let registry = python.import("_siphon_registry")?;
-        registry.call_method1(
-            "register",
-            (
-                "diameter.on_request",
-                python.None(),
-                func.bind(python),
-                is_async,
-            ),
-        )?;
-        Ok(func)
+    #[pyo3(signature = (arg=None))]
+    fn on_request<'py>(
+        python: Python<'py>,
+        arg: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        match arg {
+            // Bare decorator: @diameter.on_request  (arg is the handler).
+            Some(value) if value.is_callable() => {
+                register_on_request(python, &value, None)?;
+                Ok(value)
+            }
+            // Filtered: @diameter.on_request("S6a:ULR") → returns a decorator.
+            Some(value) => {
+                let filter: String = value.extract().map_err(|_| {
+                    pyo3::exceptions::PyTypeError::new_err(
+                        "diameter.on_request expects a handler function or a filter string",
+                    )
+                })?;
+                validate_request_filter(&filter)?;
+                make_on_request_decorator(python, Some(filter))
+            }
+            // @diameter.on_request() with empty parens → catch-all decorator.
+            None => make_on_request_decorator(python, None),
+        }
     }
 
     /// Register the server-mode (DRA) post-answer hook.

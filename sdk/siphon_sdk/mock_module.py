@@ -3450,24 +3450,31 @@ class MockDiameter:
         return fn
 
     @staticmethod
-    def on_request(fn: Any) -> Any:
+    def on_request(arg: Any = None) -> Any:
         """Register the server-mode (DRA) inbound-request dispatcher.
 
-        Called for every inbound request (R-bit set). Return
-        ``req.reject(code)``, ``await req.forward_to(peer, ...)``, or ``None``
-        (→ the DRA answers DIAMETER_UNABLE_TO_DELIVER, 3002).
+        Called for inbound requests (R-bit set). Return ``req.reject(code)``,
+        ``await req.forward_to(peer, ...)``, ``req.answer(code)``, or ``None``
+        (→ DIAMETER_UNABLE_TO_DELIVER, 3002).
+
+        An optional command filter scopes the handler (mirrors
+        ``@proxy.on_request("INVITE")``): bare ``@diameter.on_request`` (all),
+        ``@diameter.on_request("ULR")``, ``"ULR|AIR"``, or app-qualified
+        ``"S6a:ULR"``. The mock treats it as an identity decorator either way.
 
         Example::
 
-            @diameter.on_request
-            async def handle(req):
-                pool = diameter.peer_pool(req.peer.tenant, ["hss"])
-                peer = pool.pick_round_robin()
-                if peer is None:
-                    return req.reject(3002)
-                return await req.forward_to(peer)
+            @diameter.on_request("S6a:ULR")
+            async def update_location(req):
+                return req.answer(2001)
         """
-        return fn
+        # Bare form: @diameter.on_request  (arg is the handler).
+        if callable(arg):
+            return arg
+        # Filtered form: @diameter.on_request("S6a:ULR") → returns a decorator.
+        def _decorator(fn: Any) -> Any:
+            return fn
+        return _decorator
 
     @staticmethod
     def on_request_completed(fn: Any) -> Any:
