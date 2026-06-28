@@ -199,15 +199,14 @@ impl SipMessage {
             }
         }
         
-        // Headers
-        for name in self.headers.names() {
-            if let Some(values) = self.headers.get_all(&name.to_lowercase()) {
-                for value in values {
-                    result.extend_from_slice(name.as_bytes());
-                    result.extend_from_slice(b": ");
-                    result.extend_from_slice(value.as_bytes());
-                    result.extend_from_slice(b"\r\n");
-                }
+        // Headers — one pass over the map, original-cased name + values
+        // together (no per-header re-lowercase + re-lookup).
+        for (name, values) in self.headers.iter_original() {
+            for value in values {
+                result.extend_from_slice(name.as_bytes());
+                result.extend_from_slice(b": ");
+                result.extend_from_slice(value.as_bytes());
+                result.extend_from_slice(b"\r\n");
             }
         }
         

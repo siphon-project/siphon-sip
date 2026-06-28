@@ -24,6 +24,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
     connect with `ErrorKind::Unsupported` (no silent fallback to TCP).
   - CI builds and tests both configurations (default and `--features sctp`).
 
+### Performance
+- `SipHeaders` now stores one `IndexMap<String, (String, Vec<String>)>` (lowercase
+  key → original-cased name + values) instead of two parallel maps. This removes a
+  per-header key-clone + hash-insert on the parse path, halves the copy-on-write
+  clone, and serializes in a single pass. Criterion microbenches: SIP parse −30%,
+  serialize −50%, full parse→serialize roundtrip −33%, first header write −20%.
+  No public API change; serialized output is byte-identical (RFC 4475 + proptest
+  roundtrips unchanged).
+
 ### Internal
 - Criterion microbenchmarks for the per-message / per-call hot paths, one bench
   file per path: `sip_hot_path` (parse/serialize/header/txn-key), `sdp_hot_path`
