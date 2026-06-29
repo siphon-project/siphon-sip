@@ -6,6 +6,39 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **Native `siphon-rtp` media backend (JSON-over-TCP).** siphon can now drive
+  the in-house `siphon-rtp` media engine over its native control protocol — a
+  persistent TCP connection carrying length-prefixed JSON frames — as an
+  alternative to the rtpengine NG/bencode-over-UDP engine. Select it per
+  deployment:
+  ```yaml
+  media:
+    backend: siphon-rtp            # default: rtpengine
+    siphon_rtp:
+      address: "127.0.0.1:8080"
+      control_secret: "${SIPHON_RTP_CONTROL_SECRET}"   # optional
+      timeout_ms: 2000
+  ```
+  - Reliable transport with request/response correlation, an optional
+    shared-secret auth handshake, and automatic reconnect with backoff (siphon
+    boots even when the engine is down; commands issued before the connection is
+    up wait for it, up to their timeout).
+  - **Server-pushed events** (DTMF, media-timeout) arrive on the same control
+    connection and flow through the existing event path, so
+    `@rtpengine.on_dtmf` handlers work unchanged regardless of backend.
+  - The Python `rtpengine` scripting API and all media profiles are **unchanged**
+    — only the transport underneath differs.
+  - **Full HA / load-balancing parity with rtpengine:** `media.siphon_rtp`
+    accepts either a single `address` or an `instances:` list with weights, using
+    weighted round-robin plus per-call-id connection affinity (every command for
+    a call stays on one connection). Per-instance health is probed and exported
+    alongside the existing rtpengine health metrics.
+  - **Backward compatible:** the default backend remains `rtpengine`; existing
+    `media.rtpengine` configs are untouched. SIPREC/MPTY subscriptions are not
+    yet implemented on `siphon-rtp` and surface a clear engine error there.
+  - Depends on the published `siphon-rtp-proto` crate (the shared wire contract).
+
 ### Changed
 - **SCTP is now an opt-in build feature, off by default.** SIP-over-SCTP
   (RFC 4168) and Diameter-over-SCTP link the `libsctp` system library, which

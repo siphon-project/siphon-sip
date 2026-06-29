@@ -132,8 +132,10 @@ This document tracks the maturity of every SIPhon feature across three readiness
 
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
-| RTPEngine integration (NG protocol) | **Production** | `media.rtpengine` | Single or multi-instance |
+| RTPEngine integration (NG protocol) | **Production** | `media.rtpengine` | Single or multi-instance; `media.backend: rtpengine` (default) |
 | RTPEngine load balancing | Implemented | `media.rtpengine.instances[]` | Weighted distribution |
+| Native siphon-rtp backend (JSON/TCP) | Implemented | `media.backend: siphon-rtp` + `media.siphon_rtp` | Persistent TCP control, auth handshake, reconnect, server-pushed DTMF/media-timeout events; same `rtpengine` API/profiles. SIPREC/MPTY not yet supported on this engine. Validate end-to-end against a live siphon-rtp daemon. |
+| Native siphon-rtp load balancing | Implemented | `media.siphon_rtp.instances[]` | Weighted round-robin + per-call-id connection affinity; per-instance health probes (parity with rtpengine) |
 | Built-in profile: SRTP↔RTP | Implemented | `srtp_to_rtp` | SRTP UE ↔ RTP core |
 | Built-in profile: WS↔RTP | Implemented | `ws_to_rtp` | WebSocket UE ↔ RTP core |
 | Built-in profile: WSS↔RTP | Implemented | `wss_to_rtp` | DTLS-SRTP/AVPF + ICE ↔ RTP |

@@ -15,8 +15,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use tracing::{debug, warn};
 
-use crate::rtpengine::client::{PlayMediaSource, RtpEngineSet};
+use crate::rtpengine::client::PlayMediaSource;
 use crate::rtpengine::profile::ProfileRegistry;
+use crate::rtpengine::MediaBackend;
 use crate::rtpengine::session::{MediaSession, MediaSessionStore};
 use crate::sip::message::SipMessage;
 
@@ -29,14 +30,14 @@ use super::request::PyRequest;
 /// Injected as `siphon.rtpengine` when media config is present.
 #[pyclass(name = "RtpEngineNamespace")]
 pub struct PyRtpEngine {
-    client: Arc<RtpEngineSet>,
+    client: Arc<MediaBackend>,
     sessions: Arc<MediaSessionStore>,
     registry: Arc<ProfileRegistry>,
 }
 
 impl PyRtpEngine {
     pub fn new(
-        client: Arc<RtpEngineSet>,
+        client: Arc<MediaBackend>,
         sessions: Arc<MediaSessionStore>,
         registry: Arc<ProfileRegistry>,
     ) -> Self {
