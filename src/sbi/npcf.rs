@@ -188,6 +188,14 @@ pub struct NpcfClient {
     base_url: String,
     client: reqwest::Client,
     communication: crate::sbi::Communication,
+    /// Local registry of app-sessions this client created and has not yet
+    /// deleted, keyed by app-session id. Drives the
+    /// `siphon_sbi_npcf_app_sessions_active` gauge and is the leak surface a
+    /// missed `delete_session` shows up in. Complementary to — not a replacement
+    /// for — the script's Redis call_id↔session correlation used for HA across
+    /// replicas; this one tracks only what *this* process created, for the gauge
+    /// and orphan visibility.
+    sessions: dashmap::DashMap<String, std::time::Instant>,
 }
 
 impl NpcfClient {
@@ -198,6 +206,7 @@ impl NpcfClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             client,
             communication: crate::sbi::Communication::Direct,
+            sessions: dashmap::DashMap::new(),
         }
     }
 
@@ -206,6 +215,23 @@ impl NpcfClient {
     pub fn with_communication(mut self, communication: crate::sbi::Communication) -> Self {
         self.communication = communication;
         self
+    }
+
+    /// Number of app-sessions this client currently tracks (created and not yet
+    /// deleted). Backs the `siphon_sbi_npcf_app_sessions_active` gauge and the
+    /// per-module leak test.
+    pub fn active_app_sessions(&self) -> usize {
+        self.sessions.len()
+    }
+
+    /// Publish the live app-session count to Prometheus. No-op when metrics are
+    /// not initialised (tests / CLI).
+    fn publish_session_gauge(&self) {
+        if let Some(metrics) = crate::metrics::try_metrics() {
+            metrics
+                .sbi_npcf_app_sessions_active
+                .set(self.sessions.len() as i64);
+        }
     }
 
     /// Create a new app session (POST /npcf-policyauthorization/v1/app-sessions).
@@ -276,11 +302,19 @@ impl NpcfClient {
             .map(app_session_id_from_location)
             .unwrap_or_default();
 
-        Ok(CreatedAppSession {
+        let created = CreatedAppSession {
             app_session_id,
             authorized: true,
             location,
-        })
+        };
+        // Track locally so the active-session gauge reflects the N5 sessions
+        // this NF holds; a missed delete then surfaces as gauge growth.
+        if !created.app_session_id.is_empty() {
+            self.sessions
+                .insert(created.app_session_id.clone(), std::time::Instant::now());
+            self.publish_session_gauge();
+        }
+        Ok(created)
     }
 
     /// Delete an app session.
@@ -307,6 +341,10 @@ impl NpcfClient {
         if !response.status().is_success() && response.status().as_u16() != 204 {
             return Err(SbiError::HttpError(response.status().as_u16()));
         }
+        // Session is gone PCF-side — drop the local tracking entry.
+        self.sessions
+            .remove(&app_session_id_from_location(session_ref));
+        self.publish_session_gauge();
         Ok(())
     }
 
@@ -937,6 +975,85 @@ mod tests {
     }
 
     // --- Delete (TS 29.514 §5.6.2.4: POST {resource}/delete → 204) ---
+
+    /// Router for the app-session leak test: each create mints a unique
+    /// app-session id (so the store can grow), and any `.../{id}/delete` returns
+    /// 204 — the spec-correct create (201 + Location) and custom-delete shapes.
+    fn leak_create_delete_router() -> axum::Router {
+        use axum::routing::post;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        axum::Router::new()
+            .route(
+                "/npcf-policyauthorization/v1/app-sessions",
+                post(move || {
+                    let counter = Arc::clone(&counter);
+                    async move {
+                        let n = counter.fetch_add(1, Ordering::Relaxed);
+                        (
+                            axum::http::StatusCode::CREATED,
+                            [(
+                                "location",
+                                format!("/npcf-policyauthorization/v1/app-sessions/sess-{n}"),
+                            )],
+                            "",
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/npcf-policyauthorization/v1/app-sessions/{id}/delete",
+                post(|| async { axum::http::StatusCode::NO_CONTENT }),
+            )
+    }
+
+    /// Leak guard for the N5/Npcf app-session registry: `create_session` inserts,
+    /// `delete_session` removes, so a full create→delete cycle MUST leave the
+    /// store empty. A regression — or a script that misses a delete — surfaces as
+    /// growth in `active_app_sessions()` and the
+    /// `siphon_sbi_npcf_app_sessions_active` gauge (the stranded early-media Rx/N5
+    /// session the P-CSCF guards against). The store IS the leak surface here.
+    #[tokio::test]
+    async fn app_session_store_drains_on_create_delete() {
+        let base = spawn_mock(leak_create_delete_router()).await;
+        let client = NpcfClient::new(&base, reqwest::Client::new());
+        let request = AppSessionContextReqData::default();
+
+        // Phase 1 — create without deleting: the store must hold every session.
+        let mut locations = Vec::new();
+        for _ in 0..50 {
+            let created = client.create_app_session(None, &request).await.unwrap();
+            locations.push(created.location.expect("create returns a Location"));
+        }
+        assert_eq!(
+            client.active_app_sessions(),
+            50,
+            "every created app-session must be tracked"
+        );
+
+        // Phase 2 — delete each: the store must drain back to empty.
+        for location in &locations {
+            client.delete_app_session(location).await.unwrap();
+        }
+        assert_eq!(
+            client.active_app_sessions(),
+            0,
+            "store must drain to empty once every session is deleted"
+        );
+
+        // Phase 3 — many full create→delete cycles stay flat at zero.
+        for _ in 0..200 {
+            let created = client.create_app_session(None, &request).await.unwrap();
+            let location = created.location.expect("create returns a Location");
+            client.delete_app_session(&location).await.unwrap();
+        }
+        assert_eq!(
+            client.active_app_sessions(),
+            0,
+            "store must not grow across repeated create→delete cycles"
+        );
+    }
 
     /// A router that serves ONLY the spec-correct custom delete operation
     /// (`POST .../app-sessions/sess-1/delete` → 204 No Content) and records the

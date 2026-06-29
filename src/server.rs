@@ -310,6 +310,59 @@ impl SiphonServer {
             init_logging(&config.log)
         };
 
+        // --- Allocator tuning (glibc arena cap + periodic trim) ---
+        // Applied as early as possible so the arena cap takes effect before the
+        // Python/script workload starts creating glibc arenas. The
+        // `siphon_glibc_*` gauges are always on regardless; this only bounds the
+        // pool. No-op off glibc.
+        if let Some(memory) = config.memory.as_ref() {
+            if let Some(arena_max) = memory.glibc.arena_max {
+                if crate::metrics::glibc::set_arena_max(arena_max) {
+                    tracing::info!(arena_max, "glibc M_ARENA_MAX cap applied");
+                } else {
+                    tracing::warn!(
+                        arena_max,
+                        "glibc M_ARENA_MAX cap not applied (non-glibc target or mallopt rejected it)"
+                    );
+                }
+            }
+            let trim_interval = memory.glibc.trim_interval_secs;
+            if trim_interval > 0 {
+                tokio::spawn(async move {
+                    let mut ticker =
+                        tokio::time::interval(std::time::Duration::from_secs(trim_interval));
+                    ticker.tick().await; // consume the immediate first tick
+                    loop {
+                        ticker.tick().await;
+                        let released = crate::metrics::glibc::trim();
+                        tracing::debug!(released, "periodic glibc malloc_trim(0)");
+                    }
+                });
+            }
+        }
+
+        // SIGUSR2 → dump the full glibc `malloc_info` XML to the log for
+        // call-site attribution (which arena, how fragmented). A passive
+        // diagnostic, always installed on Unix; pair with heaptrack
+        // (`PYTHONMALLOC=malloc`) under load to name a true raw-domain leak.
+        #[cfg(unix)]
+        tokio::spawn(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut stream = match signal(SignalKind::user_defined2()) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::warn!(%error, "could not install SIGUSR2 glibc malloc_info handler");
+                    return;
+                }
+            };
+            while stream.recv().await.is_some() {
+                match crate::metrics::glibc::malloc_info_xml() {
+                    Some(xml) => tracing::info!("glibc malloc_info dump (SIGUSR2):\n{xml}"),
+                    None => tracing::info!("glibc malloc_info unavailable (non-glibc target)"),
+                }
+            }
+        });
+
         let script_desc = if self.embedded_script.is_some() || self.embedded_bytecode.is_some() {
             "<embedded>".to_owned()
         } else {
