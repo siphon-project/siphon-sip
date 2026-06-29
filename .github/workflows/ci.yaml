@@ -80,6 +80,34 @@ jobs:
       - name: Run clippy (all features)
         run: PYO3_PYTHON=python3.14 cargo clippy --all-targets --all-features -- -D warnings
 
+  # ── Criterion bench compile gate ─────────────────────────────────────────
+  # Keep the per-message hot-path criterion benches (benches/sip_hot_path.rs)
+  # compiling so they never bit-rot. The hard ">10% regression fails" gate is
+  # deliberately NOT run here: absolute timings on shared GitHub runners are too
+  # noisy to gate on. That gate runs at release-cut on the same fixed hardware
+  # as the README throughput table (scripts/bench_regression.sh, wired into
+  # scripts/cut-release.sh). Mirrors rust-tests' build env (the crate links
+  # PyO3, so the benches need free-threaded Python 3.14 + libsctp-dev to build).
+  benches:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Python 3.14 (free-threaded)
+        uses: deadsnakes/action@v3.2.0
+        with:
+          python-version: "3.14-dev"
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsctp-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Compile benches (no run)
+        run: PYO3_PYTHON=python3.14 cargo bench --no-run --all-features
+
   # ── Python SDK tests ──────────────────────────────────────────────────
   sdk-tests:
     runs-on: ubuntu-latest

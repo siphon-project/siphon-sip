@@ -27,10 +27,16 @@ exclude = [
 [lib]
 name = "siphon"
 path = "src/lib.rs"
+# Disable the default libtest bench harness on the lib/bin: they carry no
+# `#[bench]` fns, and leaving it on makes `cargo bench --benches` run an empty
+# libtest harness that rejects criterion's CLI flags (--measurement-time, …).
+# The criterion `[[bench]]` targets below still link the lib normally.
+bench = false
 
 [[bin]]
 name = "siphon"
 path = "src/main.rs"
+bench = false
 
 [dependencies]
 # Async runtime
@@ -150,6 +156,35 @@ proptest = "1"
 tokio-test = "0.4"
 tempfile = "3"
 rcgen = "0.14"
+# Per-message hot-path microbenchmarks (benches/sip_hot_path.rs). The
+# release-cut gate (scripts/cut-release.sh) runs these via `critcmp` against a
+# committed baseline; CI only proves they compile (`cargo bench --no-run`).
+criterion = "0.5"
+
+# Criterion perf gates for the per-message / per-call hot paths. `harness =
+# false` hands `main` to criterion instead of the libtest harness. The
+# release-cut gate (scripts/bench_regression.sh) runs every [[bench]] target via
+# `cargo bench --benches` and auto-discovers each benchmark id, so adding a new
+# bench file here needs no other wiring.
+[[bench]]
+name = "sip_hot_path"      # SIP parse / serialize / header touch / txn keying
+harness = false
+
+[[bench]]
+name = "sdp_hot_path"      # SDP parse / codec-filter / serialize (per call)
+harness = false
+
+[[bench]]
+name = "diameter_codec"    # Diameter AVP encode + message decode (IMS Cx/Rf/Rx)
+harness = false
+
+[[bench]]
+name = "rtpengine_bencode" # rtpengine NG bencode encode / decode (media anchor)
+harness = false
+
+[[bench]]
+name = "crypto"            # Milenage AKA + digest response (per auth)
+harness = false
 
 [features]
 default = ["redis-backend", "postgres-backend"]

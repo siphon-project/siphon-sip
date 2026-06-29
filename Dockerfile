@@ -64,6 +64,11 @@ WORKDIR /build
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
+# benches/ holds the criterion [[bench]] targets declared in Cargo.toml; cargo
+# validates those files exist (they are explicit targets, unlike auto-discovered
+# tests/), so the manifest won't parse without them even though the image never
+# runs them.
+COPY benches/ benches/
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ── Build dependencies (cached until Cargo.toml/lock change) ─────────────────
@@ -74,6 +79,7 @@ RUN cargo chef cook --release --recipe-path recipe.json
 # Build the real binary
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
+COPY benches/ benches/
 RUN cargo build --release
 
 # ── Runtime stage ────────────────────────────────────────────────────────────

@@ -24,6 +24,19 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
     connect with `ErrorKind::Unsupported` (no silent fallback to TCP).
   - CI builds and tests both configurations (default and `--features sctp`).
 
+### Internal
+- Criterion microbenchmarks for the per-message / per-call hot paths, one bench
+  file per path: `sip_hot_path` (parse/serialize/header/txn-key), `sdp_hot_path`
+  (parse/filter/serialize), `diameter_codec` (AVP encode + message decode),
+  `rtpengine_bencode` (NG offer encode/decode), and `crypto` (Milenage AKA +
+  digest response assembly). They isolate the individual costs the SIPp
+  throughput baseline averages over.
+- Release-cut regression gate (`scripts/bench_regression.sh`, wired into
+  `scripts/cut-release.sh`): fails on >10% slowdown vs the committed
+  `benches/baseline.json`. Self-contained (reads criterion's own `estimates.json`,
+  no `critcmp`/`jq`). CI proves the benches compile; the hard timing gate runs at
+  release cut on fixed hardware, where absolute timings are meaningful.
+
 ## [1.0.0] — 2026-06-26
 
 First stable release. A love letter to Kamailio and OpenSIPS — their proven
