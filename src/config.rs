@@ -777,9 +777,9 @@ pub struct DiameterConfig {
     /// Folded into the implicit `"default"` tenant.
     #[serde(default)]
     pub connect_to: Vec<DiameterServerEntry>,
-    /// Per-tenant identity + peer tables + opaque routes. Optional — the common
-    /// single-domain case omits this and uses the flat `clients` / `servers` /
-    /// `connect_to` fields above instead.
+    /// Per-tenant identity + peer tables. Optional — the common single-domain
+    /// case omits this and uses the flat `clients` / `servers` / `connect_to`
+    /// fields above instead.
     #[serde(default)]
     pub tenants: std::collections::HashMap<String, DiameterTenant>,
     /// Generic event sink for Python-emitted signalling events.
@@ -818,7 +818,6 @@ impl DiameterConfig {
                 clients: self.clients.clone(),
                 servers: self.servers.clone(),
                 connect_to: self.connect_to.clone(),
-                routes: serde_json::Value::Null,
             },
         );
         tenants
@@ -836,8 +835,11 @@ pub struct DiameterListenConfig {
     pub sctp: Option<String>,
 }
 
-/// A Diameter server tenant: its advertised identity, inbound clients, outbound servers,
-/// and an opaque routing table consumed by the Python dispatch script.
+/// A Diameter server tenant: its advertised identity, inbound clients, and
+/// outbound servers. siphon does no routing — where a request goes is decided
+/// by the script (`@diameter.on_request` + `forward_to`), so there is no
+/// routing table here; the script sources its own (constants, a cache, an
+/// external store, …).
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct DiameterTenant {
     pub identity: DiameterTenantIdentity,
@@ -853,9 +855,6 @@ pub struct DiameterTenant {
     /// direction is independent of the request direction (RFC 6733 §2.1).
     #[serde(default)]
     pub connect_to: Vec<DiameterServerEntry>,
-    /// Opaque to siphon — surfaced verbatim to scripts via `diameter.config`.
-    #[serde(default)]
-    pub routes: serde_json::Value,
 }
 
 /// The (origin_host, origin_realm) a tenant advertises in its CEA.
@@ -4169,8 +4168,6 @@ diameter:
           expected_origin_host: "mme.epc.example.org"
       servers:
         - { name: hss, host: "172.16.0.61", port: 3868, transport: tcp }
-      routes:
-        - { application: s6c, destinations: ["hss"] }
 "#;
         let config = Config::from_str(yaml).expect("Diameter server config should parse");
         let diameter = config.diameter.expect("diameter section");
@@ -4186,11 +4183,6 @@ diameter:
         assert_eq!(tenant.clients[0].allowed_ips, vec!["172.16.0.0/24"]);
         assert_eq!(tenant.servers[0].name, "hss");
         assert_eq!(tenant.servers[0].port, 3868);
-
-        // Opaque routes survive as JSON and re-serialize (for diameter.config).
-        let snapshot = serde_json::json!({ "tenants": &diameter.tenants }).to_string();
-        assert!(snapshot.contains("\"application\":\"s6c\""));
-        assert!(snapshot.contains("hss"));
 
         let event_sink = diameter.event_sink.expect("event_sink");
         assert_eq!(event_sink.backend, "file");
@@ -4215,14 +4207,14 @@ diameter:
         origin_host: "hss.epc.example.org"
         origin_realm: "epc.example.org"
       connect_to:
-        - { name: dra, host: "172.16.0.10", port: 3868, transport: sctp }
+        - { name: upstream, host: "172.16.0.10", port: 3868, transport: sctp }
 "#;
         let config = Config::from_str(yaml).expect("HSS connect_to config should parse");
         let diameter = config.diameter.expect("diameter section");
         assert!(diameter.listen.is_none(), "HSS dials out, no listener");
         let tenant = diameter.tenants.get("default").unwrap();
         assert_eq!(tenant.connect_to.len(), 1);
-        assert_eq!(tenant.connect_to[0].name, "dra");
+        assert_eq!(tenant.connect_to[0].name, "upstream");
         assert_eq!(tenant.connect_to[0].transport, "sctp");
     }
 

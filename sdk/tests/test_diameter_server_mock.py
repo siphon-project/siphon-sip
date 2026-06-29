@@ -19,11 +19,10 @@ def test_on_inbound_cer_and_config():
             "tenants": {
                 "default": {
                     "identity": {
-                        "origin_host": "dra.epc.example.org",
+                        "origin_host": "diam.epc.example.org",
                         "origin_realm": "epc.example.org",
                     },
                     "clients": [{"name": "mme", "allowed_ips": ["10.0.0.0/24"]}],
-                    "routes": [{"application": "s6c", "destinations": ["hss"]}],
                 }
             }
         }
@@ -37,7 +36,7 @@ def test_on_inbound_cer_and_config():
         return identity["origin_host"], identity["origin_realm"]
 
     result = cer_received("10.0.0.5", "mme", "mme.epc.example.org")
-    assert result == ("dra.epc.example.org", "epc.example.org")
+    assert result == ("diam.epc.example.org", "epc.example.org")
 
 
 def test_peer_pool_round_robin_and_liveness():

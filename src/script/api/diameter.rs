@@ -1300,7 +1300,7 @@ impl PyDiameter {
     /// ```python,ignore
     /// @diameter.on_reply
     /// def hide_topology(req, answer):
-    ///     answer.set_avp("Origin-Host", b"dra.example.net")
+    ///     answer.set_avp("Origin-Host", b"diam.example.net")
     /// ```
     #[staticmethod]
     fn on_reply(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {

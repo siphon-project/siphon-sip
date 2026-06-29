@@ -71,11 +71,11 @@ pub fn rewrite_origin(msg: &mut DiameterMsg, origin_host: &str, origin_realm: &s
 /// Prepare an inbound request for forwarding: detect a loop through us, then
 /// append our Route-Record. Returns [`ForwardError::LoopDetected`] when our
 /// identity is already present.
-pub fn prepare_forward(msg: &mut DiameterMsg, dra_identity: &str) -> Result<(), ForwardError> {
-    if has_route_record(msg, dra_identity) {
+pub fn prepare_forward(msg: &mut DiameterMsg, local_identity: &str) -> Result<(), ForwardError> {
+    if has_route_record(msg, local_identity) {
         return Err(ForwardError::LoopDetected);
     }
-    append_route_record(msg, dra_identity);
+    append_route_record(msg, local_identity);
     Ok(())
 }
 
@@ -187,7 +187,7 @@ mod tests {
     #[test]
     fn rewrite_origin_replaces_in_place() {
         let mut msg = sample_request();
-        rewrite_origin(&mut msg, "diam.example.org", "dra-realm.org");
+        rewrite_origin(&mut msg, "diam.example.org", "diam-realm.org");
         assert_eq!(msg.find_all(avp::ORIGIN_HOST, 0).count(), 1);
         assert_eq!(
             msg.get_str(avp::ORIGIN_HOST).as_deref(),
@@ -195,7 +195,7 @@ mod tests {
         );
         assert_eq!(
             msg.get_str(avp::ORIGIN_REALM).as_deref(),
-            Some("dra-realm.org")
+            Some("diam-realm.org")
         );
     }
 
@@ -205,9 +205,9 @@ mod tests {
         let answer = build_answer(
             &request,
             "diam.example.org",
-            "dra-realm.org",
+            "diam-realm.org",
             dictionary::DIAMETER_LOOP_DETECTED,
-            Some("loop via dra"),
+            Some("loop detected"),
         );
         assert!(!answer.is_request(), "answer must clear the R-bit");
         assert!(answer.is_proxiable(), "P-bit mirrors the request");
@@ -225,7 +225,7 @@ mod tests {
             answer.get_str(avp::ORIGIN_HOST).as_deref(),
             Some("diam.example.org")
         );
-        assert_eq!(answer.get_str(avp::ERROR_MESSAGE).as_deref(), Some("loop via dra"));
+        assert_eq!(answer.get_str(avp::ERROR_MESSAGE).as_deref(), Some("loop detected"));
     }
 
     #[test]
@@ -234,7 +234,7 @@ mod tests {
         let answer = build_answer(
             &request,
             "diam.example.org",
-            "dra-realm.org",
+            "diam-realm.org",
             dictionary::DIAMETER_SUCCESS,
             None,
         );
@@ -281,7 +281,7 @@ mod tests {
         let answer = build_answer(
             &request,
             "diam.example.org",
-            "dra-realm.org",
+            "diam-realm.org",
             dictionary::DIAMETER_UNABLE_TO_DELIVER,
             None,
         );

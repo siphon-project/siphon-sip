@@ -3531,11 +3531,11 @@ class MockDiameter:
         """Read-only view of the parsed ``diameter`` config (tenants/listen).
 
         Set it in tests with ``diameter.set_config({...})``."""
-        return getattr(self, "_dra_config", {})
+        return getattr(self, "_diameter_config", {})
 
     def set_config(self, config: dict) -> None:
         """Test helper: set the dict returned by :attr:`config`."""
-        self._dra_config = dict(config)
+        self._diameter_config = dict(config)
 
     @property
     def event_sink(self) -> "MockEventSink":
