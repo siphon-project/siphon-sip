@@ -620,6 +620,120 @@ mod tests {
         );
     }
 
+    /// Build a throwaway `PeerConfig` for the loopback leak tests. The watchdog
+    /// interval is set far longer than any test runs so no DWR is injected into
+    /// the `pending` map to perturb the assertions.
+    fn leak_test_config() -> PeerConfig {
+        PeerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            origin_host: "siphon.test".to_string(),
+            origin_realm: "test".to_string(),
+            destination_host: None,
+            destination_realm: "test".to_string(),
+            local_ip: "127.0.0.1".parse().unwrap(),
+            application_ids: vec![(dictionary::VENDOR_3GPP, dictionary::CX_APP_ID)],
+            watchdog_interval: 3600,
+            reconnect_delay: 5,
+            product_name: "SIPhon".to_string(),
+            firmware_revision: 1,
+        }
+    }
+
+    /// Stand up a real [`DiameterPeer`] over a loopback TCP connection whose far
+    /// end is a mock peer that turns every request it receives into an answer
+    /// (clears the R-bit) and echoes it back with the same Hop-by-Hop id. This
+    /// drives the **production** reader task from [`spawn_connection_tasks`], so
+    /// the test exercises the real `pending`-map removal on the answer path, not
+    /// a re-implementation. Returns the peer plus the incoming-request receiver,
+    /// which the caller holds so the channel stays open.
+    async fn loopback_peer_with_echo() -> (Arc<DiameterPeer>, mpsc::Receiver<IncomingRequest>) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Mock far-end peer: flip every request into an answer and echo it back.
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = tokio::io::split(stream);
+                let mut reader = BufReader::new(read_half);
+                while let Ok(mut bytes) = codec::read_diameter_message(&mut reader).await {
+                    if bytes.len() > 4 {
+                        bytes[4] &= !codec::FLAG_REQUEST; // request -> answer
+                    }
+                    if write_half.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let client_stream = TcpStream::connect(addr).await.unwrap();
+        let (incoming_tx, incoming_rx) = mpsc::channel(16);
+        let peer = spawn_connection_tasks(
+            leak_test_config(),
+            DiameterStream::Tcp(client_stream),
+            incoming_tx,
+        );
+        (peer, incoming_rx)
+    }
+
+    /// Leak guard for the Diameter request/answer correlation map shared by every
+    /// interface — Rx/Cx/Rf/Sh all funnel through `send_request`. After each
+    /// answered request the reader task MUST remove the Hop-by-Hop entry from
+    /// `pending`; a regression leaks one `oneshot::Sender` per transaction for the
+    /// life of the connection (threads/FDs flat, only the heap grows).
+    #[tokio::test]
+    async fn pending_map_drains_across_answered_requests() {
+        let (peer, _incoming_rx) = loopback_peer_with_echo().await;
+        let config = peer.config().clone();
+
+        for _ in 0..300 {
+            let hbh = peer.next_hbh();
+            // Any valid request works — the map is keyed by Hop-by-Hop, not command.
+            let request = build_cer(&config, hbh, 1);
+            // The echo peer answers, so the real reader resolves and removes `hbh`.
+            let _ = peer.send_request(request).await;
+        }
+
+        assert_eq!(
+            peer.pending.lock().await.len(),
+            0,
+            "pending request map must drain to empty after answered requests — \
+             a non-zero count is one leaked oneshot::Sender per Diameter transaction"
+        );
+    }
+
+    /// Same invariant under concurrent in-flight requests — the carrier-grade
+    /// case where many transactions race through the shared map at once.
+    #[tokio::test]
+    async fn pending_map_drains_under_concurrent_inflight() {
+        let (peer, _incoming_rx) = loopback_peer_with_echo().await;
+        let config = peer.config().clone();
+
+        let mut handles = Vec::new();
+        for _ in 0..100 {
+            let peer = Arc::clone(&peer);
+            let config = config.clone();
+            handles.push(tokio::spawn(async move {
+                let hbh = peer.next_hbh();
+                let request = build_cer(&config, hbh, 1);
+                let _ = peer.send_request(request).await;
+            }));
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        assert_eq!(
+            peer.pending.lock().await.len(),
+            0,
+            "pending request map must drain under concurrent in-flight load"
+        );
+    }
+
     #[test]
     fn build_cea_valid_binary() {
         let config = PeerConfig {

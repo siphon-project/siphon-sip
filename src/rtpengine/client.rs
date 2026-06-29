@@ -1229,6 +1229,69 @@ mod tests {
         addr
     }
 
+    /// Memory-leak guard for the NG control path: the `pending` correlation map
+    /// MUST drain back to empty after every command settles. On the success path
+    /// the receiver loop removes the cookie when the answer lands; this pins that
+    /// invariant across a full offer → answer → delete lifecycle run many times.
+    /// A regression that drops the removal leaks one `oneshot::Sender` per command
+    /// for the life of the process (threads/FDs stay flat — only the heap grows).
+    #[tokio::test]
+    async fn pending_map_drains_on_success() {
+        let addr = spawn_mock_rtpengine().await;
+        let client = RtpEngineClient::new(addr, 2000).await.unwrap();
+        let flags = NgFlags::default();
+        let sdp = b"v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 8000 RTP/AVP 0\r\n";
+
+        // Each call is awaited to completion, so the receiver loop must have
+        // removed its cookie before the next command begins.
+        for index in 0..500 {
+            let call_id = format!("leak-success-{index}");
+            client.offer(&call_id, "from", sdp, &flags).await.unwrap();
+            client
+                .answer(&call_id, "from", "to", sdp, &flags)
+                .await
+                .unwrap();
+            client.delete(&call_id, "from").await.unwrap();
+        }
+
+        assert_eq!(
+            client.pending.len(),
+            0,
+            "pending correlation map must drain to empty after completed commands \
+             — a non-zero count is one leaked oneshot::Sender per command"
+        );
+    }
+
+    /// The timeout path must clean up too: point the client at a bound-but-silent
+    /// socket so every command times out, and confirm `pending` is still empty
+    /// afterwards (i.e. `send_command`'s timeout arm removes the cookie). Without
+    /// that removal, every timed-out command — exactly what happens when rtpengine
+    /// is briefly unreachable under load — would leak a pending entry.
+    #[tokio::test]
+    async fn pending_map_drains_on_timeout() {
+        // Bind a socket so the address is valid but never answer on it.
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = silent.local_addr().unwrap();
+
+        // Short timeout keeps the test fast (~1s worst case for the whole loop).
+        let client = RtpEngineClient::new(silent_addr, 50).await.unwrap();
+        let flags = NgFlags::default();
+        let sdp = b"v=0\r\nc=IN IP4 10.0.0.1\r\nm=audio 8000 RTP/AVP 0\r\n";
+
+        for index in 0..20 {
+            let call_id = format!("leak-timeout-{index}");
+            let result = client.offer(&call_id, "from", sdp, &flags).await;
+            assert!(result.is_err(), "command to a silent peer must time out");
+        }
+
+        assert_eq!(
+            client.pending.len(),
+            0,
+            "pending correlation map must drain on the timeout path too — a leaked \
+             entry here accumulates one sender per timed-out command"
+        );
+    }
+
     #[tokio::test]
     async fn set_single_instance() {
         let addr = spawn_mock_rtpengine().await;
