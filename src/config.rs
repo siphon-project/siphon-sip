@@ -4161,7 +4161,7 @@ diameter:
   tenants:
     default:
       identity:
-        origin_host: "dra.epc.mnc001.mcc001.3gppnetwork.org"
+        origin_host: "diam.epc.mnc001.mcc001.3gppnetwork.org"
         origin_realm: "epc.mnc001.mcc001.3gppnetwork.org"
       clients:
         - name: mme
@@ -4181,7 +4181,7 @@ diameter:
         assert!(diameter.origin_host.is_empty());
 
         let tenant = diameter.tenants.get("default").expect("default tenant");
-        assert_eq!(tenant.identity.origin_host, "dra.epc.mnc001.mcc001.3gppnetwork.org");
+        assert_eq!(tenant.identity.origin_host, "diam.epc.mnc001.mcc001.3gppnetwork.org");
         assert_eq!(tenant.clients[0].name, "mme");
         assert_eq!(tenant.clients[0].allowed_ips, vec!["172.16.0.0/24"]);
         assert_eq!(tenant.servers[0].name, "hss");

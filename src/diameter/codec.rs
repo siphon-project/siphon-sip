@@ -1200,12 +1200,12 @@ mod avp_tree_tests {
 
     #[test]
     fn single_avp_no_vendor_roundtrip() {
-        let avp = Avp::utf8(dictionary::avp::ORIGIN_HOST, 0, "dra.epc.example.org");
+        let avp = Avp::utf8(dictionary::avp::ORIGIN_HOST, 0, "diam.epc.example.org");
         let wire = encode_avps(std::slice::from_ref(&avp));
         let parsed = parse_avps(&wire).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0], avp);
-        assert_eq!(parsed[0].as_str().as_deref(), Some("dra.epc.example.org"));
+        assert_eq!(parsed[0].as_str().as_deref(), Some("diam.epc.example.org"));
         // No vendor field on the wire (8-byte header).
         assert_eq!(parsed[0].flags & AVP_FLAG_VENDOR, 0);
     }
@@ -1302,7 +1302,7 @@ mod avp_tree_tests {
     #[test]
     fn full_message_from_wire_to_wire() {
         let mut avps = Vec::new();
-        avps.extend_from_slice(&encode_avp_utf8(dictionary::avp::SESSION_ID, "dra;1;1"));
+        avps.extend_from_slice(&encode_avp_utf8(dictionary::avp::SESSION_ID, "diam;1;1"));
         avps.extend_from_slice(&encode_avp_utf8(dictionary::avp::ORIGIN_HOST, "mme.example.org"));
         avps.extend_from_slice(&encode_avp_u32(dictionary::avp::RESULT_CODE, 2001));
         let wire = encode_diameter_message(
@@ -1319,7 +1319,7 @@ mod avp_tree_tests {
         assert!(msg.is_proxiable());
         assert_eq!(msg.hop_by_hop, 0x1122_3344);
         assert_eq!(msg.end_to_end, 0x5566_7788);
-        assert_eq!(msg.get_str(dictionary::avp::SESSION_ID).as_deref(), Some("dra;1;1"));
+        assert_eq!(msg.get_str(dictionary::avp::SESSION_ID).as_deref(), Some("diam;1;1"));
 
         // Byte-exact round-trip for this well-formed (zero-padded) message.
         assert_eq!(msg.to_wire(), wire);

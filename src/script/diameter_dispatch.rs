@@ -13,7 +13,7 @@
 //!
 //! Per-request concurrency is the key difference from the client-mode
 //! `dispatcher.rs` loop, which awaits each handler serially: a Diameter server relay can
-//! block for the backend RTT, so serial dispatch would head-of-line-block
+//! block for the backend round-trip, so serial dispatch would head-of-line-block
 //! every tenant.
 
 use std::collections::HashMap;
@@ -124,7 +124,7 @@ pub fn spawn(
             .values()
             .next()
             .cloned()
-            .unwrap_or_else(|| ("dra.localdomain".to_string(), "localdomain".to_string()))
+            .unwrap_or_else(|| ("diam.localdomain".to_string(), "localdomain".to_string()))
     };
 
     let handshake = Arc::new(ServerHandshake {

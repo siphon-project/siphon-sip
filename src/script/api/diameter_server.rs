@@ -701,7 +701,7 @@ mod tests {
                 addr: "10.0.0.5:5000".into(),
                 transport: "tcp".into(),
             },
-            "dra.epc.example.org".into(),
+            "diam.epc.example.org".into(),
             "epc.example.org".into(),
         )
     }

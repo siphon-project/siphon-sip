@@ -477,7 +477,7 @@ impl PyDiameter {
 
     /// Attach server mode runtime: the config snapshot exposed as
     /// `diameter.config`, and the event sink behind `diameter.event_sink`.
-    pub fn with_dra_runtime(
+    pub fn with_server_runtime(
         mut self,
         config_json: String,
         event_sink: Option<Arc<crate::diameter::event_sink::EventSink>>,

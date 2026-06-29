@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-/// Default T1 value: RTT estimate (500ms per RFC 3261).
+/// Default T1 value: round-trip-time estimate (500ms per RFC 3261).
 pub const DEFAULT_T1: Duration = Duration::from_millis(500);
 
 /// Default T2 value: maximum retransmit interval for non-INVITE (4s per RFC 3261).

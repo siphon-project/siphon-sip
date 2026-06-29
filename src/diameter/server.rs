@@ -228,7 +228,7 @@ mod tests {
             acl: Arc::new(acl),
             origin_policy: Arc::new(policy),
             identity: ServerIdentity {
-                default_origin_host: "dra.example.org".into(),
+                default_origin_host: "diam.example.org".into(),
                 default_origin_realm: "example.org".into(),
                 local_ip: "127.0.0.1".parse().unwrap(),
                 product_name: "SIPhon-Diameter server".into(),
@@ -259,7 +259,7 @@ mod tests {
 
     fn accept_resolver(_m: &AclMatch, _asserted: &str) -> CerDecision {
         CerDecision::Accept {
-            origin_host: "dra.epc.example.org".into(),
+            origin_host: "diam.epc.example.org".into(),
             origin_realm: "epc.example.org".into(),
         }
     }
@@ -269,13 +269,13 @@ mod tests {
         // Empty ACL → no source matches. run() must return immediately WITHOUT
         // reading a CER (we never write one; a read attempt would hang).
         let handshake = handshake_with(SourceIpAcl::new(), OriginHostPolicy::new());
-        let (dra_side, _client_side) = tokio::io::duplex(8192);
+        let (server_side, _client_side) = tokio::io::duplex(8192);
         let (incoming_tx, _rx) = mpsc::channel(8);
         let addr: SocketAddr = "203.0.113.9:5000".parse().unwrap();
 
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(200),
-            handshake.run(dra_side, addr, incoming_tx, accept_resolver),
+            handshake.run(server_side, addr, incoming_tx, accept_resolver),
         )
         .await
         .expect("must not hang — ACL gate runs before any read");
@@ -291,14 +291,14 @@ mod tests {
         policy.set("mme", "mme.epc.example.org");
         let handshake = handshake_with(acl, policy);
 
-        let (dra_side, mut client_side) = tokio::io::duplex(8192);
+        let (server_side, mut client_side) = tokio::io::duplex(8192);
         let (incoming_tx, _rx) = mpsc::channel(8);
         let addr: SocketAddr = "10.0.0.5:5000".parse().unwrap();
 
         // Client asserts the WRONG Origin-Host.
         client_side.write_all(&client_cer("spoofed.example.org")).await.unwrap();
 
-        let result = handshake.run(dra_side, addr, incoming_tx, accept_resolver).await;
+        let result = handshake.run(server_side, addr, incoming_tx, accept_resolver).await;
         assert!(matches!(
             result,
             Err(HandshakeError::OriginHostMismatch { .. })
@@ -320,20 +320,20 @@ mod tests {
         acl.add_str("10.0.0.0/24", "default", "mme").unwrap();
         let handshake = handshake_with(acl, OriginHostPolicy::new());
 
-        let (dra_side, mut client_side) = tokio::io::duplex(8192);
+        let (server_side, mut client_side) = tokio::io::duplex(8192);
         let (incoming_tx, mut incoming_rx) = mpsc::channel(8);
         let addr: SocketAddr = "10.0.0.7:5000".parse().unwrap();
 
         client_side.write_all(&client_cer("mme.epc.example.org")).await.unwrap();
 
         let (peer, acl_match) = handshake
-            .run(dra_side, addr, incoming_tx, accept_resolver)
+            .run(server_side, addr, incoming_tx, accept_resolver)
             .await
             .expect("handshake should succeed");
         assert_eq!(acl_match.peer, "mme");
         assert_eq!(peer.state(), PeerState::Open);
         // CEA carries the tenant identity chosen by the resolver.
-        assert_eq!(peer.config().origin_host, "dra.epc.example.org");
+        assert_eq!(peer.config().origin_host, "diam.epc.example.org");
 
         // Read the success CEA off the wire.
         let cea_bytes = codec::read_diameter_message(&mut client_side).await.unwrap();
@@ -369,13 +369,13 @@ mod tests {
         acl.add_str("10.0.0.0/24", "default", "mme").unwrap();
         let handshake = handshake_with(acl, OriginHostPolicy::new());
 
-        let (dra_side, mut client_side) = tokio::io::duplex(8192);
+        let (server_side, mut client_side) = tokio::io::duplex(8192);
         let (incoming_tx, _rx) = mpsc::channel(8);
         let addr: SocketAddr = "10.0.0.8:5000".parse().unwrap();
         client_side.write_all(&client_cer("mme.epc.example.org")).await.unwrap();
 
         let reject = |_m: &AclMatch, _a: &str| CerDecision::Reject(dictionary::DIAMETER_UNABLE_TO_COMPLY);
-        let result = handshake.run(dra_side, addr, incoming_tx, reject).await;
+        let result = handshake.run(server_side, addr, incoming_tx, reject).await;
         assert!(matches!(result, Err(HandshakeError::Rejected(c)) if c == dictionary::DIAMETER_UNABLE_TO_COMPLY));
 
         let cea_bytes = codec::read_diameter_message(&mut client_side).await.unwrap();

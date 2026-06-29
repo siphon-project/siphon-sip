@@ -19,7 +19,7 @@ Two deployment shapes, same handler:
     serves the AIR/ULR relayed back over it (RFC 6733 §2.1 — transport
     direction is independent of request direction).
 
-Run: siphon --config examples/hss_s6a.yaml  (model a config on examples/dra.yaml).
+Run: siphon --config examples/hss_s6a.yaml  (model a config on examples/diameter_server.yaml).
 """
 
 from siphon import diameter, log

@@ -2131,13 +2131,13 @@ fn init_diameter(config: &Config) -> Option<Arc<crate::diameter::DiameterManager
     // Server mode runtime: a JSON snapshot of tenants/listen for
     // `diameter.config`, plus the event sink behind `diameter.event_sink`.
     // Only built when the deployment opts into Diameter server mode (listen/tenants set).
-    let dra_enabled =
+    let server_enabled =
         diameter_config.listen.is_some() || !diameter_config.tenants.is_empty();
     let event_sink = diameter_config
         .event_sink
         .as_ref()
         .map(|cfg| Arc::new(crate::diameter::event_sink::EventSink::spawn(cfg)));
-    let config_json = if dra_enabled {
+    let config_json = if server_enabled {
         Some(
             serde_json::json!({
                 "tenants": &diameter_config.tenants,
@@ -2152,7 +2152,7 @@ fn init_diameter(config: &Config) -> Option<Arc<crate::diameter::DiameterManager
     pyo3::Python::attach(|python| {
         let py_diameter = crate::script::api::diameter::PyDiameter::new(Arc::clone(&manager));
         let py_diameter = match config_json {
-            Some(json) => py_diameter.with_dra_runtime(json, event_sink),
+            Some(json) => py_diameter.with_server_runtime(json, event_sink),
             None => py_diameter,
         };
         if let Err(error) = crate::script::api::set_diameter_singleton(python, py_diameter) {

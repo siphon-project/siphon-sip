@@ -148,24 +148,24 @@ mod tests {
     #[test]
     fn route_record_append_and_detect() {
         let mut msg = sample_request();
-        assert!(!has_route_record(&msg, "dra.example.org"));
-        append_route_record(&mut msg, "dra.example.org");
-        assert!(has_route_record(&msg, "dra.example.org"));
+        assert!(!has_route_record(&msg, "diam.example.org"));
+        append_route_record(&mut msg, "diam.example.org");
+        assert!(has_route_record(&msg, "diam.example.org"));
         // Appended at the tail.
         let last = msg.avps.last().unwrap();
         assert_eq!(last.code, avp::ROUTE_RECORD);
-        assert_eq!(last.as_str().as_deref(), Some("dra.example.org"));
+        assert_eq!(last.as_str().as_deref(), Some("diam.example.org"));
     }
 
     #[test]
     fn prepare_forward_appends_then_detects_loop() {
         let mut msg = sample_request();
         // First pass: clean, appends our record.
-        assert_eq!(prepare_forward(&mut msg, "dra.example.org"), Ok(()));
+        assert_eq!(prepare_forward(&mut msg, "diam.example.org"), Ok(()));
         assert_eq!(msg.find_all(avp::ROUTE_RECORD, 0).count(), 1);
         // Second pass through the same Diameter server: loop.
         assert_eq!(
-            prepare_forward(&mut msg, "dra.example.org"),
+            prepare_forward(&mut msg, "diam.example.org"),
             Err(ForwardError::LoopDetected)
         );
         // No duplicate Route-Record was added on the loop path.
@@ -176,7 +176,7 @@ mod tests {
     fn append_preserves_all_other_avps() {
         let mut msg = sample_request();
         let before = msg.avps.len();
-        append_route_record(&mut msg, "dra.example.org");
+        append_route_record(&mut msg, "diam.example.org");
         assert_eq!(msg.avps.len(), before + 1);
         // Every original AVP is still present and unchanged.
         for code in [avp::SESSION_ID, avp::ORIGIN_HOST, avp::ORIGIN_REALM] {
@@ -187,11 +187,11 @@ mod tests {
     #[test]
     fn rewrite_origin_replaces_in_place() {
         let mut msg = sample_request();
-        rewrite_origin(&mut msg, "dra.example.org", "dra-realm.org");
+        rewrite_origin(&mut msg, "diam.example.org", "dra-realm.org");
         assert_eq!(msg.find_all(avp::ORIGIN_HOST, 0).count(), 1);
         assert_eq!(
             msg.get_str(avp::ORIGIN_HOST).as_deref(),
-            Some("dra.example.org")
+            Some("diam.example.org")
         );
         assert_eq!(
             msg.get_str(avp::ORIGIN_REALM).as_deref(),
@@ -204,7 +204,7 @@ mod tests {
         let request = sample_request();
         let answer = build_answer(
             &request,
-            "dra.example.org",
+            "diam.example.org",
             "dra-realm.org",
             dictionary::DIAMETER_LOOP_DETECTED,
             Some("loop via dra"),
@@ -223,7 +223,7 @@ mod tests {
         );
         assert_eq!(
             answer.get_str(avp::ORIGIN_HOST).as_deref(),
-            Some("dra.example.org")
+            Some("diam.example.org")
         );
         assert_eq!(answer.get_str(avp::ERROR_MESSAGE).as_deref(), Some("loop via dra"));
     }
@@ -233,7 +233,7 @@ mod tests {
         let request = sample_request();
         let answer = build_answer(
             &request,
-            "dra.example.org",
+            "diam.example.org",
             "dra-realm.org",
             dictionary::DIAMETER_SUCCESS,
             None,
@@ -280,7 +280,7 @@ mod tests {
         let request = sample_request();
         let answer = build_answer(
             &request,
-            "dra.example.org",
+            "diam.example.org",
             "dra-realm.org",
             dictionary::DIAMETER_UNABLE_TO_DELIVER,
             None,

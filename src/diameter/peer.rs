@@ -783,7 +783,7 @@ mod tests {
 
     #[test]
     fn build_dpr_dpa_valid_binary() {
-        let dpr = build_dpr("dra.example.org", "example.org", 0, 5, 6);
+        let dpr = build_dpr("diam.example.org", "example.org", 0, 5, 6);
         // Verify via the lossless tree (Disconnect-Cause AVP 273 is read by
         // code, not by dictionary name).
         let tree = codec::DiameterMsg::from_wire(&dpr).unwrap();
@@ -795,7 +795,7 @@ mod tests {
             Some(0)
         );
 
-        let dpa = build_dpa("dra.example.org", "example.org", 5, 6);
+        let dpa = build_dpa("diam.example.org", "example.org", 5, 6);
         let decoded = codec::decode_diameter(&dpa).unwrap();
         assert!(!decoded.is_request);
         assert_eq!(decoded.command_code, dictionary::CMD_DISCONNECT_PEER);
@@ -809,7 +809,7 @@ mod tests {
         PeerConfig {
             host: "peer.example.org".to_string(),
             port: 3868,
-            origin_host: "dra.example.org".to_string(),
+            origin_host: "diam.example.org".to_string(),
             origin_realm: "example.org".to_string(),
             destination_host: None,
             destination_realm: "example.org".to_string(),
@@ -832,7 +832,7 @@ mod tests {
         // Drain the writer so send() doesn't block on a full channel.
         tokio::spawn(async move { while write_rx.recv().await.is_some() {} });
 
-        let dwr = build_dwr("dra.example.org", "example.org", 42, 42);
+        let dwr = build_dwr("diam.example.org", "example.org", 42, 42);
         let start = std::time::Instant::now();
         let result = peer
             .send_request_timeout(dwr, Duration::from_millis(50))
@@ -896,7 +896,7 @@ mod tests {
                     dictionary::S6A_APP_ID,
                     0x4242,
                     0x4343,
-                    &encode_avp_utf8(avp::SESSION_ID, "dra;1;1"),
+                    &encode_avp_utf8(avp::SESSION_ID, "diam;1;1"),
                 );
                 // Fire the request without awaiting the answer.
                 tokio::spawn(async move {

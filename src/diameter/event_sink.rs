@@ -132,7 +132,7 @@ mod tests {
     #[tokio::test]
     async fn file_backend_writes_rows() {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("siphon-dra-events-{}.jsonl", std::process::id()));
+        let path = dir.join(format!("siphon-diameter-events-{}.jsonl", std::process::id()));
         let path_str = path.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
 
