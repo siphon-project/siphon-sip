@@ -7,6 +7,30 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **Generic Diameter server mode** — the Diameter stack was client-only
+  (originate toward HSS/PCRF); it now also accepts inbound Diameter from
+  authenticated peers, runs the CER/CEA handshake and the DWR/DWA watchdog, and
+  dispatches each inbound request to Python. Transport direction is independent
+  of request direction (RFC 6733 §2.1): incoming **and** outgoing connections,
+  TCP + SCTP, and a node that dials out (`diameter.connect_to`) can still serve
+  inbound requests over that connection. New Python server API:
+  `@diameter.on_inbound_cer` (advertise CEA identity), `@diameter.on_request`
+  with optional `"App:CMD"` filter (`req.answer(code)` / `req.reject(code)` /
+  `await req.forward_to(peer)`; unhandled → `3002`), `@diameter.on_reply`
+  (central answer-AVP rewrite — topology hiding, Origin / Result-Code mapping),
+  `@diameter.on_request_completed` (post-answer event hook), and
+  `diameter.peer_pool(target)` (round-robin / weighted / sticky with
+  Route-Record loop detection → `3005` and per-call timeout). Two Rust-only
+  admission gates run before any Python: source-IP CIDR ACL + Origin-Host
+  validation. A lossless AVP tree (`DiameterMsg` / `Avp`) sits alongside the
+  JSON decode path for byte-faithful relay that preserves unknown AVPs and flags
+  verbatim. Config is flat single-domain
+  (`diameter.{listen, origin_host, clients, servers, connect_to}`) or an
+  explicit per-domain map; `diameter.event_sink` writes per-transaction events
+  (file / none; clickhouse / kafka feature-gated). Ships an **S6a dictionary**
+  (TS 29.272: command codes 316–324, AVPs 1400–1450 / 1635, AIR / ULR / PUR
+  builders + parsers) and examples (`examples/diameter_server.{py,yaml}`,
+  `examples/hss_s6a.py`).
 - **glibc allocator instrumentation** — new `siphon_glibc_*` Prometheus gauges
   (`system_bytes`, `in_use_bytes`, `free_bytes`, `mmap_bytes`, `arena_count`)
   sourced from `malloc_info(3)`, aggregated across all arenas. This surfaces the
