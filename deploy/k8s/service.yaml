@@ -1,0 +1,32 @@
+# Headless Service — gives each StatefulSet pod a stable DNS name
+# (siphon-0.siphon, siphon-1.siphon, ...). Useful for per-pod addressing and as
+# the backing for SIP DNS SRV records.
+apiVersion: v1
+kind: Service
+metadata:
+  name: siphon
+  labels: { app: siphon }
+spec:
+  clusterIP: None
+  selector: { app: siphon }
+  ports:
+    - { port: 5060, protocol: UDP, name: sip-udp }
+    - { port: 5060, protocol: TCP, name: sip-tcp }
+    - { port: 9090, protocol: TCP, name: metrics }
+---
+# Ingress Service — one entry point that spreads SIP across the pods.
+# externalTrafficPolicy: Local preserves the client source IP/port, which SIP
+# needs for correct Via/Contact handling. Front this with your SIP-aware LB (or a
+# SIPhon LB pod) if you need subscriber affinity.
+apiVersion: v1
+kind: Service
+metadata:
+  name: siphon-ingress
+  labels: { app: siphon }
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector: { app: siphon }
+  ports:
+    - { port: 5060, protocol: UDP, name: sip-udp }
+    - { port: 5060, protocol: TCP, name: sip-tcp }

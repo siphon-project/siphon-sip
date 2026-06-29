@@ -1,0 +1,80 @@
+# HA-demo: the "front LB + 2 backends + shared Redis" topology from
+# docs/deployment.md, containerised.
+#
+# This is the REFERENCE SHAPE (how you'd containerise the pattern). For a quick,
+# deterministic failover proof that does NOT build the full image, use
+# ./validate.sh instead (it runs the binary on the host).
+#
+#   docker compose -p siphon-hademo -f docker-compose.ha.yaml up --build
+#
+# Build context is the repo root so the existing Dockerfile is reused. Swap the
+# `build:` blocks for `image: <your-registry>/siphon-sip:<tag>` once you publish.
+#
+# Networking note: this demo uses a bridge network (all SIP stays inside it, so
+# service-name routing is clean). For real ingress, prefer host networking or a
+# LoadBalancer that preserves source IP/port — SIP is sensitive to NAT rewriting
+# of Via/Contact (see docs/deployment.md).
+
+x-siphon: &siphon
+  image: siphon-sip:ha-demo
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  depends_on:
+    - redis
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  backend1:
+    <<: *siphon
+    volumes:
+      - ./siphon-backend.yaml:/etc/siphon/siphon.yaml:ro
+      - ./proxy.py:/etc/siphon/proxy.py:ro
+    environment:
+      INSTANCE_ID: backend1
+      SCRIPT_PATH: /etc/siphon/proxy.py
+      REDIS_HOST: redis
+      SIP_PORT: "5060"
+      METRICS_PORT: "9090"
+    command: ["--config", "/etc/siphon/siphon.yaml"]
+
+  backend2:
+    <<: *siphon
+    volumes:
+      - ./siphon-backend.yaml:/etc/siphon/siphon.yaml:ro
+      - ./proxy.py:/etc/siphon/proxy.py:ro
+    environment:
+      INSTANCE_ID: backend2
+      SCRIPT_PATH: /etc/siphon/proxy.py
+      REDIS_HOST: redis
+      SIP_PORT: "5060"
+      METRICS_PORT: "9090"
+    command: ["--config", "/etc/siphon/siphon.yaml"]
+
+  frontend:
+    <<: *siphon
+    depends_on:
+      - backend1
+      - backend2
+    volumes:
+      - ./siphon-frontend.yaml:/etc/siphon/siphon.yaml:ro
+      - ./lb.py:/etc/siphon/lb.py:ro
+    environment:
+      INSTANCE_ID: frontend
+      SCRIPT_PATH: /etc/siphon/lb.py
+      SIP_PORT: "5060"
+      METRICS_PORT: "9090"
+      BACKEND1_URI: "sip:backend1:5060"
+      BACKEND1_ADDR: "backend1:5060"
+      BACKEND2_URI: "sip:backend2:5060"
+      BACKEND2_ADDR: "backend2:5060"
+    command: ["--config", "/etc/siphon/siphon.yaml"]
+    ports:
+      - "5060:5060/udp"   # SIP ingress
+      - "9090:9090/tcp"   # /metrics
+      - "9091:9091/tcp"   # /admin/health, /admin/ready, /admin/registrations
