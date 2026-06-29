@@ -5,6 +5,7 @@
 //! inline (at the call site) and scraped via the HTTP admin API `/metrics`.
 
 pub mod custom;
+pub mod glibc;
 
 use std::sync::{Arc, OnceLock};
 
@@ -198,6 +199,31 @@ pub struct SiphonMetrics {
     pub rtpengine_instances_up: IntGauge,
     pub rtpengine_instances_total: IntGauge,
     pub rtpengine_instance_up: IntGaugeVec,
+
+    // --- SBI (5G N5/Npcf) ---
+    /// Active N5/Npcf app-sessions this NF created and has not yet deleted. A
+    /// steady climb under flat call rate is a session leak (a missed
+    /// delete_session — e.g. the early-media Rx/N5 session stranded at the PCF).
+    pub sbi_npcf_app_sessions_active: IntGauge,
+
+    // --- glibc allocator (C-side / CPython raw domain) ---
+    // The pool jemalloc and CPython's mimalloc cannot see. Sourced from
+    // `malloc_info(3)` (all arenas), not `mallinfo2` (main arena only).
+    /// Total OS memory held by glibc malloc across all arenas (non-mmap). The
+    /// resident "dark pool"; where free-threaded-CPython per-thread 64 MB
+    /// arenas show up. The C-side analogue of `siphon_memory_resident_bytes`.
+    pub glibc_system_bytes: IntGauge,
+    /// Live (allocated, not freed) C-side bytes = system − free. A steady climb
+    /// here under flat load is a genuine raw-domain leak — the alert signal.
+    pub glibc_in_use_bytes: IntGauge,
+    /// Free/retained bytes inside the arenas. High free + high system + flat
+    /// in_use = arena retention (tune arena_max / malloc_trim), not a leak.
+    pub glibc_free_bytes: IntGauge,
+    /// Bytes served by mmap (large allocations), separate from the arenas.
+    pub glibc_mmap_bytes: IntGauge,
+    /// Number of arenas (heaps). Each is a ~64 MB reservation; a rising count
+    /// is per-thread-arena proliferation under free-threaded concurrency.
+    pub glibc_arena_count: IntGauge,
 }
 
 impl SiphonMetrics {
@@ -427,6 +453,32 @@ impl SiphonMetrics {
             &["address"],
         )?;
 
+        let sbi_npcf_app_sessions_active = IntGauge::new(
+            "siphon_sbi_npcf_app_sessions_active",
+            "Active N5/Npcf app-sessions created by this NF and not yet deleted",
+        )?;
+
+        let glibc_system_bytes = IntGauge::new(
+            "siphon_glibc_system_bytes",
+            "Total OS memory held by glibc malloc across all arenas (C-side / CPython raw domain; invisible to jemalloc)",
+        )?;
+        let glibc_in_use_bytes = IntGauge::new(
+            "siphon_glibc_in_use_bytes",
+            "Live (allocated, not freed) glibc bytes across all arenas — the C-side leak signal",
+        )?;
+        let glibc_free_bytes = IntGauge::new(
+            "siphon_glibc_free_bytes",
+            "Free/retained bytes within glibc arenas (high while in_use is flat = arena retention, not a leak)",
+        )?;
+        let glibc_mmap_bytes = IntGauge::new(
+            "siphon_glibc_mmap_bytes",
+            "Bytes served by glibc via mmap (large allocations), separate from the arenas",
+        )?;
+        let glibc_arena_count = IntGauge::new(
+            "siphon_glibc_arena_count",
+            "Number of glibc malloc arenas (each a ~64 MB reservation; rises with per-thread contention)",
+        )?;
+
         // Register all metrics
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(responses_total.clone()))?;
@@ -471,6 +523,12 @@ impl SiphonMetrics {
         registry.register(Box::new(rtpengine_instances_up.clone()))?;
         registry.register(Box::new(rtpengine_instances_total.clone()))?;
         registry.register(Box::new(rtpengine_instance_up.clone()))?;
+        registry.register(Box::new(sbi_npcf_app_sessions_active.clone()))?;
+        registry.register(Box::new(glibc_system_bytes.clone()))?;
+        registry.register(Box::new(glibc_in_use_bytes.clone()))?;
+        registry.register(Box::new(glibc_free_bytes.clone()))?;
+        registry.register(Box::new(glibc_mmap_bytes.clone()))?;
+        registry.register(Box::new(glibc_arena_count.clone()))?;
 
         Ok(Self {
             registry,
@@ -517,6 +575,12 @@ impl SiphonMetrics {
             rtpengine_instances_up,
             rtpengine_instances_total,
             rtpengine_instance_up,
+            sbi_npcf_app_sessions_active,
+            glibc_system_bytes,
+            glibc_in_use_bytes,
+            glibc_free_bytes,
+            glibc_mmap_bytes,
+            glibc_arena_count,
         })
     }
 }
@@ -592,6 +656,30 @@ pub fn update_python_stats() {
     if let Ok(blocks) = result {
         metrics.python_allocated_blocks.set(blocks);
     }
+}
+
+/// Refresh the glibc allocator gauges from `malloc_info`. Call periodically (the
+/// dispatcher does so on its cleanup tick). This is the C-side / CPython
+/// raw-domain pool that neither [`update_memory_stats`] (jemalloc) nor
+/// [`update_python_stats`] (CPython's mimalloc) can see — because Rust runs on
+/// jemalloc, glibc's arenas hold *only* the C side, so these gauges isolate it.
+/// No-op off glibc.
+///
+/// `glibc_in_use_bytes` is the one to alert on (the C-side leak signal). A high
+/// `glibc_system_bytes` with high `glibc_free_bytes` and flat `in_use` is arena
+/// retention — address it with `memory.glibc.arena_max` / `trim_interval_secs`.
+pub fn update_glibc_stats() {
+    let Some(metrics) = metrics() else {
+        return;
+    };
+    let Some(stats) = glibc::read_stats() else {
+        return;
+    };
+    metrics.glibc_system_bytes.set(stats.system_bytes as i64);
+    metrics.glibc_in_use_bytes.set(stats.in_use_bytes as i64);
+    metrics.glibc_free_bytes.set(stats.free_bytes as i64);
+    metrics.glibc_mmap_bytes.set(stats.mmap_bytes as i64);
+    metrics.glibc_arena_count.set(stats.arena_count as i64);
 }
 
 // ---------------------------------------------------------------------------
@@ -683,23 +771,22 @@ mod tests {
 
     #[test]
     fn diameter_peers_connected_gauge() {
+        // Gauge inc/dec/get mechanics on a fresh, isolated instance. The
+        // process-global gauge is shared across parallel tests — the diameter
+        // peer leak tests open real loopback connections that inc it — so
+        // asserting absolute values on the global here would race. A fresh
+        // instance is the correct unit under test for the mechanics.
+        let metrics = SiphonMetrics::new().unwrap();
+        assert_eq!(metrics.diameter_peers_connected.get(), 0);
+        metrics.diameter_peers_connected.inc();
+        metrics.diameter_peers_connected.inc();
+        assert_eq!(metrics.diameter_peers_connected.get(), 2);
+        metrics.diameter_peers_connected.dec();
+        assert_eq!(metrics.diameter_peers_connected.get(), 1);
+
+        // Registration + text encoding go through the global registry.
         init().unwrap();
-        let metrics = metrics().unwrap();
-
-        // The gauge is a process-global singleton; other tests that open real
-        // connections may have moved it, so assert deltas from a baseline
-        // rather than absolute values (parallel-test safe).
-        let baseline = metrics.diameter_peers_connected.get();
-        metrics.diameter_peers_connected.inc();
-        metrics.diameter_peers_connected.inc();
-        assert_eq!(metrics.diameter_peers_connected.get(), baseline + 2);
-        metrics.diameter_peers_connected.dec();
-        assert_eq!(metrics.diameter_peers_connected.get(), baseline + 1);
-        // Restore the baseline so we don't perturb other tests.
-        metrics.diameter_peers_connected.dec();
-
-        let output = encode_metrics();
-        assert!(output.contains("siphon_diameter_peers_connected"));
+        assert!(encode_metrics().contains("siphon_diameter_peers_connected"));
     }
 
     #[test]

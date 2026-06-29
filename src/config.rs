@@ -35,6 +35,34 @@ fn expand_env_vars(input: &str) -> String {
         .into_owned()
 }
 
+/// Allocator runtime tuning — how the process *manages* memory, distinct from
+/// `metrics` (what it *measures*). The `siphon_glibc_*` gauges are always on
+/// regardless of this block; it carries only the optional bounding knobs.
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+pub struct MemoryConfig {
+    /// glibc malloc tuning for the C-side / CPython raw-domain pool.
+    #[serde(default)]
+    pub glibc: GlibcMemoryConfig,
+}
+
+/// glibc `malloc` tuning. Both knobs default off — measure with the gauges
+/// first, then bound only if the pool proves to be arena *retention* rather
+/// than a true leak.
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+pub struct GlibcMemoryConfig {
+    /// `mallopt(M_ARENA_MAX, n)` — cap the number of glibc arenas (each a
+    /// ~64 MB reservation). The primary lever against per-thread-arena
+    /// retention under free-threaded concurrency. `None` = leave glibc's
+    /// default (8 × CPUs). Applied once at startup, before the thread pools.
+    #[serde(default)]
+    pub arena_max: Option<usize>,
+
+    /// Period in seconds for a background `malloc_trim(0)` that returns free
+    /// arena memory to the OS. `0` = disabled.
+    #[serde(default)]
+    pub trim_interval_secs: u64,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     pub listen: ListenConfig,
@@ -74,6 +102,11 @@ pub struct Config {
 
     /// SIP transaction layer timer overrides.
     pub transaction: Option<TransactionConfig>,
+
+    /// Allocator runtime tuning (glibc arena cap + periodic trim). The
+    /// `siphon_glibc_*` gauges are always on; this block only adds the optional
+    /// bounding knobs. `None` = gauges only, no tuning.
+    pub memory: Option<MemoryConfig>,
 
     /// Dialog state tracking backend.
     pub dialog: Option<DialogConfig>,
@@ -3230,6 +3263,55 @@ transaction:
         let tx = config.transaction.unwrap();
         assert_eq!(tx.timeout_secs, 5);
         assert_eq!(tx.invite_timeout_secs, 30);
+    }
+
+    #[test]
+    fn parses_memory_config() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+memory:
+  glibc:
+    arena_max: 2
+    trim_interval_secs: 30
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let memory = config.memory.expect("memory block present");
+        assert_eq!(memory.glibc.arena_max, Some(2));
+        assert_eq!(memory.glibc.trim_interval_secs, 30);
+    }
+
+    #[test]
+    fn memory_config_absent_and_partial_defaults() {
+        // Absent → None (gauges still always-on; only the knobs are gated).
+        let config = Config::from_str(minimal_yaml()).unwrap();
+        assert!(config.memory.is_none());
+
+        // Partial → unspecified knobs take their defaults (arena_max None,
+        // trim disabled), so a bare `memory:` block is valid.
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+memory:
+  glibc:
+    arena_max: 4
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let glibc = config.memory.unwrap().glibc;
+        assert_eq!(glibc.arena_max, Some(4));
+        assert_eq!(glibc.trim_interval_secs, 0);
     }
 
     #[test]

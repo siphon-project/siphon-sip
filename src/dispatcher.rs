@@ -1195,6 +1195,9 @@ async fn sweep_stale_entries(state: &DispatcherState) {
     // count (jemalloc can't see CPython's allocator) for Python leak detection.
     crate::metrics::update_memory_stats();
     crate::metrics::update_python_stats();
+    // Refresh the glibc allocator gauges — the C-side / CPython raw-domain pool
+    // that jemalloc and CPython's mimalloc can't see (no-op off glibc).
+    crate::metrics::update_glibc_stats();
 
     if expired_sessions > 0
         || expired_uac > 0
