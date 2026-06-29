@@ -5,20 +5,28 @@
 //!
 //! SCTP uses `tokio-sctp` with a duplex bridge: background tasks do
 //! recvmsg/sendmsg while the user-facing side implements AsyncRead/AsyncWrite.
+//! It links the `libsctp` system library, so the whole SCTP half of this module
+//! is gated behind the `sctp` Cargo feature (off by default). When the feature
+//! is disabled, only the TCP transport is compiled in and
+//! [`connect`] rejects `transport == "sctp"` with `ErrorKind::Unsupported`.
 
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+#[cfg(feature = "sctp")]
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::{TcpListener, TcpStream};
+#[cfg(feature = "sctp")]
 use tokio_sctp::{SctpListener, SctpStream, SendOptions};
 
 // ── SCTP AsyncRead/AsyncWrite bridge ────────────────────────────────────
 
 /// Wrapper around `tokio_sctp::SctpStream` that implements `AsyncRead + AsyncWrite`
 /// by bridging through background tasks that call recvmsg/sendmsg on SCTP stream 0.
+#[cfg(feature = "sctp")]
 pub struct SctpAsyncStream {
     reader: DuplexStream,
     writer: DuplexStream,
@@ -26,6 +34,7 @@ pub struct SctpAsyncStream {
     peer_addr: SocketAddr,
 }
 
+#[cfg(feature = "sctp")]
 impl SctpAsyncStream {
     pub fn new(stream: SctpStream) -> Self {
         let fallback_addr = SocketAddr::from(([0, 0, 0, 0], 0));
@@ -99,6 +108,7 @@ impl SctpAsyncStream {
     }
 }
 
+#[cfg(feature = "sctp")]
 impl AsyncRead for SctpAsyncStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -109,6 +119,7 @@ impl AsyncRead for SctpAsyncStream {
     }
 }
 
+#[cfg(feature = "sctp")]
 impl AsyncWrite for SctpAsyncStream {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -132,6 +143,7 @@ impl AsyncWrite for SctpAsyncStream {
 /// A Diameter transport stream, either TCP or SCTP.
 pub enum DiameterStream {
     Tcp(TcpStream),
+    #[cfg(feature = "sctp")]
     Sctp(SctpAsyncStream),
 }
 
@@ -139,6 +151,7 @@ impl DiameterStream {
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         match self {
             DiameterStream::Tcp(s) => s.peer_addr(),
+            #[cfg(feature = "sctp")]
             DiameterStream::Sctp(s) => s.peer_addr(),
         }
     }
@@ -146,6 +159,7 @@ impl DiameterStream {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         match self {
             DiameterStream::Tcp(s) => s.local_addr(),
+            #[cfg(feature = "sctp")]
             DiameterStream::Sctp(s) => s.local_addr(),
         }
     }
@@ -153,6 +167,7 @@ impl DiameterStream {
     pub fn transport_name(&self) -> &'static str {
         match self {
             DiameterStream::Tcp(_) => "TCP",
+            #[cfg(feature = "sctp")]
             DiameterStream::Sctp(_) => "SCTP",
         }
     }
@@ -164,6 +179,7 @@ impl From<TcpStream> for DiameterStream {
     }
 }
 
+#[cfg(feature = "sctp")]
 impl From<SctpAsyncStream> for DiameterStream {
     fn from(s: SctpAsyncStream) -> Self {
         DiameterStream::Sctp(s)
@@ -178,6 +194,7 @@ impl AsyncRead for DiameterStream {
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             DiameterStream::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "sctp")]
             DiameterStream::Sctp(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
@@ -191,6 +208,7 @@ impl AsyncWrite for DiameterStream {
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             DiameterStream::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "sctp")]
             DiameterStream::Sctp(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
@@ -198,6 +216,7 @@ impl AsyncWrite for DiameterStream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             DiameterStream::Tcp(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "sctp")]
             DiameterStream::Sctp(s) => Pin::new(s).poll_flush(cx),
         }
     }
@@ -205,6 +224,7 @@ impl AsyncWrite for DiameterStream {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             DiameterStream::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "sctp")]
             DiameterStream::Sctp(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
@@ -215,6 +235,7 @@ impl AsyncWrite for DiameterStream {
 /// A Diameter listener, either TCP or SCTP.
 pub enum DiameterListener {
     Tcp(TcpListener),
+    #[cfg(feature = "sctp")]
     Sctp(SctpListener),
 }
 
@@ -226,6 +247,7 @@ impl DiameterListener {
     }
 
     /// Bind an SCTP listener.
+    #[cfg(feature = "sctp")]
     pub fn bind_sctp(addr: SocketAddr) -> io::Result<Self> {
         let listener = SctpListener::bind(addr)?;
         Ok(DiameterListener::Sctp(listener))
@@ -238,6 +260,7 @@ impl DiameterListener {
                 let (stream, addr) = l.accept().await?;
                 Ok((DiameterStream::Tcp(stream), addr))
             }
+            #[cfg(feature = "sctp")]
             DiameterListener::Sctp(l) => {
                 let (stream, addr) = l.accept().await?;
                 Ok((DiameterStream::Sctp(SctpAsyncStream::new(stream)), addr))
@@ -248,6 +271,7 @@ impl DiameterListener {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         match self {
             DiameterListener::Tcp(l) => l.local_addr(),
+            #[cfg(feature = "sctp")]
             DiameterListener::Sctp(l) => l.local_addr(),
         }
     }
@@ -255,6 +279,7 @@ impl DiameterListener {
     pub fn transport_name(&self) -> &'static str {
         match self {
             DiameterListener::Tcp(_) => "TCP",
+            #[cfg(feature = "sctp")]
             DiameterListener::Sctp(_) => "SCTP",
         }
     }
@@ -263,6 +288,7 @@ impl DiameterListener {
 /// Connect to a Diameter peer over TCP or SCTP.
 pub async fn connect(addr: &str, transport: &str) -> io::Result<DiameterStream> {
     match transport {
+        #[cfg(feature = "sctp")]
         "sctp" => {
             let addr: SocketAddr = addr.parse().map_err(|e| {
                 io::Error::new(io::ErrorKind::InvalidInput, format!("bad address: {}", e))
@@ -270,6 +296,12 @@ pub async fn connect(addr: &str, transport: &str) -> io::Result<DiameterStream> 
             let stream = SctpAsyncStream::connect(addr).await?;
             Ok(DiameterStream::Sctp(stream))
         }
+        #[cfg(not(feature = "sctp"))]
+        "sctp" => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Diameter-over-SCTP requested but this binary was built without the `sctp` feature; \
+             rebuild with `--features sctp`",
+        )),
         _ => {
             let stream = TcpStream::connect(addr).await?;
             Ok(DiameterStream::Tcp(stream))

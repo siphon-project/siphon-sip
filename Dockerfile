@@ -17,9 +17,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         pkg-config \
         libssl-dev \
-        libsctp-dev \
         xz-utils \
     && rm -rf /var/lib/apt/lists/*
+# NOTE: the default build excludes SIP/Diameter-over-SCTP (the `sctp` Cargo
+# feature is off by default), so libsctp-dev is not needed. To build an
+# SCTP-capable image, add `libsctp-dev` here, `libsctp1` to the runtime stage,
+# and pass `--features sctp` to the `cargo build` below.
 
 # uv: standalone Python installer + project manager. Pulls
 # python-build-standalone binaries (no apt python needed).
@@ -86,7 +89,6 @@ FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl3 \
-        libsctp1 \
         iproute2 \
     && rm -rf /var/lib/apt/lists/*
 

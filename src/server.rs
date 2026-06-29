@@ -904,7 +904,14 @@ impl SiphonServer {
         let (tls_outbound_tx, tls_outbound_rx) = flume::unbounded::<transport::OutboundMessage>();
         let (ws_outbound_tx, ws_outbound_rx) = flume::unbounded::<transport::OutboundMessage>();
         let (wss_outbound_tx, wss_outbound_rx) = flume::unbounded::<transport::OutboundMessage>();
+        // The `sctp` sender always exists on the OutboundRouter so the
+        // `Transport::Sctp` routing arm stays infallible; the receiver is only
+        // consumed by the SCTP listener loop, which is compiled in under the
+        // `sctp` feature. Without it the receiver is intentionally unused.
+        #[cfg(feature = "sctp")]
         let (sctp_outbound_tx, sctp_outbound_rx) = flume::unbounded::<transport::OutboundMessage>();
+        #[cfg(not(feature = "sctp"))]
+        let (sctp_outbound_tx, _sctp_outbound_rx) = flume::unbounded::<transport::OutboundMessage>();
 
         // UDP listeners get a dedicated outbound channel each — required
         // for IPsec sec-agree on the P-CSCF role (3GPP TS 33.203 §7.4)
@@ -1182,23 +1189,37 @@ impl SiphonServer {
             }
         }
 
-        // SCTP
-        let sctp_connection_map = Arc::new(dashmap::DashMap::new());
-        for entry in &config.listen.sctp {
-            let addr: std::net::SocketAddr = entry.address().parse().unwrap_or_else(|error| {
-                eprintln!("Invalid SCTP listen address '{}': {error}", entry.address());
-                std::process::exit(1);
-            });
-            if first_listen_addr.is_none() {
-                first_listen_addr = Some(addr);
+        // SCTP — compiled in only under the `sctp` feature (links libsctp).
+        #[cfg(feature = "sctp")]
+        {
+            let sctp_connection_map = Arc::new(dashmap::DashMap::new());
+            for entry in &config.listen.sctp {
+                let addr: std::net::SocketAddr = entry.address().parse().unwrap_or_else(|error| {
+                    eprintln!("Invalid SCTP listen address '{}': {error}", entry.address());
+                    std::process::exit(1);
+                });
+                if first_listen_addr.is_none() {
+                    first_listen_addr = Some(addr);
+                }
+                listen_addrs.entry(transport::Transport::Sctp).or_insert(addr);
+                if let Some(adv) = entry.advertise() {
+                    advertised_addrs.entry(transport::Transport::Sctp).or_insert_with(|| adv.to_string());
+                }
+                let tos = resolve_tos(entry);
+                info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting SCTP transport");
+                transport::sctp::listen(addr, inbound_tx.clone(), sctp_outbound_rx.clone(), Arc::clone(&sctp_connection_map), Arc::clone(&transport_acl), tos).await;
             }
-            listen_addrs.entry(transport::Transport::Sctp).or_insert(addr);
-            if let Some(adv) = entry.advertise() {
-                advertised_addrs.entry(transport::Transport::Sctp).or_insert_with(|| adv.to_string());
-            }
-            let tos = resolve_tos(entry);
-            info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting SCTP transport");
-            transport::sctp::listen(addr, inbound_tx.clone(), sctp_outbound_rx.clone(), Arc::clone(&sctp_connection_map), Arc::clone(&transport_acl), tos).await;
+        }
+        // Built without the `sctp` feature: any configured SCTP listener cannot
+        // be honoured. Warn loudly rather than silently dropping it so the
+        // misconfiguration is visible (rebuild with `--features sctp`).
+        #[cfg(not(feature = "sctp"))]
+        if !config.listen.sctp.is_empty() {
+            tracing::warn!(
+                count = config.listen.sctp.len(),
+                "listen.sctp configured but this binary was built without the `sctp` feature; \
+                 SCTP listeners are ignored. Rebuild with `--features sctp` to enable SIP-over-SCTP."
+            );
         }
 
         let local_addr = first_listen_addr.unwrap_or_else(|| {

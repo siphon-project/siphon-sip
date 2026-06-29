@@ -6,6 +6,24 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Changed
+- **SCTP is now an opt-in build feature, off by default.** SIP-over-SCTP
+  (RFC 4168) and Diameter-over-SCTP link the `libsctp` system library, which
+  only exists on Linux. Moving them behind the `sctp` Cargo feature lets the
+  default build — including the official Docker image and the prebuilt release
+  packages (`.deb` / `.rpm` / tarball) — drop the `libsctp-dev` / `libsctp1`
+  dependency and build cleanly on macOS and Windows.
+  - **To enable SCTP:** build with `--features sctp` (on Linux, install
+    `libsctp-dev` first). The official Docker image and release binaries do
+    **not** include SCTP — you must build it yourself.
+  - **No config or scripting-API breakage:** the `Transport::Sctp` variant and
+    the `listen.sctp` config block still exist, so existing configs parse
+    unchanged whether or not the feature is enabled.
+  - **When built without SCTP:** a configured `listen.sctp` listener is skipped
+    with a warning, and a Diameter peer set to `transport: sctp` fails at
+    connect with `ErrorKind::Unsupported` (no silent fallback to TCP).
+  - CI builds and tests both configurations (default and `--features sctp`).
+
 ### Internal
 - Criterion microbenchmarks for the per-message / per-call hot paths, one bench
   file per path: `sip_hot_path` (parse/serialize/header/txn-key), `sdp_hot_path`
