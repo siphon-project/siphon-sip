@@ -827,7 +827,7 @@ pub async fn run(
                         Ok(permit) => permit,
                         Err(_) => return,
                     };
-                    crate::script::dra::dispatch_request(
+                    crate::script::diameter_dispatch::dispatch_request(
                         engine,
                         inbound_peer,
                         incoming,

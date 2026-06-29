@@ -4,7 +4,7 @@
 pub mod api;
 pub mod async_pool;
 pub mod blocking;
-pub mod dra;
+pub mod diameter_dispatch;
 pub mod engine;
 pub mod handle;
 pub mod py_executor;

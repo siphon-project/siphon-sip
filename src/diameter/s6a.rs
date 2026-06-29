@@ -10,7 +10,7 @@
 //! | PUR/PUA | 321  | MME → HSS | Purge-UE — detach cleanup |
 //!
 //! As with the other app modules, request encoding uses the typed byte
-//! builders and answer parsing reads the lossy JSON view; the DRA relay path
+//! builders and answer parsing reads the lossy JSON view; the Diameter server relay path
 //! uses the lossless tree in `codec.rs` instead.
 
 use crate::diameter::codec::{self, *};

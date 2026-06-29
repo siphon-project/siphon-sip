@@ -1,7 +1,7 @@
-//! Server-mode (DRA) connection acceptance.
+//! Server mode connection acceptance.
 //!
 //! The existing [`peer::accept`] does CER→CEA in one shot with a fixed
-//! identity — fine for a simple server NF. A Diameter Routing Agent needs a
+//! identity — fine for a simple server NF. A Diameter server needs a
 //! **staged** handshake so two Rust-only auth gates and a per-tenant identity
 //! decision land between reading the CER and writing the CEA:
 //!
@@ -60,7 +60,7 @@ pub enum HandshakeError {
     Protocol(String),
 }
 
-/// The DRA's own capabilities/identity used when building CEAs and the
+/// The Diameter server's own capabilities/identity used when building CEAs and the
 /// per-connection `PeerConfig`.
 #[derive(Debug, Clone)]
 pub struct ServerIdentity {
@@ -75,7 +75,7 @@ pub struct ServerIdentity {
     pub application_ids: Vec<(u32, u32)>,
 }
 
-/// The two auth gates plus the DRA's identity — everything needed to admit (or
+/// The two auth gates plus the Diameter server's identity — everything needed to admit (or
 /// refuse) an inbound connection.
 pub struct ServerHandshake {
     pub acl: Arc<SourceIpAcl>,
@@ -179,7 +179,7 @@ impl ServerHandshake {
             peer = %acl_match.peer,
             asserted_origin = %asserted,
             advertised_origin = %origin_host,
-            "Diameter DRA: peer admitted"
+            "Diameter server: peer admitted"
         );
         Ok((admitted, acl_match))
     }
@@ -231,7 +231,7 @@ mod tests {
                 default_origin_host: "dra.example.org".into(),
                 default_origin_realm: "example.org".into(),
                 local_ip: "127.0.0.1".parse().unwrap(),
-                product_name: "SIPhon-DRA".into(),
+                product_name: "SIPhon-Diameter server".into(),
                 firmware_revision: 1,
                 watchdog_interval: 300,
                 application_ids: vec![],

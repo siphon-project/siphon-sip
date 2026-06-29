@@ -1,4 +1,4 @@
-"""Tests for the server-mode (DRA) Diameter mocks in siphon_sdk."""
+"""Tests for the server-mode Diameter mocks in siphon_sdk."""
 
 import asyncio
 
@@ -48,12 +48,12 @@ def test_peer_pool_round_robin_and_liveness():
 
     from siphon import diameter as d
 
-    pool = d.peer_pool("default", ["hss-a", "hss-b", "hss-dead"])
+    pool = d.peer_pool(["hss-a", "hss-b", "hss-dead"])
     assert pool.live_count == 2
     picked = {pool.pick_round_robin().name for _ in range(2)}
     assert picked == {"hss-a", "hss-b"}
 
-    empty = d.peer_pool("default", ["hss-dead"])
+    empty = d.peer_pool(["hss-dead"])
     assert empty.pick_round_robin() is None
 
 
@@ -65,7 +65,7 @@ def test_on_request_forward_and_reject():
 
     @d.on_request
     async def handle(req):
-        pool = d.peer_pool(req.peer.tenant, ["hss"])
+        pool = d.peer_pool(["hss"])
         peer = pool.pick_round_robin()
         if peer is None:
             return req.reject(3002)
@@ -138,6 +138,33 @@ def test_server_answer_with_grouped_avp():
     )
     stored = answer.get_avp("Authentication-Info", 10415)
     assert stored[0][0] == "E-UTRAN-Vector"
+
+
+def test_on_reply_rewrites_answer():
+    """@diameter.on_reply gets (req, answer) and rewrites AVPs in place."""
+    diameter = _fresh_diameter()
+
+    @diameter.on_reply
+    def hide_topology(req, answer):
+        # Topology hiding: replace the backend's Origin-Host before it goes
+        # back upstream. siphon re-serializes the mutated answer.
+        answer.set_avp("Origin-Host", b"diam.example.net")
+
+    # The decorator returns the handler unchanged.
+    assert hide_topology.__name__ == "hide_topology"
+
+    req = mock_module.MockDiameterRequest(application_name="S6a", command_name="ULR")
+    answer = req.answer(2001)
+    hide_topology(req, answer)
+    assert answer.get_avp("Origin-Host") == b"diam.example.net"
+
+
+def test_peer_pool_tenant_defaults_to_single_domain():
+    """peer_pool(target) works without a tenant arg (single-domain server)."""
+    diameter = _fresh_diameter()
+    diameter.add_peer("backend", connected=True)
+    pool = diameter.peer_pool("backend")
+    assert pool.pick_round_robin().name == "backend"
 
 
 def test_ip_in_cidr_and_fnmatch_helpers():

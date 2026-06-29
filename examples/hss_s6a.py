@@ -5,16 +5,16 @@ requests to Python and ships the answer the script returns; the **script owns
 all S6a semantics** — subscriber data, SQN management, and authentication-vector
 crypto. siphon does not implement Milenage or any S6a logic.
 
-The inbound serving path is the same `@diameter.on_request` hook the DRA uses
+The inbound serving path is the same `@diameter.on_request` hook every server-mode script uses
 (enabled by `diameter.listen` + a tenant whose `clients` are the MMEs). Instead
 of forwarding, the handler builds an answer with `req.answer(...)` and populates
 it — including the nested Authentication-Info → E-UTRAN-Vector grouping — using
 the generic grouped-AVP value shape (`list` of `(code, value[, vendor])`).
 
 Two deployment shapes, same handler:
-  - **MME/DRA dials in**: set `diameter.listen` + a tenant whose `clients` are
+  - **a peer dials in**: set `diameter.listen` + a tenant whose `clients` are
     the peers allowed to connect (source-IP ACL).
-  - **HSS dials the DRA**: omit `diameter.listen`; put the DRA under the
+  - **this node dials out**: omit `diameter.listen`; put the upstream under the
     tenant's `connect_to` list. siphon initiates the connection and still
     serves the AIR/ULR relayed back over it (RFC 6733 §2.1 — transport
     direction is independent of request direction).
@@ -55,7 +55,7 @@ async def on_ulr(req):
     return _handle_ulr(req)
 
 
-@diameter.on_request("s6a:purge-ue")
+@diameter.on_request("s6a:PUR")
 async def on_purge_ue(req):
     return req.answer(DIAMETER_SUCCESS)  # Purge-UE: nothing to return
 

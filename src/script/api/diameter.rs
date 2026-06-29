@@ -475,7 +475,7 @@ impl PyDiameter {
         }
     }
 
-    /// Attach server-mode (DRA) runtime: the config snapshot exposed as
+    /// Attach server mode runtime: the config snapshot exposed as
     /// `diameter.config`, and the event sink behind `diameter.event_sink`.
     pub fn with_dra_runtime(
         mut self,
@@ -1209,7 +1209,7 @@ impl PyDiameter {
     }
 
 
-    /// Register the server-mode (DRA) CER identity callback.
+    /// Register the server mode CER identity callback.
     ///
     /// Called for an already-authenticated peer (both Rust auth gates have
     /// passed) to decide which identity to advertise in the CEA. Return
@@ -1240,7 +1240,7 @@ impl PyDiameter {
         Ok(func)
     }
 
-    /// Register the server-mode (DRA) inbound-request dispatcher.
+    /// Register the server mode inbound-request dispatcher.
     ///
     /// Called for inbound requests (R-bit set) from an authenticated peer.
     /// Return ``req.reject(code)``, ``await req.forward_to(peer, …)``,
@@ -1248,7 +1248,7 @@ impl PyDiameter {
     ///
     /// An optional filter scopes the handler to specific commands, mirroring
     /// ``@proxy.on_request("INVITE")``:
-    ///   - bare ``@diameter.on_request`` — every command (the DRA relay catch-all)
+    ///   - bare ``@diameter.on_request`` — every command (the Diameter server relay catch-all)
     ///   - ``@diameter.on_request("ULR")`` — that command, any application
     ///   - ``@diameter.on_request("ULR|AIR")`` — several commands
     ///   - ``@diameter.on_request("S6a:ULR")`` — app-qualified. The most specific
@@ -1287,7 +1287,41 @@ impl PyDiameter {
         }
     }
 
-    /// Register the server-mode (DRA) post-answer hook.
+    /// Register the server mode answer-rewrite hook.
+    ///
+    /// Called with ``fn(req, answer)`` on the answer an ``on_request`` handler
+    /// produced — whether relayed via ``forward_to`` or built by
+    /// ``answer``/``reject`` — just before it goes back upstream. A central
+    /// place to rewrite answer AVPs for every reply (topology hiding,
+    /// Origin-Host/Result-Code mapping) instead of repeating it in each
+    /// ``on_request`` handler. Mutate ``answer`` in place; the return value is
+    /// ignored. Both sync and async handlers are supported.
+    ///
+    /// ```python,ignore
+    /// @diameter.on_reply
+    /// def hide_topology(req, answer):
+    ///     answer.set_avp("Origin-Host", b"dra.example.net")
+    /// ```
+    #[staticmethod]
+    fn on_reply(python: Python<'_>, func: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        let asyncio = python.import("asyncio")?;
+        let is_async = asyncio
+            .call_method1("iscoroutinefunction", (func.bind(python),))?
+            .is_truthy()?;
+        let registry = python.import("_siphon_registry")?;
+        registry.call_method1(
+            "register",
+            (
+                "diameter.on_reply",
+                python.None(),
+                func.bind(python),
+                is_async,
+            ),
+        )?;
+        Ok(func)
+    }
+
+    /// Register the server mode post-answer hook.
     ///
     /// Called after the answer has been sent upstream with
     /// ``fn(req, answer, latency_us)`` — typically to emit an event.
@@ -1311,17 +1345,20 @@ impl PyDiameter {
     }
 
     /// Build a backend peer pool for `target` (a peer name or list of names)
-    /// resolved through the DRA's connected peers (state-as-truth liveness).
+    /// resolved through the connected peers (state-as-truth liveness).
     ///
     /// ```python,ignore
-    /// pool = diameter.peer_pool("default", ["hss-a", "hss-b"])
+    /// pool = diameter.peer_pool(["hss-a", "hss-b"])
     /// peer = pool.pick_sticky(req.session_id, ttl_secs=300)
     /// ```
-    #[pyo3(signature = (tenant, target))]
+    ///
+    /// `tenant` is an optional label used only to scope the pool; it defaults
+    /// to `"default"` and can be left unset for single-domain servers.
+    #[pyo3(signature = (target, tenant=None))]
     fn peer_pool(
         &self,
-        tenant: String,
         target: &Bound<'_, PyAny>,
+        tenant: Option<String>,
     ) -> PyResult<crate::script::api::diameter_server::PyPeerPool> {
         let names: Vec<String> = if let Ok(single) = target.extract::<String>() {
             vec![single]
@@ -1333,7 +1370,7 @@ impl PyDiameter {
             })?
         };
         let pool = std::sync::Arc::new(crate::diameter::pool::PeerPool::new(
-            tenant,
+            tenant.unwrap_or_else(|| "default".to_string()),
             std::sync::Arc::clone(&self.manager),
             names,
         ));
@@ -1367,7 +1404,7 @@ impl PyDiameter {
     }
 
     /// Read-only view of the parsed `diameter` config (`tenants`, `listen`),
-    /// loaded once at startup. Returns an empty dict when no DRA config is set.
+    /// loaded once at startup. Returns an empty dict when no Diameter server config is set.
     ///
     /// Note: siphon has no YAML hot-reload — a route-table change needs a
     /// restart in v1.

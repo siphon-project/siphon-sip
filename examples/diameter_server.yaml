@@ -1,0 +1,53 @@
+# SIPhon as a Diameter server.
+#
+# siphon accepts inbound Diameter from authenticated peers, runs CER/CEA + the
+# DWR/DWA watchdog, and dispatches each request to the Python handlers in
+# examples/diameter_server.py. siphon transports Diameter; the script decides
+# what to do with each request (answer locally, or relay to a backend).
+#
+# Usage:
+#   siphon --config examples/diameter_server.yaml
+
+# siphon does not process SIP here; this listener is unused but required by the
+# config schema. Point it at an unused loopback port.
+listen:
+  udp:
+    - "127.0.0.1:5099"
+
+# Required by the config schema; this server routes on Diameter realms, not SIP.
+domain:
+  local:
+    - "epc.mnc001.mcc001.3gppnetwork.org"
+
+script:
+  path: "examples/diameter_server.py"
+  reload: auto
+
+diameter:
+  # Inbound listeners — presence enables server mode (accept + CER/CEA + DWR).
+  listen:
+    tcp: "0.0.0.0:3868"
+    sctp: "0.0.0.0:3868"
+
+  # This server's advertised identity (CEA + Origin-Host on relayed requests).
+  origin_host: "diam.epc.mnc001.mcc001.3gppnetwork.org"
+  origin_realm: "epc.mnc001.mcc001.3gppnetwork.org"
+
+  # Generic event sink for Python-emitted signalling events.
+  event_sink:
+    backend: file
+    file:
+      path: "/var/log/siphon/diameter-events.jsonl"
+
+  # Peers allowed to connect: source-IP ACL + optional Origin-Host validation.
+  # Both gates run in Rust before any Python handler — an unlisted source never
+  # reaches a script.
+  clients:
+    - name: client-a
+      allowed_ips: ["172.16.0.150", "172.16.0.0/24"]
+      expected_origin_host: "client-a.epc.mnc001.mcc001.3gppnetwork.org"
+
+  # Backend(s) this server connects out to and relays toward. Referenced by
+  # name from the script via diameter.peer_pool(..., "backend").
+  servers:
+    - { name: backend, host: "172.16.0.61", port: 3868, transport: tcp }

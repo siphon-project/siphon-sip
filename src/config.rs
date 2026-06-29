@@ -732,7 +732,7 @@ fn default_diameter_route_algorithm() -> String { "failover".to_string() }
 #[derive(Debug, Deserialize, Clone)]
 pub struct DiameterConfig {
     /// Origin-Host identity for this SIPhon node (used in all client-mode CER
-    /// messages). Optional for pure DRA deployments, which carry identity
+    /// messages). Optional for pure Diameter server deployments, which carry identity
     /// per-tenant under `tenants.<name>.identity` instead.
     #[serde(default)]
     pub origin_host: String,
@@ -759,11 +759,27 @@ pub struct DiameterConfig {
     #[serde(default)]
     pub routes: Vec<DiameterRouteEntry>,
 
-    // ── Server-mode (DRA) — all opt-in, additive ────────────────────────────
-    /// Inbound listener addresses. Presence enables server (DRA) mode.
+    // ── Server mode — all opt-in, additive ────────────────────────────
+    /// Inbound listener addresses. Presence enables server mode.
     #[serde(default)]
     pub listen: Option<DiameterListenConfig>,
-    /// Multi-tenant identity + per-tenant peer tables + opaque routes.
+    /// Inbound peers (source-IP ACL + optional Origin-Host validation) for the
+    /// single-domain server. Folded into the implicit `"default"` tenant when
+    /// `tenants` is omitted. See [`DiameterConfig::effective_tenants`].
+    #[serde(default)]
+    pub clients: Vec<DiameterClientEntry>,
+    /// Backends this server connects out to and relays toward, for the
+    /// single-domain server. Folded into the implicit `"default"` tenant.
+    #[serde(default)]
+    pub servers: Vec<DiameterServerEntry>,
+    /// Outbound connections siphon initiates but serves inbound requests on
+    /// (e.g. this node dialling an upstream), for the single-domain server.
+    /// Folded into the implicit `"default"` tenant.
+    #[serde(default)]
+    pub connect_to: Vec<DiameterServerEntry>,
+    /// Per-tenant identity + peer tables + opaque routes. Optional — the common
+    /// single-domain case omits this and uses the flat `clients` / `servers` /
+    /// `connect_to` fields above instead.
     #[serde(default)]
     pub tenants: std::collections::HashMap<String, DiameterTenant>,
     /// Generic event sink for Python-emitted signalling events.
@@ -771,7 +787,45 @@ pub struct DiameterConfig {
     pub event_sink: Option<EventSinkConfig>,
 }
 
-/// Inbound Diameter listener addresses for server (DRA) mode.
+impl DiameterConfig {
+    /// Resolve the tenant map the server bootstrap runs against.
+    ///
+    /// Multi-tenant deployments declare `diameter.tenants.<name>` explicitly.
+    /// The common single-domain case omits it and uses the flat
+    /// `diameter.{origin_host,origin_realm,clients,servers,connect_to}` fields;
+    /// those are folded into one implicit `"default"` tenant here, so the rest
+    /// of the server runs through exactly the same path either way. Pure
+    /// client-mode NFs (no identity, no peer lists) yield an empty map and
+    /// never reach the server bootstrap.
+    pub fn effective_tenants(&self) -> std::collections::HashMap<String, DiameterTenant> {
+        if !self.tenants.is_empty() {
+            return self.tenants.clone();
+        }
+        // Trigger synthesis on the server-specific fields only. `origin_host`
+        // alone is set by pure client-mode NFs too, so it must not by itself
+        // conjure a server tenant.
+        if self.clients.is_empty() && self.servers.is_empty() && self.connect_to.is_empty() {
+            return std::collections::HashMap::new();
+        }
+        let mut tenants = std::collections::HashMap::new();
+        tenants.insert(
+            "default".to_string(),
+            DiameterTenant {
+                identity: DiameterTenantIdentity {
+                    origin_host: self.origin_host.clone(),
+                    origin_realm: self.origin_realm.clone(),
+                },
+                clients: self.clients.clone(),
+                servers: self.servers.clone(),
+                connect_to: self.connect_to.clone(),
+                routes: serde_json::Value::Null,
+            },
+        );
+        tenants
+    }
+}
+
+/// Inbound Diameter listener addresses for server mode.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct DiameterListenConfig {
     /// TCP bind address, e.g. "0.0.0.0:3868".
@@ -782,7 +836,7 @@ pub struct DiameterListenConfig {
     pub sctp: Option<String>,
 }
 
-/// A DRA tenant: its advertised identity, inbound clients, outbound servers,
+/// A Diameter server tenant: its advertised identity, inbound clients, outbound servers,
 /// and an opaque routing table consumed by the Python dispatch script.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct DiameterTenant {
@@ -792,8 +846,8 @@ pub struct DiameterTenant {
     #[serde(default)]
     pub servers: Vec<DiameterServerEntry>,
     /// Outbound connections siphon **initiates** but **serves** inbound
-    /// requests on — e.g. an HSS dialling a DRA, then answering the AIR/ULR
-    /// the DRA relays back over that same connection. siphon sends the CER
+    /// requests on — e.g. an HSS dialling a Diameter server, then answering the AIR/ULR
+    /// the Diameter server relays back over that same connection. siphon sends the CER
     /// (this tenant's identity) and routes inbound requests to
     /// `@diameter.on_request`, exactly like the listener path. The transport
     /// direction is independent of the request direction (RFC 6733 §2.1).
@@ -813,7 +867,7 @@ pub struct DiameterTenantIdentity {
     pub origin_realm: String,
 }
 
-/// An inbound (client) peer the DRA accepts connections from.
+/// An inbound (client) peer the Diameter server accepts connections from.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct DiameterClientEntry {
     pub name: String,
@@ -825,7 +879,7 @@ pub struct DiameterClientEntry {
     pub expected_origin_host: Option<String>,
 }
 
-/// An outbound (server) peer the DRA relays to, using the tenant's identity.
+/// An outbound (server) peer the Diameter server relays to, using the tenant's identity.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 pub struct DiameterServerEntry {
     pub name: String,
@@ -4086,7 +4140,7 @@ script:
     }
 
     #[test]
-    fn dra_server_config_parses() {
+    fn diameter_server_config_parses() {
         let yaml = r#"
 listen:
   udp:
@@ -4095,7 +4149,7 @@ domain:
   local:
     - "epc.mnc001.mcc001.3gppnetwork.org"
 script:
-  path: "examples/dra.py"
+  path: "examples/diameter_server.py"
 diameter:
   listen:
     tcp: "0.0.0.0:3868"
@@ -4103,7 +4157,7 @@ diameter:
   event_sink:
     backend: file
     file:
-      path: "/tmp/dra.jsonl"
+      path: "/tmp/diameter.jsonl"
   tenants:
     default:
       identity:
@@ -4118,7 +4172,7 @@ diameter:
       routes:
         - { application: s6c, destinations: ["hss"] }
 "#;
-        let config = Config::from_str(yaml).expect("DRA config should parse");
+        let config = Config::from_str(yaml).expect("Diameter server config should parse");
         let diameter = config.diameter.expect("diameter section");
         let listen = diameter.listen.expect("listen");
         assert_eq!(listen.tcp.as_deref(), Some("0.0.0.0:3868"));
@@ -4143,8 +4197,8 @@ diameter:
     }
 
     #[test]
-    fn hss_connect_to_dra_config_parses() {
-        // An HSS that dials a DRA: no listener, a tenant with connect_to.
+    fn hss_connect_to_server_config_parses() {
+        // An HSS that dials a Diameter server: no listener, a tenant with connect_to.
         let yaml = r#"
 listen:
   udp:
@@ -4173,12 +4227,69 @@ diameter:
     }
 
     #[test]
-    fn example_dra_yaml_loads() {
+    fn example_diameter_server_yaml_loads() {
         // The shipped example must always parse (acceptance artifact).
-        let config = Config::from_file("examples/dra.yaml").expect("examples/dra.yaml must parse");
+        let config = Config::from_file("examples/diameter_server.yaml")
+            .expect("examples/diameter_server.yaml must parse");
         let diameter = config.diameter.expect("diameter section");
         assert!(diameter.listen.is_some());
-        assert!(diameter.tenants.contains_key("default"));
+        // Flat single-domain shape: no `tenants:` block — the server runs
+        // against the implicit "default" tenant synthesized from the flat
+        // fields by effective_tenants().
+        assert!(diameter.tenants.is_empty());
+        assert!(!diameter.origin_host.is_empty());
+        assert_eq!(diameter.clients[0].name, "client-a");
+        assert_eq!(diameter.servers[0].name, "backend");
+
+        let effective = diameter.effective_tenants();
+        let default = effective.get("default").expect("synthesized default tenant");
+        assert_eq!(default.identity.origin_host, diameter.origin_host);
+        assert_eq!(default.identity.origin_realm, diameter.origin_realm);
+        assert_eq!(default.clients[0].name, "client-a");
+        assert_eq!(default.servers[0].name, "backend");
+    }
+
+    #[test]
+    fn effective_tenants_prefers_explicit_over_flat() {
+        // When `tenants:` is declared, the flat fields are ignored.
+        let yaml = r#"
+listen:
+  udp: ["127.0.0.1:5099"]
+domain:
+  local: ["example.org"]
+script:
+  path: "examples/diameter_server.py"
+diameter:
+  origin_host: "flat.example.org"
+  servers:
+    - { name: flatbackend, host: "10.0.0.1" }
+  tenants:
+    alpha:
+      identity: { origin_host: "alpha.example.org", origin_realm: "example.org" }
+"#;
+        let diameter = Config::from_str(yaml).unwrap().diameter.unwrap();
+        let effective = diameter.effective_tenants();
+        assert!(effective.contains_key("alpha"));
+        assert!(!effective.contains_key("default"));
+    }
+
+    #[test]
+    fn effective_tenants_empty_for_client_only() {
+        // Pure client-mode NFs set origin_host (for their CER) but no server
+        // fields (clients/servers/connect_to) — they synthesize no tenant.
+        let yaml = r#"
+listen:
+  udp: ["127.0.0.1:5099"]
+domain:
+  local: ["example.org"]
+script:
+  path: "examples/diameter_server.py"
+diameter:
+  origin_host: "client.example.org"
+  origin_realm: "example.org"
+"#;
+        let diameter = Config::from_str(yaml).unwrap().diameter.unwrap();
+        assert!(diameter.effective_tenants().is_empty());
     }
 
     #[test]

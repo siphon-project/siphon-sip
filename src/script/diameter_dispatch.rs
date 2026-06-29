@@ -1,4 +1,4 @@
-//! Diameter Routing Agent (DRA) server bootstrap and dispatch.
+//! Diameter server bootstrap and dispatch.
 //!
 //! Wires the server-mode pieces (Phases 0–5) into a running agent:
 //!   - connects each tenant's backend `servers` as outbound clients (so pools
@@ -12,7 +12,7 @@
 //!     connection.
 //!
 //! Per-request concurrency is the key difference from the client-mode
-//! `dispatcher.rs` loop, which awaits each handler serially: a DRA relay can
+//! `dispatcher.rs` loop, which awaits each handler serially: a Diameter server relay can
 //! block for the backend RTT, so serial dispatch would head-of-line-block
 //! every tenant.
 
@@ -42,7 +42,7 @@ const MAX_INFLIGHT: usize = 512;
 /// Per-tenant advertised identity, indexed by tenant name.
 type TenantIdentities = Arc<HashMap<String, (String, String)>>;
 
-/// Bootstrap the DRA / server NF: connect backends, dial any outbound serving
+/// Bootstrap the Diameter server / server NF: connect backends, dial any outbound serving
 /// connections (`connect_to`), and bind the inbound listeners. Runs whenever
 /// `diameter.listen` is set OR any tenant has `connect_to` peers.
 pub fn spawn(
@@ -52,17 +52,20 @@ pub fn spawn(
     product_name: &str,
     product_version: &str,
 ) {
-    let has_connect_to = config.tenants.values().any(|t| !t.connect_to.is_empty());
+    // Single-domain configs (flat clients/servers, no `tenants:` block) and
+    // multi-tenant configs both resolve to the same tenant map here.
+    let tenants = config.effective_tenants();
+    let has_connect_to = tenants.values().any(|t| !t.connect_to.is_empty());
     if config.listen.is_none() && !has_connect_to {
         return;
     }
 
     let semaphore = Arc::new(Semaphore::new(MAX_INFLIGHT));
 
-    // Tenant identities + connect backend servers (DRA relay targets) +
-    // outbound serving connections (e.g. HSS → DRA).
+    // Tenant identities + connect backend servers (relay targets) + outbound
+    // serving connections (e.g. a node dialling an upstream).
     let mut identities: HashMap<String, (String, String)> = HashMap::new();
-    for (tenant_name, tenant) in &config.tenants {
+    for (tenant_name, tenant) in &tenants {
         let identity = (
             tenant.identity.origin_host.clone(),
             tenant.identity.origin_realm.clone(),
@@ -99,11 +102,11 @@ pub fn spawn(
     // Build the two auth gates from every tenant's client list.
     let mut acl = SourceIpAcl::new();
     let mut origin_policy = OriginHostPolicy::new();
-    for (tenant_name, tenant) in &config.tenants {
+    for (tenant_name, tenant) in &tenants {
         for client in &tenant.clients {
             for cidr in &client.allowed_ips {
                 if let Err(error) = acl.add_str(cidr, tenant_name, &client.name) {
-                    warn!(%error, tenant = %tenant_name, peer = %client.name, "DRA: bad allowed_ips entry");
+                    warn!(%error, tenant = %tenant_name, peer = %client.name, "Diameter server: bad allowed_ips entry");
                 }
             }
             if let Some(expected) = &client.expected_origin_host {
@@ -194,14 +197,14 @@ fn spawn_backend_connection(
                 Ok((connected, mut incoming_rx)) => {
                     let client = Arc::new(DiameterClient::new(Arc::clone(&connected)));
                     manager.register(name.clone(), client);
-                    info!(peer = %name, "DRA backend connected");
+                    info!(peer = %name, "Diameter server backend connected");
                     // Drain backend-initiated requests (none expected for a
                     // pure relay target); answers correlate via send_request.
                     while incoming_rx.recv().await.is_some() {}
-                    warn!(peer = %name, "DRA backend disconnected, reconnecting");
+                    warn!(peer = %name, "Diameter server backend disconnected, reconnecting");
                 }
                 Err(error) => {
-                    warn!(peer = %name, %error, "DRA backend connect failed, retrying in 5s");
+                    warn!(peer = %name, %error, "Diameter server backend connect failed, retrying in 5s");
                 }
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -210,7 +213,7 @@ fn spawn_backend_connection(
 }
 
 /// Dial an outbound connection and **serve** the inbound requests it carries
-/// via `@diameter.on_request` — the HSS-dials-DRA case. siphon sends the CER
+/// via `@diameter.on_request` — the HSS-dials-Diameter server case. siphon sends the CER
 /// with the tenant identity; reconnects on drop. Per-request dispatch is
 /// bounded by the same global semaphore as the listener path.
 #[allow(clippy::too_many_arguments)]
@@ -253,7 +256,7 @@ fn spawn_serving_connection(
                     info!(
                         peer = %entry.name,
                         tenant = %tenant_name,
-                        "DRA: outbound serving connection established (inbound requests → on_request)"
+                        "Diameter server: outbound serving connection established (inbound requests → on_request)"
                     );
                     while let Some(incoming) = incoming_rx.recv().await {
                         let engine = Arc::clone(&engine);
@@ -278,10 +281,10 @@ fn spawn_serving_connection(
                             .await;
                         });
                     }
-                    warn!(peer = %entry.name, "DRA: outbound serving connection dropped, reconnecting");
+                    warn!(peer = %entry.name, "Diameter server: outbound serving connection dropped, reconnecting");
                 }
                 Err(error) => {
-                    warn!(peer = %entry.name, %error, "DRA: outbound serving connect failed, retrying in 5s");
+                    warn!(peer = %entry.name, %error, "Diameter server: outbound serving connect failed, retrying in 5s");
                 }
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -304,7 +307,7 @@ fn spawn_listener(
             "sctp" => match addr.parse::<SocketAddr>() {
                 Ok(socket_addr) => DiameterListener::bind_sctp(socket_addr),
                 Err(error) => {
-                    warn!(%addr, %error, "DRA: bad SCTP listen address");
+                    warn!(%addr, %error, "Diameter server: bad SCTP listen address");
                     return;
                 }
             },
@@ -312,7 +315,7 @@ fn spawn_listener(
             "sctp" => {
                 warn!(
                     %addr,
-                    "DRA: diameter.listen.sctp is set but this build has no `sctp` feature — \
+                    "Diameter server: diameter.listen.sctp is set but this build has no `sctp` feature — \
                      SCTP listener not started (rebuild with `--features sctp`)"
                 );
                 return;
@@ -322,11 +325,11 @@ fn spawn_listener(
         let listener = match listener {
             Ok(listener) => listener,
             Err(error) => {
-                warn!(%addr, %transport, %error, "DRA: failed to bind listener");
+                warn!(%addr, %transport, %error, "Diameter server: failed to bind listener");
                 return;
             }
         };
-        info!(%addr, %transport, "DRA listening");
+        info!(%addr, %transport, "Diameter server listening");
 
         loop {
             match listener.accept().await {
@@ -343,7 +346,7 @@ fn spawn_listener(
                     });
                 }
                 Err(error) => {
-                    warn!(%addr, %transport, %error, "DRA: accept error");
+                    warn!(%addr, %transport, %error, "Diameter server: accept error");
                     return;
                 }
             }
@@ -378,13 +381,13 @@ async fn serve_connection(
     {
         Ok(result) => result,
         Err(error) => {
-            warn!(%peer_addr, %transport, %error, "DRA: handshake rejected");
+            warn!(%peer_addr, %transport, %error, "Diameter server: handshake rejected");
             return;
         }
     };
 
-    let dra_origin_host = admitted_peer.config().origin_host.clone();
-    let dra_origin_realm = admitted_peer.config().origin_realm.clone();
+    let local_origin_host = admitted_peer.config().origin_host.clone();
+    let local_origin_realm = admitted_peer.config().origin_realm.clone();
     let peer_info = PyInboundPeer {
         name: acl_match.peer.clone(),
         tenant: acl_match.tenant.clone(),
@@ -397,8 +400,8 @@ async fn serve_connection(
         let semaphore = Arc::clone(&semaphore);
         let inbound_peer = Arc::clone(&admitted_peer);
         let peer_info = peer_info.clone();
-        let dra_origin_host = dra_origin_host.clone();
-        let dra_origin_realm = dra_origin_realm.clone();
+        let local_origin_host = local_origin_host.clone();
+        let local_origin_realm = local_origin_realm.clone();
         tokio::spawn(async move {
             let _permit = match semaphore.acquire_owned().await {
                 Ok(permit) => permit,
@@ -409,8 +412,8 @@ async fn serve_connection(
                 inbound_peer,
                 incoming,
                 peer_info,
-                dra_origin_host,
-                dra_origin_realm,
+                local_origin_host,
+                local_origin_realm,
             )
             .await;
         });
@@ -451,7 +454,7 @@ fn resolve_cer_identity(
                     match run_coroutine_value(python, &value) {
                         Ok(resolved) => resolved.into_bound(python),
                         Err(error) => {
-                            warn!(%error, "DRA: async on_inbound_cer failed");
+                            warn!(%error, "Diameter server: async on_inbound_cer failed");
                             return fallback();
                         }
                     }
@@ -460,7 +463,7 @@ fn resolve_cer_identity(
                 }
             }
             Err(error) => {
-                warn!(%error, "DRA: on_inbound_cer failed");
+                warn!(%error, "Diameter server: on_inbound_cer failed");
                 return fallback();
             }
         };
@@ -473,7 +476,7 @@ fn resolve_cer_identity(
                 origin_realm,
             },
             Err(_) => {
-                warn!("DRA: on_inbound_cer must return (origin_host, origin_realm) or None");
+                warn!("Diameter server: on_inbound_cer must return (origin_host, origin_realm) or None");
                 fallback()
             }
         }
@@ -483,7 +486,7 @@ fn resolve_cer_identity(
 /// Dispatch a single inbound request to `@diameter.on_request`, ship the
 /// answer back, then fire `@diameter.on_request_completed`.
 ///
-/// Shared by the DRA listener, outbound serving connections, AND the legacy
+/// Shared by the Diameter server listener, outbound serving connections, AND the legacy
 /// `diameter.peers` inbound path (dispatcher.rs) — one inbound model for every
 /// connection type and every application.
 pub(crate) async fn dispatch_request(
@@ -491,8 +494,8 @@ pub(crate) async fn dispatch_request(
     inbound_peer: Arc<DiameterPeer>,
     incoming: IncomingRequest,
     peer_info: PyInboundPeer,
-    dra_origin_host: String,
-    dra_origin_realm: String,
+    local_origin_host: String,
+    local_origin_realm: String,
 ) {
     let start = Instant::now();
 
@@ -502,14 +505,33 @@ pub(crate) async fn dispatch_request(
     let engine_for_handler = Arc::clone(&engine);
     let join = crate::script::py_executor::try_run(move || -> AnswerOutcome {
         pyo3::Python::attach(|python| {
-            build_answer_via_handler(
+            let mut outcome = build_answer_via_handler(
                 python,
                 &engine_for_handler,
                 &incoming,
                 &peer_info,
-                &dra_origin_host,
-                &dra_origin_realm,
-            )
+                &local_origin_host,
+                &local_origin_realm,
+            );
+            // `@diameter.on_reply` — let the script rewrite the answer in place
+            // before it goes back upstream, then re-serialize the (possibly
+            // mutated) answer. Only runs when a handler is registered and the
+            // request actually reached a script handler (request/answer Py
+            // objects present); siphon's own error answers pass through.
+            let new_wire: Option<Vec<u8>> = match (&outcome.request_py, &outcome.answer_py) {
+                (Some(request_py), Some(answer_py)) => {
+                    if run_on_reply(python, &engine_for_handler, request_py, answer_py) {
+                        answer_py.borrow(python).to_wire().ok()
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(wire) = new_wire {
+                outcome.wire = wire;
+            }
+            outcome
         })
     })
     .await;
@@ -517,13 +539,13 @@ pub(crate) async fn dispatch_request(
     let outcome = match join {
         Ok(outcome) => outcome,
         Err(_panic) => {
-            warn!("DRA: dispatch task panicked");
+            warn!("Diameter server: dispatch task panicked");
             return;
         }
     };
 
     if let Err(error) = inbound_peer.send_response(outcome.wire).await {
-        warn!(%error, "DRA: failed to send answer upstream");
+        warn!(%error, "Diameter server: failed to send answer upstream");
     }
 
     // Post-answer hook (best-effort).
@@ -542,11 +564,11 @@ pub(crate) async fn dispatch_request(
                     match call {
                         Ok(value) if handler.is_async => {
                             if let Err(error) = run_coroutine_value(python, &value) {
-                                warn!(%error, "DRA: async on_request_completed failed");
+                                warn!(%error, "Diameter server: async on_request_completed failed");
                             }
                         }
                         Ok(_) => {}
-                        Err(error) => warn!(%error, "DRA: on_request_completed failed"),
+                        Err(error) => warn!(%error, "Diameter server: on_request_completed failed"),
                     }
                 }
             });
@@ -570,19 +592,19 @@ fn build_answer_via_handler(
     engine: &Arc<ScriptEngine>,
     incoming: &IncomingRequest,
     peer_info: &PyInboundPeer,
-    dra_origin_host: &str,
-    dra_origin_realm: &str,
+    local_origin_host: &str,
+    local_origin_realm: &str,
 ) -> AnswerOutcome {
     // Parse the inbound request into the lossless tree.
     let request_msg = match DiameterMsg::from_wire(&incoming.raw) {
         Ok(msg) => msg,
         Err(error) => {
-            warn!(%error, "DRA: malformed inbound request");
+            warn!(%error, "Diameter server: malformed inbound request");
             let stub = stub_message(incoming);
             let answer = forward::build_answer(
                 &stub,
-                dra_origin_host,
-                dra_origin_realm,
+                local_origin_host,
+                local_origin_realm,
                 dictionary::DIAMETER_INVALID_AVP_LENGTH,
                 Some("malformed request"),
             );
@@ -602,8 +624,8 @@ fn build_answer_via_handler(
     let no_route_answer = || {
         forward::build_answer(
             &request_msg,
-            dra_origin_host,
-            dra_origin_realm,
+            local_origin_host,
+            local_origin_realm,
             dictionary::DIAMETER_UNABLE_TO_DELIVER,
             Some("no on_request handler"),
         )
@@ -622,13 +644,13 @@ fn build_answer_via_handler(
     let request = PyDiameterRequest::new(
         request_msg.clone(),
         peer_info.clone(),
-        dra_origin_host.to_string(),
-        dra_origin_realm.to_string(),
+        local_origin_host.to_string(),
+        local_origin_realm.to_string(),
     );
     let request_py = match Py::new(python, request) {
         Ok(handle) => handle,
         Err(error) => {
-            warn!(%error, "DRA: failed to build request object");
+            warn!(%error, "Diameter server: failed to build request object");
             let answer = no_route_answer();
             return AnswerOutcome {
                 wire: answer.to_wire(),
@@ -645,7 +667,7 @@ fn build_answer_via_handler(
                 match run_coroutine_value(python, &value) {
                     Ok(resolved) => resolved.into_bound(python),
                     Err(error) => {
-                        warn!(%error, "DRA: async on_request handler failed");
+                        warn!(%error, "Diameter server: async on_request handler failed");
                         let answer = no_route_answer();
                         return AnswerOutcome {
                             wire: answer.to_wire(),
@@ -659,7 +681,7 @@ fn build_answer_via_handler(
             }
         }
         Err(error) => {
-            warn!(%error, "DRA: on_request handler raised");
+            warn!(%error, "Diameter server: on_request handler raised");
             let answer = no_route_answer();
             return AnswerOutcome {
                 wire: answer.to_wire(),
@@ -686,7 +708,7 @@ fn build_answer_via_handler(
         match resolved.cast::<PyDiameterAnswer>() {
             Ok(answer_bound) => answer_bound.clone().unbind(),
             Err(_) => {
-                warn!("DRA: on_request must return a DiameterAnswer or None");
+                warn!("Diameter server: on_request must return a DiameterAnswer or None");
                 match Py::new(python, PyDiameterAnswer::from_msg(no_route_answer())) {
                     Ok(handle) => handle,
                     Err(_) => {
@@ -704,7 +726,7 @@ fn build_answer_via_handler(
     let wire = match answer_py.borrow(python).to_wire() {
         Ok(bytes) => bytes,
         Err(error) => {
-            warn!(%error, "DRA: failed to serialize answer");
+            warn!(%error, "Diameter server: failed to serialize answer");
             no_route_answer().to_wire()
         }
     };
@@ -714,6 +736,38 @@ fn build_answer_via_handler(
         request_py: Some(request_py),
         answer_py: Some(answer_py),
     }
+}
+
+/// Invoke every `@diameter.on_reply` handler on the answer before it goes
+/// upstream, letting the script rewrite AVPs in place (topology hiding,
+/// Origin-Host/Result-Code mapping). The handler's return value is ignored —
+/// it mutates `answer_py`. Returns whether any handler ran (so the caller can
+/// skip a redundant re-serialization when none are registered).
+fn run_on_reply(
+    python: Python<'_>,
+    engine: &Arc<ScriptEngine>,
+    request_py: &Py<PyDiameterRequest>,
+    answer_py: &Py<PyDiameterAnswer>,
+) -> bool {
+    let state = engine.state();
+    let mut ran = false;
+    for handler in state.handlers_for(&HandlerKind::DiameterOnReply) {
+        ran = true;
+        match handler
+            .callable
+            .bind(python)
+            .call1((request_py.bind(python), answer_py.bind(python)))
+        {
+            Ok(value) if handler.is_async => {
+                if let Err(error) = run_coroutine_value(python, &value) {
+                    warn!(%error, "Diameter server: async on_reply failed");
+                }
+            }
+            Ok(_) => {}
+            Err(error) => warn!(%error, "Diameter server: on_reply handler raised"),
+        }
+    }
+    ran
 }
 
 /// Pick the single best `@diameter.on_request` handler for an inbound

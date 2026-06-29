@@ -1,4 +1,4 @@
-//! Accept-time peer authentication for the server-mode (DRA) Diameter path.
+//! Accept-time peer authentication for the server mode Diameter path.
 //!
 //! Two Rust-only gates, both enforced **before** any Python callback runs, so a
 //! script bug cannot let an unauthenticated peer reach `@diameter.on_request`:

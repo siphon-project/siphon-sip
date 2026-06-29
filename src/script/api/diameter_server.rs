@@ -1,4 +1,4 @@
-//! Python bindings for the server-mode (DRA) Diameter path.
+//! Python bindings for the server mode Diameter path.
 //!
 //! Exposes the pyclasses the `@diameter.on_request` handler works with:
 //!   - [`PyDiameterRequest`] — the inbound request: read-only header attrs,
@@ -299,7 +299,7 @@ fn build_child_spec(spec: &Bound<'_, PyAny>) -> PyResult<Avp> {
 
 // ── PyDiameterAnswer ────────────────────────────────────────────────────────
 
-/// The answer the DRA returns upstream. Returned by `forward_to` / `reject`,
+/// The answer the Diameter server returns upstream. Returned by `forward_to` / `reject`,
 /// or constructable for a fully script-built answer.
 #[pyclass(name = "DiameterAnswer")]
 pub struct PyDiameterAnswer {
@@ -405,19 +405,19 @@ pub struct PyDiameterRequest {
     inbound_hbh: u32,
     inbound_e2e: u32,
     peer: PyInboundPeer,
-    dra_origin_host: String,
-    dra_origin_realm: String,
+    local_origin_host: String,
+    local_origin_realm: String,
 }
 
 impl PyDiameterRequest {
     /// Construct from a decoded inbound message + the authenticated peer
-    /// identity + the DRA's own identity (for Route-Record + answers).
+    /// identity + the Diameter server's own identity (for Route-Record + answers).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         msg: DiameterMsg,
         peer: PyInboundPeer,
-        dra_origin_host: String,
-        dra_origin_realm: String,
+        local_origin_host: String,
+        local_origin_realm: String,
     ) -> Self {
         let inbound_hbh = msg.hop_by_hop;
         let inbound_e2e = msg.end_to_end;
@@ -426,8 +426,8 @@ impl PyDiameterRequest {
             inbound_hbh,
             inbound_e2e,
             peer,
-            dra_origin_host,
-            dra_origin_realm,
+            local_origin_host,
+            local_origin_realm,
         }
     }
 
@@ -571,8 +571,8 @@ impl PyDiameterRequest {
         let request = self.lock()?;
         let answer = forward::build_answer(
             &request,
-            &self.dra_origin_host,
-            &self.dra_origin_realm,
+            &self.local_origin_host,
+            &self.local_origin_realm,
             result_code,
             error_message.as_deref(),
         );
@@ -600,8 +600,8 @@ impl PyDiameterRequest {
         // Snapshot everything out of `self` before the async block (no Python
         // objects may be held across the await).
         let mut tree = self.lock()?.clone();
-        let dra_origin_host = self.dra_origin_host.clone();
-        let dra_origin_realm = self.dra_origin_realm.clone();
+        let local_origin_host = self.local_origin_host.clone();
+        let local_origin_realm = self.local_origin_realm.clone();
         let inbound_hbh = self.inbound_hbh;
         let inbound_e2e = self.inbound_e2e;
         let client = Arc::clone(&peer.client);
@@ -614,11 +614,11 @@ impl PyDiameterRequest {
             }
 
             // Loop detection + Route-Record append.
-            if let Err(error) = forward::prepare_forward(&mut tree, &dra_origin_host) {
+            if let Err(error) = forward::prepare_forward(&mut tree, &local_origin_host) {
                 let answer = forward::build_answer(
                     &tree,
-                    &dra_origin_host,
-                    &dra_origin_realm,
+                    &local_origin_host,
+                    &local_origin_realm,
                     error.result_code(),
                     Some(&error.to_string()),
                 );
@@ -642,8 +642,8 @@ impl PyDiameterRequest {
                         Err(_) => {
                             let answer = forward::build_answer(
                                 &tree,
-                                &dra_origin_host,
-                                &dra_origin_realm,
+                                &local_origin_host,
+                                &local_origin_realm,
                                 dictionary::DIAMETER_UNABLE_TO_DELIVER,
                                 Some("malformed answer from backend"),
                             );
@@ -659,8 +659,8 @@ impl PyDiameterRequest {
                     };
                     let answer = forward::build_answer(
                         &tree,
-                        &dra_origin_host,
-                        &dra_origin_realm,
+                        &local_origin_host,
+                        &local_origin_realm,
                         result_code,
                         Some(&reason),
                     );

@@ -1,4 +1,4 @@
-//! Relay primitives for the Diameter Routing Agent (DRA) path.
+//! Relay primitives for the Diameter server path.
 //!
 //! Pure functions over the lossless [`DiameterMsg`] tree: Route-Record append
 //! and loop detection (RFC 6733 §6.1.9 / §6.3), Origin identity rewrite for
@@ -24,7 +24,7 @@ pub enum ForwardError {
     /// The backend connection dropped while the request was in flight.
     #[error("backend connection closed")]
     PeerClosed,
-    /// The DRA is shedding load.
+    /// The Diameter server is shedding load.
     #[error("overloaded")]
     Overload,
     /// Our own identity is already in a Route-Record — relaying would loop.
@@ -163,7 +163,7 @@ mod tests {
         // First pass: clean, appends our record.
         assert_eq!(prepare_forward(&mut msg, "dra.example.org"), Ok(()));
         assert_eq!(msg.find_all(avp::ROUTE_RECORD, 0).count(), 1);
-        // Second pass through the same DRA: loop.
+        // Second pass through the same Diameter server: loop.
         assert_eq!(
             prepare_forward(&mut msg, "dra.example.org"),
             Err(ForwardError::LoopDetected)

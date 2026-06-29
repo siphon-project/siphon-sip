@@ -84,14 +84,20 @@ pub enum HandlerKind {
         name: String,
         jitter_secs: u64,
     },
-    /// `@diameter.on_inbound_cer` — server-mode (DRA) CER identity decision.
+    /// `@diameter.on_inbound_cer` — server mode CER identity decision.
     DiameterOnInboundCer,
-    /// `@diameter.on_request` — server-mode (DRA) inbound request dispatch.
+    /// `@diameter.on_request` — server mode inbound request dispatch.
     /// Optional filter: `None` = every command; `"ULR"` / `"ULR|AIR"` = those
     /// commands (any application); `"S6a:ULR"` = app-qualified. Matched by
-    /// command **code** in `script::dra`, not by this string.
+    /// command **code** in `script::diameter_dispatch`, not by this string.
     DiameterOnRequest(Option<String>),
-    /// `@diameter.on_request_completed` — server-mode (DRA) post-answer hook.
+    /// `@diameter.on_reply` — server mode answer-rewrite hook. Fires on the
+    /// answer an `on_request` handler produced (relayed via `forward_to` or
+    /// built by `answer`/`reject`) just before it goes back upstream, so a
+    /// script can rewrite AVPs centrally (topology hiding, Origin/Result-Code
+    /// mapping). The handler mutates the answer in place; its return is ignored.
+    DiameterOnReply,
+    /// `@diameter.on_request_completed` — server mode post-answer hook.
     DiameterOnRequestCompleted,
     /// `@sbi.on_event` — incoming PCF event notification (N5).
     SbiOnEvent,
@@ -168,7 +174,7 @@ impl ScriptState {
 
     /// All `@diameter.on_request` handlers with their (already-validated)
     /// filter strings, in registration order. The diameter dispatch layer
-    /// (`script::dra`) scores these against the inbound request by command
+    /// (`script::diameter_dispatch`) scores these against the inbound request by command
     /// **code** — not name — so the matching vocabulary stays consistent with
     /// decoration-time validation, and the generic engine stays free of any
     /// Diameter-dictionary coupling.
@@ -783,6 +789,7 @@ fn extract_handlers(
             "srs.on_session_end" => HandlerKind::SrsOnSessionEnd,
             "diameter.on_inbound_cer" => HandlerKind::DiameterOnInboundCer,
             "diameter.on_request" => HandlerKind::DiameterOnRequest(filter),
+            "diameter.on_reply" => HandlerKind::DiameterOnReply,
             "diameter.on_request_completed" => HandlerKind::DiameterOnRequestCompleted,
             "sbi.on_event" => HandlerKind::SbiOnEvent,
             "timer.every" => {

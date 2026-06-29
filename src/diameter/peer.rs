@@ -60,7 +60,7 @@ pub fn version_to_firmware_revision(version: &str) -> u32 {
 type PendingRequest = oneshot::Sender<DiameterMessage>;
 
 /// Default request timeout (RFC 6733 Tx ≈ 30s, but siphon's app paths use a
-/// tighter 10s). The DRA relay path overrides this per-call via
+/// tighter 10s). The Diameter server relay path overrides this per-call via
 /// [`DiameterPeer::send_request_timeout`].
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -159,7 +159,7 @@ impl DiameterPeer {
         self.send_request_timeout(msg, DEFAULT_REQUEST_TIMEOUT).await
     }
 
-    /// Send a request and wait up to `timeout` for the answer. Used by the DRA
+    /// Send a request and wait up to `timeout` for the answer. Used by the Diameter server
     /// relay path, which honours the per-call `forward_to(timeout=…)`.
     pub async fn send_request_timeout(
         &self,
@@ -878,13 +878,13 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_connection_receives_inbound_request() {
-        // The HSS-dials-DRA case: siphon initiates the connection (client CER),
+        // The HSS-dials-Diameter server case: siphon initiates the connection (client CER),
         // but a request (AIR) arrives over it and must surface on incoming_rx
         // for @diameter.on_request dispatch — not be dropped.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        // "DRA" side: accept, complete CER/CEA, then send an AIR request.
+        // "Diameter server" side: accept, complete CER/CEA, then send an AIR request.
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             if let Ok((server_peer, _rx)) =

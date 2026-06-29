@@ -1,6 +1,6 @@
-//! Backend peer pool for the Diameter Routing Agent.
+//! Backend peer pool for the Diameter server.
 //!
-//! A `PeerPool` is a named set of outbound peers (by name) that the DRA can
+//! A `PeerPool` is a named set of outbound peers (by name) that the Diameter server can
 //! relay to. It resolves names to live [`DiameterClient`]s through the shared
 //! [`DiameterManager`] using **state-as-truth**: a peer is eligible only when
 //! its connection is [`PeerState::Open`]. Reconnects swap the `Arc` under the

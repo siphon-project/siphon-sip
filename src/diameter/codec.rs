@@ -39,7 +39,7 @@ pub struct DiameterMessage {
     pub end_to_end: u32,
     pub is_request: bool,
     pub avps: Value,
-    /// Original wire bytes. Carried so the DRA relay path can reconstruct the
+    /// Original wire bytes. Carried so the Diameter server relay path can reconstruct the
     /// lossless AVP tree from an answer (the JSON `avps` view is lossy). Empty
     /// only for messages not produced by `decode_diameter`.
     pub raw: Vec<u8>,
@@ -500,12 +500,12 @@ pub fn encode_diameter_message(
     buf
 }
 
-// ── Lossless AVP tree (DRA relay path) ──────────────────────────────────────
+// ── Lossless AVP tree (Diameter server relay path) ──────────────────────────────────────
 //
 // The `serde_json::Value` decode path above is LOSSY (drops AVP flags, folds
 // vendor-id away, hex-encodes OctetStrings ambiguously, collapses duplicate
 // AVPs into arrays losing order). That is fine for the typed app modules that
-// read named fields, but a Diameter Routing Agent must relay a message —
+// read named fields, but a Diameter server must relay a message —
 // including AVPs it does not understand — byte-faithfully, append a
 // Route-Record, and re-serialize. This tree preserves every AVP's code,
 // vendor, flags, and raw value bytes in order, so `from_wire → to_wire`
@@ -1192,7 +1192,7 @@ mod tests {
     }
 }
 
-// ── Lossless AVP tree tests (Phase 0 — DRA relay) ───────────────────────────
+// ── Lossless AVP tree tests (Phase 0 — Diameter server relay) ───────────────────────────
 
 #[cfg(test)]
 mod avp_tree_tests {

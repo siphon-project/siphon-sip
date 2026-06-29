@@ -3430,11 +3430,11 @@ class MockDiameter:
         self._rf_acrs.clear()
 
 
-    # -- Server-mode (DRA — Diameter Routing Agent) --
+    # -- Server-mode (accept inbound + dispatch to Python) --
 
     @staticmethod
     def on_inbound_cer(fn: Any) -> Any:
-        """Register the server-mode (DRA) CER identity callback.
+        """Register the server-mode CER identity callback.
 
         Called for an already-authenticated peer (both Rust auth gates have
         passed) with ``(peer_addr, peer_name, asserted_origin_host)``. Return
@@ -3451,7 +3451,7 @@ class MockDiameter:
 
     @staticmethod
     def on_request(arg: Any = None) -> Any:
-        """Register the server-mode (DRA) inbound-request dispatcher.
+        """Register the server-mode inbound-request dispatcher.
 
         Called for inbound requests (R-bit set). Return ``req.reject(code)``,
         ``await req.forward_to(peer, ...)``, ``req.answer(code)``, or ``None``
@@ -3477,17 +3477,31 @@ class MockDiameter:
         return _decorator
 
     @staticmethod
+    def on_reply(fn: Any) -> Any:
+        """Register the server-mode answer-rewrite hook.
+
+        Called with ``(req, answer)`` on the answer an ``on_request`` handler
+        produced — relayed via ``forward_to`` or built by ``answer``/``reject``
+        — just before it goes back upstream. A central place to rewrite answer
+        AVPs for every reply (topology hiding, Origin-Host/Result-Code mapping).
+        Mutate ``answer`` in place; the return value is ignored.
+        """
+        return fn
+
+    @staticmethod
     def on_request_completed(fn: Any) -> Any:
-        """Register the server-mode (DRA) post-answer hook.
+        """Register the server-mode post-answer hook.
 
         Called after the answer is sent upstream with
         ``(req, answer, latency_us)`` — typically to emit an event.
         """
         return fn
 
-    def peer_pool(self, tenant: str, target: Any) -> "MockPeerPool":
-        """Build a mock backend peer pool. ``target`` is a peer name or list
-        of names. Register backends with :meth:`add_peer(connected=True)`."""
+    def peer_pool(self, target: Any, tenant: str = "default") -> "MockPeerPool":
+        """Build a mock backend peer pool. ``target`` is a peer name or list of
+        names; ``tenant`` is an optional scope label (defaults to "default" —
+        single-domain servers leave it unset). Register backends with
+        :meth:`add_peer(connected=True)`."""
         names = [target] if isinstance(target, str) else list(target)
         return MockPeerPool(self, tenant, names)
 

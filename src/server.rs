@@ -1411,13 +1411,13 @@ impl SiphonServer {
         // Do NOT drop diameter_incoming_tx here — the reconnect tasks hold clones
         // and the channel must stay open for the lifetime of the process.
 
-        // --- Diameter Routing Agent (server mode) ---
+        // --- Diameter server (server mode) ---
         // Opt-in via `diameter.listen`: connects tenant backends, binds the
         // inbound listeners, and dispatches inbound requests to
         // `@diameter.on_request`.
         if let Some(ref diameter_config) = config.diameter {
             if let Some(ref manager) = diameter_manager {
-                crate::script::dra::spawn(
+                crate::script::diameter_dispatch::spawn(
                     diameter_config,
                     Arc::clone(manager),
                     Arc::clone(&engine),
@@ -2128,9 +2128,9 @@ fn init_diameter(config: &Config) -> Option<Arc<crate::diameter::DiameterManager
 
     let manager = Arc::new(crate::diameter::DiameterManager::new());
 
-    // Server-mode (DRA) runtime: a JSON snapshot of tenants/listen for
+    // Server mode runtime: a JSON snapshot of tenants/listen for
     // `diameter.config`, plus the event sink behind `diameter.event_sink`.
-    // Only built when the deployment opts into DRA mode (listen/tenants set).
+    // Only built when the deployment opts into Diameter server mode (listen/tenants set).
     let dra_enabled =
         diameter_config.listen.is_some() || !diameter_config.tenants.is_empty();
     let event_sink = diameter_config
