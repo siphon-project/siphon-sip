@@ -261,6 +261,10 @@ async fn file_backend_write_and_read_back() {
     file.write_all(format!("{json_line}\n").as_bytes())
         .await
         .unwrap();
+    // tokio::fs::File buffers internally and drop does not reliably flush before
+    // the read-back below — flush explicitly or the read can race to an empty
+    // file (intermittent "EOF while parsing" under CI load).
+    file.flush().await.unwrap();
     drop(file);
 
     // Read back and parse.
