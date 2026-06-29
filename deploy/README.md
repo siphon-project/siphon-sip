@@ -75,9 +75,26 @@ kubectl apply -f deploy/k8s/
 |---|---|
 | `configmap.yaml` | `siphon.yaml` + the routing script |
 | `redis.yaml` | shared Redis (Deployment + Service) |
-| `statefulset.yaml` | SIPhon pods with stable identity, drain-aware termination, `/metrics` probes |
+| `statefulset.yaml` | SIPhon pods with stable identity, drain-aware termination, `/admin/*` probes |
 | `service.yaml` | headless Service (per-pod DNS / SRV) + a `LoadBalancer` ingress |
+| `validate-kind.sh` | **kill-a-pod failover drill** on a local `kind` cluster (below) |
 
 Scale with `replicas`. For any-pod terminating-call delivery, add subscriber affinity
 at your ingress (consistent hash on the AoR) — see
 [`docs/deployment.md`](../docs/deployment.md#kubernetes-kept-deliberately-light).
+
+### Kill-a-pod failover drill (`validate-kind.sh`)
+
+The K8s analogue of the compose `validate.sh`: stand the manifests up on a local
+[`kind`](https://kind.sigs.k8s.io) cluster, register a contact, **`kubectl delete pod
+siphon-0`**, and prove the StatefulSet recreates it and it **recovers the binding from
+Redis** — verified over the admin API (`/admin/registrations/{aor}`).
+
+```bash
+# needs: kind, kubectl, docker, and a siphon image with the admin API
+SIPHON_IMAGE=ghcr.io/siphon-project/siphon-sip:latest deploy/k8s/validate-kind.sh
+```
+
+The REGISTER is sent from an in-cluster Job (SIP/UDP via cluster DNS); a locally-built
+image is auto-loaded into kind (`kind load`). `KEEP_CLUSTER=1` leaves the cluster up
+for inspection.

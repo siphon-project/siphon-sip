@@ -36,12 +36,15 @@ def _rand(n=8):
 def _send(host, port, message):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(TIMEOUT_S)
-    sock.bind(("127.0.0.1", 0))
+    # connect() so the kernel selects a route-correct source address (works for
+    # both loopback and inter-pod/k8s). getsockname() then yields the real source
+    # IP we put in Via/Contact, so the reply finds its way back to us.
+    sock.connect((host, int(port)))
     local_host, local_port = sock.getsockname()
     wire = message.format(local_host=local_host, local_port=local_port).encode()
-    sock.sendto(wire, (host, int(port)))
+    sock.send(wire)
     try:
-        data, _ = sock.recvfrom(65535)
+        data = sock.recv(65535)
     except socket.timeout:
         return None
     finally:

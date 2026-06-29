@@ -32,11 +32,10 @@ data:
       format: json              # structured logs for aggregation
 
   proxy.py: |
-    # Minimal demo proxy. Replace with scripts/proxy_default.py (digest auth,
-    # sanity checks, presence) for production.
-    from siphon import proxy, registrar, auth, log
-
-    DOMAIN = "example.com"
+    # Minimal demo proxy (no auth, so a plain REGISTER works in the demo).
+    # Replace with scripts/proxy_default.py (digest auth, sanity checks, presence)
+    # for production.
+    from siphon import proxy, registrar, log
 
     @proxy.on_request
     def route(request):
@@ -50,8 +49,6 @@ data:
                 request.reply(404, "Not Here")
             return
         if request.method == "REGISTER":
-            if not auth.require_digest(request, realm=DOMAIN):
-                return
             registrar.save(request)
             return
         if not request.ruri.user:
