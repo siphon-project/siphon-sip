@@ -93,7 +93,7 @@ This isn't a replacement for Kamailio or OpenSIPS. It's what happens when someon
 | **TCP Transport** | RFC 3261 §18 | Unit tests, connection pool |
 | **TLS Transport** | RFC 5246 (TLS 1.3) | Unit tests |
 | **WebSocket (WS/WSS)** | RFC 7118 | Unit tests |
-| **SCTP Transport** | RFC 4168 | Unit tests |
+| **SCTP Transport** | RFC 4168 | Unit tests (opt-in `sctp` feature) |
 | **NAT Traversal (rport)** | RFC 3581 | Unit tests |
 | **Outbound / Flow Tokens** | RFC 5626 | Unit tests |
 | **DNS SRV/NAPTR** | RFC 3263 | Unit + integration tests |
@@ -146,6 +146,14 @@ cargo install siphon-sip
 cargo install siphon-sip --features redis-backend,postgres-backend
 ```
 
+**SCTP transport is off by default.** SIP/Diameter-over-SCTP (RFC 4168) links
+the `libsctp` system library and is Linux-only, so it is gated behind the `sctp`
+Cargo feature. Enable it explicitly (and install `libsctp-dev` first on Linux):
+
+```bash
+cargo install siphon-sip --features sctp
+```
+
 ### Option 2: Docker
 
 ```bash
@@ -154,6 +162,11 @@ docker pull ghcr.io/siphon-project/siphon-sip:latest
 # Or build locally
 docker build -t siphon .
 ```
+
+> **Note:** the published Docker image is the default build — it does **not**
+> include SCTP. If you need SIP/Diameter-over-SCTP, build a custom image with the
+> `sctp` feature (add `libsctp-dev`/`libsctp1` and `cargo build --features sctp`
+> to the [Dockerfile](Dockerfile)).
 
 ### Option 3: Debian/Ubuntu (.deb)
 
@@ -621,6 +634,42 @@ ceiling from ~28k to ~32k cps, at lower CPU than before:
 
 Beyond ~32k the benchmark rig (64 SIPp processes on a 24-core box) saturates
 before siphon does — siphon still has CPU headroom at that point.
+
+### Per-message microbenchmarks (criterion)
+
+The SIPp table above measures **aggregate throughput**. Criterion microbenches in
+[`benches/`](benches/) isolate the **per-message / per-call costs** that
+throughput averages over, so a hot-path change is visible directly instead of
+diluted into a CPS figure.
+
+```sh
+PYO3_PYTHON=python3 cargo bench            # all hot paths
+PYO3_PYTHON=python3 cargo bench --bench sip_hot_path   # just one
+```
+
+One bench file per hot path — covering the work siphon repeats on every message,
+call, or auth:
+
+| Bench file | What it measures |
+|------------|------------------|
+| `sip_hot_path`     | RFC 3261 parse (INVITE ±SDP, REGISTER, 200 OK), serialize, roundtrip, header read + copy-on-write mutate, transaction-key extraction (§17) |
+| `sdp_hot_path`     | SDP parse, codec filter, serialize, and the per-call parse→filter→serialize rewrite |
+| `diameter_codec`   | Diameter AVP encode + message decode — a representative IMS Cx MAR (per registration/charging transaction) |
+| `rtpengine_bencode`| rtpengine NG bencode encode/decode of an `offer` (per media-anchored call) |
+| `crypto`           | Milenage AKA vector generation and digest response assembly (MD5 / SHA-256 / AKAv1-MD5). Benches the constructions siphon *owns*, not the vendored hash/cipher primitives |
+
+**Regression policy.** New code on the per-message dispatch / parse / transaction
+/ serialize path ships a criterion bench in the same change; code that carries no
+per-message cost (config, persistence, scripting glue) does not. The hard gate —
+**>10% slower than [`benches/baseline.json`](benches/baseline.json) fails** — runs
+at release cut on the reference machine via
+[`scripts/bench_regression.sh`](scripts/bench_regression.sh) (wired into
+[`scripts/cut-release.sh`](scripts/cut-release.sh)), **not** in normal CI, because
+absolute timings on shared CI runners are too noisy to gate on. CI only proves the
+benches compile. If a number improves, re-baseline to lock the new floor
+(`scripts/bench_regression.sh --save`); never raise the baseline to pass a
+regression. The baseline is hardware-specific — regenerate it on the same machine
+as the table above.
 
 ## Roadmap
 

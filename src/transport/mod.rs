@@ -5,6 +5,7 @@ pub mod udp;
 pub mod tcp;
 pub mod tls;
 pub mod ws;
+#[cfg(feature = "sctp")]
 pub mod sctp;
 pub mod pool;
 pub mod rate_limit;

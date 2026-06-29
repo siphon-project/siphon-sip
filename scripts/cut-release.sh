@@ -15,7 +15,7 @@
 #   scripts/cut-release.sh 1.1.0-rc1
 #   PERF_OK=1 scripts/cut-release.sh 1.0.0     # skip the interactive perf/mem prompt
 #
-# Per CLAUDE.md the performance + memory-leak baseline MUST pass before a
+# Per project policy the performance + memory-leak baseline MUST pass before a
 # release. That run is hardware-specific and long, so this script does NOT run
 # it for you — it requires you to confirm it passed (or set PERF_OK=1).
 
@@ -40,7 +40,7 @@ cd "$REPO_ROOT"
 [ -z "$(git status --porcelain)" ] || die "working tree not clean — commit or stash first"
 git rev-parse -q --verify "refs/tags/$TAG" >/dev/null && die "tag $TAG already exists"
 
-# A release MUST document its version in CHANGELOG.md (CLAUDE.md rule; CI gates it too).
+# A release MUST document its version in CHANGELOG.md (project rule; CI gates it too).
 grep -qE "^## \[?$(printf '%s' "$VERSION" | sed 's/\./\\./g')\]?" CHANGELOG.md \
   || die "CHANGELOG.md has no '## [$VERSION]' section — write the release notes before cutting."
 
@@ -60,10 +60,10 @@ else
   ( cd sdk && python -m pytest tests/ -q )
 fi
 
-# ── Performance + memory-leak baseline (manual, per CLAUDE.md) ──────────────
+# ── Performance + memory-leak baseline (manual, per project policy) ─────────
 if [ "${PERF_OK:-0}" != "1" ]; then
   echo
-  echo "CLAUDE.md requires the 16-row perf baseline + mem-leak test to PASS"
+  echo "Project policy requires the 16-row perf baseline + mem-leak test to PASS"
   echo "(Failures/Retransmits == 0, allocated flat) on the README hardware before"
   echo "a release. Run them now if you haven't:"
   echo "    scripts/scale_test.sh ...        (all 16 rows)"
@@ -71,6 +71,19 @@ if [ "${PERF_OK:-0}" != "1" ]; then
   printf 'Have those passed on this hardware? [y/N] '
   read -r answer
   [ "$answer" = "y" ] || [ "$answer" = "Y" ] || die "aborted — run the perf/mem baseline first (or set PERF_OK=1)"
+fi
+
+# ── Criterion per-message hot-path regression gate (per project policy) ─────
+# Unlike the 16-row SIPp baseline this is fast + fully automated, so run it
+# here. It compares the per-message hot paths (parse / serialize / header touch
+# / transaction keying) against benches/baseline.json and fails on >10% slower.
+# The numbers are hardware-specific: if this machine differs from the one that
+# produced the committed baseline, re-baseline first and commit it:
+#     scripts/bench_regression.sh --save && git add benches/baseline.json
+if [ "${BENCH_OK:-0}" != "1" ]; then
+  echo "==> criterion hot-path regression gate"
+  scripts/bench_regression.sh \
+    || die "criterion regression gate failed — diagnose/roll back, or (if the bench hardware changed) re-baseline with scripts/bench_regression.sh --save (or set BENCH_OK=1 to skip)"
 fi
 
 # ── Set the version, commit, tag, push ─────────────────────────────────────

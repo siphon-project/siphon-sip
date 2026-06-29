@@ -17,9 +17,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         pkg-config \
         libssl-dev \
-        libsctp-dev \
         xz-utils \
     && rm -rf /var/lib/apt/lists/*
+# NOTE: the default build excludes SIP/Diameter-over-SCTP (the `sctp` Cargo
+# feature is off by default), so libsctp-dev is not needed. To build an
+# SCTP-capable image, add `libsctp-dev` here, `libsctp1` to the runtime stage,
+# and pass `--features sctp` to the `cargo build` below.
 
 # uv: standalone Python installer + project manager. Pulls
 # python-build-standalone binaries (no apt python needed).
@@ -61,6 +64,11 @@ WORKDIR /build
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
+# benches/ holds the criterion [[bench]] targets declared in Cargo.toml; cargo
+# validates those files exist (they are explicit targets, unlike auto-discovered
+# tests/), so the manifest won't parse without them even though the image never
+# runs them.
+COPY benches/ benches/
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ── Build dependencies (cached until Cargo.toml/lock change) ─────────────────
@@ -71,6 +79,7 @@ RUN cargo chef cook --release --recipe-path recipe.json
 # Build the real binary
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
+COPY benches/ benches/
 RUN cargo build --release
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
@@ -80,7 +89,6 @@ FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl3 \
-        libsctp1 \
         iproute2 \
     && rm -rf /var/lib/apt/lists/*
 

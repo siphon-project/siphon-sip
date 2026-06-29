@@ -27,10 +27,16 @@ exclude = [
 [lib]
 name = "siphon"
 path = "src/lib.rs"
+# Disable the default libtest bench harness on the lib/bin: they carry no
+# `#[bench]` fns, and leaving it on makes `cargo bench --benches` run an empty
+# libtest harness that rejects criterion's CLI flags (--measurement-time, …).
+# The criterion `[[bench]]` targets below still link the lib normally.
+bench = false
 
 [[bin]]
 name = "siphon"
 path = "src/main.rs"
+bench = false
 
 [dependencies]
 # Async runtime
@@ -66,7 +72,12 @@ rustls-pki-types = { version = "1", features = ["std"] }
 webpki-roots = "1"
 tokio-tungstenite = "0.28"
 futures-util = "0.3"
-tokio-sctp = "0.2"
+# SIP-over-SCTP (RFC 4168) + Diameter-over-SCTP transport. Optional because it
+# links the `libsctp` system library (libsctp-dev to build, libsctp1 at runtime)
+# and needs the kernel SCTP module — most SIP proxy/B2BUA deployments never use
+# it. Gated behind the `sctp` feature (off by default); enable with
+# `--features sctp`.
+tokio-sctp = { version = "0.2", optional = true }
 http = "1"
 
 # Diameter AVP decoding
@@ -145,11 +156,47 @@ proptest = "1"
 tokio-test = "0.4"
 tempfile = "3"
 rcgen = "0.14"
+# Per-message hot-path microbenchmarks (benches/sip_hot_path.rs). The
+# release-cut gate (scripts/cut-release.sh) runs these via `critcmp` against a
+# committed baseline; CI only proves they compile (`cargo bench --no-run`).
+criterion = "0.5"
+
+# Criterion perf gates for the per-message / per-call hot paths. `harness =
+# false` hands `main` to criterion instead of the libtest harness. The
+# release-cut gate (scripts/bench_regression.sh) runs every [[bench]] target via
+# `cargo bench --benches` and auto-discovers each benchmark id, so adding a new
+# bench file here needs no other wiring.
+[[bench]]
+name = "sip_hot_path"      # SIP parse / serialize / header touch / txn keying
+harness = false
+
+[[bench]]
+name = "sdp_hot_path"      # SDP parse / codec-filter / serialize (per call)
+harness = false
+
+[[bench]]
+name = "diameter_codec"    # Diameter AVP encode + message decode (IMS Cx/Rf/Rx)
+harness = false
+
+[[bench]]
+name = "rtpengine_bencode" # rtpengine NG bencode encode / decode (media anchor)
+harness = false
+
+[[bench]]
+name = "crypto"            # Milenage AKA + digest response (per auth)
+harness = false
 
 [features]
 default = ["redis-backend", "postgres-backend"]
 redis-backend = ["dep:redis"]
 postgres-backend = ["dep:tokio-postgres"]
+# SIP-over-SCTP + Diameter-over-SCTP transport. Off by default because it pulls
+# the `libsctp` system library and kernel SCTP module; enable with
+# `--features sctp` (CI exercises this via `--all-features`). When disabled, the
+# `Transport::Sctp` enum variant still exists (config still parses), but no SCTP
+# listener is started and a configured `listen.sctp` block is ignored with a
+# loud warning; a Diameter peer with `transport: sctp` errors at connect time.
+sctp = ["dep:tokio-sctp"]
 
 # --- Lint policy ---
 # The codebase is clippy-clean (see `clippy.toml` for the one tuned threshold).
