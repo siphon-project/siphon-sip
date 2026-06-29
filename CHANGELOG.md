@@ -6,6 +6,27 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **glibc allocator instrumentation** — new `siphon_glibc_*` Prometheus gauges
+  (`system_bytes`, `in_use_bytes`, `free_bytes`, `mmap_bytes`, `arena_count`)
+  sourced from `malloc_info(3)`, aggregated across all arenas. This surfaces the
+  C-side / CPython-raw-domain memory pool (incl. `libsctp`) that jemalloc
+  (`siphon_memory_*`) and CPython's mimalloc (`siphon_python_allocated_blocks`)
+  cannot see; because Rust runs on jemalloc, glibc's arenas hold only the C
+  side, so the gauges isolate it cleanly. Deliberately uses `malloc_info` rather
+  than `mallinfo2`, which reports the main arena only. Sampled on the dispatcher
+  cleanup tick; no-op off glibc. `SIGUSR2` dumps the full `malloc_info` XML to
+  the log for call-site attribution.
+- **`memory:` config block** for allocator runtime tuning:
+  `memory.glibc.arena_max` (`mallopt(M_ARENA_MAX)`, caps the number of arenas)
+  and `memory.glibc.trim_interval_secs` (periodic `malloc_trim(0)`). The gauges
+  above are always-on; both knobs default off — measure first, bound only if the
+  pool proves to be arena retention rather than a leak.
+- **`siphon_sbi_npcf_app_sessions_active` gauge** — active N5/Npcf app-sessions
+  created by this NF and not yet deleted (a steady climb under flat call rate is
+  a stranded-session leak), backed by a new per-replica app-session registry on
+  `NpcfClient` that inserts on create and removes on delete.
+
 ### Changed
 - **SCTP is now an opt-in build feature, off by default.** SIP-over-SCTP
   (RFC 4168) and Diameter-over-SCTP link the `libsctp` system library, which
@@ -34,6 +55,12 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   roundtrips unchanged).
 
 ### Internal
+- Per-module steady-state memory-leak guards for the control-plane paths the
+  SIP mem-leak test never exercised, each gating on the production store
+  draining back to baseline: rtpengine (`pending` correlation map on the success
+  and timeout paths), diameter (`pending` map through the real connection
+  reader, sequential and under concurrent in-flight load), and SBI/N5
+  (`NpcfClient` app-session store across create → delete).
 - Criterion microbenchmarks for the per-message / per-call hot paths, one bench
   file per path: `sip_hot_path` (parse/serialize/header/txn-key), `sdp_hot_path`
   (parse/filter/serialize), `diameter_codec` (AVP encode + message decode),
