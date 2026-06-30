@@ -230,7 +230,7 @@ or force-unregister bindings), and `/metrics`. If you'd rather not enable it, a
 ping to the SIP port works for readiness (the default proxy scripts answer local
 `OPTIONS` with `200`).
 
-### Metrics & alerting
+### Metrics and alerting
 
 Scrape `/metrics`. The handful that matter operationally:
 

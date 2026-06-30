@@ -1,6 +1,6 @@
 site_name: SIPhon
 site_description: High-performance SIP proxy, B2BUA, and IMS platform in Rust with free-threaded Python scripting
-site_url: https://siphon-sip.org/
+site_url: https://docs.siphon-sip.org/
 repo_url: https://github.com/siphon-project/siphon-sip
 repo_name: siphon-project/siphon-sip
 edit_uri: edit/main/docs/
@@ -40,6 +40,15 @@ theme:
 
 nav:
   - Home: README.md
+  - Cookbook:
+      - Overview: cookbook/index.md
+      - Registrar: cookbook/registrar.md
+      - Stateful proxy: cookbook/proxy.md
+      - Load balancer: cookbook/load-balancer.md
+      - SBC (B2BUA): cookbook/sbc.md
+      - Media & RTP profiles: cookbook/media-rtp.md
+      - Hardening & security: cookbook/security.md
+      - Monitoring & observability: cookbook/monitoring.md
   - Running in production:
       - Scaling, clustering & redundancy: scaling-and-redundancy.md
       - Deployment & operations: deployment.md
