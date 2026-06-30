@@ -37,7 +37,7 @@ jobs:
       - name: Build site (strict)
         run: mkdocs build --strict
       - name: Pin the custom domain
-        run: echo "docs.siphon-sip.org" > site/CNAME
+        run: echo "siphon-sip.org" > site/CNAME
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site

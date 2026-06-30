@@ -1,6 +1,6 @@
 site_name: SIPhon
 site_description: High-performance SIP proxy, B2BUA, and IMS platform in Rust with free-threaded Python scripting
-site_url: https://docs.siphon-sip.org/
+site_url: https://siphon-sip.org/
 repo_url: https://github.com/siphon-project/siphon-sip
 repo_name: siphon-project/siphon-sip
 edit_uri: edit/main/docs/
