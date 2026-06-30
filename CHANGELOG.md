@@ -51,6 +51,36 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
     `media.rtpengine` configs are untouched. SIPREC/MPTY subscriptions are not
     yet implemented on `siphon-rtp` and surface a clear engine error there.
   - Depends on the published `siphon-rtp-proto` crate (the shared wire contract).
+- **Classic `rtpproxy` media backend (text-over-UDP).** siphon can now drive a
+  classic `rtpproxy` relay (the Sippy/Kamailio/OpenSIPS media proxy) as a third
+  media-control backend — for migrating an existing deployment to siphon while
+  keeping its in-place rtpproxy. Select it per deployment:
+  ```yaml
+  media:
+    backend: rtpproxy             # default: rtpengine
+    rtpproxy:
+      address: "127.0.0.1:22222"  # rtpproxy -s udp:<addr>
+      timeout_ms: 1000
+      retries: 2                  # UDP retransmits (same cookie); default 2
+  ```
+  - Speaks the classic cookie-prefixed `U`/`L`/`D`/`V` protocol over UDP, with
+    cookie-keyed request/response correlation and **idempotent retransmits** for
+    reliability over UDP (rtpproxy de-duplicates by cookie).
+  - rtpproxy only allocates a relay port, so **siphon rewrites the SDP itself**
+    (`c=`/`m=`), per media stream, including multi-stream offers (media-id tag
+    suffix) and held media (`m=… 0`, left untouched).
+  - The Python `rtpengine` scripting API and media profiles are **unchanged** —
+    `rtpengine.offer/answer/delete/ping` and `call.media` map onto rtpproxy. The
+    profile's NAT `direction` (e.g. `["internal","external"]`) and `asymmetric`
+    flag map to rtpproxy bridge/symmetry modifiers; IPv6 is detected per stream.
+  - **HA / load-balancing parity with rtpengine:** `media.rtpproxy` accepts a
+    single `address` or an `instances:` list with weights (weighted round-robin
+    plus per-call-id affinity); per-instance health is probed (`V`) and exported
+    alongside the existing rtpengine health metrics.
+  - **Backward compatible:** the default backend remains `rtpengine`. The
+    rtpengine-only verbs (announcements, DTMF injection, gating, SIPREC/MPTY) are
+    not available on rtpproxy and surface a clear engine error there; rtpproxy
+    pushes no async events, so the `media.events` listener is unused.
 - **B2BUA `call.set_from_host()` / `call.set_to_host()`** — pin the host part of
   the B-leg From / To URI, mirroring `set_from_user` / `set_to_user`. By default
   the B2BUA rewrites the B-leg From host to its own advertised address (topology

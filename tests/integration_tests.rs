@@ -24,6 +24,9 @@ mod rtpengine_tests;
 #[path = "integration/siphon_rtp_tests.rs"]
 mod siphon_rtp_tests;
 
+#[path = "integration/rtpproxy_tests.rs"]
+mod rtpproxy_tests;
+
 #[path = "integration/diameter_tests.rs"]
 mod diameter_tests;
 

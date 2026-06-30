@@ -437,17 +437,21 @@ auth:
 #     local_max_entries: 10000
 
 # ---------------------------------------------------------------------------
-# Media engine (rtpengine or native siphon-rtp)
+# Media engine (rtpengine, native siphon-rtp, or classic rtpproxy)
 # ---------------------------------------------------------------------------
-# siphon drives one of two media-control backends, selected by `media.backend`:
+# siphon drives one of three media-control backends, selected by `media.backend`:
 #   rtpengine  (default) — rtpengine NG protocol, bencode over UDP
 #   siphon-rtp           — native siphon-rtp engine, JSON over a persistent TCP
 #                          connection (reliable, optional auth, server-pushed
 #                          DTMF/media-timeout events on the same connection).
 #                          EXPERIMENTAL — the siphon-rtp engine is pre-release;
 #                          use rtpengine in production until it stabilises.
+#   rtpproxy             — classic rtpproxy relay, text over UDP (siphon rewrites
+#                          the SDP itself); for migrating an existing
+#                          OpenSIPS/Kamailio/Sippy + rtpproxy deployment
 # The Python `rtpengine` scripting API and all media profiles are identical for
-# both backends — only the transport underneath differs.
+# every backend — only the transport (and, for rtpproxy, the supported verbs)
+# differ.
 #
 # --- rtpengine backend (default) ---
 # Single instance:
@@ -500,6 +504,38 @@ auth:
 #   # `profiles:` and `health_check_interval_secs:` apply to this backend too.
 #   # The rtpengine-only `media.events:` listener is not used here — events ride
 #   # the control connection.
+#
+# --- classic rtpproxy backend (legacy media relay) ---
+# For migrating an existing OpenSIPS/Kamailio/Sippy deployment to siphon while
+# keeping its in-place rtpproxy. siphon speaks the classic cookie-prefixed
+# U/L/D/V protocol over UDP and rewrites the SDP itself (rtpproxy only allocates
+# the relay port). The rtpengine-only verbs (announcements, DTMF injection,
+# gating, SIPREC/MPTY) are NOT available on this backend.
+# Single instance:
+# media:
+#   backend: rtpproxy
+#   rtpproxy:
+#     address: "127.0.0.1:22222"    # rtpproxy -s udp:<addr>
+#     timeout_ms: 1000               # per-command budget, split across retransmits
+#     retries: 2                     # UDP retransmits after the first send (same cookie)
+#
+# Multiple instances (weighted round-robin + per-call-id affinity, same as
+# rtpengine):
+# media:
+#   backend: rtpproxy
+#   rtpproxy:
+#     timeout_ms: 1000               # default; per-instance timeout_ms overrides
+#     retries: 2
+#     instances:
+#       - address: "10.0.0.1:22222"
+#         weight: 2
+#       - address: "10.0.0.2:22222"
+#         weight: 1
+#         timeout_ms: 1500
+#   # `profiles:` and `health_check_interval_secs:` apply here too. A profile's
+#   # NAT `direction` (["internal","external"]) and `asymmetric` flag map to
+#   # rtpproxy bridge/symmetry modifiers; IPv6 is auto-detected per stream.
+#   # The `media.events:` listener is unused — rtpproxy pushes no async events.
 #
 # Custom media profiles (extend or override built-ins):
 #
