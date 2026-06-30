@@ -44,19 +44,21 @@ a=fmtp:101 0-15
   <label id="1" />
   <recv response="180" optional="true" next="1" />
 
-  <!-- Expect 200 OK -->
-  <recv response="200" rtd="true" crlf="true" />
+  <!-- Expect 200 OK; capture the Record-Route set (rrs) for in-dialog routing -->
+  <recv response="200" rtd="true" crlf="true" rrs="true" />
 
-  <!-- Send ACK -->
+  <!-- Send ACK (in-dialog: Contact from 200 OK via [next_url] + [routes]).
+       Hardcoding the R-URI to the proxy would self-route at the proxy after
+       loose_route() pops its own Route, dropping the ACK / 482-looping the BYE. -->
   <send>
     <![CDATA[
-ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+ACK [next_url] SIP/2.0
 Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
 From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
 To: <sip:bob@[remote_ip]>[peer_tag_param]
 Call-ID: [call_id]
 CSeq: 1 ACK
-Route: <sip:[remote_ip]:[remote_port];lr>
+[routes]
 Max-Forwards: 70
 Content-Length: 0
 
@@ -66,16 +68,16 @@ Content-Length: 0
   <!-- Hold call briefly -->
   <pause milliseconds="500" />
 
-  <!-- Send BYE -->
+  <!-- Send BYE (in-dialog: Contact from 200 OK via [next_url] + [routes]) -->
   <send retrans="500">
     <![CDATA[
-BYE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+BYE [next_url] SIP/2.0
 Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
 From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
 To: <sip:bob@[remote_ip]>[peer_tag_param]
 Call-ID: [call_id]
 CSeq: 2 BYE
-Route: <sip:[remote_ip]:[remote_port];lr>
+[routes]
 Max-Forwards: 70
 Content-Length: 0
 
