@@ -97,6 +97,10 @@ pub struct Config {
     /// Prometheus metrics endpoint.
     pub metrics: Option<MetricsConfig>,
 
+    /// HTTP admin API (health/readiness probes + registration inspection).
+    /// `None` = disabled.
+    pub admin: Option<AdminConfig>,
+
     /// Server and User-Agent header values injected into responses.
     pub server: Option<ServerIdentityConfig>,
 
@@ -1372,6 +1376,25 @@ pub struct PrometheusConfig {
 
 fn default_metrics_path() -> String {
     "/metrics".to_owned()
+}
+
+// ---------------------------------------------------------------------------
+// HTTP admin API
+// ---------------------------------------------------------------------------
+
+/// HTTP admin API listener. Exposes liveness/readiness probes and registration
+/// inspection on a dedicated port:
+///   `GET /admin/health`              liveness — 200 while the process is alive
+///   `GET /admin/ready`               readiness — 200, or 503 while draining
+///   `GET /admin/stats`               uptime + active registration count
+///   `GET /admin/registrations`       list all AoRs + contacts
+///   `GET /admin/registrations/{aor}` one AoR's contacts
+///   `DELETE /admin/registrations/{aor}` force-unregister an AoR
+///   `GET /metrics`                   Prometheus scrape (same body as the metrics port)
+#[derive(Debug, Deserialize, Clone)]
+pub struct AdminConfig {
+    /// Address to expose the admin API on (e.g. "0.0.0.0:9091").
+    pub listen: String,
 }
 
 // ---------------------------------------------------------------------------

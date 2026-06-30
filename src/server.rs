@@ -1719,6 +1719,31 @@ impl SiphonServer {
 
         // --- Start dispatcher ---
         let drain = Arc::new(dispatcher::DrainState::new());
+
+        // --- HTTP admin API (health/readiness probes + registration inspection) ---
+        // Spawned here so it can share the drain signal: /admin/ready reports 503
+        // while draining. Independent of the Prometheus `metrics` listener above
+        // (the admin router also serves /metrics for convenience).
+        if let Some(ref admin_config) = config.admin {
+            match admin_config.listen.parse::<std::net::SocketAddr>() {
+                Ok(listen_addr) => {
+                    if let Some(registrar) = crate::script::api::registrar_arc() {
+                        let admin_state = crate::admin::AdminState {
+                            registrar: Arc::clone(registrar),
+                            start_time: std::time::Instant::now(),
+                            draining: Some(Arc::clone(&drain)),
+                        };
+                        tokio::spawn(crate::admin::serve(listen_addr, admin_state));
+                    } else {
+                        error!("admin API enabled but registrar is not initialized; not starting");
+                    }
+                }
+                Err(error) => {
+                    error!(listen = %admin_config.listen, "invalid admin.listen address: {error}");
+                }
+            }
+        }
+
         let dispatcher_handle = tokio::spawn(dispatcher::run(
             inbound_rx,
             outbound_senders,

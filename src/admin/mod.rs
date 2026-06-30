@@ -18,6 +18,7 @@ use axum::Router;
 use serde::Serialize;
 use tracing::{error, info};
 
+use crate::dispatcher::DrainState;
 use crate::registrar::Registrar;
 
 /// Shared state available to all admin API handlers.
@@ -25,6 +26,10 @@ use crate::registrar::Registrar;
 pub struct AdminState {
     pub registrar: Arc<Registrar>,
     pub start_time: Instant,
+    /// Drain signal, when wired by the server. `/admin/ready` returns 503 while
+    /// draining so a load balancer / orchestrator stops sending new work. `None`
+    /// (e.g. in tests) means "never draining".
+    pub draining: Option<Arc<DrainState>>,
 }
 
 /// Start the HTTP admin API server.
@@ -51,6 +56,7 @@ fn router(state: AdminState) -> Router {
     Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/admin/health", get(health_handler))
+        .route("/admin/ready", get(ready_handler))
         .route("/admin/stats", get(stats_handler))
         .route("/admin/registrations", get(registrations_handler))
         .route("/admin/registrations/{aor}", get(registration_detail_handler))
@@ -72,13 +78,39 @@ async fn metrics_handler() -> impl IntoResponse {
     )
 }
 
-/// `GET /admin/health` — liveness + readiness probe.
+/// `GET /admin/health` — liveness probe. 200 for as long as the process is
+/// alive and the admin server is servicing requests. It does NOT flip during
+/// drain (use `/admin/ready` for that): a liveness probe failing during a
+/// graceful drain would make an orchestrator kill the pod mid-drain.
 async fn health_handler(State(state): State<AdminState>) -> impl IntoResponse {
     let uptime = state.start_time.elapsed().as_secs();
     Json(HealthResponse {
         status: "ok".to_string(),
         uptime_seconds: uptime,
     })
+}
+
+/// `GET /admin/ready` — readiness probe. 200 normally; **503 while draining**
+/// (SIGTERM received) so a load balancer / orchestrator removes this node from
+/// rotation before it stops accepting new INVITEs. When no drain signal is wired
+/// it always reports ready.
+async fn ready_handler(State(state): State<AdminState>) -> impl IntoResponse {
+    let draining = state
+        .draining
+        .as_ref()
+        .map(|drain| drain.is_draining.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(false);
+    if draining {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "status": "draining" })),
+        )
+    } else {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "ready" })),
+        )
+    }
 }
 
 /// `GET /admin/stats` — aggregate counters.
@@ -200,6 +232,7 @@ mod tests {
         AdminState {
             registrar: Arc::new(Registrar::new(crate::registrar::RegistrarConfig::default())),
             start_time: Instant::now(),
+            draining: None,
         }
     }
 
@@ -222,6 +255,46 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");
         assert!(json["uptime_seconds"].as_u64().is_some());
+    }
+
+    #[tokio::test]
+    async fn ready_when_not_draining() {
+        // No drain signal wired -> always ready.
+        let app = test_app();
+
+        let response = app
+            .oneshot(Request::get("/admin/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ready");
+    }
+
+    #[tokio::test]
+    async fn ready_returns_503_while_draining() {
+        let drain = Arc::new(DrainState::new());
+        drain
+            .is_draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let state = AdminState {
+            registrar: Arc::new(Registrar::new(crate::registrar::RegistrarConfig::default())),
+            start_time: Instant::now(),
+            draining: Some(drain),
+        };
+        let app = router(state);
+
+        let response = app
+            .oneshot(Request::get("/admin/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "draining");
     }
 
     #[tokio::test]

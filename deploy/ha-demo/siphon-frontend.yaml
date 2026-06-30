@@ -1,0 +1,46 @@
+# HA-demo FRONTEND node config (the load balancer).
+#
+# A thin proxy that spreads new transactions over a `gateway` group of the two
+# backend nodes. See lb.py for the routing logic and docs/deployment.md for the
+# pattern. Parametrised with ${VAR:-default} for compose + validate.sh reuse.
+
+listen:
+  udp:
+    - "${SIP_BIND:-0.0.0.0}:${SIP_PORT:-5060}"
+
+domain:
+  local:
+    - "example.com"
+    - "127.0.0.1"
+
+script:
+  path: "${SCRIPT_PATH:-/etc/siphon/lb.py}"
+
+gateway:
+  groups:
+    - name: "backends"
+      algorithm: hash          # consistent hash on the AoR => subscriber affinity
+      probe:
+        enabled: true
+        interval_secs: 5
+        failure_threshold: 3
+      destinations:
+        - uri: "${BACKEND1_URI:-sip:backend1:5060}"
+          address: "${BACKEND1_ADDR:-backend1:5060}"
+        - uri: "${BACKEND2_URI:-sip:backend2:5060}"
+          address: "${BACKEND2_ADDR:-backend2:5060}"
+
+server:
+  instance_id: "${INSTANCE_ID:-frontend}"
+  drain_secs: 5
+
+metrics:
+  prometheus:
+    listen: "0.0.0.0:${METRICS_PORT:-9090}"
+
+admin:
+  listen: "0.0.0.0:${ADMIN_PORT:-9091}"
+
+log:
+  level: info
+  format: pretty

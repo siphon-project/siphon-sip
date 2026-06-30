@@ -1,0 +1,56 @@
+# SIPhon as a StatefulSet — stable per-pod identity (siphon-0, siphon-1, ...) so
+# each pod's `server.instance_id` is stable across restarts. Scale with `replicas`.
+#
+# Redundancy model (see docs/scaling-and-redundancy.md): pods share one Redis for
+# registrar durability; they do NOT live-replicate location state. If you need
+# any-pod terminating-call delivery, put subscriber affinity at your ingress
+# (consistent hash on the AoR). Otherwise rely on re-register convergence.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: siphon
+  labels: { app: siphon }
+spec:
+  serviceName: siphon          # the headless Service below
+  replicas: 2
+  selector:
+    matchLabels: { app: siphon }
+  template:
+    metadata:
+      labels: { app: siphon }
+    spec:
+      # SIP is sensitive to NAT rewriting of Via/Contact. hostNetwork keeps source
+      # IP/port intact; drop it only if your ingress preserves them another way.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      # Let the SIGTERM drain (server.drain_secs) finish before SIGKILL.
+      terminationGracePeriodSeconds: 40
+      containers:
+        - name: siphon
+          image: ghcr.io/siphon-project/siphon-sip:latest   # or your registry/tag
+          args: ["--config", "/etc/siphon/siphon.yaml"]
+          env:
+            # Pod name -> server.instance_id via ${POD_NAME} expansion in the config.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef: { fieldPath: metadata.name }
+          ports:
+            - { containerPort: 5060, protocol: UDP, name: sip-udp }
+            - { containerPort: 5060, protocol: TCP, name: sip-tcp }
+            - { containerPort: 9090, protocol: TCP, name: metrics }
+            - { containerPort: 9091, protocol: TCP, name: admin }
+          # Liveness stays up through drain; readiness returns 503 while draining
+          # so the pod leaves Service endpoints before it stops taking new INVITEs.
+          livenessProbe:
+            httpGet: { path: /admin/health, port: 9091 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /admin/ready, port: 9091 }
+            periodSeconds: 5
+          volumeMounts:
+            - { name: config, mountPath: /etc/siphon/siphon.yaml, subPath: siphon.yaml }
+            - { name: config, mountPath: /etc/siphon/scripts/proxy.py, subPath: proxy.py }
+      volumes:
+        - name: config
+          configMap: { name: siphon-config }

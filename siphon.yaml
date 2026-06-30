@@ -503,6 +503,21 @@ auth:
 #     path: "/metrics"
 
 # ---------------------------------------------------------------------------
+# HTTP admin API (health/readiness probes + registration inspection)
+# ---------------------------------------------------------------------------
+# Optional. A dedicated HTTP port exposing operational endpoints — point your
+# load balancer / Kubernetes probes at it (see docs/deployment.md):
+#   GET    /admin/health              liveness  — 200 while the process is alive
+#   GET    /admin/ready               readiness — 200, or 503 while draining (SIGTERM)
+#   GET    /admin/stats               uptime + active registration count
+#   GET    /admin/registrations       list all AoRs + their contacts
+#   GET    /admin/registrations/{aor} one AoR's contacts
+#   DELETE /admin/registrations/{aor} force-unregister an AoR
+#   GET    /metrics                   Prometheus scrape (same body as the metrics port)
+# admin:
+#   listen: "0.0.0.0:9091"
+
+# ---------------------------------------------------------------------------
 # Gateway dispatcher (named groups with load balancing + health probing)
 # ---------------------------------------------------------------------------
 # gateway:

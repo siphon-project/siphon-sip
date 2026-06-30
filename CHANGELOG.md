@@ -62,6 +62,26 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   created by this NF and not yet deleted (a steady climb under flat call rate is
   a stranded-session leak), backed by a new per-replica app-session registry on
   `NpcfClient` that inserts on create and removes on delete.
+- **HTTP admin API is now served**, behind a new optional `admin.listen`. It was
+  implemented but never started, so only `/metrics` was exposed at runtime.
+  Endpoints: `/admin/health` (liveness), `/admin/ready` (readiness — returns 503
+  while the process is draining on SIGTERM, so a load balancer / Kubernetes
+  deschedules it before it stops accepting new INVITEs), `/admin/stats`,
+  `/admin/registrations[/{aor}]` (inspect / force-unregister), and `/metrics`.
+  Off by default (no `admin.listen` ⇒ unchanged behaviour).
+- **Operator documentation for scaling, redundancy and deployment** (`docs/`):
+  `scaling-and-redundancy.md` (what state is node-local vs. Redis-shared, what the
+  Redis backend actually provides, and why SIPhon ships no clusterer/DMQ-style
+  replication engine), `deployment.md` (single-node / redundant-pair / N-node
+  with a front LB + DNS SRV / IMS topologies, an operations runbook, and a light
+  Kubernetes shape), and `migrating-from-kamailio-opensips.md`.
+- **Reference deployments** (`deploy/`): a front-LB + 2-backend + Redis HA demo
+  (docker-compose + a host-binary `validate.sh` that proves restart recovery from
+  Redis), and Kubernetes manifests with a `kind` kill-a-pod failover drill
+  (`validate-kind.sh`).
+- **Release-cut HA failover gate** — `cut-release.sh` now runs the Redis-registrar
+  failover validation as a mandatory gate (skip with `FAILOVER_OK=1`), alongside
+  the existing perf/mem and criterion regression gates.
 
 ### Changed
 - **SCTP is now an opt-in build feature, off by default.** SIP-over-SCTP

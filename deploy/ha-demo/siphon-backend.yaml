@@ -1,0 +1,43 @@
+# HA-demo BACKEND node config.
+#
+# Parametrised with ${VAR:-default} so the SAME file is used by both
+# docker-compose.ha.yaml (env from compose) and validate.sh (env from the shell,
+# running the binary directly on loopback with custom ports). A real deployment
+# would hard-code these.
+#
+# The load-bearing line for redundancy is `registrar.backend: redis`: every
+# REGISTER is written through to the shared Redis, and on restart this node
+# reloads the FULL registrar snapshot from it — see docs/scaling-and-redundancy.md.
+
+listen:
+  udp:
+    - "${SIP_BIND:-0.0.0.0}:${SIP_PORT:-5060}"
+
+domain:
+  local:
+    - "example.com"
+    - "127.0.0.1"
+
+script:
+  path: "${SCRIPT_PATH:-/etc/siphon/proxy.py}"
+
+registrar:
+  backend: redis
+  redis:
+    url: "redis://${REDIS_HOST:-redis}:${REDIS_PORT:-6379}"
+    key_prefix: "siphon:reg:"
+
+server:
+  instance_id: "${INSTANCE_ID:-backend}"   # distinct per node
+  drain_secs: 5                             # short for the demo; 30 in production
+
+metrics:
+  prometheus:
+    listen: "0.0.0.0:${METRICS_PORT:-9090}" # /metrics — Prometheus scrape
+
+admin:
+  listen: "0.0.0.0:${ADMIN_PORT:-9091}"     # /admin/health + /admin/ready probes
+
+log:
+  level: info
+  format: pretty

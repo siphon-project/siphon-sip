@@ -1,0 +1,62 @@
+# siphon.yaml + the routing script, mounted read-only into each pod.
+# This is the "shape to copy" — adjust domain, auth, and the script for real use.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: siphon-config
+  labels: { app: siphon }
+data:
+  siphon.yaml: |
+    listen:
+      udp: ["0.0.0.0:5060"]
+      tcp: ["0.0.0.0:5060"]
+    domain:
+      local: ["example.com"]
+    script:
+      path: "/etc/siphon/scripts/proxy.py"
+    registrar:
+      backend: redis            # durability: a restarted pod reloads the snapshot
+      redis:
+        url: "redis://siphon-redis:6379"
+    server:
+      # Stable per-pod identity, from the StatefulSet pod name (downward API).
+      instance_id: "${POD_NAME}"
+      drain_secs: 30            # graceful drain window on SIGTERM
+    metrics:
+      prometheus:
+        listen: "0.0.0.0:9090"  # /metrics — Prometheus scrape
+    admin:
+      listen: "0.0.0.0:9091"    # /admin/health (liveness) + /admin/ready (readiness)
+    log:
+      level: info
+      format: json              # structured logs for aggregation
+
+  proxy.py: |
+    # Minimal demo proxy (no auth, so a plain REGISTER works in the demo).
+    # Replace with scripts/proxy_default.py (digest auth, sanity checks, presence)
+    # for production.
+    from siphon import proxy, registrar, log
+
+    @proxy.on_request
+    def route(request):
+        if request.method == "OPTIONS" and request.ruri.is_local and not request.ruri.user:
+            request.reply(200, "OK")
+            return
+        if request.in_dialog:
+            if request.loose_route():
+                request.relay()
+            else:
+                request.reply(404, "Not Here")
+            return
+        if request.method == "REGISTER":
+            registrar.save(request)
+            return
+        if not request.ruri.user:
+            request.reply(484, "Address Incomplete")
+            return
+        contacts = registrar.lookup(request.ruri)
+        if not contacts:
+            request.reply(404, "Not Found")
+            return
+        request.record_route()
+        request.fork(contacts)

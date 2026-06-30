@@ -553,6 +553,29 @@ src/
 - **No GIL** — free-threaded Python 3.14t with `#[pymodule(gil_used = false)]`
 - **No per-request allocations** on the hot path where avoidable
 
+### Scaling, HA & operations
+
+A single SIPhon node handles tens of thousands of calls per second, so you run more
+than one node for **redundancy**, not throughput — and you get it the proven SIP way
+(a front load balancer + DNS SRV + a shared Redis registrar), not a clustering
+engine. The operator docs ([docs/](docs/)) cover this end to end:
+
+- **[docs/scaling-and-redundancy.md](docs/scaling-and-redundancy.md)** — what state
+  is node-local vs. Redis-shared, what the Redis backend actually buys you
+  (durability + boot snapshot, not live cross-node sync), and why SIPhon ships no
+  `clusterer`/DMQ equivalent.
+- **[docs/deployment.md](docs/deployment.md)** — concrete topologies (single node,
+  redundant pair / N nodes, IMS), the operations runbook (graceful drain, probes,
+  metrics/alerts, capacity), and a light Kubernetes shape.
+- **[docs/migrating-from-kamailio-opensips.md](docs/migrating-from-kamailio-opensips.md)**
+  — a concept map for porting routes, plus how to translate `clusterer`/`dmq_usrloc`
+  topologies.
+- **[docs/handler-execution-model.md](docs/handler-execution-model.md)** — the
+  handler pool, blocking contract, and liveness guarantees.
+
+Runnable reference deployments (a front-LB + 2-backend demo with a failover-proof
+script, and Kubernetes manifests) live in **[deploy/](deploy/)**.
+
 ## Testing
 
 SIPhon follows strict TDD practices across multiple test layers:

@@ -86,6 +86,24 @@ if [ "${BENCH_OK:-0}" != "1" ]; then
     || die "criterion regression gate failed — diagnose/roll back, or (if the bench hardware changed) re-baseline with scripts/bench_regression.sh --save (or set BENCH_OK=1 to skip)"
 fi
 
+# ── HA failover validation gate (per project policy) ───────────────────────
+# The Redis-backed registrar's core HA promise — a node that dies comes back
+# whole — is a correctness invariant, so prove it at release-cut. This is fast +
+# fully automated: deploy/ha-demo/validate.sh stands up a throwaway Redis + a
+# front LB + two backend nodes, registers a contact, restarts a backend, and
+# asserts it recovers the binding from Redis (plus the /admin/* probes). Needs
+# docker (already required for the SIPp runs). The k8s flavour
+# (deploy/k8s/validate-kind.sh, kill-a-pod on kind) stays manual — it needs a
+# cluster + image — so it is NOT gated here.
+if [ "${FAILOVER_OK:-0}" != "1" ]; then
+  echo "==> HA failover validation gate (deploy/ha-demo/validate.sh)"
+  command -v docker >/dev/null \
+    || die "docker is required for the failover gate (or set FAILOVER_OK=1 to skip)"
+  PYO3_PYTHON="${PYO3_PYTHON:-python3}" cargo build --quiet
+  SIPHON_BIN="$REPO_ROOT/target/debug/siphon" deploy/ha-demo/validate.sh \
+    || die "HA failover gate failed — the Redis-backed registrar must survive a node restart (or set FAILOVER_OK=1 to skip)"
+fi
+
 # ── Set the version, commit, tag, push ─────────────────────────────────────
 echo "==> setting Cargo.toml version to $VERSION"
 # Only the package version (the first `version = ` under [package]).
