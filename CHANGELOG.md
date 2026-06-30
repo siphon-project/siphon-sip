@@ -135,6 +135,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
     connect with `ErrorKind::Unsupported` (no silent fallback to TCP).
   - CI builds and tests both configurations (default and `--features sctp`).
 
+### Removed
+- **Dropped the no-op `nat.force_rport` and `nat.fix_register` config keys.** Both
+  were accepted but never consumed by the runtime. Their intended behaviour is
+  already covered: responses are always routed symmetrically to the request's
+  source address (RFC 6314, so rport is effectively unconditional), and every
+  `registrar.save()` records the observed source (`Contact.received` /
+  `Contact.flow`) for NAT/MT routing. REGISTER-side fixups remain available as the
+  explicit script methods `request.fix_nated_register()` / `fix_nated_contact()`.
+  Removal is backward-compatible — existing `siphon.yaml` files carrying either
+  key still parse (the keys are ignored, exactly as before). `nat.fix_contact`,
+  `nat.keepalive`, and `nat.crlf_keepalive` are unchanged.
+
 ### Fixed
 - **Premature `100 Trying` on non-INVITE transactions over UDP (RFC 4320 §4.2).**
   The non-INVITE auto-100 (MESSAGE/SUBSCRIBE/OPTIONS/BYE) fired after the short

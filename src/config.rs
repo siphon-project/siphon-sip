@@ -88,7 +88,7 @@ pub struct Config {
     /// Rate limiting, scanner UA blocking, trusted source CIDRs.
     pub security: Option<SecurityConfig>,
 
-    /// NAT traversal: force_rport, Contact rewriting, keepalive OPTIONS.
+    /// NAT traversal: response Contact rewriting + keepalives (OPTIONS + CRLF).
     pub nat: Option<NatConfig>,
 
     /// SIP call tracing via HEP (Homer/captAgent).
@@ -1255,15 +1255,18 @@ fn default_strong_signal_weight() -> u32 {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct NatConfig {
-    /// Always rewrite received port in Via/Contact from source port.
-    #[serde(default)]
-    pub force_rport: bool,
-    /// Rewrite Contact URI host:port with observed source address.
+    /// Rewrite the Contact URI host:port on *responses* with the observed
+    /// source address of the entity that sent the response (applied before
+    /// `@proxy.on_reply` handlers run).
+    ///
+    /// Note: there is no `force_rport` / `fix_register` equivalent here.
+    /// Responses are always routed symmetrically to the request's source
+    /// (RFC 6314), so rport is effectively unconditional, and every
+    /// `registrar.save()` already records the observed source for NAT
+    /// routing — the REGISTER-side fixups are exposed as the explicit script
+    /// methods `request.fix_nated_register()` / `fix_nated_contact()`.
     #[serde(default)]
     pub fix_contact: bool,
-    /// Rewrite Contact on REGISTER with observed source address.
-    #[serde(default)]
-    pub fix_register: bool,
     /// Send periodic OPTIONS keep-alives to maintain NAT pinholes.
     pub keepalive: Option<NatKeepaliveConfig>,
     /// RFC 5626 §4.4.1 CRLF keep-alive for persistent connections (TCP/TLS).
@@ -3235,9 +3238,7 @@ domain:
 script:
   path: "scripts/proxy_default.py"
 nat:
-  force_rport: true
   fix_contact: true
-  fix_register: true
   keepalive:
     enabled: true
     interval_secs: 30
@@ -3245,12 +3246,34 @@ nat:
 "#;
         let config = Config::from_str(yaml).unwrap();
         let nat = config.nat.unwrap();
-        assert!(nat.force_rport);
         assert!(nat.fix_contact);
-        assert!(nat.fix_register);
         let ka = nat.keepalive.unwrap();
         assert!(ka.enabled);
         assert_eq!(ka.interval_secs, 30);
+    }
+
+    #[test]
+    fn nat_config_ignores_removed_legacy_keys() {
+        // The no-op `force_rport` / `fix_register` keys were removed; a config
+        // that still carries them must keep parsing (serde ignores unknown
+        // fields) so existing siphon.yaml files don't break on upgrade.
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+nat:
+  force_rport: true
+  fix_contact: true
+  fix_register: true
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let nat = config.nat.unwrap();
+        assert!(nat.fix_contact);
     }
 
     #[test]
