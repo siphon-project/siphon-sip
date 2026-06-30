@@ -1,0 +1,52 @@
+[package]
+name = "siphon-bin"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+description = "SIPhon binary with opt-in, feature-gated extension modules (SMPP, …)"
+# Built from source by operators who want extensions. The plain `siphon` binary
+# ships from the `siphon-sip` crate (`cargo install siphon-sip`); this package is
+# a superset that composes optional extension crates behind cargo features.
+publish = false
+
+[[bin]]
+# SAME artifact name as siphon-sip's binary on purpose: an operator who wants
+# extensions builds this package instead, producing a drop-in `siphon` binary.
+# Because this is a separate, excluded workspace, a root `cargo build` in the
+# siphon-sip repo never builds it — so the Dockerfile / cargo-deb / release
+# machinery for the plain binary is unaffected.
+name = "siphon"
+path = "src/main.rs"
+
+[features]
+default = []
+# Each extension module is opt-in and off by default. With a module's feature
+# disabled, an `extensions.<name>` block in siphon.yaml still parses and is
+# skipped with a loud warning (mirrors the siphon `sctp` feature contract).
+smpp = ["dep:siphon-smpp"] # SMPP 3.4 — inbound/outbound binds, scriptable `smpp` namespace
+# http = ["dep:siphon-http"]   # ← drop-in slot: uncomment when siphon-http lands
+# full = ["smpp"]              # convenience aggregate: grows to ["smpp", "http", …]
+
+[dependencies]
+# Single-source rule: every crate here that depends on siphon-sip MUST use a
+# byte-identical git URL + ref, or cargo keys two separate `siphon-sip` sources
+# (it does NOT follow GitHub's repo-rename redirect) and the builder closures
+# fail to type-match. siphon-smpp v1.1.0 pins
+# `siphon-sip = { git = ".../siphon-sip", branch = "main" }`, so siphon-sip stays
+# on `branch = "main"` here too; the committed Cargo.lock pins the exact SHA for
+# reproducible builds (advance with `cargo update`). Extension crates themselves
+# are pinned to their released tags for stable, intentional bumps.
+siphon-sip = { git = "https://github.com/siphon-project/siphon-sip", branch = "main" }
+siphon-smpp = { git = "https://github.com/siphon-project/siphon-smpp", tag = "v1.1.0", optional = true }
+# siphon-http = { git = "https://github.com/siphon-project/siphon-http", tag = "vX.Y.Z", optional = true }
+
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+# jemalloc is installed in main.rs via `siphon::install_allocator!()`, which
+# re-exports siphon's own tikv-jemallocator — so there is no jemalloc dependency
+# to declare here (avoids `links = "jemalloc"` version skew with siphon-sip).
+
+# Standalone workspace so this package is never swept into the siphon-sip
+# package and its dependency graph stays independent.
+[workspace]

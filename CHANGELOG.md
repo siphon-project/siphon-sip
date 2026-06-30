@@ -7,6 +7,19 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **Opt-in extension binary (`siphon-bin`)** — a new standalone package that
+  builds a drop-in `siphon` binary composing optional extension modules behind
+  cargo features (all off by default). The first module is **SMPP 3.4**
+  (`--features smpp`): when `extensions.smpp` in `siphon.yaml` points at an
+  `smpp.yaml`, it registers the scriptable `smpp` namespace and the SMPP runtime
+  so scripts can handle `@smpp.on_pdu` / `@smpp.on_bind`. With a module's feature
+  off, its `extensions.<name>` block still parses and is skipped with a loud
+  warning (same contract as the `sctp` feature). The plain `siphon` binary from
+  `cargo install siphon-sip` is unchanged; operators who want extensions build
+  `siphon-bin` (e.g. `cargo build -p siphon-bin --release --features smpp`, or
+  the `siphon-bin/Dockerfile` image). Documented under **Extensions** in the
+  docs site. The `ext/` layer is structured so further modules (HTTP, …) plug in
+  behind their own features.
 - **`siphon::install_allocator!()` — one-line jemalloc + page-decay setup.** A
   `#[global_allocator]` and jemalloc's `_rjem_malloc_conf` config symbol only
   take effect in the final binary crate (the language honors `#[global_allocator]`
