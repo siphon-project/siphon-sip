@@ -1,0 +1,8 @@
+# Surfaces the "Sponsor" button on the repository.
+# Feature sponsorship, sponsored development, and commercial support are
+# handled by Real Time Telecom B.V.
+custom: ["https://realtime-telecom.nl"]
+
+# Native GitHub Sponsors button — uncomment once the account is enrolled at
+# https://github.com/sponsors:
+# github: [killdashnine]

@@ -728,6 +728,22 @@ Release history is tracked in [CHANGELOG.md](CHANGELOG.md).
 
 SIPhon stands on the shoulders of [Kamailio](https://www.kamailio.org/) and [OpenSIPS](https://opensips.org/). Their decades of work defining how SIP proxies should behave — from transaction handling semantics to registrar storage patterns to the idea that routing logic should be scriptable — is the foundation this project builds on. If SIPhon's architecture feels familiar, that's by design.
 
+## Commercial Support
+
+SIPhon is MIT-licensed and free to use in production. If you'd like a hand getting it
+there — deployment design, IMS/VoLTE integration, custom scripting, performance tuning,
+or an SLA-backed support contract — commercial support is available from
+**[Real Time Telecom B.V.](https://realtime-telecom.nl)**, run by SIPhon's maintainer.
+
+Reach out via [realtime-telecom.nl](https://realtime-telecom.nl) to talk specifics.
+
+## Sponsors
+
+Ongoing development is backed by **[Real Time Telecom B.V.](https://realtime-telecom.nl)**,
+SIPhon's founding sponsor. Need a particular feature built or fast-tracked? Feature
+sponsorship is welcome — use the **Sponsor** button on the repository, or get in touch
+through RTT.
+
 ## License
 
 MIT
