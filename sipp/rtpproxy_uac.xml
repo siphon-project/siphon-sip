@@ -5,13 +5,13 @@
   rtpproxy proxy UAC scenario:
   INVITE (with SDP) → 180 → 200 OK → ACK → BYE → 200
 
-  Same as rtpengine_uac.xml, but with an optional 100-Trying absorber before the
-  BYE's 200 OK: siphon's NIST timer may auto-emit a 100 for the in-dialog BYE
-  (it does the same for the INVITE, absorbed below) when the relay round-trip
-  exceeds transaction.auto_100_delay. Without the absorber the UAC aborts on the
-  unexpected 100. The proxy calls rtpengine.offer() before relaying the INVITE,
-  rtpengine.answer() on the 200 OK, and rtpengine.delete() on the BYE — all of
-  which map onto rtpproxy via media.backend.
+  The proxy anchors media via rtpproxy.offer() on the INVITE, rtpproxy.answer()
+  on the 200 OK, and rtpproxy.delete() on the BYE (all mapped onto rtpproxy via
+  media.backend). In-dialog requests (ACK/BYE) are routed correctly through the
+  record-routing proxy: `rrs="true"` captures the Record-Route set on the 200 OK,
+  and ACK/BYE use `[next_url]` (the UAS Contact) + `[routes]` — mirroring
+  invite_uac.xml. Hardcoding the in-dialog R-URI to the proxy (as the older
+  rtpengine_uac.xml does) would self-route at the proxy and 482-loop.
 -->
 <scenario name="rtpproxy proxy UAC">
 
@@ -20,7 +20,7 @@
     <![CDATA[
 INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
 Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
-From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+From: <sip:alice@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
 To: <sip:bob@[remote_ip]>
 Call-ID: [call_id]
 CSeq: 1 INVITE
@@ -49,19 +49,19 @@ a=fmtp:101 0-15
   <label id="1" />
   <recv response="180" optional="true" next="1" />
 
-  <!-- Expect 200 OK -->
-  <recv response="200" rtd="true" crlf="true" />
+  <!-- Expect 200 OK; capture the Record-Route set (rrs) for in-dialog routing -->
+  <recv response="200" rtd="true" crlf="true" rrs="true" />
 
-  <!-- Send ACK -->
+  <!-- Send ACK (in-dialog: Contact from 200 OK via [next_url] + [routes]) -->
   <send>
     <![CDATA[
-ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+ACK [next_url] SIP/2.0
 Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
-From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+From: <sip:alice@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
 To: <sip:bob@[remote_ip]>[peer_tag_param]
 Call-ID: [call_id]
 CSeq: 1 ACK
-Route: <sip:[remote_ip]:[remote_port];lr>
+[routes]
 Max-Forwards: 70
 Content-Length: 0
 
@@ -71,24 +71,23 @@ Content-Length: 0
   <!-- Hold call briefly -->
   <pause milliseconds="500" />
 
-  <!-- Send BYE -->
+  <!-- Send BYE (in-dialog: Contact from 200 OK via [next_url] + [routes]) -->
   <send retrans="500">
     <![CDATA[
-BYE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+BYE [next_url] SIP/2.0
 Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
-From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+From: <sip:alice@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
 To: <sip:bob@[remote_ip]>[peer_tag_param]
 Call-ID: [call_id]
 CSeq: 2 BYE
-Route: <sip:[remote_ip]:[remote_port];lr>
+[routes]
 Max-Forwards: 70
 Content-Length: 0
 
 ]]>
   </send>
 
-  <!-- Absorb an optional 100 Trying for the BYE, then expect its 200 OK -->
-  <recv response="100" optional="true" />
+  <!-- Expect 200 OK for BYE -->
   <recv response="200" rtd="true" />
 
 </scenario>
