@@ -16,9 +16,10 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   off, its `extensions.<name>` block still parses and is skipped with a loud
   warning (same contract as the `sctp` feature). The plain `siphon` binary from
   `cargo install siphon-sip` is unchanged; operators who want extensions build
-  `siphon-bin` (e.g. `cargo build -p siphon-bin --release --features smpp`). The
-  `ext/` layer is structured so further modules (HTTP, …) plug in behind their
-  own features.
+  `siphon-bin` (e.g. `cargo build -p siphon-bin --release --features smpp`, or
+  the `siphon-bin/Dockerfile` image). Documented under **Extensions** in the
+  docs site. The `ext/` layer is structured so further modules (HTTP, …) plug in
+  behind their own features.
 - **ISDN-AddressString AVPs decode to E.164 in scripts** — MSISDN (701),
   SC-Address (3300), SGSN-Number (1489) and MME-Number-for-MT-SMS (1645) are
   now dictionary-typed `ISDNAddressString` (3GPP TS 29.002 §17.7.8) instead of

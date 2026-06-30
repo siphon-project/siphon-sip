@@ -108,6 +108,51 @@ jobs:
       - name: Compile benches (no run)
         run: PYO3_PYTHON=python3.14 cargo bench --no-run --all-features
 
+  # ── siphon-bin extension binary (opt-in SMPP) ───────────────────────────
+  # The siphon-bin/ package is a SEPARATE, excluded standalone workspace that
+  # git-deps the published siphon-sip lib + the extension crates, so the main
+  # jobs above never build it. This job is the bit-rot guard for the
+  # composition: it proves the `siphon` binary still compiles (and is
+  # clippy-clean) both WITHOUT and WITH the `smpp` feature. Because the deps are
+  # git `branch = "main"`, this builds against current siphon-sip/siphon-smpp
+  # main — i.e. it validates the composition against the latest published lib,
+  # not the in-tree lib of this checkout (the deliberate git-dep tradeoff).
+  siphon-bin:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: siphon-bin
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Python 3.14 (free-threaded)
+        uses: deadsnakes/action@v3.2.0
+        with:
+          python-version: "3.14-dev"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: siphon-bin
+
+      # Feature off: plain composition (an `extensions.smpp` block parses and is
+      # skipped with a loud warning — no siphon-smpp/smpp34 in the graph).
+      - name: Build (no extensions)
+        run: PYO3_PYTHON=python3.14 cargo build
+
+      - name: Clippy (no extensions)
+        run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin -- -D warnings
+
+      # Feature on: pulls siphon-smpp + smpp34 and wires the `smpp` namespace.
+      - name: Build (--features smpp)
+        run: PYO3_PYTHON=python3.14 cargo build --features smpp
+
+      - name: Clippy (--features smpp)
+        run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --features smpp -- -D warnings
+
   # ── Python SDK tests ──────────────────────────────────────────────────
   sdk-tests:
     runs-on: ubuntu-latest

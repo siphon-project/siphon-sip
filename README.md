@@ -165,6 +165,9 @@ extension binary only if you need one:
 ```bash
 # SMPP 3.4 (scriptable `smpp` namespace: @smpp.on_pdu / @smpp.on_bind)
 cargo build -p siphon-bin --release --features smpp
+
+# …or as a container image (operator mounts siphon.yaml + smpp.yaml + script):
+docker build -f siphon-bin/Dockerfile -t siphon-smpp siphon-bin/
 ```
 
 Point siphon at the extension's config from `siphon.yaml`:
