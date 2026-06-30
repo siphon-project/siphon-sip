@@ -132,7 +132,7 @@ explicit **state-replication subsystems** and SIPhon deliberately did not.
 
 If your scale genuinely requires N-way live usrloc replication with zero affinity,
 that's a deliberate design discussion — see the "when would you miss one" section of
-[scaling-and-redundancy.md](scaling-and-redundancy.md#why-siphon-has-no-clusterer--dmq-and-when-youd-miss-one).
+[scaling-and-redundancy.md](scaling-and-redundancy.md#why-siphon-ships-no-clusterer-or-dmq).
 
 ---
 

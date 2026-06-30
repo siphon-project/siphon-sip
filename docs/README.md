@@ -29,10 +29,10 @@ browse the `docs/` folder.)
 ## Runnable deployments
 
 Reference deployment artifacts — a front-LB + 2-backend demo with a failover-proof
-script, plus Kubernetes manifests — live in **[../deploy/](../deploy/)**.
+script, plus Kubernetes manifests — live in **[../deploy/](https://github.com/siphon-project/siphon-sip/tree/main/deploy/)**.
 
 ## Also
 
-- The main **[README](../README.md)** — overview, install, scripting API, performance.
-- **[siphon.yaml](../siphon.yaml)** — the annotated reference configuration.
-- **[sdk/](../sdk/)** — the `siphon-sip` mock library for testing scripts.
+- The main **[README](https://github.com/siphon-project/siphon-sip/blob/main/README.md)** — overview, install, scripting API, performance.
+- **[siphon.yaml](https://github.com/siphon-project/siphon-sip/blob/main/siphon.yaml)** — the annotated reference configuration.
+- **[sdk/](https://github.com/siphon-project/siphon-sip/tree/main/sdk/)** — the `siphon-sip` mock library for testing scripts.

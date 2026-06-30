@@ -16,3 +16,6 @@ CLAUDE.md
 
 # Private test fixtures
 sipp/ipsec/
+
+# mkdocs build output
+/site/

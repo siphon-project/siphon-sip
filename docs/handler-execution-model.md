@@ -3,8 +3,8 @@
 This documents how SIPhon runs Python script handlers, what may block, and the
 elasticity / backpressure / liveness guarantees. It is the user-facing companion
 to the source doc-comments in
-[`src/script/py_executor.rs`](../src/script/py_executor.rs) and
-[`src/script/async_pool.rs`](../src/script/async_pool.rs).
+[`src/script/py_executor.rs`](https://github.com/siphon-project/siphon-sip/blob/main/src/script/py_executor.rs) and
+[`src/script/async_pool.rs`](https://github.com/siphon-project/siphon-sip/blob/main/src/script/async_pool.rs).
 
 ## The two handler pools
 

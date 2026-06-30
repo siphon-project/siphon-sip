@@ -8,19 +8,19 @@ The golden rule from that document, restated: **one node does the work; you add
 nodes for redundancy, and you get redundancy with a front LB + DNS SRV, not a
 cluster.**
 
-- [Scenario 1 — single node](#scenario-1--single-node)
-- [Scenario 2 — redundant pair / N nodes (front LB + DNS SRV)](#scenario-2--redundant-pair--n-nodes)
-- [Scenario 3 — IMS core](#scenario-3--ims-core)
+- [Scenario 1: single node](#scenario-1-single-node)
+- [Scenario 2: redundant pair, N nodes (front LB + DNS SRV)](#scenario-2-redundant-pair-n-nodes)
+- [Scenario 3: IMS core](#scenario-3-ims-core)
 - [Operations runbook](#operations-runbook)
 - [Kubernetes (kept deliberately light)](#kubernetes-kept-deliberately-light)
 
 A runnable, self-contained version of Scenario 2 lives in
-[`deploy/ha-demo/`](../deploy/ha-demo/); the Kubernetes manifests are in
-[`deploy/k8s/`](../deploy/k8s/).
+[`deploy/ha-demo/`](https://github.com/siphon-project/siphon-sip/tree/main/deploy/ha-demo/); the Kubernetes manifests are in
+[`deploy/k8s/`](https://github.com/siphon-project/siphon-sip/tree/main/deploy/k8s/).
 
 ---
 
-## Scenario 1 — single node
+## Scenario 1: single node
 
 The default, and the right answer for most deployments. One process, optionally a
 Redis backend so a restart comes back whole.
@@ -57,7 +57,7 @@ same config, kept ready; promote it by moving traffic (DNS/VIP) when you need to
 
 ---
 
-## Scenario 2 — redundant pair / N nodes
+## Scenario 2: redundant pair, N nodes
 
 Survive a node failure and do zero-downtime upgrades. Three ingredients, none of
 which require the nodes to share live call state:
@@ -87,7 +87,7 @@ works in both directions.
 ### The front LB (SIPhon fronting SIPhon)
 
 You can use any SIP-aware load balancer you already trust. The self-contained way —
-and what [`deploy/ha-demo/`](../deploy/ha-demo/) demonstrates — is a thin SIPhon
+and what [`deploy/ha-demo/`](https://github.com/siphon-project/siphon-sip/tree/main/deploy/ha-demo/) demonstrates — is a thin SIPhon
 proxy whose only job is to spread traffic over a `gateway` group of backends:
 
 ```yaml
@@ -169,7 +169,7 @@ gives you active/standby rather than active/active.
 
 ---
 
-## Scenario 3 — IMS core
+## Scenario 3: IMS core
 
 In IMS, **SIPhon does not need to share location state at all**, because the
 **HSS is the location authority**:
@@ -184,7 +184,7 @@ In IMS, **SIPhon does not need to share location state at all**, because the
 
 So an IMS core scales to many nodes per role using exactly the mechanisms above plus
 the HSS — no `clusterer`/DMQ equivalent required. See the
-[`examples/ims_*`](../examples/) configs for per-role starting points.
+[`examples/ims_*`](https://github.com/siphon-project/siphon-sip/tree/main/examples/) configs for per-role starting points.
 
 ---
 
@@ -270,7 +270,7 @@ re-registration. There is no SIPhon-specific snapshot format to manage.
 ## Kubernetes (kept deliberately light)
 
 People expect to see K8s, so here's a clean shape to copy — **not** a platform.
-Manifests are in [`deploy/k8s/`](../deploy/k8s/). The load-bearing details:
+Manifests are in [`deploy/k8s/`](https://github.com/siphon-project/siphon-sip/tree/main/deploy/k8s/). The load-bearing details:
 
 - **`StatefulSet`** (not Deployment) so each pod has a stable identity. Wire
   `server.instance_id` from the pod name via the downward API:

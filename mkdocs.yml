@@ -1,0 +1,69 @@
+site_name: SIPhon
+site_description: High-performance SIP proxy, B2BUA, and IMS platform in Rust with free-threaded Python scripting
+site_url: https://siphon-sip.org/
+repo_url: https://github.com/siphon-project/siphon-sip
+repo_name: siphon-project/siphon-sip
+edit_uri: edit/main/docs/
+copyright: MIT-licensed. SIPhon is built on the shoulders of Kamailio and OpenSIPS.
+
+docs_dir: docs
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.instant
+    - navigation.tracking
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.action.edit
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+
+nav:
+  - Home: README.md
+  - Running in production:
+      - Scaling, clustering & redundancy: scaling-and-redundancy.md
+      - Deployment & operations: deployment.md
+      - Migrating from Kamailio / OpenSIPS: migrating-from-kamailio-opensips.md
+  - Internals:
+      - Handler execution model: handler-execution-model.md
+      - Feature readiness matrix: feature-readiness-matrix.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search

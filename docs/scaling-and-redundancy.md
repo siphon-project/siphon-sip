@@ -9,7 +9,7 @@ why SIPhon deliberately does **not** ship a clustering/replication engine.
 
 - **One node is a lot.** A single SIPhon process handles tens of thousands of calls
   per second — the documented baseline runs to roughly **28–30k cps** on one
-  commodity box (see the [README baseline](../README.md#current-baseline)). Most
+  commodity box (see the [README baseline](https://github.com/siphon-project/siphon-sip/blob/main/README.md#current-baseline)). Most
   deployments never outgrow a single active node.
 - **You run more than one node for _redundancy_, not throughput.** And you get
   redundancy the boring, proven SIP way: a **front-facing load balancer + DNS SRV
@@ -143,7 +143,7 @@ Concrete configs for all of this are in [deployment.md](deployment.md).
 
 ---
 
-## Why SIPhon has no `clusterer` / DMQ (and when you'd miss one)
+## Why SIPhon ships no clusterer or DMQ
 
 If you come from Kamailio or OpenSIPS you'll notice SIPhon has nothing like their
 state-replication subsystems. That's a deliberate design choice, not a gap waiting
