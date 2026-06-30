@@ -175,6 +175,14 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   no `critcmp`/`jq`). CI proves the benches compile; the hard timing gate runs at
   release cut on fixed hardware, where absolute timings are meaningful.
 
+### Documentation
+- Added a **Transports & networking** guide (docs site, under *Running in
+  production*): transport listeners (UDP/TCP/TLS/WS/WSS/SCTP), WebSocket/WebRTC
+  (RFC 7118) and the signaling-vs-media split, RFC 5626 flow tokens and
+  connection reuse, `advertised_address` for behind-NAT / load-balancer
+  deployments, client NAT traversal, inter-transport routing, and IPv4/IPv6
+  interworking.
+
 ## [1.0.0] — 2026-06-26
 
 First stable release. A love letter to Kamailio and OpenSIPS — their proven

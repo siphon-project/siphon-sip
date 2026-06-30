@@ -50,6 +50,7 @@ nav:
       - Hardening & security: cookbook/security.md
       - Monitoring & observability: cookbook/monitoring.md
   - Running in production:
+      - Transports & networking: transports.md
       - Scaling, clustering & redundancy: scaling-and-redundancy.md
       - Deployment & operations: deployment.md
       - Migrating from Kamailio / OpenSIPS: migrating-from-kamailio-opensips.md
