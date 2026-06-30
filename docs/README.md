@@ -70,6 +70,13 @@ common roles — each with the config, a real script, and how to test it:
 Reference deployment artifacts — a front-LB + 2-backend demo with a failover-proof
 script, plus Kubernetes manifests — live in **[deploy/](https://github.com/siphon-project/siphon-sip/tree/main/deploy/)**.
 
+## Commercial support & sponsorship
+
+Running SIPhon in production and want a hand — or want to fund a feature? Commercial
+support and feature sponsorship are available from
+**[Real Time Telecom B.V.](https://realtime-telecom.nl)**, run by SIPhon's maintainer.
+See **[Commercial support](support.md)**.
+
 ## Also
 
 - The main **[README](https://github.com/siphon-project/siphon-sip/blob/main/README.md)** — overview, install, full scripting API, performance baseline.

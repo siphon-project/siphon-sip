@@ -53,6 +53,7 @@ nav:
       - Scaling, clustering & redundancy: scaling-and-redundancy.md
       - Deployment & operations: deployment.md
       - Migrating from Kamailio / OpenSIPS: migrating-from-kamailio-opensips.md
+  - Commercial support: support.md
   - Internals:
       - Handler execution model: handler-execution-model.md
       - Feature readiness matrix: feature-readiness-matrix.md
