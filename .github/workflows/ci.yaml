@@ -303,6 +303,52 @@ jobs:
             siphon-b2bua.log
             *.log
 
+  # ── rtpproxy functional test ───────────────────────────────────────────
+  # Drives a real INVITE→200→ACK→BYE through siphon configured with
+  # `media.backend: rtpproxy`, anchoring media via a mock rtpproxy. Proves the
+  # text-protocol client + siphon-side SDP rewrite work end-to-end.
+  sipp-rtpproxy:
+    runs-on: ubuntu-latest
+    needs: rust-tests
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build siphon-rtpproxy image
+        run: docker compose -f sipp/docker-compose.yaml --profile rtpproxy build siphon-rtpproxy
+
+      - name: Start mock rtpproxy + siphon-rtpproxy
+        run: docker compose -f sipp/docker-compose.yaml --profile rtpproxy up -d --wait mock-rtpproxy siphon-rtpproxy
+
+      - name: Register bob
+        run: docker compose -f sipp/docker-compose.yaml --profile rtpproxy run --rm sipp-rtpproxy-register
+
+      - name: rtpproxy call (INVITE → media anchor → 200 → BYE)
+        # Gate on the UAC: it drives the call to completion (BYE→200) and exits
+        # 0, after which the abort tears down the lingering UAS (which would
+        # otherwise show a teardown-race 255). --exit-code-from makes the UAC's
+        # result authoritative — same pattern as the b2bua call steps.
+        run: docker compose -f sipp/docker-compose.yaml --profile rtpproxy up --abort-on-container-exit --exit-code-from sipp-rtpproxy-uac sipp-rtpproxy-uac sipp-rtpproxy-uas
+
+      - name: Collect logs
+        if: always()
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs siphon-rtpproxy > siphon-rtpproxy.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs mock-rtpproxy > mock-rtpproxy.log 2>&1 || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile rtpproxy down --remove-orphans
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-rtpproxy-logs
+          path: |
+            siphon-rtpproxy.log
+            mock-rtpproxy.log
+            *.log
+
   # ── Fuzz testing (nightly) ─────────────────────────────────────────────
   fuzz:
     runs-on: ubuntu-latest
