@@ -22,6 +22,10 @@ exclude = [
     ".dockerignore",
     "Dockerfile",
     "sdk/",
+    # Opt-in extension-composition binary — its own standalone package/workspace
+    # (git-deps the published siphon-sip lib). Kept out of the published crate and
+    # never built by a root `cargo build` of siphon-sip.
+    "siphon-bin/",
 ]
 
 [lib]

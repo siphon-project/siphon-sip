@@ -1,0 +1,5 @@
+/target
+# Cargo.lock is intentionally not committed yet: a valid lockfile for the
+# git `branch = "main"` deps can only be generated once the siphon-smpp
+# `siphon-sip` URL fix has landed on its main. Commit it in a follow-up.
+/Cargo.lock

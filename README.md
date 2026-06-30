@@ -154,6 +154,29 @@ Cargo feature. Enable it explicitly (and install `libsctp-dev` first on Linux):
 cargo install siphon-sip --features sctp
 ```
 
+#### Optional extension modules (SMPP, …)
+
+Protocol extensions that aren't part of the core SIP datapath live in their own
+crates and are composed into a drop-in `siphon` binary by the separate
+[`siphon-bin`](siphon-bin/) package, each behind its own off-by-default cargo
+feature. The plain `cargo install siphon-sip` binary is unaffected; build the
+extension binary only if you need one:
+
+```bash
+# SMPP 3.4 (scriptable `smpp` namespace: @smpp.on_pdu / @smpp.on_bind)
+cargo build -p siphon-bin --release --features smpp
+```
+
+Point siphon at the extension's config from `siphon.yaml`:
+
+```yaml
+extensions:
+  smpp: /etc/siphon/smpp.yaml
+```
+
+If `extensions.smpp` is present but the binary was built without `--features
+smpp`, it is skipped with a loud warning (same contract as `sctp`).
+
 ### Option 2: Docker
 
 ```bash
