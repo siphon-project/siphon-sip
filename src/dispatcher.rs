@@ -4419,6 +4419,7 @@ pub fn init_rtpengine(
         crate::config::MediaBackendKind::SiphonRtp => {
             build_siphon_rtp_backend(media_config, event_sender)
         }
+        crate::config::MediaBackendKind::Rtpproxy => build_rtpproxy_backend(media_config),
     };
     let backend = match backend {
         Some(backend) => Arc::new(backend),
@@ -4545,6 +4546,55 @@ fn build_siphon_rtp_backend(
         }
         Err(error) => {
             error!(error = %error, "failed to initialize siphon-rtp client set");
+            None
+        }
+    }
+}
+
+/// Build the classic rtpproxy text-over-UDP backend from `media.rtpproxy`.
+fn build_rtpproxy_backend(
+    media_config: &crate::config::MediaConfig,
+) -> Option<crate::rtpengine::MediaBackend> {
+    let rtpproxy_config = match &media_config.rtpproxy {
+        Some(config) => config,
+        None => {
+            error!("media.backend is 'rtpproxy' but no media.rtpproxy block is configured");
+            return None;
+        }
+    };
+
+    let mut instance_tuples = Vec::new();
+    for (address, timeout_ms, weight) in rtpproxy_config.instances() {
+        match address.parse::<std::net::SocketAddr>() {
+            Ok(parsed) => instance_tuples.push((parsed, timeout_ms, weight)),
+            Err(parse_error) => error!(
+                address = %address,
+                error = %parse_error,
+                "invalid rtpproxy control address, skipping"
+            ),
+        }
+    }
+    if instance_tuples.is_empty() {
+        error!("media.backend is 'rtpproxy' but no valid control address is configured");
+        return None;
+    }
+
+    let count = instance_tuples.len();
+    let retries = rtpproxy_config.retries;
+    let handle = tokio::runtime::Handle::current();
+    match tokio::task::block_in_place(|| {
+        handle.block_on(crate::rtpengine::RtpProxyClientSet::new(instance_tuples, retries))
+    }) {
+        Ok(set) => {
+            info!(
+                instances = count,
+                "rtpproxy media backend configured ({count} instance{})",
+                if count == 1 { "" } else { "s" }
+            );
+            Some(crate::rtpengine::MediaBackend::RtpProxy(set))
+        }
+        Err(error) => {
+            error!(error = %error, "failed to initialize rtpproxy client set");
             None
         }
     }

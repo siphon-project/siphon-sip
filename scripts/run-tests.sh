@@ -7,6 +7,7 @@
 #   ./scripts/run-tests.sh --skip-rust  # Skip Rust tests (Docker only)
 #   ./scripts/run-tests.sh --call       # Also run call scenarios (UAC+UAS)
 #   ./scripts/run-tests.sh --rtpengine  # Also run B2BUA + RTPEngine tests
+#   ./scripts/run-tests.sh --rtpproxy   # Also run classic rtpproxy media test
 #   ./scripts/run-tests.sh --b2bua     # Also run B2BUA call/session-timer/cancel/failure tests
 set -euo pipefail
 
@@ -26,6 +27,7 @@ RUN_IPSEC=false
 RUN_CALL=false
 RUN_PRESENCE=false
 RUN_RTPENGINE=false
+RUN_RTPPROXY=false
 RUN_REINVITE=false
 RUN_B2BUA=false
 RUN_GATEWAY=false
@@ -43,6 +45,7 @@ for arg in "$@"; do
     --call)       RUN_CALL=true ;;
     --presence)   RUN_PRESENCE=true ;;
     --rtpengine)  RUN_RTPENGINE=true ;;
+    --rtpproxy)   RUN_RTPPROXY=true ;;
     --reinvite)   RUN_REINVITE=true ;;
     --b2bua)      RUN_B2BUA=true ;;
     --gateway)    RUN_GATEWAY=true ;;
@@ -54,7 +57,7 @@ for arg in "$@"; do
     --webrtc)     RUN_WEBRTC=true ;;
     --skip-rust)  SKIP_RUST=true ;;
     --help|-h)
-      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--reinvite] [--b2bua] [--gateway] [--auto100] [--http-auth] [--wedge] [--banscan] [--security] [--webrtc] [--skip-rust]"
+      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--rtpproxy] [--reinvite] [--b2bua] [--gateway] [--auto100] [--http-auth] [--wedge] [--banscan] [--security] [--webrtc] [--skip-rust]"
       exit 0
       ;;
     *)
@@ -123,6 +126,14 @@ if [[ "$RUN_RTPENGINE" == true ]]; then
   echo "=== SIPp RTPEngine test (register bob → INVITE with media anchoring) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile rtpengine run --rm sipp-rtpengine-register
   run_sipp docker compose -f "$COMPOSE_FILE" --profile rtpengine up --abort-on-container-exit sipp-rtpengine-uac sipp-rtpengine-uas
+fi
+
+# ── Step 7b: Classic rtpproxy proxy test (optional) ───────────────────────
+if [[ "$RUN_RTPPROXY" == true ]]; then
+  echo "=== SIPp rtpproxy test (register bob → INVITE with siphon-side SDP rewrite) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile rtpproxy run --rm sipp-rtpproxy-register
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile rtpproxy up --abort-on-container-exit --exit-code-from sipp-rtpproxy-uac sipp-rtpproxy-uac sipp-rtpproxy-uas
+  docker compose -f "$COMPOSE_FILE" --profile rtpproxy rm -sf sipp-rtpproxy-uac sipp-rtpproxy-uas 2>/dev/null || true
 fi
 
 # ── Step 8: RTPEngine re-INVITE tests (optional) ──────────────────────────

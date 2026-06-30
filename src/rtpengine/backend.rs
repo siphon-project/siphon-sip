@@ -1,15 +1,22 @@
 //! Media-control backend abstraction.
 //!
-//! siphon can drive either the legacy rtpengine NG/bencode-over-UDP engine
-//! ([`RtpEngineSet`]) or the native `siphon-rtp` JSON-over-TCP engine
-//! ([`SiphonRtpClient`]).  Both expose the same media-control verbs; this enum
-//! is a thin dispatcher so the dispatcher and the Python `rtpengine` namespace
-//! call one type regardless of which is configured (`media.backend`).
+//! siphon can drive one of three media engines, all behind the same media-control
+//! verbs:
+//! - the legacy rtpengine NG/bencode-over-UDP engine ([`RtpEngineSet`]),
+//! - the native `siphon-rtp` JSON-over-TCP engine ([`SiphonRtpClientSet`]),
+//! - the classic `rtpproxy` text-over-UDP relay ([`RtpProxyClientSet`]) — for
+//!   migrating an existing OpenSIPS/Kamailio/Sippy deployment to siphon while
+//!   keeping its in-place rtpproxy.
+//!
+//! This enum is a thin dispatcher so the dispatcher and the Python `rtpengine`
+//! namespace call one type regardless of which is configured (`media.backend`).
 //!
 //! Enum dispatch (rather than `Arc<dyn Trait>`) keeps the methods as plain
-//! `async fn` with no `async-trait` dependency, and there are exactly two
-//! backends.  Every method mirrors [`RtpEngineSet`]'s signature verbatim so all
-//! existing call sites compile unchanged when the field type is swapped.
+//! `async fn` with no `async-trait` dependency.  Every method mirrors
+//! [`RtpEngineSet`]'s signature verbatim so all existing call sites compile
+//! unchanged when the field type is swapped.  rtpproxy only allocates relay
+//! ports, so the rtpengine-only verbs (prompts, DTMF, gating, SIPREC/MPTY)
+//! return a clear [`RtpEngineError::EngineError`] on that backend.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -17,6 +24,7 @@ use std::sync::Arc;
 use super::client::{PlayMediaSource, RtpEngineSet};
 use super::error::RtpEngineError;
 use super::profile::NgFlags;
+use super::rtpproxy::RtpProxyClientSet;
 use super::siphon_rtp::SiphonRtpClientSet;
 
 /// The configured media-control backend.
@@ -25,6 +33,8 @@ pub enum MediaBackend {
     RtpEngine(Arc<RtpEngineSet>),
     /// Native `siphon-rtp` control protocol (JSON over TCP), one or more instances.
     SiphonRtp(Arc<SiphonRtpClientSet>),
+    /// Classic `rtpproxy` control protocol (text over UDP), one or more instances.
+    RtpProxy(Arc<RtpProxyClientSet>),
 }
 
 impl MediaBackend {
@@ -39,6 +49,7 @@ impl MediaBackend {
         match self {
             Self::RtpEngine(set) => set.offer(call_id, from_tag, sdp, flags).await,
             Self::SiphonRtp(client) => client.offer(call_id, from_tag, sdp, flags).await,
+            Self::RtpProxy(client) => client.offer(call_id, from_tag, sdp, flags).await,
         }
     }
 
@@ -54,6 +65,7 @@ impl MediaBackend {
         match self {
             Self::RtpEngine(set) => set.answer(call_id, from_tag, to_tag, sdp, flags).await,
             Self::SiphonRtp(client) => client.answer(call_id, from_tag, to_tag, sdp, flags).await,
+            Self::RtpProxy(client) => client.answer(call_id, from_tag, to_tag, sdp, flags).await,
         }
     }
 
@@ -62,6 +74,7 @@ impl MediaBackend {
         match self {
             Self::RtpEngine(set) => set.delete(call_id, from_tag).await,
             Self::SiphonRtp(client) => client.delete(call_id, from_tag).await,
+            Self::RtpProxy(client) => client.delete(call_id, from_tag).await,
         }
     }
 
@@ -103,6 +116,19 @@ impl MediaBackend {
                     )
                     .await
             }
+            Self::RtpProxy(client) => {
+                client
+                    .play_media(
+                        call_id,
+                        from_tag,
+                        source,
+                        repeat_times,
+                        start_pos_ms,
+                        duration_ms,
+                        to_tag,
+                    )
+                    .await
+            }
         }
     }
 
@@ -111,6 +137,7 @@ impl MediaBackend {
         match self {
             Self::RtpEngine(set) => set.stop_media(call_id, from_tag).await,
             Self::SiphonRtp(client) => client.stop_media(call_id, from_tag).await,
+            Self::RtpProxy(client) => client.stop_media(call_id, from_tag).await,
         }
     }
 
@@ -136,6 +163,11 @@ impl MediaBackend {
                     .play_dtmf(call_id, from_tag, code, duration_ms, volume_dbm0, pause_ms, to_tag)
                     .await
             }
+            Self::RtpProxy(client) => {
+                client
+                    .play_dtmf(call_id, from_tag, code, duration_ms, volume_dbm0, pause_ms, to_tag)
+                    .await
+            }
         }
     }
 
@@ -144,6 +176,7 @@ impl MediaBackend {
         match self {
             Self::RtpEngine(set) => set.silence_media(call_id, from_tag).await,
             Self::SiphonRtp(client) => client.silence_media(call_id, from_tag).await,
+            Self::RtpProxy(client) => client.silence_media(call_id, from_tag).await,
         }
     }
 
@@ -156,6 +189,7 @@ impl MediaBackend {
         match self {
             Self::RtpEngine(set) => set.unsilence_media(call_id, from_tag).await,
             Self::SiphonRtp(client) => client.unsilence_media(call_id, from_tag).await,
+            Self::RtpProxy(client) => client.unsilence_media(call_id, from_tag).await,
         }
     }
 
@@ -164,6 +198,7 @@ impl MediaBackend {
         match self {
             Self::RtpEngine(set) => set.block_media(call_id, from_tag).await,
             Self::SiphonRtp(client) => client.block_media(call_id, from_tag).await,
+            Self::RtpProxy(client) => client.block_media(call_id, from_tag).await,
         }
     }
 
@@ -172,6 +207,7 @@ impl MediaBackend {
         match self {
             Self::RtpEngine(set) => set.unblock_media(call_id, from_tag).await,
             Self::SiphonRtp(client) => client.unblock_media(call_id, from_tag).await,
+            Self::RtpProxy(client) => client.unblock_media(call_id, from_tag).await,
         }
     }
 
@@ -191,6 +227,9 @@ impl MediaBackend {
             Self::SiphonRtp(client) => {
                 client.subscribe_request(call_id, from_tag, to_tag, sdp, flags).await
             }
+            Self::RtpProxy(client) => {
+                client.subscribe_request(call_id, from_tag, to_tag, sdp, flags).await
+            }
         }
     }
 
@@ -206,6 +245,9 @@ impl MediaBackend {
                 set.subscribe_request_siprec(call_id, from_tags, profile_flags).await
             }
             Self::SiphonRtp(client) => {
+                client.subscribe_request_siprec(call_id, from_tags, profile_flags).await
+            }
+            Self::RtpProxy(client) => {
                 client.subscribe_request_siprec(call_id, from_tags, profile_flags).await
             }
         }
@@ -227,6 +269,9 @@ impl MediaBackend {
             Self::SiphonRtp(client) => {
                 client.subscribe_answer(call_id, from_tag, to_tag, sdp, flags).await
             }
+            Self::RtpProxy(client) => {
+                client.subscribe_answer(call_id, from_tag, to_tag, sdp, flags).await
+            }
         }
     }
 
@@ -240,6 +285,7 @@ impl MediaBackend {
         match self {
             Self::RtpEngine(set) => set.unsubscribe(call_id, from_tag, to_tag).await,
             Self::SiphonRtp(client) => client.unsubscribe(call_id, from_tag, to_tag).await,
+            Self::RtpProxy(client) => client.unsubscribe(call_id, from_tag, to_tag).await,
         }
     }
 
@@ -248,6 +294,7 @@ impl MediaBackend {
         match self {
             Self::RtpEngine(set) => set.ping().await,
             Self::SiphonRtp(client) => client.ping().await,
+            Self::RtpProxy(client) => client.ping().await,
         }
     }
 
@@ -256,6 +303,7 @@ impl MediaBackend {
         match self {
             Self::RtpEngine(set) => set.health_check().await,
             Self::SiphonRtp(client) => client.health_check().await,
+            Self::RtpProxy(client) => client.health_check().await,
         }
     }
 
@@ -264,6 +312,7 @@ impl MediaBackend {
         match self {
             Self::RtpEngine(set) => set.active_sessions(),
             Self::SiphonRtp(client) => client.active_sessions(),
+            Self::RtpProxy(client) => client.active_sessions(),
         }
     }
 
@@ -272,6 +321,7 @@ impl MediaBackend {
         match self {
             Self::RtpEngine(set) => set.instance_count(),
             Self::SiphonRtp(client) => client.instance_count(),
+            Self::RtpProxy(client) => client.instance_count(),
         }
     }
 
@@ -280,6 +330,7 @@ impl MediaBackend {
         match self {
             Self::RtpEngine(set) => set.instance_addresses(),
             Self::SiphonRtp(client) => client.instance_addresses(),
+            Self::RtpProxy(client) => client.instance_addresses(),
         }
     }
 }

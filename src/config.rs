@@ -1526,6 +1526,8 @@ pub enum MediaBackendKind {
     Rtpengine,
     /// Native `siphon-rtp` control protocol (JSON over TCP).
     SiphonRtp,
+    /// Classic `rtpproxy` control protocol (text over UDP).
+    Rtpproxy,
 }
 
 /// Media proxy configuration.
@@ -1543,6 +1545,9 @@ pub struct MediaConfig {
     /// Native `siphon-rtp` engine connection. Required when `backend: siphon-rtp`.
     #[serde(default)]
     pub siphon_rtp: Option<SiphonRtpConfig>,
+    /// Classic `rtpproxy` relay connection. Required when `backend: rtpproxy`.
+    #[serde(default)]
+    pub rtpproxy: Option<RtpProxyConfig>,
     /// Custom media profiles (name → offer/answer NG flags).
     /// Built-in profiles (srtp_to_rtp, ws_to_rtp, wss_to_rtp, rtp_passthrough)
     /// are always available; custom entries here extend or override them.
@@ -1642,6 +1647,82 @@ pub struct SiphonRtpInstanceConfig {
     /// Weight for load-balancing (higher = more traffic). Default: 1.
     #[serde(default = "default_rtpengine_weight")]
     pub weight: u32,
+}
+
+/// Connection to a classic `rtpproxy` media relay (text-over-UDP control).
+///
+/// Accepts a single relay (`address`) or several (`instances`) for HA /
+/// load-balancing, mirroring `media.rtpengine`. Per-call-id affinity keeps all
+/// of a call's commands on one relay (the allocated ports live on one instance).
+///
+/// rtpproxy only allocates relay ports and returns them; siphon rewrites the SDP
+/// itself. The rtpengine-only verbs (announcements, DTMF injection, gating,
+/// SIPREC/MPTY) are not available on this backend. The rtpengine `media.events`
+/// listener is also unused — rtpproxy pushes no async events.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RtpProxyConfig {
+    /// Single control endpoint, e.g. ``"127.0.0.1:22222"``
+    /// (`rtpproxy -s udp:<addr>`). Shorthand for one instance; ignored when
+    /// `instances` is non-empty.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Multiple control endpoints for HA / weighted load-balancing. Takes
+    /// precedence over `address` when present.
+    #[serde(default)]
+    pub instances: Vec<RtpProxyInstanceConfig>,
+    /// Default per-command response budget in milliseconds, split across
+    /// retransmits (per-instance `timeout_ms` overrides it). Default: 1000.
+    #[serde(default = "default_rtpproxy_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Retransmits after the first send before giving up. rtpproxy de-duplicates
+    /// by cookie, so retransmitting the same command is safe and is the standard
+    /// way to ride out UDP loss. Default: 2 (i.e. up to 3 sends).
+    #[serde(default = "default_rtpproxy_retries")]
+    pub retries: u32,
+}
+
+impl RtpProxyConfig {
+    /// Normalized `(address, timeout_ms, weight)` tuples — from `instances` when
+    /// present, else the single `address`. Empty when neither is configured.
+    pub fn instances(&self) -> Vec<(String, u64, u32)> {
+        if !self.instances.is_empty() {
+            self.instances
+                .iter()
+                .map(|instance| {
+                    (
+                        instance.address.clone(),
+                        instance.timeout_ms.unwrap_or(self.timeout_ms),
+                        instance.weight,
+                    )
+                })
+                .collect()
+        } else if let Some(address) = &self.address {
+            vec![(address.clone(), self.timeout_ms, 1)]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+/// One `rtpproxy` control endpoint in a multi-instance set.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RtpProxyInstanceConfig {
+    /// Control endpoint, e.g. ``"10.0.0.1:22222"``.
+    pub address: String,
+    /// Response timeout in ms; falls back to the parent `timeout_ms` when unset.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Weight for load-balancing (higher = more traffic). Default: 1.
+    #[serde(default = "default_rtpengine_weight")]
+    pub weight: u32,
+}
+
+fn default_rtpproxy_timeout_ms() -> u64 {
+    1000
+}
+
+fn default_rtpproxy_retries() -> u32 {
+    2
 }
 
 fn default_siphon_rtp_timeout_ms() -> u64 {
@@ -3626,6 +3707,71 @@ media:
         // First inherits the parent timeout; second overrides it.
         assert_eq!(instances[0], ("10.0.0.1:8080".to_string(), 1500, 2));
         assert_eq!(instances[1], ("10.0.0.2:8080".to_string(), 3000, 1));
+    }
+
+    #[test]
+    fn parses_media_backend_rtpproxy() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+media:
+  backend: rtpproxy
+  rtpproxy:
+    address: "127.0.0.1:22222"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let media = config.media.unwrap();
+        assert_eq!(media.backend, MediaBackendKind::Rtpproxy);
+        assert!(media.rtpengine.is_none());
+        assert!(media.siphon_rtp.is_none());
+        let rtpproxy = media.rtpproxy.expect("rtpproxy block configured");
+        assert_eq!(rtpproxy.address.as_deref(), Some("127.0.0.1:22222"));
+        assert_eq!(rtpproxy.timeout_ms, 1000); // default
+        assert_eq!(rtpproxy.retries, 2); // default
+        let instances = rtpproxy.instances();
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0], ("127.0.0.1:22222".to_string(), 1000, 1));
+    }
+
+    #[test]
+    fn parses_media_rtpproxy_multiple_instances() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+media:
+  backend: rtpproxy
+  rtpproxy:
+    timeout_ms: 1500
+    retries: 3
+    instances:
+      - address: "10.0.0.1:22222"
+        weight: 2
+      - address: "10.0.0.2:22222"
+        weight: 1
+        timeout_ms: 3000
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let media = config.media.unwrap();
+        assert_eq!(media.backend, MediaBackendKind::Rtpproxy);
+        let rtpproxy = media.rtpproxy.expect("rtpproxy block configured");
+        assert_eq!(rtpproxy.retries, 3);
+        let instances = rtpproxy.instances();
+        assert_eq!(instances.len(), 2);
+        // First inherits the parent timeout; second overrides it.
+        assert_eq!(instances[0], ("10.0.0.1:22222".to_string(), 1500, 2));
+        assert_eq!(instances[1], ("10.0.0.2:22222".to_string(), 3000, 1));
     }
 
     #[test]

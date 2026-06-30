@@ -136,6 +136,8 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | RTPEngine load balancing | Implemented | `media.rtpengine.instances[]` | Weighted distribution |
 | Native siphon-rtp backend (JSON/TCP) | **Experimental** | `media.backend: siphon-rtp` + `media.siphon_rtp` | Persistent TCP control, auth handshake, reconnect, server-pushed DTMF/media-timeout events; same `rtpengine` API/profiles. The siphon-rtp engine is pre-release — use rtpengine in production. SIPREC/MPTY not yet supported on this engine. |
 | Native siphon-rtp load balancing | **Experimental** | `media.siphon_rtp.instances[]` | Weighted round-robin + per-call-id connection affinity; per-instance health probes (parity with rtpengine) |
+| Classic rtpproxy backend (text/UDP) | Implemented | `media.backend: rtpproxy` + `media.rtpproxy` | Classic `U`/`L`/`D`/`V` protocol with cookie correlation + idempotent retransmits; siphon-side SDP rewrite (multi-stream, held media); same `rtpengine` API/profiles. For migrating OpenSIPS/Kamailio/Sippy + rtpproxy. No prompts/DTMF/gating/SIPREC on this engine. Validate end-to-end against a live rtpproxy. |
+| Classic rtpproxy load balancing | Implemented | `media.rtpproxy.instances[]` | Weighted round-robin + per-call-id affinity; per-instance health probes (`V`) |
 | Built-in profile: SRTP↔RTP | Implemented | `srtp_to_rtp` | SRTP UE ↔ RTP core |
 | Built-in profile: WS↔RTP | Implemented | `ws_to_rtp` | WebSocket UE ↔ RTP core |
 | Built-in profile: WSS↔RTP | Implemented | `wss_to_rtp` | DTLS-SRTP/AVPF + ICE ↔ RTP |

@@ -1,0 +1,46 @@
+# siphon config for proxy + classic rtpproxy functional test
+#
+# Used with: sipp/docker-compose.yaml (rtpproxy profile)
+# Script:    examples/proxy_rtpproxy.py
+#
+# Same proxy script shape as the rtpengine test — only `media.backend` and the
+# profile name differ — demonstrating the scripting API is backend-agnostic.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+advertised_address: "172.20.0.45"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.45"
+    - "127.0.0.1"
+
+script:
+  path: "examples/proxy_rtpproxy.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+media:
+  backend: rtpproxy
+  rtpproxy:
+    address: "172.20.0.44:22222"
+    timeout_ms: 2000
+    retries: 2
+
+log:
+  level: debug
+  format: pretty
