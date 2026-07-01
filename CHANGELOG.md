@@ -19,7 +19,9 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `siphon-bin` (e.g. `cargo build -p siphon-bin --release --features smpp`, or
   the `siphon-bin/Dockerfile` image). Documented under **Extensions** in the
   docs site. The `ext/` layer is structured so further modules (HTTP, …) plug in
-  behind their own features.
+  behind their own features. The SMPP module is pinned to **siphon-smpp v1.2.0**,
+  which adds a per-ESME-session inbound ingress rate cap (`server.max_msg_per_sec`
+  with a `pace` / `reject` over-rate action).
 - **`siphon::install_allocator!()` — one-line jemalloc + page-decay setup.** A
   `#[global_allocator]` and jemalloc's `_rjem_malloc_conf` config symbol only
   take effect in the final binary crate (the language honors `#[global_allocator]`
