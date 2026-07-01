@@ -6,12 +6,12 @@
 //! `extensions.<name>` block, a loud warning is emitted and the module is
 //! skipped — the same contract as siphon's `sctp` feature.
 //!
-//! ## Adding a module (e.g. when `siphon-http` lands)
+//! ## Adding a module (the `smpp` / `http` modules are the templates)
 //!
 //! 1. Add the optional dep + feature to `Cargo.toml`
-//!    (`http = ["dep:siphon-http"]`).
-//! 2. Add `src/ext/http.rs` (a near-copy of [`smpp`]).
-//! 3. Wire three lines below: the `register_http` call inside [`register_all`],
+//!    (e.g. `foo = ["dep:siphon-foo"]`).
+//! 2. Add `src/ext/foo.rs` (a near-copy of [`smpp`] / [`http`]).
+//! 3. Wire three lines below: the `register_foo` call inside [`register_all`],
 //!    plus the feature-on `pub use` and the feature-off shim.
 
 use siphon::config::Config;
@@ -22,7 +22,7 @@ use siphon::SiphonServer;
 /// module's feature-off shim below).
 pub fn register_all(mut builder: SiphonServer, config: &Config) -> SiphonServer {
     builder = register_smpp(builder, config);
-    // builder = register_http(builder, config);   // ← add when siphon-http lands
+    builder = register_http(builder, config);
     builder
 }
 
@@ -34,6 +34,17 @@ pub use smpp::register as register_smpp;
 #[cfg(not(feature = "smpp"))]
 pub fn register_smpp(builder: SiphonServer, config: &Config) -> SiphonServer {
     warn_unwired(config, "smpp", "smpp");
+    builder
+}
+
+#[cfg(feature = "http")]
+mod http;
+#[cfg(feature = "http")]
+pub use http::register as register_http;
+
+#[cfg(not(feature = "http"))]
+pub fn register_http(builder: SiphonServer, config: &Config) -> SiphonServer {
+    warn_unwired(config, "http", "http");
     builder
 }
 

@@ -7,6 +7,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **HTTP extension wired into `siphon-bin` (`--features http`).** The second
+  opt-in extension module alongside SMPP: when `extensions.http` in `siphon.yaml`
+  points at an `http.yaml`, `siphon-bin` registers the scriptable `http`
+  namespace and the HTTP runtime, so scripts can serve inbound HTTP
+  (`@http.route`, `@http.middleware`, `@http.on_startup`) and make outbound calls
+  (`http.Client`) from the same asyncio loop they use for SIP. `http.Client` is a
+  **pooled, Rust-backed (reqwest) client whose calls run entirely on siphon's
+  Tokio runtime and yield the asyncio driver loop while in flight** — so a script
+  that only needs outbound HTTP on the hot path (a REST lookup per INVITE, a
+  provisioning callback) should enable this feature and use `http.Client` rather
+  than a synchronous Python client that blocks its driver loop for the whole
+  round-trip. A new `full` aggregate feature (`--features full`) enables every
+  extension module at once. The HTTP module is pinned to **siphon-http v1.0.0**;
+  with the feature off, an `extensions.http` block still parses and is skipped
+  with a loud warning (same contract as SMPP and the `sctp` feature). Documented
+  under **Extensions** in the docs site.
 - **Opt-in extension binary (`siphon-bin`)** — a new standalone package that
   builds a drop-in `siphon` binary composing optional extension modules behind
   cargo features (all off by default). The first module is **SMPP 3.4**

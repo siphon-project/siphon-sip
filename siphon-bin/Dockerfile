@@ -1,16 +1,19 @@
-# SIPhon container image WITH opt-in extension modules (SMPP).
+# SIPhon container image WITH opt-in extension modules (SMPP, HTTP).
 #
 # This builds the `siphon-bin` package — a drop-in `siphon` binary that composes
-# optional extension crates behind cargo features — with `--features smpp`. It is
-# SEPARATE from the root Dockerfile (which builds the plain siphon-sip binary):
-# siphon-bin git-deps the published siphon-sip lib + siphon-smpp, so the build
-# context is just this package directory (no root tree needed).
+# optional extension crates behind cargo features — with `--features smpp` by
+# default. It is SEPARATE from the root Dockerfile (which builds the plain
+# siphon-sip binary): siphon-bin git-deps the published siphon-sip lib + the
+# extension crates, so the build context is just this package directory (no root
+# tree needed).
 #
 # Build (context = this directory):
 #   docker build -f siphon-bin/Dockerfile -t siphon-smpp siphon-bin/
 #
-# Override the enabled modules with the FEATURES build-arg, e.g.
-#   docker build -f siphon-bin/Dockerfile --build-arg FEATURES=smpp -t siphon-smpp siphon-bin/
+# Override the enabled modules with the FEATURES build-arg, e.g. HTTP only, or
+# every module at once via the `full` aggregate:
+#   docker build -f siphon-bin/Dockerfile --build-arg FEATURES=http -t siphon-http siphon-bin/
+#   docker build -f siphon-bin/Dockerfile --build-arg FEATURES=full -t siphon-ext  siphon-bin/
 #
 # The image bakes NO default script/config (the SMPP handler lives in your
 # script, e.g. siphon-smpp's examples/echo.py). Mount siphon.yaml + smpp.yaml +

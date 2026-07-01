@@ -25,8 +25,8 @@ default = []
 # disabled, an `extensions.<name>` block in siphon.yaml still parses and is
 # skipped with a loud warning (mirrors the siphon `sctp` feature contract).
 smpp = ["dep:siphon-smpp"] # SMPP 3.4 — inbound/outbound binds, scriptable `smpp` namespace
-# http = ["dep:siphon-http"]   # ← drop-in slot: uncomment when siphon-http lands
-# full = ["smpp"]              # convenience aggregate: grows to ["smpp", "http", …]
+http = ["dep:siphon-http"] # HTTP/HTTPS — inbound routes + Rust-backed `http.Client`, scriptable `http` namespace
+full = ["smpp", "http"]    # convenience aggregate: every extension module
 
 [dependencies]
 # Single-source rule: every crate here that depends on siphon-sip MUST use a
@@ -39,7 +39,7 @@ smpp = ["dep:siphon-smpp"] # SMPP 3.4 — inbound/outbound binds, scriptable `sm
 # are pinned to their released tags for stable, intentional bumps.
 siphon-sip = { git = "https://github.com/siphon-project/siphon-sip", branch = "main" }
 siphon-smpp = { git = "https://github.com/siphon-project/siphon-smpp", tag = "v1.2.0", optional = true }
-# siphon-http = { git = "https://github.com/siphon-project/siphon-http", tag = "vX.Y.Z", optional = true }
+siphon-http = { git = "https://github.com/siphon-project/siphon-http", tag = "v1.0.0", optional = true }
 
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
