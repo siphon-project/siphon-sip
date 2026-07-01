@@ -2985,8 +2985,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-http"
-version = "1.0.0"
-source = "git+https://github.com/siphon-project/siphon-http?tag=v1.0.0#569ac5a3f9913ab67a5752c1aa05902d12c7bab1"
+version = "1.0.1"
+source = "git+https://github.com/siphon-project/siphon-http?tag=v1.0.1#9f5e03a7045ddf4b15b942866e191738ccb3b011"
 dependencies = [
  "async-trait",
  "axum",
@@ -3015,7 +3015,7 @@ dependencies = [
 [[package]]
 name = "siphon-sip"
 version = "1.0.0"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#15c69aa3342ee6267cd8fbfb31addce53d3a362d"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#0746fa7d21d4dc967f697845b3b7570ad6d3abd2"
 dependencies = [
  "aes",
  "arc-swap",
@@ -3071,8 +3071,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-smpp"
-version = "1.2.0"
-source = "git+https://github.com/siphon-project/siphon-smpp?tag=v1.2.0#7321095008f8e9a197922ab3ba08f5da539e5f72"
+version = "1.2.1"
+source = "git+https://github.com/siphon-project/siphon-smpp?tag=v1.2.1#59eb5d7cf31516308cd004b3700066e9394ebe9d"
 dependencies = [
  "async-trait",
  "pyo3",

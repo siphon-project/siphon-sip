@@ -7,6 +7,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **SDK mocks for the extension namespaces (`smpp`, `http`).** The `siphon-sip`
+  Python SDK now mocks the namespaces injected by the opt-in extensions, so
+  `from siphon import smpp` / `from siphon import http` resolve under pytest and
+  carry full type hints + docstrings for script authoring. Two new harnesses —
+  `siphon_sdk.smpp_testing.SmppTestHarness` and
+  `siphon_sdk.http_testing.HttpTestHarness` — dispatch mock binds / PDUs and
+  HTTP requests into a script's handlers and capture the results, mirroring
+  `SipTestHarness`. This lets SMPP/HTTP scripts be unit-tested with a single
+  `pip install siphon-sip`, no running SMSC or listener required. The mocks
+  track the extension runtimes (siphon-smpp, siphon-http), which each ship a CI
+  check that fails if their namespace surface drifts from these mocks. The docs
+  **Extensions** page and nav now link the per-extension documentation sites.
 - **HTTP extension wired into `siphon-bin` (`--features http`).** The second
   opt-in extension module alongside SMPP: when `extensions.http` in `siphon.yaml`
   points at an `http.yaml`, `siphon-bin` registers the scriptable `http`
@@ -19,7 +31,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   provisioning callback) should enable this feature and use `http.Client` rather
   than a synchronous Python client that blocks its driver loop for the whole
   round-trip. A new `full` aggregate feature (`--features full`) enables every
-  extension module at once. The HTTP module is pinned to **siphon-http v1.0.0**;
+  extension module at once. The HTTP module is pinned to **siphon-http v1.0.1**;
   with the feature off, an `extensions.http` block still parses and is skipped
   with a loud warning (same contract as SMPP and the `sctp` feature). Documented
   under **Extensions** in the docs site.
@@ -35,7 +47,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `siphon-bin` (e.g. `cargo build -p siphon-bin --release --features smpp`, or
   the `siphon-bin/Dockerfile` image). Documented under **Extensions** in the
   docs site. The `ext/` layer is structured so further modules (HTTP, …) plug in
-  behind their own features. The SMPP module is pinned to **siphon-smpp v1.2.0**,
+  behind their own features. The SMPP module is pinned to **siphon-smpp v1.2.1**,
   which adds a per-ESME-session inbound ingress rate cap (`server.max_msg_per_sec`
   with a `pace` / `reject` over-rate action).
 - **`siphon::install_allocator!()` — one-line jemalloc + page-decay setup.** A
