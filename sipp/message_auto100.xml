@@ -2,19 +2,27 @@
 <!DOCTYPE scenario SYSTEM "sipp.dtd">
 
 <!--
-  MESSAGE UAC that expects siphon's NIST auto-100 Trying timer to fire.
+  MESSAGE UAC that expects siphon's non-INVITE auto-100 Trying timer to fire.
 
-  Sends a MESSAGE and asserts the proxy emits 100 Trying *before* the
-  upstream UAS's final 200 OK. Pairs with message_auto100_uas.xml which
-  delays its 200 OK by 500 ms; the proxy's auto-100 timer (200 ms) must
-  produce the provisional so retrans="500" never fires on the UAC.
+  Asserts the proxy emits 100 Trying *before* the upstream (slow) UAS's final
+  200 OK. Pairs with message_auto100_uas.xml, which self-registers and then
+  delays its 200 OK to 4.5s.
 
-  retrans="500" is left in place so a missing 100 Trying surfaces as a
-  retransmit count > 0 in sipp's stats — a regression signal.
+  Per RFC 4320 §4.2 the proxy delays a non-INVITE 100 over UDP until the UAC's
+  Timer E is reset to T2 (~3.5s with default T1=500ms/T2=4s). So the MESSAGE
+  legitimately retransmits (retrans="500") a few times before the ~3.5s
+  auto-100 — expected RFC 4320 behaviour, not a regression. The assertion is
+  the ORDERING: the 100 arrives before the 200.
 
-  Run: sipp -sf message_auto100.xml -s user <proxy>:<port>
+  An initial pause lets the UAS finish self-registering before the MESSAGE is
+  sent, so the proxy has a binding to relay to.
+
+  Run: sipp -sf message_auto100.xml -s alice <proxy>:<port>
 -->
 <scenario name="MESSAGE (auto-100 Trying)">
+
+  <!-- Let the self-registering UAS install its binding first. -->
+  <pause milliseconds="3000" />
 
   <send retrans="500">
     <![CDATA[

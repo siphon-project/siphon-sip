@@ -279,8 +279,10 @@ services:
   # The proxy's NIST auto-100 timer (default 200 ms) must fire and produce a
   # 100 Trying upstream; the UAC's scenario requires the 100 before the 200.
 
-  # Register alice with Contact pointing to 172.20.0.36:5060 (slow UAS)
-  sipp-message-auto100-register:
+  # Slow MESSAGE UAS at 172.20.0.36:5060 — self-registers (Contact = its own
+  # address, so the proxy's MT routing lands back here), then pauses past the
+  # ~3.5s RFC 4320 §4.2 auto-100 point before the 200 OK.
+  sipp-message-auto100-uas:
     image: ctaloi/sipp:latest
     depends_on:
       siphon:
@@ -289,46 +291,18 @@ services:
       - .:/sipp/scenarios:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.38
-    entrypoint:
-      - sipp
-      - "172.20.0.10:5060"
-      - -sf
-      - /sipp/scenarios/register_alice_contact.xml
-      - -inf
-      - /sipp/scenarios/message_auto100_contact.csv
-      - -s
-      - alice
-      - -ap
-      - secret
-      - -m
-      - "1"
-      - -timeout
-      - "10"
-    profiles:
-      - auto100
-
-  # Slow MESSAGE UAS at 172.20.0.36:5060 — pauses 500 ms before 200 OK
-  sipp-message-auto100-uas:
-    image: ctaloi/sipp:latest
-    depends_on:
-      sipp-message-auto100-register:
-        condition: service_completed_successfully
-    volumes:
-      - .:/sipp/scenarios:ro
-    networks:
-      sipnet:
         ipv4_address: 172.20.0.36
+    # Register self (from this container's own IP, so the proxy records THIS
+    # address for MT routing), then run the pure server scenario.
     entrypoint:
-      - sipp
-      - -sf
-      - /sipp/scenarios/message_auto100_uas.xml
-      - -p
-      - "5060"
-      - -m
-      - "1"
-      - -timeout
-      - "30"
+      - sh
+      - -c
+      - >-
+        sipp 172.20.0.10:5060
+        -sf /sipp/scenarios/register_alice_contact.xml
+        -inf /sipp/scenarios/message_auto100_contact.csv
+        -s alice -ap secret -m 1 -timeout 10
+        && sipp -sf /sipp/scenarios/message_auto100_uas.xml -p 5060 -m 1 -timeout 30
     profiles:
       - auto100
 
