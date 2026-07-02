@@ -53,6 +53,7 @@ nav:
       - Transports & networking: transports.md
       - Scaling, clustering & redundancy: scaling-and-redundancy.md
       - Deployment & operations: deployment.md
+      - Supply chain & SBOM: supply-chain.md
       - Migrating from Kamailio / OpenSIPS: migrating-from-kamailio-opensips.md
   - Extensions:
       - Overview: extensions.md

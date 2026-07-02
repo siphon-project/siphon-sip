@@ -7,6 +7,14 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **Supply-chain documentation + `SECURITY.md`.** A new **Supply chain & SBOM**
+  docs page documents the per-release SBOM (SPDX 2.3 + CycloneDX 1.4, attached to
+  each GitHub Release), how to consume it with Grype / Trivy / Dependency-Track,
+  how to reproduce it with `cargo sbom`, and the scheduled `cargo-deny` advisory /
+  license / source audit. A root `SECURITY.md` adds a private vulnerability-
+  reporting policy (GitHub private reporting, coordinated disclosure) — previously
+  absent. No behavioural change; documents supply-chain artifacts that already
+  ship at release.
 - **SDK mocks for the extension namespaces (`smpp`, `http`).** The `siphon-sip`
   Python SDK now mocks the namespaces injected by the opt-in extensions, so
   `from siphon import smpp` / `from siphon import http` resolve under pytest and
