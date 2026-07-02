@@ -13,6 +13,22 @@ use dashmap::DashMap;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use regex::Regex;
+
+/// quick-xml 0.41 (RUSTSEC-2026-0194/0195 fix) removed `BytesText::unescape()`;
+/// restore its "decode encoding + resolve XML entities" behaviour.
+trait BytesTextExt {
+    fn unescape(&self) -> Result<std::borrow::Cow<'_, str>, String>;
+}
+impl BytesTextExt for quick_xml::events::BytesText<'_> {
+    fn unescape(&self) -> Result<std::borrow::Cow<'_, str>, String> {
+        let decoded = self.decode().map_err(|error| error.to_string())?;
+        Ok(std::borrow::Cow::Owned(
+            quick_xml::escape::unescape(&decoded)
+                .map_err(|error| error.to_string())?
+                .into_owned(),
+        ))
+    }
+}
 use tokio::sync::mpsc;
 use tracing::warn;
 

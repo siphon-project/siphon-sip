@@ -131,7 +131,7 @@ tower = { version = "0.5.3", features = ["util"] }
 rasn = "0.22"
 rasn-derive = "0.22"
 chrono = { version = "0.4", default-features = false }
-quick-xml = { version = "0.37", features = ["serialize"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
 
 # iFC evaluation engine — regex for SPT header content matching
 regex = "1"

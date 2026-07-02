@@ -6,6 +6,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.1.1] — 2026-07-02
+
+### Security
+- **Bump `quick-xml` 0.37 → 0.41** to address RUSTSEC-2026-0194 (quadratic
+  runtime when checking a start tag for duplicate attribute names) and
+  RUSTSEC-2026-0195 (unbounded namespace-declaration allocation in `NsReader`,
+  a memory-exhaustion DoS). siphon parses XML on the presence (PIDF/reginfo),
+  iFC, SIPREC-metadata, and Sh paths — some of it from remote peers — so the
+  parser hardening matters. No API or behavioural change (the reginfo / iFC /
+  SIPREC parsers keep identical decode + entity-unescape semantics).
+
 ## [1.1.0] — 2026-07-02
 
 ### Added
