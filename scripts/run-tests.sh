@@ -110,8 +110,7 @@ fi
 
 # ── Step 6b: NIST auto-100 Trying + UAS To-tag tests (optional) ─────────────
 if [[ "$RUN_AUTO100" == true ]]; then
-  echo "=== SIPp NIST auto-100 test (slow MESSAGE UAS forces proxy auto-100) ==="
-  run_sipp docker compose -f "$COMPOSE_FILE" --profile auto100 run --rm sipp-message-auto100-register
+  echo "=== SIPp NIST auto-100 test (self-registering slow MESSAGE UAS forces proxy auto-100) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile auto100 up --abort-on-container-exit sipp-message-auto100-uas sipp-message-auto100-uac
 
   echo "=== SIPp UAS To-tag test (script-built 404 must carry tag=) ==="
