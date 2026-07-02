@@ -6,6 +6,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-07-02
+
 ### Added
 - **SDK mocks for the extension namespaces (`smpp`, `http`).** The `siphon-sip`
   Python SDK now mocks the namespaces injected by the opt-in extensions, so
