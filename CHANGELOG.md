@@ -6,6 +6,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-07-02
+
 ### Added
 - **Supply-chain documentation + `SECURITY.md`.** A new **Supply chain & SBOM**
   docs page documents the per-release SBOM (SPDX 2.3 + CycloneDX 1.4, attached to
