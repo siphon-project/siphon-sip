@@ -7,7 +7,8 @@
 //! the media-anchoring path. The benched dict is a representative `offer`
 //! carrying an SDP body (the realistic large value in these messages).
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
 use siphon::rtpengine::bencode::{decode_full_dict, encode, BencodeValue};
 
 const OFFER_SDP: &str = concat!(

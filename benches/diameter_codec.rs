@@ -9,7 +9,8 @@
 //! representative Cx Multimedia-Auth-Request (MAR). Fixtures use only the 3GPP
 //! test realm (`ims.example.com`), never real identities.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
 use siphon::diameter::codec::{
     decode_diameter, encode_avp_grouped_3gpp, encode_avp_octet_3gpp, encode_avp_u32,
     encode_avp_u32_3gpp, encode_avp_utf8, encode_avp_utf8_3gpp, encode_diameter_message,
