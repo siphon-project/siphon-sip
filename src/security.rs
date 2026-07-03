@@ -141,6 +141,9 @@ pub struct AutoBanStore {
     /// these unambiguous signals faster than a bare scanning probe (weight 1)
     /// while reusing the single per-IP window. Always ≥ 1.
     strong_weight: u32,
+    /// Optional kernel-firewall handle. When wired, every new ban is also
+    /// pushed to the nf_tables set so the source is dropped pre-userspace.
+    firewall: OnceLock<crate::firewall::KernelFirewall>,
 }
 
 impl AutoBanStore {
@@ -166,7 +169,14 @@ impl AutoBanStore {
             window: Duration::from_secs(u64::from(window_secs.max(1))),
             ban_duration: Duration::from_secs(u64::from(ban_duration_secs.max(1))),
             strong_weight: strong_weight.max(1),
+            firewall: OnceLock::new(),
         }
+    }
+
+    /// Attach a kernel-firewall handle so new bans are also programmed into the
+    /// nf_tables set. Called once at startup; a second call is a no-op.
+    pub fn set_firewall(&self, firewall: crate::firewall::KernelFirewall) {
+        let _ = self.firewall.set(firewall);
     }
 
     fn is_trusted(&self, source: IpAddr) -> bool {
@@ -223,6 +233,14 @@ impl AutoBanStore {
         if newly_banned {
             self.failures.remove(&source);
             self.bans.insert(source, now + self.ban_duration);
+            // Mirror the ban into the kernel firewall (nf_tables) if wired, so
+            // the source is dropped before it reaches siphon's socket. The
+            // kernel element carries the same TTL as the in-memory ban, so both
+            // expire in lockstep. Non-blocking (drops silently if the actor
+            // queue is full — the userspace ACL still enforces the ban).
+            if let Some(firewall) = self.firewall.get() {
+                firewall.ban(source, self.ban_duration);
+            }
         }
         newly_banned
     }
@@ -651,6 +669,7 @@ mod tests {
             trusted_cidrs: trusted_cidrs.into_iter().map(String::from).collect(),
             failed_auth_ban: None,
             apiban: None,
+            firewall: None,
         }
     }
 

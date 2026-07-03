@@ -38,6 +38,9 @@ pub struct ApiBanClient {
     interval: Duration,
     banned: Arc<DashSet<IpAddr>>,
     client: reqwest::Client,
+    /// Optional kernel-firewall handle — fetched IPs are also pushed to the
+    /// nf_tables set (permanently; the blocklist carries no per-IP TTL).
+    firewall: Option<crate::firewall::KernelFirewall>,
 }
 
 impl ApiBanClient {
@@ -53,12 +56,20 @@ impl ApiBanClient {
             interval: Duration::from_secs(config.interval_secs),
             banned: Arc::new(DashSet::new()),
             client,
+            firewall: None,
         })
     }
 
     /// Returns the shared banned IP set for ACL integration.
     pub fn banned(&self) -> Arc<DashSet<IpAddr>> {
         Arc::clone(&self.banned)
+    }
+
+    /// Attach a kernel-firewall handle so fetched IPs are also programmed into
+    /// the nf_tables set, on top of the userspace ACL set.
+    pub fn with_firewall(mut self, firewall: Option<crate::firewall::KernelFirewall>) -> Self {
+        self.firewall = firewall;
+        self
     }
 
     /// Spawn the background polling task. Returns a `JoinHandle` for the poll loop.
@@ -144,6 +155,9 @@ impl ApiBanClient {
                     Ok(ip_address) => {
                         if self.banned.insert(ip_address) {
                             total_added += 1;
+                            if let Some(firewall) = &self.firewall {
+                                firewall.ban_permanent(ip_address);
+                            }
                         }
                     }
                     Err(_) => {

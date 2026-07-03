@@ -6,6 +6,20 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **Kernel firewall (`security.firewall`).** Mirror SIPhon's bans — the
+  confidence-weighted `failed_auth_ban` store and the APIBAN blocklist — into a
+  kernel nf_tables set, so abusive sources are dropped in the kernel before they
+  reach SIPhon's socket instead of only in the userspace ACL. Self-contained:
+  SIPhon programs the set directly over netlink (no `nft` shell-out, no daemon, no
+  new dependencies), and the kernel auto-expires each ban via a per-element timeout
+  matching the in-memory TTL. Opt-in, Linux-only, needs `CAP_NET_ADMIN`; falls back
+  to the userspace ACL with a warning when it's missing. SIPhon owns the sets; you
+  add one drop rule referencing them (self-contained rule management is a follow-up).
+  Also expands the security cookbook with the ban-scoring model and adds a Kernel
+  firewall page covering `CAP_NET_ADMIN` per runtime, container behaviour, and the
+  nftables-vs-XDP tradeoff.
+
 ## [1.1.1] — 2026-07-02
 
 ### Security

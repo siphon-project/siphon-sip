@@ -31,11 +31,36 @@ security:
     interval_secs: 300
 ```
 
-`failed_auth_ban` weights signals by confidence: a wrong-password digest, a forged
-nonce, or non-SIP garbage on a TLS stream counts heavily; a single 401 challenge
-counts as 1; a successful auth resets the counter. Banned IPs are dropped at
-`recv()`, before parsing. Put your load balancers and health checks in
-`trusted_cidrs`.
+### How the scoring works
+
+`failed_auth_ban` is a **confidence-weighted** counter, not a flat fail2ban tally.
+Every abuse signal from a source IP adds to a per-IP score within `window_secs`;
+crossing `threshold` bans the IP for `ban_duration_secs`. Signals are weighted by
+how hard they are to fake:
+
+| Signal | Score |
+|--------|-------|
+| 401/407 challenge with no follow-up success | 1 |
+| INVITE server-transaction timeout (never ACKed) | 1 |
+| Wrong password, or a forged/stale/replayed digest nonce | `strong_signal_weight` (default 3) |
+| Non-SIP bytes on a TCP/TLS stream | `strong_signal_weight` |
+| Failed TLS/WSS/WS handshake | `strong_signal_weight` |
+| Scanner User-Agent (`scanner_block`) | `strong_signal_weight` |
+
+Signals arriving over TCP (handshake, malformed bytes) score high because the source
+IP is validated by the three-way handshake — it can't be spoofed, and a legitimate
+client never trips them. A **successful authentication resets the score to zero**,
+so a subscriber who mistypes a password twice then logs in is never banned, while an
+IP spraying garbage is banned ~3× faster than one just rattling doorknobs.
+
+Bans are enforced at `recv()`/`accept()` — before any SIP parsing — and expire on
+their own. `trusted_cidrs` are exempt from scoring entirely, so put your load
+balancers and health checks there.
+
+!!! tip "Drop bans in the kernel"
+    With [`security.firewall`](../kernel-firewall.md), every ban is also pushed to a
+    kernel nf_tables set, so abusive sources are dropped **before they reach
+    SIPhon** — real defense against volume, not just userspace politeness.
 
 In a script, you can also rate-limit a specific flow:
 

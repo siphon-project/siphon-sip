@@ -1185,6 +1185,33 @@ pub struct SecurityConfig {
     pub failed_auth_ban: Option<FailedAuthBanConfig>,
     /// APIBAN community blocklist integration.
     pub apiban: Option<ApiBanConfig>,
+    /// Kernel firewall: drop banned sources in the kernel via nf_tables so
+    /// abusive traffic never reaches siphon's socket (Linux only, needs
+    /// `CAP_NET_ADMIN`). Falls back to the userspace ACL when unavailable.
+    pub firewall: Option<FirewallConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct FirewallConfig {
+    /// nf_tables table name siphon owns (family `inet`). Default: `siphon`.
+    #[serde(default = "default_firewall_table")]
+    pub table: String,
+    /// Set holding banned IPv4 sources. Default: `banned4`.
+    #[serde(default = "default_firewall_set_v4")]
+    pub set_v4: String,
+    /// Set holding banned IPv6 sources. Default: `banned6`.
+    #[serde(default = "default_firewall_set_v6")]
+    pub set_v6: String,
+}
+
+fn default_firewall_table() -> String {
+    "siphon".to_string()
+}
+fn default_firewall_set_v4() -> String {
+    "banned4".to_string()
+}
+fn default_firewall_set_v6() -> String {
+    "banned6".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
