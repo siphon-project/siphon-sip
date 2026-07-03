@@ -112,7 +112,7 @@ sha2 = "0.10"
 uuid = { version = "1.22", features = ["v4", "fast-rng"] }
 # Cryptographic randomness — used by Milenage AKA RAND generation
 # (3GPP TS 35.206) and any other place that needs unpredictable bytes.
-getrandom = "0.3"
+getrandom = "0.4"
 ipnet = "2"
 notify = "8"
 thiserror = "2"
