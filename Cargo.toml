@@ -163,7 +163,7 @@ rcgen = "0.14"
 # Per-message hot-path microbenchmarks (benches/sip_hot_path.rs). The
 # release-cut gate (scripts/cut-release.sh) runs these via `critcmp` against a
 # committed baseline; CI only proves they compile (`cargo bench --no-run`).
-criterion = "0.5"
+criterion = "0.8"
 
 # Criterion perf gates for the per-message / per-call hot paths. `harness =
 # false` hands `main` to criterion instead of the libtest harness. The
