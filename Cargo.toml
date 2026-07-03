@@ -74,7 +74,7 @@ tokio-rustls = "0.26"
 # feature in the 1.x line we resolve here.
 rustls-pki-types = { version = "1", features = ["std"] }
 webpki-roots = "1"
-tokio-tungstenite = "0.28"
+tokio-tungstenite = "0.29"
 futures-util = "0.3"
 # SIP-over-SCTP (RFC 4168) + Diameter-over-SCTP transport. Optional because it
 # links the `libsctp` system library (libsctp-dev to build, libsctp1 at runtime)
