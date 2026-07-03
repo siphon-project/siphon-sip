@@ -17,7 +17,8 @@
 //! Fixtures use the 3GPP TS 35.208 Test Set 1 reference vector and the 3GPP
 //! test realm — never real subscriber secrets.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 use siphon::auth::{
     compute_aka_response, compute_digest_response, DigestAlgorithm, DigestChallenge,
     DigestCredentials,

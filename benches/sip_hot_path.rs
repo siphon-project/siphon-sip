@@ -13,9 +13,8 @@
 //! Fixtures use only RFC 5737 documentation addresses (192.0.2.0/24) and generic
 //! example.com hosts — never real IPs or subscriber identities.
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput,
-};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use std::hint::black_box;
 use siphon::sip::parse_sip_message;
 use siphon::transaction::TransactionManager;
 
