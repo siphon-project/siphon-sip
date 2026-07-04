@@ -69,7 +69,14 @@ impl KernelFirewall {
 /// typically a missing `CAP_NET_ADMIN`.
 #[cfg(target_os = "linux")]
 pub async fn start(config: &crate::config::FirewallConfig) -> std::io::Result<KernelFirewall> {
-    nftables::ensure_sets(&config.table, &config.set_v4, &config.set_v6).await?;
+    nftables::ensure_firewall(
+        &config.table,
+        &config.chain,
+        &config.set_v4,
+        &config.set_v6,
+        config.manage_rule,
+    )
+    .await?;
 
     let (sender, mut receiver) = mpsc::channel::<Command>(1024);
     let table = config.table.clone();

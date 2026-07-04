@@ -14,10 +14,12 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   SIPhon programs the set directly over netlink (no `nft` shell-out, no daemon, no
   new dependencies), and the kernel auto-expires each ban via a per-element timeout
   matching the in-memory TTL. Opt-in, Linux-only, needs `CAP_NET_ADMIN`; falls back
-  to the userspace ACL with a warning when it's missing. SIPhon owns the sets; you
-  add one drop rule referencing them (self-contained rule management is a follow-up).
-  Also expands the security cookbook with the ban-scoring model and adds a Kernel
-  firewall page covering `CAP_NET_ADMIN` per runtime, container behaviour, and the
+  to the userspace ACL with a warning when it's missing. Zero-touch by default:
+  SIPhon owns the whole ruleset (table, sets, base chain, and the `saddr @banned
+  drop` rules), so `firewall: {}` is all that's needed; set `manage_rule: false` to
+  have SIPhon maintain only the sets and reference them from your own ruleset. Also
+  expands the security cookbook with the ban-scoring model and adds a Kernel firewall
+  page covering `CAP_NET_ADMIN` per runtime, container behaviour, and the
   nftables-vs-XDP tradeoff.
 
 ## [1.1.1] — 2026-07-02

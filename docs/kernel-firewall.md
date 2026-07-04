@@ -31,15 +31,17 @@ security:
     window_secs: 600
     ban_duration_secs: 3600
 
-  firewall:
-    table: "siphon"           # nf_tables table SIPhon owns (family inet)
-    set_v4: "banned4"         # IPv4 ban set
-    set_v6: "banned6"         # IPv6 ban set
+  firewall: {}                # that's it — every field below defaults
+    # table:  "siphon"        # nf_tables table SIPhon owns (family inet)
+    # chain:  "input"         # base chain SIPhon adds the drop rules to
+    # set_v4: "banned4"       # IPv4 ban set
+    # set_v6: "banned6"       # IPv6 ban set
+    # manage_rule: true       # SIPhon owns the chain + drop rules too (see below)
 ```
 
-All three names default to the values shown, so `firewall: {}` is enough. On
-startup SIPhon creates the `inet siphon` table and the two timeout sets
-(idempotent — safe across restarts).
+`firewall: {}` is enough. On startup SIPhon creates the `inet siphon` table, the
+two timeout sets, a base chain, and the drop rules that reference them — all
+idempotent and safe across restarts. Nothing else to configure.
 
 ## Grant `CAP_NET_ADMIN`
 
@@ -68,10 +70,29 @@ ACL — the feature is never fatal, it just doesn't reach the kernel.
         add: ["NET_ADMIN"]
     ```
 
-## Activate the drop rule
+## Zero-touch by default
 
-SIPhon owns and maintains the **sets**; you reference them from one drop rule.
-Add it once (a shipped `.nft` snippet or your existing ruleset works too):
+With `manage_rule: true` (the default) SIPhon owns the whole ruleset — table,
+sets, base chain, and the two drop rules — so enabling `firewall` is all you do.
+On startup it installs, in the `inet siphon` table:
+
+```nft
+chain input {
+    type filter hook input priority filter; policy accept;
+    ip  saddr @banned4 drop
+    ip6 saddr @banned6 drop
+}
+```
+
+Banned sources are dropped in-kernel from the first ban; SIPhon keeps the set
+contents current with per-element timeouts. On restart it leaves the existing
+table in place (so the rules are never duplicated).
+
+### Bring your own rule (`manage_rule: false`)
+
+If you already manage nftables and want to place the drop yourself, set
+`manage_rule: false`. SIPhon then maintains only the **sets**, and you reference
+them from your own ruleset:
 
 ```nft
 table inet siphon {
@@ -86,15 +107,6 @@ table inet siphon {
 ```bash
 nft -f /etc/siphon/firewall.nft
 ```
-
-The sets already exist (SIPhon created them), so this only adds the chain + rules.
-Once loaded, banned sources are dropped in-kernel; SIPhon keeps the set contents
-current.
-
-!!! note "Self-contained rule management is coming"
-    A future release will let SIPhon own the chain + rule too (`manage_rule: true`),
-    so no manual `nft` step is needed. Today SIPhon manages the sets and you wire
-    the one rule.
 
 ## Containers: use nftables, not XDP
 
@@ -132,8 +144,9 @@ nft list ruleset
 - **`kernel firewall (nf_tables) unavailable` in the logs?** SIPhon couldn't
   program the sets — almost always a missing `CAP_NET_ADMIN`. It's running on the
   userspace ACL until you grant it.
-- **Bans not dropping?** The sets are current but you haven't added the drop rule
-  (see above), or the rule references the wrong set names.
+- **Bans not dropping?** Confirm the `chain input` + `@banned4/@banned6 drop` rules
+  are present in `nft list ruleset`. With the default `manage_rule: true` SIPhon
+  installs them; with `manage_rule: false` you add them yourself (see above).
 
 ## See also
 

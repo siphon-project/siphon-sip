@@ -1202,10 +1202,21 @@ pub struct FirewallConfig {
     /// Set holding banned IPv6 sources. Default: `banned6`.
     #[serde(default = "default_firewall_set_v6")]
     pub set_v6: String,
+    /// Base chain siphon adds the drop rules to. Default: `input`.
+    #[serde(default = "default_firewall_chain")]
+    pub chain: String,
+    /// When true (the default), siphon also owns the chain + drop rules, so no
+    /// manual `nft` step is needed — enabling `firewall` is enough. Set false to
+    /// have siphon manage only the sets and reference them from your own ruleset.
+    #[serde(default = "bool_true")]
+    pub manage_rule: bool,
 }
 
 fn default_firewall_table() -> String {
     "siphon".to_string()
+}
+fn default_firewall_chain() -> String {
+    "input".to_string()
 }
 fn default_firewall_set_v4() -> String {
     "banned4".to_string()
