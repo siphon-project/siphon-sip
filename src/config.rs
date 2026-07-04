@@ -101,6 +101,11 @@ pub struct Config {
     /// `None` = disabled.
     pub admin: Option<AdminConfig>,
 
+    /// External remote-control plane (experimental, POC). A WebSocket listener
+    /// that lets an out-of-process application drive B2BUA calls handed over via
+    /// `call.handover("app")`. `None` = disabled (the default).
+    pub control: Option<ControlConfig>,
+
     /// Server and User-Agent header values injected into responses.
     pub server: Option<ServerIdentityConfig>,
 
@@ -1404,6 +1409,56 @@ fn default_metrics_path() -> String {
 pub struct AdminConfig {
     /// Address to expose the admin API on (e.g. "0.0.0.0:9091").
     pub listen: String,
+}
+
+// ---------------------------------------------------------------------------
+// External control plane (experimental, POC)
+// ---------------------------------------------------------------------------
+
+/// Configuration for the experimental external control plane (`control:`).
+///
+/// A single bidirectional WebSocket per application. Out-of-process apps
+/// connect, authenticate with a per-app bearer token, and drive B2BUA calls
+/// that a Python `@b2bua.on_invite` handler explicitly hands over via
+/// `call.handover("app")` (ARI Stasis model).
+///
+/// OFF by default (the whole block is `None` when absent). This POC only binds
+/// on a loopback address with plain WebSocket and bearer-token auth; TLS/mTLS,
+/// ACLs and per-app scopes are follow-ups.
+///
+/// ```yaml
+/// control:
+///   listen: "127.0.0.1:9092"
+///   apps:
+///     - name: "ivr-app"
+///       token: "${IVR_APP_TOKEN}"
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct ControlConfig {
+    /// Address to expose the control WebSocket on (e.g. "127.0.0.1:9092").
+    pub listen: String,
+    /// Applications allowed to connect, each with its own bearer token.
+    #[serde(default)]
+    pub apps: Vec<ControlAppConfig>,
+    /// Per-connection bounded event-queue depth. Full queue drops the oldest
+    /// event (never blocks the publisher). Default: 1024.
+    #[serde(default = "default_control_event_queue_depth")]
+    pub event_queue_depth: usize,
+}
+
+/// A single application registered with the control plane.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ControlAppConfig {
+    /// Application name — must match the `hello` frame's `app` and the
+    /// `call.handover("<name>")` argument.
+    pub name: String,
+    /// Bearer token presented in the WebSocket-upgrade `Authorization` header.
+    /// Supports `${ENV}` expansion via the standard config env substitution.
+    pub token: String,
+}
+
+fn default_control_event_queue_depth() -> usize {
+    1024
 }
 
 // ---------------------------------------------------------------------------
@@ -2793,6 +2848,51 @@ log:
         assert!(config.registrant.is_none());
         assert!(config.lawful_intercept.is_none());
         assert!(config.diameter.is_none());
+        assert!(config.control.is_none());
+    }
+
+    #[test]
+    fn parses_control_config() {
+        let yaml = format!(
+            "{}{}",
+            minimal_yaml(),
+            r#"
+control:
+  listen: "127.0.0.1:9092"
+  event_queue_depth: 256
+  apps:
+    - name: "ivr-app"
+      token: "s3cr3t"
+    - name: "screening-app"
+      token: "another-token"
+"#
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        let control = config.control.expect("control block present");
+        assert_eq!(control.listen, "127.0.0.1:9092");
+        assert_eq!(control.event_queue_depth, 256);
+        assert_eq!(control.apps.len(), 2);
+        assert_eq!(control.apps[0].name, "ivr-app");
+        assert_eq!(control.apps[0].token, "s3cr3t");
+        assert_eq!(control.apps[1].name, "screening-app");
+    }
+
+    #[test]
+    fn control_config_event_queue_depth_defaults() {
+        let yaml = format!(
+            "{}{}",
+            minimal_yaml(),
+            r#"
+control:
+  listen: "127.0.0.1:9092"
+  apps:
+    - name: "ivr-app"
+      token: "s3cr3t"
+"#
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        let control = config.control.expect("control block present");
+        assert_eq!(control.event_queue_depth, 1024);
     }
 
     #[test]

@@ -72,6 +72,13 @@ pub enum CallAction {
         body: Option<Vec<u8>>,
         content_type: Option<String>,
     },
+    /// Hand the call over to an external control application (ARI *Stasis*
+    /// model). The dispatcher keeps the `CallActor` alive un-dialed, sends a
+    /// `180 Ringing` to the A-leg, clears the answer deadline so the orphan
+    /// sweep won't 408 it, registers the call with the control bus, and emits
+    /// a `StasisStart` event to the named application. The out-of-process app
+    /// then drives the call with `answer`/`hangup` verbs.
+    Handover { app: String },
 }
 
 /// Which side initiated a BYE.
@@ -723,6 +730,27 @@ impl PyCall {
         self.action = CallAction::Terminate;
     }
 
+    /// Hand this call over to an external control application (experimental).
+    ///
+    /// The `@b2bua.on_invite` handler stops here: instead of dialling a B-leg,
+    /// siphon keeps the call alive (a `180 Ringing` goes to the caller) and
+    /// offers it to the named application over the control WebSocket. The app
+    /// then drives it with `answer` / `hangup` commands. Calls that are not
+    /// handed over are unaffected.
+    ///
+    /// Usage:
+    ///   @b2bua.on_invite
+    ///   async def route(call):
+    ///       if is_ivr_number(call.to_uri):
+    ///           call.handover("ivr-app")
+    ///       else:
+    ///           call.dial(call.ruri)
+    fn handover(&mut self, app: &str) {
+        self.action = CallAction::Handover {
+            app: app.to_string(),
+        };
+    }
+
     /// Set per-call session timer parameters (overrides global config).
     ///
     /// Usage in Python:
@@ -929,6 +957,19 @@ mod tests {
             &CallAction::Reject {
                 code: 404,
                 reason: "Not Found".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn call_handover_sets_action() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        call.handover("ivr-app");
+        assert_eq!(
+            call.action(),
+            &CallAction::Handover {
+                app: "ivr-app".to_string()
             }
         );
     }

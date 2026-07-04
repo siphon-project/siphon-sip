@@ -199,7 +199,12 @@ class Action:
 
     kind: str
     """Action type: ``"reply"``, ``"relay"``, ``"fork"``, ``"reject"``,
-    ``"dial"``, ``"terminate"``, ``"record_route"``, ``"silent_drop"``."""
+    ``"dial"``, ``"terminate"``, ``"handover"``, ``"record_route"``,
+    ``"silent_drop"``."""
+
+    app: Optional[str] = None
+    """For ``handover`` — the external control application name the call was
+    handed over to (``call.handover("ivr-app")``)."""
 
     status_code: Optional[int] = None
     """For ``reply`` / ``reject`` — the SIP status code (e.g. 200, 404)."""

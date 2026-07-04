@@ -352,6 +352,30 @@ class Call:
         self._state = "terminated"
         self._actions.append(Action(kind="terminate"))
 
+    def handover(self, app: str) -> None:
+        """Hand this call over to an external control application (experimental).
+
+        Instead of dialling a B-leg, siphon keeps the call alive (a ``180
+        Ringing`` goes to the caller) and offers it to the named application
+        over the control WebSocket (the ARI *Stasis* model).  The out-of-process
+        app then drives the call with ``answer`` / ``hangup`` commands.  Calls
+        that are not handed over are unaffected.
+
+        Args:
+            app: The control application name, matching a ``control.apps[].name``
+                entry in ``siphon.yaml`` and the app's ``hello`` handshake.
+
+        Example::
+
+            @b2bua.on_invite
+            async def route(call):
+                if is_ivr_number(call.to_uri):
+                    call.handover("ivr-app")
+                else:
+                    call.dial(call.ruri)
+        """
+        self._actions.append(Action(kind="handover", app=app))
+
     def accept_refer(self) -> None:
         """Accept an incoming REFER and initiate the transfer.
 

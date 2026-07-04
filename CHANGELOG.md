@@ -6,6 +6,21 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **Experimental external control plane (proof-of-concept).** A new optional
+  `control:` config block enables a loopback WebSocket on which an out-of-process
+  application drives B2BUA calls that a `@b2bua.on_invite` handler explicitly
+  hands over with the new `call.handover("app")` API (ARI *Stasis* model — calls
+  that are not handed over are unaffected). The wire protocol is JSON
+  (`command`/`reply`/`event`), auth is a per-app `Authorization: Bearer` token
+  checked before the WebSocket upgrade, and the app drives the call with `answer`
+  and `hangup` verbs. Events (`StasisStart`/`StasisEnd`) are fanned out over a
+  bounded, drop-oldest per-connection queue that can never block the dispatcher
+  or a leg actor. Off by default (no `control:` block = disabled); plain
+  WebSocket only binds on a loopback address. This is a POC of the control plane
+  — TLS/mTLS, channels/bridges, originate, and media control are not included.
+  SDK: `call.handover(app)` mock added.
+
 ## [1.1.1] — 2026-07-02
 
 ### Security

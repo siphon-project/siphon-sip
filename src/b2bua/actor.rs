@@ -629,6 +629,13 @@ pub struct CallActor {
     /// the call is still un-answered. `None` = no application timeout (the 24h
     /// orphan backstop still applies).
     pub answer_deadline: Option<std::time::Instant>,
+    /// When `Some(app)`, this call has been handed over to an external control
+    /// application (experimental control plane). While controlled, the orphan
+    /// sweep leaves the call alone — an out-of-process app owns its lifecycle
+    /// and answers/hangs up over the control WebSocket. This is the POC's
+    /// lightweight stand-in for a full `CallState::Parked` variant (avoids
+    /// auditing every `CallState` match site).
+    pub controlled: Option<String>,
 }
 
 impl CallActor {
@@ -657,6 +664,7 @@ impl CallActor {
             a_leg_supports_100rel: false,
             auth_retry_count: 0,
             answer_deadline: None,
+            controlled: None,
         }
     }
 
@@ -1401,6 +1409,7 @@ impl CallActorStore {
         self.calls.iter()
             .filter(|entry| {
                 matches!(entry.state, CallState::Calling | CallState::Ringing)
+                    && entry.controlled.is_none()
                     && entry.answer_deadline.is_some_and(|deadline| now >= deadline)
             })
             .map(|entry| entry.id.clone())
@@ -2240,6 +2249,26 @@ mod tests {
         // Nothing was removed.
         assert_eq!(store.count(), 4);
         let _ = (waiting, answered, no_deadline);
+    }
+
+    #[test]
+    fn take_timed_out_calls_skips_controlled_calls() {
+        // A call handed over to an external control application must never be
+        // swept by the orphan timeout, even past its deadline — the app owns
+        // its lifecycle. Handover clears the deadline anyway; the `controlled`
+        // guard is the belt-and-suspenders backstop.
+        let store = CallActorStore::new();
+        let now = std::time::Instant::now();
+        let past = now - std::time::Duration::from_secs(1);
+
+        let controlled = store.create_call(make_a_leg());
+        store.set_answer_deadline(&controlled, past);
+        if let Some(mut call) = store.get_call_mut(&controlled) {
+            call.controlled = Some("ivr-app".to_string());
+        }
+
+        assert!(store.take_timed_out_calls(now).is_empty());
+        assert_eq!(store.count(), 1);
     }
 
     // --- LegRegistry tests ---

@@ -5,6 +5,7 @@ pub mod auth;
 pub mod b2bua;
 pub mod cache;
 pub mod config;
+pub mod control;
 pub mod diameter;
 pub mod dialog;
 pub mod dispatcher;

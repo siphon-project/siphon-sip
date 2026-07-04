@@ -1767,6 +1767,55 @@ impl SiphonServer {
             }
         }
 
+        // --- External control plane (experimental, POC) ---
+        // OFF unless a `control:` block is present. Installs the process-global
+        // ControlBus, boots the WebSocket listener, and hands the command
+        // receiver to the dispatcher's sibling consumer.
+        let control_command_rx = if let Some(ref control_config) = config.control {
+            match control_config.listen.parse::<std::net::SocketAddr>() {
+                Ok(listen_addr) => {
+                    // Fail closed: plain-WS control only binds on loopback in
+                    // this build (TLS/mTLS are follow-ups).
+                    if !listen_addr.ip().is_loopback() {
+                        error!(
+                            listen = %control_config.listen,
+                            "control.listen must be a loopback address in this build; control plane not started"
+                        );
+                        None
+                    } else {
+                        let (command_tx, command_rx) = flume::unbounded();
+                        let bus = crate::control::ControlBus::new(
+                            command_tx,
+                            control_config.event_queue_depth,
+                            crate::control::SlowConsumerPolicy::DropOldest,
+                        );
+                        if crate::control::ControlBus::install(Arc::clone(&bus)).is_err() {
+                            error!("control bus already installed; control plane not started");
+                            None
+                        } else {
+                            let control_state = crate::control::ControlServerState {
+                                apps: Arc::new(control_config.apps.clone()),
+                                bus: Arc::clone(&bus),
+                            };
+                            tokio::spawn(crate::control::serve(listen_addr, control_state));
+                            info!(
+                                listen = %control_config.listen,
+                                apps = control_config.apps.len(),
+                                "control plane (experimental) enabled"
+                            );
+                            Some(command_rx)
+                        }
+                    }
+                }
+                Err(error) => {
+                    error!(listen = %control_config.listen, "invalid control.listen address: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let dispatcher_handle = tokio::spawn(dispatcher::run(
             inbound_rx,
             outbound_senders,
@@ -1788,6 +1837,7 @@ impl SiphonServer {
             rtpengine_events_rx,
             rf_charger.clone(),
             Arc::clone(&drain),
+            control_command_rx,
             product_name,
             product_version,
         ));
