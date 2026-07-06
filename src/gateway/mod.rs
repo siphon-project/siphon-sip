@@ -486,6 +486,10 @@ async fn probe_destination(
     } else {
         (host_part.to_string(), current_addr.port())
     };
+    // Keep the configured hostname for TLS SNI — the probe addresses the
+    // resolved IP (`current_addr`), but a hostname-vhost peer routes the TLS
+    // handshake on SNI, so a new outbound TLS connection must present it.
+    let server_name = host.clone();
     let mut request_uri = SipUri::new(host).with_port(port);
     if dest.transport != Transport::Udp {
         request_uri = request_uri.with_param(
@@ -500,6 +504,11 @@ async fn probe_destination(
         request_uri,
         from_user,
         from_domain,
+        if dest.transport == Transport::Tls {
+            Some(server_name.as_str())
+        } else {
+            None
+        },
     );
 
     let result = tokio::time::timeout(Duration::from_secs(5), receiver).await;
