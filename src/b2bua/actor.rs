@@ -598,6 +598,14 @@ pub struct CallActor {
     pub li_record: bool,
     /// When true, copy the A-leg Call-ID to B-leg(s).
     pub preserve_call_id: bool,
+    /// Script-pinned B-leg From URI host (`call.set_from_host()`). When set,
+    /// the B-leg INVITE From host is rewritten to this instead of the B2BUA
+    /// advertised address — opts out of From topology-hiding for multitenant
+    /// edges that key the tenant on the From domain.
+    pub from_host_override: Option<String>,
+    /// Script-pinned B-leg To URI host (`call.set_to_host()`). When set, the
+    /// B-leg INVITE To host is rewritten to this instead of the dial-target host.
+    pub to_host_override: Option<String>,
     /// Pre-built ACK for the winning B-leg, deferred until A-leg ACKs (late ACK pattern).
     /// Contains (ACK message, transport, destination address).
     pub pending_b_leg_ack: Option<(SipMessage, crate::transport::Transport, std::net::SocketAddr)>,
@@ -652,6 +660,8 @@ impl CallActor {
             digest_nc: crate::auth::NonceCounter::new(),
             li_record: false,
             preserve_call_id: false,
+            from_host_override: None,
+            to_host_override: None,
             pending_b_leg_ack: None,
             resolved_header_policy: None,
             a_leg_supports_100rel: false,
