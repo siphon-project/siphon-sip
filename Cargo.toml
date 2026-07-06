@@ -124,7 +124,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 redis = { version = "1", features = ["tokio-comp"], optional = true }
 tokio-postgres = { version = "0.7", optional = true }
 prometheus = { version = "0.14", features = ["process"] }
-axum = { version = "0.8.8", features = ["tokio"] }
+axum = { version = "0.8.8", features = ["tokio", "ws"] }
 tower = { version = "0.5.3", features = ["util"] }
 
 # Lawful Intercept — ETSI ASN.1/BER + XML

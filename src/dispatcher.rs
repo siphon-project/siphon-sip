@@ -365,6 +365,7 @@ pub async fn run(
     rtpengine_events_rx: tokio::sync::mpsc::Receiver<crate::rtpengine::events::RtpEngineEvent>,
     rf_charger: Option<Arc<crate::diameter::rf_service::RfChargingService>>,
     drain: Arc<DrainState>,
+    control_command_rx: Option<flume::Receiver<crate::control::ControlCommand>>,
     product_name: &'static str,
     product_version: &'static str,
 ) {
@@ -902,6 +903,28 @@ pub async fn run(
                     }
                 }
             }
+        });
+    }
+
+    // --- External control plane: sibling command consumer ---
+    //
+    // A separate tokio task drains the control command channel and applies each
+    // command as a plain async task — ZERO blocking-pool slots, off the inbound
+    // hot path entirely. Correctness is via the `CallActorStore` per-key
+    // DashMap lock (the real serializer), so control application races nothing
+    // the inbound-SIP path doesn't already race. There is no Python handler in
+    // the v1 verbs, so these never touch `py_executor`.
+    if let Some(control_command_rx) = control_command_rx {
+        let control_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            info!("control command consumer started");
+            while let Ok(command) = control_command_rx.recv_async().await {
+                let task_state = Arc::clone(&control_state);
+                tokio::spawn(async move {
+                    apply_control_command(command, &task_state).await;
+                });
+            }
+            info!("control command consumer stopped (channel closed)");
         });
     }
 
@@ -7601,6 +7624,409 @@ fn handle_b2bua_invite(
             // Actor stays alive — the A-leg dialog is now confirmed and the
             // @b2bua.on_bye handler takes over when the UAC BYEs.
         }
+        CallAction::Handover { app } => {
+            b2bua_handover_to_control(&call_id, &app, &message_guard, &inbound, state);
+        }
+    }
+}
+
+/// Hand a B2BUA call over to an external control application (ARI *Stasis*).
+///
+/// Keeps the `CallActor` alive un-dialed, sends a `180 Ringing` to the A-leg,
+/// clears the answer deadline (so the orphan sweep won't 408 the parked call),
+/// registers the call in the [`ControlBus`](crate::control::ControlBus) and
+/// emits a `StasisStart` event to a connection of the named app. If no app is
+/// connected, the call is rejected `480` rather than silently black-holed.
+fn b2bua_handover_to_control(
+    call_id: &str,
+    app: &str,
+    original_request: &SipMessage,
+    inbound: &InboundMessage,
+    state: &DispatcherState,
+) {
+    // Ringback while the control app decides.
+    let ringing = build_response(
+        original_request,
+        180,
+        "Ringing",
+        state.server_header.as_deref(),
+        &[],
+    );
+    send_message_from(
+        ringing,
+        inbound.transport,
+        inbound.remote_addr,
+        inbound.connection_id,
+        Some(inbound.local_addr),
+        state,
+    );
+
+    let channel = call_id.to_string();
+    let handed_over = match crate::control::ControlBus::global() {
+        Some(bus) => match bus.pick_connection(app) {
+            Some(conn) => {
+                if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+                    call.controlled = Some(app.to_string());
+                    // Clear the app answer deadline — the control app owns the
+                    // call's lifecycle now (the `controlled` guard is the
+                    // belt-and-suspenders backstop in the orphan sweep).
+                    call.answer_deadline = None;
+                    call.state = CallState::Ringing;
+                }
+                bus.register_channel(&channel, Arc::clone(&conn), call_id);
+                let payload = handover_stasis_payload(original_request, &channel);
+                conn.events.try_push(crate::control::EventFrame::new(
+                    "StasisStart",
+                    &channel,
+                    app,
+                    payload,
+                ));
+                info!(call_id = %call_id, %app, "B2BUA: handed over to control app");
+                true
+            }
+            None => false,
+        },
+        None => false,
+    };
+
+    if !handed_over {
+        warn!(
+            call_id = %call_id,
+            %app,
+            "B2BUA: no control app connected for handover — rejecting 480"
+        );
+        let response = build_response(
+            original_request,
+            480,
+            "Temporarily Unavailable",
+            state.server_header.as_deref(),
+            &[],
+        );
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
+        state.call_actors.remove_call(call_id);
+        state.call_event_receivers.remove(call_id);
+    }
+}
+
+/// Build the `StasisStart` payload for a handed-over call.
+fn handover_stasis_payload(invite: &SipMessage, channel: &str) -> serde_json::Value {
+    serde_json::json!({
+        "channel": channel,
+        "caller": invite.headers.from().cloned(),
+        "callee": invite.headers.to().cloned(),
+        "call_id": invite.headers.call_id().cloned(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Control-plane command application
+// ---------------------------------------------------------------------------
+
+/// A local SIP action decided by [`apply_control_verb`], rendered into an actual
+/// send by [`apply_control_command`]. Kept separate from the store mutation so
+/// the verb core is a synchronous, easily-tested function that touches only the
+/// [`CallActorStore`] — and so the SIP message is built **outside** the DashMap
+/// lock (never nesting the message mutex under the store lock).
+//
+// `large_enum_variant`: `ByeALeg` carries a full `Leg` while `RespondToALeg`
+// holds a handful of small fields — the size gap is real, but these live in a
+// per-command `Vec` of tiny cardinality at signaling rate, so boxing would only
+// add an allocation to the local action with no benefit.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+enum ControlEffect {
+    /// Send a response (built from the stored A-leg INVITE) to the A-leg.
+    RespondToALeg {
+        invite: Arc<Mutex<SipMessage>>,
+        transport: LegTransport,
+        code: u16,
+        reason: String,
+        /// UAS To-tag to stamp on the response (dialog establishment).
+        to_tag: Option<String>,
+        body: Option<Vec<u8>>,
+        content_type: Option<String>,
+    },
+    /// Send an in-dialog BYE to the A-leg, built from the leg's dialog state.
+    ByeALeg { leg: Leg },
+}
+
+/// The outcome of applying one control command: the *local* reply, the SIP
+/// effects to perform, and whether the channel is now ended (→ remove it from
+/// the bus + emit `StasisEnd`).
+#[derive(Debug)]
+struct ControlOutcome {
+    result: crate::control::ControlResult,
+    effects: Vec<ControlEffect>,
+    end_channel: bool,
+}
+
+impl ControlOutcome {
+    fn error(code: crate::control::ControlErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            result: crate::control::ControlResult::error(code, message),
+            effects: Vec::new(),
+            end_channel: false,
+        }
+    }
+}
+
+/// Apply one control command as a plain async task (zero blocking-pool slots).
+///
+/// **The load-bearing rule:** this performs only the *bounded, local* action —
+/// mutate the store and send at most one SIP message — and returns "accepted"
+/// immediately. It NEVER waits for the callee to answer, for an ACK, or for a
+/// BYE 200; those far-end outcomes arrive later as async events. The single
+/// `.await`s here are the localhost UDP/TCP sends (already non-blocking) and the
+/// final `oneshot` reply — never a dialog-progress wait.
+async fn apply_control_command(command: crate::control::ControlCommand, state: &DispatcherState) {
+    let outcome = apply_control_verb(&state.call_actors, &command);
+
+    // Render the local SIP effect(s). Each builds a message (locking the A-leg
+    // INVITE mutex standalone — no store lock held) and hands it to the
+    // non-blocking outbound path.
+    for effect in &outcome.effects {
+        match effect {
+            ControlEffect::RespondToALeg {
+                invite,
+                transport,
+                code,
+                reason,
+                to_tag,
+                body,
+                content_type,
+            } => {
+                let response = {
+                    let guard = match invite.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    let mut response = build_response(
+                        &guard,
+                        *code,
+                        reason,
+                        state.server_header.as_deref(),
+                        &[],
+                    );
+                    if let Some(tag) = to_tag {
+                        if let Some(current_to) =
+                            response.headers.get("To").map(|value| value.to_string())
+                        {
+                            response.headers.set(
+                                "To",
+                                crate::b2bua::actor::ensure_tag(&current_to, Some(tag)),
+                            );
+                        }
+                    }
+                    if let Some(body_bytes) = body {
+                        if let Some(content_type) = content_type {
+                            response.headers.set("Content-Type", content_type.clone());
+                        }
+                        response
+                            .headers
+                            .set("Content-Length", body_bytes.len().to_string());
+                        response.body = body_bytes.clone();
+                    }
+                    response
+                };
+                send_message(
+                    response,
+                    transport.transport,
+                    transport.remote_addr,
+                    transport.connection_id,
+                    state,
+                );
+            }
+            ControlEffect::ByeALeg { leg } => {
+                if let Some(bye) = build_b2bua_bye(leg, state) {
+                    send_message(
+                        bye,
+                        leg.transport.transport,
+                        leg.transport.remote_addr,
+                        leg.transport.connection_id,
+                        state,
+                    );
+                }
+            }
+        }
+    }
+
+    // Channel teardown: drop it from the bus and tell the owning app.
+    if outcome.end_channel {
+        if let Some(channel) = command.channel_target() {
+            if let Some(bus) = crate::control::ControlBus::global() {
+                if let Some(owner) = bus.remove_channel(&channel) {
+                    owner.conn.events.try_push(crate::control::EventFrame::new(
+                        "StasisEnd",
+                        &channel,
+                        &owner.app,
+                        serde_json::json!({}),
+                    ));
+                }
+            }
+        }
+    }
+
+    let _ = command.response_tx.send(outcome.result);
+}
+
+/// The synchronous verb core: mutate the store and decide the local SIP effect.
+///
+/// This is deliberately a plain function over the [`CallActorStore`] so it is
+/// unit-testable against an in-process store, and so it structurally cannot
+/// await a far-end result. Lock discipline: the A-leg INVITE mutex and the
+/// store's per-key lock are **never** held simultaneously (each acquired,
+/// used, and dropped in turn), matching the inbound path's ordering.
+fn apply_control_verb(
+    store: &CallActorStore,
+    command: &crate::control::ControlCommand,
+) -> ControlOutcome {
+    use crate::control::{ControlErrorCode, ControlResult};
+
+    let Some(channel) = command.channel_target() else {
+        return ControlOutcome::error(
+            ControlErrorCode::BadRequest,
+            "command target must be {\"channel\": \"…\"}",
+        );
+    };
+
+    match command.verb.as_str() {
+        "answer" => {
+            // Step 1: snapshot under the store lock (no message lock held).
+            let Some((invite, transport, to_tag)) = ({
+                match store.get_call(&channel) {
+                    Some(call) => call.a_leg_invite.as_ref().map(|invite| {
+                        (
+                            Arc::clone(invite),
+                            call.a_leg.transport.clone(),
+                            call.a_leg.dialog.local_tag.clone(),
+                        )
+                    }),
+                    None => {
+                        return ControlOutcome::error(
+                            ControlErrorCode::NotFound,
+                            format!("no such channel: {channel}"),
+                        )
+                    }
+                }
+            }) else {
+                return ControlOutcome::error(
+                    ControlErrorCode::Unavailable,
+                    "channel has no stored A-leg INVITE",
+                );
+            };
+
+            // Step 2: read the INVITE (message lock only) — echo its offer SDP.
+            let (to_value, from_value, contact_value, body, content_type) = {
+                let guard = match invite.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let body = if guard.body.is_empty() {
+                    None
+                } else {
+                    Some(guard.body.clone())
+                };
+                let content_type = guard
+                    .headers
+                    .get("Content-Type")
+                    .map(|value| value.to_string())
+                    .or_else(|| body.as_ref().map(|_| "application/sdp".to_string()));
+                (
+                    guard.headers.to().cloned(),
+                    guard.headers.from().cloned(),
+                    guard
+                        .headers
+                        .get("Contact")
+                        .map(|value| crate::b2bua::actor::extract_contact_uri(value)),
+                    body,
+                    content_type,
+                )
+            };
+
+            // Step 3: mutate the call (store lock only). Populate the A-leg
+            // dialog so a later `hangup` builds a coherent in-dialog BYE.
+            let Some(mut call) = store.get_call_mut(&channel) else {
+                return ControlOutcome::error(
+                    ControlErrorCode::NotFound,
+                    format!("no such channel: {channel}"),
+                );
+            };
+            call.a_leg.dialog.local_from_uri = to_value; // INVITE To → our From
+            call.a_leg.dialog.remote_to_uri = from_value; // INVITE From → our To
+            if let Some(contact) = contact_value {
+                call.a_leg.dialog.remote_contact = Some(contact);
+            }
+            call.state = CallState::Answered;
+            drop(call);
+
+            ControlOutcome {
+                result: ControlResult::Ok(serde_json::json!({
+                    "channel": channel,
+                    "state": "answered",
+                })),
+                effects: vec![ControlEffect::RespondToALeg {
+                    invite,
+                    transport,
+                    code: 200,
+                    reason: "OK".to_string(),
+                    to_tag: Some(to_tag),
+                    body,
+                    content_type,
+                }],
+                end_channel: false,
+            }
+        }
+        "hangup" => {
+            let effect = {
+                let Some(mut call) = store.get_call_mut(&channel) else {
+                    return ControlOutcome::error(
+                        ControlErrorCode::NotFound,
+                        format!("no such channel: {channel}"),
+                    );
+                };
+                let answered = matches!(call.state, CallState::Answered);
+                call.state = CallState::Terminated;
+                if answered {
+                    // In-dialog BYE (built from the leg's cloned dialog state —
+                    // no message mutex touched under the store lock).
+                    Some(ControlEffect::ByeALeg {
+                        leg: call.a_leg.clone(),
+                    })
+                } else {
+                    // Not yet answered → decline the pending INVITE.
+                    call.a_leg_invite.clone().map(|invite| ControlEffect::RespondToALeg {
+                        invite,
+                        transport: call.a_leg.transport.clone(),
+                        code: 603,
+                        reason: "Decline".to_string(),
+                        to_tag: None,
+                        body: None,
+                        content_type: None,
+                    })
+                }
+            };
+            store.remove_call(&channel);
+
+            ControlOutcome {
+                result: ControlResult::Ok(serde_json::json!({
+                    "channel": channel,
+                    "state": "terminated",
+                })),
+                effects: effect.into_iter().collect(),
+                end_channel: true,
+            }
+        }
+        other => ControlOutcome::error(
+            ControlErrorCode::UnsupportedVerb,
+            format!("unsupported verb: {other}"),
+        ),
     }
 }
 
@@ -14021,4 +14447,163 @@ a=rtpmap:8 PCMA/8000\r\n";
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Control-plane apply verb tests (against an in-process CallActorStore).
+    //
+    // These assert `apply_control_verb` performs only the LOCAL action and
+    // returns immediately — it is a synchronous function, so it structurally
+    // cannot await a far-end result. Each test checks the store mutation and
+    // the decided SIP effect.
+    // -----------------------------------------------------------------------
+
+    fn control_invite() -> SipMessage {
+        let mut message = SipMessageBuilder::new()
+            .request(
+                Method::Invite,
+                SipUri::new("example.com".to_string()).with_user("ivr".to_string()),
+            )
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-ctrl".to_string())
+            .from("Alice <sip:alice@atlanta.com>;tag=alicetag".to_string())
+            .to("<sip:ivr@example.com>".to_string())
+            .call_id("control-call-1@10.0.0.1".to_string())
+            .cseq("1 INVITE".to_string())
+            .header("Contact", "<sip:alice@10.0.0.1:5060>".to_string())
+            .content_length(0)
+            .build()
+            .expect("builds control invite");
+        message.headers.set("Content-Type", "application/sdp".to_string());
+        message.body = b"v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\n".to_vec();
+        message
+    }
+
+    fn control_test_store() -> (CallActorStore, String) {
+        let store = CallActorStore::new();
+        let transport = LegTransport {
+            remote_addr: "127.0.0.1:5060".parse().unwrap(),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+        };
+        let leg = Leg::new_a_leg(
+            "control-call-1@10.0.0.1".to_string(),
+            "alicetag".to_string(),
+            "z9hG4bK-ctrl".to_string(),
+            transport,
+        );
+        let channel = store.create_call(leg);
+        store.set_a_leg_invite(&channel, Arc::new(Mutex::new(control_invite())));
+        (store, channel)
+    }
+
+    fn control_command(verb: &str, channel: Option<&str>) -> crate::control::ControlCommand {
+        let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+        let target = match channel {
+            Some(channel) => serde_json::json!({ "channel": channel }),
+            None => serde_json::Value::Null,
+        };
+        crate::control::ControlCommand {
+            id: "c1".to_string(),
+            verb: verb.to_string(),
+            target,
+            args: serde_json::json!({}),
+            response_tx,
+        }
+    }
+
+    #[test]
+    fn apply_verb_answer_marks_answered_echoes_sdp_and_returns() {
+        let (store, channel) = control_test_store();
+        let outcome = apply_control_verb(&store, &control_command("answer", Some(&channel)));
+
+        // Ok result, channel NOT ended (a call in progress, not torn down).
+        assert!(matches!(outcome.result, crate::control::ControlResult::Ok(_)));
+        assert!(!outcome.end_channel);
+
+        // Only the local action happened: state flipped to Answered, no B-leg
+        // dialed, and the call is still present (not awaiting the far end).
+        let call = store.get_call(&channel).expect("call still present");
+        assert_eq!(call.state, CallState::Answered);
+        assert!(call.b_legs.is_empty());
+        // Dialog populated so a later BYE is coherent.
+        assert!(call.a_leg.dialog.local_from_uri.is_some());
+        assert!(call.a_leg.dialog.remote_to_uri.is_some());
+        assert!(call.a_leg.dialog.remote_contact.is_some());
+        drop(call);
+
+        // Effect: a 200 OK to the A-leg with a UAS To-tag echoing the offer SDP.
+        assert_eq!(outcome.effects.len(), 1);
+        match &outcome.effects[0] {
+            ControlEffect::RespondToALeg { code, to_tag, body, content_type, .. } => {
+                assert_eq!(*code, 200);
+                assert!(to_tag.is_some());
+                assert_eq!(body.as_deref(), Some(&b"v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\n"[..]));
+                assert_eq!(content_type.as_deref(), Some("application/sdp"));
+            }
+            other => panic!("expected RespondToALeg, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_verb_hangup_answered_sends_bye_and_ends_channel() {
+        let (store, channel) = control_test_store();
+        // Answer first so the call is in the Answered state with a real dialog.
+        let _ = apply_control_verb(&store, &control_command("answer", Some(&channel)));
+
+        let outcome = apply_control_verb(&store, &control_command("hangup", Some(&channel)));
+        assert!(matches!(outcome.result, crate::control::ControlResult::Ok(_)));
+        assert!(outcome.end_channel);
+        assert_eq!(outcome.effects.len(), 1);
+        assert!(matches!(outcome.effects[0], ControlEffect::ByeALeg { .. }));
+        // The call was removed from the store.
+        assert!(store.get_call(&channel).is_none());
+    }
+
+    #[test]
+    fn apply_verb_hangup_unanswered_declines_and_ends_channel() {
+        let (store, channel) = control_test_store();
+        let outcome = apply_control_verb(&store, &control_command("hangup", Some(&channel)));
+        assert!(outcome.end_channel);
+        assert_eq!(outcome.effects.len(), 1);
+        match &outcome.effects[0] {
+            ControlEffect::RespondToALeg { code, .. } => assert_eq!(*code, 603),
+            other => panic!("expected a 603 decline, got {other:?}"),
+        }
+        assert!(store.get_call(&channel).is_none());
+    }
+
+    #[test]
+    fn apply_verb_unknown_channel_is_not_found() {
+        let (store, _channel) = control_test_store();
+        let outcome = apply_control_verb(&store, &control_command("answer", Some("bogus")));
+        match outcome.result {
+            crate::control::ControlResult::Error { code, .. } => {
+                assert_eq!(code, crate::control::ControlErrorCode::NotFound);
+            }
+            other => panic!("expected NotFound error, got {other:?}"),
+        }
+        assert!(outcome.effects.is_empty());
+    }
+
+    #[test]
+    fn apply_verb_unsupported_verb_errors() {
+        let (store, channel) = control_test_store();
+        let outcome = apply_control_verb(&store, &control_command("frobnicate", Some(&channel)));
+        match outcome.result {
+            crate::control::ControlResult::Error { code, .. } => {
+                assert_eq!(code, crate::control::ControlErrorCode::UnsupportedVerb);
+            }
+            other => panic!("expected UnsupportedVerb, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_verb_missing_target_is_bad_request() {
+        let (store, _channel) = control_test_store();
+        let outcome = apply_control_verb(&store, &control_command("answer", None));
+        match outcome.result {
+            crate::control::ControlResult::Error { code, .. } => {
+                assert_eq!(code, crate::control::ControlErrorCode::BadRequest);
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
 }
