@@ -1,0 +1,126 @@
+# ---------------------------------------------------------------------------
+# SIPhon SBC for Microsoft Teams Direct Routing
+#
+# Bridges a Teams tenant (mutual TLS + SRTP) to a PSTN carrier trunk (RTP).
+# See examples/teams_sbc.py for the routing logic.
+#
+# Teams-side prerequisites (provisioned in the tenant, not here):
+#   * advertised_address below is the SBC FQDN paired via
+#     New-CsOnlinePSTNGateway.
+#   * The TLS certificate is from a CA on Microsoft's supported Direct Routing
+#     list (Let's Encrypt is NOT supported) with SAN = the paired FQDN.
+# ---------------------------------------------------------------------------
+
+listen:
+  udp:
+    - "0.0.0.0:5060"          # carrier-facing
+  tcp:
+    - "0.0.0.0:5060"          # carrier-facing
+  tls:
+    - "0.0.0.0:5061"          # Teams-facing (mutual TLS)
+
+# Contact / Via / Record-Route host. Teams matches this against the paired
+# gateway, so it MUST be the SBC FQDN (not an IP).
+advertised_address: "sbc.example.com"
+
+domain:
+  local:
+    - "sbc.example.com"
+
+tls:
+  # Server identity presented to Teams (Teams -> SBC). Paired-FQDN cert from a
+  # Microsoft-supported CA.
+  certificate: "/etc/siphon/tls/sbc.example.com/fullchain.pem"
+  private_key: "/etc/siphon/tls/sbc.example.com/privkey.pem"
+  method: "TLSv1_2"           # Teams requires TLS 1.2
+
+  # Client identity presented to Teams on the OUTBOUND leg (SBC -> Teams).
+  # Direct Routing is mutual TLS: without this, Teams aborts the handshake with
+  # CertificateUnknown. Same paired-FQDN identity as the server cert above.
+  client_certificate: "/etc/siphon/tls/sbc.example.com/fullchain.pem"
+  client_private_key: "/etc/siphon/tls/sbc.example.com/privkey.pem"
+
+script:
+  path: "examples/teams_sbc.py"
+  reload: auto
+
+# Teams polls the SBC with OPTIONS from its signalling range — never rate-limit
+# or ban it. Confirm the range against Microsoft's current published list.
+security:
+  trusted_cidrs: ["52.114.0.0/16"]
+
+b2bua:
+  # Strip P-*/X-* between Teams and the carrier trunk (trust-boundary hygiene).
+  default_header_policy: "sip-trunk-edge@2026"
+
+gateway:
+  groups:
+    # Teams Direct Routing SIP proxies, in failover priority order. The SBC
+    # sends OPTIONS keepalives here (transport=tls -> mutual TLS, client cert +
+    # SNI applied automatically). from_domain MUST be the paired SBC FQDN.
+    - name: "teams"
+      algorithm: weighted
+      probe:
+        enabled: true
+        interval_secs: 60
+        failure_threshold: 3
+        from_user: "options"
+        from_domain: "sbc.example.com"
+      destinations:
+        - uri: "sip:sip.pstnhub.microsoft.com:5061;transport=tls"
+          priority: 1
+        - uri: "sip:sip2.pstnhub.microsoft.com:5061;transport=tls"
+          priority: 2
+        - uri: "sip:sip3.pstnhub.microsoft.com:5061;transport=tls"
+          priority: 3
+
+    # PSTN carrier / SIP trunk (plain SIP over UDP).
+    - name: "carrier"
+      algorithm: weighted
+      probe:
+        enabled: true
+        interval_secs: 30
+        failure_threshold: 3
+        from_domain: "sbc.example.com"
+      destinations:
+        - uri: "sip:sip.carrier.example.net:5060"
+
+media:
+  rtpengine:
+    address: "127.0.0.1:22222"
+    timeout_ms: 1000
+    sdp_name: "SIPhon SBC"
+  health_check_interval_secs: 30
+  profiles:
+    # PSTN -> Teams: carrier offers RTP, transcode up to SRTP for Teams.
+    # The direction labels ("carrier"/"teams") must match the interface names
+    # configured in rtpengine.conf.
+    rtp_to_srtp:
+      offer:
+        transport_protocol: "RTP/SAVP"
+        ice: "remove"
+        replace: ["origin", "session-connection"]
+        direction: ["carrier", "teams"]
+        codec: ["offer", "PCMA,PCMU"]
+      answer:
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        replace: ["origin", "session-connection"]
+        direction: ["teams", "carrier"]
+    # Teams -> PSTN: Teams offers SRTP, transcode down to RTP for the carrier.
+    srtp_to_rtp:
+      offer:
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        replace: ["origin", "session-connection"]
+        direction: ["teams", "carrier"]
+        codec: ["offer", "PCMA,PCMU"]
+      answer:
+        transport_protocol: "RTP/SAVP"
+        ice: "remove"
+        replace: ["origin", "session-connection"]
+        direction: ["carrier", "teams"]
+
+log:
+  level: info
+  format: pretty
