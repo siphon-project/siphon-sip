@@ -7,6 +7,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **`@rtpengine.on_media_timeout` script hook.** The media engine reaps a call
+  whose media went dead (no packets past its inactivity window) and pushes a
+  media-timeout event; a handler decorated with `@rtpengine.on_media_timeout`
+  (optionally filtered by `call_id` / `from_tag`, same shape as
+  `@rtpengine.on_dtmf`) now receives `(call_id, from_tag)` so the script can
+  release the per-call state no BYE will clear — Rx/N5 QoS sessions, offline
+  charging, dialog/session-store entries. The event is still logged; the hook is
+  additive. Delivered by the native **siphon-rtp** backend, which pushes the
+  event over its control connection — the rtpengine backend does not emit
+  media-timeout events (its NG event log carries only DTMF), so the hook is a
+  no-op under rtpengine today. Mirrored in the `siphon-sip` SDK mock
+  (`on_media_timeout` + a `fire_media_timeout` test helper).
 - **Native `siphon-rtp` media backend (JSON-over-TCP) — experimental.** siphon
   can now drive the in-house `siphon-rtp` media engine over its native control
   protocol — a persistent TCP connection carrying length-prefixed JSON frames —

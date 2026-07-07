@@ -109,6 +109,17 @@ pub enum HandlerKind {
         call_id: Option<String>,
         from_tag: Option<String>,
     },
+    /// `@rtpengine.on_media_timeout` — the media engine reaped a call whose
+    /// media went dead (no packets past its inactivity window). The handler
+    /// receives ``(call_id, from_tag)`` and typically releases the per-call
+    /// state no BYE will now clear (Rx/N5 QoS, charging, dialog).
+    ///
+    /// ``call_id`` and ``from_tag`` are optional filters: when set, only
+    /// matching media-timeout events invoke the handler.
+    RtpEngineOnMediaTimeout {
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    },
     /// Open extension point for handler kinds owned by host extensions.
     /// The string is the registry key the extension wrote (e.g.
     /// `"audit.sink"`); siphon-core does not interpret it. Per-handler
@@ -196,6 +207,26 @@ impl ScriptState {
             .iter()
             .filter(|h| match &h.kind {
                 HandlerKind::RtpEngineOnDtmf { call_id: filter_cid, from_tag: filter_ftag } => {
+                    filter_cid.as_deref().map_or(true, |v| v == call_id)
+                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// Return all `RtpEngineOnMediaTimeout` handlers whose optional
+    /// call-id/from-tag filters match the event.  `None` filters match
+    /// everything.
+    pub fn media_timeout_handlers(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Vec<&HandlerEntry> {
+        self.handlers
+            .iter()
+            .filter(|h| match &h.kind {
+                HandlerKind::RtpEngineOnMediaTimeout { call_id: filter_cid, from_tag: filter_ftag } => {
                     filter_cid.as_deref().map_or(true, |v| v == call_id)
                         && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
                 }
@@ -823,6 +854,17 @@ fn extract_handlers(
                     .and_then(|v| v.extract().ok());
                 HandlerKind::RtpEngineOnDtmf { call_id, from_tag }
             }
+            "rtpengine.on_media_timeout" => {
+                let call_id: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("call_id").ok())
+                    .and_then(|v| v.extract().ok());
+                let from_tag: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("from_tag").ok())
+                    .and_then(|v| v.extract().ok());
+                HandlerKind::RtpEngineOnMediaTimeout { call_id, from_tag }
+            }
             other => HandlerKind::Custom { kind: other.to_owned() },
         };
 
@@ -1201,6 +1243,66 @@ def on_reg_change(aor, event_type, contacts):
         let state = compile_temp_script(source).unwrap();
         assert_eq!(state.handlers.len(), 1);
         assert!(state.handlers_for(&HandlerKind::RegistrarOnChange).len() == 1);
+    }
+
+    #[test]
+    fn rtpengine_on_dtmf_and_media_timeout_are_distinct_kinds() {
+        // Both hooks share the (call_id, from_tag) filter shape but register as
+        // separate handler kinds, so a media-timeout event never fires a DTMF
+        // handler and vice versa.
+        let source = r#"
+from siphon import rtpengine
+
+@rtpengine.on_dtmf
+def digit(call_id, from_tag, digit, duration_ms, volume):
+    pass
+
+@rtpengine.on_media_timeout
+def timeout(call_id, from_tag):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 2);
+        assert_eq!(state.dtmf_handlers("c", "f").len(), 1);
+        assert_eq!(state.media_timeout_handlers("c", "f").len(), 1);
+    }
+
+    #[test]
+    fn rtpengine_on_media_timeout_filters_by_call_id_and_from_tag() {
+        // A bare handler is a catch-all; a filtered handler fires only for its
+        // exact (call_id, from_tag).  `media_timeout_handlers` is what the
+        // dispatcher consults when the engine reports a media timeout.
+        let source = r#"
+from siphon import rtpengine
+
+@rtpengine.on_media_timeout
+def any_timeout(call_id, from_tag):
+    pass
+
+@rtpengine.on_media_timeout(call_id="abc", from_tag="ftag1")
+async def specific_timeout(call_id, from_tag):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 2);
+
+        // Non-matching call: only the catch-all.
+        assert_eq!(state.media_timeout_handlers("xyz", "other").len(), 1);
+        // Exact match: catch-all + specific.
+        assert_eq!(state.media_timeout_handlers("abc", "ftag1").len(), 2);
+        // Right call-id, wrong from-tag: catch-all only.
+        assert_eq!(state.media_timeout_handlers("abc", "wrong").len(), 1);
+
+        // The filtered handler is the async one.
+        let specific = state
+            .handlers
+            .iter()
+            .find(|h| matches!(
+                &h.kind,
+                HandlerKind::RtpEngineOnMediaTimeout { call_id: Some(c), .. } if c == "abc"
+            ))
+            .expect("filtered media-timeout handler registered");
+        assert!(specific.is_async);
     }
 
     #[test]

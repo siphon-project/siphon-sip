@@ -11,7 +11,7 @@ anchors and transforms RTP. You pick one of two engines with `media.backend`:
 | **Datapath** | userspace or in-kernel (`xt_RTPENGINE` module) | userspace, optional AF_XDP acceleration |
 | **Packaging** | distro package / container; kernel module for the fast path | single static binary, no kernel module |
 | **Auth on the control channel** | none (bind to loopback / a trusted net) | optional shared-secret handshake |
-| **Async events to SIPhon** | none | DTMF + media-timeout pushed on the same connection |
+| **Async events to SIPhon** | DTMF only, over a **separate** event log (`media.events` ← rtpengine's `dtmf-log-ng-tcp-uri`) | DTMF **and** media-timeout, pushed on the **same** control connection |
 | **HA in SIPhon** | weighted round-robin over `instances[]` | weighted round-robin + **per-call-id affinity** over `instances[]` |
 
 !!! warning "siphon-rtp is experimental — use rtpengine in production"

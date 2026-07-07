@@ -899,15 +899,58 @@ pub async fn run(
                         call_id,
                         from_tag,
                     } => {
-                        // The siphon-rtp engine tore down a dead-path call. We
-                        // log it for visibility; releasing siphon's own per-call
-                        // state (a @rtpengine.on_media_timeout hook + proxy/B2BUA
-                        // teardown) is a planned follow-up.
+                        // The media engine tore down a dead-path call. Log it for
+                        // visibility regardless of whether a script handles it,
+                        // then invoke any @rtpengine.on_media_timeout handlers so
+                        // the script can release the per-call state no BYE will
+                        // now clear (Rx/N5 QoS, charging, dialog).
                         tracing::warn!(
                             %call_id,
                             %from_tag,
-                            "siphon-rtp reported media timeout (engine tore down call)"
+                            "media engine reported media timeout (engine tore down call)"
                         );
+                        let engine_state = state_for_events.engine.state();
+                        let handlers =
+                            engine_state.media_timeout_handlers(&call_id, &from_tag);
+                        if handlers.is_empty() {
+                            continue;
+                        }
+                        let state_ref = Arc::clone(&state_for_events);
+                        let call_id_clone = call_id.clone();
+                        let from_tag_clone = from_tag.clone();
+                        let _ = crate::script::py_executor::try_run(move || {
+                            let engine_state = state_ref.engine.state();
+                            let handlers = engine_state
+                                .media_timeout_handlers(&call_id_clone, &from_tag_clone);
+                            pyo3::Python::attach(|python| {
+                                for handler in handlers {
+                                    let callable = handler.callable.bind(python);
+                                    let result = callable.call1((
+                                        call_id_clone.as_str(),
+                                        from_tag_clone.as_str(),
+                                    ));
+                                    match result {
+                                        Ok(ret) => {
+                                            if handler.is_async {
+                                                if let Err(error) = run_coroutine(python, &ret) {
+                                                    tracing::error!(
+                                                        %error,
+                                                        "async rtpengine.on_media_timeout handler error"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                %error,
+                                                "rtpengine.on_media_timeout handler failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        })
+                        .await;
                     }
                     crate::rtpengine::events::RtpEngineEvent::Unknown { event, call_id, .. } => {
                         tracing::debug!(

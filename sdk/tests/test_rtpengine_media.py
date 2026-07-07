@@ -187,3 +187,40 @@ class TestClear:
         harness.rtpengine.clear()
         assert harness.rtpengine.operations == []
         assert harness.rtpengine.media_calls == []
+
+
+class TestOnMediaTimeout:
+    def test_catch_all_and_filtered_dispatch(self, harness):
+        harness.load_source(
+            """
+from siphon import rtpengine
+
+fired = []
+
+@rtpengine.on_media_timeout
+def any_timeout(call_id, from_tag):
+    fired.append(("any", call_id, from_tag))
+
+@rtpengine.on_media_timeout(call_id="abc", from_tag="ftag1")
+def specific_timeout(call_id, from_tag):
+    fired.append(("specific", call_id, from_tag))
+"""
+        )
+        # Exact match → both the catch-all and the filtered handler fire.
+        assert harness.rtpengine.fire_media_timeout("abc", "ftag1") == 2
+        # Non-matching call → only the catch-all.
+        assert harness.rtpengine.fire_media_timeout("xyz", "other") == 1
+        # Right call-id, wrong from-tag → catch-all only.
+        assert harness.rtpengine.fire_media_timeout("abc", "wrong") == 1
+
+    def test_no_handlers_fires_nothing(self, harness):
+        harness.load_source(
+            """
+from siphon import proxy
+
+@proxy.on_request
+def route(request):
+    request.reply(200, "OK")
+"""
+        )
+        assert harness.rtpengine.fire_media_timeout("abc", "ftag1") == 0

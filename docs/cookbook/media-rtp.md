@@ -155,6 +155,32 @@ The `rtpengine` namespace also drives announcements and tones (`play_media`,
 `play_dtmf`), gating (`silence_media` / `block_media`), DTMF events (`@rtpengine.on_dtmf`),
 and conference/MPTY subscriptions — useful for IVR, MMTel announcements, and recording.
 
+### React to a dead media path
+
+The media engine reaps a call whose media stops flowing (no packets past its
+inactivity window). Handle `@rtpengine.on_media_timeout` to release the per-call
+state that no BYE will now clear — Rx/N5 QoS sessions, offline charging, dialog
+or session-store entries. It is the media-path analogue of the abandoned-call
+teardown `@proxy.on_cancel` / `@b2bua.on_cancel` cover.
+
+```python
+from siphon import rtpengine, log
+
+@rtpengine.on_media_timeout
+def media_gone(call_id, from_tag):
+    log.warn(f"media timeout on {call_id} — releasing call state")
+    # e.g. diameter.rx_str(session_id) / sbi.delete_session(...) / cdr.write(...)
+```
+
+Filter to a specific call with `@rtpengine.on_media_timeout(call_id=..., from_tag=...)`,
+the same shape as `@rtpengine.on_dtmf`.
+
+!!! note "siphon-rtp only, for now"
+    This event is delivered by the native **siphon-rtp** backend, which pushes it
+    over its control connection. The rtpengine backend's event log carries only
+    DTMF, so `@rtpengine.on_media_timeout` does not fire under rtpengine yet —
+    see [Media engines](../media-engines.md).
+
 ## See also
 
 - Real examples: [`examples/proxy_rtpengine.py`](https://github.com/siphon-project/siphon-sip/blob/main/examples/proxy_rtpengine.py), [`examples/b2bua_rtpengine.py`](https://github.com/siphon-project/siphon-sip/blob/main/examples/b2bua_rtpengine.py).
