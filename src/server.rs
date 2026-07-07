@@ -2228,6 +2228,11 @@ fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {
         }
     });
 
+    // Store the Rust-side manager Arc so `request.from_gateway` /
+    // `call.from_gateway` can test source membership without a Python
+    // round-trip (points at the same manager as the Python singleton).
+    crate::script::api::set_gateway_manager(Arc::clone(&manager));
+
     Some(manager)
 }
 

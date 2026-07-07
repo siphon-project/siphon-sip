@@ -1447,6 +1447,31 @@ impl PyRequest {
         }
         Ok(false)
     }
+
+    /// True when this request's source IP is a member of the resolved
+    /// addresses of the gateway group named `group_name`.
+    ///
+    /// A routing-direction / trust predicate — the siphon equivalent of
+    /// Kamailio `ds_is_from_list()` / OpenSIPS `ds_is_in_list()`. Use it to
+    /// replace hardcoded source CIDRs when deciding which trunk a request
+    /// arrived from (e.g. an inbound Microsoft Teams call). Matches on IP
+    /// only (the source port is ignored) and against every resolved A/AAAA
+    /// candidate of every destination in the group, so a hostname that
+    /// round-robins across many IPs matches on any of them.
+    ///
+    /// Infallible — returns `false` (never raises) when the group does not
+    /// exist, no gateway is configured, or the source IP does not parse.
+    ///
+    /// Security: on connection-oriented transports (TCP/TLS/WS/WSS) the source
+    /// IP is handshake-verified and trustworthy as an authorization signal; on
+    /// UDP it is spoofable, so `from_gateway` there is a best-effort direction
+    /// hint, not an auth gate.
+    ///
+    /// Example: `if request.from_gateway("teams"): request.relay()`
+    #[allow(clippy::wrong_self_convention)]
+    fn from_gateway(&self, group_name: &str) -> bool {
+        self.from_gateway_impl(group_name, super::gateway_manager())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1454,6 +1479,26 @@ impl PyRequest {
 // ---------------------------------------------------------------------------
 
 impl PyRequest {
+    /// Source-membership predicate shared by the `from_gateway` pymethod and
+    /// its unit tests. Kept infallible: any failure (unparseable source IP,
+    /// no manager, unknown group) resolves to `false`. The `manager` seam
+    /// lets tests inject a `DispatcherManager` without touching the process
+    /// singleton (which is a first-writer-wins `OnceLock`).
+    #[allow(clippy::wrong_self_convention)]
+    fn from_gateway_impl(
+        &self,
+        group_name: &str,
+        manager: Option<&Arc<crate::gateway::DispatcherManager>>,
+    ) -> bool {
+        let Ok(source_ip) = self.source_ip.parse::<IpAddr>() else {
+            return false;
+        };
+        match manager {
+            Some(manager) => manager.source_in_group(group_name, source_ip),
+            None => false,
+        }
+    }
+
     fn lock(&self) -> PyResult<std::sync::MutexGuard<'_, SipMessage>> {
         self.message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
@@ -2317,6 +2362,65 @@ mod tests {
     fn source_ip_in_empty_list() {
         let request = make_request();
         assert!(!request.source_ip_in(vec![]).unwrap());
+    }
+
+    // --- from_gateway (source-membership predicate) ---
+
+    fn gateway_manager_with_group() -> Arc<crate::gateway::DispatcherManager> {
+        use crate::gateway::{Algorithm, Destination, DispatcherGroup};
+        use crate::transport::Transport;
+
+        let manager = Arc::new(crate::gateway::DispatcherManager::new());
+        manager.add_group(DispatcherGroup::new(
+            "trunks".to_string(),
+            Algorithm::Weighted,
+            // make_request() has source_ip = "10.0.0.1".
+            vec![Destination::new(
+                "sip:gw1.example.com".to_string(),
+                "10.0.0.1:5060".parse().unwrap(),
+                Transport::Udp,
+                1,
+                1,
+            )],
+        ));
+        manager
+    }
+
+    #[test]
+    fn from_gateway_true_for_member_source() {
+        let request = make_request(); // source_ip = "10.0.0.1"
+        let manager = gateway_manager_with_group();
+        assert!(request.from_gateway_impl("trunks", Some(&manager)));
+    }
+
+    #[test]
+    fn from_gateway_false_for_non_member_source() {
+        let message = Arc::new(Mutex::new(invite_request_message()));
+        // RFC 5737 TEST-NET-1 — not a member of the group above.
+        let request = PyRequest::new(message, "udp".to_string(), "192.0.2.7".to_string(), 5060);
+        let manager = gateway_manager_with_group();
+        assert!(!request.from_gateway_impl("trunks", Some(&manager)));
+    }
+
+    #[test]
+    fn from_gateway_false_for_unknown_group() {
+        let request = make_request();
+        let manager = gateway_manager_with_group();
+        assert!(!request.from_gateway_impl("nonexistent", Some(&manager)));
+    }
+
+    #[test]
+    fn from_gateway_false_when_no_manager() {
+        let request = make_request();
+        assert!(!request.from_gateway_impl("trunks", None));
+    }
+
+    #[test]
+    fn from_gateway_false_for_unparseable_source_ip() {
+        let message = Arc::new(Mutex::new(invite_request_message()));
+        let request = PyRequest::new(message, "udp".to_string(), "not-an-ip".to_string(), 5060);
+        let manager = gateway_manager_with_group();
+        assert!(!request.from_gateway_impl("trunks", Some(&manager)));
     }
 
     // --- R-URI setter tests ---

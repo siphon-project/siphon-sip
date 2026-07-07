@@ -35,6 +35,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   hostname now flows from the resolved SIP URI (relay, fork, and gateway TLS
   health probe) through to the connection pool. Bare-IP next hops are unchanged
   (still no SNI).
+- **Gateway source-membership predicate — `request.from_gateway(group)` /
+  `call.from_gateway(group)`.** Returns `True` when the message's source IP is
+  one of the resolved addresses of the named gateway group (configured under
+  `gateway.groups`). siphon's equivalent of Kamailio `ds_is_from_list()` /
+  OpenSIPS `ds_is_in_list()` — a routing-direction / trust predicate that
+  replaces hardcoded source CIDRs. Matches on IP only (source port ignored)
+  against every resolved A/AAAA candidate of every destination in the group, so
+  a hostname that round-robins across many IPs (e.g. Teams'
+  `sip`/`sip2`/`sip3.pstnhub.microsoft.com`) matches on any of them. The member
+  set is cached lock-free and refreshed at startup and on each health-probe
+  cycle, so the predicate never resolves DNS on the request path. Infallible —
+  returns `False` (never raises) for an unknown group, no configured gateway, or
+  an unparseable source IP. Security note: on connection-oriented transports
+  (TCP/TLS/WS/WSS) the source IP is handshake-verified and trustworthy as an
+  authorization signal; on UDP it is spoofable, so `from_gateway` there is a
+  best-effort direction hint, not an auth gate.
 
 ## [1.1.1] — 2026-07-02
 

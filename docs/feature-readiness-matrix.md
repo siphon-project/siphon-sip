@@ -158,6 +158,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Priority-based failover tiers | Implemented | `destinations[].priority` | |
 | Dynamic group management | Implemented | Python `gateway.add_group()` / `gateway.remove_group()` | |
 | Destination up/down marking | Implemented | Python `gateway.mark_up()` / `gateway.mark_down()` | |
+| Source-membership predicate | Implemented | Python `request.from_gateway()` / `call.from_gateway()` | `ds_is_from_list()` / `ds_is_in_list()` equivalent; IP-only match against all resolved group addresses, cached + refreshed on probe cycle. Trust signal on TCP/TLS/WS/WSS, direction hint on UDP |
 
 ## Call Detail Records
 

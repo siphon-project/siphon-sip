@@ -115,6 +115,43 @@ def on_invite(request):
 
 Needs a `stir:` block with `signing` + `verification` configured.
 
+The `source_ip_in([...])` above hardcodes the peer's CIDR. If that peer is already
+a `gateway` group (a trunk you health-probe), test membership by group name instead
+so you never maintain two copies of the address list — see the next section.
+
+## 5.5. Direction & trust — `from_gateway`
+
+`request.from_gateway("group")` (and `call.from_gateway("group")` in a B2BUA) returns
+`True` when the message's **source IP** is one of the resolved addresses of the named
+gateway group. It's SIPhon's equivalent of Kamailio `ds_is_from_list()` /
+OpenSIPS `ds_is_in_list()` — a routing-direction predicate that replaces hardcoded
+source CIDRs with the trunk list you already maintain under `gateway.groups`.
+
+```python
+from siphon import proxy, gateway
+
+@proxy.on_request("INVITE")
+def route(request):
+    if request.from_gateway("teams"):
+        # Inbound leg from Microsoft Teams — trust it, forward to the PBX.
+        request.relay("sip:pbx.internal:5060")
+    else:
+        # Outbound leg from the PBX — send to Teams.
+        request.relay(gateway.select("teams").uri)
+```
+
+It matches on **IP only** (source port ignored) against **every** resolved address in
+the group, so a hostname that round-robins across many IPs — Teams'
+`sip`/`sip2`/`sip3.pstnhub.microsoft.com`, a carrier's rotating trunk — matches on any
+of them. The member set is cached and refreshed on the health-probe cycle, so the
+predicate never resolves DNS on the request path.
+
+!!! warning "Trustworthy on TCP/TLS/WS/WSS, a hint on UDP"
+    On connection-oriented transports the source IP is verified by the handshake, so
+    `from_gateway` is a sound **authorization** signal. On UDP the source IP is
+    spoofable — treat `from_gateway` there as a best-effort **direction hint**, and
+    gate real trust decisions on TLS/mTLS or digest/AKA auth.
+
 ## 6. IMS access security — IPsec (Gm)
 
 For a P-CSCF, SIPhon does full 3GPP TS 33.203 sec-agree: parse `Security-Client`,

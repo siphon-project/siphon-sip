@@ -359,6 +359,26 @@ impl PyCall {
         self.source_ip.parse().ok()
     }
 
+    /// Source-membership predicate shared by the `from_gateway` pymethod and
+    /// its unit tests. Kept infallible: an unparseable source IP, a missing
+    /// manager, or an unknown group all resolve to `false`. The `manager`
+    /// seam lets tests inject a `DispatcherManager` without touching the
+    /// process singleton (a first-writer-wins `OnceLock`).
+    #[allow(clippy::wrong_self_convention)]
+    fn from_gateway_impl(
+        &self,
+        group_name: &str,
+        manager: Option<&Arc<crate::gateway::DispatcherManager>>,
+    ) -> bool {
+        let Ok(source_ip) = self.source_ip.parse::<std::net::IpAddr>() else {
+            return false;
+        };
+        match manager {
+            Some(manager) => manager.source_in_group(group_name, source_ip),
+            None => false,
+        }
+    }
+
     /// Whether the script wants to preserve the A-leg Call-ID on the B-leg.
     pub fn preserve_call_id(&self) -> bool {
         self.preserve_call_id_flag
@@ -407,6 +427,29 @@ impl PyCall {
     #[getter]
     fn source_ip(&self) -> &str {
         &self.source_ip
+    }
+
+    /// True when the A-leg source IP is a member of the resolved addresses
+    /// of the gateway group named `group_name`.
+    ///
+    /// The B2BUA equivalent of `request.from_gateway` — a routing-direction /
+    /// trust predicate (siphon's answer to Kamailio `ds_is_from_list()` /
+    /// OpenSIPS `ds_is_in_list()`) that replaces hardcoded source CIDRs.
+    /// Matches on IP only (source port ignored) against every resolved A/AAAA
+    /// candidate of every destination in the group.
+    ///
+    /// Infallible — returns `false` (never raises) when the group does not
+    /// exist, no gateway is configured, or the source IP does not parse.
+    ///
+    /// Security: on connection-oriented transports (TCP/TLS/WS/WSS) the source
+    /// IP is handshake-verified and trustworthy as an authorization signal; on
+    /// UDP it is spoofable, so `from_gateway` there is a best-effort direction
+    /// hint, not an auth gate.
+    ///
+    /// Example: `if call.from_gateway("teams"): call.dial(...)`
+    #[allow(clippy::wrong_self_convention)]
+    fn from_gateway(&self, group_name: &str) -> bool {
+        self.from_gateway_impl(group_name, super::gateway_manager())
     }
 
     /// Media anchoring handle.
@@ -1386,5 +1429,66 @@ mod tests {
         assert_eq!(call.get_header("X-Custom").unwrap(), Some("test-value".to_string()));
         call.remove_header("X-Custom").unwrap();
         assert_eq!(call.get_header("X-Custom").unwrap(), None);
+    }
+
+    // --- from_gateway (source-membership predicate) ---
+
+    fn gateway_manager_with_group() -> Arc<crate::gateway::DispatcherManager> {
+        use crate::gateway::{Algorithm, Destination, DispatcherGroup};
+        use crate::transport::Transport;
+
+        let manager = Arc::new(crate::gateway::DispatcherManager::new());
+        manager.add_group(DispatcherGroup::new(
+            "trunks".to_string(),
+            Algorithm::Weighted,
+            vec![Destination::new(
+                "sip:gw1.example.com".to_string(),
+                "10.0.0.1:5060".parse().unwrap(),
+                Transport::Udp,
+                1,
+                1,
+            )],
+        ));
+        manager
+    }
+
+    #[test]
+    fn call_from_gateway_true_for_member_source() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let manager = gateway_manager_with_group();
+        assert!(call.from_gateway_impl("trunks", Some(&manager)));
+    }
+
+    #[test]
+    fn call_from_gateway_false_for_non_member_source() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        // RFC 5737 TEST-NET-1 — not a member of the group.
+        let call = PyCall::new("test-id".to_string(), message, "192.0.2.7".to_string());
+        let manager = gateway_manager_with_group();
+        assert!(!call.from_gateway_impl("trunks", Some(&manager)));
+    }
+
+    #[test]
+    fn call_from_gateway_false_for_unknown_group() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let manager = gateway_manager_with_group();
+        assert!(!call.from_gateway_impl("nonexistent", Some(&manager)));
+    }
+
+    #[test]
+    fn call_from_gateway_false_when_no_manager() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        assert!(!call.from_gateway_impl("trunks", None));
+    }
+
+    #[test]
+    fn call_from_gateway_false_for_unparseable_source_ip() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new("test-id".to_string(), message, "not-an-ip".to_string());
+        let manager = gateway_manager_with_group();
+        assert!(!call.from_gateway_impl("trunks", Some(&manager)));
     }
 }

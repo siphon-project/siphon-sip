@@ -11,13 +11,14 @@
 //!     request.relay(gw.uri)
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use tracing::{debug, info, warn};
 
@@ -203,19 +204,30 @@ pub struct DispatcherGroup {
     destinations: Vec<Arc<Destination>>,
     /// Round-robin counter per priority level.
     counters: DashMap<u32, AtomicU32>,
+    /// Lock-free cache of every resolved source IP across all destinations.
+    ///
+    /// Read on the request hot path by `contains_source` (the backing store
+    /// for `request.from_gateway` / `call.from_gateway`); rebuilt off the
+    /// hot path by `refresh_member_ips` (startup + each probe cycle). The
+    /// `ArcSwap` gives an atomic swap with no empty window during refresh.
+    member_ips: ArcSwap<HashSet<IpAddr>>,
 }
 
 impl DispatcherGroup {
     pub fn new(name: String, algorithm: Algorithm, destinations: Vec<Destination>) -> Self {
         let destinations: Vec<Arc<Destination>> =
             destinations.into_iter().map(Arc::new).collect();
-        Self {
+        let group = Self {
             name,
             algorithm,
             probe_config: ProbeConfig::default(),
             destinations,
             counters: DashMap::new(),
-        }
+            member_ips: ArcSwap::from_pointee(HashSet::new()),
+        };
+        // Startup resolution — sync context, `to_socket_addrs` is fine here.
+        group.refresh_member_ips();
+        group
     }
 
     pub fn with_probe_config(mut self, config: ProbeConfig) -> Self {
@@ -360,6 +372,47 @@ impl DispatcherGroup {
     pub fn all_destinations(&self) -> &[Arc<Destination>] {
         &self.destinations
     }
+
+    /// Rebuild the cached set of member source IPs.
+    ///
+    /// For every destination: if `address_str` is set, resolve it and insert
+    /// each resolved candidate IP (so a round-robin hostname, and Teams'
+    /// `sip`/`sip2`/`sip3.pstnhub.microsoft.com`, all match, not just the
+    /// currently-selected address). The currently-resolved `address().ip()`
+    /// is ALWAYS also inserted as a floor — this covers static-IP
+    /// destinations and survives a transient resolver hiccup. The new set is
+    /// swapped in atomically, so readers never observe an empty window.
+    ///
+    /// Uses blocking `to_socket_addrs`, so it must never run on the request
+    /// hot path — it is called once at construction (startup) and once per
+    /// probe cycle. Groups with probing disabled get only the startup
+    /// refresh, so a DNS change on such a group is not picked up until
+    /// restart; static-IP and probed groups are always correct.
+    pub fn refresh_member_ips(&self) {
+        use std::net::ToSocketAddrs;
+
+        let mut set: HashSet<IpAddr> = HashSet::new();
+        for dest in &self.destinations {
+            if let Some(ref address_str) = dest.address_str {
+                if let Ok(addrs) = address_str.to_socket_addrs() {
+                    for addr in addrs {
+                        set.insert(addr.ip());
+                    }
+                }
+            }
+            // Floor: the currently-resolved address always counts as a member.
+            set.insert(dest.address().ip());
+        }
+        self.member_ips.store(Arc::new(set));
+    }
+
+    /// True when `ip` is a member of this group's cached resolved-address set.
+    ///
+    /// Matches on IP only (source port is ignored — gateways answer from
+    /// varied ports). Reads the lock-free cache; never resolves DNS.
+    pub fn contains_source(&self, ip: IpAddr) -> bool {
+        self.member_ips.load().contains(&ip)
+    }
 }
 
 
@@ -407,6 +460,18 @@ impl DispatcherManager {
     ) -> Option<Arc<Destination>> {
         self.get_group(group_name)
             .and_then(|group| group.select(key, attr_filter))
+    }
+
+    /// True when `ip` is a resolved member of the named group.
+    ///
+    /// Backs `request.from_gateway` / `call.from_gateway` — a routing-direction
+    /// / trust predicate (the siphon equivalent of Kamailio `ds_is_from_list()`
+    /// / OpenSIPS `ds_is_in_list()`). Returns `false` when the group does not
+    /// exist, so callers can stay infallible.
+    pub fn source_in_group(&self, group_name: &str, ip: IpAddr) -> bool {
+        self.get_group(group_name)
+            .map(|group| group.contains_source(ip))
+            .unwrap_or(false)
     }
 }
 
@@ -457,12 +522,24 @@ pub fn spawn_health_probers(
 }
 
 async fn probe_group(
-    group: &DispatcherGroup,
+    group: &Arc<DispatcherGroup>,
     uac_sender: &UacSender,
     failure_threshold: u32,
     from_user: Option<&str>,
     from_domain: Option<&str>,
 ) {
+    // Refresh the cached member-IP set so `from_gateway` tracks DNS changes on
+    // the probe interval. `refresh_member_ips` does blocking DNS, so run it off
+    // the tokio worker; the request hot path only ever reads the cached set.
+    let group_for_refresh = Arc::clone(group);
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        group_for_refresh.refresh_member_ips();
+    })
+    .await
+    {
+        warn!(group = %group.name, %error, "member-IP refresh task failed");
+    }
+
     for dest in group.all_destinations() {
         probe_destination(dest, uac_sender, failure_threshold, from_user, from_domain).await;
     }
@@ -1533,5 +1610,100 @@ mod tests {
     #[test]
     fn resolve_address_rejects_garbage() {
         assert!(resolve_address("not_valid").is_err());
+    }
+
+    // --- Member-IP set / source membership (from_gateway backing store) ---
+
+    #[test]
+    fn member_ips_populated_from_static_ip_destinations() {
+        // make_dest builds destinations at 10.0.0.1:<port> with no
+        // address_str, so the floor (address().ip()) is the only source.
+        let group = DispatcherGroup::new(
+            "static".to_string(),
+            Algorithm::Weighted,
+            vec![
+                make_dest("sip:gw1.example.com", 5060, 1, 1),
+                make_dest("sip:gw2.example.com", 5061, 1, 1),
+            ],
+        );
+        // Constructor already called refresh_member_ips().
+        assert!(group.contains_source("10.0.0.1".parse().unwrap()));
+        // RFC 5737 TEST-NET-1 — never a member here.
+        assert!(!group.contains_source("192.0.2.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn member_ips_resolve_hostname_candidates() {
+        // Floor is RFC 5737 TEST-NET-2; the hostname resolves to loopback.
+        // Seeing 127.0.0.1 in the set proves resolution ran (not the floor).
+        let dest = Destination::new(
+            "sip:local.example.com".to_string(),
+            "198.51.100.1:5060".parse().unwrap(),
+            Transport::Udp,
+            1,
+            1,
+        )
+        .with_address_str("localhost:5060".to_string());
+        let group =
+            DispatcherGroup::new("local".to_string(), Algorithm::Weighted, vec![dest]);
+
+        assert!(
+            group.contains_source("127.0.0.1".parse().unwrap()),
+            "localhost should resolve to 127.0.0.1"
+        );
+        // Floor is always present too.
+        assert!(group.contains_source("198.51.100.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn contains_source_ignores_port() {
+        // Membership is IP-only; the source port never enters the set.
+        let group = DispatcherGroup::new(
+            "static".to_string(),
+            Algorithm::Weighted,
+            vec![make_dest("sip:gw1.example.com", 12345, 1, 1)],
+        );
+        assert!(group.contains_source("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn source_in_group_matches_and_rejects() {
+        let manager = DispatcherManager::new();
+        manager.add_group(DispatcherGroup::new(
+            "trunks".to_string(),
+            Algorithm::Weighted,
+            vec![make_dest("sip:gw1.example.com", 5060, 1, 1)],
+        ));
+
+        assert!(manager.source_in_group("trunks", "10.0.0.1".parse().unwrap()));
+        assert!(!manager.source_in_group("trunks", "192.0.2.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn source_in_group_unknown_group_is_false() {
+        let manager = DispatcherManager::new();
+        manager.add_group(DispatcherGroup::new(
+            "trunks".to_string(),
+            Algorithm::Weighted,
+            vec![make_dest("sip:gw1.example.com", 5060, 1, 1)],
+        ));
+        // Unknown group must never raise — it returns false.
+        assert!(!manager.source_in_group("nonexistent", "10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn refresh_member_ips_tracks_address_change() {
+        let group = DispatcherGroup::new(
+            "static".to_string(),
+            Algorithm::Weighted,
+            vec![make_dest("sip:gw1.example.com", 5060, 1, 1)],
+        );
+        assert!(group.contains_source("10.0.0.1".parse().unwrap()));
+
+        // Simulate a DNS re-resolution to a new IP (as probe_destination does),
+        // then re-run the refresh the probe cycle would trigger.
+        group.all_destinations()[0].set_address("203.0.113.7:5060".parse().unwrap());
+        group.refresh_member_ips();
+        assert!(group.contains_source("203.0.113.7".parse().unwrap()));
     }
 }

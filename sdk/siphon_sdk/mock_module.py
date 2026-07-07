@@ -12,6 +12,7 @@ configurable backends for registrar, auth, cache, etc.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import sys
 import uuid
 from types import ModuleType
@@ -2057,6 +2058,27 @@ class MockRtpEngine:
 # Dispatcher namespace
 # ---------------------------------------------------------------------------
 
+def _ip_of_address(address: str) -> Optional[str]:
+    """Extract the bare IP from a ``host:port`` (or bare-host) address string.
+
+    Handles ``"10.0.0.1:5060"`` → ``"10.0.0.1"``, ``"[::1]:5060"`` → ``"::1"``,
+    and bare literals unchanged.  Returns ``None`` only for the empty string.
+    Used by :meth:`MockGateway.contains_source` to model the Rust engine's
+    IP-only source membership.
+    """
+    if not address:
+        return None
+    if address.startswith("["):
+        end = address.find("]")
+        if end != -1:
+            return address[1:end]
+    # "10.0.0.1:5060" (one colon) → strip the port; a bare IPv6 (many colons,
+    # no port) or a bare IPv4 is returned unchanged.
+    if address.count(":") == 1:
+        return address.rsplit(":", 1)[0]
+    return address
+
+
 class MockDestination:
     """A destination returned by ``gateway.select()`` or ``gateway.list()``.
 
@@ -2177,6 +2199,45 @@ class MockGateway:
         counter = self._counters.get(group_name, 0)
         self._counters[group_name] = counter + 1
         return candidates[counter % len(candidates)]
+
+    def contains_source(self, group_name: str, source_ip: str) -> bool:
+        """True when ``source_ip`` is a member IP of the named group.
+
+        Mirrors the Rust ``DispatcherManager::source_in_group`` — the backing
+        check for ``request.from_gateway`` / ``call.from_gateway``.  Matches on
+        IP only (destination port ignored) against every destination's
+        ``address``.  Returns ``False`` (never raises) for an unknown group or
+        an unparseable ``source_ip``, so callers stay infallible.
+
+        In the mock, membership is the set of destination-address IP literals
+        you registered via :meth:`add_group` (no DNS is performed — give
+        destinations literal IP addresses to model resolved gateways).
+
+        Example::
+
+            gateway.add_group("teams", [
+                {"uri": "sip:sip.pstnhub.microsoft.com", "address": "203.0.113.10:5061"},
+            ])
+            gateway.contains_source("teams", "203.0.113.10")  # True
+        """
+        dests = self._groups.get(group_name)
+        if not dests:
+            return False
+        try:
+            needle = ipaddress.ip_address(source_ip)
+        except ValueError:
+            return False
+        for dest in dests:
+            host = _ip_of_address(dest.address)
+            if host is None:
+                continue
+            try:
+                if ipaddress.ip_address(host) == needle:
+                    return True
+            except ValueError:
+                # Non-literal host (a hostname) — the mock does no DNS; skip.
+                continue
+        return False
 
     def list(self, group_name: str) -> list[MockDestination]:
         """List all destinations in a group.
