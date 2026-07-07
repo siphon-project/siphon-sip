@@ -620,6 +620,146 @@ services:
     profiles:
       - rtpengine
 
+  # ── rtpproxy proxy test ───────────────────────────────────────────────────
+  # Tests media anchoring through a mock classic rtpproxy via proxy script.
+  # Same flow + SIPp scenarios as the rtpengine test, but the backend is
+  # `media.backend: rtpproxy` and siphon rewrites the SDP itself (rtpproxy only
+  # allocates the relay port). Requires the "rtpproxy" profile.
+  #
+  # Usage:
+  #   docker compose -f sipp/docker-compose.yaml --profile rtpproxy \
+  #     up --abort-on-container-exit sipp-rtpproxy-uac sipp-rtpproxy-uas
+
+  # Mock rtpproxy — Python script simulating the text protocol on UDP 22222
+  mock-rtpproxy:
+    image: python:3.12-slim
+    container_name: mock-rtpproxy
+    volumes:
+      - ./rtpproxy:/app:ro
+    working_dir: /app
+    command: ["python3", "mock_rtpproxy.py"]
+    environment:
+      RTPPROXY_PORT: "22222"
+      MOCK_MEDIA_IP: "203.0.113.1"
+      MOCK_MEDIA_PORT: "30000"
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.44
+    healthcheck:
+      # Send a `V` (version) query and expect a digit-led reply.
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'hc V', ('127.0.0.1',22222)); d=s.recv(1024); s.close(); exit(0 if d.split(b' ',1)[1][:1].isdigit() else 1)\""]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    profiles:
+      - rtpproxy
+
+  # SIPhon proxy with rtpproxy config (media.backend: rtpproxy)
+  siphon-rtpproxy:
+    build:
+      context: ..
+    container_name: siphon-rtpproxy-test
+    depends_on:
+      mock-rtpproxy:
+        condition: service_healthy
+    volumes:
+      - ./rtpproxy/siphon-rtpproxy.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.45
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - rtpproxy
+
+  # Register bob from the UAS IP so proxy knows where to relay
+  sipp-rtpproxy-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-rtpproxy:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.46
+    entrypoint:
+      - sipp
+      - "172.20.0.45:5060"
+      - -sf
+      - /sipp/scenarios/register.xml
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - rtpproxy
+
+  # B-leg UAS: receives INVITE relayed by proxy with rtpproxy-rewritten SDP.
+  # Reuses the rtpengine SIPp scenarios — the mock returns the same media addr.
+  sipp-rtpproxy-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-rtpproxy-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.46
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/rtpengine_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - rtpproxy
+
+  # A-leg UAC: sends INVITE to proxy with SDP, expects rtpproxy-rewritten 200 OK
+  sipp-rtpproxy-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-rtpproxy:
+        condition: service_healthy
+      sipp-rtpproxy-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.47
+    entrypoint:
+      - sipp
+      - "172.20.0.45:5060"
+      - -sf
+      - /sipp/scenarios/rtpproxy_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - rtpproxy
+
   # ── RTPEngine re-INVITE test (hold/resume) ────────────────────────────────
   # Tests mid-dialog re-INVITE with RTPEngine offer/answer cycle.
   # Flow: INVITE → 200 → ACK → re-INVITE(hold) → 200 → ACK

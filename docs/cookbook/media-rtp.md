@@ -36,12 +36,17 @@ media:
 
 ## Choosing a media engine
 
-SIPhon drives one of two media engines, chosen with `media.backend`:
-[RTPEngine](https://github.com/sipwise/rtpengine) (`rtpengine`, the default) or
-the in-house **siphon-rtp** (`siphon-rtp`). Everything on this page — the
-`offer` / `answer` / `delete` lifecycle, the profiles, and the `rtpengine`
-scripting namespace — is **identical** for both; only the engine you run and the
-`media:` block that points at it change.
+SIPhon drives one of three media engines, chosen with `media.backend`:
+
+| `media.backend` | Engine | Control transport |
+|---|---|---|
+| `rtpengine` *(default)* | [RTPEngine](https://github.com/sipwise/rtpengine) | NG protocol, bencode over UDP |
+| `siphon-rtp` | the in-house **siphon-rtp** engine | native JSON over a persistent TCP connection |
+| `rtpproxy` | classic [rtpproxy](https://github.com/sippy/rtpproxy) relay | text protocol over UDP |
+
+Everything else on this page — the `offer` / `answer` / `delete` lifecycle, the
+profiles, and the `rtpengine` scripting namespace — is **identical** for all
+backends; only the transport underneath changes.
 
 !!! warning "siphon-rtp is experimental"
     The siphon-rtp engine is pre-release, so this backend is **experimental** —
@@ -50,6 +55,45 @@ scripting namespace — is **identical** for both; only the engine you run and t
 
 See [Media engines: rtpengine vs siphon-rtp](../media-engines.md) for the full
 comparison, the `media.siphon_rtp` config, and how to run and operate each engine.
+
+### Classic rtpproxy (keep your existing relay)
+
+Migrating an OpenSIPS / Kamailio / Sippy deployment? Point siphon at your existing
+`rtpproxy` instead of standing up a new media engine — the script is unchanged, only
+the config differs:
+
+```yaml
+media:
+  backend: rtpproxy
+  rtpproxy:
+    address: "127.0.0.1:22222"     # rtpproxy -s udp:<addr>
+    timeout_ms: 1000
+    retries: 2                     # UDP retransmits (same cookie); rtpproxy de-dupes
+
+# or several, for HA / weighted load-balancing (per-call-id affinity)
+media:
+  backend: rtpproxy
+  rtpproxy:
+    instances:
+      - { address: "10.0.0.1:22222", weight: 2 }
+      - { address: "10.0.0.2:22222", weight: 1 }
+```
+
+siphon speaks rtpproxy's classic `U`/`L`/`D` protocol on the wire. Because rtpproxy
+only hands back a relay port (it does **not** rewrite SDP itself), siphon rewrites the
+`c=`/`m=` lines for you — per media stream, including held media (`m=… 0`). Profiles
+still apply, but only the flags rtpproxy understands: a profile's
+`direction: ["internal","external"]` becomes bridge mode (`ie`/`ei`) and an
+`asymmetric` flag maps through; IPv6 is detected per stream. SRTP/DTLS/ICE flags are
+ignored — rtpproxy is a plain RTP relay (use `rtpengine` or `siphon-rtp` for SRTP↔RTP,
+WebRTC, or transcoding). It has the same weighted round-robin + per-call-id affinity
+and per-instance `V` health probes as the other backends.
+
+!!! note "rtpproxy is anchor-only"
+    The extra `rtpengine` verbs — announcements / tones (`play_media`, `play_dtmf`),
+    gating (`silence_media` / `block_media`), DTMF events, and SIPREC/MPTY
+    subscriptions — are not available on the rtpproxy backend and raise a clear
+    error. They need `rtpengine` or `siphon-rtp`.
 
 ## The offer / answer / delete lifecycle
 
