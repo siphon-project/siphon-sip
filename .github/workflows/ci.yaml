@@ -325,18 +325,16 @@ jobs:
       - name: Run fuzz target (60s)
         run: PYO3_PYTHON=python3.14 cargo +nightly fuzz run sip_parser_fuzz -- -max_total_time=60
 
-  # ── SIPp IPsec VoLTE test (manual-only) ────────────────────────────────
+  # ── SIPp IPsec VoLTE test (self-hosted) ────────────────────────────────
   # IPsec XFRM SA installation needs CAP_NET_ADMIN, which GitHub-hosted runners
-  # don't grant — this can NEVER pass here. It used to run on every push/PR,
-  # burning ~7 min compiling siphon for a guaranteed (continue-on-error) red.
-  # Now it only runs on a manual `workflow_dispatch`, so point that at a
-  # privileged/self-hosted runner when you actually want it. The ipsec logic is
+  # don't grant. Runs on the self-hosted `ipsec` runner (real xfrm) on trusted
+  # triggers only — pushes to trunk and manual dispatch, never fork PRs — so
+  # untrusted code can't reach the privileged box. The ipsec logic is also
   # covered by the unit tests in rust-tests.
   sipp-ipsec:
-    if: ${{ github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    runs-on: [self-hosted, linux, x64, ipsec]
     needs: rust-tests
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
 

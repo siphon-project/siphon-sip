@@ -42,8 +42,28 @@ def on_cancel(call):                            # caller abandoned before answer
 Each B-leg gets its own Call-ID and From-tag by default, so the two dialogs are fully
 decoupled — **topology hiding out of the box**. Other call methods: `call.fork(targets)`
 (ring several B-legs), `call.reject(code, reason)`, `call.terminate()`,
-`call.set_header` / `remove_header`, and B-leg userpart rewrites
-(`call.set_ruri_user` / `set_from_user` / `set_to_user`).
+`call.set_header` / `remove_header`, and B-leg URI rewrites — userpart
+(`call.set_ruri_user` / `set_from_user` / `set_to_user`) and host
+(`call.set_from_host` / `set_to_host`).
+
+### Keeping a tenant domain in the From
+
+Topology hiding rewrites the B-leg From host to SIPhon's advertised address and the To
+host to the dial target. That's the right default, but a multitenant downstream that
+selects the tenant from the From domain needs the original domain to survive — a
+domainless From lands the call in its unauthenticated/default routing context. Pin it:
+
+```python
+@b2bua.on_invite
+def on_invite(call):
+    call.set_from_host("tenant.example.com")   # keep the tenant domain in From
+    call.dial(str(call.ruri), next_hop="sip:pbx.example.com:5060")
+```
+
+`set_from_host` opts that leg out of the From host-rewrite; `set_to_host` pins the To
+host the same way (a declarative replacement for hand-building
+`set_header("To", "<sip:user@host>")`). Only the host changes — scheme, user, port,
+params, and tags are preserved — and both apply to `call.dial()` and `call.fork()`.
 
 ## Header policies — control what crosses the boundary
 
