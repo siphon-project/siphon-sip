@@ -35,7 +35,7 @@ Ongoing development is backed by
 ### Platform Partner
 
 <p align="center">
-  <a href="https://www.arnacon.com/"><img src="assets/partners/arnacon.svg" alt="Arnacon by Cellact — Platform Partner" width="300"></a>
+  <a href="https://www.arnacon.com/"><img src="assets/partners/arnacon.png" alt="Arnacon by Cellact — Platform Partner" width="300"></a>
 </p>
 
 **[Cellact](https://www.cellact.com/)** and its Web3 telecom project
