@@ -338,13 +338,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The ipsec runner is self-hosted and persistent — a stale container from
+      # a previous run (started with an older image/config, e.g. before the
+      # config had ipsec.path_host) would otherwise be reused by `up`, since the
+      # profiled services survive a bare `down`. Nuke them first.
+      - name: Reset stale test containers
+        run: docker compose -f sipp/docker-compose.yaml --profile ipsec down -v --remove-orphans || true
+
       - name: Build siphon and sipp-ipsec images
         run: |
           docker compose -f sipp/docker-compose.yaml build siphon
           docker compose -f sipp/docker-compose.yaml --profile ipsec build sipp-ipsec
 
       - name: Start P-CSCF + S-CSCF
-        run: docker compose -f sipp/docker-compose.yaml --profile ipsec up -d --wait siphon-ipsec
+        run: docker compose -f sipp/docker-compose.yaml --profile ipsec up -d --wait --force-recreate siphon-ipsec
 
       - name: SIPp IPsec VoLTE registration
         run: docker compose -f sipp/docker-compose.yaml --profile ipsec run --rm sipp-ipsec
@@ -359,7 +366,7 @@ jobs:
 
       - name: Teardown
         if: always()
-        run: docker compose -f sipp/docker-compose.yaml down --remove-orphans
+        run: docker compose -f sipp/docker-compose.yaml --profile ipsec down -v --remove-orphans
 
       - name: Upload logs
         if: always()
