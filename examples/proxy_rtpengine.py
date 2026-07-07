@@ -1,8 +1,12 @@
 """
-SIPhon proxy script with RTPEngine media anchoring.
+SIPhon proxy script with media anchoring.
 
-Used for functional testing: anchors media through a mock RTPEngine
+Used for functional testing: anchors media through the media engine
 on INVITE (offer) and reply (answer), deletes on BYE.
+
+The `rtpengine` namespace is backend-agnostic: this script runs unchanged
+on either media engine — flip `media.backend` between `rtpengine` (default)
+and `siphon-rtp` in siphon.yaml. See docs/media-engines.md.
 """
 from siphon import proxy, registrar, auth, rtpengine, log
 

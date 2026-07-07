@@ -2,9 +2,15 @@
 
 SIPhon anchors and transforms media through a pluggable media engine —
 [RTPEngine](https://github.com/sipwise/rtpengine) over its NG control protocol by
-default, or the native **siphon-rtp** engine ([see below](#media-backends)). A
-**profile** is a named bundle of engine flags — SRTP↔RTP interworking, WebRTC, ICE
-handling, transcoding direction — that you select per call with one argument.
+default, or the native **siphon-rtp** engine ([choosing and managing an
+engine](../media-engines.md)). A **profile** is a named bundle of engine flags —
+SRTP↔RTP interworking, WebRTC, ICE handling, transcoding direction — that you
+select per call with one argument.
+
+This page is the **scripting recipe** — the `offer` / `answer` / `delete`
+lifecycle and the profile catalogue. It is identical for both backends. For
+*which* engine to run and *how to operate each one*, see
+[Media engines: rtpengine vs siphon-rtp](../media-engines.md).
 
 ## Config
 
@@ -28,47 +34,22 @@ media:
       - { address: "10.0.0.2:22222", weight: 1 }
 ```
 
-## Media backends
+## Choosing a media engine
 
 SIPhon drives one of two media engines, chosen with `media.backend`:
-
-| `media.backend` | Engine | Control transport |
-|---|---|---|
-| `rtpengine` *(default)* | [RTPEngine](https://github.com/sipwise/rtpengine) | NG protocol, bencode over UDP |
-| `siphon-rtp` | the in-house **siphon-rtp** engine | native JSON over a persistent TCP connection |
-
-Everything else on this page — the `offer` / `answer` / `delete` lifecycle, the
-profiles, and the `rtpengine` scripting namespace — is **identical** for both
-backends; only the transport underneath changes.
+[RTPEngine](https://github.com/sipwise/rtpengine) (`rtpengine`, the default) or
+the in-house **siphon-rtp** (`siphon-rtp`). Everything on this page — the
+`offer` / `answer` / `delete` lifecycle, the profiles, and the `rtpengine`
+scripting namespace — is **identical** for both; only the engine you run and the
+`media:` block that points at it change.
 
 !!! warning "siphon-rtp is experimental"
     The siphon-rtp engine is pre-release, so this backend is **experimental** —
     use the default `rtpengine` backend in production until it stabilises.
     SIPREC/MPTY subscriptions are not yet implemented on siphon-rtp.
 
-The native backend speaks a reliable TCP control channel with request/response
-correlation, an optional shared-secret auth handshake, automatic reconnect with
-backoff, and **server-pushed events** (DTMF, media-timeout) on the same connection
-(so `@rtpengine.on_dtmf` works unchanged). It has the same weighted round-robin +
-per-call-id connection affinity HA story as rtpengine.
-
-```yaml
-# single engine
-media:
-  backend: siphon-rtp
-  siphon_rtp:
-    address: "127.0.0.1:8080"                        # siphon-rtp --control <addr> (TCP)
-    control_secret: "${SIPHON_RTP_CONTROL_SECRET}"   # optional shared secret
-    timeout_ms: 2000
-
-# or several, for HA (control_secret is shared across all)
-media:
-  backend: siphon-rtp
-  siphon_rtp:
-    instances:
-      - { address: "10.0.0.1:8080", weight: 2 }
-      - { address: "10.0.0.2:8080", weight: 1 }
-```
+See [Media engines: rtpengine vs siphon-rtp](../media-engines.md) for the full
+comparison, the `media.siphon_rtp` config, and how to run and operate each engine.
 
 ## The offer / answer / delete lifecycle
 

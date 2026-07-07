@@ -51,6 +51,7 @@ nav:
       - Monitoring & observability: cookbook/monitoring.md
   - Running in production:
       - Transports & networking: transports.md
+      - Media engines (rtpengine / siphon-rtp): media-engines.md
       - Scaling, clustering & redundancy: scaling-and-redundancy.md
       - Deployment & operations: deployment.md
       - Supply chain & SBOM: supply-chain.md
