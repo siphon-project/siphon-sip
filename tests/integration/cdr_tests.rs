@@ -236,6 +236,7 @@ async fn file_backend_write_and_read_back() {
             path: temp_path.clone(),
             rotate_size_mb: 100,
         },
+        auto_emit: false,
         include_register: false,
         channel_size: 100,
     };

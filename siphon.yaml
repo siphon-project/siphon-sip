@@ -578,10 +578,21 @@ auth:
 # destination_ip, transport, user_agent, auth_user, disconnect_initiator,
 # sip_reason, plus any extra fields added by scripts.
 #
+# Two ways to produce CDRs, additive:
+#   * auto_emit: true  — siphon writes one CDR per call automatically on the
+#     call lifecycle (INVITE answer -> BYE, plus failed/cancelled/timed-out
+#     calls), for both proxy and B2BUA, with timestamps, duration_secs and
+#     disconnect_initiator filled in. No script needed. Default OFF, so
+#     existing manual-only deployments are unchanged.
+#   * cdr.write(request|call, extra=...) from a script — always available, and
+#     stacks on top of auto_emit (use it to add billing_id / trunk / etc., or
+#     to emit records auto_emit doesn't).
+#
 # File backend (JSON-lines):
 # cdr:
 #   enabled: true
-#   include_register: false       # generate CDRs for REGISTER events too
+#   auto_emit: true               # auto-generate a CDR per call (default false)
+#   include_register: false       # with auto_emit, also emit a CDR per REGISTER
 #   channel_size: 10000           # async buffer (drop CDR if full)
 #   backend: file
 #   file:
@@ -603,9 +614,10 @@ auth:
 #   syslog:
 #     target: "10.0.0.5:514"
 #
-# Python usage:
+# Python usage (adds to / stacks on auto_emit):
 #   from siphon import cdr
-#   cdr.write(request, extra={"billing_id": "B-12345", "trunk": "carrier-a"})
+#   cdr.write(request, extra={"billing_id": "B-12345", "trunk": "carrier-a"})  # proxy
+#   cdr.write(call, extra={"billing_id": "B-12345"})                          # b2bua
 
 # ---------------------------------------------------------------------------
 # SRS — Session Recording Server (RFC 7866 SIPREC)

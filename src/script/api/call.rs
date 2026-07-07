@@ -155,6 +155,8 @@ pub struct PyCall {
     message: Arc<Mutex<SipMessage>>,
     /// Source IP of the A-leg.
     source_ip: String,
+    /// Transport the A-leg arrived on ("udp"/"tcp"/"tls"/"ws"/"wss"), for CDRs.
+    transport_name: String,
     /// Current call state.
     state: String,
     /// The action chosen by the script.
@@ -212,11 +214,13 @@ impl PyCall {
         id: String,
         message: Arc<Mutex<SipMessage>>,
         source_ip: String,
+        transport_name: String,
     ) -> Self {
         Self {
             id,
             message,
             source_ip,
+            transport_name,
             state: "calling".to_string(),
             action: CallAction::None,
             media_handle: PyMediaHandle::default(),
@@ -377,6 +381,142 @@ impl PyCall {
             Some(manager) => manager.source_in_group(group_name, source_ip),
             None => false,
         }
+    }
+
+    // --- CDR helper accessors (Rust-side, no PyResult) ---
+    //
+    // Mirror the `cdr_*` accessors on `PyRequest` so `cdr.write(call)` from a
+    // B2BUA handler produces the same record shape as `cdr.write(request)` from
+    // a proxy handler.  The B2BUA `Call` is always driven by the A-leg INVITE,
+    // so `cdr_method()` is INVITE and the URIs/Call-ID come off that INVITE.
+
+    /// SIP method string for CDR (always INVITE for a B2BUA call).
+    pub fn cdr_method(&self) -> String {
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("lock poisoned in cdr_method, using poisoned guard");
+                poisoned.into_inner()
+            }
+        };
+        match &message.start_line {
+            crate::sip::message::StartLine::Request(request_line) => {
+                request_line.method.as_str().to_string()
+            }
+            _ => "INVITE".to_string(),
+        }
+    }
+
+    /// Call-ID for CDR.
+    pub fn cdr_call_id(&self) -> String {
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("lock poisoned in cdr_call_id, using poisoned guard");
+                poisoned.into_inner()
+            }
+        };
+        message.headers.call_id().cloned().unwrap_or_default()
+    }
+
+    /// From URI string for CDR.
+    pub fn cdr_from_uri(&self) -> String {
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("lock poisoned in cdr_from_uri, using poisoned guard");
+                poisoned.into_inner()
+            }
+        };
+        message
+            .headers
+            .from()
+            .and_then(|v| crate::sip::headers::nameaddr::NameAddr::parse(v).ok())
+            .map(|na| na.uri.to_string())
+            .unwrap_or_default()
+    }
+
+    /// To URI string for CDR.
+    pub fn cdr_to_uri(&self) -> String {
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("lock poisoned in cdr_to_uri, using poisoned guard");
+                poisoned.into_inner()
+            }
+        };
+        message
+            .headers
+            .to()
+            .and_then(|v| crate::sip::headers::nameaddr::NameAddr::parse(v).ok())
+            .map(|na| na.uri.to_string())
+            .unwrap_or_default()
+    }
+
+    /// Request-URI string for CDR.
+    pub fn cdr_ruri(&self) -> String {
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("lock poisoned in cdr_ruri, using poisoned guard");
+                poisoned.into_inner()
+            }
+        };
+        match &message.start_line {
+            crate::sip::message::StartLine::Request(request_line) => {
+                request_line.request_uri.to_string()
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// Source IP for CDR.
+    pub fn cdr_source_ip(&self) -> String {
+        self.source_ip.clone()
+    }
+
+    /// Transport name for CDR (the A-leg's arrival transport).
+    pub fn cdr_transport(&self) -> String {
+        self.transport_name.clone()
+    }
+
+    /// Candidate Rf-session storage keys for the CDR auto-stamp lookup.
+    ///
+    /// Mirrors [`PyRequest::cdr_rf_dialog_key_candidates`](super::request::PyRequest)
+    /// so a `cdr.write(call)` from a B2BUA handler is annotated with the same
+    /// `rf_session_id` / `rf_result_code` the proxy path stamps.
+    pub fn cdr_rf_dialog_key_candidates(&self) -> Vec<String> {
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!(
+                    "lock poisoned in cdr_rf_dialog_key_candidates, using poisoned guard"
+                );
+                poisoned.into_inner()
+            }
+        };
+        let icid = message
+            .headers
+            .get("P-Charging-Vector")
+            .and_then(|v| crate::sip::headers::charging::ChargingVector::parse(v).icid);
+        let call_id = message.headers.call_id();
+        let from_tag = message
+            .headers
+            .from()
+            .and_then(|v| crate::sip::headers::nameaddr::NameAddr::parse(v).ok())
+            .and_then(|na| na.tag);
+        let to_tag = message
+            .headers
+            .to()
+            .and_then(|v| crate::sip::headers::nameaddr::NameAddr::parse(v).ok())
+            .and_then(|na| na.tag);
+
+        crate::diameter::rf_service::rf_lookup_candidates(
+            icid.as_deref(),
+            call_id.map(|s| s.as_str()),
+            from_tag.as_deref(),
+            to_tag.as_deref(),
+        )
     }
 
     /// Whether the script wants to preserve the A-leg Call-ID on the B-leg.
@@ -1067,7 +1207,7 @@ mod tests {
     #[test]
     fn call_initial_state() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         assert_eq!(call.id, "test-id");
         assert_eq!(call.state, "calling");
         assert_eq!(call.action(), &CallAction::None);
@@ -1076,7 +1216,7 @@ mod tests {
     #[test]
     fn call_reject() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         call.reject(404, "Not Found");
         assert_eq!(
             call.action(),
@@ -1090,7 +1230,7 @@ mod tests {
     #[test]
     fn call_dial() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         call.dial("sip:bob@10.0.0.2:5060", 30, None, None, None, vec![], vec![], vec![], vec![]);
         assert_eq!(
             call.action(),
@@ -1109,7 +1249,7 @@ mod tests {
     #[test]
     fn call_dial_with_route() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         call.dial(
             "sip:5112@ims.mnc01.mcc001.3gppnetwork.org",
             30,
@@ -1132,7 +1272,7 @@ mod tests {
     #[test]
     fn call_dial_next_hop() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         call.dial(
             "sip:5112@ims.mnc088.mcc204.3gppnetwork.org",
             30,
@@ -1159,7 +1299,7 @@ mod tests {
     #[test]
     fn call_dial_with_header_policy_and_deltas() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         call.dial(
             "sip:bob@10.0.0.2:5060",
             30,
@@ -1186,7 +1326,7 @@ mod tests {
         pyo3::Python::initialize();
         pyo3::Python::attach(|py| {
             let message = Arc::new(Mutex::new(make_invite()));
-            let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+            let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
             let targets: Vec<Bound<'_, PyAny>> = vec![
                 pyo3::types::PyString::new(py, "sip:bob@10.0.0.2").into_any(),
                 pyo3::types::PyString::new(py, "sip:bob@10.0.0.3").into_any(),
@@ -1209,7 +1349,7 @@ mod tests {
         pyo3::Python::initialize();
         pyo3::Python::attach(|py| {
             let message = Arc::new(Mutex::new(make_invite()));
-            let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+            let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
             let targets: Vec<Bound<'_, PyAny>> = vec![
                 pyo3::types::PyString::new(py, "sip:bob@10.0.0.2").into_any(),
                 pyo3::types::PyString::new(py, "sip:bob@10.0.0.3").into_any(),
@@ -1224,7 +1364,7 @@ mod tests {
     #[test]
     fn call_terminate() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         call.terminate();
         assert_eq!(call.action(), &CallAction::Terminate);
     }
@@ -1232,7 +1372,7 @@ mod tests {
     #[test]
     fn call_state_transition() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         assert_eq!(call.state, "calling");
         call.set_state("ringing");
         assert_eq!(call.state, "ringing");
@@ -1243,7 +1383,7 @@ mod tests {
     #[test]
     fn call_header_access() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         assert_eq!(call.get_header("Call-ID").unwrap(), Some("call-test-1".to_string()));
         assert!(call.has_header("Via").unwrap());
         assert!(!call.has_header("X-Custom").unwrap());
@@ -1252,7 +1392,7 @@ mod tests {
     #[test]
     fn call_session_timer_override() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         assert!(call.session_timer_override().is_none());
 
         call.session_timer(3600, 120, "uas");
@@ -1265,7 +1405,7 @@ mod tests {
     #[test]
     fn call_accept_refer() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         call.accept_refer();
         assert_eq!(call.action(), &CallAction::AcceptRefer);
     }
@@ -1273,7 +1413,7 @@ mod tests {
     #[test]
     fn call_reject_refer() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         call.reject_refer(403, "Forbidden");
         assert_eq!(
             call.action(),
@@ -1287,7 +1427,7 @@ mod tests {
     #[test]
     fn call_refer_to_initially_none() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         assert!(call.refer_to_uri.is_none());
         assert!(call.refer_replaces_info.is_none());
     }
@@ -1295,7 +1435,7 @@ mod tests {
     #[test]
     fn call_set_refer_to_blind() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         call.set_refer_to("sip:carol@example.com".to_string(), None);
         assert_eq!(call.refer_to_uri.as_deref(), Some("sip:carol@example.com"));
         assert!(call.refer_replaces_info.is_none());
@@ -1304,7 +1444,7 @@ mod tests {
     #[test]
     fn call_set_refer_to_attended() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         let replaces = crate::sip::headers::refer::Replaces {
             call_id: "other-call@host".to_string(),
             from_tag: "ft".to_string(),
@@ -1322,7 +1462,7 @@ mod tests {
     #[test]
     fn call_set_ruri_user() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string());
+        let call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string(), "udp".to_string());
         call.set_ruri_user("+33123456789").unwrap();
         let msg = message.lock().unwrap();
         if let crate::sip::message::StartLine::Request(ref rl) = msg.start_line {
@@ -1335,7 +1475,7 @@ mod tests {
     #[test]
     fn call_set_from_user() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string());
+        let call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string(), "udp".to_string());
         call.set_from_user("+33999888777").unwrap();
         let msg = message.lock().unwrap();
         let from = msg.headers.get("From").unwrap();
@@ -1346,7 +1486,7 @@ mod tests {
     #[test]
     fn call_set_to_user() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string());
+        let call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string(), "udp".to_string());
         call.set_to_user("5112").unwrap();
         let msg = message.lock().unwrap();
         let to = msg.headers.get("To").unwrap();
@@ -1359,7 +1499,7 @@ mod tests {
         let mut invite = make_invite();
         invite.headers.set("To", "<sip:bob@example.com>;tag=remote-tag".to_string());
         let message = Arc::new(Mutex::new(invite));
-        let call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string());
+        let call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string(), "udp".to_string());
         call.set_to_user("5112").unwrap();
         let msg = message.lock().unwrap();
         let to = msg.headers.get("To").unwrap();
@@ -1370,7 +1510,7 @@ mod tests {
     #[test]
     fn call_set_from_host() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let mut call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string());
+        let mut call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string(), "udp".to_string());
         call.set_from_host("tenant.example.com").unwrap();
         let msg = message.lock().unwrap();
         let from = msg.headers.get("From").unwrap();
@@ -1389,7 +1529,7 @@ mod tests {
             "\"Alice\" <sip:1001@old.example.com:5060>;tag=xyz".to_string(),
         );
         let message = Arc::new(Mutex::new(invite));
-        let mut call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string());
+        let mut call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string(), "udp".to_string());
         call.set_from_host("tenant.example.com").unwrap();
         let msg = message.lock().unwrap();
         let from = msg.headers.get("From").unwrap();
@@ -1402,7 +1542,7 @@ mod tests {
     #[test]
     fn call_set_to_host() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let mut call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string());
+        let mut call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string(), "udp".to_string());
         call.set_to_host("trunk.example.com").unwrap();
         let msg = message.lock().unwrap();
         let to = msg.headers.get("To").unwrap();
@@ -1416,7 +1556,7 @@ mod tests {
     #[test]
     fn call_set_from_host_none_by_default() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         assert_eq!(call.from_host_override(), None);
         assert_eq!(call.to_host_override(), None);
     }
@@ -1424,7 +1564,7 @@ mod tests {
     #[test]
     fn call_set_and_remove_header() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         call.set_header("X-Custom", "test-value").unwrap();
         assert_eq!(call.get_header("X-Custom").unwrap(), Some("test-value".to_string()));
         call.remove_header("X-Custom").unwrap();
@@ -1455,7 +1595,7 @@ mod tests {
     #[test]
     fn call_from_gateway_true_for_member_source() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         let manager = gateway_manager_with_group();
         assert!(call.from_gateway_impl("trunks", Some(&manager)));
     }
@@ -1464,7 +1604,7 @@ mod tests {
     fn call_from_gateway_false_for_non_member_source() {
         let message = Arc::new(Mutex::new(make_invite()));
         // RFC 5737 TEST-NET-1 — not a member of the group.
-        let call = PyCall::new("test-id".to_string(), message, "192.0.2.7".to_string());
+        let call = PyCall::new("test-id".to_string(), message, "192.0.2.7".to_string(), "udp".to_string());
         let manager = gateway_manager_with_group();
         assert!(!call.from_gateway_impl("trunks", Some(&manager)));
     }
@@ -1472,7 +1612,7 @@ mod tests {
     #[test]
     fn call_from_gateway_false_for_unknown_group() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         let manager = gateway_manager_with_group();
         assert!(!call.from_gateway_impl("nonexistent", Some(&manager)));
     }
@@ -1480,15 +1620,52 @@ mod tests {
     #[test]
     fn call_from_gateway_false_when_no_manager() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         assert!(!call.from_gateway_impl("trunks", None));
     }
 
     #[test]
     fn call_from_gateway_false_for_unparseable_source_ip() {
         let message = Arc::new(Mutex::new(make_invite()));
-        let call = PyCall::new("test-id".to_string(), message, "not-an-ip".to_string());
+        let call = PyCall::new("test-id".to_string(), message, "not-an-ip".to_string(), "udp".to_string());
         let manager = gateway_manager_with_group();
         assert!(!call.from_gateway_impl("trunks", Some(&manager)));
+    }
+
+    #[test]
+    fn call_cdr_accessors() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new(
+            "test-id".to_string(),
+            message,
+            "10.0.0.1".to_string(),
+            "tcp".to_string(),
+        );
+        assert_eq!(call.cdr_method(), "INVITE");
+        assert_eq!(call.cdr_call_id(), "call-test-1");
+        assert_eq!(call.cdr_from_uri(), "sip:alice@atlanta.com");
+        assert_eq!(call.cdr_to_uri(), "sip:bob@example.com");
+        assert_eq!(call.cdr_ruri(), "sip:bob@example.com");
+        assert_eq!(call.cdr_source_ip(), "10.0.0.1");
+        // Transport is threaded from the A-leg, not hard-coded.
+        assert_eq!(call.cdr_transport(), "tcp");
+    }
+
+    #[test]
+    fn call_cdr_rf_dialog_keys_include_from_tag() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new(
+            "test-id".to_string(),
+            message,
+            "10.0.0.1".to_string(),
+            "udp".to_string(),
+        );
+        let keys = call.cdr_rf_dialog_key_candidates();
+        // make_invite() has Call-ID "call-test-1" and From-tag "abc"; the
+        // dialog-keyed candidate must be present so the Rf auto-stamp can hit.
+        assert!(
+            keys.iter().any(|k| k.contains("call-test-1") && k.contains("abc")),
+            "expected a dialog key with Call-ID + From-tag, got {keys:?}"
+        );
     }
 }

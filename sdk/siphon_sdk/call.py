@@ -48,6 +48,7 @@ class Call:
         headers: Optional[dict[str, str]] = None,
         refer_to: Optional[str] = None,
         refer_replaces: Optional[dict] = None,
+        transport: str = "udp",
     ) -> None:
         self._id = call_id or str(uuid.uuid4())
         self._from_uri = _parse_uri(from_uri)
@@ -55,6 +56,10 @@ class Call:
         self._ruri = _parse_uri(ruri)
         self._source_ip = source_ip
         self._state = state
+        # Transport the A-leg arrived on.  Not a public property (the real
+        # PyCall does not expose one either) — it exists so cdr.write(call)
+        # produces a record carrying the A-leg transport, like the engine does.
+        self._transport = transport
         self._body = body
         self._call_id = call_id or self._id
         self._headers: dict[str, str] = dict(headers) if headers else {}
