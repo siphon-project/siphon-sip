@@ -13,6 +13,9 @@
 services:
   # ── SIPhon under test ──────────────────────────────────────────────────────
   siphon:
+    # Built once; siphon-ipsec and siphon-scscf reuse this same image instead of
+    # each rebuilding an identical one (they differ only in mounted config).
+    image: sipp-siphon
     build:
       context: ..
     container_name: siphon-test
@@ -1683,8 +1686,7 @@ services:
   # Standalone S-CSCF (local Milenage AKA, no HSS) that the P-CSCF relays
   # REGISTER to. Reachable from the P-CSCF as the network alias "ims.test".
   siphon-scscf:
-    build:
-      context: ..
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     container_name: siphon-scscf-test
     volumes:
       - ./ipsec/siphon-scscf.yaml:/etc/siphon/siphon.yaml:ro
@@ -1705,8 +1707,7 @@ services:
       - ipsec
 
   siphon-ipsec:
-    build:
-      context: ..
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     container_name: siphon-ipsec-test
     depends_on:
       siphon-scscf:
