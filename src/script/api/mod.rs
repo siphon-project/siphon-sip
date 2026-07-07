@@ -87,6 +87,13 @@ static RTPENGINE_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 /// Optional gateway singleton — set only when `gateway` is configured.
 static GATEWAY_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
+/// The gateway `DispatcherManager` Arc — stored so `request.from_gateway` /
+/// `call.from_gateway` can test a source IP against a group's resolved-address
+/// set without a Python round-trip. Set alongside `GATEWAY_SINGLETON` whenever
+/// `gateway` is configured.
+static GATEWAY_MANAGER_ARC: OnceLock<std::sync::Arc<crate::gateway::DispatcherManager>> =
+    OnceLock::new();
+
 /// Optional CDR singleton — set only when `cdr` is configured and enabled.
 static CDR_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
@@ -235,6 +242,21 @@ pub fn set_gateway_singleton(
         .into_any();
     let _ = GATEWAY_SINGLETON.set(gateway_py);
     Ok(())
+}
+
+/// Store the gateway `DispatcherManager` Arc so the `from_gateway` predicates
+/// can resolve source membership. Idempotent — first writer wins. Set from
+/// `server.rs` alongside `set_gateway_singleton`, pointing at the same manager.
+pub fn set_gateway_manager(manager: std::sync::Arc<crate::gateway::DispatcherManager>) {
+    let _ = GATEWAY_MANAGER_ARC.set(manager);
+}
+
+/// Get the shared gateway `DispatcherManager` (set when `gateway` is
+/// configured). `None` in headless / unit-test contexts that never wired a
+/// gateway — `from_gateway` treats that as "not a member" (returns `false`).
+pub(crate) fn gateway_manager() -> Option<&'static std::sync::Arc<crate::gateway::DispatcherManager>>
+{
+    GATEWAY_MANAGER_ARC.get()
 }
 
 /// Store the registration singleton for injection into the siphon module.

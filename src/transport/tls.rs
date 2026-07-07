@@ -308,7 +308,7 @@ pub async fn listen(
                 }
             } else if let Some(ref pool) = pool {
                 // No existing connection — create outbound TLS via pool
-                match pool.send_tls(outbound.destination, outbound.data).await {
+                match pool.send_tls(outbound.destination, outbound.server_name.as_deref(), outbound.data).await {
                     Ok(connection_id) => {
                         debug!(
                             destination = %outbound.destination,
@@ -554,6 +554,8 @@ mod tests {
             method: "TLSv1_3".to_string(),
             verify_client: false,
             client_ca: None,
+            client_certificate: None,
+            client_private_key: None,
         }
     }
 
@@ -575,6 +577,8 @@ mod tests {
             method: "TLSv1_3".to_string(),
             verify_client: false,
             client_ca: None,
+            client_certificate: None,
+            client_private_key: None,
         };
         let result = build_tls_acceptor(&tls_config);
         assert!(result.is_err());
@@ -618,6 +622,8 @@ mod tests {
             method: "TLSv1_3".to_string(),
             verify_client: false,
             client_ca: None,
+            client_certificate: None,
+            client_private_key: None,
         };
         let result = build_tls_acceptor(&tls_config);
         assert!(result.is_err());

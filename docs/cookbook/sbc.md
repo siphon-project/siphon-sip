@@ -163,6 +163,38 @@ def on_invite(call):
     call.dial(gateway.select("carriers").uri)
 ```
 
+## Upstream trunk requiring mutual TLS
+
+Some upstream SIP trunks require siphon to present a **client certificate** when
+it dials out over TLS — mutual TLS (for example Microsoft Teams Direct Routing).
+Without one, the peer aborts the handshake with `CertificateUnknown`. Attach the
+client identity in the top-level `tls:` block:
+
+```yaml
+tls:
+  certificate: "/etc/siphon/tls/example.com.crt"   # inbound server cert
+  private_key:  "/etc/siphon/tls/example.com.key"
+  # Presented on OUTBOUND TLS when the upstream trunk requests a client cert:
+  client_certificate: "/etc/siphon/tls/client.crt"
+  client_private_key: "/etc/siphon/tls/client.key"
+```
+
+Then dial the trunk over TLS as usual — the B2BUA presents the configured client
+certificate automatically:
+
+```python
+@b2bua.on_invite
+def on_invite(call):
+    call.media.anchor(engine="rtpengine")
+    call.dial("sip:+15551234567@sbc.example.com;transport=tls")
+```
+
+Both `client_certificate` and `client_private_key` must be set together (or
+neither); a one-sided setting or an unreadable file fails startup. The outbound
+handshake also sends the target hostname (`sbc.example.com`) as SNI, so a
+hostname-vhost trunk front-end can route it. Server-certificate verification is
+unchanged (permissive) — this only adds the client certificate siphon presents.
+
 ## See also
 
 - Real examples: [`scripts/b2bua_default.py`](https://github.com/siphon-project/siphon-sip/blob/main/scripts/b2bua_default.py), [`examples/b2bua_gateway.py`](https://github.com/siphon-project/siphon-sip/blob/main/examples/b2bua_gateway.py), [`examples/b2bua_rtpengine.py`](https://github.com/siphon-project/siphon-sip/blob/main/examples/b2bua_rtpengine.py).

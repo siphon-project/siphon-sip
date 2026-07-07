@@ -43,10 +43,26 @@ tls:
   certificate: "/etc/siphon/tls/example.com.crt"
   private_key:  "/etc/siphon/tls/example.com.key"
   method: "TLSv1_3"             # TLSv1_2 | TLSv1_3
-  # mTLS for trunks with mutual auth (applies to listen.tls AND listen.wss):
+  # INBOUND mTLS — siphon verifies clients that connect INTO it (applies to
+  # listen.tls AND listen.wss):
   verify_client: false
   client_ca: "/etc/siphon/tls/client-ca.pem"
+  # OUTBOUND mTLS — the cert siphon PRESENTS when it dials OUT to an upstream
+  # trunk that requires a client certificate:
+  client_certificate: "/etc/siphon/tls/client.crt"
+  client_private_key: "/etc/siphon/tls/client.key"
 ```
+
+The two mTLS directions are independent. `verify_client` / `client_ca` govern
+**inbound** mutual TLS — siphon verifying the certificate of a peer connecting
+*into* it. `client_certificate` / `client_private_key` govern **outbound** mutual
+TLS — the certificate siphon *presents* when it dials *out* to an upstream SIP
+trunk that requires a client certificate (for example Microsoft Teams Direct
+Routing). Both outbound fields must be set together, or neither; a one-sided
+setting or an unreadable file is a hard startup error. Outbound TLS also now
+sends the resolved target hostname as SNI (RFC 6066) instead of the destination
+IP, so a hostname-vhost front-end can route the handshake; bare-IP next hops
+send no SNI, as before.
 
 A listener can be a **plain string** (`"10.0.0.1:5060"`) or the **extended form**
 with a per-socket advertised host and DSCP override (like OpenSIPS
