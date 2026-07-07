@@ -7,6 +7,34 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **B2BUA `call.set_from_host()` / `call.set_to_host()`** — pin the host part of
+  the B-leg From / To URI, mirroring `set_from_user` / `set_to_user`. By default
+  the B2BUA rewrites the B-leg From host to its own advertised address (topology
+  hiding) and the To host to the dial-target host. `set_from_host()` opts a leg
+  out of the From host-rewrite so the original domain survives — needed for a
+  multitenant SBC whose downstream selects the tenant from the From domain (a
+  domainless call would otherwise land in an unauthenticated/default routing
+  context). `set_to_host()` pins the To host declaratively (replaces the raw
+  `set_header("To", "<sip:…>")` idiom). Only the host changes; scheme/user/port/
+  params and tags are preserved. Applies to both `call.dial()` and `call.fork()`.
+  Mirrored in the `siphon-sip` SDK mock; new SIPp acceptance scenario
+  (`sipp/b2bua_set_host_uas.xml`).
+- **Outbound TLS client certificate (mutual TLS).** New `tls.client_certificate`
+  and `tls.client_private_key` (PEM chain + key). When set, siphon presents that
+  client certificate on outbound TLS connections whose peer requests one — for
+  upstream SIP trunks that require client-certificate / mutual TLS (e.g.
+  Microsoft Teams Direct Routing). Previously the outbound pool presented no
+  client certificate, so such peers aborted the handshake with
+  `CertificateUnknown`. Both fields must be set together (or neither); a
+  one-sided setting or an unreadable/unparseable file is a hard startup error
+  (fail closed). Server-certificate verification is unchanged (still permissive).
+- **Hostname-based outbound TLS SNI.** Outbound TLS handshakes now present the
+  resolved target hostname as SNI / certificate name instead of the destination
+  IP literal. RFC 6066 forbids SNI for an IP literal, so IP-based next hops
+  emitted none and hostname-vhost front-ends could not route the handshake; the
+  hostname now flows from the resolved SIP URI (relay, fork, and gateway TLS
+  health probe) through to the connection pool. Bare-IP next hops are unchanged
+  (still no SNI).
 - **Gateway source-membership predicate — `request.from_gateway(group)` /
   `call.from_gateway(group)`.** Returns `True` when the message's source IP is
   one of the resolved addresses of the named gateway group (configured under

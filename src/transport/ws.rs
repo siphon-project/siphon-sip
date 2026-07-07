@@ -696,6 +696,8 @@ mod tests {
             method: "TLSv1_3".to_string(),
             verify_client: false,
             client_ca: None,
+            client_certificate: None,
+            client_private_key: None,
         }
     }
 }
