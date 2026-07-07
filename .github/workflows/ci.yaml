@@ -343,15 +343,19 @@ jobs:
           docker compose -f sipp/docker-compose.yaml build siphon
           docker compose -f sipp/docker-compose.yaml --profile ipsec build sipp-ipsec
 
-      - name: Start siphon
-        run: docker compose -f sipp/docker-compose.yaml up -d --wait siphon
+      - name: Start P-CSCF + S-CSCF
+        run: docker compose -f sipp/docker-compose.yaml --profile ipsec up -d --wait siphon-ipsec
 
       - name: SIPp IPsec VoLTE registration
         run: docker compose -f sipp/docker-compose.yaml --profile ipsec run --rm sipp-ipsec
 
       - name: Collect logs
         if: always()
-        run: docker compose -f sipp/docker-compose.yaml logs siphon > siphon-ipsec.log 2>&1 || true
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs siphon-ipsec > siphon-ipsec.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs siphon-scscf > siphon-scscf.log 2>&1 || true
+          echo "::group::P-CSCF (siphon-ipsec) log"; cat siphon-ipsec.log || true; echo "::endgroup::"
+          echo "::group::S-CSCF (siphon-scscf) log"; cat siphon-scscf.log || true; echo "::endgroup::"
 
       - name: Teardown
         if: always()
