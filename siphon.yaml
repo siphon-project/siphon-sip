@@ -529,6 +529,8 @@ auth:
 #   GET    /admin/registrations       list all AoRs + their contacts
 #   GET    /admin/registrations/{aor} one AoR's contacts
 #   DELETE /admin/registrations/{aor} force-unregister an AoR
+#   GET    /admin/bans                list active auto-bans + remaining TTL
+#   DELETE /admin/bans/{ip}           lift an auto-ban (also clears the kernel set)
 #   GET    /metrics                   Prometheus scrape (same body as the metrics port)
 # admin:
 #   listen: "0.0.0.0:9091"

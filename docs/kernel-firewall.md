@@ -171,6 +171,22 @@ Two counters on `/metrics` cover the runtime failure modes:
 | `siphon_firewall_command_failures_total` | any sustained `rate() > 0` | Bans are **not** reaching the kernel (ruleset deleted out from under SIPhon, capability lost). Userspace ACL is the only enforcement left. |
 | `siphon_firewall_commands_dropped_total` | sustained `rate() > 0` | A ban storm is outrunning the netlink actor's queue; kernel enforcement lags the ban rate (userspace ACL still enforces every ban). |
 
+### Lifting a false-positive ban
+
+If a legitimate source gets auto-banned, lift it through the [admin API](deployment.md)
+rather than editing `nft` by hand — that keeps the userspace ban and the kernel
+set in sync:
+
+```bash
+curl http://127.0.0.1:9091/admin/bans                        # list active bans
+curl -X DELETE http://127.0.0.1:9091/admin/bans/203.0.113.5  # lift one
+```
+
+`DELETE /admin/bans/{ip}` clears the userspace ban and, when the kernel firewall
+is enabled, removes the matching nf_tables element in the same step. (A ban left
+alone expires on its own; both the userspace store and the kernel element use the
+same TTL.)
+
 ## See also
 
 - [How the scoring works](cookbook/security.md#how-the-scoring-works) — what earns

@@ -5,8 +5,9 @@
 //! - Runtime inspection (registrations, dialogs, transactions, connections)
 //! - Health/readiness probes (`GET /admin/health`)
 //! - Force-unregister (`DELETE /admin/registrations/:aor`)
+//! - List / lift auto-bans (`GET /admin/bans`, `DELETE /admin/bans/:ip`)
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -61,6 +62,8 @@ fn router(state: AdminState) -> Router {
         .route("/admin/registrations", get(registrations_handler))
         .route("/admin/registrations/{aor}", get(registration_detail_handler))
         .route("/admin/registrations/{aor}", delete(registration_delete_handler))
+        .route("/admin/bans", get(bans_handler))
+        .route("/admin/bans/{ip}", delete(ban_delete_handler))
         .with_state(state)
 }
 
@@ -199,6 +202,56 @@ async fn registration_delete_handler(
         "status": "removed",
         "aor": aor,
     })))
+}
+
+/// `GET /admin/bans` — list the sources currently auto-banned by
+/// `failed_auth_ban`, each with its remaining ban time in seconds. Empty when
+/// the feature is not configured.
+async fn bans_handler() -> impl IntoResponse {
+    let entries: Vec<serde_json::Value> = crate::security::auto_ban()
+        .map(|store| store.banned_sources())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(address, remaining)| {
+            serde_json::json!({
+                "ip": address.to_string(),
+                "expires_remaining": remaining,
+            })
+        })
+        .collect();
+    Json(entries)
+}
+
+/// `DELETE /admin/bans/:ip` — lift an auto-ban early (operator clearing a false
+/// positive). Removes the userspace ban and, when the kernel firewall is wired,
+/// the matching nf_tables element too, so the in-kernel drop is lifted in
+/// lockstep. 404 when the source is not banned or `failed_auth_ban` is off,
+/// 400 when `:ip` is not a valid address.
+async fn ban_delete_handler(Path(ip): Path<String>) -> impl IntoResponse {
+    let address: IpAddr = match ip.parse() {
+        Ok(address) => address,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid IP address", "ip": ip })),
+            );
+        }
+    };
+
+    match crate::security::auto_ban() {
+        Some(store) if store.unban(address) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "unbanned", "ip": address.to_string() })),
+        ),
+        Some(_) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "not banned", "ip": address.to_string() })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "auto-ban not enabled", "ip": address.to_string() })),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -382,5 +435,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // The auto-ban store is a process-global `OnceLock` that another test in the
+    // lib binary installs, so these assert only what holds regardless of whether
+    // a store is installed (list is always a JSON array; a bad IP is always 400).
+    // The unban / list-contents logic is covered by store-level tests in
+    // `crate::security` where a local store can be constructed deterministically.
+    #[tokio::test]
+    async fn bans_list_returns_json_array() {
+        let app = test_app();
+
+        let response = app
+            .oneshot(Request::get("/admin/bans").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json.is_array());
+    }
+
+    #[tokio::test]
+    async fn ban_delete_invalid_ip_returns_400() {
+        let app = test_app();
+
+        let response = app
+            .oneshot(
+                Request::delete("/admin/bans/not-an-ip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "invalid IP address");
     }
 }

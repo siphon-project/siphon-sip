@@ -37,6 +37,12 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the security cookbook with the ban-scoring model and adds a Kernel firewall page
   covering `CAP_NET_ADMIN` per runtime, container behaviour, and the
   nftables-vs-XDP tradeoff.
+- **Admin API ban management** — `GET /admin/bans` lists the sources currently
+  auto-banned by `failed_auth_ban` (with remaining TTL), and
+  `DELETE /admin/bans/{ip}` lifts a ban early for an operator clearing a false
+  positive. The unban clears the userspace ban and, when the kernel firewall is
+  enabled, removes the matching nf_tables element in lockstep so the in-kernel
+  drop is lifted too.
 
 ## [1.1.1] — 2026-07-02
 
