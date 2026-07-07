@@ -207,7 +207,10 @@ pub struct CdrConfig {
     pub enabled: bool,
     /// Backend type.
     pub backend: CdrBackendType,
-    /// Include REGISTER events.
+    /// Automatically emit a CDR per call on lifecycle events (no script
+    /// `cdr.write()` needed).
+    pub auto_emit: bool,
+    /// Include REGISTER events (only when `auto_emit`).
     pub include_register: bool,
     /// Channel buffer size.
     pub channel_size: usize,
@@ -221,10 +224,21 @@ impl Default for CdrConfig {
                 path: "/var/log/siphon/cdr.jsonl".to_string(),
                 rotate_size_mb: 100,
             },
+            auto_emit: false,
             include_register: false,
             channel_size: 10_000,
         }
     }
+}
+
+/// Runtime auto-emit flags, latched at `init` so the dispatcher hot path can
+/// check them without threading `CdrConfig` everywhere (mirrors `CDR_SENDER`).
+static CDR_AUTO_FLAGS: OnceLock<CdrAutoFlags> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy)]
+struct CdrAutoFlags {
+    auto_emit: bool,
+    include_register: bool,
 }
 
 /// CDR backend types.
@@ -246,6 +260,126 @@ pub enum CdrBackendType {
     },
 }
 
+/// In-flight per-call state accumulated between the INVITE and the BYE so an
+/// auto-emitted CDR can carry setup time, answer time, duration, and the
+/// disconnecting side.
+///
+/// Held in `DispatcherState::cdr_sessions`, keyed by the SIP dialog
+/// (`<Call-ID>\0<tag>`) for proxy calls or the internal call UUID for B2BUA
+/// calls. Removed when the call ends (BYE / failure / cancel); the orphan
+/// sweep is only a backstop for calls whose teardown never reached the
+/// dispatcher.
+#[derive(Debug, Clone)]
+pub struct CdrSession {
+    call_id: String,
+    from_uri: String,
+    to_uri: String,
+    ruri: String,
+    source_ip: String,
+    transport: String,
+    user_agent: Option<String>,
+    auth_user: Option<String>,
+    /// Wall-clock INVITE time (serialized as `timestamp_start`).
+    start_wall: SystemTime,
+    /// Wall-clock answer time; `None` until a 2xx is seen.
+    answer_wall: Option<SystemTime>,
+    /// Monotonic answer time — durations use this so a wall-clock step can't
+    /// produce a negative or wildly wrong `duration_secs`.
+    answer_instant: Option<Instant>,
+    /// Final response code seen so far (200 once answered, else the failure).
+    response_code: u16,
+    /// When this session was created — the orphan-sweep backstop keys off it.
+    created_at: Instant,
+}
+
+impl CdrSession {
+    /// Start tracking a call at INVITE time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        call_id: String,
+        from_uri: String,
+        to_uri: String,
+        ruri: String,
+        source_ip: String,
+        transport: String,
+        user_agent: Option<String>,
+        auth_user: Option<String>,
+    ) -> Self {
+        Self {
+            call_id,
+            from_uri,
+            to_uri,
+            ruri,
+            source_ip,
+            transport,
+            user_agent,
+            auth_user,
+            start_wall: SystemTime::now(),
+            answer_wall: None,
+            answer_instant: None,
+            response_code: 0,
+            created_at: Instant::now(),
+        }
+    }
+
+    /// Record the answer (2xx to the INVITE). Idempotent — the first answer
+    /// wins so a 2xx retransmission can't reset the answer time.
+    pub fn mark_answered(&mut self, response_code: u16) {
+        if self.answer_instant.is_none() {
+            self.answer_wall = Some(SystemTime::now());
+            self.answer_instant = Some(Instant::now());
+        }
+        self.response_code = response_code;
+    }
+
+    /// Whether the call was answered (a 2xx was seen).
+    pub fn is_answered(&self) -> bool {
+        self.answer_instant.is_some()
+    }
+
+    /// When this session was created — used by the orphan sweep.
+    pub fn created_at(&self) -> Instant {
+        self.created_at
+    }
+
+    /// Build the final CDR at call teardown and consume the session.
+    ///
+    /// `disconnect_initiator` is one of `"caller"` / `"callee"` / `"timeout"`
+    /// / `"error"`. `response_code` overrides the tracked code (e.g. the
+    /// failure code on an unanswered call); pass `None` to keep the tracked
+    /// value. `sip_reason` carries an RFC 3326 Reason header value if present.
+    pub fn finalize(
+        self,
+        disconnect_initiator: &str,
+        response_code: Option<u16>,
+        sip_reason: Option<String>,
+    ) -> Cdr {
+        let mut cdr = Cdr::new(
+            self.call_id,
+            self.from_uri,
+            self.to_uri,
+            self.ruri,
+            "INVITE".to_string(),
+            self.source_ip,
+            self.transport,
+        );
+        cdr.response_code = response_code.unwrap_or(self.response_code);
+        cdr.timestamp_start = Some(format_timestamp(self.start_wall));
+        if let Some(answer_wall) = self.answer_wall {
+            cdr.timestamp_answer = Some(format_timestamp(answer_wall));
+        }
+        cdr.timestamp_end = Some(format_timestamp(SystemTime::now()));
+        if let Some(answer_at) = self.answer_instant {
+            cdr.duration_secs = answer_at.elapsed().as_secs_f64();
+        }
+        cdr.user_agent = self.user_agent;
+        cdr.auth_user = self.auth_user;
+        cdr.disconnect_initiator = Some(disconnect_initiator.to_string());
+        cdr.sip_reason = sip_reason;
+        cdr
+    }
+}
+
 /// Initialize the CDR subsystem. Returns the receiver for the background writer.
 pub fn init(config: &CdrConfig) -> Option<mpsc::Receiver<Cdr>> {
     if !config.enabled {
@@ -254,7 +388,28 @@ pub fn init(config: &CdrConfig) -> Option<mpsc::Receiver<Cdr>> {
 
     let (sender, receiver) = mpsc::channel(config.channel_size);
     CDR_SENDER.set(sender).ok()?;
+    // Latch the auto-emit flags for the dispatcher hot path. Ignore a second
+    // set (only `init` writes it, once).
+    let _ = CDR_AUTO_FLAGS.set(CdrAutoFlags {
+        auto_emit: config.auto_emit,
+        include_register: config.include_register,
+    });
     Some(receiver)
+}
+
+/// Whether siphon should auto-generate call CDRs on lifecycle events.
+/// False unless the CDR system is enabled AND `cdr.auto_emit: true`.
+pub fn auto_emit_enabled() -> bool {
+    CDR_AUTO_FLAGS.get().map(|f| f.auto_emit).unwrap_or(false)
+}
+
+/// Whether auto-emitted CDRs should include REGISTER events.
+/// Only meaningful when [`auto_emit_enabled`] is also true.
+pub fn include_register_enabled() -> bool {
+    CDR_AUTO_FLAGS
+        .get()
+        .map(|f| f.include_register)
+        .unwrap_or(false)
 }
 
 /// Write a CDR to the channel (non-blocking). Returns false if channel is full.
@@ -695,8 +850,58 @@ mod tests {
     fn cdr_config_defaults() {
         let config = CdrConfig::default();
         assert!(!config.enabled);
+        assert!(!config.auto_emit);
         assert!(!config.include_register);
         assert_eq!(config.channel_size, 10_000);
+    }
+
+    fn sample_session() -> CdrSession {
+        CdrSession::new(
+            "call-abc@host".to_string(),
+            "sip:alice@example.com".to_string(),
+            "sip:bob@example.com".to_string(),
+            "sip:bob@10.0.0.2".to_string(),
+            "10.0.0.1".to_string(),
+            "udp".to_string(),
+            Some("Ozona/5.0".to_string()),
+            Some("alice".to_string()),
+        )
+    }
+
+    #[test]
+    fn cdr_session_answered_finalize() {
+        let mut session = sample_session();
+        assert!(!session.is_answered());
+        session.mark_answered(200);
+        assert!(session.is_answered());
+        // A 2xx retransmit must not reset the answer or change the code path.
+        session.mark_answered(200);
+
+        let cdr = session.finalize("caller", None, None);
+        assert_eq!(cdr.call_id, "call-abc@host");
+        assert_eq!(cdr.method, "INVITE");
+        assert_eq!(cdr.response_code, 200);
+        assert_eq!(cdr.transport, "udp");
+        assert_eq!(cdr.disconnect_initiator.as_deref(), Some("caller"));
+        assert_eq!(cdr.user_agent.as_deref(), Some("Ozona/5.0"));
+        assert_eq!(cdr.auth_user.as_deref(), Some("alice"));
+        assert!(cdr.timestamp_start.is_some());
+        assert!(cdr.timestamp_answer.is_some());
+        assert!(cdr.timestamp_end.is_some());
+        // Answered → a real (non-negative) duration.
+        assert!(cdr.duration_secs >= 0.0);
+    }
+
+    #[test]
+    fn cdr_session_unanswered_finalize() {
+        // A call that failed before answer: no answer timestamp, zero duration,
+        // and the failure code + initiator carried through.
+        let session = sample_session();
+        let cdr = session.finalize("error", Some(486), None);
+        assert_eq!(cdr.response_code, 486);
+        assert_eq!(cdr.disconnect_initiator.as_deref(), Some("error"));
+        assert!(cdr.timestamp_answer.is_none());
+        assert_eq!(cdr.duration_secs, 0.0);
     }
 
     #[test]

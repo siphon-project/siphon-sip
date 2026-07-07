@@ -51,6 +51,33 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   (TCP/TLS/WS/WSS) the source IP is handshake-verified and trustworthy as an
   authorization signal; on UDP it is spoofable, so `from_gateway` there is a
   best-effort direction hint, not an auth gate.
+- **Automatic CDR generation (`cdr.auto_emit`).** With `cdr.auto_emit: true`,
+  siphon now writes one CDR per call automatically on the call lifecycle — no
+  `cdr.write()` in the script — for both the proxy and B2BUA datapaths. The
+  record carries `timestamp_start` (INVITE), `timestamp_answer` (200),
+  `timestamp_end` (BYE), `duration_secs`, `response_code`, and
+  `disconnect_initiator` (`caller`/`callee`/`timeout`/`error`). Every teardown
+  is covered: answered→BYE (either side), B-leg failure, answer-timeout (408),
+  and caller CANCEL (487). Default **off**, so manual-only deployments are
+  unchanged; manual `cdr.write()` still works and stacks on top. The previously
+  **inert** `cdr.include_register` flag is now wired: with `auto_emit`, each
+  registrar state change emits a REGISTER CDR (`reg_event` = registered /
+  refreshed / deregistered / expired). New `siphon_cdr_sessions` gauge exposes
+  the live per-call tracking count (drains to 0 between calls; a steady climb
+  is a teardown-hook leak). Per-call state is bounded by the orphan sweep.
+
+### Fixed
+- **`cdr.write()` now accepts a B2BUA `Call`, not just a proxy `Request`.**
+  Calling `cdr.write(call, extra=…)` from a `@b2bua.on_answer` / `on_bye` /
+  `on_failure` / `on_early_media` / `on_cancel` handler previously raised
+  `TypeError: 'Call' object is not an instance of 'Request'` — the method was
+  typed for `Request` only, so B2BUA scripts had no way to write a CDR. It is
+  now polymorphic: a `Call` produces the same record shape as a `Request`
+  (method `INVITE`, Call-ID / From / To / R-URI / source IP off the A-leg
+  INVITE, plus the same Rf `rf_session_id` / `rf_result_code` auto-stamp), with
+  the A-leg's arrival transport threaded through so the `transport` field is
+  correct. Passing any other object now raises a clear `TypeError`. Mirrored in
+  the SDK mock (`cdr.write(call)`).
 
 ## [1.1.1] — 2026-07-02
 

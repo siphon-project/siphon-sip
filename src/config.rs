@@ -1963,7 +1963,16 @@ pub struct CdrYamlConfig {
     /// Enable CDR generation. Default: false.
     #[serde(default)]
     pub enabled: bool,
-    /// Include REGISTER events as CDRs. Default: false.
+    /// Automatically emit a CDR per call on lifecycle events (INVITE answer →
+    /// BYE, plus failed/cancelled/timed-out calls) without the script calling
+    /// `cdr.write()`. Default: false — existing manual-only deployments are
+    /// unchanged; opt in to get call CDRs for free. Manual `cdr.write()` still
+    /// works and is additive.
+    #[serde(default)]
+    pub auto_emit: bool,
+    /// Include REGISTER events as CDRs. Only meaningful with `auto_emit: true`
+    /// — when set, each registrar state change emits a REGISTER CDR. Default:
+    /// false.
     #[serde(default)]
     pub include_register: bool,
     /// Async channel buffer size. Default: 10000.
@@ -2031,6 +2040,7 @@ impl CdrYamlConfig {
         crate::cdr::CdrConfig {
             enabled: self.enabled,
             backend,
+            auto_emit: self.auto_emit,
             include_register: self.include_register,
             channel_size: self.channel_size,
         }
