@@ -11,6 +11,7 @@ pub mod dispatcher;
 pub mod dns;
 pub mod hep;
 pub mod error;
+pub mod firewall;
 pub mod nat;
 pub mod presence;
 pub mod proxy;

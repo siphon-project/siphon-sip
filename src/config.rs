@@ -1195,6 +1195,44 @@ pub struct SecurityConfig {
     pub failed_auth_ban: Option<FailedAuthBanConfig>,
     /// APIBAN community blocklist integration.
     pub apiban: Option<ApiBanConfig>,
+    /// Kernel firewall: drop banned sources in the kernel via nf_tables so
+    /// abusive traffic never reaches siphon's socket (Linux only, needs
+    /// `CAP_NET_ADMIN`). Falls back to the userspace ACL when unavailable.
+    pub firewall: Option<FirewallConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct FirewallConfig {
+    /// nf_tables table name siphon owns (family `inet`). Default: `siphon`.
+    #[serde(default = "default_firewall_table")]
+    pub table: String,
+    /// Set holding banned IPv4 sources. Default: `banned4`.
+    #[serde(default = "default_firewall_set_v4")]
+    pub set_v4: String,
+    /// Set holding banned IPv6 sources. Default: `banned6`.
+    #[serde(default = "default_firewall_set_v6")]
+    pub set_v6: String,
+    /// Base chain siphon adds the drop rules to. Default: `input`.
+    #[serde(default = "default_firewall_chain")]
+    pub chain: String,
+    /// When true (the default), siphon also owns the chain + drop rules, so no
+    /// manual `nft` step is needed — enabling `firewall` is enough. Set false to
+    /// have siphon manage only the sets and reference them from your own ruleset.
+    #[serde(default = "bool_true")]
+    pub manage_rule: bool,
+}
+
+fn default_firewall_table() -> String {
+    "siphon".to_string()
+}
+fn default_firewall_chain() -> String {
+    "input".to_string()
+}
+fn default_firewall_set_v4() -> String {
+    "banned4".to_string()
+}
+fn default_firewall_set_v6() -> String {
+    "banned6".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1409,6 +1447,8 @@ fn default_metrics_path() -> String {
 ///   `GET /admin/registrations`       list all AoRs + contacts
 ///   `GET /admin/registrations/{aor}` one AoR's contacts
 ///   `DELETE /admin/registrations/{aor}` force-unregister an AoR
+///   `GET /admin/bans`                list active auto-bans + remaining TTL
+///   `DELETE /admin/bans/{ip}`        lift an auto-ban (also clears the kernel set)
 ///   `GET /metrics`                   Prometheus scrape (same body as the metrics port)
 #[derive(Debug, Deserialize, Clone)]
 pub struct AdminConfig {

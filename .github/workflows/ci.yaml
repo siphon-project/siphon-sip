@@ -365,3 +365,40 @@ jobs:
           path: |
             siphon-ipsec.log
             *.log
+
+  # ── nftables kernel-firewall live test (self-hosted) ───────────────────
+  # The nf_tables netlink marshalling is validated end-to-end against a real
+  # kernel — the only coverage for the chain/rule/expression builders that a
+  # byte-layout test can't fully prove (it caught the big-endian-integer,
+  # NFTA_SET_KEY_TYPE, and multi-ack bugs during development). Needs
+  # CAP_NET_ADMIN, which GitHub-hosted runners don't grant, so it shares the
+  # self-hosted `ipsec` runner on trusted triggers only (trunk push + manual
+  # dispatch, never fork PRs). The test runs inside a throwaway user+net
+  # namespace (`unshare -rn`): the fresh netns gives it an isolated nft ruleset
+  # so it touches nothing on the host and cleans up when the namespace exits,
+  # and the user-namespace root map supplies CAP_NET_ADMIN without real
+  # privilege. Host prerequisites on the runner: the `nft` binary and
+  # unprivileged user namespaces enabled (user.max_user_namespaces > 0).
+  nftables-firewall:
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    runs-on: [self-hosted, linux, x64, ipsec]
+    needs: rust-tests
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Python 3.14 (free-threaded)
+        uses: deadsnakes/action@v3.2.0
+        with:
+          python-version: "3.14-dev"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Build the test binary WITH network, OUTSIDE the namespace, so the
+      # network-isolated `unshare -n` run below never needs to fetch or compile.
+      - name: Build the firewall live test
+        run: PYO3_PYTHON=python3.14 cargo test --lib --no-run firewall::nftables
+
+      - name: nftables live-kernel roundtrip (isolated user+net namespace)
+        run: unshare -rn env PYO3_PYTHON=python3.14 cargo test --lib firewall::nftables::tests::live_kernel_roundtrip -- --ignored --nocapture

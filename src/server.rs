@@ -906,8 +906,24 @@ impl SiphonServer {
             );
         }
 
+        // --- Kernel firewall (nf_tables) — opt-in, needs CAP_NET_ADMIN ---
+        // Programs banned sources into a kernel set so abusive traffic is
+        // dropped before it reaches siphon's socket. On failure (missing
+        // capability, non-Linux) we warn and fall back to the userspace ACL —
+        // never fatal.
+        let kernel_firewall = match config.security.as_ref().and_then(|sec| sec.firewall.as_ref()) {
+            Some(firewall_config) => match crate::firewall::start(firewall_config).await {
+                Ok(handle) => Some(handle),
+                Err(error) => {
+                    warn!(%error, "kernel firewall (nf_tables) unavailable — falling back to the userspace ACL (missing CAP_NET_ADMIN?)");
+                    None
+                }
+            },
+            None => None,
+        };
+
         // --- Build transport ACL ---
-        let transport_acl = build_transport_acl(&config);
+        let transport_acl = build_transport_acl(&config, kernel_firewall.clone());
 
         // --- Auto-ban (failed_auth_ban scanner protection) ---
         // Opt-in: only installed when configured. Once installed, the auth path
@@ -923,6 +939,9 @@ impl SiphonServer {
                     fab.strong_signal_weight,
                 ));
                 crate::security::set_auto_ban(Arc::clone(&store));
+                if let Some(ref firewall) = kernel_firewall {
+                    store.set_firewall(firewall.clone());
+                }
                 info!(
                     threshold = fab.threshold,
                     window_secs = fab.window_secs,
@@ -2694,13 +2713,17 @@ fn spawn_li_tasks(
     });
 }
 
-fn build_transport_acl(config: &Config) -> Arc<transport::acl::TransportAcl> {
+fn build_transport_acl(
+    config: &Config,
+    firewall: Option<crate::firewall::KernelFirewall>,
+) -> Arc<transport::acl::TransportAcl> {
     use transport::acl::TransportAcl;
 
     if let Some(ref sec) = config.security {
         let apiban_set = if let Some(ref apiban_config) = sec.apiban {
             match crate::apiban::ApiBanClient::new(apiban_config) {
                 Ok(client) => {
+                    let client = client.with_firewall(firewall.clone());
                     let banned = client.banned();
                     client.start();
                     info!("APIBAN blocklist poller started");

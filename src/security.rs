@@ -141,6 +141,9 @@ pub struct AutoBanStore {
     /// these unambiguous signals faster than a bare scanning probe (weight 1)
     /// while reusing the single per-IP window. Always ≥ 1.
     strong_weight: u32,
+    /// Optional kernel-firewall handle. When wired, every new ban is also
+    /// pushed to the nf_tables set so the source is dropped pre-userspace.
+    firewall: OnceLock<crate::firewall::KernelFirewall>,
 }
 
 impl AutoBanStore {
@@ -166,7 +169,14 @@ impl AutoBanStore {
             window: Duration::from_secs(u64::from(window_secs.max(1))),
             ban_duration: Duration::from_secs(u64::from(ban_duration_secs.max(1))),
             strong_weight: strong_weight.max(1),
+            firewall: OnceLock::new(),
         }
+    }
+
+    /// Attach a kernel-firewall handle so new bans are also programmed into the
+    /// nf_tables set. Called once at startup; a second call is a no-op.
+    pub fn set_firewall(&self, firewall: crate::firewall::KernelFirewall) {
+        let _ = self.firewall.set(firewall);
     }
 
     fn is_trusted(&self, source: IpAddr) -> bool {
@@ -223,6 +233,14 @@ impl AutoBanStore {
         if newly_banned {
             self.failures.remove(&source);
             self.bans.insert(source, now + self.ban_duration);
+            // Mirror the ban into the kernel firewall (nf_tables) if wired, so
+            // the source is dropped before it reaches siphon's socket. The
+            // kernel element carries the same TTL as the in-memory ban, so both
+            // expire in lockstep. Non-blocking (drops silently if the actor
+            // queue is full — the userspace ACL still enforces the ban).
+            if let Some(firewall) = self.firewall.get() {
+                firewall.ban(source, self.ban_duration);
+            }
         }
         newly_banned
     }
@@ -265,6 +283,41 @@ impl AutoBanStore {
     /// entries; published as a metric and pruned periodically).
     pub fn active_bans(&self) -> usize {
         self.bans.len()
+    }
+
+    /// Currently-banned sources with their remaining ban time in seconds
+    /// (expired-but-not-yet-pruned entries are skipped). For the admin API's
+    /// `GET /admin/bans`.
+    pub fn banned_sources(&self) -> Vec<(IpAddr, u64)> {
+        let now = Instant::now();
+        self.bans
+            .iter()
+            .filter_map(|entry| {
+                let remaining = entry.value().saturating_duration_since(now);
+                if remaining.is_zero() {
+                    None
+                } else {
+                    Some((*entry.key(), remaining.as_secs()))
+                }
+            })
+            .collect()
+    }
+
+    /// Lift the ban on `source` early — an operator clearing a false positive
+    /// (via the admin API). Removes the userspace ban and the failure window,
+    /// and, when the kernel firewall is wired, removes the source from the
+    /// nf_tables set too so the in-kernel drop is lifted in lockstep. Returns
+    /// `true` if a ban was actually present.
+    pub fn unban(&self, source: IpAddr) -> bool {
+        let was_banned = self.bans.remove(&source).is_some();
+        // Always clear any failure window so the source starts clean.
+        self.failures.remove(&source);
+        if was_banned {
+            if let Some(firewall) = self.firewall.get() {
+                firewall.unban(source);
+            }
+        }
+        was_banned
     }
 
     /// Drop expired bans and stale failure windows. Call periodically to keep
@@ -565,6 +618,44 @@ mod tests {
     }
 
     #[test]
+    fn unban_lifts_an_active_ban() {
+        let store = AutoBanStore::new(1, 600, 3600, &[], 1);
+        let source = ip("203.0.113.40");
+        assert!(store.record_failure(source)); // threshold 1 -> banned
+        assert!(store.is_banned(source));
+        assert!(store.unban(source)); // present -> true
+        assert!(!store.is_banned(source)); // lifted
+        assert_eq!(store.active_bans(), 0);
+    }
+
+    #[test]
+    fn unban_of_an_unbanned_source_is_false() {
+        let store = AutoBanStore::new(3, 600, 3600, &[], 1);
+        let source = ip("203.0.113.41");
+        // Never banned -> nothing to lift.
+        assert!(!store.unban(source));
+        // A failure count without a ban is still cleared, and reports false.
+        store.record_failure(source);
+        assert!(!store.unban(source));
+    }
+
+    #[test]
+    fn banned_sources_lists_active_bans_with_remaining() {
+        let store = AutoBanStore::new(1, 600, 3600, &[], 1);
+        let one = ip("203.0.113.42");
+        let two = ip("2001:db8::42");
+        store.record_failure(one);
+        store.record_failure(two);
+        let mut listed = store.banned_sources();
+        listed.sort_by_key(|(address, _)| address.to_string());
+        assert_eq!(listed.len(), 2);
+        // Both carry a positive remaining TTL (≤ the 3600 s ban duration).
+        assert!(listed.iter().all(|(_, remaining)| *remaining > 0 && *remaining <= 3600));
+        assert!(listed.iter().any(|(address, _)| *address == one));
+        assert!(listed.iter().any(|(address, _)| *address == two));
+    }
+
+    #[test]
     fn strong_failures_ban_faster_than_plain_probes() {
         // threshold 6, strong weight 3: two high-confidence signals (3+3=6) ban,
         // while a plain probe (weight 1) needs the full six hits.
@@ -651,6 +742,7 @@ mod tests {
             trusted_cidrs: trusted_cidrs.into_iter().map(String::from).collect(),
             failed_auth_ban: None,
             apiban: None,
+            firewall: None,
         }
     }
 

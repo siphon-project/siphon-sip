@@ -19,6 +19,30 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   params and tags are preserved. Applies to both `call.dial()` and `call.fork()`.
   Mirrored in the `siphon-sip` SDK mock; new SIPp acceptance scenario
   (`sipp/b2bua_set_host_uas.xml`).
+- **Kernel firewall (`security.firewall`).** Mirror SIPhon's bans — the
+  confidence-weighted `failed_auth_ban` store and the APIBAN blocklist — into a
+  kernel nf_tables set, so abusive sources are dropped in the kernel before they
+  reach SIPhon's socket instead of only in the userspace ACL. Self-contained:
+  SIPhon programs the set directly over netlink (no `nft` shell-out, no daemon, no
+  new dependencies), and the kernel auto-expires each ban via a per-element timeout
+  matching the in-memory TTL. Opt-in, Linux-only, needs `CAP_NET_ADMIN`; falls back
+  to the userspace ACL with a warning when it's missing. Zero-touch by default:
+  SIPhon owns the whole ruleset (table, sets, base chain, and the `saddr @banned
+  drop` rules), so `firewall: {}` is all that's needed; set `manage_rule: false` to
+  have SIPhon maintain only the sets and reference them from your own ruleset. Two
+  new counters make the runtime failure modes observable:
+  `siphon_firewall_command_failures_total` (a ban did not reach the kernel — alert
+  on it) and `siphon_firewall_commands_dropped_total` (a ban storm outran the
+  netlink actor's queue; the userspace ACL still enforces every ban). Also expands
+  the security cookbook with the ban-scoring model and adds a Kernel firewall page
+  covering `CAP_NET_ADMIN` per runtime, container behaviour, and the
+  nftables-vs-XDP tradeoff.
+- **Admin API ban management** — `GET /admin/bans` lists the sources currently
+  auto-banned by `failed_auth_ban` (with remaining TTL), and
+  `DELETE /admin/bans/{ip}` lifts a ban early for an operator clearing a false
+  positive. The unban clears the userspace ban and, when the kernel firewall is
+  enabled, removes the matching nf_tables element in lockstep so the in-kernel
+  drop is lifted too.
 - **Outbound TLS client certificate (mutual TLS).** New `tls.client_certificate`
   and `tls.client_private_key` (PEM chain + key). When set, siphon presents that
   client certificate on outbound TLS connections whose peer requests one — for
