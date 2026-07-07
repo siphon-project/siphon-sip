@@ -9,14 +9,18 @@
 //! Python scripts interact via `from siphon import rtpengine` or
 //! `call.media.anchor()`.
 
+pub mod backend;
 pub mod bencode;
 pub mod client;
 pub mod error;
 pub mod events;
 pub mod profile;
 pub mod session;
+pub mod siphon_rtp;
 
+pub use backend::MediaBackend;
 pub use client::{RtpEngineClient, RtpEngineSet};
 pub use error::RtpEngineError;
 pub use profile::{NgFlags, ProfileEntry, ProfileRegistry};
 pub use session::{MediaSession, MediaSessionStore};
+pub use siphon_rtp::{SiphonRtpClient, SiphonRtpClientSet};

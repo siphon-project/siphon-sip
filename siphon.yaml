@@ -437,10 +437,22 @@ auth:
 #     local_max_entries: 10000
 
 # ---------------------------------------------------------------------------
-# Media (RTPEngine)
+# Media engine (rtpengine or native siphon-rtp)
 # ---------------------------------------------------------------------------
+# siphon drives one of two media-control backends, selected by `media.backend`:
+#   rtpengine  (default) — rtpengine NG protocol, bencode over UDP
+#   siphon-rtp           — native siphon-rtp engine, JSON over a persistent TCP
+#                          connection (reliable, optional auth, server-pushed
+#                          DTMF/media-timeout events on the same connection).
+#                          EXPERIMENTAL — the siphon-rtp engine is pre-release;
+#                          use rtpengine in production until it stabilises.
+# The Python `rtpengine` scripting API and all media profiles are identical for
+# both backends — only the transport underneath differs.
+#
+# --- rtpengine backend (default) ---
 # Single instance:
 # media:
+#   backend: rtpengine             # optional; this is the default
 #   rtpengine:
 #     address: "127.0.0.1:22222"   # NG control protocol (UDP)
 #     timeout_ms: 1000              # NG protocol response timeout
@@ -460,6 +472,34 @@ auth:
 #       - address: "10.0.0.2:22222"
 #         weight: 1
 #         timeout_ms: 2000
+#
+# --- native siphon-rtp backend (EXPERIMENTAL) ---
+# The siphon-rtp media engine is pre-release; this backend is not yet
+# recommended for production. SIPREC/MPTY are not implemented on it yet.
+# Single instance:
+# media:
+#   backend: siphon-rtp
+#   siphon_rtp:
+#     address: "127.0.0.1:8080"     # siphon-rtp --control <addr> (TCP)
+#     control_secret: "${SIPHON_RTP_CONTROL_SECRET}"  # optional shared secret
+#     timeout_ms: 2000               # per-command response timeout (default 2000)
+#
+# Multiple instances (weighted round-robin + per-call-id affinity, same as
+# rtpengine; control_secret is shared across all):
+# media:
+#   backend: siphon-rtp
+#   siphon_rtp:
+#     control_secret: "${SIPHON_RTP_CONTROL_SECRET}"
+#     timeout_ms: 2000               # default; per-instance timeout_ms overrides
+#     instances:
+#       - address: "10.0.0.1:8080"
+#         weight: 2
+#       - address: "10.0.0.2:8080"
+#         weight: 1
+#         timeout_ms: 3000
+#   # `profiles:` and `health_check_interval_secs:` apply to this backend too.
+#   # The rtpengine-only `media.events:` listener is not used here — events ride
+#   # the control connection.
 #
 # Custom media profiles (extend or override built-ins):
 #

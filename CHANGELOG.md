@@ -7,6 +7,50 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **`@rtpengine.on_media_timeout` script hook.** The media engine reaps a call
+  whose media went dead (no packets past its inactivity window) and pushes a
+  media-timeout event; a handler decorated with `@rtpengine.on_media_timeout`
+  (optionally filtered by `call_id` / `from_tag`, same shape as
+  `@rtpengine.on_dtmf`) now receives `(call_id, from_tag)` so the script can
+  release the per-call state no BYE will clear — Rx/N5 QoS sessions, offline
+  charging, dialog/session-store entries. The event is still logged; the hook is
+  additive. Delivered by the native **siphon-rtp** backend, which pushes the
+  event over its control connection — the rtpengine backend does not emit
+  media-timeout events (its NG event log carries only DTMF), so the hook is a
+  no-op under rtpengine today. Mirrored in the `siphon-sip` SDK mock
+  (`on_media_timeout` + a `fire_media_timeout` test helper).
+- **Native `siphon-rtp` media backend (JSON-over-TCP) — experimental.** siphon
+  can now drive the in-house `siphon-rtp` media engine over its native control
+  protocol — a persistent TCP connection carrying length-prefixed JSON frames —
+  as an alternative to the rtpengine NG/bencode-over-UDP engine. The siphon-rtp
+  engine is pre-release, so this backend is **experimental**; rtpengine remains
+  the recommended production backend. Select it per deployment:
+  ```yaml
+  media:
+    backend: siphon-rtp            # default: rtpengine
+    siphon_rtp:
+      address: "127.0.0.1:8080"
+      control_secret: "${SIPHON_RTP_CONTROL_SECRET}"   # optional
+      timeout_ms: 2000
+  ```
+  - Reliable transport with request/response correlation, an optional
+    shared-secret auth handshake, and automatic reconnect with backoff (siphon
+    boots even when the engine is down; commands issued before the connection is
+    up wait for it, up to their timeout).
+  - **Server-pushed events** (DTMF, media-timeout) arrive on the same control
+    connection and flow through the existing event path, so
+    `@rtpengine.on_dtmf` handlers work unchanged regardless of backend.
+  - The Python `rtpengine` scripting API and all media profiles are **unchanged**
+    — only the transport underneath differs.
+  - **Full HA / load-balancing parity with rtpengine:** `media.siphon_rtp`
+    accepts either a single `address` or an `instances:` list with weights, using
+    weighted round-robin plus per-call-id connection affinity (every command for
+    a call stays on one connection). Per-instance health is probed and exported
+    alongside the existing rtpengine health metrics.
+  - **Backward compatible:** the default backend remains `rtpengine`; existing
+    `media.rtpengine` configs are untouched. SIPREC/MPTY subscriptions are not
+    yet implemented on `siphon-rtp` and surface a clear engine error there.
+  - Depends on the published `siphon-rtp-proto` crate (the shared wire contract).
 - **B2BUA `call.set_from_host()` / `call.set_to_host()`** — pin the host part of
   the B-leg From / To URI, mirroring `set_from_user` / `set_to_user`. By default
   the B2BUA rewrites the B-leg From host to its own advertised address (topology

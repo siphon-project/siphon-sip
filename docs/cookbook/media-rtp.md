@@ -1,9 +1,16 @@
 # Media & RTP profiles
 
-SIPhon anchors and transforms media through [RTPEngine](https://github.com/sipwise/rtpengine)
-using its NG control protocol. A **profile** is a named bundle of RTPEngine flags —
-SRTP↔RTP interworking, WebRTC, ICE handling, transcoding direction — that you select
-per call with one argument.
+SIPhon anchors and transforms media through a pluggable media engine —
+[RTPEngine](https://github.com/sipwise/rtpengine) over its NG control protocol by
+default, or the native **siphon-rtp** engine ([choosing and managing an
+engine](../media-engines.md)). A **profile** is a named bundle of engine flags —
+SRTP↔RTP interworking, WebRTC, ICE handling, transcoding direction — that you
+select per call with one argument.
+
+This page is the **scripting recipe** — the `offer` / `answer` / `delete`
+lifecycle and the profile catalogue. It is identical for both backends. For
+*which* engine to run and *how to operate each one*, see
+[Media engines: rtpengine vs siphon-rtp](../media-engines.md).
 
 ## Config
 
@@ -26,6 +33,23 @@ media:
       - { address: "10.0.0.1:22222", weight: 2 }
       - { address: "10.0.0.2:22222", weight: 1 }
 ```
+
+## Choosing a media engine
+
+SIPhon drives one of two media engines, chosen with `media.backend`:
+[RTPEngine](https://github.com/sipwise/rtpengine) (`rtpengine`, the default) or
+the in-house **siphon-rtp** (`siphon-rtp`). Everything on this page — the
+`offer` / `answer` / `delete` lifecycle, the profiles, and the `rtpengine`
+scripting namespace — is **identical** for both; only the engine you run and the
+`media:` block that points at it change.
+
+!!! warning "siphon-rtp is experimental"
+    The siphon-rtp engine is pre-release, so this backend is **experimental** —
+    use the default `rtpengine` backend in production until it stabilises.
+    SIPREC/MPTY subscriptions are not yet implemented on siphon-rtp.
+
+See [Media engines: rtpengine vs siphon-rtp](../media-engines.md) for the full
+comparison, the `media.siphon_rtp` config, and how to run and operate each engine.
 
 ## The offer / answer / delete lifecycle
 
@@ -130,6 +154,32 @@ s.apply(request)
 The `rtpengine` namespace also drives announcements and tones (`play_media`,
 `play_dtmf`), gating (`silence_media` / `block_media`), DTMF events (`@rtpengine.on_dtmf`),
 and conference/MPTY subscriptions — useful for IVR, MMTel announcements, and recording.
+
+### React to a dead media path
+
+The media engine reaps a call whose media stops flowing (no packets past its
+inactivity window). Handle `@rtpengine.on_media_timeout` to release the per-call
+state that no BYE will now clear — Rx/N5 QoS sessions, offline charging, dialog
+or session-store entries. It is the media-path analogue of the abandoned-call
+teardown `@proxy.on_cancel` / `@b2bua.on_cancel` cover.
+
+```python
+from siphon import rtpengine, log
+
+@rtpengine.on_media_timeout
+def media_gone(call_id, from_tag):
+    log.warn(f"media timeout on {call_id} — releasing call state")
+    # e.g. diameter.rx_str(session_id) / sbi.delete_session(...) / cdr.write(...)
+```
+
+Filter to a specific call with `@rtpengine.on_media_timeout(call_id=..., from_tag=...)`,
+the same shape as `@rtpengine.on_dtmf`.
+
+!!! note "siphon-rtp only, for now"
+    This event is delivered by the native **siphon-rtp** backend, which pushes it
+    over its control connection. The rtpengine backend's event log carries only
+    DTMF, so `@rtpengine.on_media_timeout` does not fire under rtpengine yet —
+    see [Media engines](../media-engines.md).
 
 ## See also
 

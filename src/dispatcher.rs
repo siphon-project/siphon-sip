@@ -44,11 +44,12 @@ use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, OutboundRo
 use crate::transport::pool::ConnectionPool;
 use crate::uac::UacSender;
 
-/// RTPEngine wiring produced by [`init_rtpengine`]: the engine set, the media
-/// session store, and the profile registry. Each component is present only
-/// when `media.rtpengine` is configured (otherwise all three are `None`).
+/// RTPEngine wiring produced by [`init_rtpengine`]: the media-control backend
+/// (rtpengine NG or native siphon-rtp), the media session store, and the
+/// profile registry. Each component is present only when `media` is configured
+/// (otherwise all three are `None`).
 type RtpEngineComponents = (
-    Option<Arc<crate::rtpengine::client::RtpEngineSet>>,
+    Option<Arc<crate::rtpengine::MediaBackend>>,
     Option<Arc<crate::rtpengine::session::MediaSessionStore>>,
     Option<Arc<crate::rtpengine::ProfileRegistry>>,
 );
@@ -110,11 +111,12 @@ struct DispatcherState {
     hep_sender: Option<Arc<HepSender>>,
     /// UAC sender for outbound requests (keepalive, health probes).
     uac_sender: Arc<UacSender>,
-    /// RTPEngine client set (None when media.rtpengine is not configured).
-    rtpengine_set: Option<Arc<crate::rtpengine::client::RtpEngineSet>>,
-    /// RTPEngine media session store (None when media.rtpengine is not configured).
+    /// Media-control backend — rtpengine NG or native siphon-rtp (None when
+    /// `media` is not configured).
+    rtpengine_set: Option<Arc<crate::rtpengine::MediaBackend>>,
+    /// RTPEngine media session store (None when media is not configured).
     rtpengine_sessions: Option<Arc<crate::rtpengine::session::MediaSessionStore>>,
-    /// RTPEngine media profile registry (None when media.rtpengine is not configured).
+    /// RTPEngine media profile registry (None when media is not configured).
     rtpengine_profiles: Option<Arc<crate::rtpengine::ProfileRegistry>>,
     /// RFC 4028 session timer configuration (None when not configured).
     session_timer_config: Option<crate::config::SessionTimerConfig>,
@@ -902,6 +904,63 @@ pub async fn run(
                                             tracing::error!(
                                                 %error,
                                                 "rtpengine.on_dtmf handler failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        })
+                        .await;
+                    }
+                    crate::rtpengine::events::RtpEngineEvent::MediaTimeout {
+                        call_id,
+                        from_tag,
+                    } => {
+                        // The media engine tore down a dead-path call. Log it for
+                        // visibility regardless of whether a script handles it,
+                        // then invoke any @rtpengine.on_media_timeout handlers so
+                        // the script can release the per-call state no BYE will
+                        // now clear (Rx/N5 QoS, charging, dialog).
+                        tracing::warn!(
+                            %call_id,
+                            %from_tag,
+                            "media engine reported media timeout (engine tore down call)"
+                        );
+                        let engine_state = state_for_events.engine.state();
+                        let handlers =
+                            engine_state.media_timeout_handlers(&call_id, &from_tag);
+                        if handlers.is_empty() {
+                            continue;
+                        }
+                        let state_ref = Arc::clone(&state_for_events);
+                        let call_id_clone = call_id.clone();
+                        let from_tag_clone = from_tag.clone();
+                        let _ = crate::script::py_executor::try_run(move || {
+                            let engine_state = state_ref.engine.state();
+                            let handlers = engine_state
+                                .media_timeout_handlers(&call_id_clone, &from_tag_clone);
+                            pyo3::Python::attach(|python| {
+                                for handler in handlers {
+                                    let callable = handler.callable.bind(python);
+                                    let result = callable.call1((
+                                        call_id_clone.as_str(),
+                                        from_tag_clone.as_str(),
+                                    ));
+                                    match result {
+                                        Ok(ret) => {
+                                            if handler.is_async {
+                                                if let Err(error) = run_coroutine(python, &ret) {
+                                                    tracing::error!(
+                                                        %error,
+                                                        "async rtpengine.on_media_timeout handler error"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                %error,
+                                                "rtpengine.on_media_timeout handler failed"
                                             );
                                         }
                                     }
@@ -4494,78 +4553,156 @@ fn send_to_target(
 /// When a handler is `async def`, calling it returns a coroutine object.
 /// This function drives it using `asyncio.run()` which creates a fresh
 /// event loop, runs the coroutine, and tears it down.
-/// Initialize the RTPEngine client set and media session store.
+/// Initialize the media-control backend, media session store, and profile
+/// registry, and register the Python `siphon.rtpengine` singleton.
 ///
-/// Returns `(None, None)` when `media.rtpengine` is not configured.
-/// Also registers the Python `siphon.rtpengine` singleton for script use.
-pub fn init_rtpengine(config: &Config) -> RtpEngineComponents {
+/// Selects rtpengine NG or the native siphon-rtp engine per `media.backend`.
+/// `event_sender` carries async engine events (DTMF, media-timeout) onward to
+/// the dispatcher's consumer loop; the native backend forwards events from its
+/// control connection over it (the rtpengine backend uses the separate TCP
+/// event listener instead). Returns `(None, None, None)` when `media` is not
+/// configured or the selected backend cannot be built.
+pub fn init_rtpengine(
+    config: &Config,
+    event_sender: tokio::sync::mpsc::Sender<crate::rtpengine::events::RtpEngineEvent>,
+) -> RtpEngineComponents {
     let media_config = match &config.media {
         Some(c) => c,
         None => return (None, None, None),
     };
 
-    let instances_config = media_config.rtpengine.instances();
-    let mut instance_tuples = Vec::new();
+    let backend = match media_config.backend {
+        crate::config::MediaBackendKind::Rtpengine => build_rtpengine_backend(media_config),
+        crate::config::MediaBackendKind::SiphonRtp => {
+            build_siphon_rtp_backend(media_config, event_sender)
+        }
+    };
+    let backend = match backend {
+        Some(backend) => Arc::new(backend),
+        None => return (None, None, None),
+    };
 
+    let sessions = Arc::new(crate::rtpengine::session::MediaSessionStore::new());
+    // Profile registry from built-in defaults + custom YAML profiles (shared
+    // across backends — profiles map to NG flags / proto ProfileFlags alike).
+    let registry = Arc::new(crate::rtpengine::ProfileRegistry::from_config(
+        &media_config.profiles,
+    ));
+
+    // Create the Python-side singleton (shares the same Arcs).
+    let py_rtpengine = crate::script::api::rtpengine::PyRtpEngine::new(
+        Arc::clone(&backend),
+        Arc::clone(&sessions),
+        Arc::clone(&registry),
+    );
+    Python::attach(|python| {
+        if let Err(error) = crate::script::api::set_rtpengine_singleton(python, py_rtpengine) {
+            error!("failed to store RTPEngine singleton: {error}");
+        } else {
+            info!(
+                instances = backend.instance_count(),
+                "media backend registered"
+            );
+        }
+    });
+
+    (Some(backend), Some(sessions), Some(registry))
+}
+
+/// Build the rtpengine NG/bencode backend from `media.rtpengine`.
+fn build_rtpengine_backend(
+    media_config: &crate::config::MediaConfig,
+) -> Option<crate::rtpengine::MediaBackend> {
+    let rtpengine_config = match &media_config.rtpengine {
+        Some(config) => config,
+        None => {
+            error!("media.backend is 'rtpengine' but no media.rtpengine block is configured");
+            return None;
+        }
+    };
+
+    let instances_config = rtpengine_config.instances();
+    let mut instance_tuples = Vec::new();
     for instance in &instances_config {
         match instance.address.parse::<std::net::SocketAddr>() {
-            Ok(address) => {
-                instance_tuples.push((address, instance.timeout_ms, instance.weight));
-            }
-            Err(parse_error) => {
-                error!(
-                    address = %instance.address,
-                    error = %parse_error,
-                    "invalid RTPEngine address, skipping"
-                );
-            }
+            Ok(address) => instance_tuples.push((address, instance.timeout_ms, instance.weight)),
+            Err(parse_error) => error!(
+                address = %instance.address,
+                error = %parse_error,
+                "invalid RTPEngine address, skipping"
+            ),
         }
     }
-
     if instance_tuples.is_empty() {
-        return (None, None, None);
+        return None;
     }
 
+    let count = instance_tuples.len();
     let handle = tokio::runtime::Handle::current();
     match tokio::task::block_in_place(|| {
         handle.block_on(crate::rtpengine::client::RtpEngineSet::new(instance_tuples))
     }) {
-        Ok(rtpengine_set) => {
-            let rtpengine_set = Arc::new(rtpengine_set);
-            let sessions = Arc::new(crate::rtpengine::session::MediaSessionStore::new());
-
-            // Build profile registry from built-in defaults + custom YAML profiles
-            let registry = Arc::new(
-                crate::rtpengine::ProfileRegistry::from_config(&media_config.profiles),
+        Ok(set) => {
+            info!(
+                instances = count,
+                "rtpengine NG backend configured ({count} instance{})",
+                if count == 1 { "" } else { "s" }
             );
-
-            // Create the Python-side singleton (shares the same Arcs)
-            let py_rtpengine = crate::script::api::rtpengine::PyRtpEngine::new(
-                Arc::clone(&rtpengine_set),
-                Arc::clone(&sessions),
-                Arc::clone(&registry),
-            );
-
-            Python::attach(|python| {
-                if let Err(error) =
-                    crate::script::api::set_rtpengine_singleton(python, py_rtpengine)
-                {
-                    error!("failed to store RTPEngine singleton: {error}");
-                } else {
-                    let count = instances_config.len();
-                    info!(
-                        instances = count,
-                        "RTPEngine client registered ({count} instance{})",
-                        if count == 1 { "" } else { "s" }
-                    );
-                }
-            });
-
-            (Some(rtpengine_set), Some(sessions), Some(registry))
+            Some(crate::rtpengine::MediaBackend::RtpEngine(Arc::new(set)))
         }
-        Err(rtpengine_error) => {
-            error!(error = %rtpengine_error, "failed to initialize RTPEngine client");
-            (None, None, None)
+        Err(error) => {
+            error!(error = %error, "failed to initialize RTPEngine client");
+            None
+        }
+    }
+}
+
+/// Build the native siphon-rtp JSON-over-TCP backend from `media.siphon_rtp`.
+fn build_siphon_rtp_backend(
+    media_config: &crate::config::MediaConfig,
+    event_sender: tokio::sync::mpsc::Sender<crate::rtpengine::events::RtpEngineEvent>,
+) -> Option<crate::rtpengine::MediaBackend> {
+    let siphon_rtp_config = match &media_config.siphon_rtp {
+        Some(config) => config,
+        None => {
+            error!("media.backend is 'siphon-rtp' but no media.siphon_rtp block is configured");
+            return None;
+        }
+    };
+
+    let mut instance_tuples = Vec::new();
+    for (address, timeout_ms, weight) in siphon_rtp_config.instances() {
+        match address.parse::<std::net::SocketAddr>() {
+            Ok(parsed) => instance_tuples.push((parsed, timeout_ms, weight)),
+            Err(parse_error) => error!(
+                address = %address,
+                error = %parse_error,
+                "invalid siphon-rtp control address, skipping"
+            ),
+        }
+    }
+    if instance_tuples.is_empty() {
+        error!("media.backend is 'siphon-rtp' but no valid control address is configured");
+        return None;
+    }
+
+    let count = instance_tuples.len();
+    match crate::rtpengine::SiphonRtpClientSet::new(
+        instance_tuples,
+        siphon_rtp_config.control_secret.clone(),
+        event_sender,
+    ) {
+        Ok(set) => {
+            info!(
+                instances = count,
+                "siphon-rtp native media backend configured ({count} instance{})",
+                if count == 1 { "" } else { "s" }
+            );
+            Some(crate::rtpengine::MediaBackend::SiphonRtp(set))
+        }
+        Err(error) => {
+            error!(error = %error, "failed to initialize siphon-rtp client set");
+            None
         }
     }
 }
@@ -4582,7 +4719,7 @@ pub fn init_rtpengine(config: &Config) -> RtpEngineComponents {
 /// - `siphon_rtpengine_instances_up` — number that answered the last ping
 /// - `siphon_rtpengine_instance_up{address}` — 0/1 for each instance
 pub fn spawn_rtpengine_health_check(
-    rtpengine_set: Arc<crate::rtpengine::client::RtpEngineSet>,
+    rtpengine_set: Arc<crate::rtpengine::MediaBackend>,
     interval_secs: u64,
 ) {
     if interval_secs == 0 {

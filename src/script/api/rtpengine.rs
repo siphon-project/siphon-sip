@@ -15,8 +15,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use tracing::{debug, warn};
 
-use crate::rtpengine::client::{PlayMediaSource, RtpEngineSet};
+use crate::rtpengine::client::PlayMediaSource;
 use crate::rtpengine::profile::ProfileRegistry;
+use crate::rtpengine::MediaBackend;
 use crate::rtpengine::session::{MediaSession, MediaSessionStore};
 use crate::sip::message::SipMessage;
 
@@ -29,14 +30,14 @@ use super::request::PyRequest;
 /// Injected as `siphon.rtpengine` when media config is present.
 #[pyclass(name = "RtpEngineNamespace")]
 pub struct PyRtpEngine {
-    client: Arc<RtpEngineSet>,
+    client: Arc<MediaBackend>,
     sessions: Arc<MediaSessionStore>,
     registry: Arc<ProfileRegistry>,
 }
 
 impl PyRtpEngine {
     pub fn new(
-        client: Arc<RtpEngineSet>,
+        client: Arc<MediaBackend>,
         sessions: Arc<MediaSessionStore>,
         registry: Arc<ProfileRegistry>,
     ) -> Self {
@@ -753,6 +754,73 @@ def make_decorator(call_id, from_tag):
         let decorator = make_decorator.call1((call_id, from_tag))?;
 
         // Support both `@on_dtmf` (bare) and `@on_dtmf(call_id=...)` forms.
+        match func_or_none {
+            Some(func) => decorator.call1((func.bind(python),)),
+            None => Ok(decorator),
+        }
+    }
+
+    /// Register a handler for media-timeout events from the media engine.
+    ///
+    /// The engine reaps a call whose media went dead (no packets past its
+    /// inactivity window) and pushes a media-timeout event.  The handler
+    /// receives ``(call_id, from_tag)`` and should release the per-call state
+    /// no BYE will now clear — Rx/N5 QoS sessions, offline-charging records,
+    /// dialog/session-store entries — much like `@proxy.on_cancel` /
+    /// `@b2bua.on_cancel` cover the abandoned-call teardown a BYE never sends.
+    ///
+    /// Delivered by the native **siphon-rtp** backend, which pushes the event
+    /// over its control connection.  The rtpengine backend does not emit
+    /// media-timeout events (its NG event log carries only DTMF), so this hook
+    /// does not fire under rtpengine today.
+    ///
+    /// ```python,ignore
+    /// @rtpengine.on_media_timeout(call_id="abc", from_tag="ftag1")
+    /// def handle_timeout(call_id, from_tag):
+    ///     ...
+    ///
+    /// # Catch-all - no filters
+    /// @rtpengine.on_media_timeout
+    /// def handle_any(call_id, from_tag):
+    ///     ...
+    /// ```
+    ///
+    /// Args:
+    ///     func_or_none: When applied directly (``@rtpengine.on_media_timeout``)
+    ///         this is the function.  When called with keyword filters the
+    ///         return value is a decorator.
+    ///     call_id: Optional engine call-id filter.
+    ///     from_tag: Optional from-tag filter.
+    #[pyo3(signature = (func_or_none=None, *, call_id=None, from_tag=None))]
+    fn on_media_timeout<'py>(
+        &self,
+        python: Python<'py>,
+        func_or_none: Option<Py<PyAny>>,
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // Compose a Python-side decorator that registers via _siphon_registry
+        // with metadata describing the filters (mirrors `on_dtmf`).
+        let code = r#"
+def make_decorator(call_id, from_tag):
+    import asyncio
+    import _siphon_registry
+    def decorator(fn):
+        is_async = asyncio.iscoroutinefunction(fn)
+        metadata = {"call_id": call_id, "from_tag": from_tag}
+        _siphon_registry.register("rtpengine.on_media_timeout", None, fn, is_async, metadata)
+        return fn
+    return decorator
+"#;
+        let globals = PyDict::new(python);
+        python.run(&std::ffi::CString::new(code).unwrap(), Some(&globals), None)?;
+        let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("failed to build on_media_timeout decorator")
+        })?;
+        let decorator = make_decorator.call1((call_id, from_tag))?;
+
+        // Support both `@on_media_timeout` (bare) and
+        // `@on_media_timeout(call_id=...)` forms.
         match func_or_none {
             Some(func) => decorator.call1((func.bind(python),)),
             None => Ok(decorator),

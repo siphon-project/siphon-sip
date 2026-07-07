@@ -1576,11 +1576,32 @@ pub struct NamedCacheConfig {
 // Media (RTPEngine)
 // ---------------------------------------------------------------------------
 
+/// Which media-control backend siphon drives.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum MediaBackendKind {
+    /// rtpengine NG protocol (bencode over UDP) — the default.
+    #[default]
+    Rtpengine,
+    /// Native `siphon-rtp` control protocol (JSON over TCP).
+    SiphonRtp,
+}
+
 /// Media proxy configuration.
 #[derive(Debug, Deserialize, Clone)]
 pub struct MediaConfig {
+    /// Which media engine to drive. Defaults to `rtpengine` for backward
+    /// compatibility; set to `siphon-rtp` to use the native JSON-over-TCP
+    /// engine via the `siphon_rtp:` block below.
+    #[serde(default)]
+    pub backend: MediaBackendKind,
     /// RTPEngine instance(s). A single instance or a list for load-balancing / HA.
-    pub rtpengine: RtpEngineSetConfig,
+    /// Required when `backend: rtpengine` (the default); ignored for `siphon-rtp`.
+    #[serde(default)]
+    pub rtpengine: Option<RtpEngineSetConfig>,
+    /// Native `siphon-rtp` engine connection. Required when `backend: siphon-rtp`.
+    #[serde(default)]
+    pub siphon_rtp: Option<SiphonRtpConfig>,
     /// Custom media profiles (name → offer/answer NG flags).
     /// Built-in profiles (srtp_to_rtp, ws_to_rtp, wss_to_rtp, rtp_passthrough)
     /// are always available; custom entries here extend or override them.
@@ -1613,6 +1634,77 @@ fn default_rtpengine_health_check_interval_secs() -> u64 {
 pub struct RtpEngineEventsConfig {
     /// Socket address to listen on (e.g. ``"0.0.0.0:22226"``).
     pub listen_addr: String,
+}
+
+/// Connection to the native `siphon-rtp` media engine (JSON-over-TCP control).
+///
+/// Accepts a single engine (`address`) or several (`instances`) for HA /
+/// load-balancing, mirroring `media.rtpengine`. Per-call-id affinity keeps all
+/// of a call's commands on one connection (siphon-rtp keys call ownership to the
+/// control connection). `control_secret` is shared across all instances.
+///
+/// Events (DTMF, media-timeout) arrive on the control connection itself, so the
+/// rtpengine-specific `media.events` listener is not used with this backend.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SiphonRtpConfig {
+    /// Single control endpoint, e.g. ``"127.0.0.1:8080"``
+    /// (`siphon-rtp --control <addr>`). Shorthand for one instance; ignored when
+    /// `instances` is non-empty.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Multiple control endpoints for HA / weighted load-balancing. Takes
+    /// precedence over `address` when present.
+    #[serde(default)]
+    pub instances: Vec<SiphonRtpInstanceConfig>,
+    /// Optional shared secret. When set, siphon authenticates each control
+    /// connection before issuing commands (matches `siphon-rtp`'s
+    /// `SIPHON_RTP_CONTROL_SECRET`). Supports `${VAR}` env expansion.
+    #[serde(default)]
+    pub control_secret: Option<String>,
+    /// Default per-command response timeout in milliseconds (per-instance
+    /// `timeout_ms` overrides it). Default: 2000.
+    #[serde(default = "default_siphon_rtp_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl SiphonRtpConfig {
+    /// Normalized `(address, timeout_ms, weight)` tuples — from `instances` when
+    /// present, else the single `address`. Empty when neither is configured.
+    pub fn instances(&self) -> Vec<(String, u64, u32)> {
+        if !self.instances.is_empty() {
+            self.instances
+                .iter()
+                .map(|instance| {
+                    (
+                        instance.address.clone(),
+                        instance.timeout_ms.unwrap_or(self.timeout_ms),
+                        instance.weight,
+                    )
+                })
+                .collect()
+        } else if let Some(address) = &self.address {
+            vec![(address.clone(), self.timeout_ms, 1)]
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+/// One `siphon-rtp` control endpoint in a multi-instance set.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SiphonRtpInstanceConfig {
+    /// Control endpoint, e.g. ``"10.0.0.1:8080"``.
+    pub address: String,
+    /// Response timeout in ms; falls back to the parent `timeout_ms` when unset.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Weight for load-balancing (higher = more traffic). Default: 1.
+    #[serde(default = "default_rtpengine_weight")]
+    pub weight: u32,
+}
+
+fn default_siphon_rtp_timeout_ms() -> u64 {
+    2000
 }
 
 /// A user-defined RTPEngine media profile with separate offer/answer NG flags.
@@ -3505,7 +3597,8 @@ media:
 "#;
         let config = Config::from_str(yaml).unwrap();
         let media = config.media.unwrap();
-        let instances = media.rtpengine.instances();
+        let rtpengine = media.rtpengine.expect("rtpengine block configured");
+        let instances = rtpengine.instances();
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].address, "127.0.0.1:22222");
         assert_eq!(instances[0].timeout_ms, 500);
@@ -3534,7 +3627,8 @@ media:
 "#;
         let config = Config::from_str(yaml).unwrap();
         let media = config.media.unwrap();
-        let instances = media.rtpengine.instances();
+        let rtpengine = media.rtpengine.expect("rtpengine block configured");
+        let instances = rtpengine.instances();
         assert_eq!(instances.len(), 2);
         assert_eq!(instances[0].address, "10.0.0.1:22222");
         assert_eq!(instances[0].weight, 2);
@@ -3561,9 +3655,98 @@ media:
 "#;
         let config = Config::from_str(yaml).unwrap();
         let media = config.media.unwrap();
-        let instances = media.rtpengine.instances();
+        let rtpengine = media.rtpengine.expect("rtpengine block configured");
+        let instances = rtpengine.instances();
         assert_eq!(instances[0].timeout_ms, 1000); // default
         assert_eq!(instances[0].weight, 1); // default
+    }
+
+    #[test]
+    fn media_backend_defaults_to_rtpengine() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+media:
+  rtpengine:
+    address: "127.0.0.1:22222"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let media = config.media.unwrap();
+        assert_eq!(media.backend, MediaBackendKind::Rtpengine);
+        assert!(media.rtpengine.is_some());
+        assert!(media.siphon_rtp.is_none());
+    }
+
+    #[test]
+    fn parses_media_backend_siphon_rtp() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "127.0.0.1:8080"
+    control_secret: "s3cret"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let media = config.media.unwrap();
+        assert_eq!(media.backend, MediaBackendKind::SiphonRtp);
+        assert!(media.rtpengine.is_none());
+        let siphon_rtp = media.siphon_rtp.expect("siphon_rtp block configured");
+        assert_eq!(siphon_rtp.address.as_deref(), Some("127.0.0.1:8080"));
+        assert_eq!(siphon_rtp.control_secret.as_deref(), Some("s3cret"));
+        assert_eq!(siphon_rtp.timeout_ms, 2000); // default
+        // Single `address` normalizes to one (address, timeout, weight) tuple.
+        let instances = siphon_rtp.instances();
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0], ("127.0.0.1:8080".to_string(), 2000, 1));
+    }
+
+    #[test]
+    fn parses_media_siphon_rtp_multiple_instances() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    control_secret: "shared"
+    timeout_ms: 1500
+    instances:
+      - address: "10.0.0.1:8080"
+        weight: 2
+      - address: "10.0.0.2:8080"
+        weight: 1
+        timeout_ms: 3000
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let media = config.media.unwrap();
+        assert_eq!(media.backend, MediaBackendKind::SiphonRtp);
+        let siphon_rtp = media.siphon_rtp.expect("siphon_rtp block configured");
+        assert_eq!(siphon_rtp.control_secret.as_deref(), Some("shared"));
+        let instances = siphon_rtp.instances();
+        assert_eq!(instances.len(), 2);
+        // First inherits the parent timeout; second overrides it.
+        assert_eq!(instances[0], ("10.0.0.1:8080".to_string(), 1500, 2));
+        assert_eq!(instances[1], ("10.0.0.2:8080".to_string(), 3000, 1));
     }
 
     #[test]

@@ -365,6 +365,31 @@ class _RtpEngineNamespace:
             return decorator(func_or_none)
         return decorator
 
+    def on_media_timeout(self, func_or_none=None, *, call_id=None, from_tag=None):
+        """Register a handler for media-timeout events from the media engine.
+
+        The engine reaps a call whose media went dead and pushes a media-timeout
+        event; the handler releases the per-call state no BYE will now clear
+        (Rx/N5 QoS, charging, dialog).
+
+        Usage:
+            @rtpengine.on_media_timeout
+            def handle_any(call_id, from_tag):
+                ...
+
+            @rtpengine.on_media_timeout(call_id="abc")
+            def handle_specific(call_id, from_tag):
+                ...
+        """
+        def decorator(fn):
+            is_async = _asyncio.iscoroutinefunction(fn)
+            metadata = {"call_id": call_id, "from_tag": from_tag}
+            _registry.register("rtpengine.on_media_timeout", None, fn, is_async, metadata)
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
 
 # ---------------------------------------------------------------------------
 # Gateway namespace (stub — replaced by Rust when gateway is configured)

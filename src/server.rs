@@ -471,7 +471,13 @@ impl SiphonServer {
         );
 
         dispatcher::inject_python_singletons(&config);
-        let pre_rtpengine = dispatcher::init_rtpengine(&config);
+        // Media-engine async event channel (DTMF, media-timeout). Created before
+        // init_rtpengine so the native siphon-rtp backend can forward events from
+        // its control connection over the same channel the rtpengine NG event
+        // listener feeds; the dispatcher consumes from `rtpengine_events_rx`.
+        let (rtpengine_events_tx, rtpengine_events_rx) =
+            tokio::sync::mpsc::channel::<crate::rtpengine::events::RtpEngineEvent>(256);
+        let pre_rtpengine = dispatcher::init_rtpengine(&config, rtpengine_events_tx.clone());
 
         // --- Gateway dispatcher ---
         let gateway_manager = init_gateway(&config);
@@ -1466,8 +1472,11 @@ impl SiphonServer {
         }
 
         // --- RTPEngine event listener (DTMF, etc.) ---
-        let (rtpengine_events_tx, rtpengine_events_rx) =
-            tokio::sync::mpsc::channel::<crate::rtpengine::events::RtpEngineEvent>(256);
+        // The event channel was created earlier (before init_rtpengine). This
+        // standalone TCP listener serves the rtpengine NG backend, which delivers
+        // events over a separate connection; the native siphon-rtp backend feeds
+        // the same channel directly from its control connection, so it does not
+        // need this listener (and `media.events` is typically unset there).
         if let Some(ref media_config) = config.media {
             if let Some(ref events_config) = media_config.events {
                 match events_config.listen_addr.parse() {

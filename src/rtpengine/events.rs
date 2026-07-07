@@ -23,11 +23,18 @@ use tracing::{debug, info, warn};
 use super::bencode::{self, BencodeValue};
 use super::error::RtpEngineError;
 
-/// One decoded rtpengine event.
+/// One decoded media-engine event.
 #[derive(Debug, Clone)]
 pub enum RtpEngineEvent {
     /// DTMF digit detected on a call leg.
     Dtmf(DtmfEvent),
+    /// A call's media went silent past the timeout and the engine tore it down
+    /// (dead-path detection).  Emitted by the `siphon-rtp` native backend; the
+    /// rtpengine NG backend does not currently surface this.
+    MediaTimeout {
+        call_id: String,
+        from_tag: String,
+    },
     /// An event we didn't recognise — passed through for logging.
     Unknown {
         event: String,

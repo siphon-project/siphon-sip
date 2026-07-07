@@ -492,7 +492,8 @@ async fn config_media_section_backward_compatible() {
     );
     let config = Config::from_str(yaml_with_media).unwrap();
     let media = config.media.unwrap();
-    let instances = media.rtpengine.instances();
+    let rtpengine = media.rtpengine.expect("rtpengine block configured");
+    let instances = rtpengine.instances();
     assert_eq!(instances.len(), 1);
     assert_eq!(instances[0].address, "127.0.0.1:22222");
 }

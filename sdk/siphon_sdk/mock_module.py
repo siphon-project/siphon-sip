@@ -1697,6 +1697,7 @@ class MockRtpEngine:
         self._subscribe_request_sdp: bytes = b""
         self._subscribe_answer_sdp: bytes = b""
         self._dtmf_handlers: list[dict[str, Any]] = []
+        self._media_timeout_handlers: list[dict[str, Any]] = []
 
     @property
     def active_sessions(self) -> int:
@@ -2036,6 +2037,49 @@ class MockRtpEngine:
             fired += 1
         return fired
 
+    def on_media_timeout(self, func_or_none: Any = None, *,
+                         call_id: Optional[str] = None,
+                         from_tag: Optional[str] = None) -> Any:
+        """Register a handler for media-timeout events from the media engine.
+
+        The engine reaps a call whose media went dead and pushes a
+        media-timeout event; the handler releases the per-call state no BYE
+        will now clear (Rx/N5 QoS, charging, dialog).
+
+        Usage::
+
+            @rtpengine.on_media_timeout
+            def handle_any(call_id, from_tag):
+                ...
+
+            @rtpengine.on_media_timeout(call_id="abc", from_tag="ftag1")
+            def handle_specific(call_id, from_tag):
+                ...
+        """
+        def decorator(fn: Any) -> Any:
+            self._media_timeout_handlers.append({
+                "fn": fn,
+                "call_id": call_id,
+                "from_tag": from_tag,
+            })
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def fire_media_timeout(self, call_id: str, from_tag: str) -> int:
+        """Test helper: fire a media-timeout event.  Returns the number of
+        handlers that matched (and were invoked)."""
+        fired = 0
+        for entry in self._media_timeout_handlers:
+            if entry["call_id"] is not None and entry["call_id"] != call_id:
+                continue
+            if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
+                continue
+            entry["fn"](call_id, from_tag)
+            fired += 1
+        return fired
+
     def set_subscribe_request_sdp(self, sdp: bytes) -> None:
         """Configure the SDP returned by :meth:`subscribe_request` (test helper)."""
         self._subscribe_request_sdp = sdp
@@ -2049,9 +2093,11 @@ class MockRtpEngine:
         self._play_media_duration_ms = duration_ms
 
     def clear(self) -> None:
-        """Clear recorded operations (test helper)."""
+        """Clear recorded operations and registered event handlers (test helper)."""
         self.operations.clear()
         self.media_calls.clear()
+        self._dtmf_handlers.clear()
+        self._media_timeout_handlers.clear()
 
 
 # ---------------------------------------------------------------------------
