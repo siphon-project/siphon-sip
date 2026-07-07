@@ -7,6 +7,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **B2BUA `call.set_from_host()` / `call.set_to_host()`** — pin the host part of
+  the B-leg From / To URI, mirroring `set_from_user` / `set_to_user`. By default
+  the B2BUA rewrites the B-leg From host to its own advertised address (topology
+  hiding) and the To host to the dial-target host. `set_from_host()` opts a leg
+  out of the From host-rewrite so the original domain survives — needed for a
+  multitenant SBC whose downstream selects the tenant from the From domain (a
+  domainless call would otherwise land in an unauthenticated/default routing
+  context). `set_to_host()` pins the To host declaratively (replaces the raw
+  `set_header("To", "<sip:…>")` idiom). Only the host changes; scheme/user/port/
+  params and tags are preserved. Applies to both `call.dial()` and `call.fork()`.
+  Mirrored in the `siphon-sip` SDK mock; new SIPp acceptance scenario
+  (`sipp/b2bua_set_host_uas.xml`).
 - **Kernel firewall (`security.firewall`).** Mirror SIPhon's bans — the
   confidence-weighted `failed_auth_ban` store and the APIBAN blocklist — into a
   kernel nf_tables set, so abusive sources are dropped in the kernel before they

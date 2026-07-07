@@ -1,0 +1,23 @@
+# Minimal B2BUA config for the call.set_from_host() / set_to_host() acceptance scenario.
+# See sipp/b2bua_set_host_uas.xml for the full native run procedure.
+#
+# advertised_address is 127.0.0.1: without the set_from_host() override the
+# B-leg From host would be rewritten to 127.0.0.1 (topology hiding). The UAS
+# asserts it is tenant.example.test instead, proving the override works.
+listen:
+  udp:
+    - "127.0.0.1:5060"
+
+domain:
+  local:
+    - "example.com"
+    - "127.0.0.1"
+
+advertised_address: "127.0.0.1"
+
+script:
+  path: "sipp/set_host_b2bua.py"
+  reload: sighup
+
+log:
+  level: info
