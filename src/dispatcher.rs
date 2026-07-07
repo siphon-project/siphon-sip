@@ -2509,6 +2509,7 @@ fn relay_request(
                         Some((dest, transport)) => RelayTarget {
                             address: dest,
                             transport: Some(transport),
+                            server_name: None,
                         },
                         None => {
                             warn!(target = %target_uri_string, "cannot resolve relay target");
@@ -2756,6 +2757,7 @@ fn relay_request(
             destination,
             data,
             source_local_addr: Some(local),
+            server_name: None,
         };
         let cid = outbound_message.connection_id;
         if let Err(error) = state.outbound.send(outbound_message) {
@@ -2778,6 +2780,7 @@ fn relay_request(
         let target = RelayTarget {
             address: destination,
             transport: Some(outbound_transport),
+            server_name: None,
         };
         send_to_target(data, &target, inbound.transport, inbound.connection_id, state)
     };
@@ -3041,6 +3044,7 @@ fn relay_fork_branch(
             destination,
             data,
             source_local_addr: Some(flow.local_addr),
+            server_name: None,
         };
         let cid = outbound_message.connection_id;
         if let Err(error) = state.outbound.send(outbound_message) {
@@ -3048,7 +3052,7 @@ fn relay_fork_branch(
         }
         cid
     } else {
-        let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport) };
+        let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport), server_name: None };
         send_to_target(data, &relay_target, inbound.transport, inbound.connection_id, state)
     };
 
@@ -3184,6 +3188,7 @@ fn handle_response(
                                 let target = RelayTarget {
                                     address: destination,
                                     transport: Some(transport),
+                                    server_name: None,
                                 };
                                 send_to_target(data, &target, transport, ConnectionId::default(), state);
                             }
@@ -3462,7 +3467,7 @@ fn handle_response(
                         let ack = build_ack_for_non2xx(&original_request, &message, &branch, cb.transport, state.local_addr);
                         send_to_target(
                             ack.to_bytes().into(),
-                            &RelayTarget { address: cb.destination, transport: Some(cb.transport) },
+                            &RelayTarget { address: cb.destination, transport: Some(cb.transport), server_name: None },
                             cb.transport,
                             cb.connection_id,
                             state,
@@ -4118,6 +4123,11 @@ struct RelayTarget {
     address: SocketAddr,
     /// Transport from URI params or SRV; `None` means use the inbound transport.
     transport: Option<Transport>,
+    /// Hostname from the resolved SIP URI, used as TLS SNI / certificate
+    /// hostname when a new outbound TLS connection must be opened. `None` for
+    /// bare-IP targets (RFC 6066 sends no SNI for an IP literal) and for
+    /// in-dialog / failover paths that route by address.
+    server_name: Option<String>,
 }
 
 /// Resolve a SIP target URI to its full ordered candidate set (RFC 3263).
@@ -4132,7 +4142,7 @@ struct RelayTarget {
 fn resolve_candidates(uri_string: &str, resolver: &SipResolver) -> Vec<RelayTarget> {
     // Try as bare IP:port first (cheapest check)
     if let Ok(addr) = uri_string.parse::<SocketAddr>() {
-        return vec![RelayTarget { address: addr, transport: None }];
+        return vec![RelayTarget { address: addr, transport: None, server_name: None }];
     }
 
     // Try parsing as a full SIP URI
@@ -4164,7 +4174,9 @@ fn resolve_candidates(uri_string: &str, resolver: &SipResolver) -> Vec<RelayTarg
                         "wss" => Some(Transport::WebSocketSecure),
                         _ => None,
                     });
-                RelayTarget { address: r.address, transport }
+                // All candidates from one URI share the target hostname — carry
+                // it for TLS SNI so a hostname-vhost peer routes the handshake.
+                RelayTarget { address: r.address, transport, server_name: Some(uri.host.clone()) }
             })
             .collect();
     }
@@ -4262,6 +4274,8 @@ fn send_to_target(
                     destination,
                     data,
                     source_local_addr: None,
+                    // Connection *reuse* — no TLS handshake, so no SNI needed.
+                    server_name: None,
                 };
                 if let Err(error) = state.outbound.send(outbound_message) {
                     error!(destination = %destination, "TLS connection reuse send failed: {error}");
@@ -4277,9 +4291,10 @@ fn send_to_target(
                 // No inbound connection to reuse — create outbound TLS via pool
                 let pool = Arc::clone(&state.connection_pool);
                 let data_clone = data;
+                let server_name = target.server_name.clone();
                 match tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current()
-                        .block_on(pool.send_tls(destination, data_clone))
+                        .block_on(pool.send_tls(destination, server_name.as_deref(), data_clone))
                 }) {
                     Ok(connection_id) => {
                         debug!(
@@ -4322,6 +4337,7 @@ fn send_to_target(
                         destination,
                         data,
                         source_local_addr: None,
+                        server_name: None,
                     };
                     if let Err(error) = state.outbound.send(outbound_message) {
                         error!(destination = %destination, %transport, "WS/WSS connection reuse send failed: {error}");
@@ -4366,6 +4382,7 @@ fn send_to_target(
                 destination,
                 data,
                 source_local_addr,
+                server_name: None,
             };
             if let Err(error) = state.outbound.send(outbound_message) {
                 error!("failed to enqueue relayed request: {error}");
@@ -4928,6 +4945,7 @@ fn select_b2bua_retry_destination(
             RelayTarget {
                 address: member_addr,
                 transport: Some(member_transport),
+                server_name: None,
             },
         )),
         None => resolve_target(target_uri, resolver).map(|relay_target| {
@@ -5306,6 +5324,7 @@ fn send_outbound_from(
         destination,
         data,
         source_local_addr,
+        server_name: None,
     };
 
     if let Err(error) = state.outbound.send(outbound_message) {
@@ -5552,6 +5571,7 @@ fn send_b2bua_to_bleg(
     let target = RelayTarget {
         address: destination,
         transport: Some(transport),
+        server_name: None,
     };
     send_to_target(data, &target, transport, ConnectionId::default(), state);
 }
@@ -6612,6 +6632,7 @@ fn handle_ack_via_session(
             let target = RelayTarget {
                 address: destination,
                 transport: Some(out_transport),
+                server_name: None,
             };
             send_to_target(
                 data,
@@ -7944,12 +7965,13 @@ fn b2bua_send_b_leg_invite(
             destination,
             data,
             source_local_addr: Some(flow.local_addr),
+            server_name: None,
         };
         if let Err(error) = state.outbound.send(outbound_message) {
             error!(call_id = %call_id, destination = %destination, transport = %outbound_transport, "B2BUA: flow send failed: {error}");
         }
     } else {
-        let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport) };
+        let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport), server_name: None };
         send_to_target(data, &relay_target, outbound_transport, ConnectionId::default(), state);
     }
 
@@ -8377,6 +8399,7 @@ fn handle_registrant_ipsec_challenge(
             destination,
             data,
             source_local_addr: Some(source),
+            server_name: None,
         };
         if let Err(error) = outbound.send(outbound_message) {
             warn!(aor = %aor_task, %error, "IPsec UE: failed to send protected REGISTER");
@@ -9631,6 +9654,7 @@ fn handle_b2bua_response(
                     let target = RelayTarget {
                         address: destination,
                         transport: Some(transport),
+                        server_name: None,
                     };
                     send_to_target(data, &target, transport, ConnectionId::default(), state);
                 }
@@ -10595,6 +10619,7 @@ fn handle_b2bua_bye(
         let target = RelayTarget {
             address: destination,
             transport: Some(transport),
+            server_name: None,
         };
         send_to_target(data, &target, transport, ConnectionId::default(), state);
     }
@@ -10918,6 +10943,7 @@ fn arm_reliable_provisional_retransmit(
                         destination,
                         data: bytes.clone(),
                         source_local_addr: None,
+                        server_name: None,
                     });
                     interval = (interval * 2).min(cap);
                 }
@@ -13004,6 +13030,20 @@ a=rtpmap:8 PCMA/8000\r\n";
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_candidates_carries_hostname_for_sni() {
+        let resolver = test_resolver();
+        // A SIP URI with a hostname → every candidate carries the host so a new
+        // outbound TLS connection presents it as SNI / certificate hostname.
+        let hosted = resolve_target("sip:alice@localhost:5090", &resolver)
+            .expect("localhost must resolve");
+        assert_eq!(hosted.server_name.as_deref(), Some("localhost"));
+
+        // A bare IP:port short-circuits → no SNI (RFC 6066 emits none for an IP).
+        let bare = resolve_target("192.0.2.1:5060", &resolver).expect("bare ip target");
+        assert!(bare.server_name.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn resolve_target_transport_tcp() {
         let resolver = test_resolver();
         let result = resolve_target("sip:alice@10.0.0.1:5060;transport=tcp", &resolver).unwrap();
@@ -13020,7 +13060,7 @@ a=rtpmap:8 PCMA/8000\r\n";
     // --- In-dialog connection reuse (RFC 5923) ---
 
     fn candidate(addr: &str) -> RelayTarget {
-        RelayTarget { address: addr.parse().unwrap(), transport: None }
+        RelayTarget { address: addr.parse().unwrap(), transport: None, server_name: None }
     }
 
     #[test]

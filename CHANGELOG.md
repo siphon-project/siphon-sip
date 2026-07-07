@@ -19,6 +19,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   params and tags are preserved. Applies to both `call.dial()` and `call.fork()`.
   Mirrored in the `siphon-sip` SDK mock; new SIPp acceptance scenario
   (`sipp/b2bua_set_host_uas.xml`).
+- **Outbound TLS client certificate (mutual TLS).** New `tls.client_certificate`
+  and `tls.client_private_key` (PEM chain + key). When set, siphon presents that
+  client certificate on outbound TLS connections whose peer requests one — for
+  upstream SIP trunks that require client-certificate / mutual TLS (e.g.
+  Microsoft Teams Direct Routing). Previously the outbound pool presented no
+  client certificate, so such peers aborted the handshake with
+  `CertificateUnknown`. Both fields must be set together (or neither); a
+  one-sided setting or an unreadable/unparseable file is a hard startup error
+  (fail closed). Server-certificate verification is unchanged (still permissive).
+- **Hostname-based outbound TLS SNI.** Outbound TLS handshakes now present the
+  resolved target hostname as SNI / certificate name instead of the destination
+  IP literal. RFC 6066 forbids SNI for an IP literal, so IP-based next hops
+  emitted none and hostname-vhost front-ends could not route the handshake; the
+  hostname now flows from the resolved SIP URI (relay, fork, and gateway TLS
+  health probe) through to the connection pool. Bare-IP next hops are unchanged
+  (still no SNI).
 
 ## [1.1.1] — 2026-07-02
 

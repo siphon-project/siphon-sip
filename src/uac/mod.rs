@@ -145,7 +145,7 @@ impl UacSender {
         transport: Transport,
         request_uri: SipUri,
     ) -> oneshot::Receiver<UacResult> {
-        self.send_options_with_identity(destination, transport, request_uri, None, None)
+        self.send_options_with_identity(destination, transport, request_uri, None, None, None)
     }
 
     /// Send an OPTIONS request on a specific existing connection (TLS reuse).
@@ -160,7 +160,7 @@ impl UacSender {
         request_uri: SipUri,
         connection_id: ConnectionId,
     ) -> oneshot::Receiver<UacResult> {
-        self.send_options_on_connection_inner(destination, transport, request_uri, connection_id, None, None, None)
+        self.send_options_on_connection_inner(destination, transport, request_uri, connection_id, None, None, None, None)
     }
 
     /// Send an OPTIONS over a captured inbound flow: egress from
@@ -191,10 +191,15 @@ impl UacSender {
             None,
             None,
             Some(source_local_addr),
+            None,
         )
     }
 
     /// Send an OPTIONS request with custom From identity.
+    ///
+    /// `server_name` is the TLS SNI / certificate hostname to present when the
+    /// probe opens a new outbound TLS connection (the gateway health probe knows
+    /// the configured hostname; an IP-addressed probe passes `None`).
     pub fn send_options_with_identity(
         &self,
         destination: SocketAddr,
@@ -202,10 +207,11 @@ impl UacSender {
         request_uri: SipUri,
         from_user: Option<&str>,
         from_domain: Option<&str>,
+        server_name: Option<&str>,
     ) -> oneshot::Receiver<UacResult> {
         self.send_options_on_connection_inner(
             destination, transport, request_uri,
-            ConnectionId::default(), from_user, from_domain, None,
+            ConnectionId::default(), from_user, from_domain, None, server_name,
         )
     }
 
@@ -216,6 +222,7 @@ impl UacSender {
     /// it leaves the right listener / matches the IPsec egress policy) and the
     /// Via reflects it; when `None`, behaviour is unchanged (Via from the
     /// configured listen address, `source_local_addr` unset).
+    #[allow(clippy::too_many_arguments)]
     fn send_options_on_connection_inner(
         &self,
         destination: SocketAddr,
@@ -225,6 +232,7 @@ impl UacSender {
         from_user: Option<&str>,
         from_domain: Option<&str>,
         source_local_addr: Option<SocketAddr>,
+        server_name: Option<&str>,
     ) -> oneshot::Receiver<UacResult> {
         let branch = format!("z9hG4bK-uac-{}", uuid::Uuid::new_v4());
         let cseq = self
@@ -284,6 +292,7 @@ impl UacSender {
             destination,
             data,
             source_local_addr,
+            server_name: server_name.map(str::to_owned),
         };
 
         let (sender, receiver) = oneshot::channel();
@@ -386,6 +395,7 @@ impl UacSender {
             destination,
             data,
             source_local_addr: None,
+            server_name: None,
         };
 
         self.pending.insert(
@@ -434,6 +444,7 @@ impl UacSender {
             destination,
             data,
             source_local_addr: None,
+            server_name: None,
         };
 
         debug!(
@@ -868,6 +879,7 @@ mod tests {
             SipUri::new("10.0.0.1".to_string()),
             Some("bgcf"),
             Some("sip.connect.example.com"),
+            None,
         );
 
         let outbound = udp_rx.try_recv().unwrap();
