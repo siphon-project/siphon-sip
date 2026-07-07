@@ -33,7 +33,6 @@ const NLMSG_ALIGNTO: usize = 4;
 
 const NLM_F_REQUEST: u16 = 0x001;
 const NLM_F_ACK: u16 = 0x004;
-const NLM_F_EXCL: u16 = 0x200;
 const NLM_F_CREATE: u16 = 0x400;
 const NLM_F_APPEND: u16 = 0x800;
 
@@ -97,6 +96,7 @@ const NFTA_LIST_ELEM: u16 = 1;
 
 const NFT_MSG_NEWCHAIN: u16 = 3;
 const NFT_MSG_NEWRULE: u16 = 6;
+const NFT_MSG_DELRULE: u16 = 8;
 
 const NFPROTO_IPV4: u8 = 2;
 const NFPROTO_IPV6: u8 = 10;
@@ -325,13 +325,25 @@ fn build_new_chain(table: &str, chain: &str, seq: u32) -> Vec<u8> {
     nlmsg(nft_type(NFT_MSG_NEWCHAIN), OBJECT_FLAGS, seq, &body)
 }
 
-/// Like `build_new_table` but with `NLM_F_EXCL`, so it fails with `EEXIST` when
-/// the table already exists. This lets the caller tell a first run (create the
-/// chain + rules) from a restart (they already exist) without deleting anything.
-fn build_new_table_exclusive(table: &str, seq: u32) -> Vec<u8> {
+/// Declare siphon's `inet` table. Idempotent (`NLM_F_CREATE`, no `NLM_F_EXCL`),
+/// so a restart re-declares the existing table as a no-op instead of erroring.
+fn build_new_table(table: &str, seq: u32) -> Vec<u8> {
     let mut body = nfgenmsg(NFPROTO_INET, 0).to_vec();
     push_nla_str(&mut body, NFTA_TABLE_NAME, table);
-    nlmsg(nft_type(NFT_MSG_NEWTABLE), OBJECT_FLAGS | NLM_F_EXCL, seq, &body)
+    nlmsg(nft_type(NFT_MSG_NEWTABLE), OBJECT_FLAGS, seq, &body)
+}
+
+/// Flush every rule in `chain` (`NFT_MSG_DELRULE` with only the table + chain
+/// name and no rule handle deletes all of the chain's rules). Batched directly
+/// before re-appending the drop rules so a restart converges to exactly the
+/// current rule set instead of stacking a duplicate — and because the flush and
+/// the re-append commit in the *same* atomic transaction, the drop rule is never
+/// absent for even an instant.
+fn build_flush_chain(table: &str, chain: &str, seq: u32) -> Vec<u8> {
+    let mut body = nfgenmsg(NFPROTO_INET, 0).to_vec();
+    push_nla_str(&mut body, NFTA_RULE_TABLE, table);
+    push_nla_str(&mut body, NFTA_RULE_CHAIN, chain);
+    nlmsg(nft_type(NFT_MSG_DELRULE), NLM_F_REQUEST | NLM_F_ACK, seq, &body)
 }
 
 /// Append one expression: `NFTA_LIST_ELEM { NFTA_EXPR_NAME, NFTA_EXPR_DATA }`.
@@ -487,64 +499,22 @@ fn count_acks(buffer: &[u8]) -> io::Result<usize> {
     Ok(ok)
 }
 
-/// The errno of the first `NLMSG_ERROR` in a reply, or `None` if there is none.
-fn first_errno(buffer: &[u8]) -> Option<i32> {
-    let mut offset = 0;
-    while offset + NLMSG_HDR_LEN <= buffer.len() {
-        let len = u32::from_ne_bytes([
-            buffer[offset],
-            buffer[offset + 1],
-            buffer[offset + 2],
-            buffer[offset + 3],
-        ]) as usize;
-        let msg_type = u16::from_ne_bytes([buffer[offset + 4], buffer[offset + 5]]);
-        if len < NLMSG_HDR_LEN || offset + len > buffer.len() {
-            return None;
-        }
-        if msg_type == NLMSG_ERROR && len >= NLMSG_HDR_LEN + 4 {
-            return Some(i32::from_ne_bytes([
-                buffer[offset + NLMSG_HDR_LEN],
-                buffer[offset + NLMSG_HDR_LEN + 1],
-                buffer[offset + NLMSG_HDR_LEN + 2],
-                buffer[offset + NLMSG_HDR_LEN + 3],
-            ]));
-        }
-        offset += align_to(len, NLMSG_ALIGNTO);
-    }
-    None
-}
-
-/// Send a single-object batch and report whether the object was newly created
-/// (`Ok(true)`) or already existed (`Ok(false)`, from `EEXIST`).
-async fn send_create_exclusive(message: Vec<u8>) -> io::Result<bool> {
-    const EEXIST: i32 = 17;
-    let batch = wrap_batch(&[message]);
-    let expected = batch.len();
-    tokio::task::spawn_blocking(move || -> io::Result<bool> {
-        let socket = Socket::new(NETLINK_NETFILTER)?;
-        socket.connect(&SocketAddr::new(0, 0))?;
-        let sent = socket.send(&batch, 0)?;
-        if sent != expected {
-            return Err(io::Error::other(format!("nftables: short send ({sent}/{expected})")));
-        }
-        let mut response = vec![0u8; 8192];
-        let received = socket.recv(&mut &mut response[..], 0)?;
-        match first_errno(&response[..received]) {
-            Some(0) | None => Ok(true),
-            Some(errno) if -errno == EEXIST => Ok(false),
-            Some(errno) => Err(io::Error::from_raw_os_error(-errno)),
-        }
-    })
-    .await
-    .map_err(|join| io::Error::other(format!("nftables netlink task panic: {join}")))?
-}
-
 // --- public operations ------------------------------------------------------
 
 /// Ensure the `inet` table + both timeout sets exist, and — when `manage_rule`
-/// — the base chain + drop rules that reference them, all in one idempotent,
-/// atomic transaction. With `manage_rule` the operator needs no manual `nft`
-/// step at all; without it siphon owns only the sets and the operator adds the
+/// — the base chain + drop rules that reference them, all in ONE idempotent,
+/// atomic netlink transaction.
+///
+/// Every object is declared with `NLM_F_CREATE` (a no-op when it already
+/// exists), and the chain's rules are flushed and re-appended, so a first run,
+/// a clean restart, and a restart after a crash that interrupted a previous
+/// setup all converge to exactly the same ruleset — no half-configured state,
+/// no stacked-duplicate rules. Because it is a single `BATCH_BEGIN … BATCH_END`
+/// the kernel applies all of it or none of it, and the drop rule is never
+/// missing for even an instant across the flush/re-append.
+///
+/// With `manage_rule` the operator needs no manual `nft` step at all; without it
+/// siphon owns only the sets and the operator references them from their own
 /// rule.
 pub async fn ensure_firewall(
     table: &str,
@@ -553,35 +523,24 @@ pub async fn ensure_firewall(
     set_v6: &str,
     manage_rule: bool,
 ) -> io::Result<()> {
-    // Create the table exclusively so we can tell a first run (table newly
-    // created) from a restart (table already there). On a restart the chain +
-    // drop rules already exist, so we skip re-adding them and never duplicate.
-    let table_is_new = send_create_exclusive(build_new_table_exclusive(table, 1)).await?;
-
-    // Ensure both timeout sets exist (idempotent).
-    send(
-        wrap_batch(&[
-            build_new_set(table, set_v4, 1, SetFamily::V4, 1),
-            build_new_set(table, set_v6, 2, SetFamily::V6, 2),
-        ]),
-        2,
-    )
-    .await?;
-
-    if manage_rule && table_is_new {
-        // Fresh table: create the base chain, then the drop rules that look the
-        // source address up in the (now committed) sets by name.
-        send(wrap_batch(&[build_new_chain(table, chain, 1)]), 1).await?;
-        send(
-            wrap_batch(&[
-                build_drop_rule(table, chain, set_v4, SetFamily::V4, 1),
-                build_drop_rule(table, chain, set_v6, SetFamily::V6, 2),
-            ]),
-            2,
-        )
-        .await?;
+    // Object seqs run 1..=N within the batch (BATCH_END is N+1, set by
+    // `wrap_batch`). The kernel resolves the rules' set/chain references against
+    // the objects staged earlier in the same transaction, so table → sets →
+    // chain → rules in one batch is self-consistent.
+    let mut messages = vec![
+        build_new_table(table, 1),
+        build_new_set(table, set_v4, 1, SetFamily::V4, 2),
+        build_new_set(table, set_v6, 2, SetFamily::V6, 3),
+    ];
+    if manage_rule {
+        messages.push(build_new_chain(table, chain, 4));
+        // Flush before re-appending so a restart never stacks a duplicate rule.
+        messages.push(build_flush_chain(table, chain, 5));
+        messages.push(build_drop_rule(table, chain, set_v4, SetFamily::V4, 6));
+        messages.push(build_drop_rule(table, chain, set_v6, SetFamily::V6, 7));
     }
-    Ok(())
+    let object_count = messages.len();
+    send(wrap_batch(&messages), object_count).await
 }
 
 /// Add a banned source to the appropriate set with a per-element timeout
@@ -618,6 +577,44 @@ mod tests {
     }
     fn be32_at(buffer: &[u8], offset: usize) -> u32 {
         u32::from_be_bytes([buffer[offset], buffer[offset + 1], buffer[offset + 2], buffer[offset + 3]])
+    }
+    fn be32(payload: &[u8]) -> u32 {
+        u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
+    }
+
+    /// Split a sequence of netlink attributes into `(type_without_nested_flag,
+    /// payload)` pairs. `payload` is the value after the 4-byte attr header,
+    /// length `nla_len - 4` (padding excluded). Works for both a top-level
+    /// object body (pass `&message[NLMSG_HDR_LEN + 4..]`, i.e. past nlmsghdr +
+    /// nfgenmsg) and a nested attribute's payload.
+    fn walk_attrs(buffer: &[u8]) -> Vec<(u16, &[u8])> {
+        let mut attrs = Vec::new();
+        let mut offset = 0;
+        while offset + 4 <= buffer.len() {
+            let nla_len = u16_at(buffer, offset) as usize;
+            let nla_type = u16_at(buffer, offset + 2) & !NLA_F_NESTED;
+            if nla_len < 4 || offset + nla_len > buffer.len() {
+                break;
+            }
+            attrs.push((nla_type, &buffer[offset + 4..offset + nla_len]));
+            offset += align_to(nla_len, NLA_ALIGNTO);
+        }
+        attrs
+    }
+
+    /// The payload of the first attribute of `attr_type`, or panic. `expect_msg`
+    /// names the attribute in the failure.
+    fn attr<'a>(attrs: &[(u16, &'a [u8])], attr_type: u16, expect_msg: &str) -> &'a [u8] {
+        attrs
+            .iter()
+            .find(|(ty, _)| *ty == attr_type)
+            .map(|(_, payload)| *payload)
+            .unwrap_or_else(|| panic!("missing attribute: {expect_msg}"))
+    }
+
+    /// The `NFTA_EXPR_DATA` payload of one expression `NFTA_LIST_ELEM`.
+    fn expr_data(expr_elem: &[u8]) -> &[u8] {
+        attr(&walk_attrs(expr_elem), NFTA_EXPR_DATA, "NFTA_EXPR_DATA")
     }
 
     #[test]
@@ -717,8 +714,123 @@ mod tests {
     }
 
     #[test]
+    fn new_chain_carries_hook_type_and_priority() {
+        let message = build_new_chain("siphon", "input", 4);
+        assert_eq!(u16_at(&message, 4), nft_type(NFT_MSG_NEWCHAIN));
+        let attrs = walk_attrs(&message[NLMSG_HDR_LEN + 4..]);
+        assert_eq!(attr(&attrs, NFTA_CHAIN_TABLE, "table"), b"siphon\0");
+        assert_eq!(attr(&attrs, NFTA_CHAIN_NAME, "name"), b"input\0");
+        // A base chain: type "filter", hook = input, priority 0 (NF_IP_PRI_FILTER).
+        assert_eq!(attr(&attrs, NFTA_CHAIN_TYPE, "type"), b"filter\0");
+        let hook = walk_attrs(attr(&attrs, NFTA_CHAIN_HOOK, "hook"));
+        assert_eq!(be32(attr(&hook, NFTA_HOOK_HOOKNUM, "hooknum")), NF_INET_LOCAL_IN);
+        assert_eq!(be32(attr(&hook, NFTA_HOOK_PRIORITY, "priority")), 0);
+    }
+
+    #[test]
+    fn drop_rule_expression_sequence_and_layout() {
+        // The v4 rule: `meta nfproto ipv4; ipv4 saddr @banned4; drop`.
+        let message = build_drop_rule("siphon", "input", "banned4", SetFamily::V4, 6);
+        assert_eq!(u16_at(&message, 4), nft_type(NFT_MSG_NEWRULE));
+        let attrs = walk_attrs(&message[NLMSG_HDR_LEN + 4..]);
+        assert_eq!(attr(&attrs, NFTA_RULE_TABLE, "table"), b"siphon\0");
+        assert_eq!(attr(&attrs, NFTA_RULE_CHAIN, "chain"), b"input\0");
+
+        // Expressions in order: meta, cmp, payload, lookup, immediate.
+        let exprs = walk_attrs(attr(&attrs, NFTA_RULE_EXPRESSIONS, "expressions"));
+        let names: Vec<&[u8]> = exprs
+            .iter()
+            .map(|(_, elem)| attr(&walk_attrs(elem), NFTA_EXPR_NAME, "expr name"))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                b"meta\0".as_ref(),
+                b"cmp\0",
+                b"payload\0",
+                b"lookup\0",
+                b"immediate\0"
+            ]
+        );
+
+        // meta loads nfproto into reg1.
+        let meta = walk_attrs(expr_data(exprs[0].1));
+        assert_eq!(be32(attr(&meta, NFTA_META_KEY, "meta key")), NFT_META_NFPROTO);
+        assert_eq!(be32(attr(&meta, NFTA_META_DREG, "meta dreg")), NFT_REG_1);
+
+        // cmp reg1 == NFPROTO_IPV4 (a single byte) — the guard that keeps a v6
+        // packet from matching the v4 saddr offset/length in the shared `inet`
+        // chain.
+        let cmp = walk_attrs(expr_data(exprs[1].1));
+        assert_eq!(be32(attr(&cmp, NFTA_CMP_SREG, "cmp sreg")), NFT_REG_1);
+        assert_eq!(be32(attr(&cmp, NFTA_CMP_OP, "cmp op")), NFT_CMP_EQ);
+        let cmp_value = walk_attrs(attr(&cmp, NFTA_CMP_DATA, "cmp data"));
+        assert_eq!(attr(&cmp_value, NFTA_DATA_VALUE, "cmp value"), &[NFPROTO_IPV4]);
+
+        // payload loads the v4 source address: network base, offset 12, len 4.
+        let payload = walk_attrs(expr_data(exprs[2].1));
+        assert_eq!(be32(attr(&payload, NFTA_PAYLOAD_DREG, "dreg")), NFT_REG_1);
+        assert_eq!(
+            be32(attr(&payload, NFTA_PAYLOAD_BASE, "base")),
+            NFT_PAYLOAD_NETWORK_HEADER
+        );
+        assert_eq!(be32(attr(&payload, NFTA_PAYLOAD_OFFSET, "offset")), 12);
+        assert_eq!(be32(attr(&payload, NFTA_PAYLOAD_LEN, "len")), 4);
+
+        // lookup references the set by name.
+        let lookup = walk_attrs(expr_data(exprs[3].1));
+        assert_eq!(be32(attr(&lookup, NFTA_LOOKUP_SREG, "lookup sreg")), NFT_REG_1);
+        assert_eq!(attr(&lookup, NFTA_LOOKUP_SET, "lookup set"), b"banned4\0");
+
+        // immediate verdict = drop, into the verdict register.
+        let immediate = walk_attrs(expr_data(exprs[4].1));
+        assert_eq!(
+            be32(attr(&immediate, NFTA_IMMEDIATE_DREG, "imm dreg")),
+            NFT_REG_VERDICT
+        );
+        let imm_data = walk_attrs(attr(&immediate, NFTA_IMMEDIATE_DATA, "imm data"));
+        let verdict = walk_attrs(attr(&imm_data, NFTA_DATA_VERDICT, "verdict container"));
+        assert_eq!(be32(attr(&verdict, NFTA_VERDICT_CODE, "verdict code")), NF_DROP);
+    }
+
+    #[test]
+    fn drop_rule_v6_uses_ipv6_saddr_offset_and_len() {
+        // The v6 rule must load 16 bytes at offset 8 and guard on NFPROTO_IPV6.
+        let message = build_drop_rule("siphon", "input", "banned6", SetFamily::V6, 6);
+        let attrs = walk_attrs(&message[NLMSG_HDR_LEN + 4..]);
+        let exprs = walk_attrs(attr(&attrs, NFTA_RULE_EXPRESSIONS, "expressions"));
+
+        let cmp = walk_attrs(expr_data(exprs[1].1));
+        let cmp_value = walk_attrs(attr(&cmp, NFTA_CMP_DATA, "cmp data"));
+        assert_eq!(attr(&cmp_value, NFTA_DATA_VALUE, "cmp value"), &[NFPROTO_IPV6]);
+
+        let payload = walk_attrs(expr_data(exprs[2].1));
+        assert_eq!(be32(attr(&payload, NFTA_PAYLOAD_OFFSET, "offset")), 8);
+        assert_eq!(be32(attr(&payload, NFTA_PAYLOAD_LEN, "len")), 16);
+
+        let lookup = walk_attrs(expr_data(exprs[3].1));
+        assert_eq!(attr(&lookup, NFTA_LOOKUP_SET, "lookup set"), b"banned6\0");
+    }
+
+    #[test]
+    fn flush_chain_targets_table_and_chain_with_no_handle() {
+        // A flush is DELRULE carrying only table + chain (no rule handle), so the
+        // kernel drops every rule in the chain.
+        const NFTA_RULE_HANDLE: u16 = 3; // absent = flush all rules in the chain
+        let message = build_flush_chain("siphon", "input", 5);
+        assert_eq!(u16_at(&message, 4), nft_type(NFT_MSG_DELRULE));
+        let attrs = walk_attrs(&message[NLMSG_HDR_LEN + 4..]);
+        assert_eq!(attr(&attrs, NFTA_RULE_TABLE, "table"), b"siphon\0");
+        assert_eq!(attr(&attrs, NFTA_RULE_CHAIN, "chain"), b"input\0");
+        assert!(
+            !attrs.iter().any(|(ty, _)| *ty == NFTA_RULE_HANDLE),
+            "flush must carry no rule handle"
+        );
+    }
+
+    #[test]
     fn batch_wraps_begin_and_end() {
-        let inner = build_new_table_exclusive("siphon", 1);
+        let inner = build_new_table("siphon", 1);
         let batch = wrap_batch(std::slice::from_ref(&inner));
         assert_eq!(u16_at(&batch, 4), NFNL_MSG_BATCH_BEGIN);
         let after_begin = 20; // BATCH_BEGIN = 16 hdr + 4 nfgenmsg
