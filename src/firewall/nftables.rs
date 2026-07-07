@@ -22,8 +22,14 @@
 
 use std::io;
 use std::net::IpAddr;
+use std::time::Duration;
 
 use netlink_sys::{protocols::NETLINK_NETFILTER, Socket, SocketAddr};
+
+/// Upper bound on waiting for a kernel ack (`SO_RCVTIMEO`). Netlink to the
+/// local kernel is reliable, so this never fires in practice — it exists so a
+/// lost ack can never park a `spawn_blocking` thread forever.
+const ACK_RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
 // --- netlink framing (shared shape with src/ipsec/netlink.rs) --------------
 
@@ -279,9 +285,11 @@ fn build_new_set(table: &str, set: &str, set_id: u32, family: SetFamily, seq: u3
     nlmsg(nft_type(NFT_MSG_NEWSET), OBJECT_FLAGS, seq, &body)
 }
 
-/// Encode one set element: nested `NFTA_LIST_ELEM { KEY { DATA_VALUE=ip },
-/// TIMEOUT=ttl_ms }`. `ttl_ms == 0` means never expire.
-fn encode_element(address: &IpAddr, ttl_ms: u64) -> Vec<u8> {
+/// Encode one set element: nested `NFTA_LIST_ELEM { KEY { DATA_VALUE=ip }[,
+/// TIMEOUT=ttl_ms] }`. `ttl_ms` is only meaningful on an add: `Some(0)` means
+/// never expire; a delete passes `None` (it matches on the key alone, so the
+/// attribute is omitted).
+fn encode_element(address: &IpAddr, ttl_ms: Option<u64>) -> Vec<u8> {
     let key_value: Vec<u8> = match address {
         IpAddr::V4(v4) => v4.octets().to_vec(),
         IpAddr::V6(v6) => v6.octets().to_vec(),
@@ -292,14 +300,23 @@ fn encode_element(address: &IpAddr, ttl_ms: u64) -> Vec<u8> {
 
     let mut elem = Vec::new();
     push_nla_nested(&mut elem, NFTA_SET_ELEM_KEY, &data);
-    push_nla_be64(&mut elem, NFTA_SET_ELEM_TIMEOUT, ttl_ms);
+    if let Some(ttl_ms) = ttl_ms {
+        push_nla_be64(&mut elem, NFTA_SET_ELEM_TIMEOUT, ttl_ms);
+    }
 
     let mut list_elem = Vec::new();
     push_nla_nested(&mut list_elem, NFTA_LIST_ELEM, &elem);
     list_elem
 }
 
-fn build_setelem(msg: u16, table: &str, set: &str, address: &IpAddr, ttl_ms: u64, seq: u32) -> Vec<u8> {
+fn build_setelem(
+    msg: u16,
+    table: &str,
+    set: &str,
+    address: &IpAddr,
+    ttl_ms: Option<u64>,
+    seq: u32,
+) -> Vec<u8> {
     let mut body = nfgenmsg(NFPROTO_INET, 0).to_vec();
     push_nla_str(&mut body, NFTA_SET_ELEM_LIST_TABLE, table);
     push_nla_str(&mut body, NFTA_SET_ELEM_LIST_SET, set);
@@ -432,15 +449,53 @@ fn wrap_batch(messages: &[Vec<u8>]) -> Vec<u8> {
     buffer
 }
 
+const EEXIST: i32 = 17;
+const ENOENT: i32 = 2;
+
+/// Bound the blocking `recv` with `SO_RCVTIMEO` so a lost ack surfaces as an
+/// error instead of parking the thread forever. `netlink-sys` exposes no
+/// timeout setter, so this goes through `libc::setsockopt` on the raw fd
+/// (`libc` is already in the tree as a hard dependency of `netlink-sys`).
+fn set_recv_timeout(socket: &Socket, timeout: Duration) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let timeval = libc::timeval {
+        tv_sec: timeout.as_secs() as libc::time_t,
+        tv_usec: libc::suseconds_t::from(timeout.subsec_micros()),
+    };
+    // SAFETY: plain setsockopt on a socket fd we own, passing a properly sized
+    // and initialized `timeval` — no aliasing, no retained pointers.
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&raw const timeval).cast::<libc::c_void>(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Send a batch and read its `object_count` per-message acks. A successful
 /// batch yields one errno-0 `NLMSG_ERROR` per acked object message; a failure
 /// yields the offending message's errno and rolls the transaction back
 /// atomically. Blocking I/O is offloaded to `spawn_blocking` (bans are rare, a
-/// fresh socket per transaction is fine — matches the XFRM backend).
-async fn send(buffer: Vec<u8>, object_count: usize) -> io::Result<()> {
+/// fresh socket per transaction is fine — matches the XFRM backend); the recv
+/// is bounded by [`ACK_RECV_TIMEOUT`] so a missing ack cannot wedge the thread.
+///
+/// `benign_errno` is the ONE errno this operation may treat as idempotent
+/// success (see [`count_acks`]). Because a kernel-side benign errno still
+/// aborts the whole transaction, callers must never batch a benign-errno-able
+/// message together with messages whose effects they rely on — element
+/// add/remove are single-message batches for exactly this reason.
+async fn send(buffer: Vec<u8>, object_count: usize, benign_errno: Option<i32>) -> io::Result<()> {
     let expected = buffer.len();
     tokio::task::spawn_blocking(move || -> io::Result<()> {
         let socket = Socket::new(NETLINK_NETFILTER)?;
+        set_recv_timeout(&socket, ACK_RECV_TIMEOUT)?;
         socket.connect(&SocketAddr::new(0, 0))?;
         let sent = socket.send(&buffer, 0)?;
         if sent != expected {
@@ -449,8 +504,17 @@ async fn send(buffer: Vec<u8>, object_count: usize) -> io::Result<()> {
         let mut seen = 0usize;
         let mut response = vec![0u8; 8192];
         while seen < object_count {
-            let received = socket.recv(&mut &mut response[..], 0)?;
-            seen += count_acks(&response[..received])?;
+            let received = socket.recv(&mut &mut response[..], 0).map_err(|error| {
+                if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("nftables: timed out waiting for kernel ack ({seen}/{object_count} received)"),
+                    )
+                } else {
+                    error
+                }
+            })?;
+            seen += count_acks(&response[..received], benign_errno)?;
         }
         Ok(())
     })
@@ -459,12 +523,14 @@ async fn send(buffer: Vec<u8>, object_count: usize) -> io::Result<()> {
 }
 
 /// Count the errno-0 acks in a reply, returning `Err` on a real kernel error.
-/// `EEXIST` (add of an existing element) and `ENOENT` (delete of a missing
-/// element, e.g. one the kernel already expired) are benign idempotency cases
-/// and count as success.
-fn count_acks(buffer: &[u8]) -> io::Result<usize> {
-    const EEXIST: i32 = 17;
-    const ENOENT: i32 = 2;
+///
+/// `benign_errno` scopes idempotency to the operation at hand instead of
+/// blanket-accepting: an add may treat `EEXIST` (element already present) as
+/// success, a delete may treat `ENOENT` (element already expired) as success —
+/// but an add must NOT swallow `ENOENT`, because there it means the set/table
+/// is gone (e.g. an operator `nft flush ruleset`) and kernel enforcement has
+/// silently stopped. That case must surface so the actor can log it.
+fn count_acks(buffer: &[u8], benign_errno: Option<i32>) -> io::Result<usize> {
     let mut offset = 0;
     let mut ok = 0;
     while offset + NLMSG_HDR_LEN <= buffer.len() {
@@ -488,7 +554,7 @@ fn count_acks(buffer: &[u8]) -> io::Result<usize> {
                 buffer[offset + NLMSG_HDR_LEN + 2],
                 buffer[offset + NLMSG_HDR_LEN + 3],
             ]);
-            if errno == 0 || -errno == EEXIST || -errno == ENOENT {
+            if errno == 0 || Some(-errno) == benign_errno {
                 ok += 1;
             } else {
                 return Err(io::Error::from_raw_os_error(-errno));
@@ -540,28 +606,34 @@ pub async fn ensure_firewall(
         messages.push(build_drop_rule(table, chain, set_v6, SetFamily::V6, 7));
     }
     let object_count = messages.len();
-    send(wrap_batch(&messages), object_count).await
+    // No benign errno: every object is declared with `NLM_F_CREATE` (existing
+    // objects ack errno-0, never `EEXIST`), so ANY errno here is a real,
+    // batch-aborting failure that must reach the caller.
+    send(wrap_batch(&messages), object_count, None).await
 }
 
 /// Add a banned source to the appropriate set with a per-element timeout
-/// (`ttl_ms == 0` = permanent, e.g. an apiban entry).
+/// (`ttl_ms == 0` = permanent, e.g. an apiban entry). `EEXIST` (element already
+/// present, e.g. an apiban re-push after restart) is idempotent success;
+/// `ENOENT` (set/table gone) is a real error and surfaces.
 pub async fn add_banned(table: &str, set_v4: &str, set_v6: &str, address: IpAddr, ttl_ms: u64) -> io::Result<()> {
     let set = match SetFamily::of(&address) {
         SetFamily::V4 => set_v4,
         SetFamily::V6 => set_v6,
     };
-    let message = build_setelem(NFT_MSG_NEWSETELEM, table, set, &address, ttl_ms, 1);
-    send(wrap_batch(&[message]), 1).await
+    let message = build_setelem(NFT_MSG_NEWSETELEM, table, set, &address, Some(ttl_ms), 1);
+    send(wrap_batch(&[message]), 1, Some(EEXIST)).await
 }
 
 /// Remove a banned source (optional — the kernel auto-expires timed elements).
+/// `ENOENT` (the kernel already expired the element) is idempotent success.
 pub async fn remove_banned(table: &str, set_v4: &str, set_v6: &str, address: IpAddr) -> io::Result<()> {
     let set = match SetFamily::of(&address) {
         SetFamily::V4 => set_v4,
         SetFamily::V6 => set_v6,
     };
-    let message = build_setelem(NFT_MSG_DELSETELEM, table, set, &address, 0, 1);
-    send(wrap_batch(&[message]), 1).await
+    let message = build_setelem(NFT_MSG_DELSETELEM, table, set, &address, None, 1);
+    send(wrap_batch(&[message]), 1, Some(ENOENT)).await
 }
 
 #[cfg(test)]
@@ -574,9 +646,6 @@ mod tests {
     }
     fn u32_at(buffer: &[u8], offset: usize) -> u32 {
         u32::from_ne_bytes([buffer[offset], buffer[offset + 1], buffer[offset + 2], buffer[offset + 3]])
-    }
-    fn be32_at(buffer: &[u8], offset: usize) -> u32 {
-        u32::from_be_bytes([buffer[offset], buffer[offset + 1], buffer[offset + 2], buffer[offset + 3]])
     }
     fn be32(payload: &[u8]) -> u32 {
         u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]])
@@ -669,37 +738,30 @@ mod tests {
     }
 
     #[test]
-    fn new_set_carries_timeout_flag_keytype_keylen() {
+    fn new_set_carries_timeout_flag_keytype_keylen_and_set_id() {
         let message = build_new_set("siphon", "banned4", 1, SetFamily::V4, 2);
-        let mut offset = NLMSG_HDR_LEN + 4; // past nlmsghdr + nfgenmsg
-        let (mut flags, mut key_type, mut key_len) = (None, None, None);
-        while offset + 4 <= message.len() {
-            let nla_len = u16_at(&message, offset) as usize;
-            let nla_type = u16_at(&message, offset + 2) & !NLA_F_NESTED;
-            if nla_len < 4 {
-                break;
-            }
-            match nla_type {
-                NFTA_SET_FLAGS => flags = Some(be32_at(&message, offset + 4)),
-                NFTA_SET_KEY_TYPE => key_type = Some(be32_at(&message, offset + 4)),
-                NFTA_SET_KEY_LEN => key_len = Some(be32_at(&message, offset + 4)),
-                _ => {}
-            }
-            offset += align_to(nla_len, NLA_ALIGNTO);
-        }
-        assert_eq!(flags, Some(NFT_SET_TIMEOUT));
-        assert_eq!(key_type, Some(NFT_TYPE_IPADDR)); // 7
-        assert_eq!(key_len, Some(4));
+        let attrs = walk_attrs(&message[NLMSG_HDR_LEN + 4..]);
+        assert_eq!(attr(&attrs, NFTA_SET_TABLE, "table"), b"siphon\0");
+        assert_eq!(attr(&attrs, NFTA_SET_NAME, "name"), b"banned4\0");
+        assert_eq!(be32(attr(&attrs, NFTA_SET_FLAGS, "flags")), NFT_SET_TIMEOUT);
+        assert_eq!(be32(attr(&attrs, NFTA_SET_KEY_TYPE, "key type")), NFT_TYPE_IPADDR);
+        assert_eq!(be32(attr(&attrs, NFTA_SET_KEY_LEN, "key len")), 4);
+        // NFTA_SET_ID is REQUIRED by the kernel for NEWSET (nf_tables_newset
+        // returns EINVAL without it) — it identifies the set within a batch.
+        assert_eq!(be32(attr(&attrs, NFTA_SET_ID, "set id")), 1);
     }
 
     #[test]
     fn element_encodes_ipv4_key_and_be_timeout() {
-        let element = encode_element(&IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)), 3_600_000);
+        let element = encode_element(&IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)), Some(3_600_000));
         assert_eq!(u16_at(&element, 2) & !NLA_F_NESTED, NFTA_LIST_ELEM);
-        assert!(element.windows(4).any(|w| w == [203, 0, 113, 5]), "raw IPv4 octets");
-        assert!(
-            element.windows(8).any(|w| w == 3_600_000u64.to_be_bytes()),
-            "timeout must be big-endian u64"
+        let elem = walk_attrs(attr(&walk_attrs(&element), NFTA_LIST_ELEM, "list elem"));
+        let key = walk_attrs(attr(&elem, NFTA_SET_ELEM_KEY, "key"));
+        assert_eq!(attr(&key, NFTA_DATA_VALUE, "key value"), &[203, 0, 113, 5]);
+        assert_eq!(
+            attr(&elem, NFTA_SET_ELEM_TIMEOUT, "timeout"),
+            &3_600_000u64.to_be_bytes(),
+            "timeout must be big-endian u64 milliseconds"
         );
     }
 
@@ -709,8 +771,47 @@ mod tests {
         assert_eq!(SetFamily::V6.key_type(), NFT_TYPE_IP6ADDR);
         assert_eq!(SetFamily::of(&IpAddr::V6(Ipv6Addr::LOCALHOST)), SetFamily::V6);
         let octets: [u8; 16] = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets();
-        let element = encode_element(&IpAddr::V6("2001:db8::1".parse().unwrap()), 0);
+        let element = encode_element(&IpAddr::V6("2001:db8::1".parse().unwrap()), Some(0));
         assert!(element.windows(16).any(|w| w == octets));
+    }
+
+    #[test]
+    fn setelem_add_carries_table_set_key_and_timeout() {
+        let address: IpAddr = "203.0.113.5".parse().unwrap();
+        let message = build_setelem(
+            NFT_MSG_NEWSETELEM,
+            "siphon",
+            "banned4",
+            &address,
+            Some(60_000),
+            1,
+        );
+        assert_eq!(u16_at(&message, 4), nft_type(NFT_MSG_NEWSETELEM));
+        let attrs = walk_attrs(&message[NLMSG_HDR_LEN + 4..]);
+        assert_eq!(attr(&attrs, NFTA_SET_ELEM_LIST_TABLE, "table"), b"siphon\0");
+        assert_eq!(attr(&attrs, NFTA_SET_ELEM_LIST_SET, "set"), b"banned4\0");
+        let elements = walk_attrs(attr(&attrs, NFTA_SET_ELEM_LIST_ELEMENTS, "elements"));
+        let elem = walk_attrs(attr(&elements, NFTA_LIST_ELEM, "list elem"));
+        let key = walk_attrs(attr(&elem, NFTA_SET_ELEM_KEY, "key"));
+        assert_eq!(attr(&key, NFTA_DATA_VALUE, "key value"), &[203, 0, 113, 5]);
+        assert_eq!(attr(&elem, NFTA_SET_ELEM_TIMEOUT, "timeout"), &60_000u64.to_be_bytes());
+    }
+
+    #[test]
+    fn setelem_delete_matches_on_key_alone() {
+        // A delete matches on the key; it must not carry a timeout attribute.
+        let address: IpAddr = "203.0.113.5".parse().unwrap();
+        let message = build_setelem(NFT_MSG_DELSETELEM, "siphon", "banned4", &address, None, 1);
+        assert_eq!(u16_at(&message, 4), nft_type(NFT_MSG_DELSETELEM));
+        let attrs = walk_attrs(&message[NLMSG_HDR_LEN + 4..]);
+        let elements = walk_attrs(attr(&attrs, NFTA_SET_ELEM_LIST_ELEMENTS, "elements"));
+        let elem = walk_attrs(attr(&elements, NFTA_LIST_ELEM, "list elem"));
+        let key = walk_attrs(attr(&elem, NFTA_SET_ELEM_KEY, "key"));
+        assert_eq!(attr(&key, NFTA_DATA_VALUE, "key value"), &[203, 0, 113, 5]);
+        assert!(
+            !elem.iter().any(|(ty, _)| *ty == NFTA_SET_ELEM_TIMEOUT),
+            "delete must not carry NFTA_SET_ELEM_TIMEOUT"
+        );
     }
 
     #[test]
@@ -842,13 +943,31 @@ mod tests {
     #[test]
     fn count_acks_success_and_error() {
         let ok = nlmsg(NLMSG_ERROR, 0, 1, &0i32.to_ne_bytes());
-        assert_eq!(count_acks(&ok).unwrap(), 1);
-        let eexist = nlmsg(NLMSG_ERROR, 0, 1, &(-17i32).to_ne_bytes());
-        assert_eq!(count_acks(&eexist).unwrap(), 1); // idempotent
-        let enoent = nlmsg(NLMSG_ERROR, 0, 1, &(-2i32).to_ne_bytes());
-        assert_eq!(count_acks(&enoent).unwrap(), 1); // idempotent delete
+        assert_eq!(count_acks(&ok, None).unwrap(), 1);
         let eperm = nlmsg(NLMSG_ERROR, 0, 1, &(-1i32).to_ne_bytes());
-        assert!(count_acks(&eperm).is_err());
+        assert!(count_acks(&eperm, None).is_err());
+        // Two acks coalesced into one datagram both count.
+        let mut two = nlmsg(NLMSG_ERROR, 0, 1, &0i32.to_ne_bytes());
+        two.extend_from_slice(&nlmsg(NLMSG_ERROR, 0, 2, &0i32.to_ne_bytes()));
+        assert_eq!(count_acks(&two, None).unwrap(), 2);
+    }
+
+    #[test]
+    fn count_acks_benign_errno_is_operation_scoped() {
+        let eexist = nlmsg(NLMSG_ERROR, 0, 1, &(-EEXIST).to_ne_bytes());
+        let enoent = nlmsg(NLMSG_ERROR, 0, 1, &(-ENOENT).to_ne_bytes());
+        // Add: re-adding an existing element is idempotent success...
+        assert_eq!(count_acks(&eexist, Some(EEXIST)).unwrap(), 1);
+        // ...but a missing set/table (operator flushed the ruleset) is a REAL
+        // error — swallowing it would silently disable kernel enforcement.
+        assert!(count_acks(&enoent, Some(EEXIST)).is_err());
+        // Delete: removing an already-expired element is idempotent success.
+        assert_eq!(count_acks(&enoent, Some(ENOENT)).unwrap(), 1);
+        assert!(count_acks(&eexist, Some(ENOENT)).is_err());
+        // Ensure: nothing is benign — every object uses NLM_F_CREATE, so any
+        // errno means the atomic batch was rolled back.
+        assert!(count_acks(&eexist, None).is_err());
+        assert!(count_acks(&enoent, None).is_err());
     }
 
     /// End-to-end against the real kernel. Needs `CAP_NET_ADMIN`; run in a
@@ -869,12 +988,36 @@ mod tests {
             add_banned("siphon", "banned4", "banned6", "203.0.113.5".parse().unwrap(), 3_600_000)
                 .await
                 .expect("add v4");
+            // Timed element that STAYS, so `nft list` shows its timeout below.
+            add_banned("siphon", "banned4", "banned6", "198.51.100.7".parse().unwrap(), 3_600_000)
+                .await
+                .expect("add v4 timed");
             add_banned("siphon", "banned4", "banned6", "2001:db8::1".parse().unwrap(), 0)
                 .await
                 .expect("add v6 permanent");
+            // Re-adding an existing element (apiban re-push after restart) is
+            // idempotent success, not an error.
+            add_banned("siphon", "banned4", "banned6", "2001:db8::1".parse().unwrap(), 0)
+                .await
+                .expect("re-add v6 must be idempotent");
             remove_banned("siphon", "banned4", "banned6", "203.0.113.5".parse().unwrap())
                 .await
                 .expect("remove v4");
+            // Removing an element the kernel already expired/never had is
+            // idempotent success.
+            remove_banned("siphon", "banned4", "banned6", "203.0.113.99".parse().unwrap())
+                .await
+                .expect("remove of a missing element must be idempotent");
+            // But an add into a missing set is a REAL failure and must surface
+            // (a swallowed ENOENT here would silently disable kernel
+            // enforcement while siphon believes bans are being dropped).
+            add_banned("siphon", "no_such_set", "no_such_set6", "203.0.113.5".parse().unwrap(), 0)
+                .await
+                .expect_err("add into a missing set must error, not silently succeed");
+            // manage_rule=false owns only table + sets — no chain, no rules.
+            ensure_firewall("siphon_sets", "input", "banned4", "banned6", false)
+                .await
+                .expect("ensure_firewall sets-only");
         });
 
         let output = std::process::Command::new("nft")
@@ -887,11 +1030,27 @@ mod tests {
         assert!(text.contains("2001:db8::1"), "v6 permanent element missing:\n{text}");
         assert!(text.contains("flags timeout"), "timeout flag missing:\n{text}");
         assert!(!text.contains("203.0.113.5"), "removed v4 element still present:\n{text}");
+        // The timed element must carry a kernel-side expiry.
+        assert!(text.contains("198.51.100.7"), "timed v4 element missing:\n{text}");
+        assert!(text.contains("expires"), "per-element timeout not armed:\n{text}");
         // Self-contained chain + drop rules.
         assert!(text.contains("chain input"), "base chain missing:\n{text}");
         assert!(text.contains("@banned4") && text.contains("@banned6"), "drop rules missing:\n{text}");
         assert!(text.contains("drop"), "drop verdict missing:\n{text}");
         // The double ensure_firewall must NOT have duplicated the rules.
         assert_eq!(text.matches("@banned4 drop").count(), 1, "duplicate v4 drop rule:\n{text}");
+        assert_eq!(text.matches("@banned6 drop").count(), 1, "duplicate v6 drop rule:\n{text}");
+
+        // The sets-only table: sets exist, but no chain and no rules.
+        let output = std::process::Command::new("nft")
+            .args(["list", "table", "inet", "siphon_sets"])
+            .output()
+            .expect("run nft");
+        let sets_only = String::from_utf8_lossy(&output.stdout);
+        assert!(sets_only.contains("banned4"), "sets-only table missing sets:\n{sets_only}");
+        assert!(
+            !sets_only.contains("chain"),
+            "manage_rule=false must not create a chain:\n{sets_only}"
+        );
     }
 }

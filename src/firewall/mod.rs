@@ -35,9 +35,11 @@ enum Command {
 }
 
 /// Handle to the kernel-firewall actor. Cheap to clone; feeding a ban is a
-/// non-blocking `try_send` that drops silently if the actor's queue is full
-/// (the userspace ACL still enforces the ban, so a dropped kernel update only
-/// costs a little extra CPU until the next ban lands).
+/// non-blocking `try_send` that never blocks the ban/auth hot paths. When the
+/// actor's queue is full the command is dropped — counted on
+/// `siphon_firewall_commands_dropped_total` — and the userspace ACL still
+/// enforces the ban, so a dropped kernel update only costs a little extra CPU
+/// until the next ban lands.
 #[derive(Clone)]
 pub struct KernelFirewall {
     sender: mpsc::Sender<Command>,
@@ -47,19 +49,32 @@ impl KernelFirewall {
     /// Drop `ip` in the kernel for `ttl` (mirrors an auto-ban's TTL so the
     /// kernel expires it in lockstep with the userspace store).
     pub fn ban(&self, ip: IpAddr, ttl: Duration) {
-        let ttl_ms = ttl.as_millis().min(u64::MAX as u128) as u64;
-        let _ = self.sender.try_send(Command::Ban { ip, ttl_ms });
+        // Clamp to ≥ 1 ms: in the kernel set, 0 means PERMANENT — a sub-ms
+        // `ttl` must never silently flip a timed ban into a permanent one.
+        let ttl_ms = ttl.as_millis().clamp(1, u64::MAX as u128) as u64;
+        self.send_command(Command::Ban { ip, ttl_ms });
     }
 
     /// Drop `ip` permanently — for an apiban blocklist entry, which carries no
     /// per-IP lifetime.
     pub fn ban_permanent(&self, ip: IpAddr) {
-        let _ = self.sender.try_send(Command::Ban { ip, ttl_ms: 0 });
+        self.send_command(Command::Ban { ip, ttl_ms: 0 });
     }
 
     /// Lift a ban early (optional; timed elements self-expire).
     pub fn unban(&self, ip: IpAddr) {
-        let _ = self.sender.try_send(Command::Unban { ip });
+        self.send_command(Command::Unban { ip });
+    }
+
+    /// Non-blocking enqueue; a full (or closed) queue drops the command and
+    /// bumps `siphon_firewall_commands_dropped_total` so a ban storm outrunning
+    /// the netlink actor is visible instead of silent.
+    fn send_command(&self, command: Command) {
+        if self.sender.try_send(command).is_err() {
+            if let Some(metrics) = crate::metrics::try_metrics() {
+                metrics.firewall_commands_dropped_total.inc();
+            }
+        }
     }
 }
 
@@ -78,7 +93,13 @@ pub async fn start(config: &crate::config::FirewallConfig) -> std::io::Result<Ke
     )
     .await?;
 
-    let (sender, mut receiver) = mpsc::channel::<Command>(1024);
+    // Sized for the worst realistic burst: the APIBAN poller's first fetch
+    // pushes its whole blocklist (thousands of IPs) as fast as it parses
+    // pages, and a dropped permanent ban is not retried until a restart
+    // re-fetches the full list (the poller's dedupe set never re-pushes a
+    // known IP). Commands are tiny, so headroom is cheap; overflow is counted
+    // on `siphon_firewall_commands_dropped_total`.
+    let (sender, mut receiver) = mpsc::channel::<Command>(8192);
     let table = config.table.clone();
     let set_v4 = config.set_v4.clone();
     let set_v6 = config.set_v6.clone();
@@ -94,6 +115,11 @@ pub async fn start(config: &crate::config::FirewallConfig) -> std::io::Result<Ke
                 }
             };
             if let Err(error) = result {
+                // A failure here means the ban did NOT reach the kernel — the
+                // userspace ACL is the only enforcement left for this source.
+                if let Some(metrics) = crate::metrics::try_metrics() {
+                    metrics.firewall_command_failures_total.inc();
+                }
                 tracing::warn!(%error, "nftables: failed to apply firewall command");
             }
         }

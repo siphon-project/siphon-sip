@@ -85,8 +85,11 @@ chain input {
 ```
 
 Banned sources are dropped in-kernel from the first ban; SIPhon keeps the set
-contents current with per-element timeouts. On restart it leaves the existing
-table in place (so the rules are never duplicated).
+contents current with per-element timeouts. The whole setup is **one atomic
+nf_tables transaction**: every object is declared idempotently, and the chain's
+rules are flushed and re-appended inside the same transaction — so a first run,
+a clean restart, and a restart after a crash all converge to exactly this
+ruleset, with no duplicated rules and no instant where the drop rule is absent.
 
 ### Bring your own rule (`manage_rule: false`)
 
@@ -106,6 +109,19 @@ table inet siphon {
 
 ```bash
 nft -f /etc/siphon/firewall.nft
+```
+
+### Renaming or disabling: clean up the old objects yourself
+
+SIPhon only ever **creates** its objects — it never deletes a table or chain it
+finds, because it can't know the objects aren't yours. So if you rename `table`
+/ `chain` in the config, flip `manage_rule` off, or remove `firewall:` entirely,
+the previously created table (and its drop rules) stays in the kernel and keeps
+dropping whatever is still in its sets — including permanent APIBAN entries that
+never expire. Remove it explicitly:
+
+```bash
+nft delete table inet siphon
 ```
 
 ## Containers: use nftables, not XDP
@@ -147,6 +163,13 @@ nft list ruleset
 - **Bans not dropping?** Confirm the `chain input` + `@banned4/@banned6 drop` rules
   are present in `nft list ruleset`. With the default `manage_rule: true` SIPhon
   installs them; with `manage_rule: false` you add them yourself (see above).
+
+Two counters on `/metrics` cover the runtime failure modes:
+
+| Metric | Alert when | Meaning |
+|---|---|---|
+| `siphon_firewall_command_failures_total` | any sustained `rate() > 0` | Bans are **not** reaching the kernel (ruleset deleted out from under SIPhon, capability lost). Userspace ACL is the only enforcement left. |
+| `siphon_firewall_commands_dropped_total` | sustained `rate() > 0` | A ban storm is outrunning the netlink actor's queue; kernel enforcement lags the ban rate (userspace ACL still enforces every ban). |
 
 ## See also
 

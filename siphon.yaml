@@ -356,6 +356,20 @@ auth:
 #   apiban:                     # APIBAN community blocklist (apiban.org)
 #     api_key: "your-api-key"   # get a free key at apiban.org
 #     interval_secs: 300        # poll interval (default: 300 = 5 min)
+#
+#   firewall: {}                # kernel firewall: mirror bans (failed_auth_ban +
+#                               # apiban) into a kernel nf_tables set so banned
+#                               # sources are dropped before siphon's socket.
+#                               # Linux-only, needs CAP_NET_ADMIN; falls back to
+#                               # the userspace ACL (with a warning) without it.
+#                               # `{}` is enough — every field defaults:
+#     # table: "siphon"         # nf_tables table siphon owns (family inet)
+#     # chain: "input"          # base chain the drop rules live in
+#     # set_v4: "banned4"       # IPv4 ban set (per-element timeouts)
+#     # set_v6: "banned6"       # IPv6 ban set
+#     # manage_rule: true       # siphon owns chain + drop rules too; false =
+#                               # siphon maintains only the sets and you
+#                               # reference them from your own ruleset
 
 # ---------------------------------------------------------------------------
 # NAT traversal
