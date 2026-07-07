@@ -760,7 +760,7 @@ SIPhon stands on the shoulders of [Kamailio](https://www.kamailio.org/) and [Ope
   <a href="https://www.arnacon.com/"><img src="assets/partners/arnacon.png" alt="Arnacon by Cellact — Platform Partner" width="320"></a>
 </p>
 
-SIPhon's continued development is backed by **[Cellact](https://www.cellact.com/)** and its
+SIPhon's continued development is backed by **[Cellact](https://cellact.nl/)** and its
 Web3 telecom project **[Arnacon](https://www.arnacon.com/)** as a **Platform Partner**.
 Arnacon is their decentralized take on telephony: encrypted calls and messaging tied to an
 identity you own instead of a carrier-issued number. Their support helps drive the SIPhon

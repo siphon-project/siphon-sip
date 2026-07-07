@@ -86,7 +86,7 @@ See **[Commercial support](support.md)**.
   <a href="https://www.arnacon.com/"><img src="assets/partners/arnacon.png" alt="Arnacon by Cellact — Platform Partner" width="300"></a>
 </p>
 
-Development is backed by **[Cellact](https://www.cellact.com/)** and its Web3 telecom
+Development is backed by **[Cellact](https://cellact.nl/)** and its Web3 telecom
 project **[Arnacon](https://www.arnacon.com/)** as a Platform Partner. Their support helps
 drive the SIPhon roadmap forward.
 
