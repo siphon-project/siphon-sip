@@ -1540,10 +1540,37 @@ services:
   #   docker compose -f sipp/docker-compose.yaml --profile ipsec \
   #     up --abort-on-container-exit sipp-ipsec
 
+  # Standalone S-CSCF (local Milenage AKA, no HSS) that the P-CSCF relays
+  # REGISTER to. Reachable from the P-CSCF as the network alias "ims.test".
+  siphon-scscf:
+    build:
+      context: ..
+    container_name: siphon-scscf-test
+    volumes:
+      - ./ipsec/siphon-scscf.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.34
+        aliases:
+          - ims.test
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:ims.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@ims.test>;tag=hc\\r\\nTo: <sip:ims.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - ipsec
+
   siphon-ipsec:
     build:
       context: ..
     container_name: siphon-ipsec-test
+    depends_on:
+      siphon-scscf:
+        condition: service_healthy
     cap_add:
       - NET_ADMIN
     volumes:

@@ -52,6 +52,11 @@ auth:
 ipsec:
   pcscf_port_c: 5064
   pcscf_port_s: 5066
+  # Host part inserted into the Path header by request.add_pcscf_path() so MT
+  # requests route back to this P-CSCF instance (the container's sipnet IP).
+  # Required — ims_pcscf.py calls add_pcscf_path() on REGISTER, which errors
+  # if this is unset.
+  path_host: "172.20.0.35"
 
 log:
   level: debug
