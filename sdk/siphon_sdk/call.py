@@ -84,6 +84,51 @@ class Call:
         """Source IP address of the A-leg caller."""
         return self._source_ip
 
+    def from_gateway(self, group_name: str) -> bool:
+        """Check if the A-leg source IP is a member of a gateway group.
+
+        The B2BUA equivalent of ``request.from_gateway`` — returns ``True``
+        when the A-leg caller's source IP is one of the resolved addresses of
+        the gateway group ``group_name`` (configured under ``gateway.groups``
+        in ``siphon.yaml``, or via ``gateway.add_group``).  This is siphon's
+        answer to Kamailio ``ds_is_from_list()`` / OpenSIPS ``ds_is_in_list()``
+        — a routing-direction / trust predicate that replaces hardcoded source
+        CIDRs.
+
+        The match is on IP only (source port ignored) against **every**
+        resolved address in the group, so a hostname that round-robins across
+        many IPs matches on any of them.
+
+        Infallible: returns ``False`` (never raises) when the group does not
+        exist, no gateway is configured, or the source IP does not parse.
+
+        Security: on connection-oriented transports (TCP/TLS/WS/WSS) the source
+        IP is handshake-verified and trustworthy as an authorization signal; on
+        UDP it is spoofable, so ``from_gateway`` there is a best-effort
+        direction hint, not an auth gate.
+
+        Args:
+            group_name: Name of the gateway group to test membership against.
+
+        Returns:
+            ``True`` if the A-leg source IP belongs to the group.
+
+        Example::
+
+            @b2bua.on_invite
+            def on_invite(call):
+                if call.from_gateway("teams"):
+                    # Inbound from Microsoft Teams — bridge to the PBX.
+                    call.dial("sip:pbx.internal:5060")
+                else:
+                    call.reject(403, "Forbidden")
+        """
+        # Lazy import avoids a circular import (mock_module imports from the
+        # request module, which this module also imports at load time).
+        from siphon_sdk.mock_module import get_gateway
+
+        return get_gateway().contains_source(group_name, self._source_ip)
+
     @property
     def from_uri(self) -> Optional[SipUri]:
         """From URI of the A-leg INVITE."""
