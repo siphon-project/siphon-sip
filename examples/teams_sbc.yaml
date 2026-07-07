@@ -44,10 +44,42 @@ script:
   path: "examples/teams_sbc.py"
   reload: auto
 
-# Teams polls the SBC with OPTIONS from its signalling range — never rate-limit
-# or ban it. Confirm the range against Microsoft's current published list.
+# ---------------------------------------------------------------------------
+# Security. An internet-facing SBC is scanned and brute-forced within minutes
+# of going live — do NOT run one of these without a security block.
+# ---------------------------------------------------------------------------
 security:
-  trusted_cidrs: ["52.114.0.0/16"]
+  # Never rate-limited or auto-banned. Teams polls OPTIONS aggressively from its
+  # signalling range, so it MUST be trusted. Confirm the range against
+  # Microsoft's current published list.
+  trusted_cidrs:
+    - "52.114.0.0/16"          # Microsoft Teams signalling
+    # - "10.0.0.0/8"           # your own infra / monitoring / carrier trunk
+
+  rate_limit:
+    window_secs: 10
+    max_requests: 30           # per source IP per window
+    ban_duration_secs: 3600
+
+  scanner_block:
+    user_agents:
+      - "sipvicious"
+      - "friendly-scanner"
+      - "VaxSip"
+      - "sipcli"
+
+  failed_auth_ban:
+    threshold: 10              # weighted failures within window_secs before a ban
+    window_secs: 600
+    ban_duration_secs: 3600
+    strong_signal_weight: 3
+
+  # STRONGLY RECOMMENDED for any internet-facing SBC: APIBAN drops known SIP
+  # attackers (apiban.org community blocklist) at accept, before any parsing.
+  # Get a free key at apiban.org and uncomment:
+  # apiban:
+  #   api_key: "your-apiban-key"
+  #   interval_secs: 300
 
 b2bua:
   # Strip P-*/X-* between Teams and the carrier trunk (trust-boundary hygiene).
