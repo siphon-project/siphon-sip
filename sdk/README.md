@@ -87,6 +87,36 @@ result = harness.send_bye(initiator_side="a")
 assert result.was_terminated
 ```
 
+## Testing extension scripts (SMPP, HTTP)
+
+The opt-in [siphon extensions](https://siphon-sip.org/extensions/) inject extra
+namespaces (`smpp`, `http`) at runtime. The SDK mocks them too, with dedicated
+harnesses, so extension scripts are testable from the same `pip install
+siphon-sip` — no running SMSC or HTTP listener required:
+
+```python
+from siphon_sdk.smpp_testing import SmppTestHarness
+
+harness = SmppTestHarness()
+harness.load_script("scripts/gateway.py")
+assert harness.bind("esme1", password="s3cret")
+reply = harness.submit_sm(source_addr="15550100", destination_addr="15550101",
+                          short_message=b"hi")
+assert reply.ok
+```
+
+```python
+from siphon_sdk.http_testing import HttpTestHarness
+from siphon_sdk.http import MockResponse
+
+harness = HttpTestHarness()
+harness.add_response(MockResponse(status=200, body=b'{"ok":true}'))
+harness.load_script("scripts/api.py")
+
+resp = harness.request("GET", "/users/42")
+assert resp.status == 200
+```
+
 ## Inline scripts
 
 Test scripts without separate files:

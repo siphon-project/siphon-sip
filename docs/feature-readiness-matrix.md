@@ -119,10 +119,10 @@ This document tracks the maturity of every SIPhon feature across three readiness
 
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
-| Force rport (RFC 3581) | **Production** | `nat.force_rport: true` | |
-| Fix Contact (observed source) | **Production** | `nat.fix_contact: true` | |
-| Fix REGISTER Contact | **Production** | `nat.fix_register: true` | |
-| Fix NATed Contact (script) | **Production** | `request.fix_nated_contact()` | |
+| Symmetric response routing (rport, RFC 3581/6314) | **Production** | always on | Responses always go to the request source; no `force_rport` knob needed |
+| Fix Contact (observed source) | **Production** | `nat.fix_contact: true` | Rewrites the Contact on responses |
+| REGISTER source capture | **Production** | automatic in `registrar.save()` | Stored as `Contact.received` / `Contact.flow` for MT routing |
+| Fix NATed Contact / REGISTER (script) | **Production** | `request.fix_nated_contact()` / `fix_nated_register()` | Explicit REGISTER-side fixups |
 | NAT keepalive (OPTIONS ping) | Implemented | `nat.keepalive` | Configurable interval + failure threshold |
 | CRLF keepalive (RFC 5626 §4.4.1) | Implemented | `nat.crlf_keepalive` | TCP/TLS/pool connection keep-alive; outbound probe + inbound peer-ping/pong responder |
 | Stale contact eviction on restart | **Production** | Core | Evicts connection-oriented contacts + on_change notify |

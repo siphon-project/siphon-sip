@@ -90,6 +90,201 @@ impl Default for ExecutorConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Memory-aware pool sizing
+// ---------------------------------------------------------------------------
+
+/// Persistent per-worker Python heap on free-threaded CPython 3.14t, in MB.
+///
+/// Each elastic worker holds a persistent `PyGILState_Ensure` attach for its
+/// whole life (the never-reap design that fixes the mimalloc-heap leak), so it
+/// carries its own free-threaded mimalloc heap that grows as the worker runs
+/// handlers and then stays resident. Measured at **~8 MB** per warm worker on a
+/// free-threaded 3.14t IMS deployment — `scscf` (32 workers) − `pcscf`
+/// (8 workers) = 24 workers for +198 MB RSS ≈ 8.25 MB/worker. The original
+/// "~2 MB" estimate predated free-threading and was ~4× low. Rounded up to 10
+/// here so the derived budget is conservative (never under-counts the heap).
+const PER_WORKER_HEAP_MB: u64 = 10;
+
+/// Fraction of the container's memory limit the pool's *peak* heap
+/// (`max_threads × PER_WORKER_HEAP_MB`) is allowed to occupy by default. Keeps
+/// the pool from defaulting past ~30 % of the NF's RAM no matter how many CPUs
+/// the host has — the per-worker heap budget, not the host core count, sets the
+/// ceiling.
+const POOL_BUDGET_FRACTION: f64 = 0.30;
+
+/// Absolute floor for the CPU-derived thread ceiling (legacy default shape:
+/// `max(MIN_MAX_THREADS, 4 × core)`), before the memory budget caps it down.
+const MIN_MAX_THREADS: usize = 32;
+
+/// Always-on core-worker floor. A small container (`cpus: 0.5`) reports
+/// `available_parallelism() == 1`, which `2×` alone would make a 2-thread
+/// baseline — too small for the hot inbound path.
+const MIN_CORE_THREADS: usize = 8;
+
+/// cgroup v1 reports "no limit" as a page-aligned value near `i64::MAX`
+/// (`PAGE_COUNTER_MAX × PAGE_SIZE`, ≈ 9.22e18). A real memory limit — even a
+/// multi-terabyte one — is many orders of magnitude smaller, so treat anything
+/// at or above this threshold as unlimited.
+const CGROUP_V1_UNLIMITED: u64 = 0x7000_0000_0000_0000;
+
+/// Which budget determined the resolved `max_threads`, surfaced in the startup
+/// log so an operator can see why the ceiling landed where it did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizingBound {
+    /// The CPU-derived ceiling (`max(MIN_MAX_THREADS, 4 × core)`) was binding.
+    Cpu,
+    /// The container memory budget (`POOL_BUDGET_FRACTION` of the limit) was binding.
+    Memory,
+    /// An explicit `script.sync_pool_max` override was set.
+    Override,
+}
+
+impl SizingBound {
+    /// Lower-case label for structured logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SizingBound::Cpu => "cpu",
+            SizingBound::Memory => "memory",
+            SizingBound::Override => "override",
+        }
+    }
+}
+
+/// Resolved `core` / `max` worker counts plus the bound that set the ceiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PoolSizing {
+    pub core_threads: usize,
+    pub max_threads: usize,
+    pub bound: SizingBound,
+}
+
+/// Resolve the elastic pool's `core` / `max` worker counts from the CPU count
+/// and the container memory limit, honouring explicit overrides.
+///
+/// The ceiling is the **minimum** of a CPU-derived cap (`max(32, 4 × core)`)
+/// and a memory budget (`POOL_BUDGET_FRACTION` of the limit ÷ per-worker heap),
+/// so the pool can't default past ~30 % of the NF's RAM however many CPUs the
+/// host happens to have. `core` is likewise capped by the memory budget so an
+/// un-cpu-limited NF on a many-core box doesn't *start* at 32 always-on workers.
+/// Explicit `sync_pool_size` / `sync_pool_max` always win. `mem_limit_bytes` is
+/// `None` when no limit is readable (non-Linux / no `/proc`), in which case the
+/// CPU-derived ceiling stands unchanged (prior behaviour).
+pub fn resolve_sizing(
+    cpus: usize,
+    mem_limit_bytes: Option<u64>,
+    sync_pool_size: Option<usize>,
+    sync_pool_max: Option<usize>,
+) -> PoolSizing {
+    // How many per-worker heaps fit in the pool's memory budget. `None` keeps
+    // the CPU-derived shape (no limit known).
+    let per_worker_bytes = PER_WORKER_HEAP_MB * 1024 * 1024;
+    let mem_cap = mem_limit_bytes.map(|limit| {
+        let budget = (limit as f64) * POOL_BUDGET_FRACTION;
+        ((budget / per_worker_bytes as f64) as usize).max(1)
+    });
+
+    // Core: 2× CPUs floored at 8, but never above what the memory budget affords.
+    let cpu_core = cpus.saturating_mul(2).max(MIN_CORE_THREADS);
+    let core_threads = sync_pool_size
+        .unwrap_or(match mem_cap {
+            Some(cap) => cpu_core.min(cap),
+            None => cpu_core,
+        })
+        .max(1);
+
+    // Max: CPU-derived ceiling capped by the memory budget; an explicit
+    // override wins, clamped to at least `core` (existing contract).
+    let cpu_cap = core_threads.saturating_mul(4).max(MIN_MAX_THREADS);
+    let (max_threads, bound) = match sync_pool_max {
+        Some(explicit) => (explicit.max(core_threads), SizingBound::Override),
+        None => match mem_cap {
+            Some(cap) => {
+                let mem_max = cap.max(core_threads);
+                if mem_max < cpu_cap {
+                    (mem_max, SizingBound::Memory)
+                } else {
+                    (cpu_cap, SizingBound::Cpu)
+                }
+            }
+            None => (cpu_cap, SizingBound::Cpu),
+        },
+    };
+
+    PoolSizing {
+        core_threads,
+        max_threads,
+        bound,
+    }
+}
+
+/// Resolve the effective memory limit (bytes) for pool budgeting: the
+/// container's cgroup limit when one is set (cgroup v2 `memory.max`, then v1
+/// `memory.limit_in_bytes`), else host RAM (`/proc/meminfo` `MemTotal`). The
+/// cgroup limit is clamped to host RAM — a limit above physical RAM isn't a
+/// real budget. Returns `None` only when nothing is readable (non-Linux /
+/// no `/proc`), so callers fall back to the CPU-derived ceiling.
+pub fn read_memory_limit_bytes() -> Option<u64> {
+    let host_ram = read_host_ram_bytes();
+    let cgroup = read_cgroup_mem_limit();
+    match (cgroup, host_ram) {
+        (Some(cgroup_limit), Some(ram)) => Some(cgroup_limit.min(ram)),
+        (Some(cgroup_limit), None) => Some(cgroup_limit),
+        (None, Some(ram)) => Some(ram),
+        (None, None) => None,
+    }
+}
+
+/// Read the cgroup memory limit (v2 first, then v1). `None` when no limit is set
+/// (the `max` / unlimited sentinels) or the files are absent.
+fn read_cgroup_mem_limit() -> Option<u64> {
+    if let Some(limit) = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .ok()
+        .and_then(|content| parse_cgroup_v2_max(&content))
+    {
+        return Some(limit);
+    }
+    std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        .ok()
+        .and_then(|content| parse_cgroup_v1_limit(&content))
+}
+
+/// Read host physical RAM from `/proc/meminfo` (`MemTotal`, reported in kB).
+fn read_host_ram_bytes() -> Option<u64> {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|content| parse_meminfo_total(&content))
+}
+
+/// Parse cgroup v2 `memory.max`: a decimal byte count, or `max` (no limit).
+fn parse_cgroup_v2_max(content: &str) -> Option<u64> {
+    let trimmed = content.trim();
+    if trimmed == "max" {
+        return None;
+    }
+    trimmed.parse::<u64>().ok().filter(|&value| value > 0)
+}
+
+/// Parse cgroup v1 `memory.limit_in_bytes`: a decimal byte count. Treat the
+/// near-`i64::MAX` "unlimited" sentinel (see [`CGROUP_V1_UNLIMITED`]) as no limit.
+fn parse_cgroup_v1_limit(content: &str) -> Option<u64> {
+    content
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|&value| value > 0 && value < CGROUP_V1_UNLIMITED)
+}
+
+/// Parse `MemTotal:  N kB` from `/proc/meminfo`, returning bytes.
+fn parse_meminfo_total(content: &str) -> Option<u64> {
+    content
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|kb| kb.parse::<u64>().ok())
+        .map(|kb| kb.saturating_mul(1024))
+}
+
 /// Live, lock-free counters shared between the worker threads (which mutate
 /// them), `submit` (which reads `idle`/`total` to decide whether to grow), and
 /// the watchdog thread. `inflight`/`completed` are the watchdog's forward-progress
@@ -927,6 +1122,111 @@ mod tests {
         assert_eq!(grow_deficit(100, 0, 6, 8), 2);
         assert_eq!(grow_deficit(100, 0, 8, 8), 0);
         assert_eq!(grow_deficit(100, 0, 9, 8), 0);
+    }
+
+    const MB: u64 = 1024 * 1024;
+
+    /// With no readable memory limit (`None`), the ceiling is the legacy
+    /// CPU-derived shape — unchanged behaviour on non-Linux / no-`/proc` hosts.
+    #[test]
+    fn resolve_sizing_without_mem_limit_uses_cpu_ceiling() {
+        let sizing = resolve_sizing(8, None, None, None);
+        // core = max(8, 2×8) = 16; max = max(32, 4×16) = 64.
+        assert_eq!(sizing.core_threads, 16);
+        assert_eq!(sizing.max_threads, 64);
+        assert_eq!(sizing.bound, SizingBound::Cpu);
+    }
+
+    /// Acceptance §4.1 — a 512 MB-cgroup NF resolves `max` to ~12–16 (not 32),
+    /// and the memory budget is the binding bound.
+    #[test]
+    fn resolve_sizing_512mb_caps_max_to_memory_budget() {
+        let sizing = resolve_sizing(2, Some(512 * MB), None, None);
+        // mem budget = 512×0.30 / 10 MB ≈ 15.
+        assert_eq!(sizing.core_threads, 8); // min(max(8, 2×2)=8, 15)
+        assert_eq!(sizing.max_threads, 15);
+        assert_eq!(sizing.bound, SizingBound::Memory);
+        assert!((12..=16).contains(&sizing.max_threads));
+    }
+
+    /// A 256 MB NF budgets even fewer workers (~7).
+    #[test]
+    fn resolve_sizing_256mb_caps_lower() {
+        let sizing = resolve_sizing(2, Some(256 * MB), None, None);
+        // mem budget = 256×0.30 / 10 MB ≈ 7.
+        assert_eq!(sizing.max_threads, 7);
+        assert_eq!(sizing.bound, SizingBound::Memory);
+    }
+
+    /// Acceptance §4.2 — an un-cpu-limited NF on a 16-core box no longer defaults
+    /// to core=32/max=128; both are bounded by the memory budget. `core` is
+    /// capped too, so the pool doesn't *start* at 32 always-on workers.
+    #[test]
+    fn resolve_sizing_big_cpu_box_bounded_by_memory() {
+        let sizing = resolve_sizing(16, Some(512 * MB), None, None);
+        assert_eq!(sizing.core_threads, 15); // min(max(8, 2×16)=32, 15)
+        assert_eq!(sizing.max_threads, 15);
+        assert_eq!(sizing.bound, SizingBound::Memory);
+    }
+
+    /// A generous memory budget leaves the CPU-derived ceiling in charge.
+    #[test]
+    fn resolve_sizing_high_mem_leaves_cpu_bound() {
+        // 8 CPUs, 8 GB: mem budget = 8192×0.30 / 10 ≈ 245 ≫ cpu cap (64).
+        let sizing = resolve_sizing(8, Some(8192 * MB), None, None);
+        assert_eq!(sizing.core_threads, 16);
+        assert_eq!(sizing.max_threads, 64);
+        assert_eq!(sizing.bound, SizingBound::Cpu);
+    }
+
+    /// Acceptance §4.5 — explicit overrides win over the memory budget.
+    #[test]
+    fn resolve_sizing_explicit_overrides_win() {
+        let sizing = resolve_sizing(2, Some(256 * MB), Some(20), Some(40));
+        assert_eq!(sizing.core_threads, 20);
+        assert_eq!(sizing.max_threads, 40);
+        assert_eq!(sizing.bound, SizingBound::Override);
+    }
+
+    /// `max` is always clamped to at least `core` (existing contract), even when
+    /// an override would set it lower.
+    #[test]
+    fn resolve_sizing_max_clamped_to_core() {
+        let sizing = resolve_sizing(2, None, Some(12), Some(4));
+        assert_eq!(sizing.core_threads, 12);
+        assert_eq!(sizing.max_threads, 12);
+        assert_eq!(sizing.bound, SizingBound::Override);
+    }
+
+    /// A pathologically tiny budget still yields a usable (≥1) pool.
+    #[test]
+    fn resolve_sizing_tiny_budget_floors_at_one() {
+        let sizing = resolve_sizing(1, Some(8 * MB), None, None);
+        assert!(sizing.core_threads >= 1);
+        assert!(sizing.max_threads >= sizing.core_threads);
+    }
+
+    #[test]
+    fn parse_cgroup_v2_max_handles_max_and_number() {
+        assert_eq!(parse_cgroup_v2_max("max\n"), None);
+        assert_eq!(parse_cgroup_v2_max("536870912\n"), Some(536_870_912));
+        assert_eq!(parse_cgroup_v2_max("0\n"), None);
+        assert_eq!(parse_cgroup_v2_max("garbage"), None);
+    }
+
+    #[test]
+    fn parse_cgroup_v1_limit_handles_sentinel() {
+        // The kernel "unlimited" sentinel (near i64::MAX) is not a real limit.
+        assert_eq!(parse_cgroup_v1_limit("9223372036854771712\n"), None);
+        assert_eq!(parse_cgroup_v1_limit("268435456"), Some(268_435_456));
+        assert_eq!(parse_cgroup_v1_limit("0"), None);
+    }
+
+    #[test]
+    fn parse_meminfo_total_parses_kb_to_bytes() {
+        let meminfo = "MemTotal:       16384000 kB\nMemFree:         8000000 kB\n";
+        assert_eq!(parse_meminfo_total(meminfo), Some(16_384_000 * 1024));
+        assert_eq!(parse_meminfo_total("MemFree: 100 kB\n"), None);
     }
 
     /// The bounded queue sheds once full instead of growing without bound: with

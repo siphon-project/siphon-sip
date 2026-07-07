@@ -39,6 +39,102 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
     `media.rtpengine` configs are untouched. SIPREC/MPTY subscriptions are not
     yet implemented on `siphon-rtp` and surface a clear engine error there.
   - Depends on the published `siphon-rtp-proto` crate (the shared wire contract).
+- **B2BUA `call.set_from_host()` / `call.set_to_host()`** — pin the host part of
+  the B-leg From / To URI, mirroring `set_from_user` / `set_to_user`. By default
+  the B2BUA rewrites the B-leg From host to its own advertised address (topology
+  hiding) and the To host to the dial-target host. `set_from_host()` opts a leg
+  out of the From host-rewrite so the original domain survives — needed for a
+  multitenant SBC whose downstream selects the tenant from the From domain (a
+  domainless call would otherwise land in an unauthenticated/default routing
+  context). `set_to_host()` pins the To host declaratively (replaces the raw
+  `set_header("To", "<sip:…>")` idiom). Only the host changes; scheme/user/port/
+  params and tags are preserved. Applies to both `call.dial()` and `call.fork()`.
+  Mirrored in the `siphon-sip` SDK mock; new SIPp acceptance scenario
+  (`sipp/b2bua_set_host_uas.xml`).
+
+## [1.1.1] — 2026-07-02
+
+### Security
+- **Bump `quick-xml` 0.37 → 0.41** to address RUSTSEC-2026-0194 (quadratic
+  runtime when checking a start tag for duplicate attribute names) and
+  RUSTSEC-2026-0195 (unbounded namespace-declaration allocation in `NsReader`,
+  a memory-exhaustion DoS). siphon parses XML on the presence (PIDF/reginfo),
+  iFC, SIPREC-metadata, and Sh paths — some of it from remote peers — so the
+  parser hardening matters. No API or behavioural change (the reginfo / iFC /
+  SIPREC parsers keep identical decode + entity-unescape semantics).
+
+## [1.1.0] — 2026-07-02
+
+### Added
+- **Supply-chain documentation + `SECURITY.md`.** A new **Supply chain & SBOM**
+  docs page documents the per-release SBOM (SPDX 2.3 + CycloneDX 1.4, attached to
+  each GitHub Release), how to consume it with Grype / Trivy / Dependency-Track,
+  how to reproduce it with `cargo sbom`, and the scheduled `cargo-deny` advisory /
+  license / source audit. A root `SECURITY.md` adds a private vulnerability-
+  reporting policy (GitHub private reporting, coordinated disclosure) — previously
+  absent. No behavioural change; documents supply-chain artifacts that already
+  ship at release.
+- **SDK mocks for the extension namespaces (`smpp`, `http`).** The `siphon-sip`
+  Python SDK now mocks the namespaces injected by the opt-in extensions, so
+  `from siphon import smpp` / `from siphon import http` resolve under pytest and
+  carry full type hints + docstrings for script authoring. Two new harnesses —
+  `siphon_sdk.smpp_testing.SmppTestHarness` and
+  `siphon_sdk.http_testing.HttpTestHarness` — dispatch mock binds / PDUs and
+  HTTP requests into a script's handlers and capture the results, mirroring
+  `SipTestHarness`. This lets SMPP/HTTP scripts be unit-tested with a single
+  `pip install siphon-sip`, no running SMSC or listener required. The mocks
+  track the extension runtimes (siphon-smpp, siphon-http), which each ship a CI
+  check that fails if their namespace surface drifts from these mocks. The docs
+  **Extensions** page and nav now link the per-extension documentation sites.
+- **HTTP extension wired into `siphon-bin` (`--features http`).** The second
+  opt-in extension module alongside SMPP: when `extensions.http` in `siphon.yaml`
+  points at an `http.yaml`, `siphon-bin` registers the scriptable `http`
+  namespace and the HTTP runtime, so scripts can serve inbound HTTP
+  (`@http.route`, `@http.middleware`, `@http.on_startup`) and make outbound calls
+  (`http.Client`) from the same asyncio loop they use for SIP. `http.Client` is a
+  **pooled, Rust-backed (reqwest) client whose calls run entirely on siphon's
+  Tokio runtime and yield the asyncio driver loop while in flight** — so a script
+  that only needs outbound HTTP on the hot path (a REST lookup per INVITE, a
+  provisioning callback) should enable this feature and use `http.Client` rather
+  than a synchronous Python client that blocks its driver loop for the whole
+  round-trip. A new `full` aggregate feature (`--features full`) enables every
+  extension module at once. The HTTP module is pinned to **siphon-http v1.0.1**;
+  with the feature off, an `extensions.http` block still parses and is skipped
+  with a loud warning (same contract as SMPP and the `sctp` feature). Documented
+  under **Extensions** in the docs site.
+- **Opt-in extension binary (`siphon-bin`)** — a new standalone package that
+  builds a drop-in `siphon` binary composing optional extension modules behind
+  cargo features (all off by default). The first module is **SMPP 3.4**
+  (`--features smpp`): when `extensions.smpp` in `siphon.yaml` points at an
+  `smpp.yaml`, it registers the scriptable `smpp` namespace and the SMPP runtime
+  so scripts can handle `@smpp.on_pdu` / `@smpp.on_bind`. With a module's feature
+  off, its `extensions.<name>` block still parses and is skipped with a loud
+  warning (same contract as the `sctp` feature). The plain `siphon` binary from
+  `cargo install siphon-sip` is unchanged; operators who want extensions build
+  `siphon-bin` (e.g. `cargo build -p siphon-bin --release --features smpp`, or
+  the `siphon-bin/Dockerfile` image). Documented under **Extensions** in the
+  docs site. The `ext/` layer is structured so further modules (HTTP, …) plug in
+  behind their own features. The SMPP module is pinned to **siphon-smpp v1.2.1**,
+  which adds a per-ESME-session inbound ingress rate cap (`server.max_msg_per_sec`
+  with a `pace` / `reject` over-rate action).
+- **`siphon::install_allocator!()` — one-line jemalloc + page-decay setup.** A
+  `#[global_allocator]` and jemalloc's `_rjem_malloc_conf` config symbol only
+  take effect in the final binary crate (the language honors `#[global_allocator]`
+  only in the binary root, and jemalloc's weak `_rjem_malloc_conf = NULL` default
+  means a library-provided definition isn't reliably linked), so both must be
+  emitted in `main.rs`. The new macro does exactly that in one line:
+  `siphon::install_allocator!();` installs jemalloc as the global allocator plus
+  siphon's page-decay tuning
+  (`background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0`), with siphon
+  owning the `tikv-jemallocator` version (re-exported, so there's no
+  `links = "jemalloc"` version skew and no separate dependency to add). Pass a
+  literal to override the decay config
+  (`siphon::install_allocator!("dirty_decay_ms:0")`). A read-only boot probe
+  (`siphon::metrics::jemalloc_is_active`) now logs a loud WARN at startup if
+  jemalloc isn't the active allocator — so the system allocator running
+  unexpectedly (RSS bloat, `siphon_memory_*` gauges reading jemalloc's idle
+  footprint) shows up in logs rather than a memory post-mortem. See
+  `examples/embed_with_allocator.rs`. siphon's own binary is unchanged.
 - **ISDN-AddressString AVPs decode to E.164 in scripts** — MSISDN (701),
   SC-Address (3300), SGSN-Number (1489) and MME-Number-for-MT-SMS (1645) are
   now dictionary-typed `ISDNAddressString` (3GPP TS 29.002 §17.7.8) instead of
@@ -116,6 +212,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the existing perf/mem and criterion regression gates.
 
 ### Changed
+- **Synchronous Python executor pool ceiling is now memory-aware by default.**
+  The pool's default `max`/`core` worker counts were derived only from the host
+  CPU count (`core = max(8, 2×CPUs)`, `max = max(32, 4×core)`), which scaled the
+  pool's memory ceiling with the *box's* core count rather than the NF's memory
+  budget. Combined with a per-worker heap that is ~8 MB on free-threaded CPython
+  3.14t (not the ~2 MB the comment assumed), an un-cpu-limited NF on a 16-core
+  host defaulted to `core=32/max=128` ≈ 1 GB of pool heap, so memory-constrained
+  IMS NFs hit their cgroup limit under churn. The default ceiling is now the
+  **minimum** of that CPU-derived cap and a memory budget (~30 % of the
+  container's cgroup memory limit — v2 `memory.max`, v1 `memory.limit_in_bytes`,
+  falling back to host RAM — divided by the ~10 MB conservative per-worker heap),
+  and `core` is capped the same way so the pool no longer *starts* at 32 workers
+  on a big box. On a 512 MB NF the ceiling resolves to ~15 (was 32/128); on
+  256 MB to ~7. The resolved `core`/`max` and which bound won (`cpu`/`memory`/
+  `override`) are logged at startup. The `script.sync_pool_size` /
+  `script.sync_pool_max` overrides still take precedence when set.
 - **SCTP is now an opt-in build feature, off by default.** SIP-over-SCTP
   (RFC 4168) and Diameter-over-SCTP link the `libsctp` system library, which
   only exists on Linux. Moving them behind the `sctp` Cargo feature lets the
@@ -132,6 +244,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
     with a warning, and a Diameter peer set to `transport: sctp` fails at
     connect with `ErrorKind::Unsupported` (no silent fallback to TCP).
   - CI builds and tests both configurations (default and `--features sctp`).
+
+### Removed
+- **Dropped the no-op `nat.force_rport` and `nat.fix_register` config keys.** Both
+  were accepted but never consumed by the runtime. Their intended behaviour is
+  already covered: responses are always routed symmetrically to the request's
+  source address (RFC 6314, so rport is effectively unconditional), and every
+  `registrar.save()` records the observed source (`Contact.received` /
+  `Contact.flow`) for NAT/MT routing. REGISTER-side fixups remain available as the
+  explicit script methods `request.fix_nated_register()` / `fix_nated_contact()`.
+  Removal is backward-compatible — existing `siphon.yaml` files carrying either
+  key still parse (the keys are ignored, exactly as before). `nat.fix_contact`,
+  `nat.keepalive`, and `nat.crlf_keepalive` are unchanged.
 
 ### Fixed
 - **Premature `100 Trying` on non-INVITE transactions over UDP (RFC 4320 §4.2).**
@@ -172,6 +296,14 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `benches/baseline.json`. Self-contained (reads criterion's own `estimates.json`,
   no `critcmp`/`jq`). CI proves the benches compile; the hard timing gate runs at
   release cut on fixed hardware, where absolute timings are meaningful.
+
+### Documentation
+- Added a **Transports & networking** guide (docs site, under *Running in
+  production*): transport listeners (UDP/TCP/TLS/WS/WSS/SCTP), WebSocket/WebRTC
+  (RFC 7118) and the signaling-vs-media split, RFC 5626 flow tokens and
+  connection reuse, `advertised_address` for behind-NAT / load-balancer
+  deployments, client NAT traversal, inter-transport routing, and IPv4/IPv6
+  interworking.
 
 ## [1.0.0] — 2026-06-26
 

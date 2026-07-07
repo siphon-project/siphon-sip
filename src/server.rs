@@ -310,6 +310,13 @@ impl SiphonServer {
             init_logging(&config.log)
         };
 
+        // --- Verify jemalloc is actually the global allocator ---
+        // A binary that forgot `siphon::install_allocator!()` runs siphon's Rust
+        // working set on the system allocator (RSS bloat + meaningless
+        // siphon_memory_* gauges). Catch it in the boot log, not a post-mortem.
+        // Read-only probe — never changes allocator config.
+        crate::metrics::verify_global_allocator();
+
         // --- Allocator tuning (glibc arena cap + periodic trim) ---
         // Applied as early as possible so the arena cap takes effect before the
         // Python/script workload starts creating glibc arenas. The
@@ -414,21 +421,37 @@ impl SiphonServer {
         // free-threaded-CPython attach from leaking (the reason the pool stopped
         // using `spawn_blocking`).
         //
-        // core default = max(8, 2×CPUs): the always-on baseline. The floor of 8
-        // matters on small containers — a `cpus: 0.5` box reports
-        // `available_parallelism() == 1`, which 2× alone would make a 2-thread
-        // baseline. max default = max(32, 4×core): the burst ceiling. Each grown
-        // worker costs ~2 MB of persistent Python heap, so peak memory is
-        // ~max_threads × 2 MB — lower `script.sync_pool_max` on memory-
-        // constrained NFs (and prefer `auth.http.cache_ttl_secs`, which keeps
-        // the storm from ever needing to grow).
+        // The default ceiling is MEMORY-AWARE, not just CPU-derived. Each grown
+        // worker carries its own persistent free-threaded-CPython mimalloc heap
+        // measured at ~8 MB (not the ~2 MB the original estimate assumed), and a
+        // purely CPU-derived ceiling (`max(32, 4×core)`) scaled the pool's memory
+        // ceiling with the *host* core count — unrelated to the NF's memory
+        // budget — so an un-cpu-limited NF on a 16-core box defaulted to
+        // core=32/max=128 ≈ 1 GB of pool heap. `resolve_sizing` instead takes the
+        // MINIMUM of that CPU cap and a memory budget (~30 % of the container's
+        // cgroup limit ÷ per-worker heap), and caps `core` the same way so the
+        // pool also doesn't *start* at 32 workers on a big box. On a 512 MB NF the
+        // ceiling resolves to ~15 (was 32/128); the `script.sync_pool_size` /
+        // `script.sync_pool_max` overrides still win. `auth.http.cache_ttl_secs`
+        // remains the right lever to keep an auth storm from ever needing to grow.
         let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let core_threads = config.script.sync_pool_size.unwrap_or((cpus * 2).max(8));
-        let max_threads = config
-            .script
-            .sync_pool_max
-            .unwrap_or((core_threads * 4).max(32))
-            .max(core_threads);
+        let mem_limit = crate::script::py_executor::read_memory_limit_bytes();
+        let sizing = crate::script::py_executor::resolve_sizing(
+            cpus,
+            mem_limit,
+            config.script.sync_pool_size,
+            config.script.sync_pool_max,
+        );
+        info!(
+            cpus,
+            mem_limit_mb = mem_limit.map(|bytes| bytes / 1024 / 1024),
+            core_threads = sizing.core_threads,
+            max_threads = sizing.max_threads,
+            bound = sizing.bound.as_str(),
+            "resolved synchronous Python executor pool sizing"
+        );
+        let core_threads = sizing.core_threads;
+        let max_threads = sizing.max_threads;
         // Bound the queue (load-shed under overload instead of unbounded growth)
         // and arm the liveness watchdog (abort + supervisor-restart only if the
         // pool reaches the cap and still wedges). `handler_stall_abort_secs == 0`

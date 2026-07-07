@@ -30,5 +30,7 @@ __version__ = "0.1.0"
 
 from siphon_sdk.mock_module import install
 from siphon_sdk.testing import SipTestHarness
+from siphon_sdk.smpp_testing import SmppTestHarness
+from siphon_sdk.http_testing import HttpTestHarness
 
-__all__ = ["install", "SipTestHarness"]
+__all__ = ["install", "SipTestHarness", "SmppTestHarness", "HttpTestHarness"]

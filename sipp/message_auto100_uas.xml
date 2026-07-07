@@ -2,12 +2,15 @@
 <!DOCTYPE scenario SYSTEM "sipp.dtd">
 
 <!--
-  MESSAGE UAS that deliberately stalls before sending 200 OK.
+  Slow MESSAGE UAS (server half) for the non-INVITE auto-100 test.
 
-  Pairs with message_auto100.xml to exercise siphon's NIST auto-100 Trying
-  timer: with the UAS final response delayed 500 ms, the proxy's 200 ms
-  auto-100 timer must fire and emit a 100 Trying upstream so the UAC sees
-  a provisional before the final and does not retransmit the MESSAGE.
+  The container first self-registers alice with a Contact for its OWN address
+  (see the entrypoint in docker-compose.yaml), so the proxy's MT routing lands
+  back here. This scenario is then the pure server: it receives the relayed
+  MESSAGE and stalls past the ~3.5s RFC 4320 §4.2 non-INVITE auto-100 point
+  (default T1=500ms / T2=4s → Timer E reaches T2 at ~3.5s; see
+  TimerConfig::nist_auto_100_delay) before answering 200 OK, so the proxy's
+  auto-100 Trying fires upstream first.
 
   Run: sipp -sf message_auto100_uas.xml -p 5060
 -->
@@ -15,14 +18,16 @@
 
   <recv request="MESSAGE" />
 
-  <pause milliseconds="500" />
+  <!-- Stall past the ~3.5s RFC 4320 §4.2 auto-100 point so the proxy emits
+       the 100 Trying before this final 200 OK. -->
+  <pause milliseconds="4500" />
 
   <send>
     <![CDATA[
 SIP/2.0 200 OK
 [last_Via:]
 [last_From:]
-[last_To:];tag=[pid]SIPpTag00[call_number]
+[last_To:];tag=[pid]SIPpTag01[call_number]
 [last_Call-ID:]
 [last_CSeq:]
 Content-Length: 0

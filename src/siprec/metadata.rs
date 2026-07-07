@@ -10,6 +10,22 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use thiserror::Error;
 
+/// quick-xml 0.41 (RUSTSEC-2026-0194/0195 fix) removed `BytesText::unescape()`;
+/// restore its "decode encoding + resolve XML entities" behaviour.
+trait BytesTextExt {
+    fn unescape(&self) -> Result<std::borrow::Cow<'_, str>, String>;
+}
+impl BytesTextExt for quick_xml::events::BytesText<'_> {
+    fn unescape(&self) -> Result<std::borrow::Cow<'_, str>, String> {
+        let decoded = self.decode().map_err(|error| error.to_string())?;
+        Ok(std::borrow::Cow::Owned(
+            quick_xml::escape::unescape(&decoded)
+                .map_err(|error| error.to_string())?
+                .into_owned(),
+        ))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Error
 // ---------------------------------------------------------------------------
@@ -271,7 +287,10 @@ fn get_attribute(element: &BytesStart, attribute_name: &str) -> Option<String> {
     for attribute in element.attributes().flatten() {
         let key = std::str::from_utf8(attribute.key.as_ref()).unwrap_or("");
         if key == attribute_name {
-            return attribute.unescape_value().ok().map(|value| value.to_string());
+            return attribute
+                .normalized_value(quick_xml::XmlVersion::Explicit1_0)
+                .ok()
+                .map(|value| value.to_string());
         }
     }
     None

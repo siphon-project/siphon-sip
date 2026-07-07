@@ -154,6 +154,32 @@ Cargo feature. Enable it explicitly (and install `libsctp-dev` first on Linux):
 cargo install siphon-sip --features sctp
 ```
 
+#### Optional extension modules (SMPP, …)
+
+Protocol extensions that aren't part of the core SIP datapath live in their own
+crates and are composed into a drop-in `siphon` binary by the separate
+[`siphon-bin`](siphon-bin/) package, each behind its own off-by-default cargo
+feature. The plain `cargo install siphon-sip` binary is unaffected; build the
+extension binary only if you need one:
+
+```bash
+# SMPP 3.4 (scriptable `smpp` namespace: @smpp.on_pdu / @smpp.on_bind)
+cargo build -p siphon-bin --release --features smpp
+
+# …or as a container image (operator mounts siphon.yaml + smpp.yaml + script):
+docker build -f siphon-bin/Dockerfile -t siphon-smpp siphon-bin/
+```
+
+Point siphon at the extension's config from `siphon.yaml`:
+
+```yaml
+extensions:
+  smpp: /etc/siphon/smpp.yaml
+```
+
+If `extensions.smpp` is present but the binary was built without `--features
+smpp`, it is skipped with a loud warning (same contract as `sctp`).
+
 ### Option 2: Docker
 
 ```bash
@@ -727,6 +753,22 @@ Release history is tracked in [CHANGELOG.md](CHANGELOG.md).
 ## Acknowledgments
 
 SIPhon stands on the shoulders of [Kamailio](https://www.kamailio.org/) and [OpenSIPS](https://opensips.org/). Their decades of work defining how SIP proxies should behave — from transaction handling semantics to registrar storage patterns to the idea that routing logic should be scriptable — is the foundation this project builds on. If SIPhon's architecture feels familiar, that's by design.
+
+## Commercial Support
+
+SIPhon is MIT-licensed and free to use in production. If you'd like a hand getting it
+there — deployment design, IMS/VoLTE integration, custom scripting, performance tuning,
+or an SLA-backed support contract — commercial support is available from
+**[Real Time Telecom B.V.](https://realtime-telecom.nl)**, run by SIPhon's maintainer.
+
+Reach out via [realtime-telecom.nl](https://realtime-telecom.nl) to talk specifics.
+
+## Sponsors
+
+Ongoing development is backed by **[Real Time Telecom B.V.](https://realtime-telecom.nl)**,
+SIPhon's founding sponsor. Need a particular feature built or fast-tracked? Feature
+sponsorship is welcome — use the **Sponsor** button on the repository, or get in touch
+through RTT.
 
 ## License
 

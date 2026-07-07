@@ -361,9 +361,11 @@ auth:
 # NAT traversal
 # ---------------------------------------------------------------------------
 # nat:
-#   force_rport: true       # always rewrite Via/Contact port from observed source
-#   fix_contact: true       # rewrite Contact URI host:port with observed source
-#   fix_register: true      # rewrite Contact on REGISTER with observed source
+#   fix_contact: true       # rewrite Contact URI host:port on responses with the
+#                           # observed source address (responses already route
+#                           # symmetrically to source, RFC 6314 — no force_rport
+#                           # knob; for REGISTER use request.fix_nated_contact()
+#                           # / fix_nated_register() in your script).
 #   keepalive:
 #     enabled: true
 #     interval_secs: 30     # send OPTIONS to each registered contact

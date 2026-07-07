@@ -639,6 +639,74 @@ pub fn update_memory_stats() {
 #[cfg(target_env = "msvc")]
 pub fn update_memory_stats() {}
 
+/// Probe whether jemalloc is the live global allocator.
+///
+/// Allocates ~1 MiB and checks jemalloc's `allocated` stat moved: if jemalloc is
+/// *not* the global allocator the probe routes through the system allocator and
+/// jemalloc's internal counter doesn't budge. Read-only — never changes the
+/// allocator's runtime configuration.
+///
+/// Note: under `cargo test` this returns `false`, because the lib/integration
+/// test binaries set no `#[global_allocator]` and so run on the system allocator
+/// (the same reason the jemalloc gauges read ~0 in tests). It returns `true`
+/// only in a binary that emitted `siphon::install_allocator!()` (or its own
+/// jemalloc `#[global_allocator]`), e.g. the `siphon` binary.
+#[cfg(not(target_env = "msvc"))]
+pub fn jemalloc_is_active() -> bool {
+    use tikv_jemalloc_ctl::{epoch, stats};
+
+    const PROBE_BYTES: usize = 1 << 20; // 1 MiB
+    const MIN_DELTA: usize = 1 << 19; // 512 KiB — half the probe, tolerant of rounding/noise
+
+    // If the epoch can't be advanced we can't read jemalloc stats at all, which
+    // itself means jemalloc isn't the operative allocator.
+    if epoch::advance().is_err() {
+        return false;
+    }
+    let before = stats::allocated::read().unwrap_or(0);
+    // `with_capacity` allocates the backing buffer immediately; `black_box`
+    // stops the optimiser from eliding an otherwise-unused allocation.
+    let probe = std::hint::black_box(Vec::<u8>::with_capacity(PROBE_BYTES));
+    let _ = epoch::advance();
+    let after = stats::allocated::read().unwrap_or(0);
+    drop(probe);
+
+    after.saturating_sub(before) >= MIN_DELTA
+}
+
+/// On MSVC jemalloc is never a dependency, so it is never the allocator.
+#[cfg(target_env = "msvc")]
+pub fn jemalloc_is_active() -> bool {
+    false
+}
+
+/// Verify jemalloc is the live global allocator and warn loudly at boot if not.
+///
+/// A binary that forgot `siphon::install_allocator!()` runs siphon's Rust
+/// working set on the **system** allocator — RSS bloat (per-thread glibc
+/// arenas) and meaningless `siphon_memory_*` gauges, which then read jemalloc's
+/// idle internal footprint instead of the real working set. Catch it in the log
+/// at startup rather than in a memory post-mortem. Safe to call unconditionally:
+/// the probe is read-only.
+#[cfg(not(target_env = "msvc"))]
+pub fn verify_global_allocator() {
+    if jemalloc_is_active() {
+        tracing::debug!(target: "siphon", "jemalloc confirmed as the global allocator");
+    } else {
+        tracing::warn!(
+            target: "siphon",
+            "jemalloc is NOT the active global allocator — running on the system \
+             allocator. Add `siphon::install_allocator!();` to this binary's main.rs. \
+             Expect RSS bloat and meaningless siphon_memory_* gauges."
+        );
+    }
+}
+
+/// No-op on MSVC, where jemalloc isn't a dependency and the system allocator is
+/// expected — a warning there would be misleading.
+#[cfg(target_env = "msvc")]
+pub fn verify_global_allocator() {}
+
 /// Refresh the Python-side allocation gauge from `sys.getallocatedblocks()`.
 ///
 /// Python objects live in CPython's own allocator (mimalloc on free-threaded
@@ -689,6 +757,23 @@ pub fn update_glibc_stats() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The probe must not panic, and — because the `cargo test` binaries set no
+    /// `#[global_allocator]` and so run on the system allocator (the documented
+    /// reason the jemalloc gauges read ~0 in tests) — it must report jemalloc as
+    /// inactive here. `verify_global_allocator()` would WARN in this same case,
+    /// which is exactly its job for a binary that forgot `install_allocator!()`.
+    #[test]
+    fn jemalloc_inactive_under_cargo_test() {
+        assert!(
+            !jemalloc_is_active(),
+            "cargo-test binaries run on the system allocator, so jemalloc must \
+             probe as inactive; if this flips, a #[global_allocator] leaked into \
+             the test build"
+        );
+        // Smoke: the boot guard path must not panic either.
+        verify_global_allocator();
+    }
 
     #[test]
     fn metrics_init_and_access() {

@@ -7503,12 +7503,21 @@ fn handle_b2bua_invite(
     let engine_state = state.engine.state();
     let handlers = engine_state.handlers_for(&HandlerKind::B2buaInvite);
 
-    let (action, timer_override, credentials, li_record, preserve_call_id, policy_input) = Python::attach(|python| {
+    let (
+        action,
+        timer_override,
+        credentials,
+        li_record,
+        preserve_call_id,
+        policy_input,
+        from_host_override,
+        to_host_override,
+    ) = Python::attach(|python| {
         let call_obj = match Py::new(python, py_call) {
             Ok(obj) => obj,
             Err(error) => {
                 error!("failed to create PyCall: {error}");
-                return (CallAction::None, None, None, false, false, None);
+                return (CallAction::None, None, None, false, false, None, None, None);
             }
         };
 
@@ -7522,7 +7531,7 @@ fn handle_b2bua_invite(
                             return (CallAction::Reject {
                                 code: 500,
                                 reason: "Script Error".to_string(),
-                            }, None, None, false, false, None);
+                            }, None, None, false, false, None, None, None);
                         }
                     }
                 }
@@ -7531,7 +7540,7 @@ fn handle_b2bua_invite(
                     return (CallAction::Reject {
                         code: 500,
                         reason: "Script Error".to_string(),
-                    }, None, None, false, false, None);
+                    }, None, None, false, false, None, None, None);
                 }
             }
         }
@@ -7543,7 +7552,9 @@ fn handle_b2bua_invite(
         let li_record = borrowed.li_record();
         let preserve_cid = borrowed.preserve_call_id();
         let policy_input = borrowed.header_policy_input().cloned();
-        (action, timer_override, credentials, li_record, preserve_cid, policy_input)
+        let from_host_ovr = borrowed.from_host_override().map(String::from);
+        let to_host_ovr = borrowed.to_host_override().map(String::from);
+        (action, timer_override, credentials, li_record, preserve_cid, policy_input, from_host_ovr, to_host_ovr)
     });
 
     // Store the A-leg INVITE for later use by on_answer/on_failure/on_bye handlers
@@ -7595,6 +7606,8 @@ fn handle_b2bua_invite(
         || li_record
         || preserve_call_id
         || resolved_policy.is_some()
+        || from_host_override.is_some()
+        || to_host_override.is_some()
     {
         if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
             if let Some(override_config) = timer_override {
@@ -7609,6 +7622,12 @@ fn handle_b2bua_invite(
             call.preserve_call_id = preserve_call_id;
             if resolved_policy.is_some() {
                 call.resolved_header_policy = resolved_policy;
+            }
+            if from_host_override.is_some() {
+                call.from_host_override = from_host_override;
+            }
+            if to_host_override.is_some() {
+                call.to_host_override = to_host_override;
             }
         }
     }
@@ -7804,16 +7823,24 @@ fn b2bua_send_b_leg_invite(
     // Generate fresh dialog identifiers for the B-leg (proper B2BUA behavior).
     // Call-ID is new by default unless the script called call.preserve_call_id().
     // From-tag is always unique per B-leg regardless.
-    let (per_call_override, preserve_call_id, a_leg_call_id, a_leg_from_tag) =
-        match state.call_actors.get_call(call_id) {
-            Some(c) => (
-                c.session_timer_override.clone(),
-                c.preserve_call_id,
-                c.a_leg.dialog.call_id.clone(),
-                c.a_leg.dialog.remote_tag.clone().unwrap_or_default(),
-            ),
-            None => (None, false, String::new(), String::new()),
-        };
+    let (
+        per_call_override,
+        preserve_call_id,
+        a_leg_call_id,
+        a_leg_from_tag,
+        from_host_override,
+        to_host_override,
+    ) = match state.call_actors.get_call(call_id) {
+        Some(c) => (
+            c.session_timer_override.clone(),
+            c.preserve_call_id,
+            c.a_leg.dialog.call_id.clone(),
+            c.a_leg.dialog.remote_tag.clone().unwrap_or_default(),
+            c.from_host_override.clone(),
+            c.to_host_override.clone(),
+        ),
+        None => (None, false, String::new(), String::new(), None, None),
+    };
 
     let b_leg_call_id = if preserve_call_id {
         a_leg_call_id
@@ -7827,7 +7854,7 @@ fn b2bua_send_b_leg_invite(
 
     // Rewrite From for B-leg dialog:
     //  - Replace the tag with a fresh B-leg tag
-    //  - Rewrite the URI host to the B2BUA's own domain (mask A-leg identity)
+    //  - Rewrite the URI host (default: mask A-leg identity with our own host)
     if let Some(from) = b_leg_invite.headers.get("From")
         .or_else(|| b_leg_invite.headers.get("f"))
     {
@@ -7835,16 +7862,22 @@ fn b2bua_send_b_leg_invite(
         let new_pattern = format!("tag={}", b_leg_from_tag);
         let mut new_from = from.replace(&old_pattern, &new_pattern);
 
-        // Rewrite the host in the From URI to the B2BUA's advertised address.
+        // Rewrite the host in the From URI.  Default: the B2BUA advertised
+        // address (topology hiding — mask A-leg identity).  When the script
+        // pinned a host via `call.set_from_host()`, use that instead — opt
+        // out of From topology-hiding for multitenant edges that select the
+        // tenant from the From domain (a domainless call would otherwise land
+        // in the downstream's unauthenticated/default routing context).
         // From header format: ["Display" ]<sip:user@host[:port][;params]>[;tag=...]
-        let b2bua_host = state.via_host(&outbound_transport);
+        let from_host = from_host_override
+            .unwrap_or_else(|| state.via_host(&outbound_transport));
         if let Some(at_pos) = new_from.find('@') {
             // Find the end of the host: first occurrence of '>', ':', or ';' after '@'
             let after_at = &new_from[at_pos + 1..];
             let host_end = after_at.find(['>', ';', ':'])
                 .unwrap_or(after_at.len());
             let end_pos = at_pos + 1 + host_end;
-            new_from = format!("{}{}{}", &new_from[..at_pos + 1], b2bua_host, &new_from[end_pos..]);
+            new_from = format!("{}{}{}", &new_from[..at_pos + 1], from_host, &new_from[end_pos..]);
         }
 
         b_leg_invite.headers.set("From", new_from);
@@ -7875,22 +7908,28 @@ fn b2bua_send_b_leg_invite(
         if let Some(tag_start) = new_to.find(";tag=") {
             new_to = new_to[..tag_start].to_string();
         }
-        // Rewrite To URI host to the dial target's host
-        if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
-            if let Some(at_pos) = new_to.find('@') {
-                let after_at = &new_to[at_pos + 1..];
-                let host_end = after_at.find(['>', ';', ':'])
-                    .unwrap_or(after_at.len());
-                let end_pos = at_pos + 1 + host_end;
-                let target_host = &target_parsed.host;
+        // Rewrite the To URI host.  Default: the dial-target host (topology
+        // hiding).  When the script pinned a host via `call.set_to_host()`,
+        // use that instead (host only — the original To port is preserved).
+        if let Some(at_pos) = new_to.find('@') {
+            let after_at = &new_to[at_pos + 1..];
+            let host_end = after_at.find(['>', ';', ':'])
+                .unwrap_or(after_at.len());
+            let end_pos = at_pos + 1 + host_end;
+            let replacement = if let Some(ref pinned) = to_host_override {
+                pinned.clone()
+            } else if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
                 // Include port if present in target
-                let host_with_port = if let Some(port) = target_parsed.port {
-                    format!("{}:{}", target_host, port)
+                if let Some(port) = target_parsed.port {
+                    format!("{}:{}", target_parsed.host, port)
                 } else {
-                    target_host.clone()
-                };
-                new_to = format!("{}{}{}", &new_to[..at_pos + 1], host_with_port, &new_to[end_pos..]);
-            }
+                    target_parsed.host.clone()
+                }
+            } else {
+                // Unparseable target and no override — leave the host as-is.
+                new_to[at_pos + 1..end_pos].to_string()
+            };
+            new_to = format!("{}{}{}", &new_to[..at_pos + 1], replacement, &new_to[end_pos..]);
         }
         b_leg_invite.headers.set("To", new_to);
     }

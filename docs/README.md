@@ -53,6 +53,9 @@ common roles — each with the config, a real script, and how to test it:
   redundant pair / N nodes, IMS), the ops runbook (graceful drain, health/readiness
   probes, metrics & alerting, capacity planning, backup/DR), and a light Kubernetes
   shape.
+- **[Supply chain & SBOM](supply-chain.md)** — what every release publishes (SPDX +
+  CycloneDX SBOM), how to feed it to your own scanners, how dependency advisories are
+  audited, and how to report a vulnerability.
 - **[Migrating from Kamailio / OpenSIPS](migrating-from-kamailio-opensips.md)** — a
   concept map for porting routes and modules, and how to translate `clusterer` /
   `dmq_usrloc` topologies to SIPhon's model.
@@ -69,6 +72,13 @@ common roles — each with the config, a real script, and how to test it:
 
 Reference deployment artifacts — a front-LB + 2-backend demo with a failover-proof
 script, plus Kubernetes manifests — live in **[deploy/](https://github.com/siphon-project/siphon-sip/tree/main/deploy/)**.
+
+## Commercial support & sponsorship
+
+Running SIPhon in production and want a hand — or want to fund a feature? Commercial
+support and feature sponsorship are available from
+**[Real Time Telecom B.V.](https://realtime-telecom.nl)**, run by SIPhon's maintainer.
+See **[Commercial support](support.md)**.
 
 ## Also
 

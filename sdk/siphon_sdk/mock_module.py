@@ -19,6 +19,8 @@ from typing import Any, Callable, Optional, Union
 
 from siphon_sdk.types import Contact, SipUri
 from siphon_sdk.request import _parse_uri
+from siphon_sdk.smpp import MockSmpp
+from siphon_sdk.http import MockHttp
 
 
 # ---------------------------------------------------------------------------
@@ -5782,6 +5784,18 @@ def _ue_flow_status(media: _MiniSdpMedia) -> Optional[str]:
 _qos = MockQos()
 
 
+# The ``smpp`` namespace is injected at runtime by the siphon-smpp extension
+# (a ``siphon-bin --features smpp`` build), not by siphon-sip itself. The mock
+# is provided here so SMPP scripts can be tested/authored alongside the SIP
+# ones with a single ``pip install siphon-sip``.
+_smpp = MockSmpp()
+
+# The ``http`` namespace is injected at runtime by the siphon-http extension
+# (a ``siphon-bin`` build with the ``http`` feature). Mocked here so HTTP
+# scripts can be tested/authored with a single ``pip install siphon-sip``.
+_http = MockHttp()
+
+
 def install() -> ModuleType:
     """Install the mock ``siphon`` module into ``sys.modules``.
 
@@ -5818,6 +5832,11 @@ def install() -> ModuleType:
     mod.stir = _stir  # type: ignore[attr-defined]
     mod.sdp = _sdp  # type: ignore[attr-defined]
     mod.qos = _qos  # type: ignore[attr-defined]
+    # smpp namespace — provided by the siphon-smpp extension at runtime;
+    # mocked here so `from siphon import smpp` works under pytest.
+    mod.smpp = _smpp  # type: ignore[attr-defined]
+    # http namespace — provided by the siphon-http extension at runtime.
+    mod.http = _http  # type: ignore[attr-defined]
 
     # IPsec types — exposed at top level so scripts can do
     # `from siphon import Transform, SecurityOffer, …` (matching the
@@ -5862,6 +5881,8 @@ def reset() -> None:
     _isc.clear()
     _ipsec.clear()
     _stir.clear()
+    _smpp.clear()
+    _http.clear()
     _auth._allow = False
     _auth._credentials.clear()
     _proxy._utils._rate_limit_allow = True
@@ -5873,6 +5894,16 @@ def reset() -> None:
 def get_registry() -> _HandlerRegistry:
     """Access the handler registry (test helper)."""
     return _registry
+
+
+def get_smpp() -> MockSmpp:
+    """Access the mock smpp namespace singleton (test helper)."""
+    return _smpp
+
+
+def get_http() -> MockHttp:
+    """Access the mock http namespace singleton (test helper)."""
+    return _http
 
 
 def get_proxy() -> MockProxy:

@@ -1,6 +1,6 @@
 [package]
 name = "siphon-sip"
-version = "1.0.0"
+version = "1.1.1"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT"
@@ -22,6 +22,10 @@ exclude = [
     ".dockerignore",
     "Dockerfile",
     "sdk/",
+    # Opt-in extension-composition binary — its own standalone package/workspace
+    # (git-deps the published siphon-sip lib). Kept out of the published crate and
+    # never built by a root `cargo build` of siphon-sip.
+    "siphon-bin/",
 ]
 
 [lib]
@@ -70,7 +74,7 @@ tokio-rustls = "0.26"
 # feature in the 1.x line we resolve here.
 rustls-pki-types = { version = "1", features = ["std"] }
 webpki-roots = "1"
-tokio-tungstenite = "0.28"
+tokio-tungstenite = "0.29"
 futures-util = "0.3"
 
 # siphon-rtp native control protocol — the JSON-over-TCP wire contract shared
@@ -114,7 +118,7 @@ sha2 = "0.10"
 uuid = { version = "1.22", features = ["v4", "fast-rng"] }
 # Cryptographic randomness — used by Milenage AKA RAND generation
 # (3GPP TS 35.206) and any other place that needs unpredictable bytes.
-getrandom = "0.3"
+getrandom = "0.4"
 ipnet = "2"
 notify = "8"
 thiserror = "2"
@@ -130,10 +134,10 @@ axum = { version = "0.8.8", features = ["tokio"] }
 tower = { version = "0.5.3", features = ["util"] }
 
 # Lawful Intercept — ETSI ASN.1/BER + XML
-rasn = "0.22"
+rasn = "0.28"
 rasn-derive = "0.22"
 chrono = { version = "0.4", default-features = false }
-quick-xml = { version = "0.37", features = ["serialize"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
 
 # iFC evaluation engine — regex for SPT header content matching
 regex = "1"
@@ -169,7 +173,7 @@ siphon-rtp-proto = "0.1.0"
 # Per-message hot-path microbenchmarks (benches/sip_hot_path.rs). The
 # release-cut gate (scripts/cut-release.sh) runs these via `critcmp` against a
 # committed baseline; CI only proves they compile (`cargo bench --no-run`).
-criterion = "0.5"
+criterion = "0.8"
 
 # Criterion perf gates for the per-message / per-call hot paths. `harness =
 # false` hands `main` to criterion instead of the libtest harness. The
