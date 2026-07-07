@@ -19,7 +19,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth 1 https://github.com/carstenbock/sipp_ipsec.git /build/sipp
+# --recurse-submodules is required: SIPp vendors pugixml (and gtest) as git
+# submodules, so without it third_party/pugixml is empty and CMake fails with
+# "Cannot find source file: .../pugixml/src/pugixml.cpp".
+RUN git clone --depth 1 --recurse-submodules --shallow-submodules \
+        https://github.com/carstenbock/sipp_ipsec.git /build/sipp
 
 WORKDIR /build/sipp
 
