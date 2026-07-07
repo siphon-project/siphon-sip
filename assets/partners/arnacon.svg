@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 120" role="img" aria-label="Arnacon, a Web3 telecom project by Cellact">
+  <title>Arnacon by Cellact</title>
+  <rect x="1" y="1" width="398" height="118" rx="22" fill="#0C111F" stroke="#FFFFFF" stroke-opacity="0.10"/>
+  <g fill="none" stroke="#FFFFFF" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="62,36 40,60 62,84"/>
+    <line x1="70" y1="90" x2="82" y2="30"/>
+    <polyline points="90,36 112,60 90,84"/>
+  </g>
+  <text x="150" y="66" font-family="'Helvetica Neue',Helvetica,Arial,sans-serif" font-size="40" font-weight="700" fill="#FFFFFF" letter-spacing="0.5">Arnacon</text>
+  <text x="151" y="92" font-family="'Helvetica Neue',Helvetica,Arial,sans-serif" font-size="14.5" font-weight="400" fill="#8A93A6" letter-spacing="1.2">Web3 telecom · by Cellact</text>
+</svg>

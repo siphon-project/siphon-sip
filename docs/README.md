@@ -80,6 +80,16 @@ support and feature sponsorship are available from
 **[Real Time Telecom B.V.](https://realtime-telecom.nl)**, run by SIPhon's maintainer.
 See **[Commercial support](support.md)**.
 
+## Platform Partner
+
+<p align="center">
+  <a href="https://www.arnacon.com/"><img src="assets/partners/arnacon.svg" alt="Arnacon by Cellact — Platform Partner" width="300"></a>
+</p>
+
+Development is backed by **[Cellact](https://www.cellact.com/)** and its Web3 telecom
+project **[Arnacon](https://www.arnacon.com/)** as a Platform Partner. Their support helps
+drive the SIPhon roadmap forward.
+
 ## Also
 
 - The main **[README](https://github.com/siphon-project/siphon-sip/blob/main/README.md)** — overview, install, full scripting API, performance baseline.
