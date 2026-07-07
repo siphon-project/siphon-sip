@@ -194,6 +194,15 @@ struct DispatcherState {
     /// when `rf_charger` is `None` so the auto-emit hot path branches
     /// out cheaply.
     rf_sessions: Arc<DashMap<String, Arc<ProxyRfState>>>,
+    /// Per-call CDR tracking for `cdr.auto_emit` (INVITE → answer → BYE).
+    ///
+    /// Keyed by the SIP dialog (`<Call-ID>\0<tag>`) for proxy calls and by the
+    /// internal call UUID for B2BUA calls. Populated at INVITE, stamped with the
+    /// answer time on 2xx, and drained (a CDR is written) when the call ends —
+    /// BYE / failure / cancel / answer-timeout. Empty and cheaply skipped when
+    /// `cdr.auto_emit` is off; the orphan sweep reaps any entry whose teardown
+    /// never reached the dispatcher.
+    cdr_sessions: Arc<DashMap<String, crate::cdr::CdrSession>>,
 }
 
 /// Bundle held in `DispatcherState::rf_sessions` so ACR-STOP can reuse
@@ -519,6 +528,7 @@ pub async fn run(
         is_draining: drain.clone(),
         rf_charger,
         rf_sessions: Arc::new(DashMap::new()),
+        cdr_sessions: Arc::new(DashMap::new()),
     });
 
     // Hand the freshly-constructed manager handles to the drain coordinator
@@ -627,6 +637,13 @@ pub async fn run(
                         (aor.clone(), "expired")
                     }
                 };
+
+                // CDR: emit a REGISTER record for this state change when
+                // cdr.auto_emit + cdr.include_register are on — independent of
+                // whether a @registrar.on_change handler is registered.
+                if crate::cdr::auto_emit_enabled() && crate::cdr::include_register_enabled() {
+                    cdr_emit_register(&aor, event_type);
+                }
 
                 // Quick check if any handlers exist (avoids spawn_blocking overhead)
                 {
@@ -1137,6 +1154,17 @@ async fn sweep_stale_entries(state: &DispatcherState) {
         .retain(|_, st| now.duration_since(st.created_at) < ORPHAN_CALL_TTL);
     let expired_rf = rf_before.saturating_sub(state.rf_sessions.len()) as u64;
 
+    // Auto-emit CDR sessions — orphan backstop. Normal calls drain on their
+    // teardown hook (BYE / failure / cancel / timeout); this only reaps entries
+    // whose teardown never reached the dispatcher (e.g. a UA that vanished after
+    // answer). Dropped silently rather than emitting a misleading long-duration
+    // record — every cleanly-ended call is already accounted by a direct hook.
+    let cdr_before = state.cdr_sessions.len();
+    state
+        .cdr_sessions
+        .retain(|_, session| now.duration_since(session.created_at()) < ORPHAN_CALL_TTL);
+    let expired_cdr = cdr_before.saturating_sub(state.cdr_sessions.len()) as u64;
+
     // SIPREC recording sessions — ages by RecordingSession::created_at, and
     // clears the call_sessions / branch_to_session aliases too.
     let expired_recordings = state.recording_manager.sweep_stale(ORPHAN_CALL_TTL) as u64;
@@ -1186,6 +1214,7 @@ async fn sweep_stale_entries(state: &DispatcherState) {
     if let Some(metrics) = crate::metrics::try_metrics() {
         metrics.uac_pending_requests.set(uac_pending as i64);
         metrics.proxy_dialog_sessions.set(dialog_sessions as i64);
+        metrics.cdr_sessions.set(state.cdr_sessions.len() as i64);
         metrics.subscribe_dialogs.set(subscribe_dialogs as i64);
         metrics.ipsec_sa_pairs.set(ipsec_sa_pairs as i64);
     }
@@ -1207,6 +1236,7 @@ async fn sweep_stale_entries(state: &DispatcherState) {
         || expired_recordings > 0
         || expired_registrations > 0
         || expired_ipsec_sas > 0
+        || expired_cdr > 0
     {
         info!(
             expired_sessions,
@@ -1214,6 +1244,7 @@ async fn sweep_stale_entries(state: &DispatcherState) {
             expired_subs,
             expired_calls,
             expired_rf,
+            expired_cdr,
             expired_recordings,
             expired_registrations,
             expired_ipsec_sas,
@@ -2017,6 +2048,8 @@ fn handle_request(
     // is unaffected (spawn is fire-and-forget).
     if method == "BYE" {
         spawn_rf_proxy_stop_if_tracked(state, &message);
+        // CDR: write the call record on in-dialog BYE (cdr.auto_emit).
+        cdr_finalize_proxy_stop(state, &message);
     }
     if method == "UPDATE" && engine_state.has_b2bua_handlers() {
         // RFC 3311 in-dialog UPDATE belonging to a B2BUA call: bridge it
@@ -2414,6 +2447,23 @@ fn handle_request(
         }
     }
 
+    // CDR: start tracking a relayed/forked INVITE so a record is written when
+    // the call ends (cdr.auto_emit). Only a dialog-forming INVITE that the
+    // proxy actually forwarded is tracked.
+    if method == "INVITE"
+        && matches!(
+            action,
+            RequestAction::Relay { .. } | RequestAction::Fork { .. }
+        )
+    {
+        cdr_track_proxy_start(
+            state,
+            &message_guard,
+            &inbound.remote_addr.ip().to_string(),
+            &format!("{}", inbound.transport).to_lowercase(),
+        );
+    }
+
     // Flush deferred messages (e.g. in-dialog NOTIFY) after the reply/relay
     // has been dispatched, per RFC 3265 §3.1.6.2 (200 OK before NOTIFY).
     flush_deferred_sends(state);
@@ -2509,6 +2559,7 @@ fn relay_request(
                         Some((dest, transport)) => RelayTarget {
                             address: dest,
                             transport: Some(transport),
+                            server_name: None,
                         },
                         None => {
                             warn!(target = %target_uri_string, "cannot resolve relay target");
@@ -2756,6 +2807,7 @@ fn relay_request(
             destination,
             data,
             source_local_addr: Some(local),
+            server_name: None,
         };
         let cid = outbound_message.connection_id;
         if let Err(error) = state.outbound.send(outbound_message) {
@@ -2778,6 +2830,7 @@ fn relay_request(
         let target = RelayTarget {
             address: destination,
             transport: Some(outbound_transport),
+            server_name: None,
         };
         send_to_target(data, &target, inbound.transport, inbound.connection_id, state)
     };
@@ -3041,6 +3094,7 @@ fn relay_fork_branch(
             destination,
             data,
             source_local_addr: Some(flow.local_addr),
+            server_name: None,
         };
         let cid = outbound_message.connection_id;
         if let Err(error) = state.outbound.send(outbound_message) {
@@ -3048,7 +3102,7 @@ fn relay_fork_branch(
         }
         cid
     } else {
-        let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport) };
+        let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport), server_name: None };
         send_to_target(data, &relay_target, inbound.transport, inbound.connection_id, state)
     };
 
@@ -3184,6 +3238,7 @@ fn handle_response(
                                 let target = RelayTarget {
                                     address: destination,
                                     transport: Some(transport),
+                                    server_name: None,
                                 };
                                 send_to_target(data, &target, transport, ConnectionId::default(), state);
                             }
@@ -3462,7 +3517,7 @@ fn handle_response(
                         let ack = build_ack_for_non2xx(&original_request, &message, &branch, cb.transport, state.local_addr);
                         send_to_target(
                             ack.to_bytes().into(),
-                            &RelayTarget { address: cb.destination, transport: Some(cb.transport) },
+                            &RelayTarget { address: cb.destination, transport: Some(cb.transport), server_name: None },
                             cb.transport,
                             cb.connection_id,
                             state,
@@ -3710,6 +3765,29 @@ fn handle_response(
                         );
                         drop(session);
 
+                        // CDR: capture the dialog key before `original_request`
+                        // may be moved into the on_failure PyRequest, so the
+                        // failed-call record can be written at the convergence
+                        // point below — but only when the failure is actually
+                        // forwarded (a handler that retries via request.relay()
+                        // returns early and must NOT emit a failed CDR).
+                        let cdr_fail_key = if crate::cdr::auto_emit_enabled() {
+                            original_request
+                                .headers
+                                .get("Call-ID")
+                                .map(|s| s.to_string())
+                                .zip(
+                                    original_request
+                                        .typed_from()
+                                        .ok()
+                                        .flatten()
+                                        .and_then(|na| na.tag),
+                                )
+                                .map(|(call_id, tag)| cdr_dialog_key(&call_id, &tag))
+                        } else {
+                            None
+                        };
+
                         // Invoke @proxy.on_failure handlers before forwarding
                         let engine_state = state.engine.state();
                         let failure_handlers = engine_state.handlers_for(&HandlerKind::ProxyFailure);
@@ -3789,6 +3867,19 @@ fn handle_response(
                             send_message_from(best_response, transport, source_addr, connection_id, Some(inbound_local_addr), state);
                         }
 
+                        // CDR: both forwarded paths converge here (a retrying /
+                        // suppressing on_failure handler already returned above),
+                        // so the failed-call record is written exactly once.
+                        if let Some(key) = &cdr_fail_key {
+                            cdr_finalize(
+                                state,
+                                key,
+                                cdr_disconnect_for_failure(best_code),
+                                Some(best_code),
+                                None,
+                            );
+                        }
+
                         state.session_store.remove_by_server_key(&server_key);
                         return;
                     }
@@ -3820,6 +3911,17 @@ fn handle_response(
                 && server_key.method == crate::sip::message::Method::Invite
             {
                 spawn_rf_proxy_start_if_invite(state, &server_key, &original_request);
+                // CDR: stamp the answer time on the tracked call (cdr.auto_emit).
+                cdr_mark_proxy_answer(state, &original_request, status_code);
+            } else if (300..700).contains(&status_code)
+                && status_code != 401
+                && status_code != 407
+                && server_key.method == crate::sip::message::Method::Invite
+            {
+                // CDR: a single-relay INVITE received a final non-2xx (not an
+                // auth challenge — the UA re-sends those) → the call failed
+                // (cdr.auto_emit). Forked failures finalize at ForwardBestError.
+                cdr_finalize_proxy_fail(state, &original_request, status_code);
             }
 
             // Feed the response into the server transaction for caching
@@ -4118,6 +4220,11 @@ struct RelayTarget {
     address: SocketAddr,
     /// Transport from URI params or SRV; `None` means use the inbound transport.
     transport: Option<Transport>,
+    /// Hostname from the resolved SIP URI, used as TLS SNI / certificate
+    /// hostname when a new outbound TLS connection must be opened. `None` for
+    /// bare-IP targets (RFC 6066 sends no SNI for an IP literal) and for
+    /// in-dialog / failover paths that route by address.
+    server_name: Option<String>,
 }
 
 /// Resolve a SIP target URI to its full ordered candidate set (RFC 3263).
@@ -4132,7 +4239,7 @@ struct RelayTarget {
 fn resolve_candidates(uri_string: &str, resolver: &SipResolver) -> Vec<RelayTarget> {
     // Try as bare IP:port first (cheapest check)
     if let Ok(addr) = uri_string.parse::<SocketAddr>() {
-        return vec![RelayTarget { address: addr, transport: None }];
+        return vec![RelayTarget { address: addr, transport: None, server_name: None }];
     }
 
     // Try parsing as a full SIP URI
@@ -4164,7 +4271,9 @@ fn resolve_candidates(uri_string: &str, resolver: &SipResolver) -> Vec<RelayTarg
                         "wss" => Some(Transport::WebSocketSecure),
                         _ => None,
                     });
-                RelayTarget { address: r.address, transport }
+                // All candidates from one URI share the target hostname — carry
+                // it for TLS SNI so a hostname-vhost peer routes the handshake.
+                RelayTarget { address: r.address, transport, server_name: Some(uri.host.clone()) }
             })
             .collect();
     }
@@ -4262,6 +4371,8 @@ fn send_to_target(
                     destination,
                     data,
                     source_local_addr: None,
+                    // Connection *reuse* — no TLS handshake, so no SNI needed.
+                    server_name: None,
                 };
                 if let Err(error) = state.outbound.send(outbound_message) {
                     error!(destination = %destination, "TLS connection reuse send failed: {error}");
@@ -4277,9 +4388,10 @@ fn send_to_target(
                 // No inbound connection to reuse — create outbound TLS via pool
                 let pool = Arc::clone(&state.connection_pool);
                 let data_clone = data;
+                let server_name = target.server_name.clone();
                 match tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current()
-                        .block_on(pool.send_tls(destination, data_clone))
+                        .block_on(pool.send_tls(destination, server_name.as_deref(), data_clone))
                 }) {
                     Ok(connection_id) => {
                         debug!(
@@ -4322,6 +4434,7 @@ fn send_to_target(
                         destination,
                         data,
                         source_local_addr: None,
+                        server_name: None,
                     };
                     if let Err(error) = state.outbound.send(outbound_message) {
                         error!(destination = %destination, %transport, "WS/WSS connection reuse send failed: {error}");
@@ -4366,6 +4479,7 @@ fn send_to_target(
                 destination,
                 data,
                 source_local_addr,
+                server_name: None,
             };
             if let Err(error) = state.outbound.send(outbound_message) {
                 error!("failed to enqueue relayed request: {error}");
@@ -4928,6 +5042,7 @@ fn select_b2bua_retry_destination(
             RelayTarget {
                 address: member_addr,
                 transport: Some(member_transport),
+                server_name: None,
             },
         )),
         None => resolve_target(target_uri, resolver).map(|relay_target| {
@@ -5306,6 +5421,7 @@ fn send_outbound_from(
         destination,
         data,
         source_local_addr,
+        server_name: None,
     };
 
     if let Err(error) = state.outbound.send(outbound_message) {
@@ -5552,6 +5668,7 @@ fn send_b2bua_to_bleg(
     let target = RelayTarget {
         address: destination,
         transport: Some(transport),
+        server_name: None,
     };
     send_to_target(data, &target, transport, ConnectionId::default(), state);
 }
@@ -5688,6 +5805,264 @@ fn rf_local_uri_predicate(local_domains: &Arc<Vec<String>>) -> impl Fn(&str) -> 
         let lower = uri.to_ascii_lowercase();
         domains.iter().any(|d| lower.contains(d))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Automatic CDR generation (cdr.auto_emit) — INVITE → answer → BYE.
+//
+// These mirror the Rf auto-emit hooks and fire from the same lifecycle points,
+// but track only the fields a CDR needs (parties, timing, disconnect side) in
+// `state.cdr_sessions`. Proxy calls key by the SIP dialog `<Call-ID>\0<tag>`;
+// B2BUA calls key by the internal call UUID. All entry points no-op cheaply
+// when `cdr.auto_emit` is off (the map stays empty).
+// ---------------------------------------------------------------------------
+
+/// Dialog CDR key for a proxy call: `<Call-ID>\0<tag>`.
+fn cdr_dialog_key(call_id: &str, tag: &str) -> String {
+    format!("{call_id}\0{tag}")
+}
+
+/// Raw RFC 3326 `Reason:` header value, if present — carried into the CDR's
+/// `sip_reason` field.
+fn cdr_extract_reason(message: &SipMessage) -> Option<String> {
+    message.headers.get("Reason").map(|r| r.to_string())
+}
+
+/// disconnect_initiator for an unanswered/failed call, from the final code.
+/// 408 → timeout, 487 (CANCEL) → caller, everything else → callee (the far
+/// end returned the error).
+fn cdr_disconnect_for_failure(code: u16) -> &'static str {
+    match code {
+        408 => "timeout",
+        487 => "caller",
+        _ => "callee",
+    }
+}
+
+/// Build a `CdrSession` from an INVITE. Returns `None` if the INVITE lacks the
+/// Call-ID / From-tag needed to key it.
+fn cdr_session_from_invite(
+    invite: &SipMessage,
+    source_ip: &str,
+    transport: &str,
+    auth_user: Option<String>,
+) -> Option<(String, crate::cdr::CdrSession)> {
+    let call_id = invite.headers.get("Call-ID")?.to_string();
+    let from_na = invite.typed_from().ok().flatten();
+    let from_tag = from_na.as_ref().and_then(|na| na.tag.clone())?;
+    let from_uri = from_na.map(|na| na.uri.to_string()).unwrap_or_default();
+    let to_uri = invite
+        .typed_to()
+        .ok()
+        .flatten()
+        .map(|na| na.uri.to_string())
+        .unwrap_or_default();
+    let ruri = match &invite.start_line {
+        StartLine::Request(request_line) => request_line.request_uri.to_string(),
+        _ => String::new(),
+    };
+    let user_agent = invite.headers.get("User-Agent").map(|s| s.to_string());
+    let session = crate::cdr::CdrSession::new(
+        call_id.clone(),
+        from_uri,
+        to_uri,
+        ruri,
+        source_ip.to_string(),
+        transport.to_string(),
+        user_agent,
+        auth_user,
+    );
+    Some((cdr_dialog_key(&call_id, &from_tag), session))
+}
+
+/// Stamp the answer time on a tracked CDR session. No-op if untracked.
+fn cdr_mark_answer(state: &DispatcherState, key: &str, response_code: u16) {
+    if let Some(mut session) = state.cdr_sessions.get_mut(key) {
+        session.mark_answered(response_code);
+    }
+}
+
+/// Finalize a tracked CDR session (write the record + drop it). No-op if the
+/// call was never tracked (auto-emit off, or not an INVITE dialog).
+fn cdr_finalize(
+    state: &DispatcherState,
+    key: &str,
+    disconnect_initiator: &str,
+    response_code: Option<u16>,
+    sip_reason: Option<String>,
+) {
+    if let Some((_, session)) = state.cdr_sessions.remove(key) {
+        let cdr = session.finalize(disconnect_initiator, response_code, sip_reason);
+        crate::cdr::write(cdr);
+    }
+}
+
+/// Emit a REGISTER CDR for a registrar state change (`cdr.auto_emit` +
+/// `cdr.include_register`). A point event — no lifecycle tracking. The registrar
+/// event stream carries only the AoR and the change type, so the record keys on
+/// those, with the change in the `reg_event` extra field.
+fn cdr_emit_register(aor: &str, event_type: &str) {
+    let cdr = crate::cdr::Cdr::new(
+        String::new(), // no Call-ID in the registrar event stream
+        aor.to_string(),
+        aor.to_string(),
+        aor.to_string(),
+        "REGISTER".to_string(),
+        String::new(), // source IP not carried by the event
+        String::new(), // transport not carried by the event
+    )
+    .with_response_code(200)
+    .with_extra("reg_event".to_string(), event_type.to_string());
+    crate::cdr::write(cdr);
+}
+
+/// Proxy CDR START — the proxy is relaying/forking an INVITE. Records the call
+/// so a CDR can be emitted when it ends. Deduped so a retransmitted INVITE
+/// doesn't reset the start time.
+fn cdr_track_proxy_start(
+    state: &DispatcherState,
+    invite: &SipMessage,
+    source_ip: &str,
+    transport: &str,
+) {
+    if !crate::cdr::auto_emit_enabled() {
+        return;
+    }
+    if let Some((key, session)) = cdr_session_from_invite(invite, source_ip, transport, None) {
+        state.cdr_sessions.entry(key).or_insert(session);
+    }
+}
+
+/// Proxy CDR ANSWER — a 2xx for the INVITE was forwarded upstream.
+fn cdr_mark_proxy_answer(state: &DispatcherState, invite: &SipMessage, response_code: u16) {
+    if !crate::cdr::auto_emit_enabled() {
+        return;
+    }
+    let (Some(call_id), Some(from_tag)) = (
+        invite.headers.get("Call-ID").map(|s| s.to_string()),
+        invite.typed_from().ok().flatten().and_then(|na| na.tag),
+    ) else {
+        return;
+    };
+    cdr_mark_answer(state, &cdr_dialog_key(&call_id, &from_tag), response_code);
+}
+
+/// Proxy CDR STOP — an in-dialog BYE ended the call. Resolves the disconnecting
+/// side by which tag the BYE arrived under: the BYE's From-tag matches the
+/// INVITE's From-tag when the caller hangs up, else the callee did.
+fn cdr_finalize_proxy_stop(state: &DispatcherState, bye: &SipMessage) {
+    if !crate::cdr::auto_emit_enabled() {
+        return;
+    }
+    let Some(call_id) = bye.headers.get("Call-ID").map(|s| s.to_string()) else {
+        return;
+    };
+    let from_tag = bye.typed_from().ok().flatten().and_then(|na| na.tag);
+    let to_tag = bye.typed_to().ok().flatten().and_then(|na| na.tag);
+    let sip_reason = cdr_extract_reason(bye);
+
+    // Caller hung up: BYE From-tag == INVITE From-tag (the stored key).
+    if let Some(from_tag) = &from_tag {
+        let key = cdr_dialog_key(&call_id, from_tag);
+        if state.cdr_sessions.contains_key(&key) {
+            cdr_finalize(state, &key, "caller", None, sip_reason);
+            return;
+        }
+    }
+    // Callee hung up: BYE To-tag == INVITE From-tag.
+    if let Some(to_tag) = &to_tag {
+        let key = cdr_dialog_key(&call_id, to_tag);
+        if state.cdr_sessions.contains_key(&key) {
+            cdr_finalize(state, &key, "callee", None, sip_reason);
+        }
+    }
+}
+
+/// Proxy CDR FAIL — a single-relay INVITE got a final non-2xx (the call
+/// failed). Forked failures are finalized at `ForkAction::ForwardBestError`;
+/// auth challenges (401/407) are excluded by the caller since the UA re-sends.
+fn cdr_finalize_proxy_fail(state: &DispatcherState, invite: &SipMessage, response_code: u16) {
+    if !crate::cdr::auto_emit_enabled() {
+        return;
+    }
+    let (Some(call_id), Some(from_tag)) = (
+        invite.headers.get("Call-ID").map(|s| s.to_string()),
+        invite.typed_from().ok().flatten().and_then(|na| na.tag),
+    ) else {
+        return;
+    };
+    cdr_finalize(
+        state,
+        &cdr_dialog_key(&call_id, &from_tag),
+        cdr_disconnect_for_failure(response_code),
+        Some(response_code),
+        None,
+    );
+}
+
+/// B2BUA CDR START — a new call actor was created for an INVITE.
+fn cdr_track_b2bua_start(
+    state: &DispatcherState,
+    internal_call_id: &str,
+    invite: &SipMessage,
+    source_ip: &str,
+    transport: &str,
+) {
+    if !crate::cdr::auto_emit_enabled() {
+        return;
+    }
+    // Reuse the INVITE field extraction, but key by the internal call UUID so
+    // both legs (A/B, different Call-IDs) resolve to one CDR.
+    if let Some((_, session)) = cdr_session_from_invite(invite, source_ip, transport, None) {
+        state
+            .cdr_sessions
+            .entry(internal_call_id.to_string())
+            .or_insert(session);
+    }
+}
+
+/// B2BUA CDR ANSWER — the call transitioned to Answered (2xx to the INVITE).
+fn cdr_mark_b2bua_answer(state: &DispatcherState, internal_call_id: &str, response_code: u16) {
+    if !crate::cdr::auto_emit_enabled() {
+        return;
+    }
+    cdr_mark_answer(state, internal_call_id, response_code);
+}
+
+/// B2BUA CDR STOP — a BYE tore the call down. `from_a_leg` gives the side.
+fn cdr_finalize_b2bua_stop(
+    state: &DispatcherState,
+    internal_call_id: &str,
+    from_a_leg: bool,
+    bye: &SipMessage,
+) {
+    if !crate::cdr::auto_emit_enabled() {
+        return;
+    }
+    let disconnect = if from_a_leg { "caller" } else { "callee" };
+    cdr_finalize(
+        state,
+        internal_call_id,
+        disconnect,
+        None,
+        cdr_extract_reason(bye),
+    );
+}
+
+/// B2BUA CDR FAIL — the call ended before/without a BYE (B-leg failure,
+/// answer-timeout, or caller CANCEL). `response_code` is the final code and
+/// selects the disconnect side (see [`cdr_disconnect_for_failure`]).
+fn cdr_finalize_b2bua_fail(state: &DispatcherState, internal_call_id: &str, response_code: u16) {
+    if !crate::cdr::auto_emit_enabled() {
+        return;
+    }
+    cdr_finalize(
+        state,
+        internal_call_id,
+        cdr_disconnect_for_failure(response_code),
+        Some(response_code),
+        None,
+    );
 }
 
 /// Spawn ACR-START for the INVITE that just got a 2xx forwarded by the
@@ -6612,6 +6987,7 @@ fn handle_ack_via_session(
             let target = RelayTarget {
                 address: destination,
                 transport: Some(out_transport),
+                server_name: None,
             };
             send_to_target(
                 data,
@@ -6955,6 +7331,7 @@ fn handle_b2bua_cancel(
     let a_leg = call.a_leg.clone();
     let cancel_a_leg_invite = call.a_leg_invite.clone();
     let cancel_a_leg_source_ip = call.a_leg.transport.remote_addr.ip().to_string();
+    let cancel_a_leg_transport = format!("{}", call.a_leg.transport.transport).to_lowercase();
     drop(call);
 
     // Emit the prepared CANCELs after dropping the call lock so the
@@ -6978,7 +7355,16 @@ fn handle_b2bua_cancel(
     // B2BUA call (RFC 3261 §9). A 2xx that races this CANCEL is independently
     // ACK+BYE'd by handle_zombie_cancelled_2xx and never delivered on_answer,
     // so this only ever fires for a genuinely abandoned call.
-    run_b2bua_cancel_handlers(&call_id, cancel_a_leg_invite, cancel_a_leg_source_ip, state);
+    run_b2bua_cancel_handlers(
+        &call_id,
+        cancel_a_leg_invite,
+        cancel_a_leg_source_ip,
+        cancel_a_leg_transport,
+        state,
+    );
+
+    // CDR: the caller CANCELled before answer (cdr.auto_emit) → 487.
+    cdr_finalize_b2bua_fail(state, &call_id, 487);
 
     state.call_actors.set_state(&call_id, CallState::Terminated);
     // remove_call_after_cancel sends Shutdown to remaining actors, cleans the
@@ -7005,6 +7391,7 @@ fn run_b2bua_cancel_handlers(
     call_id: &str,
     a_leg_invite: Option<Arc<std::sync::Mutex<SipMessage>>>,
     a_leg_source_ip: String,
+    a_leg_transport: String,
     state: &DispatcherState,
 ) {
     let engine_state = state.engine.state();
@@ -7021,7 +7408,7 @@ fn run_b2bua_cancel_handlers(
         }
     };
 
-    let py_call = PyCall::new(call_id.to_string(), invite_arc, a_leg_source_ip);
+    let py_call = PyCall::new(call_id.to_string(), invite_arc, a_leg_source_ip, a_leg_transport);
 
     Python::attach(|python| {
         let call_obj = match Py::new(python, py_call) {
@@ -7120,6 +7507,9 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
         "B2BUA: answer timeout — no final response from B-leg, failing call with 408",
     );
 
+    // CDR: the call timed out before answer (cdr.auto_emit).
+    cdr_finalize_b2bua_fail(state, call_id, 408);
+
     // CANCEL each pending B-leg transaction (RFC 3261 §9.1).
     for (cancel_msg, transport, dest) in cancel_targets {
         send_b2bua_to_bleg(cancel_msg, transport, dest, state);
@@ -7137,6 +7527,7 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
                 call_id.to_string(),
                 Arc::clone(invite_arc),
                 a_leg.transport.remote_addr.ip().to_string(),
+                format!("{}", a_leg.transport.transport).to_lowercase(),
             );
             Python::attach(|python| {
                 let call_obj = match Py::new(python, py_call) {
@@ -7398,12 +7789,22 @@ fn handle_b2bua_invite(
     }
     state.call_event_receivers.insert(call_id.clone(), event_rx);
 
+    // CDR: start tracking this call at INVITE time (cdr.auto_emit).
+    cdr_track_b2bua_start(
+        state,
+        &call_id,
+        &message,
+        &inbound.remote_addr.ip().to_string(),
+        &format!("{}", inbound.transport).to_lowercase(),
+    );
+
     // Invoke @b2bua.on_invite
     let message_arc = Arc::new(std::sync::Mutex::new(message));
     let py_call = PyCall::new(
         call_id.clone(),
         Arc::clone(&message_arc),
         inbound.remote_addr.ip().to_string(),
+        format!("{}", inbound.transport).to_lowercase(),
     );
 
     let engine_state = state.engine.state();
@@ -7944,12 +8345,13 @@ fn b2bua_send_b_leg_invite(
             destination,
             data,
             source_local_addr: Some(flow.local_addr),
+            server_name: None,
         };
         if let Err(error) = state.outbound.send(outbound_message) {
             error!(call_id = %call_id, destination = %destination, transport = %outbound_transport, "B2BUA: flow send failed: {error}");
         }
     } else {
-        let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport) };
+        let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport), server_name: None };
         send_to_target(data, &relay_target, outbound_transport, ConnectionId::default(), state);
     }
 
@@ -8377,6 +8779,7 @@ fn handle_registrant_ipsec_challenge(
             destination,
             data,
             source_local_addr: Some(source),
+            server_name: None,
         };
         if let Err(error) = outbound.send(outbound_message) {
             warn!(aor = %aor_task, %error, "IPsec UE: failed to send protected REGISTER");
@@ -9233,6 +9636,9 @@ fn handle_b2bua_response(
             state.call_actors.set_winner(call_id, idx);
         }
 
+        // CDR: stamp the answer time (cdr.auto_emit).
+        cdr_mark_b2bua_answer(state, call_id, status_code);
+
         // Rf ACR-START on B2BUA call answer (TS 32.299 §6.2.2).
         // Fire-and-forget per TS 32.299 §6.5.
         if let Some(invite_arc) = &a_leg_invite {
@@ -9251,6 +9657,7 @@ fn handle_b2bua_response(
                     call_id.to_string(),
                     Arc::clone(invite_arc),
                     a_leg.transport.remote_addr.ip().to_string(),
+                    format!("{}", a_leg.transport.transport).to_lowercase(),
                 );
                 let py_reply = PyReply::new(Arc::clone(&response_arc))
                     .with_a_leg(Arc::clone(invite_arc));
@@ -9631,6 +10038,7 @@ fn handle_b2bua_response(
                     let target = RelayTarget {
                         address: destination,
                         transport: Some(transport),
+                        server_name: None,
                     };
                     send_to_target(data, &target, transport, ConnectionId::default(), state);
                 }
@@ -9657,6 +10065,7 @@ fn handle_b2bua_response(
                         call_id.to_string(),
                         Arc::clone(invite_arc),
                         a_leg.transport.remote_addr.ip().to_string(),
+                        format!("{}", a_leg.transport.transport).to_lowercase(),
                     );
                     let py_reply = PyReply::new(Arc::clone(&response_arc))
                         .with_a_leg(Arc::clone(invite_arc));
@@ -10145,6 +10554,11 @@ fn handle_b2bua_response(
             }
         }
 
+        // CDR: the call failed before answer (cdr.auto_emit). Fire regardless of
+        // whether a @b2bua.on_failure handler is registered — the record must be
+        // written for the failed call either way.
+        cdr_finalize_b2bua_fail(state, call_id, status_code);
+
         // Error response — invoke @b2bua.on_failure with (PyCall, code, reason)
         let engine_state = state.engine.state();
         let handlers = engine_state.handlers_for(&HandlerKind::B2buaFailure);
@@ -10159,6 +10573,7 @@ fn handle_b2bua_response(
                     call_id.to_string(),
                     Arc::clone(invite_arc),
                     a_leg.transport.remote_addr.ip().to_string(),
+                    format!("{}", a_leg.transport.transport).to_lowercase(),
                 );
 
                 Python::attach(|python| {
@@ -10436,13 +10851,19 @@ fn handle_b2bua_bye(
     };
 
     // Extract everything from the DashMap ref and drop it before entering Python
-    let (from_a_leg, a_leg_invite, a_leg_source_ip) = match state.call_actors.get_call(&call_id) {
-        Some(call) => {
-            let from_a = inbound.remote_addr == call.a_leg.transport.remote_addr;
-            (from_a, call.a_leg_invite.clone(), call.a_leg.transport.remote_addr.ip().to_string())
-        }
-        None => return,
-    };
+    let (from_a_leg, a_leg_invite, a_leg_source_ip, a_leg_transport) =
+        match state.call_actors.get_call(&call_id) {
+            Some(call) => {
+                let from_a = inbound.remote_addr == call.a_leg.transport.remote_addr;
+                (
+                    from_a,
+                    call.a_leg_invite.clone(),
+                    call.a_leg.transport.remote_addr.ip().to_string(),
+                    format!("{}", call.a_leg.transport.transport).to_lowercase(),
+                )
+            }
+            None => return,
+        };
 
     // Invoke @b2bua.on_bye handlers with (PyCall, PyByeInitiator)
     let engine_state = state.engine.state();
@@ -10455,6 +10876,7 @@ fn handle_b2bua_bye(
                 call_id.clone(),
                 Arc::clone(invite_arc),
                 a_leg_source_ip,
+                a_leg_transport,
             );
             let initiator = PyByeInitiator { side };
 
@@ -10500,6 +10922,10 @@ fn handle_b2bua_bye(
     // proxy committed to tearing the call down; the SIP path is
     // unaffected (spawn is fire-and-forget per §6.5).
     spawn_rf_b2bua_stop(state, &call_id, &message);
+
+    // CDR: write the call record on BYE (cdr.auto_emit). `from_a_leg` gives the
+    // disconnecting side (caller vs callee).
+    cdr_finalize_b2bua_stop(state, &call_id, from_a_leg, &message);
 
     // Re-acquire the call ref for BYE bridging
     let call = match state.call_actors.get_call(&call_id) {
@@ -10595,6 +11021,7 @@ fn handle_b2bua_bye(
         let target = RelayTarget {
             address: destination,
             transport: Some(transport),
+            server_name: None,
         };
         send_to_target(data, &target, transport, ConnectionId::default(), state);
     }
@@ -10918,6 +11345,7 @@ fn arm_reliable_provisional_retransmit(
                         destination,
                         data: bytes.clone(),
                         source_local_addr: None,
+                        server_name: None,
                     });
                     interval = (interval * 2).min(cap);
                 }
@@ -13004,6 +13432,20 @@ a=rtpmap:8 PCMA/8000\r\n";
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_candidates_carries_hostname_for_sni() {
+        let resolver = test_resolver();
+        // A SIP URI with a hostname → every candidate carries the host so a new
+        // outbound TLS connection presents it as SNI / certificate hostname.
+        let hosted = resolve_target("sip:alice@localhost:5090", &resolver)
+            .expect("localhost must resolve");
+        assert_eq!(hosted.server_name.as_deref(), Some("localhost"));
+
+        // A bare IP:port short-circuits → no SNI (RFC 6066 emits none for an IP).
+        let bare = resolve_target("192.0.2.1:5060", &resolver).expect("bare ip target");
+        assert!(bare.server_name.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn resolve_target_transport_tcp() {
         let resolver = test_resolver();
         let result = resolve_target("sip:alice@10.0.0.1:5060;transport=tcp", &resolver).unwrap();
@@ -13020,7 +13462,7 @@ a=rtpmap:8 PCMA/8000\r\n";
     // --- In-dialog connection reuse (RFC 5923) ---
 
     fn candidate(addr: &str) -> RelayTarget {
-        RelayTarget { address: addr.parse().unwrap(), transport: None }
+        RelayTarget { address: addr.parse().unwrap(), transport: None, server_name: None }
     }
 
     #[test]

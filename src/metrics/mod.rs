@@ -75,6 +75,12 @@ pub struct SiphonMetrics {
     /// means completed-call dialog keys are leaking (`by_dialog_key`).
     pub proxy_dialog_sessions: IntGauge,
 
+    /// Live `cdr.auto_emit` per-call tracking entries (INVITE → answer → BYE).
+    /// Returns to ~0 when calls are idle; a monotonic climb under a steady,
+    /// completed-call workload means a call teardown hook isn't draining the
+    /// `cdr_sessions` store. Zero when `cdr.auto_emit` is off.
+    pub cdr_sessions: IntGauge,
+
     /// Live SUBSCRIBE dialogs in the L1 `subscribe_state` store.  A monotonic
     /// climb under a steady subscribe/expire workload means expired dialogs
     /// are leaking (L1 has no TTL; the sweep reaps them).
@@ -263,6 +269,11 @@ impl SiphonMetrics {
         let proxy_dialog_sessions = IntGauge::new(
             "siphon_proxy_dialog_sessions",
             "Live proxy dialog-key entries (INVITEs within their 2xx ACK window)",
+        )?;
+
+        let cdr_sessions = IntGauge::new(
+            "siphon_cdr_sessions",
+            "Live cdr.auto_emit per-call tracking entries (INVITE to BYE)",
         )?;
 
         let subscribe_dialogs = IntGauge::new(
@@ -505,6 +516,7 @@ impl SiphonMetrics {
         registry.register(Box::new(transactions_active.clone()))?;
         registry.register(Box::new(uac_pending_requests.clone()))?;
         registry.register(Box::new(proxy_dialog_sessions.clone()))?;
+        registry.register(Box::new(cdr_sessions.clone()))?;
         registry.register(Box::new(subscribe_dialogs.clone()))?;
         registry.register(Box::new(ipsec_sa_pairs.clone()))?;
         registry.register(Box::new(registrations_active.clone()))?;
@@ -559,6 +571,7 @@ impl SiphonMetrics {
             transactions_active,
             uac_pending_requests,
             proxy_dialog_sessions,
+            cdr_sessions,
             subscribe_dialogs,
             ipsec_sa_pairs,
             registrations_active,

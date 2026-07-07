@@ -70,6 +70,8 @@ draining pod leaves rotation cleanly — see [Deployment & operations](../deploy
 ```yaml
 cdr:
   enabled: true
+  auto_emit: true            # write one CDR per call automatically
+  include_register: false    # with auto_emit, also emit a CDR per REGISTER
   backend: http              # file | http | syslog
   http:
     url: "https://collector.example.com/v1/cdr"
@@ -77,13 +79,33 @@ cdr:
 ```
 
 CDRs are written asynchronously (a bounded channel, never blocks a call) with the
-call's timing, parties, transport, disconnect initiator, and response code. Add your
-own fields from a script:
+call's timing, parties, transport, disconnect initiator, and response code.
+
+With `auto_emit: true` siphon writes one CDR per call on its own — proxy or B2BUA,
+no script needed — filling in `timestamp_start`/`answer`/`end`, `duration_secs`,
+`response_code`, and `disconnect_initiator` (`caller` / `callee` / `timeout` /
+`error`). Answered calls, B-leg failures, answer timeouts and caller CANCELs all
+produce a record. It defaults off, so it never surprises a manual-only setup.
+
+You can also write records from a script — either instead of, or on top of,
+`auto_emit` (use it to attach `billing_id` / trunk / account fields). `cdr.write()`
+takes the proxy `request` or, from a B2BUA handler, the `call`:
 
 ```python
 from siphon import cdr
-cdr.write(request, extra={"billing_id": "B-12345", "account": "ACC-789"})
+
+@proxy.on_request("INVITE")
+def route(request):
+    cdr.write(request, extra={"billing_id": "B-12345", "account": "ACC-789"})
+
+@b2bua.on_answer
+def answered(call, reply):
+    cdr.write(call, extra={"billing_id": "B-12345"})
 ```
+
+Watch `siphon_cdr_sessions` (the live per-call tracking count): it returns to 0
+between calls, and a steady climb under flat load means a call teardown isn't
+being seen.
 
 ## Full SIP tracing → Homer
 

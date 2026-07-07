@@ -1,0 +1,43 @@
+# Standalone IMS S-CSCF for the sipp-ipsec VoLTE test.
+#
+# Does local Milenage AKA (no HSS / Diameter Cx) via ims_scscf_aka_lab.py, so
+# the P-CSCF (siphon-pcscf.yaml) has something to relay REGISTER to and gets a
+# 401 with ck/ik back for IPsec SA setup. Reachable from the P-CSCF as the
+# docker network alias "ims.test" (see docker-compose.yaml).
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+  tcp:
+    - "0.0.0.0:5060"
+
+advertised_address: "172.20.0.34"
+
+domain:
+  local:
+    - "ims.test"
+    - "172.20.0.34"
+
+script:
+  path: "examples/ims_scscf_aka_lab.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 600000
+  max_expires: 600000
+
+auth:
+  realm: "ims.test"
+  backend: static
+  # 3GPP TS 35.208 test set 2 — must match the aka_K/aka_OP/aka_AMF the SIPp
+  # UE uses (test set 1 contains 0x5b '[' which breaks sipp_ipsec's parser).
+  aka_credentials:
+    "001010000000001":
+      k: "0396eb317b6d1c36f19c1c84cd6ffd16"
+      op: "ff9bb4d0b607f35029a9384c2e7eb8a3"
+      amf: "2175"
+
+log:
+  level: debug
+  format: pretty

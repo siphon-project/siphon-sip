@@ -43,6 +43,65 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   positive. The unban clears the userspace ban and, when the kernel firewall is
   enabled, removes the matching nf_tables element in lockstep so the in-kernel
   drop is lifted too.
+- **Outbound TLS client certificate (mutual TLS).** New `tls.client_certificate`
+  and `tls.client_private_key` (PEM chain + key). When set, siphon presents that
+  client certificate on outbound TLS connections whose peer requests one — for
+  upstream SIP trunks that require client-certificate / mutual TLS (e.g.
+  Microsoft Teams Direct Routing). Previously the outbound pool presented no
+  client certificate, so such peers aborted the handshake with
+  `CertificateUnknown`. Both fields must be set together (or neither); a
+  one-sided setting or an unreadable/unparseable file is a hard startup error
+  (fail closed). Server-certificate verification is unchanged (still permissive).
+- **Hostname-based outbound TLS SNI.** Outbound TLS handshakes now present the
+  resolved target hostname as SNI / certificate name instead of the destination
+  IP literal. RFC 6066 forbids SNI for an IP literal, so IP-based next hops
+  emitted none and hostname-vhost front-ends could not route the handshake; the
+  hostname now flows from the resolved SIP URI (relay, fork, and gateway TLS
+  health probe) through to the connection pool. Bare-IP next hops are unchanged
+  (still no SNI).
+- **Gateway source-membership predicate — `request.from_gateway(group)` /
+  `call.from_gateway(group)`.** Returns `True` when the message's source IP is
+  one of the resolved addresses of the named gateway group (configured under
+  `gateway.groups`). siphon's equivalent of Kamailio `ds_is_from_list()` /
+  OpenSIPS `ds_is_in_list()` — a routing-direction / trust predicate that
+  replaces hardcoded source CIDRs. Matches on IP only (source port ignored)
+  against every resolved A/AAAA candidate of every destination in the group, so
+  a hostname that round-robins across many IPs (e.g. Teams'
+  `sip`/`sip2`/`sip3.pstnhub.microsoft.com`) matches on any of them. The member
+  set is cached lock-free and refreshed at startup and on each health-probe
+  cycle, so the predicate never resolves DNS on the request path. Infallible —
+  returns `False` (never raises) for an unknown group, no configured gateway, or
+  an unparseable source IP. Security note: on connection-oriented transports
+  (TCP/TLS/WS/WSS) the source IP is handshake-verified and trustworthy as an
+  authorization signal; on UDP it is spoofable, so `from_gateway` there is a
+  best-effort direction hint, not an auth gate.
+- **Automatic CDR generation (`cdr.auto_emit`).** With `cdr.auto_emit: true`,
+  siphon now writes one CDR per call automatically on the call lifecycle — no
+  `cdr.write()` in the script — for both the proxy and B2BUA datapaths. The
+  record carries `timestamp_start` (INVITE), `timestamp_answer` (200),
+  `timestamp_end` (BYE), `duration_secs`, `response_code`, and
+  `disconnect_initiator` (`caller`/`callee`/`timeout`/`error`). Every teardown
+  is covered: answered→BYE (either side), B-leg failure, answer-timeout (408),
+  and caller CANCEL (487). Default **off**, so manual-only deployments are
+  unchanged; manual `cdr.write()` still works and stacks on top. The previously
+  **inert** `cdr.include_register` flag is now wired: with `auto_emit`, each
+  registrar state change emits a REGISTER CDR (`reg_event` = registered /
+  refreshed / deregistered / expired). New `siphon_cdr_sessions` gauge exposes
+  the live per-call tracking count (drains to 0 between calls; a steady climb
+  is a teardown-hook leak). Per-call state is bounded by the orphan sweep.
+
+### Fixed
+- **`cdr.write()` now accepts a B2BUA `Call`, not just a proxy `Request`.**
+  Calling `cdr.write(call, extra=…)` from a `@b2bua.on_answer` / `on_bye` /
+  `on_failure` / `on_early_media` / `on_cancel` handler previously raised
+  `TypeError: 'Call' object is not an instance of 'Request'` — the method was
+  typed for `Request` only, so B2BUA scripts had no way to write a CDR. It is
+  now polymorphic: a `Call` produces the same record shape as a `Request`
+  (method `INVITE`, Call-ID / From / To / R-URI / source IP off the A-leg
+  INVITE, plus the same Rf `rf_session_id` / `rf_result_code` auto-stamp), with
+  the A-leg's arrival transport threaded through so the `transport` field is
+  correct. Passing any other object now raises a clear `TypeError`. Mirrored in
+  the SDK mock (`cdr.write(call)`).
 
 ## [1.1.1] — 2026-07-02
 

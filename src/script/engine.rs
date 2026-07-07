@@ -1427,6 +1427,7 @@ def new_call(call):
             "st-test-001".to_string(),
             Arc::clone(&message_arc),
             "10.0.0.1".to_string(),
+            "udp".to_string(),
         );
 
         // Invoke the handler and verify the override was set
@@ -1505,6 +1506,7 @@ def new_call(call):
             "bgcf-test-001".to_string(),
             Arc::new(Mutex::new(invite)),
             "10.0.0.1".to_string(),
+            "udp".to_string(),
         );
 
         Python::attach(|python| {
@@ -1575,6 +1577,7 @@ def new_call(call):
             "st-test-002".to_string(),
             message_arc,
             "10.0.0.1".to_string(),
+            "udp".to_string(),
         );
 
         Python::attach(|python| {

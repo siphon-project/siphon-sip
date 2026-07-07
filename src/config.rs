@@ -1164,6 +1164,16 @@ pub struct TlsServerConfig {
     /// used only when `verify_client` is true (mutual TLS).
     #[serde(default)]
     pub client_ca: Option<String>,
+    /// PEM certificate chain siphon presents as a TLS *client* on OUTBOUND
+    /// connections when the upstream peer requests one (mutual TLS — upstream
+    /// SIP trunks that require client-certificate auth). Optional; when unset,
+    /// siphon presents no client certificate (prior behavior).
+    #[serde(default)]
+    pub client_certificate: Option<String>,
+    /// PEM private key for `client_certificate`. Must be set if and only if
+    /// `client_certificate` is set; a one-sided setting is a startup error.
+    #[serde(default)]
+    pub client_private_key: Option<String>,
 }
 
 fn default_tls_method() -> String {
@@ -1993,7 +2003,16 @@ pub struct CdrYamlConfig {
     /// Enable CDR generation. Default: false.
     #[serde(default)]
     pub enabled: bool,
-    /// Include REGISTER events as CDRs. Default: false.
+    /// Automatically emit a CDR per call on lifecycle events (INVITE answer →
+    /// BYE, plus failed/cancelled/timed-out calls) without the script calling
+    /// `cdr.write()`. Default: false — existing manual-only deployments are
+    /// unchanged; opt in to get call CDRs for free. Manual `cdr.write()` still
+    /// works and is additive.
+    #[serde(default)]
+    pub auto_emit: bool,
+    /// Include REGISTER events as CDRs. Only meaningful with `auto_emit: true`
+    /// — when set, each registrar state change emits a REGISTER CDR. Default:
+    /// false.
     #[serde(default)]
     pub include_register: bool,
     /// Async channel buffer size. Default: 10000.
@@ -2061,6 +2080,7 @@ impl CdrYamlConfig {
         crate::cdr::CdrConfig {
             enabled: self.enabled,
             backend,
+            auto_emit: self.auto_emit,
             include_register: self.include_register,
             channel_size: self.channel_size,
         }
@@ -3433,6 +3453,38 @@ tls:
         assert_eq!(tls.certificate, "/etc/siphon/tls/example.com.crt");
         assert_eq!(tls.method, "TLSv1_3");
         assert!(!tls.verify_client);
+        // Outbound client-certificate (mutual TLS) fields default to None.
+        assert!(tls.client_certificate.is_none());
+        assert!(tls.client_private_key.is_none());
+    }
+
+    #[test]
+    fn parses_tls_outbound_client_certificate() {
+        let yaml = r#"
+listen:
+  tls:
+    - "0.0.0.0:5061"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+tls:
+  certificate: "/etc/siphon/tls/example.com.crt"
+  private_key: "/etc/siphon/tls/example.com.key"
+  client_certificate: "/etc/siphon/tls/client.crt"
+  client_private_key: "/etc/siphon/tls/client.key"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let tls = config.tls.unwrap();
+        assert_eq!(
+            tls.client_certificate.as_deref(),
+            Some("/etc/siphon/tls/client.crt")
+        );
+        assert_eq!(
+            tls.client_private_key.as_deref(),
+            Some("/etc/siphon/tls/client.key")
+        );
     }
 
     #[test]

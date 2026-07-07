@@ -12,6 +12,7 @@ configurable backends for registrar, auth, cache, etc.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import sys
 import uuid
 from types import ModuleType
@@ -2057,6 +2058,27 @@ class MockRtpEngine:
 # Dispatcher namespace
 # ---------------------------------------------------------------------------
 
+def _ip_of_address(address: str) -> Optional[str]:
+    """Extract the bare IP from a ``host:port`` (or bare-host) address string.
+
+    Handles ``"10.0.0.1:5060"`` → ``"10.0.0.1"``, ``"[::1]:5060"`` → ``"::1"``,
+    and bare literals unchanged.  Returns ``None`` only for the empty string.
+    Used by :meth:`MockGateway.contains_source` to model the Rust engine's
+    IP-only source membership.
+    """
+    if not address:
+        return None
+    if address.startswith("["):
+        end = address.find("]")
+        if end != -1:
+            return address[1:end]
+    # "10.0.0.1:5060" (one colon) → strip the port; a bare IPv6 (many colons,
+    # no port) or a bare IPv4 is returned unchanged.
+    if address.count(":") == 1:
+        return address.rsplit(":", 1)[0]
+    return address
+
+
 class MockDestination:
     """A destination returned by ``gateway.select()`` or ``gateway.list()``.
 
@@ -2178,6 +2200,45 @@ class MockGateway:
         self._counters[group_name] = counter + 1
         return candidates[counter % len(candidates)]
 
+    def contains_source(self, group_name: str, source_ip: str) -> bool:
+        """True when ``source_ip`` is a member IP of the named group.
+
+        Mirrors the Rust ``DispatcherManager::source_in_group`` — the backing
+        check for ``request.from_gateway`` / ``call.from_gateway``.  Matches on
+        IP only (destination port ignored) against every destination's
+        ``address``.  Returns ``False`` (never raises) for an unknown group or
+        an unparseable ``source_ip``, so callers stay infallible.
+
+        In the mock, membership is the set of destination-address IP literals
+        you registered via :meth:`add_group` (no DNS is performed — give
+        destinations literal IP addresses to model resolved gateways).
+
+        Example::
+
+            gateway.add_group("teams", [
+                {"uri": "sip:sip.pstnhub.microsoft.com", "address": "203.0.113.10:5061"},
+            ])
+            gateway.contains_source("teams", "203.0.113.10")  # True
+        """
+        dests = self._groups.get(group_name)
+        if not dests:
+            return False
+        try:
+            needle = ipaddress.ip_address(source_ip)
+        except ValueError:
+            return False
+        for dest in dests:
+            host = _ip_of_address(dest.address)
+            if host is None:
+                continue
+            try:
+                if ipaddress.ip_address(host) == needle:
+                    return True
+            except ValueError:
+                # Non-literal host (a hostname) — the mock does no DNS; skip.
+                continue
+        return False
+
     def list(self, group_name: str) -> list[MockDestination]:
         """List all destinations in a group.
 
@@ -2293,7 +2354,8 @@ class MockCdr:
 
         from siphon import cdr
 
-        cdr.write(request, extra={"billing_id": "B-12345"})
+        cdr.write(request, extra={"billing_id": "B-12345"})  # proxy handler
+        cdr.write(call, extra={"billing_id": "B-12345"})     # b2bua handler
         cdr.enabled  # True if CDR system is active
 
     Test helper::
@@ -2311,32 +2373,56 @@ class MockCdr:
         """Whether the CDR system is enabled."""
         return self._enabled
 
-    def write(self, request: "Any", extra: "dict[str, str] | None" = None) -> bool:
-        """Write a CDR for the given request.
+    def write(self, source: "Any", extra: "dict[str, str] | None" = None) -> bool:
+        """Write a CDR for the given request or B2BUA call.
 
         Args:
-            request: The SIP request object.
+            source: The SIP ``Request`` (proxy handlers) OR the B2BUA ``Call``
+                (``@b2bua.on_answer`` / ``on_bye`` / … handlers).  Both carry
+                the Call-ID, From/To/R-URI and source IP the CDR needs.
             extra: Optional dict of extra fields to include in the CDR.
 
         Returns:
             True if the CDR was queued successfully.
 
+        Raises:
+            TypeError: if ``source`` is neither a ``Request`` nor a ``Call``.
+
         Example::
 
             from siphon import cdr
-            cdr.write(request, extra={"billing_id": "B-12345", "account": "ACC-789"})
+
+            @proxy.on_request("INVITE")
+            def route(request):
+                cdr.write(request, extra={"billing_id": "B-12345"})
+
+            @b2bua.on_answer
+            def answered(call, reply):
+                cdr.write(call, extra={"billing_id": "B-12345"})
         """
+        # A Request exposes `.method`; a B2BUA Call does not.  The Call is
+        # always INVITE-driven and its transport comes off the A-leg, mirroring
+        # the engine's `cdr_method()` / `cdr_transport()` accessors.
+        if hasattr(source, "method"):
+            method = getattr(source, "method", "")
+            transport = getattr(source, "transport", "")
+        elif hasattr(source, "id") and hasattr(source, "state"):
+            method = "INVITE"
+            transport = getattr(source, "_transport", "udp")
+        else:
+            raise TypeError("cdr.write() expects a Request or Call object")
+
         if not self._enabled:
             return False
 
         record: dict = {
-            "call_id": getattr(request, "call_id", ""),
-            "method": getattr(request, "method", ""),
-            "from_uri": str(getattr(request, "from_uri", "")),
-            "to_uri": str(getattr(request, "to_uri", "")),
-            "ruri": str(getattr(request, "ruri", "")),
-            "source_ip": getattr(request, "source_ip", ""),
-            "transport": getattr(request, "transport", ""),
+            "call_id": getattr(source, "call_id", ""),
+            "method": method,
+            "from_uri": str(getattr(source, "from_uri", "")),
+            "to_uri": str(getattr(source, "to_uri", "")),
+            "ruri": str(getattr(source, "ruri", "")),
+            "source_ip": getattr(source, "source_ip", ""),
+            "transport": transport,
         }
         if extra:
             record.update(extra)

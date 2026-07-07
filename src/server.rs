@@ -1210,6 +1210,52 @@ impl SiphonServer {
         let pool_local_addr = first_listen_addr.unwrap_or_else(||
             "0.0.0.0:5060".parse().unwrap()
         );
+        // Outbound client-certificate (mutual TLS): when `tls.client_certificate`
+        // + `tls.client_private_key` are configured, siphon presents that client
+        // identity on outbound TLS connections whose peer requests one (upstream
+        // SIP trunks requiring client-certificate auth). Both must be set, or
+        // neither; a one-sided setting or an unreadable/unparseable file is a
+        // hard startup error (fail closed) — mirrors `verify_client` without
+        // `client_ca` in the TLS acceptor.
+        let outbound_client_identity =
+            match config.tls.as_ref().map(|t| (&t.client_certificate, &t.client_private_key)) {
+                Some((Some(certificate_path), Some(private_key_path))) => {
+                    match transport::pool::load_outbound_client_identity(
+                        certificate_path,
+                        private_key_path,
+                    ) {
+                        Ok(identity) => {
+                            info!(
+                                certificate = %certificate_path,
+                                "outbound mutual TLS enabled — presenting client certificate on outbound TLS"
+                            );
+                            Some(identity)
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "Failed to load outbound TLS client certificate/key: {error}"
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                }
+                Some((Some(_), None)) | Some((None, Some(_))) => {
+                    eprintln!(
+                        "tls.client_certificate and tls.client_private_key must both be set \
+                         (outbound mutual TLS) — one was provided without the other"
+                    );
+                    std::process::exit(1);
+                }
+                _ => None,
+            };
+        let tls_client_config =
+            match transport::pool::build_outbound_tls_config(outbound_client_identity) {
+                Ok(config) => config,
+                Err(error) => {
+                    eprintln!("Failed to build outbound TLS client config: {error}");
+                    std::process::exit(1);
+                }
+            };
         let connection_pool = Arc::new(transport::pool::ConnectionPool::new(
             Arc::clone(&tcp_connection_map),
             inbound_tx.clone(),
@@ -1217,6 +1263,7 @@ impl SiphonServer {
             pool_tos,
             Some(stream_connections.clone()),
             crlf_pong_tracker.clone(),
+            tls_client_config,
         ));
 
         // Spawn TCP listeners now that the pool exists.
@@ -2199,6 +2246,11 @@ fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {
             info!("gateway registered for injection");
         }
     });
+
+    // Store the Rust-side manager Arc so `request.from_gateway` /
+    // `call.from_gateway` can test source membership without a Python
+    // round-trip (points at the same manager as the Python singleton).
+    crate::script::api::set_gateway_manager(Arc::clone(&manager));
 
     Some(manager)
 }
