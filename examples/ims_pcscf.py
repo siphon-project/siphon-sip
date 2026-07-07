@@ -167,6 +167,11 @@ async def handle_register(request):
     request.add_pcscf_path(token)
     request.set_header("P-Visited-Network-ID", REALM)
 
+    # The UE routes the initial REGISTER through this P-CSCF via a preloaded
+    # Route (3GPP TS 24.229 §5.1.1.2); consume it so relay() forwards to the
+    # home domain (S-CSCF) instead of looping back to us. No-op when absent.
+    request.loose_route()
+
     # Relay to S-CSCF.  The 401 flow-back is handled by handle_register_reply.
     request.record_route()
     request.relay()
