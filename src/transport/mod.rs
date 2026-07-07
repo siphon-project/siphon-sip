@@ -143,6 +143,14 @@ pub struct OutboundMessage {
     /// policy won't match).  When `None`, the message goes to the
     /// default UDP channel (typically the first listener configured).
     pub source_local_addr: Option<SocketAddr>,
+    /// SNI / certificate hostname for an outbound TLS handshake. Only
+    /// meaningful when this message must open a *new* outbound TLS connection
+    /// via the connection pool (`Transport::Tls`, no reusable connection).
+    /// `Some(host)` presents the resolved hostname (RFC 6066 SNI is emitted so
+    /// a hostname-vhost peer can route the handshake); `None` falls back to the
+    /// destination IP literal (no SNI). Ignored for non-TLS transports and for
+    /// TLS connection *reuse* (no handshake occurs).
+    pub server_name: Option<String>,
 }
 
 /// Routes outbound messages to the correct transport channel.
@@ -167,6 +175,11 @@ pub struct OutboundRouter {
 }
 
 impl OutboundRouter {
+    // flume's `SendError<T>` hands the un-sent message back to the caller by
+    // design, so the Err variant is as large as `OutboundMessage` itself — the
+    // type is fixed by flume's channel contract and can't be boxed without
+    // rewrapping every caller. Allow the size lint here.
+    #[allow(clippy::result_large_err)]
     pub fn send(&self, message: OutboundMessage) -> Result<(), flume::SendError<OutboundMessage>> {
         match message.transport {
             Transport::Udp => {
@@ -469,6 +482,7 @@ mod tests {
             destination: "10.0.0.1:5060".parse().unwrap(),
             data: Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"),
             source_local_addr: None,
+            server_name: None,
         };
         assert_eq!(message.connection_id, ConnectionId(99));
         assert_eq!(message.transport, Transport::Udp);

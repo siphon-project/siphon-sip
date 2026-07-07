@@ -993,6 +993,52 @@ class Request:
             return False
         return any(addr in ipaddress.ip_network(cidr) for cidr in cidr_list)
 
+    def from_gateway(self, group_name: str) -> bool:
+        """Check if the source IP is a member of a gateway group.
+
+        Returns ``True`` when this request's source IP is one of the resolved
+        addresses of the gateway group ``group_name`` (configured under
+        ``gateway.groups`` in ``siphon.yaml``, or via ``gateway.add_group``).
+        This is siphon's equivalent of Kamailio ``ds_is_from_list()`` /
+        OpenSIPS ``ds_is_in_list()`` — a routing-direction / trust predicate
+        that replaces hardcoded source CIDRs.
+
+        The match is on IP only (the source port is ignored — gateways answer
+        from varied ports) and against **every** resolved address in the
+        group, so a hostname that round-robins across many IPs (e.g. Teams'
+        ``sip``/``sip2``/``sip3.pstnhub.microsoft.com``) matches on any of
+        them.
+
+        Infallible: returns ``False`` (never raises) when the group does not
+        exist, no gateway is configured, or the source IP does not parse.
+
+        Security: on connection-oriented transports (TCP/TLS/WS/WSS) the source
+        IP is handshake-verified and trustworthy as an authorization signal; on
+        UDP it is spoofable, so ``from_gateway`` there is a best-effort
+        direction hint, not an auth gate.
+
+        Args:
+            group_name: Name of the gateway group to test membership against.
+
+        Returns:
+            ``True`` if the source IP belongs to the group.
+
+        Example::
+
+            @proxy.on_request("INVITE")
+            def route(request):
+                if request.from_gateway("teams"):
+                    # Inbound from Microsoft Teams — trust and forward to the PBX.
+                    request.relay("sip:pbx.internal:5060")
+                else:
+                    request.reply(403, "Forbidden")
+        """
+        # Lazy import avoids a circular import (mock_module imports from this
+        # module at load time).
+        from siphon_sdk.mock_module import get_gateway
+
+        return get_gateway().contains_source(group_name, self._source_ip)
+
     # -- Internal helpers (not part of the public API) -------------------------
 
     def _pending_headers(self) -> dict[str, str]:

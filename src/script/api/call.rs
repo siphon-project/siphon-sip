@@ -173,6 +173,14 @@ pub struct PyCall {
     li_record_flag: bool,
     /// When true, copy the A-leg Call-ID to B-leg instead of generating a new one.
     preserve_call_id_flag: bool,
+    /// When set, pin the B-leg From URI host to this value instead of the
+    /// B2BUA advertised address (opts out of From topology-hiding — needed
+    /// for multitenant edges where the downstream selects the tenant from the
+    /// From domain). Set via `set_from_host()`.
+    from_host_override: Option<String>,
+    /// When set, pin the B-leg To URI host to this value instead of the
+    /// dial-target host. Set via `set_to_host()`.
+    to_host_override: Option<String>,
     /// Per-call header policy input captured from `call.dial(header_policy=…, …)`
     /// or `call.fork(…)`.  The dispatcher resolves `policy_name` against
     /// the preset registry and applies deltas to produce a
@@ -218,6 +226,8 @@ impl PyCall {
             outbound_credentials: None,
             li_record_flag: false,
             preserve_call_id_flag: false,
+            from_host_override: None,
+            to_host_override: None,
             header_policy_input: None,
         }
     }
@@ -349,9 +359,43 @@ impl PyCall {
         self.source_ip.parse().ok()
     }
 
+    /// Source-membership predicate shared by the `from_gateway` pymethod and
+    /// its unit tests. Kept infallible: an unparseable source IP, a missing
+    /// manager, or an unknown group all resolve to `false`. The `manager`
+    /// seam lets tests inject a `DispatcherManager` without touching the
+    /// process singleton (a first-writer-wins `OnceLock`).
+    #[allow(clippy::wrong_self_convention)]
+    fn from_gateway_impl(
+        &self,
+        group_name: &str,
+        manager: Option<&Arc<crate::gateway::DispatcherManager>>,
+    ) -> bool {
+        let Ok(source_ip) = self.source_ip.parse::<std::net::IpAddr>() else {
+            return false;
+        };
+        match manager {
+            Some(manager) => manager.source_in_group(group_name, source_ip),
+            None => false,
+        }
+    }
+
     /// Whether the script wants to preserve the A-leg Call-ID on the B-leg.
     pub fn preserve_call_id(&self) -> bool {
         self.preserve_call_id_flag
+    }
+
+    /// Script-pinned B-leg From host, if `set_from_host()` was called.
+    /// Read by the dispatcher when building the B-leg INVITE — when `Some`,
+    /// it replaces the advertised-address rewrite of the From URI host.
+    pub fn from_host_override(&self) -> Option<&str> {
+        self.from_host_override.as_deref()
+    }
+
+    /// Script-pinned B-leg To host, if `set_to_host()` was called.
+    /// Read by the dispatcher when building the B-leg INVITE — when `Some`,
+    /// it replaces the dial-target rewrite of the To URI host.
+    pub fn to_host_override(&self) -> Option<&str> {
+        self.to_host_override.as_deref()
     }
 
     /// Set the Refer-To information (called by B2BUA core before firing on_refer).
@@ -383,6 +427,29 @@ impl PyCall {
     #[getter]
     fn source_ip(&self) -> &str {
         &self.source_ip
+    }
+
+    /// True when the A-leg source IP is a member of the resolved addresses
+    /// of the gateway group named `group_name`.
+    ///
+    /// The B2BUA equivalent of `request.from_gateway` — a routing-direction /
+    /// trust predicate (siphon's answer to Kamailio `ds_is_from_list()` /
+    /// OpenSIPS `ds_is_in_list()`) that replaces hardcoded source CIDRs.
+    /// Matches on IP only (source port ignored) against every resolved A/AAAA
+    /// candidate of every destination in the group.
+    ///
+    /// Infallible — returns `false` (never raises) when the group does not
+    /// exist, no gateway is configured, or the source IP does not parse.
+    ///
+    /// Security: on connection-oriented transports (TCP/TLS/WS/WSS) the source
+    /// IP is handshake-verified and trustworthy as an authorization signal; on
+    /// UDP it is spoofable, so `from_gateway` there is a best-effort direction
+    /// hint, not an auth gate.
+    ///
+    /// Example: `if call.from_gateway("teams"): call.dial(...)`
+    #[allow(clippy::wrong_self_convention)]
+    fn from_gateway(&self, group_name: &str) -> bool {
+        self.from_gateway_impl(group_name, super::gateway_manager())
     }
 
     /// Media anchoring handle.
@@ -855,6 +922,93 @@ impl PyCall {
         Ok(())
     }
 
+    /// Pin the host part of the B-leg From header URI.
+    ///
+    /// By default the B2BUA rewrites the From URI host to its own advertised
+    /// address (topology hiding — masking the A-leg identity).  At a
+    /// multitenant edge the downstream selects the tenant from the From
+    /// domain: a domainless call lands in an unauthenticated/default routing
+    /// context, so the tenant domain must survive.  `set_from_host()` opts
+    /// this leg out of the From host-rewrite and pins the host to `value`.
+    ///
+    /// Only the host changes; scheme/user/port/params and the From-tag are
+    /// preserved.  `value` is a bare host (no port) — the existing port is
+    /// kept.  Must be called before [`dial`] to take effect on the B-leg
+    /// INVITE — same model as [`set_from_user`].
+    ///
+    /// Usage in Python:
+    ///   call.set_from_host("tenant.example.com")
+    ///   call.dial(str(call.ruri), next_hop="sip:pbx.example.com:5060")
+    fn set_from_host(&mut self, value: &str) -> PyResult<()> {
+        {
+            let mut message = self.message.lock().map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+            })?;
+            let from_raw = message.headers.get("From")
+                .or_else(|| message.headers.get("f"))
+                .cloned();
+            if let Some(raw) = from_raw {
+                if let Ok(nameaddr) = crate::sip::headers::nameaddr::NameAddr::parse(&raw) {
+                    let mut uri = nameaddr.uri;
+                    uri.host = value.to_string();
+                    let mut new_from = if let Some(ref display) = nameaddr.display_name {
+                        format!("\"{display}\" <{uri}>")
+                    } else {
+                        format!("<{uri}>")
+                    };
+                    if let Some(ref tag) = nameaddr.tag {
+                        new_from.push_str(&format!(";tag={tag}"));
+                    }
+                    message.headers.set("From", new_from);
+                }
+            }
+        }
+        self.from_host_override = Some(value.to_string());
+        Ok(())
+    }
+
+    /// Pin the host part of the B-leg To header URI.
+    ///
+    /// By default the B2BUA rewrites the To URI host to the dial-target host.
+    /// `set_to_host()` pins it to `value` instead, so the To domain does what
+    /// the script says regardless of the routing next-hop (declarative
+    /// replacement for the raw `set_header("To", "<sip:user@host>")` idiom).
+    ///
+    /// Only the host changes; scheme/user/port/params and any To-tag are
+    /// preserved.  `value` is a bare host (no port).  Must be called before
+    /// [`dial`] — same model as [`set_to_user`].
+    ///
+    /// Usage in Python:
+    ///   call.set_to_user(callee)
+    ///   call.set_to_host(TRUNK_DOMAIN)
+    fn set_to_host(&mut self, value: &str) -> PyResult<()> {
+        {
+            let mut message = self.message.lock().map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+            })?;
+            let to_raw = message.headers.get("To")
+                .or_else(|| message.headers.get("t"))
+                .cloned();
+            if let Some(raw) = to_raw {
+                if let Ok(nameaddr) = crate::sip::headers::nameaddr::NameAddr::parse(&raw) {
+                    let mut uri = nameaddr.uri;
+                    uri.host = value.to_string();
+                    let mut new_to = if let Some(ref display) = nameaddr.display_name {
+                        format!("\"{display}\" <{uri}>")
+                    } else {
+                        format!("<{uri}>")
+                    };
+                    if let Some(ref tag) = nameaddr.tag {
+                        new_to.push_str(&format!(";tag={tag}"));
+                    }
+                    message.headers.set("To", new_to);
+                }
+            }
+        }
+        self.to_host_override = Some(value.to_string());
+        Ok(())
+    }
+
     /// Copy the A-leg Call-ID to the B-leg instead of generating a new one.
     ///
     /// By default the B2BUA generates a fresh Call-ID for each B-leg to fully
@@ -1214,6 +1368,60 @@ mod tests {
     }
 
     #[test]
+    fn call_set_from_host() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string());
+        call.set_from_host("tenant.example.com").unwrap();
+        let msg = message.lock().unwrap();
+        let from = msg.headers.get("From").unwrap();
+        assert!(from.contains("alice@tenant.example.com"), "From host should change: {from}");
+        assert!(!from.contains("atlanta.com"), "old From host must be gone: {from}");
+        assert!(from.contains(";tag=abc"), "From should preserve tag: {from}");
+        drop(msg);
+        assert_eq!(call.from_host_override(), Some("tenant.example.com"));
+    }
+
+    #[test]
+    fn call_set_from_host_preserves_display_user_port_tag() {
+        let mut invite = make_invite();
+        invite.headers.set(
+            "From",
+            "\"Alice\" <sip:1001@old.example.com:5060>;tag=xyz".to_string(),
+        );
+        let message = Arc::new(Mutex::new(invite));
+        let mut call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string());
+        call.set_from_host("tenant.example.com").unwrap();
+        let msg = message.lock().unwrap();
+        let from = msg.headers.get("From").unwrap();
+        assert!(from.contains("\"Alice\""), "display name preserved: {from}");
+        assert!(from.contains("1001@tenant.example.com:5060"), "user+host+port: {from}");
+        assert!(from.contains(";tag=xyz"), "tag preserved: {from}");
+        assert!(!from.contains("old.example.com"), "old host gone: {from}");
+    }
+
+    #[test]
+    fn call_set_to_host() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string());
+        call.set_to_host("trunk.example.com").unwrap();
+        let msg = message.lock().unwrap();
+        let to = msg.headers.get("To").unwrap();
+        assert!(to.contains("bob@trunk.example.com"), "To host should change: {to}");
+        assert!(!to.contains("example.com>") || to.contains("trunk.example.com"), "old host replaced: {to}");
+        assert!(!to.contains(";tag="), "initial INVITE To must not gain a tag: {to}");
+        drop(msg);
+        assert_eq!(call.to_host_override(), Some("trunk.example.com"));
+    }
+
+    #[test]
+    fn call_set_from_host_none_by_default() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        assert_eq!(call.from_host_override(), None);
+        assert_eq!(call.to_host_override(), None);
+    }
+
+    #[test]
     fn call_set_and_remove_header() {
         let message = Arc::new(Mutex::new(make_invite()));
         let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
@@ -1221,5 +1429,66 @@ mod tests {
         assert_eq!(call.get_header("X-Custom").unwrap(), Some("test-value".to_string()));
         call.remove_header("X-Custom").unwrap();
         assert_eq!(call.get_header("X-Custom").unwrap(), None);
+    }
+
+    // --- from_gateway (source-membership predicate) ---
+
+    fn gateway_manager_with_group() -> Arc<crate::gateway::DispatcherManager> {
+        use crate::gateway::{Algorithm, Destination, DispatcherGroup};
+        use crate::transport::Transport;
+
+        let manager = Arc::new(crate::gateway::DispatcherManager::new());
+        manager.add_group(DispatcherGroup::new(
+            "trunks".to_string(),
+            Algorithm::Weighted,
+            vec![Destination::new(
+                "sip:gw1.example.com".to_string(),
+                "10.0.0.1:5060".parse().unwrap(),
+                Transport::Udp,
+                1,
+                1,
+            )],
+        ));
+        manager
+    }
+
+    #[test]
+    fn call_from_gateway_true_for_member_source() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let manager = gateway_manager_with_group();
+        assert!(call.from_gateway_impl("trunks", Some(&manager)));
+    }
+
+    #[test]
+    fn call_from_gateway_false_for_non_member_source() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        // RFC 5737 TEST-NET-1 — not a member of the group.
+        let call = PyCall::new("test-id".to_string(), message, "192.0.2.7".to_string());
+        let manager = gateway_manager_with_group();
+        assert!(!call.from_gateway_impl("trunks", Some(&manager)));
+    }
+
+    #[test]
+    fn call_from_gateway_false_for_unknown_group() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        let manager = gateway_manager_with_group();
+        assert!(!call.from_gateway_impl("nonexistent", Some(&manager)));
+    }
+
+    #[test]
+    fn call_from_gateway_false_when_no_manager() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string());
+        assert!(!call.from_gateway_impl("trunks", None));
+    }
+
+    #[test]
+    fn call_from_gateway_false_for_unparseable_source_ip() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new("test-id".to_string(), message, "not-an-ip".to_string());
+        let manager = gateway_manager_with_group();
+        assert!(!call.from_gateway_impl("trunks", Some(&manager)));
     }
 }

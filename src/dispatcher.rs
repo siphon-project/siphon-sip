@@ -2509,6 +2509,7 @@ fn relay_request(
                         Some((dest, transport)) => RelayTarget {
                             address: dest,
                             transport: Some(transport),
+                            server_name: None,
                         },
                         None => {
                             warn!(target = %target_uri_string, "cannot resolve relay target");
@@ -2756,6 +2757,7 @@ fn relay_request(
             destination,
             data,
             source_local_addr: Some(local),
+            server_name: None,
         };
         let cid = outbound_message.connection_id;
         if let Err(error) = state.outbound.send(outbound_message) {
@@ -2778,6 +2780,7 @@ fn relay_request(
         let target = RelayTarget {
             address: destination,
             transport: Some(outbound_transport),
+            server_name: None,
         };
         send_to_target(data, &target, inbound.transport, inbound.connection_id, state)
     };
@@ -3041,6 +3044,7 @@ fn relay_fork_branch(
             destination,
             data,
             source_local_addr: Some(flow.local_addr),
+            server_name: None,
         };
         let cid = outbound_message.connection_id;
         if let Err(error) = state.outbound.send(outbound_message) {
@@ -3048,7 +3052,7 @@ fn relay_fork_branch(
         }
         cid
     } else {
-        let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport) };
+        let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport), server_name: None };
         send_to_target(data, &relay_target, inbound.transport, inbound.connection_id, state)
     };
 
@@ -3184,6 +3188,7 @@ fn handle_response(
                                 let target = RelayTarget {
                                     address: destination,
                                     transport: Some(transport),
+                                    server_name: None,
                                 };
                                 send_to_target(data, &target, transport, ConnectionId::default(), state);
                             }
@@ -3462,7 +3467,7 @@ fn handle_response(
                         let ack = build_ack_for_non2xx(&original_request, &message, &branch, cb.transport, state.local_addr);
                         send_to_target(
                             ack.to_bytes().into(),
-                            &RelayTarget { address: cb.destination, transport: Some(cb.transport) },
+                            &RelayTarget { address: cb.destination, transport: Some(cb.transport), server_name: None },
                             cb.transport,
                             cb.connection_id,
                             state,
@@ -4118,6 +4123,11 @@ struct RelayTarget {
     address: SocketAddr,
     /// Transport from URI params or SRV; `None` means use the inbound transport.
     transport: Option<Transport>,
+    /// Hostname from the resolved SIP URI, used as TLS SNI / certificate
+    /// hostname when a new outbound TLS connection must be opened. `None` for
+    /// bare-IP targets (RFC 6066 sends no SNI for an IP literal) and for
+    /// in-dialog / failover paths that route by address.
+    server_name: Option<String>,
 }
 
 /// Resolve a SIP target URI to its full ordered candidate set (RFC 3263).
@@ -4132,7 +4142,7 @@ struct RelayTarget {
 fn resolve_candidates(uri_string: &str, resolver: &SipResolver) -> Vec<RelayTarget> {
     // Try as bare IP:port first (cheapest check)
     if let Ok(addr) = uri_string.parse::<SocketAddr>() {
-        return vec![RelayTarget { address: addr, transport: None }];
+        return vec![RelayTarget { address: addr, transport: None, server_name: None }];
     }
 
     // Try parsing as a full SIP URI
@@ -4164,7 +4174,9 @@ fn resolve_candidates(uri_string: &str, resolver: &SipResolver) -> Vec<RelayTarg
                         "wss" => Some(Transport::WebSocketSecure),
                         _ => None,
                     });
-                RelayTarget { address: r.address, transport }
+                // All candidates from one URI share the target hostname — carry
+                // it for TLS SNI so a hostname-vhost peer routes the handshake.
+                RelayTarget { address: r.address, transport, server_name: Some(uri.host.clone()) }
             })
             .collect();
     }
@@ -4262,6 +4274,8 @@ fn send_to_target(
                     destination,
                     data,
                     source_local_addr: None,
+                    // Connection *reuse* — no TLS handshake, so no SNI needed.
+                    server_name: None,
                 };
                 if let Err(error) = state.outbound.send(outbound_message) {
                     error!(destination = %destination, "TLS connection reuse send failed: {error}");
@@ -4277,9 +4291,10 @@ fn send_to_target(
                 // No inbound connection to reuse — create outbound TLS via pool
                 let pool = Arc::clone(&state.connection_pool);
                 let data_clone = data;
+                let server_name = target.server_name.clone();
                 match tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current()
-                        .block_on(pool.send_tls(destination, data_clone))
+                        .block_on(pool.send_tls(destination, server_name.as_deref(), data_clone))
                 }) {
                     Ok(connection_id) => {
                         debug!(
@@ -4322,6 +4337,7 @@ fn send_to_target(
                         destination,
                         data,
                         source_local_addr: None,
+                        server_name: None,
                     };
                     if let Err(error) = state.outbound.send(outbound_message) {
                         error!(destination = %destination, %transport, "WS/WSS connection reuse send failed: {error}");
@@ -4366,6 +4382,7 @@ fn send_to_target(
                 destination,
                 data,
                 source_local_addr,
+                server_name: None,
             };
             if let Err(error) = state.outbound.send(outbound_message) {
                 error!("failed to enqueue relayed request: {error}");
@@ -4928,6 +4945,7 @@ fn select_b2bua_retry_destination(
             RelayTarget {
                 address: member_addr,
                 transport: Some(member_transport),
+                server_name: None,
             },
         )),
         None => resolve_target(target_uri, resolver).map(|relay_target| {
@@ -5306,6 +5324,7 @@ fn send_outbound_from(
         destination,
         data,
         source_local_addr,
+        server_name: None,
     };
 
     if let Err(error) = state.outbound.send(outbound_message) {
@@ -5552,6 +5571,7 @@ fn send_b2bua_to_bleg(
     let target = RelayTarget {
         address: destination,
         transport: Some(transport),
+        server_name: None,
     };
     send_to_target(data, &target, transport, ConnectionId::default(), state);
 }
@@ -6612,6 +6632,7 @@ fn handle_ack_via_session(
             let target = RelayTarget {
                 address: destination,
                 transport: Some(out_transport),
+                server_name: None,
             };
             send_to_target(
                 data,
@@ -7409,12 +7430,21 @@ fn handle_b2bua_invite(
     let engine_state = state.engine.state();
     let handlers = engine_state.handlers_for(&HandlerKind::B2buaInvite);
 
-    let (action, timer_override, credentials, li_record, preserve_call_id, policy_input) = Python::attach(|python| {
+    let (
+        action,
+        timer_override,
+        credentials,
+        li_record,
+        preserve_call_id,
+        policy_input,
+        from_host_override,
+        to_host_override,
+    ) = Python::attach(|python| {
         let call_obj = match Py::new(python, py_call) {
             Ok(obj) => obj,
             Err(error) => {
                 error!("failed to create PyCall: {error}");
-                return (CallAction::None, None, None, false, false, None);
+                return (CallAction::None, None, None, false, false, None, None, None);
             }
         };
 
@@ -7428,7 +7458,7 @@ fn handle_b2bua_invite(
                             return (CallAction::Reject {
                                 code: 500,
                                 reason: "Script Error".to_string(),
-                            }, None, None, false, false, None);
+                            }, None, None, false, false, None, None, None);
                         }
                     }
                 }
@@ -7437,7 +7467,7 @@ fn handle_b2bua_invite(
                     return (CallAction::Reject {
                         code: 500,
                         reason: "Script Error".to_string(),
-                    }, None, None, false, false, None);
+                    }, None, None, false, false, None, None, None);
                 }
             }
         }
@@ -7449,7 +7479,9 @@ fn handle_b2bua_invite(
         let li_record = borrowed.li_record();
         let preserve_cid = borrowed.preserve_call_id();
         let policy_input = borrowed.header_policy_input().cloned();
-        (action, timer_override, credentials, li_record, preserve_cid, policy_input)
+        let from_host_ovr = borrowed.from_host_override().map(String::from);
+        let to_host_ovr = borrowed.to_host_override().map(String::from);
+        (action, timer_override, credentials, li_record, preserve_cid, policy_input, from_host_ovr, to_host_ovr)
     });
 
     // Store the A-leg INVITE for later use by on_answer/on_failure/on_bye handlers
@@ -7501,6 +7533,8 @@ fn handle_b2bua_invite(
         || li_record
         || preserve_call_id
         || resolved_policy.is_some()
+        || from_host_override.is_some()
+        || to_host_override.is_some()
     {
         if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
             if let Some(override_config) = timer_override {
@@ -7515,6 +7549,12 @@ fn handle_b2bua_invite(
             call.preserve_call_id = preserve_call_id;
             if resolved_policy.is_some() {
                 call.resolved_header_policy = resolved_policy;
+            }
+            if from_host_override.is_some() {
+                call.from_host_override = from_host_override;
+            }
+            if to_host_override.is_some() {
+                call.to_host_override = to_host_override;
             }
         }
     }
@@ -7710,16 +7750,24 @@ fn b2bua_send_b_leg_invite(
     // Generate fresh dialog identifiers for the B-leg (proper B2BUA behavior).
     // Call-ID is new by default unless the script called call.preserve_call_id().
     // From-tag is always unique per B-leg regardless.
-    let (per_call_override, preserve_call_id, a_leg_call_id, a_leg_from_tag) =
-        match state.call_actors.get_call(call_id) {
-            Some(c) => (
-                c.session_timer_override.clone(),
-                c.preserve_call_id,
-                c.a_leg.dialog.call_id.clone(),
-                c.a_leg.dialog.remote_tag.clone().unwrap_or_default(),
-            ),
-            None => (None, false, String::new(), String::new()),
-        };
+    let (
+        per_call_override,
+        preserve_call_id,
+        a_leg_call_id,
+        a_leg_from_tag,
+        from_host_override,
+        to_host_override,
+    ) = match state.call_actors.get_call(call_id) {
+        Some(c) => (
+            c.session_timer_override.clone(),
+            c.preserve_call_id,
+            c.a_leg.dialog.call_id.clone(),
+            c.a_leg.dialog.remote_tag.clone().unwrap_or_default(),
+            c.from_host_override.clone(),
+            c.to_host_override.clone(),
+        ),
+        None => (None, false, String::new(), String::new(), None, None),
+    };
 
     let b_leg_call_id = if preserve_call_id {
         a_leg_call_id
@@ -7733,7 +7781,7 @@ fn b2bua_send_b_leg_invite(
 
     // Rewrite From for B-leg dialog:
     //  - Replace the tag with a fresh B-leg tag
-    //  - Rewrite the URI host to the B2BUA's own domain (mask A-leg identity)
+    //  - Rewrite the URI host (default: mask A-leg identity with our own host)
     if let Some(from) = b_leg_invite.headers.get("From")
         .or_else(|| b_leg_invite.headers.get("f"))
     {
@@ -7741,16 +7789,22 @@ fn b2bua_send_b_leg_invite(
         let new_pattern = format!("tag={}", b_leg_from_tag);
         let mut new_from = from.replace(&old_pattern, &new_pattern);
 
-        // Rewrite the host in the From URI to the B2BUA's advertised address.
+        // Rewrite the host in the From URI.  Default: the B2BUA advertised
+        // address (topology hiding — mask A-leg identity).  When the script
+        // pinned a host via `call.set_from_host()`, use that instead — opt
+        // out of From topology-hiding for multitenant edges that select the
+        // tenant from the From domain (a domainless call would otherwise land
+        // in the downstream's unauthenticated/default routing context).
         // From header format: ["Display" ]<sip:user@host[:port][;params]>[;tag=...]
-        let b2bua_host = state.via_host(&outbound_transport);
+        let from_host = from_host_override
+            .unwrap_or_else(|| state.via_host(&outbound_transport));
         if let Some(at_pos) = new_from.find('@') {
             // Find the end of the host: first occurrence of '>', ':', or ';' after '@'
             let after_at = &new_from[at_pos + 1..];
             let host_end = after_at.find(['>', ';', ':'])
                 .unwrap_or(after_at.len());
             let end_pos = at_pos + 1 + host_end;
-            new_from = format!("{}{}{}", &new_from[..at_pos + 1], b2bua_host, &new_from[end_pos..]);
+            new_from = format!("{}{}{}", &new_from[..at_pos + 1], from_host, &new_from[end_pos..]);
         }
 
         b_leg_invite.headers.set("From", new_from);
@@ -7781,22 +7835,28 @@ fn b2bua_send_b_leg_invite(
         if let Some(tag_start) = new_to.find(";tag=") {
             new_to = new_to[..tag_start].to_string();
         }
-        // Rewrite To URI host to the dial target's host
-        if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
-            if let Some(at_pos) = new_to.find('@') {
-                let after_at = &new_to[at_pos + 1..];
-                let host_end = after_at.find(['>', ';', ':'])
-                    .unwrap_or(after_at.len());
-                let end_pos = at_pos + 1 + host_end;
-                let target_host = &target_parsed.host;
+        // Rewrite the To URI host.  Default: the dial-target host (topology
+        // hiding).  When the script pinned a host via `call.set_to_host()`,
+        // use that instead (host only — the original To port is preserved).
+        if let Some(at_pos) = new_to.find('@') {
+            let after_at = &new_to[at_pos + 1..];
+            let host_end = after_at.find(['>', ';', ':'])
+                .unwrap_or(after_at.len());
+            let end_pos = at_pos + 1 + host_end;
+            let replacement = if let Some(ref pinned) = to_host_override {
+                pinned.clone()
+            } else if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
                 // Include port if present in target
-                let host_with_port = if let Some(port) = target_parsed.port {
-                    format!("{}:{}", target_host, port)
+                if let Some(port) = target_parsed.port {
+                    format!("{}:{}", target_parsed.host, port)
                 } else {
-                    target_host.clone()
-                };
-                new_to = format!("{}{}{}", &new_to[..at_pos + 1], host_with_port, &new_to[end_pos..]);
-            }
+                    target_parsed.host.clone()
+                }
+            } else {
+                // Unparseable target and no override — leave the host as-is.
+                new_to[at_pos + 1..end_pos].to_string()
+            };
+            new_to = format!("{}{}{}", &new_to[..at_pos + 1], replacement, &new_to[end_pos..]);
         }
         b_leg_invite.headers.set("To", new_to);
     }
@@ -7905,12 +7965,13 @@ fn b2bua_send_b_leg_invite(
             destination,
             data,
             source_local_addr: Some(flow.local_addr),
+            server_name: None,
         };
         if let Err(error) = state.outbound.send(outbound_message) {
             error!(call_id = %call_id, destination = %destination, transport = %outbound_transport, "B2BUA: flow send failed: {error}");
         }
     } else {
-        let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport) };
+        let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport), server_name: None };
         send_to_target(data, &relay_target, outbound_transport, ConnectionId::default(), state);
     }
 
@@ -8338,6 +8399,7 @@ fn handle_registrant_ipsec_challenge(
             destination,
             data,
             source_local_addr: Some(source),
+            server_name: None,
         };
         if let Err(error) = outbound.send(outbound_message) {
             warn!(aor = %aor_task, %error, "IPsec UE: failed to send protected REGISTER");
@@ -9592,6 +9654,7 @@ fn handle_b2bua_response(
                     let target = RelayTarget {
                         address: destination,
                         transport: Some(transport),
+                        server_name: None,
                     };
                     send_to_target(data, &target, transport, ConnectionId::default(), state);
                 }
@@ -10556,6 +10619,7 @@ fn handle_b2bua_bye(
         let target = RelayTarget {
             address: destination,
             transport: Some(transport),
+            server_name: None,
         };
         send_to_target(data, &target, transport, ConnectionId::default(), state);
     }
@@ -10879,6 +10943,7 @@ fn arm_reliable_provisional_retransmit(
                         destination,
                         data: bytes.clone(),
                         source_local_addr: None,
+                        server_name: None,
                     });
                     interval = (interval * 2).min(cap);
                 }
@@ -12965,6 +13030,20 @@ a=rtpmap:8 PCMA/8000\r\n";
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_candidates_carries_hostname_for_sni() {
+        let resolver = test_resolver();
+        // A SIP URI with a hostname → every candidate carries the host so a new
+        // outbound TLS connection presents it as SNI / certificate hostname.
+        let hosted = resolve_target("sip:alice@localhost:5090", &resolver)
+            .expect("localhost must resolve");
+        assert_eq!(hosted.server_name.as_deref(), Some("localhost"));
+
+        // A bare IP:port short-circuits → no SNI (RFC 6066 emits none for an IP).
+        let bare = resolve_target("192.0.2.1:5060", &resolver).expect("bare ip target");
+        assert!(bare.server_name.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn resolve_target_transport_tcp() {
         let resolver = test_resolver();
         let result = resolve_target("sip:alice@10.0.0.1:5060;transport=tcp", &resolver).unwrap();
@@ -12981,7 +13060,7 @@ a=rtpmap:8 PCMA/8000\r\n";
     // --- In-dialog connection reuse (RFC 5923) ---
 
     fn candidate(addr: &str) -> RelayTarget {
-        RelayTarget { address: addr.parse().unwrap(), transport: None }
+        RelayTarget { address: addr.parse().unwrap(), transport: None, server_name: None }
     }
 
     #[test]

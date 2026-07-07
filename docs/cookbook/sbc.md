@@ -42,8 +42,28 @@ def on_cancel(call):                            # caller abandoned before answer
 Each B-leg gets its own Call-ID and From-tag by default, so the two dialogs are fully
 decoupled — **topology hiding out of the box**. Other call methods: `call.fork(targets)`
 (ring several B-legs), `call.reject(code, reason)`, `call.terminate()`,
-`call.set_header` / `remove_header`, and B-leg userpart rewrites
-(`call.set_ruri_user` / `set_from_user` / `set_to_user`).
+`call.set_header` / `remove_header`, and B-leg URI rewrites — userpart
+(`call.set_ruri_user` / `set_from_user` / `set_to_user`) and host
+(`call.set_from_host` / `set_to_host`).
+
+### Keeping a tenant domain in the From
+
+Topology hiding rewrites the B-leg From host to SIPhon's advertised address and the To
+host to the dial target. That's the right default, but a multitenant downstream that
+selects the tenant from the From domain needs the original domain to survive — a
+domainless From lands the call in its unauthenticated/default routing context. Pin it:
+
+```python
+@b2bua.on_invite
+def on_invite(call):
+    call.set_from_host("tenant.example.com")   # keep the tenant domain in From
+    call.dial(str(call.ruri), next_hop="sip:pbx.example.com:5060")
+```
+
+`set_from_host` opts that leg out of the From host-rewrite; `set_to_host` pins the To
+host the same way (a declarative replacement for hand-building
+`set_header("To", "<sip:user@host>")`). Only the host changes — scheme, user, port,
+params, and tags are preserved — and both apply to `call.dial()` and `call.fork()`.
 
 ## Header policies — control what crosses the boundary
 
@@ -142,6 +162,38 @@ def on_invite(call):
     call.media.anchor(engine="rtpengine")
     call.dial(gateway.select("carriers").uri)
 ```
+
+## Upstream trunk requiring mutual TLS
+
+Some upstream SIP trunks require siphon to present a **client certificate** when
+it dials out over TLS — mutual TLS (for example Microsoft Teams Direct Routing).
+Without one, the peer aborts the handshake with `CertificateUnknown`. Attach the
+client identity in the top-level `tls:` block:
+
+```yaml
+tls:
+  certificate: "/etc/siphon/tls/example.com.crt"   # inbound server cert
+  private_key:  "/etc/siphon/tls/example.com.key"
+  # Presented on OUTBOUND TLS when the upstream trunk requests a client cert:
+  client_certificate: "/etc/siphon/tls/client.crt"
+  client_private_key: "/etc/siphon/tls/client.key"
+```
+
+Then dial the trunk over TLS as usual — the B2BUA presents the configured client
+certificate automatically:
+
+```python
+@b2bua.on_invite
+def on_invite(call):
+    call.media.anchor(engine="rtpengine")
+    call.dial("sip:+15551234567@sbc.example.com;transport=tls")
+```
+
+Both `client_certificate` and `client_private_key` must be set together (or
+neither); a one-sided setting or an unreadable file fails startup. The outbound
+handshake also sends the target hostname (`sbc.example.com`) as SNI, so a
+hostname-vhost trunk front-end can route it. Server-certificate verification is
+unchanged (permissive) — this only adds the client certificate siphon presents.
 
 ## See also
 

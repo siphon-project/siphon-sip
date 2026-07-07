@@ -101,20 +101,128 @@ pub struct ConnectionPool {
     connect_timeout: Duration,
 }
 
+/// A client identity siphon presents on OUTBOUND TLS connections when the
+/// upstream peer requests one (mutual TLS — SIP trunks that require
+/// client-certificate auth, e.g. carrier interconnects or Microsoft Teams
+/// Direct Routing).
+///
+/// Owned (`'static`) so it can be moved into the long-lived `ClientConfig`.
+pub struct OutboundClientIdentity {
+    pub chain: Vec<tokio_rustls::rustls::pki_types::CertificateDer<'static>>,
+    pub key: tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>,
+}
+
+/// Load an [`OutboundClientIdentity`] from a PEM certificate-chain path and a
+/// PEM private-key path.
+///
+/// Mirrors the loading/validation in [`crate::transport::tls::build_tls_acceptor`]:
+/// the files must be readable, the chain must contain at least one certificate,
+/// and the key must parse. Returns a clear `io::Error` otherwise.
+pub fn load_outbound_client_identity(
+    certificate_path: &str,
+    private_key_path: &str,
+) -> Result<OutboundClientIdentity, std::io::Error> {
+    use std::fs::File;
+    use std::io::BufReader;
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
+    use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+    let cert_file = File::open(certificate_path).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("failed to open outbound client certificate '{certificate_path}': {error}"),
+        )
+    })?;
+    let chain: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_reader_iter(&mut BufReader::new(cert_file))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("failed to parse outbound client certificate PEM: {error}"),
+                )
+            })?;
+    if chain.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "outbound client certificate file contains no certificates",
+        ));
+    }
+
+    let key_file = File::open(private_key_path).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("failed to open outbound client private key '{private_key_path}': {error}"),
+        )
+    })?;
+    let key = PrivateKeyDer::from_pem_reader(&mut BufReader::new(key_file)).map_err(|error| {
+        match error {
+            tokio_rustls::rustls::pki_types::pem::Error::NoItemsFound => std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "outbound client private key file contains no private key",
+            ),
+            other => std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("failed to parse outbound client private key PEM: {other}"),
+            ),
+        }
+    })?;
+
+    Ok(OutboundClientIdentity { chain, key })
+}
+
 /// Build a permissive TLS client config that accepts any server certificate.
 ///
 /// SIP trunks and interconnect peers rarely present certificates chained to
-/// public CAs, so we disable verification by default (same as OpenSIPS/Kamailio
-/// `tls_verify_server = 0`).
-fn build_outbound_tls_config() -> Arc<tokio_rustls::rustls::ClientConfig> {
+/// public CAs, so we disable server verification by default (same as
+/// OpenSIPS/Kamailio `tls_verify_server = 0`). Server verification is
+/// unchanged; the only variable is whether siphon presents a *client*
+/// certificate when the peer requests one (mutual TLS).
+///
+/// When `identity` is `Some`, siphon presents that client certificate chain +
+/// key; when `None`, no client certificate is presented (prior behavior).
+pub fn build_outbound_tls_config(
+    identity: Option<OutboundClientIdentity>,
+) -> Result<Arc<tokio_rustls::rustls::ClientConfig>, std::io::Error> {
     use tokio_rustls::rustls;
 
-    let config = rustls::ClientConfig::builder()
+    let builder = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify))
-        .with_no_client_auth();
+        .with_custom_certificate_verifier(Arc::new(NoVerify));
 
-    Arc::new(config)
+    let config = match identity {
+        Some(identity) => builder
+            .with_client_auth_cert(identity.chain, identity.key)
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("failed to build outbound client-auth TLS config: {error}"),
+                )
+            })?,
+        None => builder.with_no_client_auth(),
+    };
+
+    Ok(Arc::new(config))
+}
+
+/// Resolve the TLS `ServerName` (SNI / certificate hostname) for an outbound
+/// handshake.
+///
+/// When `sni` is `Some(host)`, the hostname is used verbatim — RFC 6066 SNI is
+/// emitted so a hostname-vhost front-end (upstream SIP trunk / Teams Direct
+/// Routing) can route the handshake. When `None`, the destination IP literal
+/// is used; rustls sends no SNI for an IP literal (RFC 6066).
+fn resolve_server_name(
+    destination: SocketAddr,
+    sni: Option<&str>,
+) -> Result<tokio_rustls::rustls::pki_types::ServerName<'static>, std::io::Error> {
+    use tokio_rustls::rustls::pki_types::ServerName;
+    let name = match sni {
+        Some(host) => host.to_owned(),
+        None => destination.ip().to_string(),
+    };
+    ServerName::try_from(name)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
 }
 
 /// Certificate verifier that accepts any server certificate (no verification).
@@ -166,6 +274,7 @@ impl ConnectionPool {
         tos: Option<u32>,
         stream_connections: Option<StreamConnections>,
         crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
+        tls_client_config: Arc<tokio_rustls::rustls::ClientConfig>,
     ) -> Self {
         Self {
             connections: Arc::new(DashMap::new()),
@@ -174,7 +283,7 @@ impl ConnectionPool {
             inbound_tx,
             local_addr,
             tos,
-            tls_connector: TlsConnector::from(build_outbound_tls_config()),
+            tls_connector: TlsConnector::from(tls_client_config),
             stream_connections,
             crlf_pong_tracker,
             connect_timeout: TCP_CONNECT_TIMEOUT,
@@ -497,10 +606,18 @@ impl ConnectionPool {
 
     /// Send data to a destination, creating or reusing a pooled TLS connection.
     ///
+    /// `server_name` is the SNI / certificate hostname to present in the TLS
+    /// handshake. When `Some(host)`, that hostname is used (RFC 6066 SNI is
+    /// emitted, letting a hostname-vhost front-end route the handshake — and
+    /// server-certificate hostname validation, if ever enabled, would match).
+    /// When `None`, the destination IP literal is used (RFC 6066 forbids SNI
+    /// for IP literals, so none is sent — prior behavior).
+    ///
     /// Returns the `ConnectionId` used (so responses can be correlated).
     pub async fn send_tls(
         &self,
         destination: SocketAddr,
+        server_name: Option<&str>,
         data: Bytes,
     ) -> Result<ConnectionId, std::io::Error> {
         let key = PoolKey {
@@ -544,13 +661,12 @@ impl ConnectionPool {
         };
         configure_tcp_socket(&tcp_stream, self.tos);
 
-        // TLS handshake — use the destination IP as SNI
-        let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(
-            destination.ip().to_string()
-        ).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        // TLS handshake — SNI/certificate hostname from `server_name` when the
+        // relay resolved a hostname; else the destination IP literal.
+        let handshake_name = resolve_server_name(destination, server_name)?;
         let tls_stream = match tokio::time::timeout(
             self.connect_timeout,
-            self.tls_connector.connect(server_name, tcp_stream),
+            self.tls_connector.connect(handshake_name, tcp_stream),
         )
         .await
         {
@@ -730,6 +846,7 @@ mod tests {
             None,
             None,
             None,
+            build_outbound_tls_config(None).expect("outbound tls config"),
         );
 
         // Send via pool
@@ -782,6 +899,7 @@ mod tests {
             None,
             None,
             None,
+            build_outbound_tls_config(None).expect("outbound tls config"),
         );
 
         let id1 = pool
@@ -824,6 +942,7 @@ mod tests {
             None,
             None,
             None,
+            build_outbound_tls_config(None).expect("outbound tls config"),
         );
 
         let id1 = pool
@@ -891,6 +1010,7 @@ mod tests {
             None,
             None,
             None,
+            build_outbound_tls_config(None).expect("outbound tls config"),
         );
 
         let connection_id = pool
@@ -931,6 +1051,7 @@ mod tests {
             None,
             None,
             None,
+            build_outbound_tls_config(None).expect("outbound tls config"),
         );
         // Short timeout so the test exercises the timeout branch in ms.
         pool.connect_timeout = Duration::from_millis(150);
@@ -1001,6 +1122,7 @@ mod tests {
             None,
             None,
             None,
+            build_outbound_tls_config(None).expect("outbound tls config"),
         ));
 
         // Fire N concurrent sends from the same fixed source.
@@ -1033,6 +1155,238 @@ mod tests {
             accepted.load(Ordering::SeqCst),
             1,
             "server accepted more than one connection — establishment did not coalesce"
+        );
+    }
+
+    // --- Outbound mutual-TLS + SNI ---------------------------------------
+
+    /// CA-signed material for the mutual-TLS tests: a CA, a server cert
+    /// (SAN `localhost` / `127.0.0.1`), and a CLIENT cert (ClientAuth EKU)
+    /// both signed by that CA.
+    struct MtlsCerts {
+        ca_cert_der: tokio_rustls::rustls::pki_types::CertificateDer<'static>,
+        server_cert_der: tokio_rustls::rustls::pki_types::CertificateDer<'static>,
+        server_key_der: tokio_rustls::rustls::pki_types::PrivateKeyDer<'static>,
+        client_cert_pem: String,
+        client_key_pem: String,
+    }
+
+    fn generate_mtls_certs() -> MtlsCerts {
+        use rcgen::{
+            BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+            KeyUsagePurpose,
+        };
+        use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let ca_key = KeyPair::generate().expect("ca keygen");
+        let mut ca_params =
+            CertificateParams::new(vec!["siphon-test-ca".to_string()]).expect("ca params");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let ca_cert = ca_params.self_signed(&ca_key).expect("ca self-sign");
+        let ca_cert_der = ca_cert.der().clone();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        // Server cert signed by the CA.
+        let server_key = KeyPair::generate().expect("server keygen");
+        let server_params =
+            CertificateParams::new(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .expect("server params");
+        let server_cert = server_params
+            .signed_by(&server_key, &issuer)
+            .expect("server sign");
+        let server_cert_der = server_cert.der().clone();
+        let server_key_der =
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der()));
+
+        // Client cert signed by the CA, with the ClientAuth EKU webpki wants.
+        let client_key = KeyPair::generate().expect("client keygen");
+        let mut client_params =
+            CertificateParams::new(vec!["siphon-test-client".to_string()]).expect("client params");
+        client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let client_cert = client_params
+            .signed_by(&client_key, &issuer)
+            .expect("client sign");
+
+        MtlsCerts {
+            ca_cert_der,
+            server_cert_der,
+            server_key_der,
+            client_cert_pem: client_cert.pem(),
+            client_key_pem: client_key.serialize_pem(),
+        }
+    }
+
+    /// A TLS server acceptor that REQUIRES and verifies a client certificate
+    /// against the CA. Pinned to TLS 1.2 so a missing client cert is rejected
+    /// *during* the handshake (client `connect().await` then returns `Err`
+    /// deterministically — under TLS 1.3 client-auth failure surfaces late).
+    fn mtls_server_acceptor(certs: &MtlsCerts) -> tokio_rustls::TlsAcceptor {
+        use tokio_rustls::rustls::server::WebPkiClientVerifier;
+        use tokio_rustls::rustls::{version, RootCertStore, ServerConfig};
+
+        let mut roots = RootCertStore::empty();
+        roots.add(certs.ca_cert_der.clone()).expect("add ca to roots");
+        let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
+            .build()
+            .expect("build client verifier");
+        let server_config = ServerConfig::builder_with_protocol_versions(&[&version::TLS12])
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![certs.server_cert_der.clone()],
+                certs.server_key_der.clone_key(),
+            )
+            .expect("server config");
+        tokio_rustls::TlsAcceptor::from(Arc::new(server_config))
+    }
+
+    #[tokio::test]
+    async fn build_outbound_tls_config_none_and_some_both_build() {
+        ensure_crypto_provider();
+        // No client identity — prior behavior (no client auth).
+        assert!(build_outbound_tls_config(None).is_ok());
+
+        // A valid client identity, loaded via the production PEM loader.
+        let certs = generate_mtls_certs();
+        let directory = tempfile::tempdir().unwrap();
+        let cert_path = directory.path().join("client.crt");
+        let key_path = directory.path().join("client.key");
+        std::fs::write(&cert_path, &certs.client_cert_pem).unwrap();
+        std::fs::write(&key_path, &certs.client_key_pem).unwrap();
+        let identity = load_outbound_client_identity(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+        )
+        .expect("client identity must load");
+        assert!(build_outbound_tls_config(Some(identity)).is_ok());
+    }
+
+    #[test]
+    fn resolve_server_name_prefers_hostname_then_ip() {
+        use tokio_rustls::rustls::pki_types::ServerName;
+        let destination: SocketAddr = "192.0.2.1:5061".parse().unwrap();
+
+        // Hostname present → SNI-capable DnsName.
+        let name = resolve_server_name(destination, Some("sbc.example.com"))
+            .expect("hostname must resolve to a ServerName");
+        match name {
+            ServerName::DnsName(dns) => assert_eq!(dns.as_ref(), "sbc.example.com"),
+            other => panic!("expected DnsName, got {other:?}"),
+        }
+
+        // No hostname → IP literal (rustls emits no SNI for an IP).
+        let ip_name = resolve_server_name(destination, None)
+            .expect("IP destination must resolve to a ServerName");
+        assert!(
+            matches!(ip_name, ServerName::IpAddress(_)),
+            "IP destination must yield an IpAddress ServerName"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mtls_handshake_succeeds_with_client_cert_and_fails_without() {
+        ensure_crypto_provider();
+        let certs = generate_mtls_certs();
+
+        // ---- (a) WITH a matching client identity: handshake succeeds ------
+        let acceptor = mtls_server_acceptor(&certs);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept");
+            let mut tls = acceptor
+                .accept(tcp)
+                .await
+                .expect("server handshake with a valid client cert must succeed");
+            let mut buffer = vec![0u8; 1024];
+            let size = tls.read(&mut buffer).await.expect("read app data");
+            String::from_utf8_lossy(&buffer[..size]).to_string()
+        });
+
+        // Load the client identity through the production PEM loader.
+        let directory = tempfile::tempdir().unwrap();
+        let cert_path = directory.path().join("client.crt");
+        let key_path = directory.path().join("client.key");
+        std::fs::write(&cert_path, &certs.client_cert_pem).unwrap();
+        std::fs::write(&key_path, &certs.client_key_pem).unwrap();
+        let identity = load_outbound_client_identity(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+        )
+        .expect("client identity must load");
+        let client_config = build_outbound_tls_config(Some(identity)).expect("client config");
+
+        let connection_map = Arc::new(DashMap::new());
+        let (inbound_tx, _inbound_rx) = flume::unbounded();
+        let pool = ConnectionPool::new(
+            connection_map,
+            inbound_tx,
+            "127.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
+            None,
+            client_config,
+        );
+
+        let data = Bytes::from_static(b"OPTIONS sip:peer@example.com SIP/2.0\r\n\r\n");
+        let outcome = pool.send_tls(server_addr, Some("localhost"), data).await;
+        assert!(
+            outcome.is_ok(),
+            "mTLS handshake with a valid client cert must succeed: {:?}",
+            outcome.err()
+        );
+
+        let received = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server task timed out")
+            .expect("server task panicked");
+        assert!(
+            received.contains("OPTIONS"),
+            "server did not receive app data over mTLS: {received}"
+        );
+
+        // ---- (b) WITHOUT a client identity: mandatory-mTLS server rejects -
+        let acceptor2 = mtls_server_acceptor(&certs);
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr2 = listener2.local_addr().unwrap();
+        let server2 = tokio::spawn(async move {
+            let (tcp, _) = listener2.accept().await.expect("accept");
+            // Server handshake MUST fail — no client certificate presented.
+            acceptor2.accept(tcp).await.is_err()
+        });
+
+        let no_auth_config = build_outbound_tls_config(None).expect("no-auth client config");
+        let connection_map2 = Arc::new(DashMap::new());
+        let (inbound_tx2, _inbound_rx2) = flume::unbounded();
+        let pool2 = ConnectionPool::new(
+            connection_map2,
+            inbound_tx2,
+            "127.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
+            None,
+            no_auth_config,
+        );
+
+        let outcome2 = pool2
+            .send_tls(server_addr2, Some("localhost"), Bytes::from_static(b"PING"))
+            .await;
+        assert!(
+            outcome2.is_err(),
+            "a handshake without a client cert against a mandatory-mTLS server must fail"
+        );
+
+        let server_rejected = tokio::time::timeout(Duration::from_secs(5), server2)
+            .await
+            .expect("server2 task timed out")
+            .expect("server2 task panicked");
+        assert!(
+            server_rejected,
+            "server must reject the handshake when no client cert is presented"
         );
     }
 }

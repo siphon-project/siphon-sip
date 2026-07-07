@@ -84,6 +84,51 @@ class Call:
         """Source IP address of the A-leg caller."""
         return self._source_ip
 
+    def from_gateway(self, group_name: str) -> bool:
+        """Check if the A-leg source IP is a member of a gateway group.
+
+        The B2BUA equivalent of ``request.from_gateway`` — returns ``True``
+        when the A-leg caller's source IP is one of the resolved addresses of
+        the gateway group ``group_name`` (configured under ``gateway.groups``
+        in ``siphon.yaml``, or via ``gateway.add_group``).  This is siphon's
+        answer to Kamailio ``ds_is_from_list()`` / OpenSIPS ``ds_is_in_list()``
+        — a routing-direction / trust predicate that replaces hardcoded source
+        CIDRs.
+
+        The match is on IP only (source port ignored) against **every**
+        resolved address in the group, so a hostname that round-robins across
+        many IPs matches on any of them.
+
+        Infallible: returns ``False`` (never raises) when the group does not
+        exist, no gateway is configured, or the source IP does not parse.
+
+        Security: on connection-oriented transports (TCP/TLS/WS/WSS) the source
+        IP is handshake-verified and trustworthy as an authorization signal; on
+        UDP it is spoofable, so ``from_gateway`` there is a best-effort
+        direction hint, not an auth gate.
+
+        Args:
+            group_name: Name of the gateway group to test membership against.
+
+        Returns:
+            ``True`` if the A-leg source IP belongs to the group.
+
+        Example::
+
+            @b2bua.on_invite
+            def on_invite(call):
+                if call.from_gateway("teams"):
+                    # Inbound from Microsoft Teams — bridge to the PBX.
+                    call.dial("sip:pbx.internal:5060")
+                else:
+                    call.reject(403, "Forbidden")
+        """
+        # Lazy import avoids a circular import (mock_module imports from the
+        # request module, which this module also imports at load time).
+        from siphon_sdk.mock_module import get_gateway
+
+        return get_gateway().contains_source(group_name, self._source_ip)
+
     @property
     def from_uri(self) -> Optional[SipUri]:
         """From URI of the A-leg INVITE."""
@@ -505,6 +550,60 @@ class Call:
         """
         if self._to_uri is not None:
             self._to_uri.user = value
+
+    def set_from_host(self, value: str) -> None:
+        """Pin the host part of the B-leg From header URI.
+
+        By default the B2BUA rewrites the From URI host to its own advertised
+        address (topology hiding — masking the A-leg identity).  At a
+        multitenant edge the downstream selects the tenant from the From
+        domain: a domainless call lands in an unauthenticated/default routing
+        context, so the tenant domain must survive.  ``set_from_host()`` opts
+        this leg out of the From host-rewrite and pins the host to ``value``.
+
+        Only the host changes; scheme/user/port/params and the From-tag are
+        preserved.  ``value`` is a bare host (no port).  Must be called before
+        :meth:`dial` for the change to take effect on the B-leg INVITE — same
+        model as :meth:`set_from_user`.
+
+        Args:
+            value: New host (e.g. ``"tenant.example.com"``).
+
+        Example::
+
+            @b2bua.on_invite
+            async def on_invite(call):
+                call.set_from_host("tenant.example.com")
+                call.dial(str(call.ruri), next_hop="sip:pbx.example.com:5060")
+        """
+        if self._from_uri is not None:
+            self._from_uri.host = value
+
+    def set_to_host(self, value: str) -> None:
+        """Pin the host part of the B-leg To header URI.
+
+        By default the B2BUA rewrites the To URI host to the dial-target host.
+        ``set_to_host()`` pins it to ``value`` instead, so the To domain does
+        what the script says regardless of the routing next-hop (declarative
+        replacement for the raw ``set_header("To", "<sip:user@host>")`` idiom).
+
+        Only the host changes; scheme/user/port/params and any To-tag are
+        preserved.  ``value`` is a bare host (no port).  Must be called before
+        :meth:`dial` — same model as :meth:`set_to_user`.
+
+        Args:
+            value: New host (e.g. ``"trunk.example.com"``).
+
+        Example::
+
+            @b2bua.on_invite
+            async def on_invite(call):
+                call.set_to_user(callee)
+                call.set_to_host(TRUNK_DOMAIN)
+                call.dial(str(call.ruri))
+        """
+        if self._to_uri is not None:
+            self._to_uri.host = value
 
     # -- Header access ---------------------------------------------------------
 
