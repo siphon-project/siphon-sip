@@ -754,6 +754,18 @@ Release history is tracked in [CHANGELOG.md](CHANGELOG.md).
 
 SIPhon stands on the shoulders of [Kamailio](https://www.kamailio.org/) and [OpenSIPS](https://opensips.org/). Their decades of work defining how SIP proxies should behave — from transaction handling semantics to registrar storage patterns to the idea that routing logic should be scriptable — is the foundation this project builds on. If SIPhon's architecture feels familiar, that's by design.
 
+## Platform Partner
+
+<p align="center">
+  <a href="https://cellact.nl/"><img src="assets/partners/cellact-arnacon.png" alt="Cellact and Arnacon — SIPhon Platform Partner" width="360"></a>
+</p>
+
+SIPhon's continued development is backed by **[Cellact](https://cellact.nl/)** and its
+Web3 telecom project **[Arnacon](https://www.arnacon.com/)** as a **Platform Partner**.
+Arnacon is their decentralized take on telephony: encrypted calls and messaging tied to an
+identity you own instead of a carrier-issued number. Their support helps drive the SIPhon
+roadmap forward.
+
 ## Commercial Support
 
 SIPhon is MIT-licensed and free to use in production. If you'd like a hand getting it
@@ -766,7 +778,8 @@ Reach out via [realtime-telecom.nl](https://realtime-telecom.nl) to talk specifi
 ## Sponsors
 
 Ongoing development is backed by **[Real Time Telecom B.V.](https://realtime-telecom.nl)**,
-SIPhon's founding sponsor. Need a particular feature built or fast-tracked? Feature
+SIPhon's founding sponsor, with **[Cellact / Arnacon](https://www.arnacon.com/)** as a
+[Platform Partner](#platform-partner). Need a particular feature built or fast-tracked? Feature
 sponsorship is welcome — use the **Sponsor** button on the repository, or get in touch
 through RTT.
 
