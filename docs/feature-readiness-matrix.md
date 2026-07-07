@@ -166,7 +166,8 @@ This document tracks the maturity of every SIPhon feature across three readiness
 
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
-| CDR generation | Implemented | `cdr:` | |
+| CDR generation | Implemented | `cdr:` | Auto-emit per call (`cdr.auto_emit`) — proxy + B2BUA, with duration + disconnect_initiator; plus script `cdr.write(request)` (proxy) / `cdr.write(call)` (B2BUA), additive |
+| REGISTER CDRs | Implemented | `cdr.include_register` | With `auto_emit`, one CDR per registrar state change (`reg_event`) |
 | File backend (JSON-lines) | Implemented | `cdr.backend: file` | With rotation |
 | Syslog backend | Implemented | `cdr.backend: syslog` | UDP syslog |
 | HTTP webhook backend | Implemented | `cdr.backend: http` | POST with optional auth header |

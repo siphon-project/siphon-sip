@@ -160,6 +160,10 @@ tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 # on other kernels; consumers gate the netlink backend on cfg(target_os).
 [target.'cfg(target_os = "linux")'.dependencies]
 netlink-sys = "0.8"
+# Already a hard dependency of netlink-sys (zero new crates) — declared
+# directly for the `SO_RCVTIMEO` setsockopt on the nf_tables ack socket, which
+# netlink-sys does not expose.
+libc = "0.2"
 
 [dev-dependencies]
 proptest = "1"

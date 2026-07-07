@@ -63,6 +63,30 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   params and tags are preserved. Applies to both `call.dial()` and `call.fork()`.
   Mirrored in the `siphon-sip` SDK mock; new SIPp acceptance scenario
   (`sipp/b2bua_set_host_uas.xml`).
+- **Kernel firewall (`security.firewall`).** Mirror SIPhon's bans — the
+  confidence-weighted `failed_auth_ban` store and the APIBAN blocklist — into a
+  kernel nf_tables set, so abusive sources are dropped in the kernel before they
+  reach SIPhon's socket instead of only in the userspace ACL. Self-contained:
+  SIPhon programs the set directly over netlink (no `nft` shell-out, no daemon, no
+  new dependencies), and the kernel auto-expires each ban via a per-element timeout
+  matching the in-memory TTL. Opt-in, Linux-only, needs `CAP_NET_ADMIN`; falls back
+  to the userspace ACL with a warning when it's missing. Zero-touch by default:
+  SIPhon owns the whole ruleset (table, sets, base chain, and the `saddr @banned
+  drop` rules), so `firewall: {}` is all that's needed; set `manage_rule: false` to
+  have SIPhon maintain only the sets and reference them from your own ruleset. Two
+  new counters make the runtime failure modes observable:
+  `siphon_firewall_command_failures_total` (a ban did not reach the kernel — alert
+  on it) and `siphon_firewall_commands_dropped_total` (a ban storm outran the
+  netlink actor's queue; the userspace ACL still enforces every ban). Also expands
+  the security cookbook with the ban-scoring model and adds a Kernel firewall page
+  covering `CAP_NET_ADMIN` per runtime, container behaviour, and the
+  nftables-vs-XDP tradeoff.
+- **Admin API ban management** — `GET /admin/bans` lists the sources currently
+  auto-banned by `failed_auth_ban` (with remaining TTL), and
+  `DELETE /admin/bans/{ip}` lifts a ban early for an operator clearing a false
+  positive. The unban clears the userspace ban and, when the kernel firewall is
+  enabled, removes the matching nf_tables element in lockstep so the in-kernel
+  drop is lifted too.
 - **Outbound TLS client certificate (mutual TLS).** New `tls.client_certificate`
   and `tls.client_private_key` (PEM chain + key). When set, siphon presents that
   client certificate on outbound TLS connections whose peer requests one — for
@@ -95,6 +119,33 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   (TCP/TLS/WS/WSS) the source IP is handshake-verified and trustworthy as an
   authorization signal; on UDP it is spoofable, so `from_gateway` there is a
   best-effort direction hint, not an auth gate.
+- **Automatic CDR generation (`cdr.auto_emit`).** With `cdr.auto_emit: true`,
+  siphon now writes one CDR per call automatically on the call lifecycle — no
+  `cdr.write()` in the script — for both the proxy and B2BUA datapaths. The
+  record carries `timestamp_start` (INVITE), `timestamp_answer` (200),
+  `timestamp_end` (BYE), `duration_secs`, `response_code`, and
+  `disconnect_initiator` (`caller`/`callee`/`timeout`/`error`). Every teardown
+  is covered: answered→BYE (either side), B-leg failure, answer-timeout (408),
+  and caller CANCEL (487). Default **off**, so manual-only deployments are
+  unchanged; manual `cdr.write()` still works and stacks on top. The previously
+  **inert** `cdr.include_register` flag is now wired: with `auto_emit`, each
+  registrar state change emits a REGISTER CDR (`reg_event` = registered /
+  refreshed / deregistered / expired). New `siphon_cdr_sessions` gauge exposes
+  the live per-call tracking count (drains to 0 between calls; a steady climb
+  is a teardown-hook leak). Per-call state is bounded by the orphan sweep.
+
+### Fixed
+- **`cdr.write()` now accepts a B2BUA `Call`, not just a proxy `Request`.**
+  Calling `cdr.write(call, extra=…)` from a `@b2bua.on_answer` / `on_bye` /
+  `on_failure` / `on_early_media` / `on_cancel` handler previously raised
+  `TypeError: 'Call' object is not an instance of 'Request'` — the method was
+  typed for `Request` only, so B2BUA scripts had no way to write a CDR. It is
+  now polymorphic: a `Call` produces the same record shape as a `Request`
+  (method `INVITE`, Call-ID / From / To / R-URI / source IP off the A-leg
+  INVITE, plus the same Rf `rf_session_id` / `rf_result_code` auto-stamp), with
+  the A-leg's arrival transport threaded through so the `transport` field is
+  correct. Passing any other object now raises a clear `TypeError`. Mirrored in
+  the SDK mock (`cdr.write(call)`).
 
 ## [1.1.1] — 2026-07-02
 

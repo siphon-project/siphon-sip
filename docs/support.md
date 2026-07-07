@@ -31,3 +31,13 @@ RTT to scope it.
 
 Ongoing development is backed by
 **[Real Time Telecom B.V.](https://realtime-telecom.nl)**, the project's founding sponsor.
+
+### Platform Partner
+
+<p align="center">
+  <a href="https://cellact.nl/"><img src="assets/partners/cellact-arnacon.png" alt="Cellact and Arnacon — SIPhon Platform Partner" width="320"></a>
+</p>
+
+**[Cellact](https://cellact.nl/)** and its Web3 telecom project
+**[Arnacon](https://www.arnacon.com/)** back SIPhon as a Platform Partner. Their support
+helps drive the roadmap forward.

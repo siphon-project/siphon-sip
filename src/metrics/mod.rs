@@ -75,6 +75,12 @@ pub struct SiphonMetrics {
     /// means completed-call dialog keys are leaking (`by_dialog_key`).
     pub proxy_dialog_sessions: IntGauge,
 
+    /// Live `cdr.auto_emit` per-call tracking entries (INVITE → answer → BYE).
+    /// Returns to ~0 when calls are idle; a monotonic climb under a steady,
+    /// completed-call workload means a call teardown hook isn't draining the
+    /// `cdr_sessions` store. Zero when `cdr.auto_emit` is off.
+    pub cdr_sessions: IntGauge,
+
     /// Live SUBSCRIBE dialogs in the L1 `subscribe_state` store.  A monotonic
     /// climb under a steady subscribe/expire workload means expired dialogs
     /// are leaking (L1 has no TTL; the sweep reaps them).
@@ -187,6 +193,16 @@ pub struct SiphonMetrics {
     /// `security.rate_limit.max_requests` within the window (PIKE-style flood
     /// protection). trusted_cidrs are never counted.
     pub rate_limited_total: IntCounter,
+    /// Total kernel-firewall (nf_tables) commands dropped before reaching the
+    /// netlink actor because its queue was full — only plausible under a ban
+    /// storm. The userspace ACL still enforces the dropped ban; a sustained
+    /// rate means kernel enforcement is lagging the ban rate.
+    pub firewall_commands_dropped_total: IntCounter,
+    /// Total kernel-firewall (nf_tables) netlink commands that failed. Any
+    /// non-zero rate means bans are NOT being enforced in the kernel (ruleset
+    /// deleted out from under siphon, capability lost, nf_tables broken) —
+    /// alert on it; the userspace ACL is the only enforcement left.
+    pub firewall_command_failures_total: IntCounter,
 
     // --- Diameter ---
     pub diameter_peers_connected: IntGauge,
@@ -253,6 +269,11 @@ impl SiphonMetrics {
         let proxy_dialog_sessions = IntGauge::new(
             "siphon_proxy_dialog_sessions",
             "Live proxy dialog-key entries (INVITEs within their 2xx ACK window)",
+        )?;
+
+        let cdr_sessions = IntGauge::new(
+            "siphon_cdr_sessions",
+            "Live cdr.auto_emit per-call tracking entries (INVITE to BYE)",
         )?;
 
         let subscribe_dialogs = IntGauge::new(
@@ -403,6 +424,16 @@ impl SiphonMetrics {
             "Total inbound requests dropped because the source exceeded security.rate_limit.max_requests within the window",
         )?;
 
+        let firewall_commands_dropped_total = IntCounter::new(
+            "siphon_firewall_commands_dropped_total",
+            "Total kernel-firewall (nf_tables) commands dropped because the netlink actor queue was full",
+        )?;
+
+        let firewall_command_failures_total = IntCounter::new(
+            "siphon_firewall_command_failures_total",
+            "Total kernel-firewall (nf_tables) netlink commands that failed — bans not enforced in the kernel",
+        )?;
+
         let diameter_peers_connected = IntGauge::new(
             "siphon_diameter_peers_connected",
             "Number of currently connected Diameter peers",
@@ -485,6 +516,7 @@ impl SiphonMetrics {
         registry.register(Box::new(transactions_active.clone()))?;
         registry.register(Box::new(uac_pending_requests.clone()))?;
         registry.register(Box::new(proxy_dialog_sessions.clone()))?;
+        registry.register(Box::new(cdr_sessions.clone()))?;
         registry.register(Box::new(subscribe_dialogs.clone()))?;
         registry.register(Box::new(ipsec_sa_pairs.clone()))?;
         registry.register(Box::new(registrations_active.clone()))?;
@@ -515,6 +547,8 @@ impl SiphonMetrics {
         registry.register(Box::new(malformed_messages_total.clone()))?;
         registry.register(Box::new(scanner_blocked_total.clone()))?;
         registry.register(Box::new(rate_limited_total.clone()))?;
+        registry.register(Box::new(firewall_commands_dropped_total.clone()))?;
+        registry.register(Box::new(firewall_command_failures_total.clone()))?;
         registry.register(Box::new(diameter_peers_connected.clone()))?;
         registry.register(Box::new(diameter_requests_total.clone()))?;
         registry.register(Box::new(diameter_request_errors_total.clone()))?;
@@ -537,6 +571,7 @@ impl SiphonMetrics {
             transactions_active,
             uac_pending_requests,
             proxy_dialog_sessions,
+            cdr_sessions,
             subscribe_dialogs,
             ipsec_sa_pairs,
             registrations_active,
@@ -567,6 +602,8 @@ impl SiphonMetrics {
             malformed_messages_total,
             scanner_blocked_total,
             rate_limited_total,
+            firewall_commands_dropped_total,
+            firewall_command_failures_total,
             diameter_peers_connected,
             diameter_requests_total,
             diameter_request_errors_total,

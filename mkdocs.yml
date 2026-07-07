@@ -52,6 +52,7 @@ nav:
   - Running in production:
       - Transports & networking: transports.md
       - Media engines (rtpengine / siphon-rtp): media-engines.md
+      - Kernel firewall (nf_tables): kernel-firewall.md
       - Scaling, clustering & redundancy: scaling-and-redundancy.md
       - Deployment & operations: deployment.md
       - Supply chain & SBOM: supply-chain.md
