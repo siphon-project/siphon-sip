@@ -8,8 +8,9 @@
 //! encoding — so the two can be compared head-to-head. The benched message is a
 //! representative `offer` carrying an SDP body (the realistic large value).
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use siphon_rtp_proto::{frame, CmdResult, Command, ProfileFlags, Request, Response};
+use std::hint::black_box;
 
 const OFFER_SDP: &str = concat!(
     "v=0\r\n",
