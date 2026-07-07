@@ -35,7 +35,7 @@ Ongoing development is backed by
 ### Platform Partner
 
 <p align="center">
-  <a href="https://www.arnacon.com/"><img src="assets/partners/arnacon.png" alt="Arnacon by Cellact — Platform Partner" width="300"></a>
+  <a href="https://cellact.nl/"><img src="assets/partners/cellact-arnacon.png" alt="Cellact and Arnacon — SIPhon Platform Partner" width="320"></a>
 </p>
 
 **[Cellact](https://cellact.nl/)** and its Web3 telecom project

@@ -757,7 +757,7 @@ SIPhon stands on the shoulders of [Kamailio](https://www.kamailio.org/) and [Ope
 ## Platform Partner
 
 <p align="center">
-  <a href="https://www.arnacon.com/"><img src="assets/partners/arnacon.png" alt="Arnacon by Cellact — Platform Partner" width="320"></a>
+  <a href="https://cellact.nl/"><img src="assets/partners/cellact-arnacon.png" alt="Cellact and Arnacon — SIPhon Platform Partner" width="360"></a>
 </p>
 
 SIPhon's continued development is backed by **[Cellact](https://cellact.nl/)** and its
