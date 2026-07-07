@@ -21,23 +21,7 @@ That client identity is configured with ``tls.client_certificate`` /
 
 Run: ``siphon -c examples/teams_sbc.yaml``
 """
-import ipaddress
-
 from siphon import b2bua, proxy, gateway, rtpengine, log
-
-# Teams Direct Routing SIP signalling (sip/sip2/sip3.pstnhub.microsoft.com)
-# resolves into this range. Confirm against Microsoft's current published
-# ranges before production.
-TEAMS_SIGNALLING = [ipaddress.ip_network("52.114.0.0/16")]
-
-
-def _from_teams(call) -> bool:
-    """True when the inbound leg originated from the Teams signalling range."""
-    try:
-        source = ipaddress.ip_address(call.source_ip)
-    except ValueError:
-        return False
-    return any(source in net for net in TEAMS_SIGNALLING)
 
 
 @proxy.on_request("OPTIONS")
@@ -48,7 +32,11 @@ def health(request):
 
 @b2bua.on_invite
 async def route(call):
-    if _from_teams(call):
+    # Detect direction by gateway membership (source IP in the "teams" group's
+    # resolved addresses) instead of a hardcoded CIDR — the trunk list lives in
+    # gateway.groups, and this tracks Teams' sip/sip2/sip3 endpoints as they
+    # resolve. Trustworthy here because the leg arrives over (mutual) TLS.
+    if call.from_gateway("teams"):
         # Teams -> PSTN: hand the call to the carrier trunk, transcode the
         # SRTP Teams offers down to RTP for the carrier.
         destination = gateway.select("carrier")
