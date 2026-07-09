@@ -1239,6 +1239,39 @@ impl PyRequest {
         rewrite_display_name(&mut message, "To", display_name)
     }
 
+    /// Replace the whole From header URI (scheme/user/host/port/params) in one
+    /// call, preserving the display name and From-tag. The tag survives — unlike
+    /// a raw `set_header("From", "<sip:…>")`, which drops the mandatory From-tag.
+    fn set_from_uri(&self, uri: &str) -> PyResult<()> {
+        let mut message = self.lock_mut()?;
+        rewrite_header_uri(&mut message, "From", "f", uri)
+    }
+
+    /// Replace the whole To header URI, preserving the display name and any
+    /// To-tag. The tag survives — unlike a raw `set_header("To", "<sip:…>")`.
+    fn set_to_uri(&self, uri: &str) -> PyResult<()> {
+        let mut message = self.lock_mut()?;
+        rewrite_header_uri(&mut message, "To", "t", uri)
+    }
+
+    /// Replace the whole Contact header URI, preserving the display name and any
+    /// Contact params (q/expires/…).
+    ///
+    /// In a proxy the Contact is the UA's in-dialog target: rewriting it changes
+    /// where mid-dialog requests (BYE, re-INVITE) are routed. Fine when the new
+    /// target is meaningful downstream; a footgun otherwise.
+    fn set_contact_uri(&self, uri: &str) -> PyResult<()> {
+        let mut message = self.lock_mut()?;
+        rewrite_header_uri(&mut message, "Contact", "m", uri)
+    }
+
+    /// Rewrite only the userpart of the Contact header URI, leaving host/port/
+    /// params intact. An empty string clears the userpart.
+    fn set_contact_user(&self, user: &str) -> PyResult<()> {
+        let mut message = self.lock_mut()?;
+        rewrite_header_uri_user(&mut message, "Contact", "m", user)
+    }
+
     /// Append `;alias` parameter to the Contact URI for NAT traversal.
     fn add_contact_alias(&self) -> PyResult<()> {
         let mut message = self.lock_mut()?;
@@ -1534,6 +1567,60 @@ fn rewrite_display_name(
             nameaddr.display_name = Some(display_name.to_string());
             message.headers.set(header_name, nameaddr.to_string());
         }
+    }
+    Ok(())
+}
+
+/// Replace the whole URI inside a From/To/Contact header value while preserving
+/// the display-name and header params (tag/q/expires/…). No-op when the header
+/// is absent. `alias` is the RFC 3261 §7.3.3 compact form (`f`/`t`/`m`).
+fn rewrite_header_uri(
+    message: &mut SipMessage,
+    primary: &str,
+    alias: &str,
+    new_uri: &str,
+) -> PyResult<()> {
+    let raw = message
+        .headers
+        .get(primary)
+        .or_else(|| message.headers.get(alias))
+        .cloned();
+    if let Some(raw) = raw {
+        let mut nameaddr = NameAddr::parse(&raw).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!("cannot parse {primary} header: {error}"))
+        })?;
+        nameaddr.uri = parse_uri_standalone(new_uri).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid SIP URI: {error}"))
+        })?;
+        message.headers.set(primary, nameaddr.to_string());
+    }
+    Ok(())
+}
+
+/// Rewrite only the userpart of the URI inside a From/To/Contact header value,
+/// preserving everything else (host/port/params, display-name, header params).
+/// An empty `user` clears the userpart. No-op when the header is absent.
+fn rewrite_header_uri_user(
+    message: &mut SipMessage,
+    primary: &str,
+    alias: &str,
+    user: &str,
+) -> PyResult<()> {
+    let raw = message
+        .headers
+        .get(primary)
+        .or_else(|| message.headers.get(alias))
+        .cloned();
+    if let Some(raw) = raw {
+        let mut nameaddr = NameAddr::parse(&raw).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!("cannot parse {primary} header: {error}"))
+        })?;
+        nameaddr.uri.user = if user.is_empty() {
+            None
+        } else {
+            Some(user.to_string())
+        };
+        message.headers.set(primary, nameaddr.to_string());
     }
     Ok(())
 }
@@ -2274,6 +2361,67 @@ mod tests {
         request.add_contact_alias().unwrap();
         let contact = request.get_header("Contact").unwrap().unwrap();
         assert!(contact.contains(";alias"));
+    }
+
+    #[test]
+    fn set_from_uri_replaces_uri_preserves_display_and_tag() {
+        let request = make_request();
+        request.set_from_uri("sip:+3120@tenant.example.com:5070;transport=tcp").unwrap();
+        let from = request.get_header("From").unwrap().unwrap();
+        assert!(from.contains("\"Alice\""), "display preserved: {from}");
+        assert!(from.contains("+3120@tenant.example.com:5070"), "uri replaced: {from}");
+        assert!(from.contains("transport=tcp"), "uri params preserved: {from}");
+        assert!(from.contains(";tag=1928301774"), "From tag preserved: {from}");
+        assert!(!from.contains("atlanta.com"), "old host gone: {from}");
+    }
+
+    #[test]
+    fn set_to_uri_replaces_uri_preserves_display() {
+        let request = make_request();
+        request.set_to_uri("sip:5112@ims.example.org").unwrap();
+        let to = request.get_header("To").unwrap().unwrap();
+        assert!(to.contains("\"Bob\""), "display preserved: {to}");
+        assert!(to.contains("5112@ims.example.org"), "uri replaced: {to}");
+        assert!(!to.contains("biloxi.com"), "old host gone: {to}");
+    }
+
+    #[test]
+    fn set_contact_uri_replaces_contact() {
+        let request = make_request();
+        request.set_header("Contact", "<sip:alice@10.0.0.1:5060>").unwrap();
+        request.set_contact_uri("sip:bob@192.0.2.9:5080;transport=tcp").unwrap();
+        let contact = request.get_header("Contact").unwrap().unwrap();
+        assert!(contact.contains("bob@192.0.2.9:5080"), "contact replaced: {contact}");
+        assert!(contact.contains("transport=tcp"), "params preserved: {contact}");
+        assert!(!contact.contains("10.0.0.1"), "old contact gone: {contact}");
+    }
+
+    #[test]
+    fn set_contact_user_rewrites_userpart_only() {
+        let request = make_request();
+        request.set_header("Contact", "<sip:alice@10.0.0.1:5060;transport=tcp>").unwrap();
+        request.set_contact_user("1001").unwrap();
+        let contact = request.get_header("Contact").unwrap().unwrap();
+        assert!(contact.contains("1001@10.0.0.1:5060"), "user rewritten, host/port kept: {contact}");
+        assert!(contact.contains("transport=tcp"), "uri params kept: {contact}");
+        assert!(!contact.contains("alice@"), "old user gone: {contact}");
+    }
+
+    #[test]
+    fn set_contact_user_empty_clears_userpart() {
+        let request = make_request();
+        request.set_header("Contact", "<sip:alice@10.0.0.1:5060>").unwrap();
+        request.set_contact_user("").unwrap();
+        let contact = request.get_header("Contact").unwrap().unwrap();
+        assert!(contact.contains("10.0.0.1:5060"), "host:port kept: {contact}");
+        assert!(!contact.contains("alice"), "user cleared: {contact}");
+        assert!(!contact.contains('@'), "no dangling @ once userpart cleared: {contact}");
+    }
+
+    #[test]
+    fn set_from_uri_rejects_invalid() {
+        let request = make_request();
+        assert!(request.set_from_uri("not-a-uri").is_err());
     }
 
     #[test]

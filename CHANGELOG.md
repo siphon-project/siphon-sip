@@ -7,6 +7,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **Whole-URI setters `set_from_uri` / `set_to_uri` / `set_contact_uri`, plus
+  `set_contact_user`, on both `request` (proxy) and `call` (B2BUA).** The
+  whole-URI form of the existing `set_*_user` / `set_*_host` setters: replace the
+  entire URI inside the header's angle brackets — scheme, user, host, port and
+  URI params — in one call, preserving the display name and the dialog-critical
+  From/To tag (unlike a raw `set_header("From", "<sip:…>")`, which drops the
+  tag). `set_contact_user` rewrites only the Contact userpart (empty string
+  clears it). On the B2BUA these mutate the outbound B-leg: `set_from_uri` /
+  `set_to_uri` also pin the host (same topology-hiding opt-out as
+  `set_from_host` / `set_to_host`); `set_contact_user` injects a userpart into
+  siphon's advertised Contact while keeping its host:port (so in-dialog routing
+  is unchanged and the userpart rides along — for a downstream that keys a
+  tenant/extension off the Contact userpart, the way it does for a REGISTER
+  Contact), and `set_contact_uri` replaces the whole Contact for edge/GRUU
+  deployments that front siphon. The B-leg Contact stays userless by default
+  (RFC 3261 §8.1.1.8 puts no identity in the Contact userpart); these are opt-in.
 - **`cache.list_len(name, key)` and `cache.list_len_sum(name, prefix)`.** Two
   async cache-namespace methods for Redis-backed lists. `list_len` returns a
   single list's length (`LLEN`, `0` for a missing key). `list_len_sum` returns

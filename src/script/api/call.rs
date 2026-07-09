@@ -183,6 +183,11 @@ pub struct PyCall {
     /// When set, pin the B-leg To URI host to this value instead of the
     /// dial-target host. Set via `set_to_host()`.
     to_host_override: Option<String>,
+    /// When set, inject this userpart into the B-leg Contact URI (keeping
+    /// siphon's advertised host:port). Set via `set_contact_user()`.
+    contact_user_override: Option<String>,
+    /// When set, replace the whole B-leg Contact URI. Set via `set_contact_uri()`.
+    contact_override: Option<String>,
     /// Per-call header policy input captured from `call.dial(header_policy=…, …)`
     /// or `call.fork(…)`.  The dispatcher resolves `policy_name` against
     /// the preset registry and applies deltas to produce a
@@ -209,6 +214,39 @@ pub struct HeaderPolicyInput {
     pub deltas_translate: Vec<(String, String)>,
 }
 
+/// Replace the URI inside a From/To/Contact header value while preserving the
+/// display-name and header params (tag/q/expires/…). Returns the parsed host of
+/// the new URI so B2BUA callers can pin the matching `*_host_override` (the
+/// B-leg builder rewrites the host otherwise). A no-op when the header is
+/// absent; the parsed host is still returned so the override is set either way.
+fn replace_header_uri(
+    message: &mut SipMessage,
+    primary: &str,
+    alias: &str,
+    new_uri: &str,
+) -> PyResult<String> {
+    let parsed = crate::sip::parser::parse_uri_standalone(new_uri).map_err(|error| {
+        pyo3::exceptions::PyValueError::new_err(format!("invalid SIP URI: {error}"))
+    })?;
+    let host = parsed.host.clone();
+    let raw = message
+        .headers
+        .get(primary)
+        .or_else(|| message.headers.get(alias))
+        .cloned();
+    if let Some(raw) = raw {
+        let mut nameaddr =
+            crate::sip::headers::nameaddr::NameAddr::parse(&raw).map_err(|error| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "cannot parse {primary} header: {error}"
+                ))
+            })?;
+        nameaddr.uri = parsed;
+        message.headers.set(primary, nameaddr.to_string());
+    }
+    Ok(host)
+}
+
 impl PyCall {
     pub fn new(
         id: String,
@@ -232,6 +270,8 @@ impl PyCall {
             preserve_call_id_flag: false,
             from_host_override: None,
             to_host_override: None,
+            contact_user_override: None,
+            contact_override: None,
             header_policy_input: None,
         }
     }
@@ -536,6 +576,20 @@ impl PyCall {
     /// it replaces the dial-target rewrite of the To URI host.
     pub fn to_host_override(&self) -> Option<&str> {
         self.to_host_override.as_deref()
+    }
+
+    /// Script-set B-leg Contact userpart, if `set_contact_user()` was called.
+    /// Read by the dispatcher when building the B-leg Contact — injected into
+    /// the URI while siphon's advertised host:port is preserved.
+    pub fn contact_user_override(&self) -> Option<&str> {
+        self.contact_user_override.as_deref()
+    }
+
+    /// Script-set B-leg Contact URI, if `set_contact_uri()` was called — a full
+    /// override of siphon's advertised Contact. Takes precedence over
+    /// `contact_user_override()`.
+    pub fn contact_override(&self) -> Option<&str> {
+        self.contact_override.as_deref()
     }
 
     /// Set the Refer-To information (called by B2BUA core before firing on_refer).
@@ -1149,6 +1203,87 @@ impl PyCall {
         Ok(())
     }
 
+    /// Replace the entire From header URI on the B-leg INVITE — scheme, user,
+    /// host, port and URI params — in one call, preserving the display name and
+    /// From-tag.
+    ///
+    /// The whole-URI form of [`set_from_user`]/[`set_from_host`]. The host is
+    /// also pinned (the B-leg builder would otherwise rewrite it to the
+    /// advertised address for topology hiding — same opt-out as
+    /// [`set_from_host`]). Must be called before [`dial`].
+    ///
+    /// Usage in Python:
+    ///   call.set_from_uri("sip:+31123@tenant.example.com:5060;transport=tcp")
+    fn set_from_uri(&mut self, uri: &str) -> PyResult<()> {
+        let host = {
+            let mut message = self.message.lock().map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+            })?;
+            replace_header_uri(&mut message, "From", "f", uri)?
+        };
+        self.from_host_override = Some(host);
+        Ok(())
+    }
+
+    /// Replace the entire To header URI on the B-leg INVITE — scheme, user,
+    /// host, port and URI params — preserving the display name and any To-tag.
+    ///
+    /// The whole-URI form of [`set_to_user`]/[`set_to_host`]. The host is also
+    /// pinned (the B-leg builder would otherwise rewrite it to the dial-target
+    /// host — same opt-out as [`set_to_host`]). Must be called before [`dial`].
+    ///
+    /// Usage in Python:
+    ///   call.set_to_uri("sip:5112@ims.mnc088.mcc204.3gppnetwork.org")
+    fn set_to_uri(&mut self, uri: &str) -> PyResult<()> {
+        let host = {
+            let mut message = self.message.lock().map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+            })?;
+            replace_header_uri(&mut message, "To", "t", uri)?
+        };
+        self.to_host_override = Some(host);
+        Ok(())
+    }
+
+    /// Inject a userpart into the B-leg Contact URI, keeping siphon's advertised
+    /// host:port (and transport).
+    ///
+    /// The B2BUA advertises its own address as the Contact so in-dialog requests
+    /// (BYE, re-INVITE) route back through siphon. By default that Contact is
+    /// userless — `set_contact_user()` adds a userpart while leaving the
+    /// host:port untouched, so in-dialog routing still works and the userpart
+    /// rides along (e.g. a downstream that keys a tenant/extension off the
+    /// Contact userpart, the way it does for a REGISTER Contact).
+    ///
+    /// Pass an empty string to force a userless Contact even when transparent
+    /// carry-through would otherwise apply. Must be called before [`dial`].
+    ///
+    /// Usage in Python:
+    ///   call.set_contact_user(extension)
+    fn set_contact_user(&mut self, user: &str) -> PyResult<()> {
+        self.contact_user_override = Some(user.to_string());
+        Ok(())
+    }
+
+    /// Replace the entire B-leg Contact URI — a full override of siphon's
+    /// advertised Contact.
+    ///
+    /// Power tool for edge deployments that front siphon (GRUU, edge SBC).
+    /// Overriding the host/port moves the in-dialog anchor off siphon, so the
+    /// deployment must route the far side's in-dialog requests back to siphon or
+    /// the dialog breaks. Takes precedence over [`set_contact_user`]. `uri` is a
+    /// bare URI (no angle brackets). Must be called before [`dial`].
+    ///
+    /// Usage in Python:
+    ///   call.set_contact_uri("sip:gruu-token@edge.example.com:5060")
+    fn set_contact_uri(&mut self, uri: &str) -> PyResult<()> {
+        crate::sip::parser::parse_uri_standalone(uri).map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!("invalid SIP URI: {error}"))
+        })?;
+        self.contact_override = Some(uri.to_string());
+        Ok(())
+    }
+
     /// Copy the A-leg Call-ID to the B-leg instead of generating a new one.
     ///
     /// By default the B2BUA generates a fresh Call-ID for each B-leg to fully
@@ -1559,6 +1694,76 @@ mod tests {
         let call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         assert_eq!(call.from_host_override(), None);
         assert_eq!(call.to_host_override(), None);
+    }
+
+    #[test]
+    fn call_set_from_uri_replaces_uri_and_pins_host() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string(), "udp".to_string());
+        call.set_from_uri("sip:1001@tenant.example.com:5070;transport=tcp").unwrap();
+        let msg = message.lock().unwrap();
+        let from = msg.headers.get("From").unwrap();
+        assert!(from.contains("1001@tenant.example.com:5070"), "user+host+port: {from}");
+        assert!(from.contains("transport=tcp"), "uri params preserved: {from}");
+        assert!(from.contains(";tag=abc"), "From tag preserved: {from}");
+        assert!(!from.contains("atlanta.com"), "old host gone: {from}");
+        drop(msg);
+        // Host is pinned so the B-leg builder's topology-hiding rewrite honours it.
+        assert_eq!(call.from_host_override(), Some("tenant.example.com"));
+    }
+
+    #[test]
+    fn call_set_to_uri_replaces_uri_and_pins_host() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string(), "udp".to_string());
+        call.set_to_uri("sip:5112@ims.example.org").unwrap();
+        let msg = message.lock().unwrap();
+        let to = msg.headers.get("To").unwrap();
+        assert!(to.contains("5112@ims.example.org"), "user+host: {to}");
+        assert!(!to.contains("example.com"), "old host gone: {to}");
+        assert!(!to.contains(";tag="), "initial INVITE To must not gain a tag: {to}");
+        drop(msg);
+        assert_eq!(call.to_host_override(), Some("ims.example.org"));
+    }
+
+    #[test]
+    fn call_set_to_uri_preserves_display_and_tag() {
+        let mut invite = make_invite();
+        invite.headers.set("To", "\"Bob\" <sip:bob@example.com>;tag=remote".to_string());
+        let message = Arc::new(Mutex::new(invite));
+        let mut call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string(), "udp".to_string());
+        call.set_to_uri("sip:5112@ims.example.org").unwrap();
+        let msg = message.lock().unwrap();
+        let to = msg.headers.get("To").unwrap();
+        assert!(to.contains("\"Bob\""), "display preserved: {to}");
+        assert!(to.contains("5112@ims.example.org"), "uri replaced: {to}");
+        assert!(to.contains(";tag=remote"), "tag preserved: {to}");
+    }
+
+    #[test]
+    fn call_set_contact_user_sets_override() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        assert_eq!(call.contact_user_override(), None);
+        call.set_contact_user("1001").unwrap();
+        assert_eq!(call.contact_user_override(), Some("1001"));
+    }
+
+    #[test]
+    fn call_set_contact_uri_sets_override() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        assert_eq!(call.contact_override(), None);
+        call.set_contact_uri("sip:gruu-token@edge.example.com:5060").unwrap();
+        assert_eq!(call.contact_override(), Some("sip:gruu-token@edge.example.com:5060"));
+    }
+
+    #[test]
+    fn call_set_contact_uri_rejects_invalid() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        assert!(call.set_contact_uri("not-a-uri").is_err());
+        assert_eq!(call.contact_override(), None);
     }
 
     #[test]

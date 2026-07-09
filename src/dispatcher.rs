@@ -8006,12 +8006,14 @@ fn handle_b2bua_invite(
         policy_input,
         from_host_override,
         to_host_override,
+        contact_user_override,
+        contact_override,
     ) = Python::attach(|python| {
         let call_obj = match Py::new(python, py_call) {
             Ok(obj) => obj,
             Err(error) => {
                 error!("failed to create PyCall: {error}");
-                return (CallAction::None, None, None, false, false, None, None, None);
+                return (CallAction::None, None, None, false, false, None, None, None, None, None);
             }
         };
 
@@ -8025,7 +8027,7 @@ fn handle_b2bua_invite(
                             return (CallAction::Reject {
                                 code: 500,
                                 reason: "Script Error".to_string(),
-                            }, None, None, false, false, None, None, None);
+                            }, None, None, false, false, None, None, None, None, None);
                         }
                     }
                 }
@@ -8034,7 +8036,7 @@ fn handle_b2bua_invite(
                     return (CallAction::Reject {
                         code: 500,
                         reason: "Script Error".to_string(),
-                    }, None, None, false, false, None, None, None);
+                    }, None, None, false, false, None, None, None, None, None);
                 }
             }
         }
@@ -8048,7 +8050,9 @@ fn handle_b2bua_invite(
         let policy_input = borrowed.header_policy_input().cloned();
         let from_host_ovr = borrowed.from_host_override().map(String::from);
         let to_host_ovr = borrowed.to_host_override().map(String::from);
-        (action, timer_override, credentials, li_record, preserve_cid, policy_input, from_host_ovr, to_host_ovr)
+        let contact_user_ovr = borrowed.contact_user_override().map(String::from);
+        let contact_ovr = borrowed.contact_override().map(String::from);
+        (action, timer_override, credentials, li_record, preserve_cid, policy_input, from_host_ovr, to_host_ovr, contact_user_ovr, contact_ovr)
     });
 
     // Store the A-leg INVITE for later use by on_answer/on_failure/on_bye handlers
@@ -8102,6 +8106,8 @@ fn handle_b2bua_invite(
         || resolved_policy.is_some()
         || from_host_override.is_some()
         || to_host_override.is_some()
+        || contact_user_override.is_some()
+        || contact_override.is_some()
     {
         if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
             if let Some(override_config) = timer_override {
@@ -8122,6 +8128,12 @@ fn handle_b2bua_invite(
             }
             if to_host_override.is_some() {
                 call.to_host_override = to_host_override;
+            }
+            if contact_user_override.is_some() {
+                call.contact_user_override = contact_user_override;
+            }
+            if contact_override.is_some() {
+                call.contact_override = contact_override;
             }
         }
     }
@@ -8208,6 +8220,43 @@ fn handle_b2bua_invite(
             // Actor stays alive — the A-leg dialog is now confirmed and the
             // @b2bua.on_bye handler takes over when the UAC BYEs.
         }
+    }
+}
+
+/// Build the B-leg Contact header value.
+///
+/// Default is siphon's own userless address `<sip:host:port;transport=…>` — RFC
+/// 3261 §8.1.1.8 puts no identity in the Contact userpart, and siphon's address
+/// is all that's needed as the §12.2.1.1 in-dialog remote target. A script may
+/// override it via `call.set_contact_user()` (inject a userpart, keep siphon's
+/// host:port — in-dialog routing intact) or `call.set_contact_uri()` (replace
+/// the whole URI — edge/GRUU deployments that front siphon). The full-URI
+/// override wins over the userpart one; an empty userpart override collapses to
+/// the userless default.
+fn build_b_leg_contact(
+    host: &str,
+    port: u16,
+    transport: Transport,
+    contact_user_override: Option<&str>,
+    contact_override: Option<&str>,
+) -> String {
+    if let Some(uri) = contact_override {
+        format!("<{uri}>")
+    } else if let Some(user) = contact_user_override.filter(|user| !user.is_empty()) {
+        format!(
+            "<sip:{}@{}:{};transport={}>",
+            user,
+            host,
+            port,
+            transport.to_string().to_lowercase(),
+        )
+    } else {
+        format!(
+            "<sip:{}:{};transport={}>",
+            host,
+            port,
+            transport.to_string().to_lowercase(),
+        )
     }
 }
 
@@ -8324,6 +8373,8 @@ fn b2bua_send_b_leg_invite(
         a_leg_from_tag,
         from_host_override,
         to_host_override,
+        contact_user_override,
+        contact_override,
     ) = match state.call_actors.get_call(call_id) {
         Some(c) => (
             c.session_timer_override.clone(),
@@ -8332,8 +8383,10 @@ fn b2bua_send_b_leg_invite(
             c.a_leg.dialog.remote_tag.clone().unwrap_or_default(),
             c.from_host_override.clone(),
             c.to_host_override.clone(),
+            c.contact_user_override.clone(),
+            c.contact_override.clone(),
         ),
-        None => (None, false, String::new(), String::new(), None, None),
+        None => (None, false, String::new(), String::new(), None, None, None, None),
     };
 
     let b_leg_call_id = if preserve_call_id {
@@ -8380,13 +8433,25 @@ fn b2bua_send_b_leg_invite(
     // Set Contact to siphon's own address so in-dialog requests route through us.
     // via_host()/via_port() apply advertised_address fallback and substitute the
     // sanitized local_addr when the bind is 0.0.0.0/[::] — never leak unspecified.
+    //
+    // The Contact is userless by default (RFC 3261 §8.1.1.8 puts no identity in
+    // the Contact userpart; siphon's own address is all that's needed for the
+    // §12.2.1.1 in-dialog remote target). A script may override it:
+    //   set_contact_user() → keep our host:port, inject a userpart (safe — we
+    //     still receive in-dialog requests, the userpart just rides along, e.g.
+    //     for a downstream that keys a tenant/extension off the Contact user);
+    //   set_contact_uri()  → replace the whole URI (edge/GRUU deployments that
+    //     front siphon — the deployment owns routing the in-dialog target back).
     let b_contact_host = state.via_host(&outbound_transport);
     let b_contact_port = state.via_port(&outbound_transport);
-    b_leg_invite.headers.set("Contact", format!(
-        "<sip:{}:{};transport={}>",
-        b_contact_host, b_contact_port,
-        outbound_transport.to_string().to_lowercase(),
-    ));
+    let b_contact_value = build_b_leg_contact(
+        &b_contact_host,
+        b_contact_port,
+        outbound_transport,
+        contact_user_override.as_deref(),
+        contact_override.as_deref(),
+    );
+    b_leg_invite.headers.set("Contact", b_contact_value.clone());
 
     // User-Agent rewrite is policy-managed (see `transparent-b2bua@2026`
     // → User-Agent: Rewrite(ReplaceWithUserAgentHeader)).  Topology-hiding
@@ -8480,12 +8545,9 @@ fn b2bua_send_b_leg_invite(
         b_leg_invite.headers.set("Content-Length", b_leg_invite.body.len().to_string());
     }
 
-    // Register B-leg with call manager
-    let b_contact_value = format!(
-        "<sip:{}:{};transport={}>",
-        b_contact_host, b_contact_port,
-        outbound_transport.to_string().to_lowercase(),
-    );
+    // Register B-leg with call manager (Contact built above; local_contact must
+    // match the wire Contact so siphon's own mid-dialog requests advertise the
+    // same address the callee will target).
     let mut b_leg = Leg::new_b_leg(
         b_leg_call_id,
         b_leg_from_tag,
@@ -12629,6 +12691,42 @@ mod tests {
     use crate::sip::parser::parse_sip_message;
     use crate::sip::uri::SipUri;
     use crate::sip::builder::SipMessageBuilder;
+
+    #[test]
+    fn b_leg_contact_default_is_userless() {
+        // RFC 3261 §8.1.1.8 — no identity in the Contact userpart by default.
+        let contact = build_b_leg_contact("proxy.example.com", 5060, Transport::Udp, None, None);
+        assert_eq!(contact, "<sip:proxy.example.com:5060;transport=udp>");
+    }
+
+    #[test]
+    fn b_leg_contact_user_override_keeps_host_port() {
+        // set_contact_user() injects a userpart, siphon's host:port unchanged.
+        let contact =
+            build_b_leg_contact("proxy.example.com", 5060, Transport::Tcp, Some("1001"), None);
+        assert_eq!(contact, "<sip:1001@proxy.example.com:5060;transport=tcp>");
+    }
+
+    #[test]
+    fn b_leg_contact_empty_user_override_collapses_to_userless() {
+        // set_contact_user("") explicitly forces the userless form.
+        let contact =
+            build_b_leg_contact("proxy.example.com", 5060, Transport::Udp, Some(""), None);
+        assert_eq!(contact, "<sip:proxy.example.com:5060;transport=udp>");
+    }
+
+    #[test]
+    fn b_leg_contact_full_uri_override_wins_over_user() {
+        // set_contact_uri() takes precedence over set_contact_user().
+        let contact = build_b_leg_contact(
+            "proxy.example.com",
+            5060,
+            Transport::Udp,
+            Some("1001"),
+            Some("sip:gruu@edge.example.com:5080"),
+        );
+        assert_eq!(contact, "<sip:gruu@edge.example.com:5080>");
+    }
 
     #[test]
     fn collect_route_set_splits_lines_and_top_level_commas() {
