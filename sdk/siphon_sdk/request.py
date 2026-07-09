@@ -943,6 +943,31 @@ class Request:
         """
         self.set_header("To-Display", display_name)
 
+    def set_from_uri(self, value: str) -> None:
+        """Replace the whole From header URI, preserving the display name and
+        From-tag.
+
+        The whole-URI form of :meth:`set_from_user`. The tag survives — unlike a
+        raw ``set_header("From", "<sip:...>")``, which drops the mandatory
+        From-tag.
+
+        Args:
+            value: New From URI (e.g. ``"sip:+3120@tenant.example.com:5070"``).
+        """
+        self._from_uri = _parse_uri(value)
+
+    def set_to_uri(self, value: str) -> None:
+        """Replace the whole To header URI, preserving the display name and any
+        To-tag.
+
+        The whole-URI form of :meth:`set_to_user`. The tag survives — unlike a
+        raw ``set_header("To", "<sip:...>")``.
+
+        Args:
+            value: New To URI (e.g. ``"sip:5112@ims.example.org"``).
+        """
+        self._to_uri = _parse_uri(value)
+
     def add_path(self, uri: str) -> None:
         """Prepend a ``Path`` header (P-CSCF registration path).
 
@@ -993,6 +1018,49 @@ class Request:
         contact = self.get_header("Contact")
         if contact and ";alias" not in contact:
             self.set_header("Contact", f"{contact};alias")
+
+    def set_contact_uri(self, value: str) -> None:
+        """Replace the whole Contact header URI, preserving the display name and
+        any Contact header params (q/expires/…).
+
+        In a proxy the Contact is the UA's in-dialog target: rewriting it changes
+        where mid-dialog requests (BYE, re-INVITE) are routed. Fine when the new
+        target is meaningful downstream; a footgun otherwise.
+
+        Args:
+            value: New Contact URI (e.g. ``"sip:bob@192.0.2.9:5080;transport=tcp"``).
+        """
+        contact = self.get_header("Contact")
+        if contact is None:
+            return
+        display = contact.split("<", 1)[0] if "<" in contact else ""
+        suffix = ">" + contact.split(">", 1)[1] if ">" in contact else ">"
+        self.set_header("Contact", f"{display}<{value}{suffix}")
+
+    def set_contact_user(self, value: str) -> None:
+        """Rewrite only the userpart of the Contact header URI, leaving the
+        host/port/params intact. An empty string clears the userpart.
+
+        Args:
+            value: New Contact userpart (e.g. an extension), or ``""`` to clear.
+        """
+        contact = self.get_header("Contact")
+        if contact is None:
+            return
+        if "<" in contact and ">" in contact:
+            prefix = contact.split("<", 1)[0] + "<"
+            inner = contact.split("<", 1)[1].split(">", 1)[0]
+            suffix = ">" + contact.split(">", 1)[1]
+        else:
+            prefix = ""
+            inner = contact
+            suffix = ""
+        scheme_sep = inner.find(":")
+        scheme = inner[: scheme_sep + 1] if scheme_sep != -1 else ""
+        body = inner[scheme_sep + 1 :] if scheme_sep != -1 else inner
+        hostpart = body.split("@", 1)[1] if "@" in body else body
+        new_inner = f"{scheme}{value}@{hostpart}" if value else f"{scheme}{hostpart}"
+        self.set_header("Contact", f"{prefix}{new_inner}{suffix}")
 
     # -- NAT fixup -------------------------------------------------------------
 
