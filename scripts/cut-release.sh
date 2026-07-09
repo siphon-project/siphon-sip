@@ -60,6 +60,19 @@ else
   ( cd sdk && python -m pytest tests/ -q )
 fi
 
+# ── Security advisory gate (per project policy) ─────────────────────────────
+# A release MUST NOT ship with an open RustSec advisory in the dependency tree.
+# The scheduled Security-audit workflow (cargo-deny) runs post-merge; run the
+# same check *before* tagging so an open advisory blocks the cut, not the publish
+# (the failure mode that let v1.2.0 tag with RUSTSEC-2026-0204 outstanding).
+if [ "${ADVISORY_OK:-0}" != "1" ]; then
+  echo "==> security advisory gate (cargo-deny check advisories)"
+  command -v cargo-deny >/dev/null \
+    || die "cargo-deny not installed — 'cargo install cargo-deny' (or set ADVISORY_OK=1 to skip)"
+  cargo deny --all-features check advisories \
+    || die "cargo-deny found an open advisory — bump the affected crate (cargo update -p <crate>) or add a reviewed ignore in deny.toml, then re-cut (or set ADVISORY_OK=1 to skip)"
+fi
+
 # ── Performance + memory-leak baseline (manual, per project policy) ─────────
 if [ "${PERF_OK:-0}" != "1" ]; then
   echo

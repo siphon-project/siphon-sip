@@ -6,7 +6,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
-## [1.2.0] — 2026-07-07
+## [1.2.1] — 2026-07-09
+
+### Security
+- **Bump `crossbeam-epoch` 0.9.18 → 0.9.20** to address RUSTSEC-2026-0204: an
+  invalid pointer dereference in the `fmt::Display` impl for `Atomic`/`Shared`
+  when the underlying pointer is null/invalid. Transitive dependency (via
+  `crossbeam-deque`); lockfile-only bump, no API or behavioural change.
+
+## [1.2.0] — 2026-07-09
 
 ### Added
 - **`@rtpengine.on_media_timeout` script hook.** The media engine reaps a call
