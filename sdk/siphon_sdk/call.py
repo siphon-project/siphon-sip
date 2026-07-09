@@ -11,7 +11,7 @@ import uuid
 from typing import Optional, Union
 
 from siphon_sdk.types import Action, Contact, Flow, MediaHandle, SipUri
-from siphon_sdk.request import _parse_uri
+from siphon_sdk.request import _parse_uri, _validate_send_socket
 
 
 class Call:
@@ -262,6 +262,7 @@ class Call:
         strip: Optional[list[str]] = None,
         translate: Optional[list[tuple[str, str]]] = None,
         route: Optional[list[str]] = None,
+        send_socket: Optional[str] = None,
     ) -> None:
         """Dial a single B-leg target.
 
@@ -304,6 +305,16 @@ class Call:
                 originating S-CSCF (RFC 3608).  Each entry is a full route
                 value, e.g. ``"<sip:scscf.ims.example.com:6060;lr>"`` — pass
                 the list returned by ``registration.service_route(impu)``.
+            send_socket: Optional egress socket pin
+                (``"<transport>:<ip>:<port>"``, e.g. ``"udp:10.0.0.1:5060"``)
+                — the operator equivalent of Kamailio's ``force_send_socket()``.
+                Selects which of siphon's own configured listeners the B-leg
+                INVITE leaves from on a multi-homed host; the B-leg Via
+                advertises that listener's address.  UDP pins the exact
+                ``(ip, port)`` listener; TCP/TLS bind the source IP with an
+                ephemeral port.  Ignored when ``flow`` is set (the flow already
+                pins egress), and when its transport doesn't match the B-leg
+                transport.  A malformed spec raises ``ValueError``.
 
         Example::
 
@@ -329,6 +340,7 @@ class Call:
                       "P-Asserted-Identity", "Reason"],
             )
         """
+        _validate_send_socket(send_socket)
         self._actions.append(Action(
             kind="dial",
             targets=[uri],
@@ -341,6 +353,7 @@ class Call:
                 "strip": strip or [],
                 "translate": translate or [],
                 "route": route or [],
+                "send_socket": send_socket,
             },
         ))
 
@@ -353,6 +366,7 @@ class Call:
         copy: Optional[list[str]] = None,
         strip: Optional[list[str]] = None,
         translate: Optional[list[tuple[str, str]]] = None,
+        send_socket: Optional[str] = None,
     ) -> None:
         """Fork to multiple B-leg targets.
 
@@ -369,6 +383,9 @@ class Call:
             header_policy / copy / strip / translate: Same semantics as
                 :meth:`dial` — the policy applies to every branch of the
                 fork (per-branch policy is a follow-up).
+            send_socket: Optional egress socket pin applied to every branch
+                (same ``"<transport>:<ip>:<port>"`` form as :meth:`dial`).  A
+                per-branch captured flow still takes precedence for that branch.
 
         Example::
 
@@ -376,6 +393,7 @@ class Call:
             # Pass Contact objects so WebSocket callees route over their flow.
             call.fork(contacts, strategy="parallel", timeout=30)
         """
+        _validate_send_socket(send_socket)
         uris = [t.uri if isinstance(t, Contact) else str(t) for t in targets]
         self._actions.append(Action(
             kind="fork",
@@ -387,6 +405,7 @@ class Call:
                 "copy": copy or [],
                 "strip": strip or [],
                 "translate": translate or [],
+                "send_socket": send_socket,
             },
         ))
 

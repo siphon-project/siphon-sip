@@ -799,7 +799,7 @@ fn extract_handlers(
         let metadata: Option<Bound<'_, PyAny>> = item
             .get_item(4)
             .ok()
-            .and_then(|v: Bound<'_, PyAny>| if v.is_none() { None } else { Some(v) });
+            .filter(|v: &Bound<'_, PyAny>| !v.is_none());
 
         let kind = match kind_str.as_str() {
             "proxy.on_request" => HandlerKind::ProxyRequest(filter),
@@ -1555,6 +1555,7 @@ def new_call(call):
                     next_hop: None,
                     flow: None,
                     route: vec![],
+                    send_socket: None,
                     timeout: 30,
                 }
             );

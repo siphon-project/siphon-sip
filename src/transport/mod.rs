@@ -128,6 +128,129 @@ impl std::fmt::Display for Transport {
     }
 }
 
+impl Transport {
+    /// Parse a SIP transport scheme token (`"udp"`, `"tcp"`, `"tls"`, `"ws"`,
+    /// `"wss"`, `"sctp"`, case-insensitive) into a [`Transport`].  Returns
+    /// `None` for an unrecognized scheme.
+    pub fn from_scheme(scheme: &str) -> Option<Transport> {
+        match scheme.to_ascii_lowercase().as_str() {
+            "udp" => Some(Transport::Udp),
+            "tcp" => Some(Transport::Tcp),
+            "tls" => Some(Transport::Tls),
+            "ws" => Some(Transport::WebSocket),
+            "wss" => Some(Transport::WebSocketSecure),
+            "sctp" => Some(Transport::Sctp),
+            _ => None,
+        }
+    }
+}
+
+/// A script-requested egress socket ("force send socket") — the operator
+/// equivalent of Kamailio's `force_send_socket()` / OpenSIPS' `$fs`.  Selects
+/// which of siphon's *own* configured listeners a relayed / dialed request
+/// leaves from, on a multi-homed host.  Resolved from a `send_socket=` string
+/// (e.g. `"udp:10.0.0.1:5060"`) against the [`ListenerRegistry`], so it always
+/// names a real listener and carries that listener's advertised address for
+/// the outgoing Via (so responses come back to the same socket).
+///
+/// Source-socket selection is transport-specific:
+/// - **UDP** pins the exact `(ip, port)` listener socket as the egress
+///   ([`OutboundMessage::source_local_addr`] → `udp_by_local`).
+/// - **TCP/TLS** bind the egress socket's *source IP* (interface); the source
+///   port stays ephemeral, because binding the listen port for an outbound
+///   connection collides on the 4-tuple in `TIME_WAIT` (`EADDRNOTAVAIL`).
+#[derive(Debug, Clone)]
+pub struct SendSocket {
+    /// The transport of the selected listener.
+    pub transport: Transport,
+    /// The listener's bound socket address.
+    pub addr: SocketAddr,
+    /// The listener's advertised host (from `listen: { advertise: ... }`),
+    /// used as the outgoing Via sent-by host when set.
+    pub advertise: Option<String>,
+}
+
+impl SendSocket {
+    /// The Via sent-by `(host, port)` this egress socket should advertise.
+    /// Prefers the configured advertised host (external reachability behind
+    /// NAT / a load balancer); falls back to the bound IP literal.  The port
+    /// is always the listener's bound port so a response reaches this socket.
+    pub fn via_sent_by(&self) -> (String, u16) {
+        let host = self
+            .advertise
+            .clone()
+            .unwrap_or_else(|| self.addr.ip().to_string());
+        (host, self.addr.port())
+    }
+}
+
+/// Parse a `send_socket=` spec string of the form `"<scheme>:<ip>:<port>"`
+/// (e.g. `"udp:10.0.0.1:5060"`, `"tls:[2001:db8::1]:5061"`) into its
+/// `(transport, addr)` parts.  Validates *format only* — existence as a real
+/// listener is checked separately against the [`ListenerRegistry`].
+///
+/// Returns a human-readable error string suitable for surfacing to a script
+/// author as a `ValueError`.
+pub fn parse_send_socket(spec: &str) -> Result<(Transport, SocketAddr), String> {
+    let (scheme, addr_part) = spec.split_once(':').ok_or_else(|| {
+        format!("send_socket '{spec}' must be '<transport>:<ip>:<port>' (e.g. 'udp:10.0.0.1:5060')")
+    })?;
+    let transport = Transport::from_scheme(scheme).ok_or_else(|| {
+        format!("send_socket '{spec}': unknown transport '{scheme}' (use udp/tcp/tls/ws/wss/sctp)")
+    })?;
+    let addr: SocketAddr = addr_part
+        .parse()
+        .map_err(|error| format!("send_socket '{spec}': invalid '<ip>:<port>' address: {error}"))?;
+    Ok((transport, addr))
+}
+
+/// Registry of every configured listener (`transport` + bound address +
+/// advertised host), built once at startup.  Backs `send_socket=` resolution:
+/// a script may only egress from a socket siphon is actually listening on, and
+/// the advertised host it should put in the outgoing Via comes from here too.
+///
+/// This is distinct from [`OutboundRouter::udp_by_local`] (which holds only the
+/// per-listener UDP *channels*) and from the per-transport `listen_addrs` map
+/// (which keeps only the first listener of each transport): multi-homed
+/// `send_socket` needs the *full* set across every transport.
+#[derive(Debug, Default, Clone)]
+pub struct ListenerRegistry {
+    entries: Arc<std::collections::HashMap<(Transport, SocketAddr), Option<String>>>,
+}
+
+impl ListenerRegistry {
+    /// Build from `(transport, bound_addr, advertise)` triples.
+    pub fn from_entries(
+        entries: impl IntoIterator<Item = (Transport, SocketAddr, Option<String>)>,
+    ) -> Self {
+        let map = entries
+            .into_iter()
+            .map(|(transport, addr, advertise)| ((transport, addr), advertise))
+            .collect();
+        Self { entries: Arc::new(map) }
+    }
+
+    /// Resolve a parsed `(transport, addr)` to a [`SendSocket`] iff a listener
+    /// with exactly that transport+address is configured.  Returns `None` for
+    /// an address siphon is not listening on (the caller should then warn and
+    /// fall back to default routing rather than drop the request).
+    pub fn resolve(&self, transport: Transport, addr: SocketAddr) -> Option<SendSocket> {
+        self.entries
+            .get(&(transport, addr))
+            .map(|advertise| SendSocket { transport, addr, advertise: advertise.clone() })
+    }
+
+    /// Number of registered listeners (diagnostics / tests).
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no listeners are registered (test fixtures).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 /// A message to be sent outbound on a specific connection.
 #[derive(Debug)]
 pub struct OutboundMessage {
@@ -603,5 +726,118 @@ mod tests {
             registry.get(&addr("10.0.0.5:50000")),
             Some((Transport::WebSocket, ConnectionId(4))),
         );
+    }
+
+    #[test]
+    fn transport_from_scheme_roundtrips() {
+        assert_eq!(Transport::from_scheme("udp"), Some(Transport::Udp));
+        assert_eq!(Transport::from_scheme("TCP"), Some(Transport::Tcp));
+        assert_eq!(Transport::from_scheme("Tls"), Some(Transport::Tls));
+        assert_eq!(Transport::from_scheme("ws"), Some(Transport::WebSocket));
+        assert_eq!(Transport::from_scheme("wss"), Some(Transport::WebSocketSecure));
+        assert_eq!(Transport::from_scheme("sctp"), Some(Transport::Sctp));
+        assert_eq!(Transport::from_scheme("carrier-pigeon"), None);
+    }
+
+    #[test]
+    fn parse_send_socket_valid_forms() {
+        let (transport, addr) = parse_send_socket("udp:10.0.0.1:5060").unwrap();
+        assert_eq!(transport, Transport::Udp);
+        assert_eq!(addr, "10.0.0.1:5060".parse().unwrap());
+
+        let (transport, addr) = parse_send_socket("tls:[2001:db8::1]:5061").unwrap();
+        assert_eq!(transport, Transport::Tls);
+        assert_eq!(addr, "[2001:db8::1]:5061".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_send_socket_rejects_malformed() {
+        assert!(parse_send_socket("10.0.0.1:5060").is_err()); // no scheme
+        assert!(parse_send_socket("udp:not-an-addr").is_err()); // bad addr
+        assert!(parse_send_socket("udp:10.0.0.1").is_err()); // missing port
+        assert!(parse_send_socket("smoke-signal:10.0.0.1:5060").is_err()); // bad scheme
+    }
+
+    #[test]
+    fn outbound_router_routes_udp_by_source_local_addr() {
+        // The UDP egress mechanism `send_socket=` relies on: when a message
+        // carries `source_local_addr = Some(addr)` and a per-listener channel
+        // is registered for `addr`, it must be delivered to *that* listener's
+        // channel — not the default.  A message with no (or an unknown) source
+        // falls back to the default channel.
+        let default = flume::unbounded::<OutboundMessage>();
+        let listener_a = flume::unbounded::<OutboundMessage>();
+        let listener_b = flume::unbounded::<OutboundMessage>();
+        let addr_a = addr("10.0.0.1:5060");
+        let addr_b = addr("192.168.1.1:5060");
+
+        let mut udp_by_local = std::collections::HashMap::new();
+        udp_by_local.insert(addr_a, listener_a.0.clone());
+        udp_by_local.insert(addr_b, listener_b.0.clone());
+
+        let (dummy, _) = flume::unbounded();
+        let router = OutboundRouter {
+            udp: default.0.clone(),
+            udp_by_local,
+            tcp: dummy.clone(),
+            tls: dummy.clone(),
+            ws: dummy.clone(),
+            wss: dummy.clone(),
+            sctp: dummy,
+        };
+
+        let make = |source: Option<SocketAddr>| OutboundMessage {
+            connection_id: ConnectionId(0),
+            transport: Transport::Udp,
+            destination: addr("203.0.113.1:5060"),
+            data: Bytes::from_static(b"PING"),
+            source_local_addr: source,
+            server_name: None,
+        };
+
+        // Pinned to listener A → lands on A's channel.
+        router.send(make(Some(addr_a))).unwrap();
+        assert_eq!(listener_a.1.try_recv().unwrap().source_local_addr, Some(addr_a));
+        assert!(listener_b.1.try_recv().is_err());
+        assert!(default.1.try_recv().is_err());
+
+        // Pinned to listener B → lands on B's channel.
+        router.send(make(Some(addr_b))).unwrap();
+        assert_eq!(listener_b.1.try_recv().unwrap().source_local_addr, Some(addr_b));
+
+        // No source → default channel.
+        router.send(make(None)).unwrap();
+        assert!(default.1.try_recv().is_ok());
+
+        // Unknown source (not a registered listener) → default channel.
+        router.send(make(Some(addr("172.16.0.1:5060")))).unwrap();
+        assert!(default.1.try_recv().is_ok());
+    }
+
+    #[test]
+    fn listener_registry_resolves_only_configured_sockets() {
+        let registry = ListenerRegistry::from_entries([
+            (Transport::Udp, addr("10.0.0.1:5060"), Some("sip.example.com".to_string())),
+            (Transport::Udp, addr("192.168.1.1:5060"), None),
+            (Transport::Tcp, addr("10.0.0.1:5060"), None),
+        ]);
+        assert_eq!(registry.len(), 3);
+
+        // Exact transport+addr match resolves, carrying the advertised host.
+        let resolved = registry.resolve(Transport::Udp, addr("10.0.0.1:5060")).unwrap();
+        assert_eq!(resolved.transport, Transport::Udp);
+        assert_eq!(resolved.addr, addr("10.0.0.1:5060"));
+        assert_eq!(resolved.via_sent_by(), ("sip.example.com".to_string(), 5060));
+
+        // No advertise → Via host falls back to the bound IP literal.
+        let plain = registry.resolve(Transport::Udp, addr("192.168.1.1:5060")).unwrap();
+        assert_eq!(plain.via_sent_by(), ("192.168.1.1".to_string(), 5060));
+
+        // Same address, different transport is a distinct listener.
+        assert!(registry.resolve(Transport::Tcp, addr("10.0.0.1:5060")).is_some());
+        assert!(registry.resolve(Transport::Tls, addr("10.0.0.1:5060")).is_none());
+
+        // An address siphon isn't listening on does not resolve.
+        assert!(registry.resolve(Transport::Udp, addr("172.16.0.1:5060")).is_none());
     }
 }

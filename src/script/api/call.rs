@@ -42,6 +42,12 @@ pub enum CallAction {
         /// Service-Route on MO calls so they traverse the originating S-CSCF
         /// (RFC 3608). Each entry is a full route value, e.g. `<sip:scscf;lr>`.
         route: Vec<String>,
+        /// Force-send-socket egress pin (`send_socket="udp:10.0.0.1:5060"`).
+        /// Selects which configured listener the B-leg INVITE leaves from on a
+        /// multi-homed host.  Validated for format at API-call time; resolved
+        /// against the configured listeners in the dispatcher.  Ignored when
+        /// `flow` is set (the flow already pins the egress listener).
+        send_socket: Option<String>,
         timeout: u32,
     },
     /// Fork to multiple targets.
@@ -54,6 +60,10 @@ pub enum CallAction {
         targets: Vec<String>,
         flows: Vec<Option<super::registrar::PyFlow>>,
         strategy: String,
+        /// Force-send-socket egress pin applied to every B-leg branch (see
+        /// [`CallAction::Dial::send_socket`]).  A per-branch flow still takes
+        /// precedence over it for that branch.
+        send_socket: Option<String>,
         timeout: u32,
     },
     /// Terminate the call (BYE both legs).
@@ -861,7 +871,8 @@ impl PyCall {
     ///         copy=["X-Operator-Tag"],
     ///         strip=["History-Info"],
     ///     )
-    #[pyo3(signature = (uri, timeout=30, next_hop=None, flow=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), route=Vec::new()))]
+    #[pyo3(signature = (uri, timeout=30, next_hop=None, flow=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), route=Vec::new(), send_socket=None))]
+    #[allow(clippy::too_many_arguments)]
     fn dial(
         &mut self,
         uri: &str,
@@ -873,15 +884,19 @@ impl PyCall {
         strip: Vec<String>,
         translate: Vec<(String, String)>,
         route: Vec<String>,
-    ) {
+        send_socket: Option<String>,
+    ) -> PyResult<()> {
+        super::request::validate_send_socket(send_socket.as_deref())?;
         self.action = CallAction::Dial {
             target: uri.to_string(),
             next_hop: next_hop.map(String::from),
             flow,
             route,
+            send_socket,
             timeout,
         };
         self.update_header_policy_input(header_policy, copy, strip, translate);
+        Ok(())
     }
 
     /// Fork to multiple targets.
@@ -892,7 +907,8 @@ impl PyCall {
     /// connection reuse, mandatory for WebSocket callees (RFC 7118 §5 / RFC
     /// 5626 §5.3).  `header_policy` / `copy` / `strip` / `translate` apply to
     /// every branch — per-branch policy is a follow-up enhancement.
-    #[pyo3(signature = (targets, strategy="parallel", timeout=30, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new()))]
+    #[pyo3(signature = (targets, strategy="parallel", timeout=30, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), send_socket=None))]
+    #[allow(clippy::too_many_arguments)]
     fn fork(
         &mut self,
         targets: Vec<Bound<'_, PyAny>>,
@@ -902,7 +918,9 @@ impl PyCall {
         copy: Vec<String>,
         strip: Vec<String>,
         translate: Vec<(String, String)>,
+        send_socket: Option<String>,
     ) -> PyResult<()> {
+        super::request::validate_send_socket(send_socket.as_deref())?;
         let mut target_uris: Vec<String> = Vec::with_capacity(targets.len());
         let mut flows: Vec<Option<super::registrar::PyFlow>> = Vec::with_capacity(targets.len());
         for item in targets {
@@ -919,6 +937,7 @@ impl PyCall {
             targets: target_uris,
             flows,
             strategy: strategy.to_string(),
+            send_socket,
             timeout,
         };
         self.update_header_policy_input(header_policy, copy, strip, translate);
@@ -1231,7 +1250,7 @@ mod tests {
     fn call_dial() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
-        call.dial("sip:bob@10.0.0.2:5060", 30, None, None, None, vec![], vec![], vec![], vec![]);
+        call.dial("sip:bob@10.0.0.2:5060", 30, None, None, None, vec![], vec![], vec![], vec![], None).unwrap();
         assert_eq!(
             call.action(),
             &CallAction::Dial {
@@ -1239,6 +1258,7 @@ mod tests {
                 next_hop: None,
                 flow: None,
                 route: vec![],
+                send_socket: None,
                 timeout: 30,
             }
         );
@@ -1260,7 +1280,8 @@ mod tests {
             vec![],
             vec![],
             vec!["<sip:scscf.ims.mnc01.mcc001.3gppnetwork.org:6060;lr>".to_string()],
-        );
+            None,
+        ).unwrap();
         match call.action() {
             CallAction::Dial { route, .. } => {
                 assert_eq!(route, &vec!["<sip:scscf.ims.mnc01.mcc001.3gppnetwork.org:6060;lr>".to_string()]);
@@ -1283,7 +1304,8 @@ mod tests {
             vec![],
             vec![],
             vec![],
-        );
+            None,
+        ).unwrap();
         assert_eq!(
             call.action(),
             &CallAction::Dial {
@@ -1291,6 +1313,7 @@ mod tests {
                 next_hop: Some("sip:172.16.0.111:4060".to_string()),
                 flow: None,
                 route: vec![],
+                send_socket: None,
                 timeout: 30,
             }
         );
@@ -1310,7 +1333,8 @@ mod tests {
             vec!["History-Info".to_string()],
             vec![("Diversion".to_string(), "rfc7044".to_string())],
             vec![],
-        );
+            None,
+        ).unwrap();
         let input = call.header_policy_input().expect("policy input must be captured");
         assert_eq!(input.policy_name.as_deref(), Some("ims-trust-domain-boundary@2026"));
         assert_eq!(input.deltas_copy, vec!["X-Operator-Tag".to_string()]);
@@ -1319,6 +1343,35 @@ mod tests {
             input.deltas_translate,
             vec![("Diversion".to_string(), "rfc7044".to_string())]
         );
+    }
+
+    #[test]
+    fn call_dial_with_send_socket() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        call.dial(
+            "sip:bob@10.0.0.2:5060", 30, None, None, None,
+            vec![], vec![], vec![], vec![],
+            Some("udp:10.0.0.1:5060".to_string()),
+        ).unwrap();
+        match call.action() {
+            CallAction::Dial { send_socket, .. } => {
+                assert_eq!(send_socket.as_deref(), Some("udp:10.0.0.1:5060"));
+            }
+            other => panic!("expected Dial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_dial_rejects_malformed_send_socket() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        let result = call.dial(
+            "sip:bob@10.0.0.2:5060", 30, None, None, None,
+            vec![], vec![], vec![], vec![],
+            Some("not-a-socket".to_string()),
+        );
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1331,13 +1384,14 @@ mod tests {
                 pyo3::types::PyString::new(py, "sip:bob@10.0.0.2").into_any(),
                 pyo3::types::PyString::new(py, "sip:bob@10.0.0.3").into_any(),
             ];
-            call.fork(targets, "parallel", 30, None, vec![], vec![], vec![]).unwrap();
+            call.fork(targets, "parallel", 30, None, vec![], vec![], vec![], None).unwrap();
             assert_eq!(
                 call.action(),
                 &CallAction::Fork {
                     targets: vec!["sip:bob@10.0.0.2".to_string(), "sip:bob@10.0.0.3".to_string()],
                     flows: vec![None, None],
                     strategy: "parallel".to_string(),
+                    send_socket: None,
                     timeout: 30,
                 }
             );
@@ -1354,7 +1408,7 @@ mod tests {
                 pyo3::types::PyString::new(py, "sip:bob@10.0.0.2").into_any(),
                 pyo3::types::PyString::new(py, "sip:bob@10.0.0.3").into_any(),
             ];
-            call.fork(targets, "parallel", 30, Some("sip-trunk-edge@2026"), vec![], vec!["X-Internal-Tag".to_string()], vec![]).unwrap();
+            call.fork(targets, "parallel", 30, Some("sip-trunk-edge@2026"), vec![], vec!["X-Internal-Tag".to_string()], vec![], None).unwrap();
             let input = call.header_policy_input().expect("policy input must be captured");
             assert_eq!(input.policy_name.as_deref(), Some("sip-trunk-edge@2026"));
             assert_eq!(input.deltas_strip, vec!["X-Internal-Tag".to_string()]);

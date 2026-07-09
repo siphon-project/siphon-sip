@@ -4,6 +4,8 @@ R-URI construction from the wire-routing destination (IMS BGCF / I-CSCF
 edge case).
 """
 
+import pytest
+
 from siphon_sdk.call import Call
 
 
@@ -80,3 +82,23 @@ class TestCallDial:
         assert action.extras["copy"] == []
         assert action.extras["strip"] == []
         assert action.extras["translate"] == []
+        assert action.extras["send_socket"] is None
+
+    def test_dial_send_socket_pin(self):
+        # Force-send-socket egress pin (multi-homed host).
+        call = Call()
+        call.dial("sip:bob@10.0.0.2:5060", send_socket="udp:10.0.0.1:5060")
+        action = call._actions[0]
+        assert action.extras["send_socket"] == "udp:10.0.0.1:5060"
+
+    def test_dial_send_socket_malformed_raises(self):
+        call = Call()
+        with pytest.raises(ValueError):
+            call.dial("sip:bob@10.0.0.2:5060", send_socket="10.0.0.1:5060")
+        with pytest.raises(ValueError):
+            call.dial("sip:bob@10.0.0.2:5060", send_socket="udp:not-an-addr")
+        with pytest.raises(ValueError):
+            call.dial("sip:bob@10.0.0.2:5060", send_socket="pigeon:10.0.0.1:5060")
+        # A well-formed IPv6 pin is accepted.
+        call.dial("sip:bob@10.0.0.2:5060", send_socket="tls:[2001:db8::1]:5061")
+        assert call._actions[-1].extras["send_socket"] == "tls:[2001:db8::1]:5061"

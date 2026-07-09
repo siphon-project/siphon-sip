@@ -99,6 +99,11 @@ pub enum RequestAction {
     Relay {
         next_hop: Option<String>,
         flow: Option<super::registrar::PyFlow>,
+        /// Force-send-socket egress pin (`send_socket="udp:10.0.0.1:5060"`).
+        /// Validated for format at API-call time; resolved against the
+        /// configured listeners in the dispatcher.  Ignored when `flow` is set
+        /// (the flow already pins the egress listener).
+        send_socket: Option<String>,
     },
     /// Fork to multiple targets.
     ///
@@ -111,7 +116,24 @@ pub enum RequestAction {
         targets: Vec<String>,
         flows: Vec<Option<super::registrar::PyFlow>>,
         strategy: String,
+        /// Force-send-socket egress pin applied to every branch (see
+        /// [`RequestAction::Relay::send_socket`]).  A per-branch flow (`flows[i]`)
+        /// still takes precedence over it for that branch.
+        send_socket: Option<String>,
     },
+}
+
+/// Format-validate a `send_socket=` argument, raising a Python `ValueError`
+/// with a helpful message on a malformed spec.  Existence as a real configured
+/// listener is checked later, in the dispatcher, against the `ListenerRegistry`
+/// (an unknown-but-well-formed socket warns and falls back to default routing
+/// rather than dropping the request).
+pub(crate) fn validate_send_socket(send_socket: Option<&str>) -> PyResult<()> {
+    if let Some(spec) = send_socket {
+        crate::transport::parse_send_socket(spec)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
+    }
+    Ok(())
 }
 
 /// Python-visible SIP request object.
@@ -840,17 +862,20 @@ impl PyRequest {
     /// Optional callbacks:
     /// - `on_reply`: called with `(request, reply)` when a response arrives
     /// - `on_failure`: called with `(request, code, reason)` on error response
-    #[pyo3(signature = (next_hop=None, on_reply=None, on_failure=None, flow=None))]
+    #[pyo3(signature = (next_hop=None, on_reply=None, on_failure=None, flow=None, send_socket=None))]
     fn relay(
         &mut self,
         next_hop: Option<String>,
         on_reply: Option<Py<PyAny>>,
         on_failure: Option<Py<PyAny>>,
         flow: Option<super::registrar::PyFlow>,
-    ) {
+        send_socket: Option<String>,
+    ) -> PyResult<()> {
+        validate_send_socket(send_socket.as_deref())?;
         self.on_reply_callback = on_reply;
         self.on_failure_callback = on_failure;
-        self.action = RequestAction::Relay { next_hop, flow };
+        self.action = RequestAction::Relay { next_hop, flow, send_socket };
+        Ok(())
     }
 
     /// Fork to multiple targets.
@@ -861,8 +886,14 @@ impl PyRequest {
     /// captured inbound flow — RFC 5626 §5.3 connection reuse, mandatory for
     /// WebSocket UEs (RFC 7118 §5).  Bare strings (and non-local contacts) are
     /// DNS-resolved as before.
-    #[pyo3(signature = (targets, strategy="parallel"))]
-    fn fork(&mut self, targets: Vec<Bound<'_, PyAny>>, strategy: &str) -> PyResult<()> {
+    #[pyo3(signature = (targets, strategy="parallel", send_socket=None))]
+    fn fork(
+        &mut self,
+        targets: Vec<Bound<'_, PyAny>>,
+        strategy: &str,
+        send_socket: Option<String>,
+    ) -> PyResult<()> {
+        validate_send_socket(send_socket.as_deref())?;
         let mut target_uris: Vec<String> = Vec::with_capacity(targets.len());
         let mut flows: Vec<Option<super::registrar::PyFlow>> = Vec::with_capacity(targets.len());
         for item in targets {
@@ -880,6 +911,7 @@ impl PyRequest {
             targets: target_uris,
             flows,
             strategy: strategy.to_string(),
+            send_socket,
         };
         Ok(())
     }
@@ -1722,22 +1754,23 @@ mod tests {
     #[test]
     fn relay_sets_action() {
         let mut request = make_request();
-        request.relay(None, None, None, None);
+        request.relay(None, None, None, None, None).unwrap();
         assert_eq!(
             *request.action(),
-            RequestAction::Relay { next_hop: None, flow: None }
+            RequestAction::Relay { next_hop: None, flow: None, send_socket: None }
         );
     }
 
     #[test]
     fn relay_with_next_hop() {
         let mut request = make_request();
-        request.relay(Some("sip:proxy@next.com:5060".to_string()), None, None, None);
+        request.relay(Some("sip:proxy@next.com:5060".to_string()), None, None, None, None).unwrap();
         assert_eq!(
             *request.action(),
             RequestAction::Relay {
                 next_hop: Some("sip:proxy@next.com:5060".to_string()),
                 flow: None,
+                send_socket: None,
             }
         );
     }
@@ -1755,12 +1788,13 @@ mod tests {
             local_addr: "127.0.0.1:5066".parse().unwrap(),
             connection_id: 0xabcdef,
         };
-        request.relay(None, None, None, Some(flow.clone()));
+        request.relay(None, None, None, Some(flow.clone()), None).unwrap();
         assert_eq!(
             *request.action(),
             RequestAction::Relay {
                 next_hop: None,
                 flow: Some(flow),
+                send_socket: None,
             }
         );
     }
@@ -1784,9 +1818,10 @@ mod tests {
             None,
             None,
             Some(flow.clone()),
-        );
+            None,
+        ).unwrap();
         match request.action() {
-            RequestAction::Relay { next_hop, flow: action_flow } => {
+            RequestAction::Relay { next_hop, flow: action_flow, .. } => {
                 assert_eq!(next_hop.as_deref(), Some("sip:ignored@example.com"));
                 assert_eq!(action_flow.as_ref(), Some(&flow));
             }
@@ -1835,6 +1870,60 @@ mod tests {
     }
 
     #[test]
+    fn relay_with_send_socket_stores_spec() {
+        let mut request = make_request();
+        request
+            .relay(None, None, None, None, Some("udp:10.0.0.1:5060".to_string()))
+            .unwrap();
+        assert_eq!(
+            *request.action(),
+            RequestAction::Relay {
+                next_hop: None,
+                flow: None,
+                send_socket: Some("udp:10.0.0.1:5060".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn relay_with_malformed_send_socket_raises() {
+        // Format is validated at the API so a script author gets an immediate
+        // ValueError rather than a silently-ignored egress pin.
+        let mut request = make_request();
+        assert!(request.relay(None, None, None, None, Some("10.0.0.1:5060".to_string())).is_err());
+        assert!(request.relay(None, None, None, None, Some("udp:nonsense".to_string())).is_err());
+        assert!(request.relay(None, None, None, None, Some("pigeon:10.0.0.1:5060".to_string())).is_err());
+        // A well-formed spec is accepted here (existence is checked later, in
+        // the dispatcher, against the configured listeners).
+        assert!(request.relay(None, None, None, None, Some("tls:[2001:db8::1]:5061".to_string())).is_ok());
+    }
+
+    #[test]
+    fn fork_with_send_socket_stores_spec() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let mut request = make_request();
+            let targets: Vec<Bound<'_, PyAny>> = vec![
+                pyo3::types::PyString::new(py, "sip:a@host").into_any(),
+            ];
+            request
+                .fork(targets, "parallel", Some("tcp:10.0.0.1:5060".to_string()))
+                .unwrap();
+            match request.action() {
+                RequestAction::Fork { send_socket, .. } => {
+                    assert_eq!(send_socket.as_deref(), Some("tcp:10.0.0.1:5060"));
+                }
+                other => panic!("expected Fork, got {other:?}"),
+            }
+
+            let targets: Vec<Bound<'_, PyAny>> = vec![
+                pyo3::types::PyString::new(py, "sip:a@host").into_any(),
+            ];
+            assert!(request.fork(targets, "parallel", Some("bad-spec".to_string())).is_err());
+        });
+    }
+
+    #[test]
     fn fork_sets_action() {
         pyo3::Python::initialize();
         pyo3::Python::attach(|py| {
@@ -1843,13 +1932,14 @@ mod tests {
                 pyo3::types::PyString::new(py, "sip:a@host").into_any(),
                 pyo3::types::PyString::new(py, "sip:b@host").into_any(),
             ];
-            request.fork(targets, "sequential").unwrap();
+            request.fork(targets, "sequential", None).unwrap();
             assert_eq!(
                 *request.action(),
                 RequestAction::Fork {
                     targets: vec!["sip:a@host".to_string(), "sip:b@host".to_string()],
                     flows: vec![None, None],
                     strategy: "sequential".to_string(),
+                    send_socket: None,
                 }
             );
         });
