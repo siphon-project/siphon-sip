@@ -6,7 +6,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
-## [1.2.1] — 2026-07-09
+### Added
+- **`cache.list_len(name, key)` and `cache.list_len_sum(name, prefix)`.** Two
+  async cache-namespace methods for Redis-backed lists. `list_len` returns a
+  single list's length (`LLEN`, `0` for a missing key). `list_len_sum` returns
+  the summed length of every list whose key matches `{prefix}*`, via a cursor
+  `SCAN` (deduped) + pipelined `LLEN` computed server-side in one await; glob
+  metacharacters in the prefix are escaped so it matches literally, and an empty
+  prefix raises `ValueError`. Both return `None` for unknown or non-Redis-backed
+  caches. This gives the live instantaneous depth of a set of sharded per-key
+  queues (e.g. summing `ims_queue_*`) — where enqueue/drain counters drift
+  upward forever because TTL-expired entries leave the keyspace silently, a
+  summed `LLEN` is truthful because expired keys are simply gone.
 
 ### Security
 - **Bump `crossbeam-epoch` 0.9.18 → 0.9.20** to address RUSTSEC-2026-0204: an

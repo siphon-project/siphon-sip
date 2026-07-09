@@ -23,6 +23,20 @@ fn validate_key(key: &str) -> PyResult<()> {
     }
 }
 
+/// Validate a `list_len_sum` prefix: reject the reserved `siphon:`
+/// prefix and reject an empty prefix (which would `SCAN` the entire
+/// keyspace). Raising `ValueError` matches `validate_key`'s style for
+/// programming errors.
+fn validate_prefix(prefix: &str) -> PyResult<()> {
+    validate_key(prefix)?;
+    if prefix.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "prefix must not be empty (would scan the entire keyspace)",
+        ));
+    }
+    Ok(())
+}
+
 /// Python-facing cache namespace.
 #[pyclass(name = "CacheNamespace")]
 pub struct PyCacheNamespace {
@@ -162,6 +176,66 @@ impl PyCacheNamespace {
         })
     }
 
+    /// Return the length of the Redis list under ``key`` (``LLEN``).
+    ///
+    /// Args:
+    ///     name: Cache name (must reference a Redis-backed entry —
+    ///         local-LRU-only caches don't have list semantics).
+    ///     key: List key. Reserved keys (``siphon:`` prefix) are rejected.
+    ///
+    /// Returns the list length (``0`` for a missing key — Redis
+    /// ``LLEN`` of an absent key is 0), or ``None`` when the cache is
+    /// unknown, the cache has no Redis backend, or the command failed.
+    fn list_len<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+        key: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        validate_key(&key)?;
+        let manager = Arc::clone(&self.manager);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok(manager.list_len(&name, &key).await)
+        })
+    }
+
+    /// Sum ``LLEN`` over every key matching ``{prefix}*`` — the live
+    /// depth of a set of sharded per-key lists (e.g. summing
+    /// ``ims_queue_*``), computed server-side in one await.
+    ///
+    /// Implemented with a cursor ``SCAN MATCH {prefix}* COUNT 512`` loop
+    /// (deduped, since ``SCAN`` may repeat keys under concurrent writes)
+    /// then a pipelined ``LLEN`` over the deduped set. Glob
+    /// metacharacters in ``prefix`` are escaped so it matches literally.
+    /// TTL-expired keys are simply gone from the keyspace, so the sum is
+    /// a truthful instantaneous depth.
+    ///
+    /// Args:
+    ///     name: Cache name (must reference a Redis-backed entry).
+    ///     prefix: Non-empty key prefix. Reserved (``siphon:``) prefixes
+    ///         are rejected; an empty prefix raises ``ValueError`` (it
+    ///         would scan the entire keyspace).
+    ///
+    /// Returns the summed length (``0`` when nothing matches), or
+    /// ``None`` when the cache is unknown, the cache has no Redis
+    /// backend, or a Redis error occurred mid-iteration.
+    ///
+    /// Note:
+    ///     ``SCAN`` is O(keyspace of that Redis DB) — intended for a
+    ///     dedicated queue DB.
+    fn list_len_sum<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+        prefix: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        validate_prefix(&prefix)?;
+        let manager = Arc::clone(&self.manager);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            Ok(manager.list_len_sum(&name, &prefix).await)
+        })
+    }
+
     /// Check whether ``key`` exists in the named cache.
     ///
     /// Considers the local LRU first (in-process), then Redis. Returns
@@ -177,5 +251,26 @@ impl PyCacheNamespace {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             Ok(manager.exists(&name, &key).await)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_prefix_rejects_empty() {
+        // Empty prefix would SCAN the whole keyspace — reject it.
+        assert!(validate_prefix("").is_err());
+    }
+
+    #[test]
+    fn validate_prefix_rejects_reserved() {
+        assert!(validate_prefix("siphon:internal").is_err());
+    }
+
+    #[test]
+    fn validate_prefix_accepts_normal() {
+        assert!(validate_prefix("ims_queue_").is_ok());
     }
 }
