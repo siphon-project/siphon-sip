@@ -301,7 +301,11 @@ impl PySubscribeState {
         // Mint dialog identity on our side.
         let call_id = format!("py-sub-{}", Uuid::new_v4());
         let local_tag = short_uuid();
-        let local_contact_addr = uac_sender.addr_for(&transport);
+        // Advertise our own reachable host (FQDN-aware) + listen port in the
+        // Via/Contact so the notifier can route the response and any in-dialog
+        // NOTIFY back to us; addr_for only supplies the port here.
+        let local_host = uac_sender.via_host_for(&transport);
+        let local_port = uac_sender.addr_for(&transport).port();
         let local_uri_default = strip_uri_params(ruri);
 
         // Pre-extract the script-supplied header dict into a Vec so the
@@ -332,8 +336,8 @@ impl PySubscribeState {
             accept,
             target_uri,
             transport,
-            target.address,
-            local_contact_addr,
+            &local_host,
+            local_port,
             &call_id,
             &local_tag,
             &extra_headers,
@@ -987,14 +991,17 @@ fn build_outbound_subscribe(
     accept: Option<&str>,
     target_uri: Option<&str>,
     transport: Transport,
-    target_address: std::net::SocketAddr,
-    local_contact_addr: std::net::SocketAddr,
+    local_host: &str,
+    local_port: u16,
     call_id: &str,
     local_tag: &str,
     extra_headers: &[(String, String)],
 ) -> PyResult<(crate::sip::message::SipMessage, u32, Option<String>)> {
     let branch = format!("z9hG4bK-uac-py-{}", Uuid::new_v4());
-    let via = format!("SIP/2.0/{} {};branch={}", transport, target_address, branch);
+    // Via sent-by is *our* advertised host:port so the notifier routes the
+    // response back to us (RFC 3261 §18.2.1 / §20.42 — the sent-by may be an
+    // FQDN), not to the destination or a loopback fallback.
+    let via = format!("SIP/2.0/{} {}:{};branch={}", transport, local_host, local_port, branch);
     let cseq_value: u32 = 1;
     let cseq_str = format!("{cseq_value} SUBSCRIBE");
 
@@ -1012,7 +1019,7 @@ fn build_outbound_subscribe(
     // any in-dialog NOTIFY it tries to send has nowhere to go.  Derive
     // the default from siphon's listen address for the chosen transport;
     // a caller-supplied ``headers={"Contact": ...}`` replaces this below.
-    let contact_default = format_default_contact(local_contact_addr, transport);
+    let contact_default = format_default_contact(local_host, local_port, transport);
 
     let mut builder = SipMessageBuilder::new()
         .request(Method::Subscribe, ruri_parsed)
@@ -1074,7 +1081,7 @@ fn build_outbound_subscribe(
 /// Used so the SUBSCRIBE we originate carries a routable Contact, which
 /// becomes the dialog's remote target for the notifier (RFC 3261 §12.1.1
 /// / RFC 6665 §4.1.2.1).
-fn format_default_contact(addr: std::net::SocketAddr, transport: Transport) -> String {
+fn format_default_contact(host: &str, port: u16, transport: Transport) -> String {
     let transport_param = match transport {
         Transport::Udp => "",
         Transport::Tcp => ";transport=tcp",
@@ -1083,7 +1090,7 @@ fn format_default_contact(addr: std::net::SocketAddr, transport: Transport) -> S
         Transport::WebSocketSecure => ";transport=wss",
         Transport::Sctp => ";transport=sctp",
     };
-    format!("<sip:{}{}>", addr, transport_param)
+    format!("<sip:{}:{}{}>", host, port, transport_param)
 }
 
 /// Return true for SIP headers that must appear at most once per RFC 3261
@@ -1297,12 +1304,12 @@ else:
         parse_uri_standalone(ruri).expect("parse ruri")
     }
 
-    fn target_addr() -> std::net::SocketAddr {
-        "10.0.0.99:5060".parse().unwrap()
+    fn local_host() -> &'static str {
+        "172.30.0.46"
     }
 
-    fn local_addr() -> std::net::SocketAddr {
-        "172.30.0.46:5070".parse().unwrap()
+    fn local_port() -> u16 {
+        5070
     }
 
     fn collect_header<'a>(message: &'a crate::sip::message::SipMessage, name: &str) -> Vec<&'a str> {
@@ -1328,8 +1335,8 @@ else:
             Some("application/reginfo+xml"),
             None,
             Transport::Udp,
-            target_addr(),
-            local_addr(),
+            local_host(),
+            local_port(),
             "py-sub-test",
             "local-tag-1",
             &[],
@@ -1369,8 +1376,8 @@ else:
             None,
             None,
             Transport::Tcp,
-            target_addr(),
-            local_addr(),
+            local_host(),
+            local_port(),
             "py-sub-tcp",
             "local-tag-tcp",
             &[],
@@ -1400,8 +1407,8 @@ else:
             None,
             None,
             Transport::Udp,
-            target_addr(),
-            local_addr(),
+            local_host(),
+            local_port(),
             "py-sub-override",
             "local-tag-2",
             &extra,
@@ -1416,11 +1423,14 @@ else:
         );
         assert_eq!(contacts[0], "<sip:ipsmgw@ipsmgw.example.com:6060>");
 
-        // No stale default leaks onto the wire.
+        // No stale default Contact leaks onto the wire. Match the Contact
+        // form specifically (`<sip:host:port>`), not the bare host:port —
+        // the latter now legitimately appears in the Via sent-by (our own
+        // advertised address), which is a different header.
         let wire = String::from_utf8(message.to_bytes()).unwrap();
         assert!(
-            !wire.contains("172.30.0.46:5070"),
-            "default Contact host:port leaked alongside user override:\n{wire}"
+            !wire.contains("<sip:172.30.0.46:5070"),
+            "default Contact leaked alongside user override:\n{wire}"
         );
     }
 
@@ -1445,8 +1455,8 @@ else:
             Some("application/reginfo+xml"),
             None,
             Transport::Udp,
-            target_addr(),
-            local_addr(),
+            local_host(),
+            local_port(),
             "py-sub-event",
             "local-tag-3",
             &extra,
@@ -1494,8 +1504,8 @@ else:
             None,
             Some("sip:scscf.example.org;lr"),
             Transport::Udp,
-            target_addr(),
-            local_addr(),
+            local_host(),
+            local_port(),
             "py-sub-multi",
             "local-tag-4",
             &extra,
@@ -1530,8 +1540,8 @@ else:
             None,
             None,
             Transport::Udp,
-            target_addr(),
-            local_addr(),
+            local_host(),
+            local_port(),
             "py-sub-from",
             "local-tag-5",
             &extra,
@@ -1555,30 +1565,63 @@ else:
     /// supported transport — the transport param is omitted only for UDP.
     #[test]
     fn format_default_contact_per_transport() {
-        let addr: std::net::SocketAddr = "192.0.2.10:5070".parse().unwrap();
         assert_eq!(
-            format_default_contact(addr, Transport::Udp),
+            format_default_contact("192.0.2.10", 5070, Transport::Udp),
             "<sip:192.0.2.10:5070>"
         );
         assert_eq!(
-            format_default_contact(addr, Transport::Tcp),
+            format_default_contact("192.0.2.10", 5070, Transport::Tcp),
             "<sip:192.0.2.10:5070;transport=tcp>"
         );
         assert_eq!(
-            format_default_contact(addr, Transport::Tls),
+            format_default_contact("192.0.2.10", 5070, Transport::Tls),
             "<sip:192.0.2.10:5070;transport=tls>"
         );
         assert_eq!(
-            format_default_contact(addr, Transport::WebSocket),
+            format_default_contact("192.0.2.10", 5070, Transport::WebSocket),
             "<sip:192.0.2.10:5070;transport=ws>"
         );
         assert_eq!(
-            format_default_contact(addr, Transport::WebSocketSecure),
+            format_default_contact("192.0.2.10", 5070, Transport::WebSocketSecure),
             "<sip:192.0.2.10:5070;transport=wss>"
         );
         assert_eq!(
-            format_default_contact(addr, Transport::Sctp),
+            format_default_contact("192.0.2.10", 5070, Transport::Sctp),
             "<sip:192.0.2.10:5070;transport=sctp>"
         );
+    }
+
+    /// An FQDN `advertised_address` is carried verbatim into the SUBSCRIBE
+    /// Via sent-by and default Contact — the notifier must be able to reach
+    /// us for the response and any in-dialog NOTIFY (RFC 6665 §4.1.2.1).
+    #[test]
+    fn build_outbound_subscribe_advertises_fqdn_host() {
+        let ruri = "sip:alice@ims.example.org";
+        let (message, _cseq, _from) = build_outbound_subscribe(
+            ruri,
+            parse_ruri(ruri),
+            "reg",
+            3600,
+            None,
+            None,
+            Transport::Udp,
+            "sbc.example.org",
+            5060,
+            "py-sub-fqdn",
+            "local-tag-fqdn",
+            &[],
+        )
+        .expect("build SUBSCRIBE");
+
+        let vias = collect_header(&message, "Via");
+        assert_eq!(vias.len(), 1, "one Via expected, got {vias:?}");
+        assert!(
+            vias[0].contains("sbc.example.org:5060"),
+            "Via sent-by must be our advertised FQDN:port, got {}",
+            vias[0]
+        );
+        let contacts = collect_header(&message, "Contact");
+        assert_eq!(contacts.len(), 1, "one Contact expected, got {contacts:?}");
+        assert_eq!(contacts[0], "<sip:sbc.example.org:5060>");
     }
 }
