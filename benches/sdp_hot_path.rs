@@ -7,7 +7,7 @@
 //! same per-call datapath as SIP parsing itself — string-heavy, siphon-owned,
 //! and run once (often twice) per call. Gated by `scripts/bench_regression.sh`.
 
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use std::hint::black_box;
 use siphon::media::sdp::SdpBody;
 
@@ -36,17 +36,19 @@ fn bench_sdp(criterion: &mut Criterion) {
         bencher.iter(|| black_box(SdpBody::parse(black_box(SAMPLE_SDP))));
     });
 
-    // filter_codecs mutates in place; the batched setup parses a fresh body
-    // (untimed) so the routine measures only the codec filter.
+    // Parse + codec-filter a fresh body. Parse is inside the timed region on
+    // purpose: it pairs each allocation with its matching free in the same
+    // region, which keeps this sub-microsecond bench stable. The previous
+    // `iter_batched` form drop-timed the filtered body and was sensitive to
+    // whole-binary code layout — it drifted when unrelated modules grew, with
+    // no change to the filter itself. Subtract `sdp/parse` for the filter-only
+    // cost; `roundtrip_filter` adds the serialize leg for the full per-call path.
     group.bench_function("filter_codecs", |bencher| {
-        bencher.iter_batched(
-            || SdpBody::parse(SAMPLE_SDP),
-            |mut sdp| {
-                sdp.filter_codecs(black_box(&["PCMU", "PCMA"]));
-                black_box(sdp)
-            },
-            BatchSize::SmallInput,
-        );
+        bencher.iter(|| {
+            let mut sdp = SdpBody::parse(black_box(SAMPLE_SDP));
+            sdp.filter_codecs(black_box(&["PCMU", "PCMA"]));
+            black_box(sdp)
+        });
     });
 
     let parsed = SdpBody::parse(SAMPLE_SDP);
