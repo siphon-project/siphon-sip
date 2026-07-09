@@ -254,11 +254,25 @@ impl UacSender {
             .unwrap_or_else(|| addr.ip().to_string());
         let from_uri = format!("<sip:{from_name}@{from_host_str}>;tag=uac-{cseq}");
 
+        // RFC 3261 §11.1 permits a Contact on an OPTIONS, and some peers require
+        // it: Microsoft Teams Direct Routing rejects an OPTIONS that carries
+        // neither Contact nor Record-Route ("Record-Route and Contact headers are
+        // missing") because it uses one of them to compute the next hop. Advertise
+        // our own reachable address — same host:port as the Via — so the peer can
+        // reach us for return traffic.
+        let contact = format!(
+            "<sip:{from_name}@{}:{};transport={}>",
+            addr.ip(),
+            addr.port(),
+            transport.to_string().to_lowercase(),
+        );
+
         let mut builder = SipMessageBuilder::new()
             .request(Method::Options, request_uri.clone())
             .via(via)
             .to(format!("<{request_uri}>"))
             .from(from_uri)
+            .contact(contact)
             .call_id(format!("uac-keepalive-{}", uuid::Uuid::new_v4()))
             .cseq(format!("{cseq} OPTIONS"))
             .max_forwards(70)
@@ -549,6 +563,31 @@ mod tests {
         );
 
         assert_eq!(sender.pending_count(), 1);
+    }
+
+    #[test]
+    fn send_options_includes_contact_header() {
+        // RFC 3261 §11.1 permits Contact on an OPTIONS; peers like Microsoft
+        // Teams Direct Routing require it and reject an OPTIONS carrying neither
+        // Contact nor Record-Route. The keepalive OPTIONS must advertise our own
+        // reachable address (same host:port as the Via, transport lowercased).
+        let (sender, receivers) = make_uac_sender();
+
+        let _receiver = sender.send_options(
+            "10.0.0.1:5060".parse().unwrap(),
+            Transport::Udp,
+            SipUri::new("10.0.0.1".to_string()),
+        );
+
+        // receivers[0] is the UDP egress channel from make_uac_sender().
+        let outbound = receivers[0]
+            .try_recv()
+            .expect("OPTIONS must be queued on the UDP egress channel");
+        let raw = String::from_utf8_lossy(&outbound.data);
+        assert!(
+            raw.contains("Contact: <sip:siphon@127.0.0.1:5060;transport=udp>"),
+            "OPTIONS keepalive must carry a Contact header, got:\n{raw}"
+        );
     }
 
     #[test]

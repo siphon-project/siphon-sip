@@ -221,7 +221,7 @@ impl PyTimerHandle {
     }
 
     fn __repr__(&self) -> String {
-        format!("TimerHandle(key={:?})", &self.key)
+        format!("TimerHandle(key={:?})", self.key)
     }
 }
 
