@@ -799,7 +799,7 @@ fn extract_handlers(
         let metadata: Option<Bound<'_, PyAny>> = item
             .get_item(4)
             .ok()
-            .filter(|v: &Bound<'_, PyAny>| !v.is_none());
+            .filter(|v| !v.is_none());
 
         let kind = match kind_str.as_str() {
             "proxy.on_request" => HandlerKind::ProxyRequest(filter),
