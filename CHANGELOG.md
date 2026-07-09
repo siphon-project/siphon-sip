@@ -6,6 +6,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-07-07
+
 ### Added
 - **`@rtpengine.on_media_timeout` script hook.** The media engine reaps a call
   whose media went dead (no packets past its inactivity window) and pushes a
