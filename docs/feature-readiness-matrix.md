@@ -225,7 +225,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Auth API | **Production** | `auth.require_digest()` etc. | |
 | Gateway API | **Production** | `gateway.select()` etc. | |
 | Cache API | **Production** | `cache.fetch()` | Redis-backed |
-| Cache list / TTL / existence ops | Implemented | `cache.list_push/list_pop_all/expire/exists` | Redis-backed FIFO queue ops (atomic LRANGE+DEL drain), per-key TTL, presence check; degrades silently when Redis is unreachable |
+| Cache list / TTL / existence ops | Implemented | `cache.list_push/list_pop_all/list_len/list_len_sum/expire/exists` | Redis-backed FIFO queue ops (atomic LRANGE+DEL drain), single-list length (`LLEN`), prefix-summed depth (`SCAN`+pipelined `LLEN`, TTL-expiry-truthful), per-key TTL, presence check; degrades silently when Redis is unreachable |
 | Presence API | **Production** | `presence.*` | Used for reg-event SUBSCRIBE/NOTIFY |
 | Outbound SUBSCRIBE (RFC 6665 watcher) | Implemented | `proxy.subscribe_state.send/find/refresh` | Originate SUBSCRIBE, capture dialog state from 200 OK, correlate inbound NOTIFY by tags |
 | Reginfo XML parser (RFC 3680) | Implemented | `presence.parse_reginfo(xml)` | Watcher-side parser for `application/reginfo+xml` NOTIFY bodies |

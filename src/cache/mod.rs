@@ -13,6 +13,21 @@ use tracing::warn;
 
 use crate::config::NamedCacheConfig;
 
+/// Escape Redis glob metacharacters (`* ? [ ] \`) so a `SCAN MATCH`
+/// prefix is matched literally. Backslash is escaped first (it is the
+/// glob escape char) by handling it in the same per-char pass.
+#[cfg(feature = "redis-backend")]
+fn escape_glob(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if matches!(ch, '\\' | '*' | '?' | '[' | ']') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 /// A single cached value with its insertion time.
 struct CacheEntry {
     value: String,
@@ -344,6 +359,98 @@ impl NamedCache {
         }
     }
 
+    /// Return the length of the Redis list under `key` (`LLEN`).
+    /// `Some(0)` for a missing key — Redis `LLEN` of an absent key is
+    /// 0 — and `None` when the Redis backend is unavailable or the
+    /// command failed. Local LRU is never consulted; list values live
+    /// only in Redis (consistent with `list_push`).
+    async fn list_len(&self, key: &str) -> Option<u64> {
+        #[cfg(feature = "redis-backend")]
+        {
+            let mut connection = self.get_redis_connection().await?;
+            match redis::cmd("LLEN")
+                .arg(key)
+                .query_async::<u64>(&mut connection)
+                .await
+            {
+                Ok(len) => Some(len),
+                Err(error) => {
+                    warn!(key = key, "Redis LLEN failed: {error}");
+                    None
+                }
+            }
+        }
+        #[cfg(not(feature = "redis-backend"))]
+        {
+            let _ = key;
+            debug!(key = key, "list_len: no Redis backend; returning None");
+            None
+        }
+    }
+
+    /// Sum `LLEN` over every key matching `{prefix}*`, computed
+    /// server-side so the caller gets the total in one await. Cursor
+    /// `SCAN MATCH {prefix}* COUNT 512` (deduped into a `HashSet`, since
+    /// SCAN may repeat keys under concurrent writes), then a pipelined
+    /// `LLEN` over the deduped set. Returns `Some(0)` when nothing
+    /// matches, `None` when the Redis backend is unavailable or a Redis
+    /// error occurred mid-iteration.
+    ///
+    /// `SCAN` is O(keyspace of that Redis DB) — intended for a dedicated
+    /// queue DB. Glob metacharacters (`* ? [ ] \`) in `prefix` are
+    /// escaped so an arbitrary prefix is matched literally.
+    async fn list_len_sum(&self, prefix: &str) -> Option<u64> {
+        #[cfg(feature = "redis-backend")]
+        {
+            let mut connection = self.get_redis_connection().await?;
+            let pattern = format!("{}*", escape_glob(prefix));
+            let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut cursor: u64 = 0;
+            loop {
+                let (next_cursor, batch): (u64, Vec<String>) = match redis::cmd("SCAN")
+                    .arg(cursor)
+                    .arg("MATCH")
+                    .arg(&pattern)
+                    .arg("COUNT")
+                    .arg(512)
+                    .query_async(&mut connection)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(error) => {
+                        warn!(prefix = prefix, "Redis SCAN failed: {error}");
+                        return None;
+                    }
+                };
+                keys.extend(batch);
+                cursor = next_cursor;
+                if cursor == 0 {
+                    break;
+                }
+            }
+            if keys.is_empty() {
+                return Some(0);
+            }
+            let mut pipe = redis::pipe();
+            for key in &keys {
+                pipe.cmd("LLEN").arg(key);
+            }
+            match pipe.query_async::<Vec<u64>>(&mut connection).await {
+                Ok(lengths) => Some(lengths.iter().sum()),
+                Err(error) => {
+                    warn!(prefix = prefix, "Redis LLEN pipeline failed: {error}");
+                    None
+                }
+            }
+        }
+        #[cfg(not(feature = "redis-backend"))]
+        {
+            let _ = prefix;
+            debug!(prefix = prefix, "list_len_sum: no Redis backend; returning None");
+            None
+        }
+    }
+
     /// Check if `key` exists in this cache. Considers the local LRU
     /// first (cheap, in-process), then Redis. Local-only caches answer
     /// from the LRU alone.
@@ -465,6 +572,20 @@ impl CacheManager {
             Some(cache) => cache.exists(key).await,
             None => false,
         }
+    }
+
+    /// Length of the Redis list under `key` (`LLEN`). `Some(0)` for a
+    /// missing key; `None` when the cache is unknown, the Redis backend
+    /// is unavailable, or the command failed.
+    pub async fn list_len(&self, name: &str, key: &str) -> Option<u64> {
+        self.caches.get(name)?.list_len(key).await
+    }
+
+    /// Sum of `LLEN` over every key matching `{prefix}*`. `Some(0)` when
+    /// nothing matches; `None` when the cache is unknown, the Redis
+    /// backend is unavailable, or a Redis error occurred mid-iteration.
+    pub async fn list_len_sum(&self, name: &str, prefix: &str) -> Option<u64> {
+        self.caches.get(name)?.list_len_sum(prefix).await
     }
 }
 
@@ -614,5 +735,40 @@ mod tests {
     async fn expire_returns_false_for_unknown_cache_name() {
         let manager = CacheManager::empty();
         assert!(!manager.expire("nope", "key", 60).await);
+    }
+
+    #[tokio::test]
+    async fn list_len_returns_none_when_redis_unreachable() {
+        let manager = CacheManager::new(&[make_config("queue", None, None)]);
+        // Bogus Redis URL — backend is unreachable, op degrades.
+        assert!(manager.list_len("queue", "ims_queue_abc").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_len_returns_none_for_unknown_cache_name() {
+        let manager = CacheManager::empty();
+        assert!(manager.list_len("nope", "key").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_len_sum_returns_none_when_redis_unreachable() {
+        let manager = CacheManager::new(&[make_config("queue", None, None)]);
+        assert!(manager.list_len_sum("queue", "ims_queue_").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_len_sum_returns_none_for_unknown_cache_name() {
+        let manager = CacheManager::empty();
+        assert!(manager.list_len_sum("nope", "ims_queue_").await.is_none());
+    }
+
+    #[cfg(feature = "redis-backend")]
+    #[test]
+    fn escape_glob_escapes_metacharacters() {
+        // Plain prefixes (underscore is not a glob metachar) pass through.
+        assert_eq!(escape_glob("ims_queue_"), "ims_queue_");
+        // The five glob metacharacters each get a backslash prefix.
+        assert_eq!(escape_glob("a*b?c[d]e"), "a\\*b\\?c\\[d\\]e");
+        assert_eq!(escape_glob("back\\slash"), "back\\\\slash");
     }
 }

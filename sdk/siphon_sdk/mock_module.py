@@ -1636,6 +1636,33 @@ class MockCache:
             return list(existing)
         return []
 
+    async def list_len(self, name: str, key: str) -> Optional[int]:
+        """Return the length of the list under ``key`` (``0`` for a
+        missing key), or ``None`` if the cache name is unknown."""
+        store = self._stores.get(name)
+        if store is None:
+            return None
+        existing = store.get(key)
+        if isinstance(existing, list):
+            return len(existing)
+        return 0
+
+    async def list_len_sum(self, name: str, prefix: str) -> Optional[int]:
+        """Sum the lengths of every list whose key starts with
+        ``prefix``. Returns ``0`` when nothing matches, ``None`` if the
+        cache name is unknown. Raises ``ValueError`` on an empty prefix
+        (which would scan the entire keyspace)."""
+        if not prefix:
+            raise ValueError("prefix must not be empty")
+        store = self._stores.get(name)
+        if store is None:
+            return None
+        total = 0
+        for key, value in store.items():
+            if key.startswith(prefix) and isinstance(value, list):
+                total += len(value)
+        return total
+
     async def expire(self, name: str, key: str, ttl: int) -> bool:
         """Mock TTL — records the call on ``self.expirations`` for
         assertions and returns ``True`` when the key currently exists
