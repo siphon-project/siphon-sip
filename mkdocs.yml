@@ -49,6 +49,22 @@ nav:
       - Media & RTP profiles: cookbook/media-rtp.md
       - Hardening & security: cookbook/security.md
       - Monitoring & observability: cookbook/monitoring.md
+  - API reference:
+      - Overview: reference/index.md
+      - Request: reference/request.md
+      - Reply: reference/reply.md
+      - Call: reference/call.md
+      - SDP: reference/sdp.md
+      - SIP types: reference/types.md
+      - Proxy & B2BUA: reference/proxy.md
+      - Registrar: reference/registrar.md
+      - Auth & security: reference/security.md
+      - Media: reference/media.md
+      - Gateway: reference/gateway.md
+      - Diameter: reference/diameter.md
+      - IMS control: reference/ims.md
+      - Observability: reference/observability.md
+      - Testing harness: reference/testing.md
   - Running in production:
       - Transports & networking: transports.md
       - Media engines (rtpengine / siphon-rtp): media-engines.md
@@ -85,3 +101,26 @@ markdown_extensions:
 
 plugins:
   - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          # `paths: [sdk]` lets griffe read `siphon_sdk` straight from the
+          # source tree — the SDK does not need to be pip-installed for the
+          # docs build.
+          paths: [sdk]
+          options:
+            docstring_style: google
+            show_source: false
+            show_root_heading: false
+            show_root_toc_entry: false
+            show_symbol_type_heading: true
+            show_symbol_type_toc: true
+            members_order: source
+            heading_level: 3
+            separate_signature: true
+            show_signature_annotations: true
+            signature_crossrefs: true
+            merge_init_into_class: false
+            docstring_section_style: table
+            filters: ["!^_"]

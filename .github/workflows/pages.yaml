@@ -11,11 +11,15 @@ on:
       - docs/**
       - mkdocs.yml
       - .github/workflows/pages.yaml
+      # The API reference is rendered from the SDK docstrings, so an SDK
+      # change can break the strict build — re-validate on those too.
+      - sdk/**
   pull_request:
     paths:
       - docs/**
       - mkdocs.yml
       - .github/workflows/pages.yaml
+      - sdk/**
   workflow_dispatch:
 
 permissions:
@@ -33,7 +37,9 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.x"
-      - run: pip install mkdocs-material
+        # `mkdocstrings[python]` renders the API reference from the siphon_sdk
+        # docstrings; `black` formats the generated signatures across lines.
+      - run: pip install mkdocs-material "mkdocstrings[python]" black
       - name: Build site (strict)
         run: mkdocs build --strict
       - name: Pin the custom domain

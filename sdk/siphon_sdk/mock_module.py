@@ -3184,7 +3184,7 @@ class MockDiameter:
 
     # -- ISDN-AddressString helpers (3GPP TS 29.002 §17.7.8) --
 
-    def decode_isdn_address(self, value) -> str:
+    def decode_isdn_address(self, value: Union[bytes, str]) -> str:
         """Decode an ISDN-AddressString to its E.164 digit string.
 
         Accepts the raw AVP bytes (``0x91`` ToN/NPI + TBCD digits) **or** an
@@ -3289,10 +3289,10 @@ class MockDiameter:
 
     def rx_aar(self, session_id: Optional[str] = None,
                framed_ip: Optional[str] = None,
-               framed_ipv6=None,
+               framed_ipv6: Union[str, bytes, None] = None,
                media_components: Optional[list] = None,
                af_application_id: str = "IMS Services",
-               subscription_id=None) -> Optional[dict]:
+               subscription_id: Optional[tuple] = None) -> Optional[dict]:
         """Send an Rx AA-Request for QoS resource reservation.
 
         Args:
@@ -3329,7 +3329,7 @@ class MockDiameter:
     # -- Sh: HSS integration (Application Server role) --
 
     def sh_udr(self, public_identity: str,
-               data_reference,
+               data_reference: Union[int, list[int]],
                service_indication: Optional[str] = None) -> Optional[dict]:
         """Send a Sh User-Data-Request to fetch user profile data from the HSS.
 
@@ -3366,7 +3366,7 @@ class MockDiameter:
         return {"result_code": self._default_sh_result_code}
 
     def sh_snr(self, public_identity: str,
-               data_reference,
+               data_reference: Union[int, list[int]],
                subs_req_type: int,
                service_indication: Optional[str] = None) -> Optional[dict]:
         """Send a Sh Subscribe-Notifications-Request to the HSS.
@@ -5749,7 +5749,8 @@ class MockQos:
         diameter.rx_aar(framed_ip=request.source_ip, media_components=components)
     """
 
-    def media_flows_from_sdp(self, *, offer, answer, direction: str = "orig") -> list[dict]:
+    def media_flows_from_sdp(self, *, offer: Any, answer: Any,
+                             direction: str = "orig") -> list[dict]:
         """Translate an SDP offer/answer pair into a ``media_components`` list.
 
         Args:
