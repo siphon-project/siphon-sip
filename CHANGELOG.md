@@ -30,6 +30,20 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   reachable address (same host:port as the Via, with `transport=` lowercased), so
   the trunk stays healthy. The host follows `advertised_address` when set — point
   it at the SBC FQDN for peers (Teams among them) that reject an IP in Contact.
+- **An FQDN `advertised_address` is now honored across every siphon-originated
+  (UAC) Via/From/Contact, not just IP literals.** Previously a non-IP
+  `advertised_address` (e.g. `sbc.example.org`) was collapsed to `127.0.0.1` on
+  the outbound OPTIONS keepalive/probe headers (including the Contact above), the
+  `proxy.subscribe_state` SUBSCRIBE Via/Contact, and the `proxy.send_request`
+  auto-Via, and it logged a spurious `advertised_address is not a valid IP, using
+  localhost` warning on each probe. The SIP header host now carries the advertised
+  value verbatim (RFC 3261 §20.42 permits an FQDN in the Via sent-by), while the
+  socket-source resolver still falls back to a local IP; the misleading warning is
+  downgraded to `debug`. This also fixes a latent bug where the `subscribe_state`
+  and `proxy.send_request` auto-Via sent-by was the *destination* address rather
+  than siphon's own, so a peer honoring the Via sent-by could route the response
+  away from us. A per-transport `listen.<t>.advertise` (or an IP
+  `advertised_address`) already worked and is unchanged.
 
 ### Security
 - **Bump `crossbeam-epoch` 0.9.18 → 0.9.20** to address RUSTSEC-2026-0204: an

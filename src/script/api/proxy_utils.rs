@@ -21,8 +21,6 @@ use crate::sip::uri::SipUri;
 use crate::transport::Transport;
 use crate::uac::UacSender;
 
-use std::net::SocketAddr;
-
 use super::reply::PyReply;
 use super::request::PyRequest;
 
@@ -366,11 +364,18 @@ impl PyProxyUtils {
             None => if scheme == "sips" { Transport::Tls } else { Transport::Udp },
         };
 
+        // Via sent-by = our advertised host (FQDN-aware) + listen port, so the
+        // peer's response comes back to us rather than the resolved destination.
+        let local_sent_by = format!(
+            "{}:{}",
+            uac_sender.via_host_for(&transport),
+            uac_sender.addr_for(&transport).port(),
+        );
         let (message, branch) = build_send_request_message(
             method,
             uri,
             transport,
-            target.address,
+            &local_sent_by,
             headers,
             body,
         )?;
@@ -529,7 +534,7 @@ fn build_send_request_message(
     method: &str,
     uri: SipUri,
     transport: Transport,
-    destination: SocketAddr,
+    local_sent_by: &str,
     headers: Option<&Bound<'_, PyDict>>,
     body: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<(SipMessage, String)> {
@@ -585,7 +590,10 @@ fn build_send_request_message(
     let auto_branch = format!("z9hG4bK-uac-py-{}", uuid::Uuid::new_v4());
     let via_value = match user_via {
         Some(via_str) => via_str,
-        None => format!("SIP/2.0/{} {};branch={}", transport, destination, auto_branch),
+        // Auto Via sent-by is *our* advertised host:port (FQDN-aware, RFC 3261
+        // §20.42) so the peer routes the response back to us — not the
+        // destination address, which was a latent bug.
+        None => format!("SIP/2.0/{} {};branch={}", transport, local_sent_by, auto_branch),
     };
     let branch = crate::sip::headers::via::Via::parse(&via_value)
         .ok()
@@ -880,8 +888,8 @@ mod tests {
         assert!(pct <= 100, "memory_used_pct returned {pct}");
     }
 
-    fn destination() -> SocketAddr {
-        "10.0.0.1:5060".parse().unwrap()
+    fn local_sent_by() -> &'static str {
+        "192.0.2.9:5060"
     }
 
     fn target_uri() -> SipUri {
@@ -910,7 +918,7 @@ mod tests {
                 "REGISTER",
                 target_uri(),
                 Transport::Udp,
-                destination(),
+                local_sent_by(),
                 Some(&headers),
                 Some(body_any),
             )
@@ -963,7 +971,7 @@ mod tests {
                 "MESSAGE",
                 target_uri(),
                 Transport::Udp,
-                destination(),
+                local_sent_by(),
                 Some(&headers),
                 Some(body_obj.as_any()),
             )
@@ -985,7 +993,7 @@ mod tests {
                 "OPTIONS",
                 target_uri(),
                 Transport::Udp,
-                destination(),
+                local_sent_by(),
                 Some(&headers),
                 None,
             )
@@ -1014,7 +1022,7 @@ mod tests {
                 "REGISTER",
                 target_uri(),
                 Transport::Udp,
-                destination(),
+                local_sent_by(),
                 Some(&headers),
                 Some(body_obj.as_any()),
             )
@@ -1042,7 +1050,7 @@ mod tests {
                 "MESSAGE",
                 target_uri(),
                 Transport::Udp,
-                destination(),
+                local_sent_by(),
                 Some(&headers),
                 None,
             )
@@ -1081,7 +1089,7 @@ mod tests {
                 "MESSAGE",
                 target_uri(),
                 Transport::Udp,
-                destination(),
+                local_sent_by(),
                 Some(&headers),
                 None,
             )
@@ -1106,7 +1114,7 @@ mod tests {
                 "OPTIONS",
                 target_uri(),
                 Transport::Udp,
-                destination(),
+                local_sent_by(),
                 Some(&headers),
                 None,
             )
@@ -1140,7 +1148,7 @@ mod tests {
                 "MESSAGE",
                 target_uri(),
                 Transport::Udp,
-                destination(),
+                local_sent_by(),
                 Some(&headers),
                 None,
             )
@@ -1155,6 +1163,37 @@ mod tests {
             assert_eq!(
                 branch, "z9hG4bK-uac-script-supplied",
                 "returned branch must come from the user-supplied Via"
+            );
+        });
+    }
+
+    /// With no script-supplied Via, the auto Via sent-by is *our* advertised
+    /// host:port (so responses route back to us), not the resolved
+    /// destination — the latent bug this fixes.
+    #[test]
+    fn send_request_auto_via_uses_local_sent_by() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let _ = py;
+            let (message, branch) = build_send_request_message(
+                "MESSAGE",
+                target_uri(),
+                Transport::Udp,
+                local_sent_by(),
+                None,
+                None,
+            )
+            .expect("build_send_request_message");
+
+            let vias = message.headers.get_all("Via").expect("Via must be present");
+            assert_eq!(vias.len(), 1, "one Via expected, got {vias:?}");
+            assert!(
+                vias[0].contains(&format!("SIP/2.0/UDP {}", local_sent_by())),
+                "auto Via sent-by must be our advertised host:port, got {vias:?}"
+            );
+            assert!(
+                branch.starts_with("z9hG4bK-uac-py-"),
+                "auto branch must use the UAC-py prefix, got {branch}"
             );
         });
     }
