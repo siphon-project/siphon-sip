@@ -1017,8 +1017,9 @@ impl SiphonServer {
         // UDP listeners get a dedicated outbound channel each — required
         // for IPsec sec-agree on the P-CSCF role (3GPP TS 33.203 §7.4)
         // where a reply must egress on the same local socket the request
-        // arrived on.  The first listener's channel doubles as the
-        // default fallback for messages without a `source_local_addr`.
+        // arrived on.  The first *configured* listener's channel doubles as
+        // the default fallback for messages without a `source_local_addr`
+        // (see `default_udp_egress_addr`).
         let mut udp_listener_channels: std::collections::HashMap<
             std::net::SocketAddr,
             (flume::Sender<transport::OutboundMessage>, flume::Receiver<transport::OutboundMessage>),
@@ -1045,7 +1046,6 @@ impl SiphonServer {
             std::net::SocketAddr,
             flume::Sender<transport::OutboundMessage>,
         > = std::collections::HashMap::new();
-        let mut udp_default: Option<flume::Sender<transport::OutboundMessage>> = None;
         let ipsec_enabled = config.ipsec.is_some();
         // Populate the per-listener UDP channel map when IPsec is enabled OR the
         // host is multi-homed (more than one UDP listener).  A single-listener
@@ -1055,15 +1055,21 @@ impl SiphonServer {
         // `send_socket=` egress pin meaningful, and it also covers
         // IPsec-protected replies (TS 33.203 §7.4).
         let per_listener_udp = ipsec_enabled || udp_listener_channels.len() > 1;
-        for (addr, (tx, _)) in udp_listener_channels.iter() {
-            if per_listener_udp {
+        if per_listener_udp {
+            for (addr, (tx, _)) in udp_listener_channels.iter() {
                 udp_by_local.insert(*addr, tx.clone());
             }
-            if udp_default.is_none() {
-                udp_default = Some(tx.clone());
-            }
         }
-        let udp_default = udp_default.unwrap_or_else(|| flume::unbounded().0);
+        // Default egress socket for UDP sends without a `source_local_addr` pin
+        // (relays, forks, UAC-originated).  Deterministically the FIRST
+        // configured `listen.udp` listener — the same one advertised as
+        // `listen_addrs[Udp]` / the outgoing Via sent-by — NOT an arbitrary
+        // `udp_listener_channels` HashMap-iteration pick (per-process randomized
+        // seed).  Without this a multi-homed UDP host could egress from a
+        // different socket than its Via advertised and flip between restarts.
+        let udp_default = default_udp_egress_addr(&config.listen.udp)
+            .and_then(|addr| udp_listener_channels.get(&addr).map(|(tx, _)| tx.clone()))
+            .unwrap_or_else(|| flume::unbounded().0);
 
         let outbound_senders = Arc::new(transport::OutboundRouter {
             udp: udp_default,
@@ -2778,6 +2784,23 @@ fn build_transport_acl(
     }
 }
 
+/// The default egress UDP socket address: the first *parseable* entry in
+/// `listen.udp` config (Vec) order.
+///
+/// This must be deterministic and must match `listen_addrs[Udp]` — the address
+/// advertised as the Via sent-by — which is likewise the first configured UDP
+/// listener (`listen_addrs.entry(Udp).or_insert(addr)` in config order). Picking
+/// the default from config order rather than `udp_listener_channels` HashMap
+/// iteration (a per-process randomized `RandomState` seed) is what keeps a
+/// multi-homed UDP deployment egressing from a *stable* socket that agrees with
+/// the Via it advertises, instead of an arbitrary listener that could differ
+/// from the Via and flip between restarts.
+fn default_udp_egress_addr(udp_entries: &[config::ListenEntry]) -> Option<std::net::SocketAddr> {
+    udp_entries
+        .iter()
+        .find_map(|entry| entry.address().parse::<std::net::SocketAddr>().ok())
+}
+
 /// Decode a PCF event-notification callback body (TS 29.514 `EventsNotification`)
 /// into the JSON string handed verbatim to `@sbi.on_event`.
 ///
@@ -2801,6 +2824,70 @@ fn pcf_notification_body_to_json(raw: &[u8]) -> Option<String> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // --- default_udp_egress_addr ---
+
+    #[test]
+    fn default_udp_egress_addr_picks_first_configured() {
+        let entries = vec![
+            config::ListenEntry::Plain("10.0.0.1:5060".to_string()),
+            config::ListenEntry::Plain("10.0.0.2:5060".to_string()),
+        ];
+        assert_eq!(
+            default_udp_egress_addr(&entries),
+            Some("10.0.0.1:5060".parse().unwrap()),
+            "default egress must be the first configured listener, not the second"
+        );
+    }
+
+    #[test]
+    fn default_udp_egress_addr_is_config_order_not_sorted() {
+        // A higher-then-lower address ordering proves we honour config order and
+        // are not accidentally min/sorting the set.
+        let entries = vec![
+            config::ListenEntry::Plain("192.0.2.9:5090".to_string()),
+            config::ListenEntry::Plain("192.0.2.1:5060".to_string()),
+        ];
+        assert_eq!(
+            default_udp_egress_addr(&entries),
+            Some("192.0.2.9:5090".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn default_udp_egress_addr_skips_unparseable_first_entry() {
+        // The channel-build loop `continue`s past an unparseable addr; the
+        // default must land on the first entry that actually parses so it maps
+        // to a real listener channel.
+        let entries = vec![
+            config::ListenEntry::Plain("not-an-address".to_string()),
+            config::ListenEntry::Plain("203.0.113.7:5060".to_string()),
+        ];
+        assert_eq!(
+            default_udp_egress_addr(&entries),
+            Some("203.0.113.7:5060".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn default_udp_egress_addr_empty_is_none() {
+        assert_eq!(default_udp_egress_addr(&[]), None);
+    }
+
+    #[test]
+    fn default_udp_egress_addr_honours_extended_form() {
+        // The extended (struct) listen form must resolve the same way as the
+        // plain string form — selection keys on `address()`, not the variant.
+        let entries = vec![config::ListenEntry::Extended {
+            address: "198.51.100.4:5062".to_string(),
+            advertise: Some("sip.example.org".to_string()),
+            dscp: None,
+        }];
+        assert_eq!(
+            default_udp_egress_addr(&entries),
+            Some("198.51.100.4:5062".parse().unwrap())
+        );
+    }
 
     /// A real-shaped TS 29.514 `EventsNotification` (the body a PCF POSTs to the
     /// AF callback) must reach the script with EVERY field intact. The old typed

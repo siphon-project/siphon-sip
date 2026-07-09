@@ -88,6 +88,14 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   than siphon's own, so a peer honoring the Via sent-by could route the response
   away from us. A per-transport `listen.<t>.advertise` (or an IP
   `advertised_address`) already worked and is unchanged.
+- **Deterministic default outbound UDP socket on multi-homed hosts.** With more
+  than one `listen.udp` entry, the default egress socket for outbound UDP
+  (relays, forks, UAC-originated requests, and responses without an explicit
+  source pin) was chosen by `HashMap` iteration order — a per-process randomized
+  seed — so a packet could leave from a different socket than the Via it
+  advertised, and the choice flipped between restarts. The default is now the
+  first `listen.udp` listener in configuration order, matching the advertised Via
+  sent-by. Single-listener and IPsec deployments are unaffected.
 
 ### Security
 - **Bump `crossbeam-epoch` 0.9.18 → 0.9.20** to address RUSTSEC-2026-0204: an
