@@ -35,10 +35,14 @@ pub fn resolve_via_addr(
             if let Ok(ip) = adv.parse::<std::net::IpAddr>() {
                 return SocketAddr::new(ip, local_addr.port());
             }
-            warn!(
+            // Not an IP literal (e.g. an FQDN). This resolves the *socket
+            // source* address, which needs an IP; the FQDN is carried into
+            // the Via/Contact/From host separately via `resolve_via_host`.
+            debug!(
                 transport = %transport,
                 value = %adv,
-                "advertised address is not a valid IP, falling back"
+                "per-transport advertised address is not an IP literal; \
+                 using the local IP for the socket source"
             );
         }
         // Fall back to global advertised_address
@@ -47,9 +51,14 @@ pub fn resolve_via_addr(
         match host.parse::<std::net::IpAddr>() {
             Ok(ip) => SocketAddr::new(ip, local_addr.port()),
             Err(_) => {
-                warn!(
+                // FQDN (or otherwise non-IP) advertised_address. Expected and
+                // benign: the socket source falls back to localhost, while the
+                // SIP header host is taken from the advertised value via
+                // `resolve_via_host` (RFC 3261 §20.42 permits an FQDN there).
+                debug!(
                     value = %host,
-                    "global advertised_address is not a valid IP, using localhost"
+                    "advertised_address is not an IP literal; using localhost \
+                     for the socket source (the SIP header host uses the FQDN)"
                 );
                 let ip = if local_addr.is_ipv6() {
                     std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
@@ -63,9 +72,38 @@ pub fn resolve_via_addr(
         local_addr
     }
 }
+
+/// Resolve the host (IP literal or FQDN) to advertise in the Via/From/Contact
+/// of a UAC-originated request for `transport`.
+///
+/// Resolution order mirrors [`resolve_via_addr`]:
+/// 1. Per-transport advertised address
+/// 2. Global `advertised_address`
+/// 3. `local_ip_fallback()` (evaluated lazily — only when no advertised
+///    address is configured, so callers can pass a value whose computation
+///    would otherwise log)
+///
+/// Unlike [`resolve_via_addr`], this preserves an FQDN instead of collapsing
+/// it to `127.0.0.1`: RFC 3261 §20.42 permits an FQDN in the Via sent-by, and
+/// a Contact/From host must be reachable rather than loopback. The result is
+/// SIP-formatted (IPv6 addresses bracketed).
+pub fn resolve_via_host(
+    transport: &Transport,
+    advertised_addrs: &HashMap<Transport, String>,
+    advertised_address: Option<&str>,
+    local_ip_fallback: impl FnOnce() -> String,
+) -> String {
+    if let Some(advertised) = advertised_addrs.get(transport) {
+        return format_sip_host(advertised);
+    }
+    if let Some(global) = advertised_address {
+        return format_sip_host(global);
+    }
+    format_sip_host(&local_ip_fallback())
+}
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::message::{Method, SipMessage};
-use crate::sip::uri::SipUri;
+use crate::sip::uri::{format_sip_host, SipUri};
 use crate::transport::{ConnectionId, OutboundMessage, OutboundRouter, Transport};
 
 /// Result of a UAC request.
@@ -133,6 +171,21 @@ impl UacSender {
     pub fn addr_for(&self, transport: &Transport) -> SocketAddr {
         let addr = self.listen_addrs.get(transport).copied().unwrap_or(self.local_addr);
         resolve_via_addr(addr, transport, &self.advertised_addrs, self.advertised_address.as_deref())
+    }
+
+    /// Return the host string (IP literal or FQDN) to advertise in the
+    /// Via/From/Contact of a UAC-originated request for `transport`.
+    ///
+    /// Unlike [`addr_for`], this preserves an FQDN `advertised_address`
+    /// instead of collapsing it to `127.0.0.1` — pair it with
+    /// `addr_for(..).port()` for the sent-by port.
+    pub fn via_host_for(&self, transport: &Transport) -> String {
+        resolve_via_host(
+            transport,
+            &self.advertised_addrs,
+            self.advertised_address.as_deref(),
+            || self.addr_for(transport).ip().to_string(),
+        )
     }
 
     /// Send an OPTIONS request to a target address.
@@ -243,22 +296,44 @@ impl UacSender {
         // will reply to (the protected P-CSCF port); otherwise use the
         // configured per-transport address.
         let addr = source_local_addr.unwrap_or_else(|| self.addr_for(&transport));
+        // Via/From host: the exact listener IP for a captured-flow probe, else
+        // the advertised host — which may be an FQDN (RFC 3261 §20.42) rather
+        // than the loopback `addr_for` collapses an FQDN to.
+        let via_host = match source_local_addr {
+            Some(local) => format_sip_host(&local.ip().to_string()),
+            None => self.via_host_for(&transport),
+        };
         let via = format!(
             "SIP/2.0/{} {}:{};branch={}",
-            transport, addr.ip(), addr.port(), branch
+            transport, via_host, addr.port(), branch
         );
 
         let from_name = from_user.unwrap_or("siphon");
         let from_host_str = from_domain
             .map(|domain| domain.to_string())
-            .unwrap_or_else(|| addr.ip().to_string());
+            .unwrap_or_else(|| via_host.clone());
         let from_uri = format!("<sip:{from_name}@{from_host_str}>;tag=uac-{cseq}");
+
+        // RFC 3261 §11.1 permits a Contact on an OPTIONS, and some peers require
+        // it: Microsoft Teams Direct Routing rejects an OPTIONS that carries
+        // neither Contact nor Record-Route ("Record-Route and Contact headers are
+        // missing") because it uses one of them to compute the next hop. Advertise
+        // our own reachable address, the same host:port as the Via (so it follows
+        // the advertised address, FQDN included, rather than a loopback fallback),
+        // so the peer can reach us for return traffic.
+        let contact = format!(
+            "<sip:{from_name}@{}:{};transport={}>",
+            via_host,
+            addr.port(),
+            transport.to_string().to_lowercase(),
+        );
 
         let mut builder = SipMessageBuilder::new()
             .request(Method::Options, request_uri.clone())
             .via(via)
             .to(format!("<{request_uri}>"))
             .from(from_uri)
+            .contact(contact)
             .call_id(format!("uac-keepalive-{}", uuid::Uuid::new_v4()))
             .cseq(format!("{cseq} OPTIONS"))
             .max_forwards(70)
@@ -549,6 +624,31 @@ mod tests {
         );
 
         assert_eq!(sender.pending_count(), 1);
+    }
+
+    #[test]
+    fn send_options_includes_contact_header() {
+        // RFC 3261 §11.1 permits Contact on an OPTIONS; peers like Microsoft
+        // Teams Direct Routing require it and reject an OPTIONS carrying neither
+        // Contact nor Record-Route. The keepalive OPTIONS must advertise our own
+        // reachable address (same host:port as the Via, transport lowercased).
+        let (sender, receivers) = make_uac_sender();
+
+        let _receiver = sender.send_options(
+            "10.0.0.1:5060".parse().unwrap(),
+            Transport::Udp,
+            SipUri::new("10.0.0.1".to_string()),
+        );
+
+        // receivers[0] is the UDP egress channel from make_uac_sender().
+        let outbound = receivers[0]
+            .try_recv()
+            .expect("OPTIONS must be queued on the UDP egress channel");
+        let raw = String::from_utf8_lossy(&outbound.data);
+        assert!(
+            raw.contains("Contact: <sip:siphon@127.0.0.1:5060;transport=udp>"),
+            "OPTIONS keepalive must carry a Contact header, got:\n{raw}"
+        );
     }
 
     #[test]
@@ -978,5 +1078,107 @@ mod tests {
         let addr: SocketAddr = "0.0.0.0:5080".parse().unwrap();
         let result = resolve_via_addr(addr, &Transport::Tcp, &HashMap::new(), Some("10.1.1.1"));
         assert_eq!(result.port(), 5080);
+    }
+
+    // --- resolve_via_host tests ---
+
+    #[test]
+    fn resolve_via_host_per_transport_wins() {
+        let mut addrs = HashMap::new();
+        addrs.insert(Transport::Udp, "203.0.113.1".to_string());
+        let result = resolve_via_host(&Transport::Udp, &addrs, Some("sbc.example.org"), || {
+            panic!("fallback must not run when an advertised address is present")
+        });
+        assert_eq!(result, "203.0.113.1");
+    }
+
+    #[test]
+    fn resolve_via_host_preserves_global_fqdn() {
+        // The whole point: an FQDN advertised_address is kept verbatim, not
+        // collapsed to an IP the way resolve_via_addr must.
+        let result = resolve_via_host(&Transport::Udp, &HashMap::new(), Some("sbc.example.org"), || {
+            panic!("fallback must not run when a global advertised address is present")
+        });
+        assert_eq!(result, "sbc.example.org");
+    }
+
+    #[test]
+    fn resolve_via_host_global_ip_literal() {
+        let result = resolve_via_host(&Transport::Udp, &HashMap::new(), Some("198.51.100.5"), || {
+            "127.0.0.1".to_string()
+        });
+        assert_eq!(result, "198.51.100.5");
+    }
+
+    #[test]
+    fn resolve_via_host_brackets_ipv6() {
+        let result = resolve_via_host(&Transport::Udp, &HashMap::new(), Some("2001:db8::1"), || {
+            "::1".to_string()
+        });
+        assert_eq!(result, "[2001:db8::1]");
+    }
+
+    #[test]
+    fn resolve_via_host_lazy_fallback_used_only_without_config() {
+        let result = resolve_via_host(&Transport::Udp, &HashMap::new(), None, || "192.0.2.7".to_string());
+        assert_eq!(result, "192.0.2.7");
+    }
+
+    /// End-to-end: a sender bound to 0.0.0.0 with an FQDN `advertised_address`
+    /// emits that FQDN in the OPTIONS Via and From — never the loopback that
+    /// the socket-source resolver falls back to.
+    #[test]
+    fn send_options_via_and_from_use_fqdn_advertised_address() {
+        let (udp_tx, udp_rx) = flume::unbounded();
+        let (tcp_tx, _tcp_rx) = flume::unbounded();
+        let (tls_tx, _tls_rx) = flume::unbounded();
+        let (ws_tx, _ws_rx) = flume::unbounded();
+        let (wss_tx, _wss_rx) = flume::unbounded();
+        let (sctp_tx, _sctp_rx) = flume::unbounded();
+        let router = Arc::new(OutboundRouter {
+            udp: udp_tx,
+            udp_by_local: std::collections::HashMap::new(),
+            tcp: tcp_tx,
+            tls: tls_tx,
+            ws: ws_tx,
+            wss: wss_tx,
+            sctp: sctp_tx,
+        });
+        let mut listen_addrs = HashMap::new();
+        listen_addrs.insert(Transport::Udp, "0.0.0.0:5060".parse().unwrap());
+        let sender = UacSender::new(
+            router,
+            "0.0.0.0:5060".parse().unwrap(),
+            listen_addrs,
+            HashMap::new(),
+            Some("sbc.example.org".to_string()),
+            None,
+            None,
+        );
+
+        let _receiver = sender.send_options(
+            "10.0.0.1:5060".parse().unwrap(),
+            Transport::Udp,
+            SipUri::new("10.0.0.1".to_string()),
+        );
+
+        let outbound = udp_rx.try_recv().unwrap();
+        let raw = String::from_utf8_lossy(&outbound.data);
+        assert!(
+            raw.contains("SIP/2.0/UDP sbc.example.org:5060"),
+            "Via must advertise the FQDN with the listen port: {raw}"
+        );
+        assert!(
+            raw.contains("sip:siphon@sbc.example.org"),
+            "From must advertise the FQDN: {raw}"
+        );
+        assert!(
+            raw.contains("Contact: <sip:siphon@sbc.example.org:5060;transport=udp>"),
+            "Contact must advertise the FQDN, not the loopback fallback: {raw}"
+        );
+        assert!(
+            !raw.contains("127.0.0.1"),
+            "must not leak loopback when an FQDN is advertised: {raw}"
+        );
     }
 }

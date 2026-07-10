@@ -7,6 +7,39 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **`send_socket=` egress pin on `request.relay()` / `request.fork()` and
+  `call.dial()` / `call.fork()`** — the operator equivalent of Kamailio's
+  `force_send_socket()` / OpenSIPS' `$fs`. Selects which of siphon's own
+  configured listeners a relayed or dialed request leaves from on a multi-homed
+  host (`send_socket="udp:10.0.0.1:5060"`), and advertises that listener's
+  address in the outgoing Via so the response returns to the same socket. UDP
+  pins the exact `(ip, port)` listener; TCP/TLS bind the source IP with an
+  ephemeral source port (the source is now part of the connection-pool key, so a
+  source-bound and a default connection to the same peer stay distinct). The pin
+  is validated for format at the scripting API (a malformed spec raises
+  `ValueError`); a well-formed spec that names no configured listener is logged
+  and falls back to default routing rather than dropping the request. It is
+  ignored when a captured `flow=` is set (the flow already pins egress) and when
+  its transport doesn't match the routed transport. Per-listener UDP egress
+  channels are now enabled whenever the host has more than one UDP listener (they
+  were previously only enabled under IPsec); a single-listener deployment keeps
+  the existing fast path unchanged.
+- **Whole-URI setters `set_from_uri` / `set_to_uri` / `set_contact_uri`, plus
+  `set_contact_user`, on both `request` (proxy) and `call` (B2BUA).** The
+  whole-URI form of the existing `set_*_user` / `set_*_host` setters: replace the
+  entire URI inside the header's angle brackets — scheme, user, host, port and
+  URI params — in one call, preserving the display name and the dialog-critical
+  From/To tag (unlike a raw `set_header("From", "<sip:…>")`, which drops the
+  tag). `set_contact_user` rewrites only the Contact userpart (empty string
+  clears it). On the B2BUA these mutate the outbound B-leg: `set_from_uri` /
+  `set_to_uri` also pin the host (same topology-hiding opt-out as
+  `set_from_host` / `set_to_host`); `set_contact_user` injects a userpart into
+  siphon's advertised Contact while keeping its host:port (so in-dialog routing
+  is unchanged and the userpart rides along — for a downstream that keys a
+  tenant/extension off the Contact userpart, the way it does for a REGISTER
+  Contact), and `set_contact_uri` replaces the whole Contact for edge/GRUU
+  deployments that front siphon. The B-leg Contact stays userless by default
+  (RFC 3261 §8.1.1.8 puts no identity in the Contact userpart); these are opt-in.
 - **`cache.list_len(name, key)` and `cache.list_len_sum(name, prefix)`.** Two
   async cache-namespace methods for Redis-backed lists. `list_len` returns a
   single list's length (`LLEN`, `0` for a missing key). `list_len_sum` returns
@@ -25,6 +58,43 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   namespaces) is now rendered on the docs site straight from the `siphon-sip`
   SDK docstrings via `mkdocstrings`, so the reference tracks the code instead of
   drifting. The PyPI `Documentation` link now points there.
+
+### Changed
+- **Bump the `siphon-bin` SMPP extension to siphon-smpp v1.3.0**, which adds
+  Prometheus metrics for the SMPP runtime into siphon's shared `/metrics`
+  registry: `siphon_smpp_binds` (gauge, `direction`/`state`) plus
+  `siphon_smpp_pdus_total`, `siphon_smpp_throttled_total`,
+  `siphon_smpp_bind_reconnects_total`, `siphon_smpp_dispatch_errors_total`,
+  `siphon_smpp_dispatch_duration_seconds` (histogram) and
+  `siphon_smpp_bind_requests_total`. Only affects builds with `--features smpp`;
+  when the host metrics engine isn't initialised every emit path is a no-op, so
+  the dispatch hot path reads no clock and touches no metric.
+
+### Fixed
+- **Outbound OPTIONS keepalives now carry a `Contact` header.** The UAC-side
+  OPTIONS builder (NAT keepalive, gateway health probe, registrar liveness probe)
+  emitted Via/From/To/Call-ID/CSeq only — no Contact. RFC 3261 §11.1 makes
+  Contact a MAY on OPTIONS, but some peers require it: Microsoft Teams Direct
+  Routing rejects an OPTIONS that carries neither Contact nor Record-Route
+  (`Q.850;cause=63;text="…Record-Route and Contact headers are missing"`) because
+  it derives the next hop from one of them. The OPTIONS now advertises the local
+  reachable address (same host:port as the Via, with `transport=` lowercased), so
+  the trunk stays healthy. The host follows `advertised_address` when set — point
+  it at the SBC FQDN for peers (Teams among them) that reject an IP in Contact.
+- **An FQDN `advertised_address` is now honored across every siphon-originated
+  (UAC) Via/From/Contact, not just IP literals.** Previously a non-IP
+  `advertised_address` (e.g. `sbc.example.org`) was collapsed to `127.0.0.1` on
+  the outbound OPTIONS keepalive/probe headers (including the Contact above), the
+  `proxy.subscribe_state` SUBSCRIBE Via/Contact, and the `proxy.send_request`
+  auto-Via, and it logged a spurious `advertised_address is not a valid IP, using
+  localhost` warning on each probe. The SIP header host now carries the advertised
+  value verbatim (RFC 3261 §20.42 permits an FQDN in the Via sent-by), while the
+  socket-source resolver still falls back to a local IP; the misleading warning is
+  downgraded to `debug`. This also fixes a latent bug where the `subscribe_state`
+  and `proxy.send_request` auto-Via sent-by was the *destination* address rather
+  than siphon's own, so a peer honoring the Via sent-by could route the response
+  away from us. A per-transport `listen.<t>.advertise` (or an IP
+  `advertised_address`) already worked and is unchanged.
 
 ### Security
 - **Bump `crossbeam-epoch` 0.9.18 → 0.9.20** to address RUSTSEC-2026-0204: an

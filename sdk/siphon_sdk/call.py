@@ -11,7 +11,7 @@ import uuid
 from typing import Optional, Union
 
 from siphon_sdk.types import Action, Contact, Flow, MediaHandle, SipUri
-from siphon_sdk.request import _parse_uri
+from siphon_sdk.request import _parse_uri, _validate_send_socket
 
 
 class Call:
@@ -71,6 +71,8 @@ class Call:
         self._media = MediaHandle()
         self._refer_to = refer_to
         self._refer_replaces = refer_replaces
+        self._contact_user_override: Optional[str] = None
+        self._contact_override: Optional[str] = None
 
     # -- Properties ------------------------------------------------------------
 
@@ -263,6 +265,7 @@ class Call:
         strip: Optional[list[str]] = None,
         translate: Optional[list[tuple[str, str]]] = None,
         route: Optional[list[str]] = None,
+        send_socket: Optional[str] = None,
     ) -> None:
         """Dial a single B-leg target.
 
@@ -305,6 +308,16 @@ class Call:
                 originating S-CSCF (RFC 3608).  Each entry is a full route
                 value, e.g. ``"<sip:scscf.ims.example.com:6060;lr>"`` — pass
                 the list returned by ``registration.service_route(impu)``.
+            send_socket: Optional egress socket pin
+                (``"<transport>:<ip>:<port>"``, e.g. ``"udp:10.0.0.1:5060"``)
+                — the operator equivalent of Kamailio's ``force_send_socket()``.
+                Selects which of siphon's own configured listeners the B-leg
+                INVITE leaves from on a multi-homed host; the B-leg Via
+                advertises that listener's address.  UDP pins the exact
+                ``(ip, port)`` listener; TCP/TLS bind the source IP with an
+                ephemeral port.  Ignored when ``flow`` is set (the flow already
+                pins egress), and when its transport doesn't match the B-leg
+                transport.  A malformed spec raises ``ValueError``.
 
         Example::
 
@@ -330,6 +343,7 @@ class Call:
                       "P-Asserted-Identity", "Reason"],
             )
         """
+        _validate_send_socket(send_socket)
         self._actions.append(Action(
             kind="dial",
             targets=[uri],
@@ -342,6 +356,7 @@ class Call:
                 "strip": strip or [],
                 "translate": translate or [],
                 "route": route or [],
+                "send_socket": send_socket,
             },
         ))
 
@@ -354,6 +369,7 @@ class Call:
         copy: Optional[list[str]] = None,
         strip: Optional[list[str]] = None,
         translate: Optional[list[tuple[str, str]]] = None,
+        send_socket: Optional[str] = None,
     ) -> None:
         """Fork to multiple B-leg targets.
 
@@ -374,6 +390,9 @@ class Call:
             strip: Per-call header strip deltas — same semantics as :meth:`dial`.
             translate: Per-call header translation deltas — same semantics as
                 :meth:`dial`.
+            send_socket: Optional egress socket pin applied to every branch
+                (same ``"<transport>:<ip>:<port>"`` form as :meth:`dial`).  A
+                per-branch captured flow still takes precedence for that branch.
 
         Example::
 
@@ -381,6 +400,7 @@ class Call:
             # Pass Contact objects so WebSocket callees route over their flow.
             call.fork(contacts, strategy="parallel", timeout=30)
         """
+        _validate_send_socket(send_socket)
         uris = [t.uri if isinstance(t, Contact) else str(t) for t in targets]
         self._actions.append(Action(
             kind="fork",
@@ -392,6 +412,7 @@ class Call:
                 "copy": copy or [],
                 "strip": strip or [],
                 "translate": translate or [],
+                "send_socket": send_socket,
             },
         ))
 
@@ -614,6 +635,86 @@ class Call:
         """
         if self._to_uri is not None:
             self._to_uri.host = value
+
+    def set_from_uri(self, value: str) -> None:
+        """Replace the entire From header URI on the B-leg INVITE.
+
+        The whole-URI form of :meth:`set_from_user` / :meth:`set_from_host` —
+        rewrites scheme, user, host, port and URI params in one call while
+        preserving the display name and From-tag. The host is also pinned (the
+        B-leg builder would otherwise rewrite it to the advertised address for
+        topology hiding — same opt-out as :meth:`set_from_host`). Must be called
+        before :meth:`dial`.
+
+        Args:
+            value: New From URI, e.g.
+                ``"sip:+31123@tenant.example.com:5060;transport=tcp"``.
+
+        Example::
+
+            @b2bua.on_invite
+            async def on_invite(call):
+                call.set_from_uri("sip:1001@tenant.example.com:5060")
+                call.dial("sip:gw@carrier.example.com")
+        """
+        self._from_uri = _parse_uri(value)
+
+    def set_to_uri(self, value: str) -> None:
+        """Replace the entire To header URI on the B-leg INVITE.
+
+        The whole-URI form of :meth:`set_to_user` / :meth:`set_to_host`,
+        preserving the display name and any To-tag. The host is also pinned
+        (same opt-out as :meth:`set_to_host`). Must be called before
+        :meth:`dial`.
+
+        Args:
+            value: New To URI, e.g.
+                ``"sip:5112@ims.mnc088.mcc204.3gppnetwork.org"``.
+        """
+        self._to_uri = _parse_uri(value)
+
+    def set_contact_user(self, value: str) -> None:
+        """Inject a userpart into the B-leg Contact URI, keeping siphon's
+        advertised host:port.
+
+        The B2BUA advertises its own address as the Contact so in-dialog
+        requests (BYE, re-INVITE) route back through siphon; by default that
+        Contact is userless (RFC 3261 §8.1.1.8 puts no identity in the Contact
+        userpart). ``set_contact_user()`` adds a userpart while leaving the
+        host:port untouched, so in-dialog routing still works and the userpart
+        rides along — e.g. a downstream that keys a tenant/extension off the
+        Contact userpart, the way it does for a REGISTER Contact.
+
+        Pass an empty string to force a userless Contact. Must be called before
+        :meth:`dial`.
+
+        Args:
+            value: Contact userpart (e.g. the extension).
+
+        Example::
+
+            @b2bua.on_invite
+            async def on_invite(call):
+                call.set_contact_user(call.from_uri.user)
+                call.dial("sip:gw@carrier.example.com")
+        """
+        self._contact_user_override = value
+
+    def set_contact_uri(self, value: str) -> None:
+        """Replace the entire B-leg Contact URI — a full override of siphon's
+        advertised Contact.
+
+        Power tool for edge deployments that front siphon (GRUU, edge SBC).
+        Overriding the host/port moves the in-dialog anchor off siphon, so the
+        deployment must route the far side's in-dialog requests back to siphon
+        or the dialog breaks. Takes precedence over :meth:`set_contact_user`.
+        ``value`` is a bare URI (no angle brackets). Must be called before
+        :meth:`dial`.
+
+        Args:
+            value: Full Contact URI, e.g. ``"sip:gruu-token@edge.example.com:5060"``.
+        """
+        self._contact_override = value
 
     # -- Header access ---------------------------------------------------------
 

@@ -13,6 +13,40 @@ from typing import Callable, Optional, Union
 
 from siphon_sdk.types import Action, Contact, Flow, SipUri
 
+_SEND_SOCKET_TRANSPORTS = {"udp", "tcp", "tls", "ws", "wss", "sctp"}
+
+
+def _validate_send_socket(spec: Optional[str]) -> None:
+    """Format-validate a ``send_socket=`` spec, mirroring the Rust engine.
+
+    Raises ``ValueError`` on a malformed spec (the real engine rejects it the
+    same way).  Existence as a real configured listener is a runtime concern,
+    not checked here.
+    """
+    if spec is None:
+        return
+    scheme, sep, addr = spec.partition(":")
+    if not sep or scheme.lower() not in _SEND_SOCKET_TRANSPORTS:
+        raise ValueError(
+            f"send_socket {spec!r} must be '<transport>:<ip>:<port>' "
+            f"(e.g. 'udp:10.0.0.1:5060'); transport one of "
+            f"{sorted(_SEND_SOCKET_TRANSPORTS)}"
+        )
+    host, colon, port = addr.rpartition(":")
+    if not colon or not host:
+        raise ValueError(
+            f"send_socket {spec!r}: missing '<ip>:<port>' after the transport"
+        )
+    try:
+        int(port)
+    except ValueError:
+        raise ValueError(f"send_socket {spec!r}: port {port!r} is not an integer") from None
+    # Validate the IP literal (strip IPv6 brackets).
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        raise ValueError(f"send_socket {spec!r}: {host!r} is not a valid IP address") from None
+
 
 def _parse_uri(value: Union[str, SipUri, None]) -> Optional[SipUri]:
     """Parse a string into a SipUri, or pass through if already one."""
@@ -327,6 +361,7 @@ class Request:
         on_reply: Optional[Callable] = None,
         on_failure: Optional[Callable] = None,
         flow: Optional[Flow] = None,
+        send_socket: Optional[str] = None,
     ) -> None:
         """Forward the request to its destination.
 
@@ -344,19 +379,38 @@ class Request:
                   — load-bearing for P-CSCF MT routing where the UE's
                   Contact URI is unreachable (NAT, IPSec).
                   Ignores ``next_hop`` when set.
+            send_socket: Optional egress socket pin
+                  (``"<transport>:<ip>:<port>"``, e.g. ``"udp:10.0.0.1:5060"``)
+                  — the operator equivalent of Kamailio's
+                  ``force_send_socket()``.  Selects which of siphon's own
+                  configured listeners the request leaves from on a multi-homed
+                  host.  The outgoing Via advertises that listener's address so
+                  the response comes back to the same socket.  UDP pins the
+                  exact ``(ip, port)`` listener; TCP/TLS bind the source IP with
+                  an ephemeral port.  Ignored when ``flow`` is set (the flow
+                  already pins egress), and when its transport doesn't match the
+                  routed transport.  A malformed spec raises ``ValueError``; a
+                  well-formed spec that names no configured listener is logged
+                  and falls back to default routing (never dropped).
 
         Example::
 
             request.relay()                           # default routing
             request.relay("sip:proxy@10.0.0.2:5060")  # explicit next-hop
             request.relay(on_reply=my_reply_handler)   # per-relay callback
+            request.relay(send_socket="udp:10.0.0.1:5060")  # pin egress NIC
             # Path-token MT routing:
             binding = registrar.lookup_by_token(token)
             request.relay(flow=binding.flow)
         """
+        _validate_send_socket(send_socket)
         extras: Optional[dict] = None
-        if flow is not None:
-            extras = {"flow": flow}
+        if flow is not None or send_socket is not None:
+            extras = {}
+            if flow is not None:
+                extras["flow"] = flow
+            if send_socket is not None:
+                extras["send_socket"] = send_socket
         self._actions.append(Action(
             kind="relay",
             next_hop=next_hop,
@@ -371,6 +425,7 @@ class Request:
         self,
         targets: list[Union[str, Contact]],
         strategy: str = "parallel",
+        send_socket: Optional[str] = None,
     ) -> None:
         """Fork the request to multiple targets.
 
@@ -383,6 +438,10 @@ class Request:
                 contacts fall back to URI routing.
             strategy: ``"parallel"`` (all at once, first 2xx wins) or
                       ``"sequential"`` (try in q-value order, next on failure).
+            send_socket: Optional egress socket pin applied to every branch
+                      (same ``"<transport>:<ip>:<port>"`` form as
+                      :meth:`relay`).  A per-branch captured flow still takes
+                      precedence over it for that branch.
 
         Example::
 
@@ -390,7 +449,9 @@ class Request:
             # Pass Contact objects so a WebSocket UE routes over its flow.
             request.fork(contacts)
             request.fork(["sip:a@host", "sip:b@host"], strategy="sequential")
+            request.fork(contacts, send_socket="udp:10.0.0.1:5060")
         """
+        _validate_send_socket(send_socket)
         uris = [t.uri if isinstance(t, Contact) else str(t) for t in targets]
         self._actions.append(Action(
             kind="fork",
@@ -398,6 +459,7 @@ class Request:
             strategy=strategy,
             headers_set=dict(self._pending_headers()),
             headers_removed=list(self._pending_removed()),
+            extras={"send_socket": send_socket} if send_socket is not None else None,
         ))
 
     def record_route(self) -> None:
@@ -881,6 +943,31 @@ class Request:
         """
         self.set_header("To-Display", display_name)
 
+    def set_from_uri(self, value: str) -> None:
+        """Replace the whole From header URI, preserving the display name and
+        From-tag.
+
+        The whole-URI form of :meth:`set_from_user`. The tag survives — unlike a
+        raw ``set_header("From", "<sip:...>")``, which drops the mandatory
+        From-tag.
+
+        Args:
+            value: New From URI (e.g. ``"sip:+3120@tenant.example.com:5070"``).
+        """
+        self._from_uri = _parse_uri(value)
+
+    def set_to_uri(self, value: str) -> None:
+        """Replace the whole To header URI, preserving the display name and any
+        To-tag.
+
+        The whole-URI form of :meth:`set_to_user`. The tag survives — unlike a
+        raw ``set_header("To", "<sip:...>")``.
+
+        Args:
+            value: New To URI (e.g. ``"sip:5112@ims.example.org"``).
+        """
+        self._to_uri = _parse_uri(value)
+
     def add_path(self, uri: str) -> None:
         """Prepend a ``Path`` header (P-CSCF registration path).
 
@@ -931,6 +1018,49 @@ class Request:
         contact = self.get_header("Contact")
         if contact and ";alias" not in contact:
             self.set_header("Contact", f"{contact};alias")
+
+    def set_contact_uri(self, value: str) -> None:
+        """Replace the whole Contact header URI, preserving the display name and
+        any Contact header params (q/expires/…).
+
+        In a proxy the Contact is the UA's in-dialog target: rewriting it changes
+        where mid-dialog requests (BYE, re-INVITE) are routed. Fine when the new
+        target is meaningful downstream; a footgun otherwise.
+
+        Args:
+            value: New Contact URI (e.g. ``"sip:bob@192.0.2.9:5080;transport=tcp"``).
+        """
+        contact = self.get_header("Contact")
+        if contact is None:
+            return
+        display = contact.split("<", 1)[0] if "<" in contact else ""
+        suffix = ">" + contact.split(">", 1)[1] if ">" in contact else ">"
+        self.set_header("Contact", f"{display}<{value}{suffix}")
+
+    def set_contact_user(self, value: str) -> None:
+        """Rewrite only the userpart of the Contact header URI, leaving the
+        host/port/params intact. An empty string clears the userpart.
+
+        Args:
+            value: New Contact userpart (e.g. an extension), or ``""`` to clear.
+        """
+        contact = self.get_header("Contact")
+        if contact is None:
+            return
+        if "<" in contact and ">" in contact:
+            prefix = contact.split("<", 1)[0] + "<"
+            inner = contact.split("<", 1)[1].split(">", 1)[0]
+            suffix = ">" + contact.split(">", 1)[1]
+        else:
+            prefix = ""
+            inner = contact
+            suffix = ""
+        scheme_sep = inner.find(":")
+        scheme = inner[: scheme_sep + 1] if scheme_sep != -1 else ""
+        body = inner[scheme_sep + 1 :] if scheme_sep != -1 else inner
+        hostpart = body.split("@", 1)[1] if "@" in body else body
+        new_inner = f"{scheme}{value}@{hostpart}" if value else f"{scheme}{hostpart}"
+        self.set_header("Contact", f"{prefix}{new_inner}{suffix}")
 
     # -- NAT fixup -------------------------------------------------------------
 

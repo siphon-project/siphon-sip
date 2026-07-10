@@ -606,6 +606,17 @@ pub struct CallActor {
     /// Script-pinned B-leg To URI host (`call.set_to_host()`). When set, the
     /// B-leg INVITE To host is rewritten to this instead of the dial-target host.
     pub to_host_override: Option<String>,
+    /// Script-pinned B-leg Contact userpart (`call.set_contact_user()`). When
+    /// set, the B-leg Contact becomes `<sip:user@advertised-host:port;transport>`
+    /// instead of the default userless anchor. siphon still receives in-dialog
+    /// requests (host:port unchanged) — the userpart just rides along.
+    pub contact_user_override: Option<String>,
+    /// Script-pinned B-leg Contact URI (`call.set_contact_uri()`). Full override
+    /// of siphon's advertised Contact — the power tool for edge deployments that
+    /// front siphon (GRUU, edge SBC). Overriding the host/port here moves the
+    /// in-dialog anchor off siphon, so the deployment must route it back or the
+    /// dialog breaks. Takes precedence over `contact_user_override`.
+    pub contact_override: Option<String>,
     /// Pre-built ACK for the winning B-leg, deferred until A-leg ACKs (late ACK pattern).
     /// Contains (ACK message, transport, destination address).
     pub pending_b_leg_ack: Option<(SipMessage, crate::transport::Transport, std::net::SocketAddr)>,
@@ -662,6 +673,8 @@ impl CallActor {
             preserve_call_id: false,
             from_host_override: None,
             to_host_override: None,
+            contact_user_override: None,
+            contact_override: None,
             pending_b_leg_ack: None,
             resolved_header_policy: None,
             a_leg_supports_100rel: false,
