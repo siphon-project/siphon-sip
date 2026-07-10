@@ -135,7 +135,7 @@ tower = { version = "0.5.3", features = ["util"] }
 
 # Lawful Intercept — ETSI ASN.1/BER + XML
 rasn = "0.28"
-rasn-derive = "0.22"
+rasn-derive = "0.28"
 chrono = { version = "0.4", default-features = false }
 quick-xml = { version = "0.41", features = ["serialize"] }
 
