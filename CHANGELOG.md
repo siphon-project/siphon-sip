@@ -60,6 +60,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   drifting. The PyPI `Documentation` link now points there.
 
 ### Changed
+- **Bump four crypto/ASN.1 dependencies to their current majors** (no behavioural
+  change; all validated against the existing known-answer vectors):
+  `aes` 0.8 → 0.9 (RustCrypto `cipher` 0.5 — `BlockEncrypt` → `BlockCipherEncrypt`,
+  `GenericArray` → `Array` in the Milenage AES-128 block op; the 3GPP TS 35.208
+  test-set KATs are byte-identical), `md5` 0.7 → 0.8 (`Context::compute` →
+  `finalize`), `x509-cert` 0.2 → 0.3 (its `Certificate` / `TbsCertificate` fields
+  became private — the STIR cert code now goes through the accessor methods and
+  `get_extension()`), and `rasn-derive` 0.22 → 0.28 to match the already-current
+  `rasn` 0.28 (the two had drifted out of lockstep). Supersedes the individual
+  Dependabot bumps.
 - **Bump the `siphon-bin` SMPP extension to siphon-smpp v1.3.0**, which adds
   Prometheus metrics for the SMPP runtime into siphon's shared `/metrics`
   registry: `siphon_smpp_binds` (gauge, `direction`/`state`) plus

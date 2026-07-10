@@ -1161,7 +1161,7 @@ fn md5_ha1_aka(username: &str, realm: &str, password_bytes: &[u8]) -> String {
     ctx.consume(realm.as_bytes());
     ctx.consume(b":");
     ctx.consume(password_bytes);
-    format!("{:x}", ctx.compute())
+    format!("{:x}", ctx.finalize())
 }
 
 /// Extract a named parameter from a Digest header value.

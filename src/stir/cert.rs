@@ -39,8 +39,8 @@ pub fn parse_pem_chain(pem: &[u8]) -> Result<Vec<Certificate>, String> {
 /// Extract the ECDSA P-256 public key from a certificate's SubjectPublicKeyInfo.
 pub fn verifying_key(certificate: &Certificate) -> Result<VerifyingKey, String> {
     let point = certificate
-        .tbs_certificate
-        .subject_public_key_info
+        .tbs_certificate()
+        .subject_public_key_info()
         .subject_public_key
         .as_bytes()
         .ok_or_else(|| "subject public key is not octet-aligned".to_string())?;
@@ -75,7 +75,7 @@ pub fn validate_chain(
 
         // 1. Does any trust anchor directly sign `current`? If so, done.
         for anchor in anchors {
-            if names_equal(&anchor.tbs_certificate.subject, &current.tbs_certificate.issuer)?
+            if names_equal(anchor.tbs_certificate().subject(), current.tbs_certificate().issuer())?
                 && verify_signed_by(&current, anchor)?
             {
                 check_validity(anchor, now_unix)?;
@@ -89,8 +89,8 @@ pub fn validate_chain(
             !visited.contains(&candidate_der)
                 && is_ca(candidate)
                 && names_equal(
-                    &candidate.tbs_certificate.subject,
-                    &current.tbs_certificate.issuer,
+                    candidate.tbs_certificate().subject(),
+                    current.tbs_certificate().issuer(),
                 )
                 .unwrap_or(false)
         });
@@ -118,11 +118,10 @@ pub fn validate_chain(
 /// True when the certificate carries the RFC 8226 TNAuthList extension.
 pub fn has_tnauthlist(certificate: &Certificate) -> bool {
     certificate
-        .tbs_certificate
-        .extensions
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
+        .tbs_certificate()
+        .extensions()
+        .into_iter()
+        .flatten()
         .any(|extension| extension.extn_id.to_string() == TNAUTHLIST_OID)
 }
 
@@ -135,19 +134,19 @@ fn der_bytes(certificate: &Certificate) -> Result<Vec<u8>, String> {
 
 /// Verify that `child` was signed by `issuer`'s private key (ECDSA-P256/SHA-256).
 fn verify_signed_by(child: &Certificate, issuer: &Certificate) -> Result<bool, String> {
-    if child.signature_algorithm.oid.to_string() != ECDSA_WITH_SHA256_OID {
+    if child.signature_algorithm().oid.to_string() != ECDSA_WITH_SHA256_OID {
         return Err(format!(
             "unsupported certificate signature algorithm {} (only ecdsa-with-SHA256 in v1)",
-            child.signature_algorithm.oid
+            child.signature_algorithm().oid
         ));
     }
     let issuer_key = verifying_key(issuer)?;
     let tbs = child
-        .tbs_certificate
+        .tbs_certificate()
         .to_der()
         .map_err(|error| format!("TBSCertificate DER encode failed: {error}"))?;
     let signature_der = child
-        .signature
+        .signature()
         .as_bytes()
         .ok_or_else(|| "certificate signature is not octet-aligned".to_string())?;
     let signature = match Signature::from_der(signature_der) {
@@ -160,14 +159,14 @@ fn verify_signed_by(child: &Certificate, issuer: &Certificate) -> Result<bool, S
 /// Ensure `now_unix` falls within the certificate's validity window.
 fn check_validity(certificate: &Certificate, now_unix: i64) -> Result<(), String> {
     let not_before = certificate
-        .tbs_certificate
-        .validity
+        .tbs_certificate()
+        .validity()
         .not_before
         .to_unix_duration()
         .as_secs() as i64;
     let not_after = certificate
-        .tbs_certificate
-        .validity
+        .tbs_certificate()
+        .validity()
         .not_after
         .to_unix_duration()
         .as_secs() as i64;
@@ -182,7 +181,7 @@ fn check_validity(certificate: &Certificate, now_unix: i64) -> Result<(), String
 
 /// True when the certificate asserts CA:TRUE in basicConstraints.
 fn is_ca(certificate: &Certificate) -> bool {
-    match certificate.tbs_certificate.get::<BasicConstraints>() {
+    match certificate.tbs_certificate().get_extension::<BasicConstraints>() {
         Ok(Some((_critical, basic_constraints))) => basic_constraints.ca,
         _ => false,
     }

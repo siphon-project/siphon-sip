@@ -7,8 +7,7 @@
 //! Algorithm Set: An example algorithm set for the 3GPP authentication
 //! and key generation functions f1, f1*, f2, f3, f4, f5 and f5*.
 
-use aes::cipher::generic_array::GenericArray;
-use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::cipher::{BlockCipherEncrypt, KeyInit};
 use aes::Aes128;
 
 // ---------------------------------------------------------------------------
@@ -65,12 +64,10 @@ pub struct AkaVector {
 
 /// AES-128 encrypt a single 16-byte block.
 fn aes_encrypt(key: &[u8; 16], input: &[u8; 16]) -> [u8; 16] {
-    let cipher = Aes128::new(GenericArray::from_slice(key));
-    let mut block = *GenericArray::from_slice(input);
+    let cipher = Aes128::new(key.into());
+    let mut block = (*input).into();
     cipher.encrypt_block(&mut block);
-    let mut output = [0u8; 16];
-    output.copy_from_slice(block.as_slice());
-    output
+    block.into()
 }
 
 /// XOR two 16-byte blocks.

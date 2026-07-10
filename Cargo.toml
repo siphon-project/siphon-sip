@@ -102,18 +102,18 @@ clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "multipart", "stream"] }
 
 # Crypto (Milenage AKA key derivation for IMS IPsec)
-aes = "0.8"
+aes = "0.9"
 
 # STIR/SHAKEN — ES256 PASSporT signing/verification (RFC 8224/8225/8226,
 # ATIS-1000074). RustCrypto, pure-Rust, no OpenSSL — fits the rustls posture.
 # ECDSA signing uses RFC 6979 deterministic nonces, so no RNG plumbing on the
 # sign path.
 p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }  # ES256 sign/verify + key load
-x509-cert = { version = "0.2", features = ["pem"] }               # cert parse, SPKI, extensions, validity
+x509-cert = { version = "0.3", features = ["pem"] }               # cert parse, SPKI, extensions, validity
 base64 = "0.22"                                                    # base64url (URL_SAFE_NO_PAD) for JWS
 
 # Utilities
-md5 = "0.7"
+md5 = "0.8"
 sha2 = "0.10"
 uuid = { version = "1.22", features = ["v4", "fast-rng"] }
 # Cryptographic randomness — used by Milenage AKA RAND generation
@@ -135,7 +135,7 @@ tower = { version = "0.5.3", features = ["util"] }
 
 # Lawful Intercept — ETSI ASN.1/BER + XML
 rasn = "0.28"
-rasn-derive = "0.22"
+rasn-derive = "0.28"
 chrono = { version = "0.4", default-features = false }
 quick-xml = { version = "0.41", features = ["serialize"] }
 
