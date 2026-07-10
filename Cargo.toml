@@ -113,7 +113,7 @@ x509-cert = { version = "0.2", features = ["pem"] }               # cert parse, 
 base64 = "0.22"                                                    # base64url (URL_SAFE_NO_PAD) for JWS
 
 # Utilities
-md5 = "0.7"
+md5 = "0.8"
 sha2 = "0.10"
 uuid = { version = "1.22", features = ["v4", "fast-rng"] }
 # Cryptographic randomness — used by Milenage AKA RAND generation
