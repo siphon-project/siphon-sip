@@ -6,6 +6,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Changed
+- **Bump `siphon-rtp-proto` 0.1.0 → 0.1.1** for the native `media.backend:
+  siphon-rtp` control path. 0.1.1 widens the wire contract — `ProfileFlags`
+  gains `address_family` (v4/v6 far-leg interworking), `received_from` (the
+  post-NAT source gate), `rtcp_mux` (an rtcp-mux override) and `ws_uri`
+  (audio-stream WebSocket bridge); `CmdResult` gains the cluster/HA answers
+  `List`/`Statistics`/`Load`/`NodeInfo`/`Checkpoint`; and `Event` gains
+  `ActiveSpeaker` (conference floor change) and `CallQuality` (periodic per-leg
+  RTCP/MOS estimate). siphon does not drive the new engine knobs yet, so the
+  serialized control frames are byte-identical to before (the new `ProfileFlags`
+  fields stay unset); the new engine events surface through the existing
+  unhandled-event path (logged at `debug`) until dedicated
+  `@rtpengine.on_active_speaker` / `on_call_quality` hooks land. Experimental
+  backend only — the rtpengine NG backend is unaffected. This also restores the
+  fuzz CI job, which re-resolves its dependencies and had begun pulling the newer
+  `siphon-rtp-proto` against the older match arms.
+
 ## [1.3.0] — 2026-07-10
 
 ### Added

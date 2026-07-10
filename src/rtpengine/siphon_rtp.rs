@@ -53,10 +53,17 @@ const READ_CHUNK: usize = 8192;
 
 /// Convert siphon's [`NgFlags`] to the proto [`ProfileFlags`] (its JSON twin).
 ///
-/// A field-for-field copy — the two structs carry identical media-handling
-/// semantics; only the wire encoding (JSON vs bencode) differs.  A free
-/// function rather than a `From` impl because both `From` and `ProfileFlags`
-/// are foreign to this crate (orphan rule).
+/// A field-for-field copy of the flags siphon models — the two structs carry
+/// identical media-handling semantics; only the wire encoding (JSON vs bencode)
+/// differs.  A free function rather than a `From` impl because both `From` and
+/// `ProfileFlags` are foreign to this crate (orphan rule).
+///
+/// `ProfileFlags` also carries engine knobs that siphon's `NgFlags` does not
+/// model (`address_family`, `received_from`, `rtcp_mux`, `ws_uri` — v4/v6
+/// interworking, the post-NAT source gate, the rtcp-mux override, and the
+/// audio-stream WebSocket URI).  They are left at their defaults (unset), so the
+/// serialized frame is byte-identical to before — siphon does not drive them
+/// yet.  When siphon gains config/script surface for one, map it here.
 pub(crate) fn profile_flags_from_ng(flags: &NgFlags) -> ProfileFlags {
     ProfileFlags {
         transport_protocol: flags.transport_protocol.clone(),
@@ -67,6 +74,7 @@ pub(crate) fn profile_flags_from_ng(flags: &NgFlags) -> ProfileFlags {
         direction: flags.direction.clone(),
         record_call: flags.record_call,
         record_path: flags.record_path.clone(),
+        ..Default::default()
     }
 }
 
@@ -491,10 +499,7 @@ impl SiphonRtpClient {
     pub async fn ping(&self) -> Result<(), RtpEngineError> {
         match self.request(Command::Ping).await? {
             CmdResult::Pong => Ok(()),
-            CmdResult::Error { reason } => Err(RtpEngineError::EngineError(reason)),
-            CmdResult::Ok { .. } => Err(RtpEngineError::Protocol(
-                "expected 'pong', got 'ok'".to_string(),
-            )),
+            other => Err(unexpected_result("ping", other)),
         }
     }
 
@@ -828,22 +833,30 @@ fn expect_ok(result: CmdResult) -> Result<(), RtpEngineError> {
 }
 
 /// Map a non-`Ok` result to the appropriate [`RtpEngineError`].
+///
+/// An engine `Error` becomes an [`RtpEngineError::EngineError`]; any other
+/// variant is a protocol violation for the command that was sent (siphon only
+/// issues commands whose success answer is `Ok`/`Pong`, never `List`,
+/// `Statistics`, `Load`, `NodeInfo` or `Checkpoint`), so the catch-all names the
+/// offending result for the log without re-enumerating the proto enum — which
+/// keeps this arm stable when siphon-rtp-proto adds further cluster/HA results.
 fn unexpected_result(context: &str, result: CmdResult) -> RtpEngineError {
     match result {
         CmdResult::Error { reason } => RtpEngineError::EngineError(reason),
-        CmdResult::Pong => {
-            RtpEngineError::Protocol(format!("unexpected 'pong' response to {context}"))
-        }
-        CmdResult::Ok { .. } => {
-            RtpEngineError::Protocol(format!("unexpected 'ok' response to {context}"))
-        }
+        other => RtpEngineError::Protocol(format!("unexpected {other:?} response to {context}")),
     }
 }
 
 /// Convert a proto [`Event`] to siphon's [`RtpEngineEvent`].
 ///
-/// `Event::Dtmf` is a field-for-field twin of [`DtmfEvent`]; `MediaTimeout`
-/// maps to the dedicated variant; anything else becomes `Unknown`.
+/// `Event::Dtmf` is a field-for-field twin of [`DtmfEvent`]; `MediaTimeout` maps
+/// to the dedicated variant.  `ActiveSpeaker` (conference floor change) and
+/// `CallQuality` (periodic per-leg RTCP/MOS estimate) have no dedicated script
+/// hook yet, so they surface as `Unknown` under their own event name — logged at
+/// `debug` by the dispatcher, never silently dropped (a dedicated
+/// `@rtpengine.on_active_speaker` / `on_call_quality` hook is a follow-up).  The
+/// match stays exhaustive so a future siphon-rtp-proto bump surfaces any new
+/// event here instead of being swallowed.
 fn convert_event(event: Event) -> RtpEngineEvent {
     match event {
         Event::Dtmf {
@@ -866,6 +879,23 @@ fn convert_event(event: Event) -> RtpEngineEvent {
         Event::MediaTimeout { call_id, from_tag } => RtpEngineEvent::MediaTimeout {
             call_id,
             from_tag,
+        },
+        Event::ActiveSpeaker {
+            conference_id,
+            from_tag,
+        } => RtpEngineEvent::Unknown {
+            event: "active_speaker".to_string(),
+            call_id: Some(conference_id),
+            from_tag,
+        },
+        Event::CallQuality {
+            conference_id,
+            call_id,
+            ..
+        } => RtpEngineEvent::Unknown {
+            event: "call_quality".to_string(),
+            call_id: conference_id.or(call_id),
+            from_tag: None,
         },
         Event::Unknown => RtpEngineEvent::Unknown {
             event: "unknown".to_string(),
@@ -1080,12 +1110,7 @@ async fn authenticate(
                             )?;
                             return match response.result {
                                 CmdResult::Ok { .. } => Ok(()),
-                                CmdResult::Error { reason } => {
-                                    Err(RtpEngineError::EngineError(reason))
-                                }
-                                CmdResult::Pong => Err(RtpEngineError::Protocol(
-                                    "unexpected 'pong' for authenticate".to_string(),
-                                )),
+                                other => Err(unexpected_result("authenticate", other)),
                             };
                         }
                     }
