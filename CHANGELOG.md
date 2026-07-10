@@ -35,6 +35,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   upward forever because TTL-expired entries leave the keyspace silently, a
   summed `LLEN` is truthful because expired keys are simply gone.
 
+### Changed
+- **Bump the `siphon-bin` SMPP extension to siphon-smpp v1.3.0**, which adds
+  Prometheus metrics for the SMPP runtime into siphon's shared `/metrics`
+  registry: `siphon_smpp_binds` (gauge, `direction`/`state`) plus
+  `siphon_smpp_pdus_total`, `siphon_smpp_throttled_total`,
+  `siphon_smpp_bind_reconnects_total`, `siphon_smpp_dispatch_errors_total`,
+  `siphon_smpp_dispatch_duration_seconds` (histogram) and
+  `siphon_smpp_bind_requests_total`. Only affects builds with `--features smpp`;
+  when the host metrics engine isn't initialised every emit path is a no-op, so
+  the dispatch hot path reads no clock and touches no metric.
+
 ### Fixed
 - **Outbound OPTIONS keepalives now carry a `Contact` header.** The UAC-side
   OPTIONS builder (NAT keepalive, gateway health probe, registrar liveness probe)
