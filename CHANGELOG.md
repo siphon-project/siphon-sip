@@ -95,6 +95,29 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   OPTIONS can now discover the supported method set — Microsoft Teams Direct Routing
   selects its call-transfer method from the SBC's advertised `Allow`, so without
   `REFER`/`NOTIFY` here it never hands siphon a REFER even though transfer works.
+- **Gateway health prober now fails a `503`, and honors `Retry-After`, for
+  Teams Direct Routing datacenter failover.** The OPTIONS prober counted *any*
+  response as a successful probe, so a destination answering `503 Service
+  Unavailable` was recorded healthy and stayed selectable. A `503` is now
+  treated as a probe failure. When it carries a `Retry-After` (RFC 3261 §20.33)
+  the destination is marked down immediately and held down for at least that
+  cooldown (a new `down_until` deadline on `Destination`); a later successful
+  probe does not flip it healthy again before the cooldown elapses. This is the
+  Microsoft Teams Direct Routing overload contract: a datacenter that sheds load
+  with `503 + Retry-After` is taken out of selection, and the next call's
+  `gateway.select()` routes to the next healthy datacenter (an operator override
+  via `gateway.mark_up()` clears the cooldown). Other answered codes
+  (`500`/`502`/`504` and any non-`503`) still count as healthy, since a peer that
+  answers is reachable and OPTIONS is not a real call; only `503` carries the
+  "stop sending me traffic" semantics. Within-call re-selection across gateway
+  destinations on a live `503` is unchanged (sequential fork still iterates the
+  script-supplied target list); marking down affects subsequent calls.
+- **Outbound REGISTER honors a `Retry-After` on the failure response.** A
+  carrier or Teams registrar that rejects a REGISTER with `503 + Retry-After`
+  now schedules the next registration attempt at the server-supplied cooldown
+  instead of the local exponential backoff (the backoff state still advances, so
+  a later failure without `Retry-After` resumes where it left off). The existing
+  re-resolve-to-a-different-IP-on-failure behavior is unchanged.
 - **Outbound OPTIONS keepalives now carry a `Contact` header.** The UAC-side
   OPTIONS builder (NAT keepalive, gateway health probe, registrar liveness probe)
   emitted Via/From/To/Call-ID/CSeq only — no Contact. RFC 3261 §11.1 makes

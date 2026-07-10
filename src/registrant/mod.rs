@@ -1084,25 +1084,38 @@ impl RegistrantManager {
     }
 
     /// Handle a failure response (non-401/407, or auth failed twice).
-    pub fn handle_failure(&self, aor: &str, status_code: u16) {
+    ///
+    /// `retry_after` carries the response's `Retry-After` header (RFC 3261
+    /// §20.33) when present: a carrier / Teams Direct Routing registrar that
+    /// answers `503` with `Retry-After` is telling us exactly when to come back,
+    /// so we schedule the next attempt at that cooldown instead of the local
+    /// exponential backoff. The backoff state is still advanced so that if the
+    /// registrar stops sending `Retry-After` we resume climbing from where we
+    /// were rather than resetting.
+    pub fn handle_failure(&self, aor: &str, status_code: u16, retry_after: Option<Duration>) {
         if let Some(mut entry) = self.entries.get_mut(aor) {
             entry.state = RegistrantState::Failed;
             entry.failure_count += 1;
             entry.expires_at = None;
 
-            // Exponential backoff capped at max_retry_interval
+            // Exponential backoff capped at max_retry_interval.
             let backoff = std::cmp::min(
                 entry.backoff * 2,
                 self.max_retry_interval,
             );
             entry.backoff = backoff;
-            entry.next_attempt = Instant::now() + backoff;
+
+            // A server-supplied Retry-After wins over local backoff — honor the
+            // registrar's explicit cooldown directive.
+            let retry_in = retry_after.unwrap_or(backoff);
+            entry.next_attempt = Instant::now() + retry_in;
 
             warn!(
                 aor = %entry.aor,
                 status_code,
                 failures = entry.failure_count,
-                retry_in = ?backoff,
+                retry_in = ?retry_in,
+                retry_after = ?retry_after,
                 "registration failed"
             );
 
@@ -1287,7 +1300,7 @@ pub async fn registration_loop(
                 let timed_out = manager.entries_timed_out();
                 for aor in &timed_out {
                     warn!(aor = %aor, "REGISTER transaction timed out — no response received");
-                    manager.handle_failure(aor, 0);
+                    manager.handle_failure(aor, 0, None);
                 }
 
                 let due = manager.entries_due();
@@ -1329,7 +1342,7 @@ pub async fn registration_loop(
                         debug!(aor = %aor, branch = %branch, "sending REGISTER");
                         if let Err(error) = outbound.send(outbound_message) {
                             warn!(aor = %aor, %error, "failed to send REGISTER");
-                            manager.handle_failure(&aor, 0);
+                            manager.handle_failure(&aor, 0, None);
                         }
                     }
                 }
@@ -1650,7 +1663,7 @@ mod tests {
         let manager = make_manager();
         manager.add(make_entry("sip:alice@carrier.com"));
 
-        manager.handle_failure("sip:alice@carrier.com", 403);
+        manager.handle_failure("sip:alice@carrier.com", 403, None);
 
         assert_eq!(
             manager.state("sip:alice@carrier.com"),
@@ -1663,12 +1676,75 @@ mod tests {
     }
 
     #[test]
+    fn retry_after_overrides_backoff() {
+        let manager = make_manager();
+        manager.add(make_entry("sip:alice@carrier.com"));
+
+        // Local backoff after one failure would be ~10s (5s initial doubled).
+        // A registrar Retry-After of 120s must win, pushing next_attempt out far
+        // beyond the backoff.
+        let before = Instant::now();
+        manager.handle_failure(
+            "sip:alice@carrier.com",
+            503,
+            Some(Duration::from_secs(120)),
+        );
+
+        let next_attempt = manager
+            .entries
+            .get("sip:alice@carrier.com")
+            .unwrap()
+            .next_attempt;
+        assert!(
+            next_attempt >= before + Duration::from_secs(60),
+            "Retry-After should schedule far past the ~10s local backoff"
+        );
+    }
+
+    #[test]
+    fn retry_after_honored_even_when_shorter_than_backoff() {
+        let manager = make_manager();
+        manager.add(make_entry("sip:alice@carrier.com"));
+
+        // A Retry-After shorter than the local backoff is still honored — the
+        // registrar's explicit directive wins in both directions.
+        let before = Instant::now();
+        manager.handle_failure("sip:alice@carrier.com", 503, Some(Duration::from_secs(1)));
+
+        let next_attempt = manager
+            .entries
+            .get("sip:alice@carrier.com")
+            .unwrap()
+            .next_attempt;
+        assert!(
+            next_attempt <= before + Duration::from_secs(3),
+            "Retry-After=1s should win over the ~10s backoff"
+        );
+    }
+
+    #[test]
+    fn backoff_still_advances_under_retry_after() {
+        // Retry-After schedules the next attempt, but the backoff state keeps
+        // climbing so a later failure without Retry-After resumes correctly.
+        let manager = make_manager();
+        manager.add(make_entry("sip:alice@carrier.com"));
+
+        manager.handle_failure("sip:alice@carrier.com", 503, Some(Duration::from_secs(30)));
+        let backoff = manager
+            .entries
+            .get("sip:alice@carrier.com")
+            .unwrap()
+            .backoff;
+        assert_eq!(backoff, Duration::from_secs(10)); // 5s doubled
+    }
+
+    #[test]
     fn backoff_increases_on_repeated_failures() {
         let manager = make_manager();
         manager.add(make_entry("sip:alice@carrier.com"));
 
         // First failure
-        manager.handle_failure("sip:alice@carrier.com", 503);
+        manager.handle_failure("sip:alice@carrier.com", 503, None);
         let backoff_1 = manager
             .entries
             .get("sip:alice@carrier.com")
@@ -1683,7 +1759,7 @@ mod tests {
             .next_attempt = Instant::now();
 
         // Second failure
-        manager.handle_failure("sip:alice@carrier.com", 503);
+        manager.handle_failure("sip:alice@carrier.com", 503, None);
         let backoff_2 = manager
             .entries
             .get("sip:alice@carrier.com")
@@ -1705,7 +1781,7 @@ mod tests {
 
         // Fail many times
         for _ in 0..20 {
-            manager.handle_failure("sip:alice@carrier.com", 503);
+            manager.handle_failure("sip:alice@carrier.com", 503, None);
         }
 
         let backoff = manager
@@ -1722,8 +1798,8 @@ mod tests {
         manager.add(make_entry("sip:alice@carrier.com"));
 
         // Fail a few times
-        manager.handle_failure("sip:alice@carrier.com", 503);
-        manager.handle_failure("sip:alice@carrier.com", 503);
+        manager.handle_failure("sip:alice@carrier.com", 503, None);
+        manager.handle_failure("sip:alice@carrier.com", 503, None);
 
         // Then succeed
         manager.handle_success("sip:alice@carrier.com", 3600);
@@ -1919,7 +1995,7 @@ mod tests {
         let mut receiver = manager.subscribe_events();
         manager.add(make_entry("sip:alice@carrier.com"));
 
-        manager.handle_failure("sip:alice@carrier.com", 503);
+        manager.handle_failure("sip:alice@carrier.com", 503, None);
 
         let event = receiver.try_recv().unwrap();
         assert!(matches!(event, RegistrantEvent::Failed { ref aor, status_code: 503 } if aor == "sip:alice@carrier.com"));

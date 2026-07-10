@@ -9075,6 +9075,12 @@ fn handle_registrant_response(
     let is_aka =
         registrant.auth_mode(&aor) == Some(crate::registrant::AuthMode::Aka);
 
+    // A carrier / Teams Direct Routing registrar that rejects with a Retry-After
+    // (RFC 3261 §20.33) is telling us exactly when to re-REGISTER — thread it
+    // into the failure handler so it schedules the next attempt at that cooldown
+    // instead of the local exponential backoff.
+    let retry_after = crate::sip::headers::retry_after::parse_retry_after(&message.headers);
+
     match status_code {
         200 => {
             // Parse granted expires: top-level Expires header first,
@@ -9136,7 +9142,7 @@ fn handle_registrant_response(
                 Some(raw) => raw.clone(),
                 None => {
                     warn!(aor = %aor, status_code, "registrant: {status_code} without {header_name}");
-                    registrant.handle_failure(&aor, status_code);
+                    registrant.handle_failure(&aor, status_code, retry_after);
                     return;
                 }
             };
@@ -9148,7 +9154,7 @@ fn handle_registrant_response(
                 // send so the kernel encrypts the protected REGISTER — both run
                 // ordered inside one spawned task (TS 33.203 §7.4).
                 if is_aka && registrant.is_ipsec_entry(&aor) {
-                    handle_registrant_ipsec_challenge(registrant, message, &aor, &challenge, status_code, state);
+                    handle_registrant_ipsec_challenge(registrant, message, &aor, &challenge, status_code, retry_after, state);
                     return;
                 }
 
@@ -9179,15 +9185,15 @@ fn handle_registrant_response(
                     let data = bytes::Bytes::from(retry_message.to_bytes());
                     send_outbound(data, transport, destination, crate::transport::ConnectionId::default(), state);
                 } else {
-                    registrant.handle_failure(&aor, status_code);
+                    registrant.handle_failure(&aor, status_code, retry_after);
                 }
             } else {
                 warn!(aor = %aor, "failed to parse digest challenge from {header_name}");
-                registrant.handle_failure(&aor, status_code);
+                registrant.handle_failure(&aor, status_code, retry_after);
             }
         }
         _ => {
-            registrant.handle_failure(&aor, status_code);
+            registrant.handle_failure(&aor, status_code, retry_after);
         }
     }
 }
@@ -9206,6 +9212,7 @@ fn handle_registrant_ipsec_challenge(
     aor: &str,
     challenge: &crate::auth::DigestChallenge,
     status_code: u16,
+    retry_after: Option<std::time::Duration>,
     state: &DispatcherState,
 ) {
     match message.headers.get("Security-Server").cloned() {
@@ -9213,13 +9220,13 @@ fn handle_registrant_ipsec_challenge(
             Some(server) => registrant.store_security_server(aor, &server, &server_raw),
             None => {
                 warn!(aor = %aor, "IPsec UE: unparseable Security-Server, failing registration");
-                registrant.handle_failure(aor, status_code);
+                registrant.handle_failure(aor, status_code, retry_after);
                 return;
             }
         },
         None => {
             warn!(aor = %aor, "IPsec UE: 401 without Security-Server, failing registration");
-            registrant.handle_failure(aor, status_code);
+            registrant.handle_failure(aor, status_code, retry_after);
             return;
         }
     }
@@ -9238,7 +9245,7 @@ fn handle_registrant_ipsec_challenge(
     let (retry_message, destination, transport) = match built {
         Some((retry_message, _branch, destination, transport)) => (retry_message, destination, transport),
         None => {
-            registrant.handle_failure(aor, status_code);
+            registrant.handle_failure(aor, status_code, retry_after);
             return;
         }
     };
@@ -9259,7 +9266,7 @@ fn handle_registrant_ipsec_challenge(
         Some(manager) => manager,
         None => {
             warn!(aor = %aor, "IPsec UE: no IpsecManager configured, failing registration");
-            registrant.handle_failure(aor, status_code);
+            registrant.handle_failure(aor, status_code, retry_after);
             return;
         }
     };
@@ -9275,7 +9282,7 @@ fn handle_registrant_ipsec_challenge(
             Some(sa) => sa,
             None => {
                 warn!(aor = %aor_task, "IPsec UE: missing CK/IK or Security-Server, protected REGISTER not sent");
-                registrant_task.handle_failure(&aor_task, 0);
+                registrant_task.handle_failure(&aor_task, 0, None);
                 return;
             }
         };
@@ -9289,7 +9296,7 @@ fn handle_registrant_ipsec_challenge(
         let _ = ipsec_manager.delete_sa_pair(&ue_addr, ue_port_c).await;
         if let Err(error) = ipsec_manager.create_ue_sa_pair(sa).await {
             warn!(aor = %aor_task, %error, "IPsec UE: SA install failed, protected REGISTER not sent");
-            registrant_task.handle_failure(&aor_task, 0);
+            registrant_task.handle_failure(&aor_task, 0, None);
             return;
         }
         let outbound_message = crate::transport::OutboundMessage {
