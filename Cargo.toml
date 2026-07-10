@@ -102,7 +102,7 @@ clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "multipart", "stream"] }
 
 # Crypto (Milenage AKA key derivation for IMS IPsec)
-aes = "0.8"
+aes = "0.9"
 
 # STIR/SHAKEN — ES256 PASSporT signing/verification (RFC 8224/8225/8226,
 # ATIS-1000074). RustCrypto, pure-Rust, no OpenSSL — fits the rustls posture.
