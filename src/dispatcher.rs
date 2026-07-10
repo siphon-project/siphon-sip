@@ -2383,6 +2383,20 @@ fn handle_request(
                 response.body = body_bytes.clone();
             }
 
+            // RFC 3261 §11.2 — make a 2xx OPTIONS a proper capability response: a
+            // Contact (Microsoft Teams Direct Routing rejects an OPTIONS answer
+            // carrying neither Contact nor Record-Route) plus an Allow advertising
+            // siphon's supported methods (peers read transfer capability from it).
+            // Both are added only when absent, so a script-set header still wins.
+            if method == "OPTIONS" && (200..300).contains(code) {
+                augment_options_response(
+                    &mut response,
+                    &state.via_host(&inbound.transport),
+                    state.via_port(&inbound.transport),
+                    inbound.transport,
+                );
+            }
+
             // RFC 3262 — script asked for a reliable provisional. Only valid for
             // 101..199 INVITE responses, and only when the UAC advertised 100rel.
             // We attach Require: 100rel + a fresh RSeq, then arm a retransmit
@@ -5460,13 +5474,50 @@ fn parse_translate_op_name(name: &str) -> Option<crate::b2bua::header_policy::Tr
     }
 }
 
+/// Set `Allow` (RFC 3261 §20.5) to the methods siphon supports, but only when the
+/// header is absent — never overwrite a caller/script-set `Allow`. Used on
+/// siphon's own UA surfaces (OPTIONS 2xx responses, B2BUA responses) so a peer can
+/// discover the supported method set, including REFER/NOTIFY for transfer.
+fn advertise_supported_methods(headers: &mut SipHeaders) {
+    if !headers.has("Allow") {
+        headers.set("Allow", crate::sip::SUPPORTED_METHODS.to_string());
+    }
+}
+
+/// Turn a 2xx OPTIONS into a proper capability response (RFC 3261 §11.2): add a
+/// `Contact` at the advertised sent-by and advertise the supported methods via
+/// `Allow`. Both are added only when absent, so a script-set `Contact`/`Allow`
+/// wins. `via_host`/`via_port` are the advertised sent-by for the transport the
+/// OPTIONS arrived on; some peers (Microsoft Teams Direct Routing) reject an
+/// OPTIONS answer that carries neither `Contact` nor `Record-Route`.
+fn augment_options_response(
+    response: &mut SipMessage,
+    via_host: &str,
+    via_port: u16,
+    transport: Transport,
+) {
+    if !response.headers.has("Contact") {
+        response.headers.set(
+            "Contact",
+            format!(
+                "<sip:{}:{};transport={}>",
+                via_host,
+                via_port,
+                transport.to_string().to_lowercase()
+            ),
+        );
+    }
+    advertise_supported_methods(&mut response.headers);
+}
+
 /// Sanitize a B2BUA response before forwarding it to the A-leg.
 ///
 /// A proper B2BUA terminates and regenerates the dialog, so B-leg-specific
 /// headers must not leak to the A-leg. This function:
 /// - Replaces Contact with siphon's own address (critical for dialog routing)
 /// - Strips User-Agent (UAC header — not for responses), sets Server
-/// - Removes Allow, Allow-Events, Supported, Require
+/// - Strips the B-leg's Allow-Events/Supported/Require, and replaces Allow with
+///   siphon's own supported methods (a B2BUA is a UA in its own right)
 /// - Strips B-leg-specific P-Asserted-Identity, P-Charging-Vector
 fn sanitize_b2bua_response(
     response: &mut SipMessage,
@@ -5531,6 +5582,15 @@ fn sanitize_b2bua_response(
         server_header: state.server_header.as_deref(),
     };
     crate::b2bua::header_policy::apply_to_response(response, &policy, &ctx);
+
+    // Advertise siphon's own supported methods. The policy above strips the
+    // B-leg's Allow (a B2BUA terminates the dialog, so the B-leg's capabilities
+    // are not siphon's to relay); replace it with what siphon actually implements
+    // as a UA, so a peer that reads transfer capability from the Allow sees
+    // REFER/NOTIFY — Microsoft Teams Direct Routing selects its transfer method
+    // this way, and without it never hands siphon a REFER. Gated on absence so a
+    // script `call.set_header("Allow", …)` (policy precedence 1) still wins.
+    advertise_supported_methods(&mut response.headers);
 
     // Sanitize SDP: mask B-leg identity in o= and s= lines, and rewrite
     // the o= address to our advertised address for topology hiding.
@@ -12901,6 +12961,60 @@ mod tests {
     use crate::sip::parser::parse_sip_message;
     use crate::sip::uri::SipUri;
     use crate::sip::builder::SipMessageBuilder;
+
+    #[test]
+    fn advertise_supported_methods_sets_allow_when_absent() {
+        let mut headers = SipHeaders::new();
+        advertise_supported_methods(&mut headers);
+        let allow = headers.get("Allow").expect("Allow must be set");
+        assert_eq!(allow, crate::sip::SUPPORTED_METHODS);
+        // The whole point: peers read transfer capability from here.
+        assert!(allow.contains("REFER") && allow.contains("NOTIFY"));
+    }
+
+    #[test]
+    fn advertise_supported_methods_preserves_existing_allow() {
+        let mut headers = SipHeaders::new();
+        headers.set("Allow", "INVITE, ACK, BYE".to_string());
+        advertise_supported_methods(&mut headers);
+        assert_eq!(headers.get("Allow").unwrap(), "INVITE, ACK, BYE");
+    }
+
+    #[test]
+    fn augment_options_response_adds_contact_and_allow() {
+        let mut response = SipMessageBuilder::new()
+            .response(200, "OK".to_string())
+            .build()
+            .unwrap();
+        augment_options_response(&mut response, "sbc.example.org", 5061, Transport::Tls);
+        assert_eq!(
+            response.headers.get("Contact").unwrap(),
+            "<sip:sbc.example.org:5061;transport=tls>"
+        );
+        assert_eq!(
+            response.headers.get("Allow").unwrap(),
+            crate::sip::SUPPORTED_METHODS
+        );
+    }
+
+    #[test]
+    fn augment_options_response_preserves_script_contact() {
+        let mut response = SipMessageBuilder::new()
+            .response(200, "OK".to_string())
+            .contact("<sip:custom@host:5060>".to_string())
+            .build()
+            .unwrap();
+        augment_options_response(&mut response, "sbc.example.org", 5061, Transport::Udp);
+        // Script-set Contact must not be clobbered; Allow is still advertised.
+        assert_eq!(
+            response.headers.get("Contact").unwrap(),
+            "<sip:custom@host:5060>"
+        );
+        assert_eq!(
+            response.headers.get("Allow").unwrap(),
+            crate::sip::SUPPORTED_METHODS
+        );
+    }
 
     #[test]
     fn b_leg_contact_default_is_userless() {

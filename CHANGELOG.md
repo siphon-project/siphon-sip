@@ -71,6 +71,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the dispatch hot path reads no clock and touches no metric.
 
 ### Fixed
+- **OPTIONS 200 and B2BUA responses now advertise `Contact` + `Allow`.** A 2xx
+  answer to an inbound OPTIONS (RFC 3261 §11.2 capability response) carried no
+  `Contact` and no `Allow`. siphon now adds a `Contact` at its advertised sent-by
+  for the transport the OPTIONS arrived on — so a peer that rejects an OPTIONS
+  answer with neither `Contact` nor `Record-Route` (Microsoft Teams Direct Routing)
+  accepts it — and an `Allow` listing the methods siphon supports. On the B2BUA
+  response path the B-leg's `Allow` is stripped (its capabilities are not siphon's
+  to relay) and replaced with siphon's own, so a peer that selects its call-transfer
+  method from the SBC's `Allow` (Teams does) sees `REFER`/`NOTIFY`. Both are added
+  only when absent, so a script-set `Contact`/`Allow` still wins.
 - **Single Record-Route now uses the advertised host, not the bind IP.** When
   siphon record-routes a relayed request whose inbound and outbound transport are
   the same, the Record-Route carried the raw bind IP (and `127.0.0.1` when bound to
