@@ -6,6 +6,21 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Fixed
+- **Registrar liveness no longer network-deregisters an IPsec binding when its
+  stream flow closes** (RFC 5626 §4.2.2 flow recovery). A closed TCP/TLS flow
+  for an IPsec-protected UE is a recoverable flow failure, not a death signal —
+  a VoLTE UE going ECM-IDLE FINs its SIP-over-TCP flow at the radio inactivity
+  timer while it stays reachable via paging, so tearing the registration down on
+  the FIN made every idle UE uncallable. On a stream close the flow-failure path
+  now **retains** (detaches) bindings whose UE source IP still has a live XFRM
+  SA — nulling the dead `inbound_connection_id` but keeping the binding, its
+  `flow_token` and Service-Route, and emitting no `Deregistered` — and defers
+  their liveness to the SA-idle sweep (`idle_multiplier × keepalive_interval` +
+  an OPTIONS probe), which reaps only genuinely gone UEs. Non-IPsec stream
+  closes (plain TCP, WSS WebRTC) keep the immediate flow-failure deregistration
+  and network-dereg cascade unchanged. No config change.
+
 ## [1.3.0] — 2026-07-10
 
 ### Added
