@@ -71,6 +71,20 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the dispatch hot path reads no clock and touches no metric.
 
 ### Fixed
+- **Single Record-Route now uses the advertised host, not the bind IP.** When
+  siphon record-routes a relayed request whose inbound and outbound transport are
+  the same, the Record-Route carried the raw bind IP (and `127.0.0.1` when bound to
+  `0.0.0.0`) even with an FQDN `advertised_address` set — only the
+  transport-bridging *double* Record-Route already used the advertised address. It
+  now carries the same host:port as the Via for that transport, so an external peer
+  that rejects an IP in Record-Route (Microsoft Teams among them) can route
+  in-dialog requests back through siphon.
+- **siphon's OPTIONS keepalives now advertise an `Allow` header** listing the SIP
+  methods siphon supports (`INVITE, ACK, CANCEL, BYE, OPTIONS, INFO, UPDATE, PRACK,
+  SUBSCRIBE, NOTIFY, REFER, MESSAGE, PUBLISH`). A peer that probes the trunk with
+  OPTIONS can now discover the supported method set — Microsoft Teams Direct Routing
+  selects its call-transfer method from the SBC's advertised `Allow`, so without
+  `REFER`/`NOTIFY` here it never hands siphon a REFER even though transfer works.
 - **Outbound OPTIONS keepalives now carry a `Contact` header.** The UAC-side
   OPTIONS builder (NAT keepalive, gateway health probe, registrar liveness probe)
   emitted Via/From/To/Call-ID/CSeq only — no Contact. RFC 3261 §11.1 makes
