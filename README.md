@@ -754,6 +754,8 @@ Release history is tracked in [CHANGELOG.md](CHANGELOG.md).
 
 SIPhon stands on the shoulders of [Kamailio](https://www.kamailio.org/) and [OpenSIPS](https://opensips.org/). Their decades of work defining how SIP proxies should behave — from transaction handling semantics to registrar storage patterns to the idea that routing logic should be scriptable — is the foundation this project builds on. If SIPhon's architecture feels familiar, that's by design.
 
+IMS IPsec and AKA testing leans on [carstenbock/sipp_ipsec](https://github.com/carstenbock/sipp_ipsec), Carsten Bock's SIPp fork that teaches the UE simulator sec-agree and IPsec. It drives the VoLTE REGISTER + AKA + IPsec sec-agree flows under [`sipp/ipsec/`](sipp/ipsec/), and it's the harness the P-CSCF is validated against.
+
 ## Platform Partner
 
 <p align="center">
