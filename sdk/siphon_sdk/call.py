@@ -224,7 +224,8 @@ class Call:
         self._actions.append(Action(kind="reject", status_code=code, reason=reason))
 
     def answer(self, code: int, reason: str,
-               body=None, content_type: str | None = None) -> None:
+               body: Union[str, bytes, None] = None,
+               content_type: str | None = None) -> None:
         """UAS-mode answer — send a final 2xx response to the inbound
         INVITE directly, without bridging to a B-leg.
 
@@ -382,9 +383,13 @@ class Call:
             strategy: ``"parallel"`` (ring all, first answer wins) or
                       ``"sequential"`` (try in order).
             timeout: Per-branch INVITE timeout in seconds.
-            header_policy / copy / strip / translate: Same semantics as
-                :meth:`dial` — the policy applies to every branch of the
-                fork (per-branch policy is a follow-up).
+            header_policy: Header-policy preset applied to every branch of the
+                fork — same semantics as :meth:`dial` (per-branch policy is a
+                follow-up).
+            copy: Per-call header copy deltas — same semantics as :meth:`dial`.
+            strip: Per-call header strip deltas — same semantics as :meth:`dial`.
+            translate: Per-call header translation deltas — same semantics as
+                :meth:`dial`.
             send_socket: Optional egress socket pin applied to every branch
                 (same ``"<transport>:<ip>:<port>"`` form as :meth:`dial`).  A
                 per-branch captured flow still takes precedence for that branch.

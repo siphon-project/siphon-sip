@@ -11,7 +11,7 @@ import ipaddress
 import uuid
 from typing import Callable, Optional, Union
 
-from siphon_sdk.types import Action, Contact, SipUri
+from siphon_sdk.types import Action, Contact, Flow, SipUri
 
 _SEND_SOCKET_TRANSPORTS = {"udp", "tcp", "tls", "ws", "wss", "sctp"}
 
@@ -360,7 +360,7 @@ class Request:
         next_hop: Optional[str] = None,
         on_reply: Optional[Callable] = None,
         on_failure: Optional[Callable] = None,
-        flow=None,
+        flow: Optional[Flow] = None,
         send_socket: Optional[str] = None,
     ) -> None:
         """Forward the request to its destination.
@@ -726,7 +726,7 @@ class Request:
         """
         return list(getattr(self, "_reply_headers", []))
 
-    def set_body(self, body, content_type: str | None = None) -> None:
+    def set_body(self, body: Union[str, bytes], content_type: str | None = None) -> None:
         """Replace the body of the incoming request message.
 
         Args:
@@ -744,7 +744,7 @@ class Request:
             self._headers["Content-Type"] = content_type
         self._headers["Content-Length"] = str(len(body))
 
-    def set_reply_body(self, body, content_type: str) -> None:
+    def set_reply_body(self, body: Union[str, bytes], content_type: str) -> None:
         """Attach a body to the response built by :meth:`reply`.
 
         The dispatcher copies this body and sets ``Content-Type`` /

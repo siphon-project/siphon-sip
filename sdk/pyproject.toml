@@ -37,7 +37,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/siphon-project/siphon-sip"
-Documentation = "https://github.com/siphon-project/siphon-sip/tree/main/sdk"
+Documentation = "https://siphon-sip.org/reference/"
 Repository = "https://github.com/siphon-project/siphon-sip"
 
 # Version from the repo's git tags. `root = ".."` points hatch-vcs at the repo

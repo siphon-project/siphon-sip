@@ -51,6 +51,13 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   queues (e.g. summing `ims_queue_*`) — where enqueue/drain counters drift
   upward forever because TTL-expired entries leave the keyspace silently, a
   summed `LLEN` is truthful because expired keys are simply gone.
+- **Public Python API reference** at
+  [siphon-sip.org/reference](https://siphon-sip.org/reference/). Every scripting
+  namespace and object (`request`, `reply`, `call`, `sdp`, the SIP value types,
+  and the `proxy`/`registrar`/`auth`/`ipsec`/`diameter`/`sbi`/`rtpengine`/… module
+  namespaces) is now rendered on the docs site straight from the `siphon-sip`
+  SDK docstrings via `mkdocstrings`, so the reference tracks the code instead of
+  drifting. The PyPI `Documentation` link now points there.
 
 ### Changed
 - **Bump the `siphon-bin` SMPP extension to siphon-smpp v1.3.0**, which adds
