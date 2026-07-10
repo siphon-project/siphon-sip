@@ -2853,7 +2853,15 @@ fn relay_request(
             core::add_record_route(&mut relayed.headers, &rr_inbound);
             core::add_record_route(&mut relayed.headers, &rr_outbound);
         } else {
-            let rr_uri = format!("sip:{}:{};transport={}", internal_host, state.local_addr.port(), transport_str.to_lowercase());
+            // Single Record-Route (inbound == outbound transport). Reuse the same
+            // sent-by as our Via — the advertised host in the normal case, or the
+            // pinned listener for IPsec/flow/send_socket egress — instead of the
+            // raw bind IP. An external peer must route in-dialog requests back
+            // through the exact host:port we advertised: Teams rejects an IP in
+            // Record-Route outright, and a P-CSCF's protected port must match or
+            // the kernel SA selector drops the in-dialog request.
+            let rr_port = via_port.unwrap_or_else(|| state.via_port(&outbound_transport));
+            let rr_uri = format!("sip:{}:{};transport={}", via_host, rr_port, transport_str.to_lowercase());
             core::add_record_route(&mut relayed.headers, &rr_uri);
         }
     }
@@ -3192,7 +3200,12 @@ fn relay_fork_branch(
             core::add_record_route(&mut relayed.headers, &rr_inbound);
             core::add_record_route(&mut relayed.headers, &rr_outbound);
         } else {
-            let rr_uri = format!("sip:{}:{};transport={}", internal_host, state.local_addr.port(), transport_str.to_lowercase());
+            // Single Record-Route (inbound == outbound transport). Reuse the same
+            // sent-by as our Via — the advertised host, or the pinned send_socket
+            // listener — instead of the raw bind IP, so an external peer can route
+            // in-dialog requests back through the exact host:port we advertised
+            // (Teams rejects an IP in Record-Route).
+            let rr_uri = format!("sip:{}:{};transport={}", via_host, via_port, transport_str.to_lowercase());
             core::add_record_route(&mut relayed.headers, &rr_uri);
         }
     }

@@ -195,6 +195,19 @@ handshake also sends the target hostname (`sbc.example.com`) as SNI, so a
 hostname-vhost trunk front-end can route it. Server-certificate verification is
 unchanged (permissive) — this only adds the client certificate siphon presents.
 
+!!! warning "Terminate strict peers (Teams) as a B2BUA, not a plain proxy"
+    Microsoft Teams Direct Routing rejects any `Contact` or `Record-Route` whose
+    host is an IP (403 Forbidden) — it must be the SBC FQDN that matches the TLS
+    certificate. The B2BUA rewrites `Contact` to siphon's advertised address, so
+    set `advertised_address` (or the per-listener `advertise`) to that FQDN and it
+    satisfies the requirement. A **pure proxy** (`@proxy.on_request` relaying
+    INVITEs) forwards the upstream UA's `Contact` verbatim — typically a PBX's
+    private IP — which Teams refuses; RFC 3261 §16 forbids a proxy from rewriting
+    another UA's `Contact`, so this is by design, not a bug. Front Teams-facing
+    signalling with `@b2bua.on_invite`. siphon's OPTIONS keepalive and its 200 OK
+    to Teams' OPTIONS already carry the advertised FQDN in `Contact` plus an
+    `Allow` advertising the supported methods (including `REFER`/`NOTIFY`).
+
 ## See also
 
 - Real examples: [`scripts/b2bua_default.py`](https://github.com/siphon-project/siphon-sip/blob/main/scripts/b2bua_default.py), [`examples/b2bua_gateway.py`](https://github.com/siphon-project/siphon-sip/blob/main/examples/b2bua_gateway.py), [`examples/b2bua_rtpengine.py`](https://github.com/siphon-project/siphon-sip/blob/main/examples/b2bua_rtpengine.py).

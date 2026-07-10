@@ -337,6 +337,10 @@ impl UacSender {
             .call_id(format!("uac-keepalive-{}", uuid::Uuid::new_v4()))
             .cseq(format!("{cseq} OPTIONS"))
             .max_forwards(70)
+            // Advertise our supported methods so a peer probing us via this
+            // OPTIONS keepalive can discover the method set — e.g. Teams Direct
+            // Routing selects its transfer method from the SBC's Allow.
+            .header("Allow", crate::sip::SUPPORTED_METHODS.to_string())
             .content_length(0);
 
         if let Some(ref user_agent) = self.user_agent_header {
@@ -1179,6 +1183,14 @@ mod tests {
         assert!(
             !raw.contains("127.0.0.1"),
             "must not leak loopback when an FQDN is advertised: {raw}"
+        );
+        assert!(
+            raw.contains(&format!("Allow: {}", crate::sip::SUPPORTED_METHODS)),
+            "OPTIONS keepalive must advertise siphon's supported methods: {raw}"
+        );
+        assert!(
+            raw.contains("REFER") && raw.contains("NOTIFY"),
+            "Allow must include REFER/NOTIFY so peers discover transfer support: {raw}"
         );
     }
 }
