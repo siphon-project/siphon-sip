@@ -7,6 +7,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **`send_socket=` egress pin on `request.relay()` / `request.fork()` and
+  `call.dial()` / `call.fork()`** — the operator equivalent of Kamailio's
+  `force_send_socket()` / OpenSIPS' `$fs`. Selects which of siphon's own
+  configured listeners a relayed or dialed request leaves from on a multi-homed
+  host (`send_socket="udp:10.0.0.1:5060"`), and advertises that listener's
+  address in the outgoing Via so the response returns to the same socket. UDP
+  pins the exact `(ip, port)` listener; TCP/TLS bind the source IP with an
+  ephemeral source port (the source is now part of the connection-pool key, so a
+  source-bound and a default connection to the same peer stay distinct). The pin
+  is validated for format at the scripting API (a malformed spec raises
+  `ValueError`); a well-formed spec that names no configured listener is logged
+  and falls back to default routing rather than dropping the request. It is
+  ignored when a captured `flow=` is set (the flow already pins egress) and when
+  its transport doesn't match the routed transport. Per-listener UDP egress
+  channels are now enabled whenever the host has more than one UDP listener (they
+  were previously only enabled under IPsec); a single-listener deployment keeps
+  the existing fast path unchanged.
 - **Whole-URI setters `set_from_uri` / `set_to_uri` / `set_contact_uri`, plus
   `set_contact_user`, on both `request` (proxy) and `call` (B2BUA).** The
   whole-URI form of the existing `set_*_user` / `set_*_host` setters: replace the

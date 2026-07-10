@@ -1555,6 +1555,7 @@ def new_call(call):
                     next_hop: None,
                     flow: None,
                     route: vec![],
+                    send_socket: None,
                     timeout: 30,
                 }
             );

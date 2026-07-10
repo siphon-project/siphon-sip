@@ -278,6 +278,58 @@ A few properties worth knowing:
 
 ---
 
+## Choosing the egress socket (`send_socket`)
+
+On a multi-homed host — several listeners across interfaces — routing usually
+picks the outbound transport, but not *which local socket* the request leaves
+from. `send_socket=` pins it, the way Kamailio's `force_send_socket()` and
+OpenSIPS' `$fs` do. It takes a `"<transport>:<ip>:<port>"` string naming one of
+siphon's **own** configured listeners:
+
+```python
+# Proxy — relay this trunk call out of the carrier-facing NIC.
+request.relay("sip:carrier.example.net", send_socket="udp:203.0.113.10:5060")
+
+# Proxy — fork; the pin applies to every branch.
+request.fork(contacts, send_socket="udp:10.0.0.1:5060")
+
+# B2BUA — dial the B-leg out of a specific interface.
+call.dial("sip:bob@10.0.0.2:5060", send_socket="tcp:10.0.0.1:5060")
+```
+
+What it does:
+
+- **Advertises the right Via.** The outgoing Via sent-by is the selected
+  listener's advertised address (its `advertise:`, else its bound IP) with the
+  listener's port, so the peer's response comes back to the same socket. This is
+  the correctness reason to use `send_socket` instead of hand-rolling a Via
+  rewrite — get the sent-by wrong and the response lands on the wrong listener
+  (or nowhere).
+- **UDP** pins the exact `(ip, port)` listener socket as the egress.
+- **TCP/TLS** bind the source **IP** (interface); the source *port* stays
+  ephemeral, because binding a listen port for an outbound connection collides on
+  the 4-tuple in `TIME_WAIT`. Source-bound and default connections to the same
+  peer are pooled separately, so they never reuse each other.
+
+Rules and fall-backs:
+
+- A **malformed** spec raises `ValueError` at the scripting API (immediate, so
+  you catch typos in tests).
+- A **well-formed but unknown** socket (no such listener) is logged and the
+  request falls back to default routing — it is never dropped.
+- Ignored when a captured **`flow=`** is set (the flow already pins egress), and
+  when its **transport doesn't match** the routed transport (logged).
+- WS/WSS callees can't be dialed (client-initiated); reach them with `flow=`, not
+  `send_socket`.
+
+!!! note "Multi-homed UDP fast path"
+    Per-listener UDP egress is enabled automatically once the host has more than
+    one UDP listener (or IPsec is configured). A single-UDP-listener deployment
+    keeps the original zero-overhead send path — `send_socket` only has real work
+    to do when there's more than one socket to choose between.
+
+---
+
 ## NAT traversal for clients
 
 Subscribers behind home NAT advertise unroutable private addresses in their Via

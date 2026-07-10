@@ -49,11 +49,21 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// a process abort.
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Key for a pooled connection: destination address + transport type.
+/// Key for a pooled connection: destination address + transport type + the
+/// requested local *bind* address.
+///
+/// The bind address is part of the key so connections with different source
+/// endpoints to the same destination stay distinct.  Without it, a
+/// source-bound send (ESP-over-TCP IPsec, or a script `send_socket=` egress
+/// pin) and an ephemeral send to the same destination would collide on one
+/// pooled connection — reusing the wrong source, or hitting `EADDRNOTAVAIL`
+/// when a rebind conflicts on the 4-tuple.  `None` means "no explicit bind"
+/// (the OS picks the source — the default TLS outbound path).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PoolKey {
     destination: SocketAddr,
     transport: Transport,
+    bind: Option<SocketAddr>,
 }
 
 /// A pooled outbound connection.
@@ -310,14 +320,16 @@ impl ConnectionPool {
     /// §7.2) requires src=`pcscf_port_c`, dst=`ue_port_us`, and an
     /// ephemerally-bound socket would never match.
     ///
-    /// Same pooling semantics as `send_tcp` — but **destinations
-    /// reached this way must always use the same source**.  The pool
-    /// keys connections by destination only, so mixing source-bound
-    /// and ephemeral connections to the same destination would either
-    /// reuse the wrong one or hit `EADDRNOTAVAIL` on rebind.  In
-    /// practice IPsec destinations are exclusively source-bound and
-    /// non-IPsec destinations are exclusively ephemeral; no mixing
-    /// occurs at runtime.
+    /// Same pooling semantics as `send_tcp` — and the requested `source`
+    /// is part of the pool key ([`PoolKey::bind`]), so a source-bound
+    /// connection and an ephemeral one to the same destination are kept
+    /// distinct: they never reuse each other or collide on rebind.  Two
+    /// sends that request the *same* `source` to the same destination do
+    /// share a pooled connection (correct — same 4-tuple source).
+    ///
+    /// Used for ESP-over-TCP IPsec (a fixed `pcscf_addr:pcscf_port_c`
+    /// source) and for a script `send_socket=` egress pin (a chosen
+    /// interface IP with an ephemeral port).
     pub async fn send_tcp_from(
         &self,
         source: SocketAddr,
@@ -336,6 +348,7 @@ impl ConnectionPool {
         let key = PoolKey {
             destination,
             transport: Transport::Tcp,
+            bind: Some(bind_addr),
         };
 
         // Fast path: reuse a live pooled connection without taking the
@@ -620,9 +633,38 @@ impl ConnectionPool {
         server_name: Option<&str>,
         data: Bytes,
     ) -> Result<ConnectionId, std::io::Error> {
+        self.send_tls_inner(None, destination, server_name, data).await
+    }
+
+    /// Send over TLS, binding the outbound socket's source to `bind_addr`
+    /// (a script `send_socket=` egress pin selecting a specific local
+    /// interface).  The source is part of the pool key, so a source-bound
+    /// TLS connection stays distinct from a default (OS-picked-source) one to
+    /// the same destination.  Pass `bind_addr` with port `0` to keep the
+    /// source port ephemeral (binding the TLS listen port for an outbound
+    /// connection collides on the 4-tuple in `TIME_WAIT`).
+    pub async fn send_tls_from(
+        &self,
+        bind_addr: SocketAddr,
+        destination: SocketAddr,
+        server_name: Option<&str>,
+        data: Bytes,
+    ) -> Result<ConnectionId, std::io::Error> {
+        self.send_tls_inner(Some(bind_addr), destination, server_name, data)
+            .await
+    }
+
+    async fn send_tls_inner(
+        &self,
+        bind_addr: Option<SocketAddr>,
+        destination: SocketAddr,
+        server_name: Option<&str>,
+        data: Bytes,
+    ) -> Result<ConnectionId, std::io::Error> {
         let key = PoolKey {
             destination,
             transport: Transport::Tls,
+            bind: bind_addr,
         };
 
         // Try existing connection first
@@ -638,18 +680,37 @@ impl ConnectionPool {
         }
 
         // Create new TCP connection, then wrap with TLS handshake.
-        // Unlike TCP pool connections we do NOT bind to a specific local port —
-        // the TLS listen port (5061) is for inbound only; outbound uses ephemeral.
+        // The default outbound path does NOT bind a specific local port — the
+        // TLS listen port (5061) is for inbound only; outbound uses ephemeral.
+        // A `send_socket=` egress pin (`bind_addr = Some`) binds the chosen
+        // interface IP (ephemeral port) so traffic leaves the intended NIC.
         //
         // Fail-fast on both the TCP connect and the TLS handshake: an
         // unreachable or silently-dropping peer would otherwise block the
         // calling worker indefinitely (same wedge class as the TCP path).
-        let tcp_stream = match tokio::time::timeout(
-            self.connect_timeout,
-            tokio::net::TcpStream::connect(destination),
-        )
-        .await
-        {
+        let connect_future = async {
+            match bind_addr {
+                Some(source) => {
+                    let socket = if destination.is_ipv6() {
+                        tokio::net::TcpSocket::new_v6()?
+                    } else {
+                        tokio::net::TcpSocket::new_v4()?
+                    };
+                    socket.set_reuseaddr(true)?;
+                    socket.set_reuseport(true)?;
+                    if let Some(tos) = self.tos {
+                        socket2::SockRef::from(&socket).set_tos_v4(tos)?;
+                    }
+                    socket.bind(source).map_err(|error| {
+                        warn!(bind_addr = %source, destination = %destination, "pool: TLS bind to requested source failed: {error}");
+                        error
+                    })?;
+                    socket.connect(destination).await
+                }
+                None => tokio::net::TcpStream::connect(destination).await,
+            }
+        };
+        let tcp_stream = match tokio::time::timeout(self.connect_timeout, connect_future).await {
             Ok(result) => result?,
             Err(_) => {
                 warn!(destination = %destination, timeout = ?self.connect_timeout, "pool: TLS TCP connect timed out");

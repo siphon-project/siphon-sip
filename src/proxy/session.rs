@@ -76,6 +76,11 @@ pub struct ProxySession {
     /// branches started after the first.  `PyFlow` is plain data (no
     /// `Py<PyAny>`), so cloning it off the dispatcher thread is sound.
     pub fork_flows: Vec<Option<crate::script::api::registrar::PyFlow>>,
+    /// Script `send_socket=` egress pin for the whole fork, stored so sequential
+    /// forking (`start_next_fork_branch`) applies the same source-socket pin to
+    /// branches started after the first.  `SendSocket` is plain data (no
+    /// `Py<PyAny>`), so cloning it off the dispatcher thread is sound.
+    pub fork_send_socket: Option<crate::transport::SendSocket>,
     /// Maps client transaction key → branch index in the ForkAggregator.
     pub branch_index_map: HashMap<TransactionKey, usize>,
     /// Whether `record_route()` was called by the script.
@@ -115,6 +120,7 @@ impl ProxySession {
             client_branches: HashMap::new(),
             fork_aggregator: None,
             fork_flows: Vec::new(),
+            fork_send_socket: None,
             branch_index_map: HashMap::new(),
             source_addr,
             inbound_local_addr,

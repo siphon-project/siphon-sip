@@ -1047,8 +1047,16 @@ impl SiphonServer {
         > = std::collections::HashMap::new();
         let mut udp_default: Option<flume::Sender<transport::OutboundMessage>> = None;
         let ipsec_enabled = config.ipsec.is_some();
+        // Populate the per-listener UDP channel map when IPsec is enabled OR the
+        // host is multi-homed (more than one UDP listener).  A single-listener
+        // deployment — the README perf baseline — keeps `udp_by_local` empty so
+        // `OutboundRouter::send` stays on the branch-predicted fast path (no
+        // per-message HashMap lookup).  Multi-homing is what makes a script
+        // `send_socket=` egress pin meaningful, and it also covers
+        // IPsec-protected replies (TS 33.203 §7.4).
+        let per_listener_udp = ipsec_enabled || udp_listener_channels.len() > 1;
         for (addr, (tx, _)) in udp_listener_channels.iter() {
-            if ipsec_enabled {
+            if per_listener_udp {
                 udp_by_local.insert(*addr, tx.clone());
             }
             if udp_default.is_none() {
@@ -1071,6 +1079,11 @@ impl SiphonServer {
         let mut first_listen_addr: Option<std::net::SocketAddr> = None;
         let mut listen_addrs = std::collections::HashMap::new();
         let mut advertised_addrs: std::collections::HashMap<transport::Transport, String> = std::collections::HashMap::new();
+        // Every configured listener (transport + bound addr + advertised host),
+        // for `send_socket=` egress resolution.  Unlike `listen_addrs` (first
+        // per transport), this keeps the FULL multi-homed set across transports.
+        let mut listener_registry_entries: Vec<(transport::Transport, std::net::SocketAddr, Option<String>)> =
+            Vec::new();
 
         // DSCP → TOS byte resolution helper.
         // Per-entry overrides the global listen.dscp (default CS3 = 24 → TOS 96).
@@ -1093,6 +1106,7 @@ impl SiphonServer {
             if let Some(adv) = entry.advertise() {
                 advertised_addrs.entry(transport::Transport::Udp).or_insert_with(|| adv.to_string());
             }
+            listener_registry_entries.push((transport::Transport::Udp, addr, entry.advertise().map(str::to_string)));
             let tos = resolve_tos(entry);
             info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting UDP transport");
             // Use this listener's dedicated outbound channel (TS 33.203
@@ -1190,6 +1204,7 @@ impl SiphonServer {
             if let Some(adv) = entry.advertise() {
                 advertised_addrs.entry(transport::Transport::Tcp).or_insert_with(|| adv.to_string());
             }
+            listener_registry_entries.push((transport::Transport::Tcp, addr, entry.advertise().map(str::to_string)));
             let tos = resolve_tos(entry);
             tcp_entries.push((addr, tos, entry.dscp().or(global_dscp)));
         }
@@ -1291,6 +1306,7 @@ impl SiphonServer {
                 if let Some(adv) = entry.advertise() {
                     advertised_addrs.entry(transport::Transport::Tls).or_insert_with(|| adv.to_string());
                 }
+                listener_registry_entries.push((transport::Transport::Tls, addr, entry.advertise().map(str::to_string)));
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting TLS transport");
                 transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map), Arc::clone(&transport_acl), stream_connections.clone(), tos, Some(Arc::clone(&connection_pool)), crlf_pong_tracker.clone(), connection_close_tx.clone()).await;
@@ -1311,6 +1327,7 @@ impl SiphonServer {
             if let Some(adv) = entry.advertise() {
                 advertised_addrs.entry(transport::Transport::WebSocket).or_insert_with(|| adv.to_string());
             }
+            listener_registry_entries.push((transport::Transport::WebSocket, addr, entry.advertise().map(str::to_string)));
             let tos = resolve_tos(entry);
             info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting WS transport");
             transport::ws::listen(addr, inbound_tx.clone(), ws_outbound_rx.clone(), Arc::clone(&ws_connection_map), Arc::clone(&transport_acl), stream_connections.clone(), tos, connection_close_tx.clone()).await;
@@ -1331,6 +1348,7 @@ impl SiphonServer {
                 if let Some(adv) = entry.advertise() {
                     advertised_addrs.entry(transport::Transport::WebSocketSecure).or_insert_with(|| adv.to_string());
                 }
+                listener_registry_entries.push((transport::Transport::WebSocketSecure, addr, entry.advertise().map(str::to_string)));
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting WSS transport");
                 transport::ws::listen_secure(addr, tls_config, inbound_tx.clone(), wss_outbound_rx.clone(), Arc::clone(&wss_connection_map), Arc::clone(&transport_acl), stream_connections.clone(), tos, connection_close_tx.clone()).await;
@@ -1353,6 +1371,7 @@ impl SiphonServer {
                 if let Some(adv) = entry.advertise() {
                     advertised_addrs.entry(transport::Transport::Sctp).or_insert_with(|| adv.to_string());
                 }
+                listener_registry_entries.push((transport::Transport::Sctp, addr, entry.advertise().map(str::to_string)));
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting SCTP transport");
                 transport::sctp::listen(addr, inbound_tx.clone(), sctp_outbound_rx.clone(), Arc::clone(&sctp_connection_map), Arc::clone(&transport_acl), tos).await;
@@ -1850,6 +1869,7 @@ impl SiphonServer {
             local_addr,
             listen_addrs,
             advertised_addrs,
+            transport::ListenerRegistry::from_entries(listener_registry_entries),
             hep_sender,
             uac_sender,
             connection_pool,

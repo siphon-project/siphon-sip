@@ -90,6 +90,11 @@ struct DispatcherState {
     /// Per-transport listen address for HEP capture (so TLS responses report
     /// port 5061, not the UDP/TCP port 5060).
     listen_addrs: std::collections::HashMap<Transport, SocketAddr>,
+    /// Every configured listener (transport + bound addr + advertised host).
+    /// Backs `send_socket=` egress resolution — a script may only pin a source
+    /// socket siphon is actually listening on, and the advertised host for the
+    /// outgoing Via comes from the matched listener.
+    listener_registry: crate::transport::ListenerRegistry,
     /// Server header value injected into locally-generated responses.
     server_header: Option<String>,
     /// User-Agent header value for outbound requests (UAC, registrant).
@@ -304,6 +309,39 @@ impl DispatcherState {
             .unwrap_or(self.local_addr.port())
     }
 
+    /// Resolve a script `send_socket=` spec against the configured listeners.
+    ///
+    /// Returns `Some(SendSocket)` only when the spec is well-formed AND names a
+    /// socket siphon is actually listening on.  A malformed spec can't reach
+    /// here (the script API rejects it with `ValueError`); a well-formed spec
+    /// that doesn't match any listener warns and returns `None`, so the caller
+    /// falls back to default routing rather than dropping the request —
+    /// silently dropping would violate the "always answer" invariant, and an
+    /// operator typo shouldn't blackhole calls.
+    fn resolve_send_socket(
+        &self,
+        spec: Option<&str>,
+    ) -> Option<crate::transport::SendSocket> {
+        let spec = spec?;
+        match crate::transport::parse_send_socket(spec) {
+            Ok((transport, addr)) => {
+                let resolved = self.listener_registry.resolve(transport, addr);
+                if resolved.is_none() {
+                    warn!(
+                        send_socket = %spec,
+                        "send_socket names no configured listener — falling back to default routing"
+                    );
+                }
+                resolved
+            }
+            Err(error) => {
+                // Should be unreachable (validated at the API), but never panic.
+                warn!(send_socket = %spec, "ignoring malformed send_socket: {error}");
+                None
+            }
+        }
+    }
+
     /// Resolve the header policy for a B2BUA call.  Returns the per-call
     /// policy when the script attached one via `call.dial(header_policy=…)`,
     /// otherwise the configured default.
@@ -360,6 +398,7 @@ pub async fn run(
     local_addr: SocketAddr,
     listen_addrs: std::collections::HashMap<Transport, SocketAddr>,
     advertised_addrs: std::collections::HashMap<Transport, String>,
+    listener_registry: crate::transport::ListenerRegistry,
     hep_sender: Option<Arc<HepSender>>,
     uac_sender: Arc<UacSender>,
     connection_pool: Arc<ConnectionPool>,
@@ -489,6 +528,7 @@ pub async fn run(
         local_addr: via_addr,
         advertised_addrs: merged_advertised,
         listen_addrs,
+        listener_registry,
         server_header,
         user_agent_header,
         transaction_timeout,
@@ -2457,13 +2497,14 @@ fn handle_request(
             }
 
         }
-        RequestAction::Relay { next_hop, flow } => {
+        RequestAction::Relay { next_hop, flow, send_socket } => {
             // RFC 3261 §16.2: a stateful proxy SHOULD send 100 Trying
             // immediately upon receiving an INVITE to stop UAC retransmissions.
             if method == "INVITE" {
                 let trying = build_response(&message_guard, 100, "Trying", state.server_header.as_deref(), &[]);
                 send_message_from(trying, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
             }
+            let send_socket = state.resolve_send_socket(send_socket.as_deref());
             relay_request(
                 &message_guard,
                 next_hop.as_deref(),
@@ -2476,9 +2517,10 @@ fn handle_request(
                 send_via_transport.as_deref(),
                 send_via_target.as_deref(),
                 flow.as_ref(),
+                send_socket.as_ref(),
             );
         }
-        RequestAction::Fork { targets, flows, strategy } => {
+        RequestAction::Fork { targets, flows, strategy, send_socket } => {
             if targets.is_empty() {
                 warn!("fork with empty targets list");
                 let response = build_response(&message_guard, 500, "No Targets", state.server_header.as_deref(), &[]);
@@ -2492,6 +2534,7 @@ fn handle_request(
                     "sequential" => crate::proxy::fork::ForkStrategy::Sequential,
                     _ => crate::proxy::fork::ForkStrategy::Parallel,
                 };
+                let send_socket = state.resolve_send_socket(send_socket.as_deref());
                 relay_fork_request(
                     &message_guard,
                     targets,
@@ -2501,6 +2544,7 @@ fn handle_request(
                     &inbound,
                     server_key.as_ref(),
                     state,
+                    send_socket.as_ref(),
                 );
             }
         }
@@ -2555,6 +2599,7 @@ fn relay_request(
     send_via_transport: Option<&str>,
     send_via_target: Option<&str>,
     flow: Option<&crate::script::api::registrar::PyFlow>,
+    send_socket: Option<&crate::transport::SendSocket>,
 ) {
     // Two ways to know where this request is going:
     //   a) flow=Some — use the captured inbound flow directly,
@@ -2725,6 +2770,28 @@ fn relay_request(
         _ => None,
     };
 
+    // Resolve the script `send_socket=` egress pin against the *final*
+    // outbound transport (the IPsec block above may have re-pinned it).  It
+    // applies only when: there is no captured flow (a flow already pins the
+    // egress listener), IPsec has not claimed the source (the kernel XFRM
+    // selector must win), and its transport matches the outbound transport.
+    // A transport mismatch is an operator config error — warn and ignore it
+    // rather than egress on the wrong socket.
+    let send_socket = match send_socket {
+        _ if flow.is_some() || ipsec_source.is_some() => None,
+        Some(pin) if pin.transport == outbound_transport => Some(pin),
+        Some(pin) => {
+            warn!(
+                send_socket = %pin.addr,
+                requested_transport = %pin.transport,
+                outbound_transport = %outbound_transport,
+                "send_socket transport does not match the outbound transport — ignoring the egress pin"
+            );
+            None
+        }
+        None => None,
+    };
+
     // Add our Via — use the outbound transport for the Via header.
     // If force_send_via set a target, use it as the Via sent-by address.
     let transport_str = format!("{}", outbound_transport);
@@ -2742,6 +2809,12 @@ fn relay_request(
         // on the Via we advertise, otherwise the kernel selector
         // doesn't match and the response is silently dropped.
         (local.ip().to_string(), Some(local.port()))
+    } else if let Some(pin) = send_socket {
+        // Script send_socket= egress pin: advertise the selected listener's
+        // sent-by (its configured advertise host, else the bound IP) with the
+        // listener's port, so the peer's response comes back to this socket.
+        let (host, port) = pin.via_sent_by();
+        (format_sip_host(&host), Some(port))
     } else if let Some(target_str) = send_via_target {
         // Parse "host:port" or just "host"
         if let Some((host, port_str)) = target_str.rsplit_once(':') {
@@ -2891,7 +2964,14 @@ fn relay_request(
             transport: Some(outbound_transport),
             server_name: None,
         };
-        send_to_target(data, &target, inbound.transport, inbound.connection_id, state)
+        send_to_target(
+            data,
+            &target,
+            inbound.transport,
+            inbound.connection_id,
+            send_socket.map(|pin| pin.addr),
+            state,
+        )
     };
     // Patch the session's ClientBranch via the locally-held `Arc` we got
     // back from `session_store.insert(...)` rather than re-looking up
@@ -2929,6 +3009,7 @@ fn relay_fork_request(
     inbound: &InboundMessage,
     server_key: Option<&TransactionKey>,
     state: &DispatcherState,
+    send_socket: Option<&crate::transport::SendSocket>,
 ) {
     use crate::proxy::fork::ForkAggregator;
 
@@ -2955,7 +3036,7 @@ fn relay_fork_request(
         None => {
             // Fall back to single-target relay if no server transaction —
             // carry the first branch's flow so a single WS contact still routes.
-            relay_request(message, targets.first().map(|s| s.as_str()), record_routed, inbound, None, state, None, None, None, None, flows.first().and_then(|f| f.as_ref()));
+            relay_request(message, targets.first().map(|s| s.as_str()), record_routed, inbound, None, state, None, None, None, None, flows.first().and_then(|f| f.as_ref()), send_socket);
             return;
         }
     };
@@ -2971,6 +3052,7 @@ fn relay_fork_request(
     );
     session.fork_aggregator = Some(Arc::clone(&aggregator));
     session.fork_flows = flows.to_vec();
+    session.fork_send_socket = send_socket.cloned();
 
     // Determine which branches to start now
     let branches_to_start: Vec<usize> = match strategy {
@@ -2998,6 +3080,7 @@ fn relay_fork_request(
             &session_arc,
             &aggregator,
             flows.get(branch_index).and_then(|f| f.as_ref()),
+            send_socket,
             state,
         );
     }
@@ -3017,6 +3100,7 @@ fn relay_fork_branch(
     session_arc: &Arc<RwLock<ProxySession>>,
     aggregator: &Arc<std::sync::Mutex<crate::proxy::fork::ForkAggregator>>,
     flow: Option<&crate::script::api::registrar::PyFlow>,
+    send_socket: Option<&crate::transport::SendSocket>,
     state: &DispatcherState,
 ) {
     // Resolve the branch destination + transport: over the captured inbound flow
@@ -3059,12 +3143,40 @@ fn relay_fork_branch(
         return; // caller handles the error for the whole fork
     }
 
+    // A script send_socket= egress pin applies to this branch only when it has
+    // no captured flow (a flow already pins egress) and its transport matches
+    // the branch's outbound transport.  When it applies, the Via sent-by is the
+    // pinned listener's advertised address so the branch's response comes back
+    // to that socket.
+    let send_socket = match send_socket {
+        _ if flow.is_some() => None,
+        Some(pin) if pin.transport == outbound_transport => Some(pin),
+        Some(pin) => {
+            warn!(
+                send_socket = %pin.addr,
+                requested_transport = %pin.transport,
+                outbound_transport = %outbound_transport,
+                branch = branch_index,
+                "fork: send_socket transport does not match the branch transport — ignoring"
+            );
+            None
+        }
+        None => None,
+    };
+
     let transport_str = format!("{}", outbound_transport);
+    let (via_host, via_port) = match send_socket {
+        Some(pin) => {
+            let (host, port) = pin.via_sent_by();
+            (format_sip_host(&host), port)
+        }
+        None => (state.via_host(&outbound_transport), state.via_port(&outbound_transport)),
+    };
     let branch = core::add_via(
         &mut relayed.headers,
         &transport_str,
-        &state.via_host(&outbound_transport),
-        Some(state.via_port(&outbound_transport)),
+        &via_host,
+        Some(via_port),
     );
 
     if record_routed {
@@ -3162,7 +3274,7 @@ fn relay_fork_branch(
         cid
     } else {
         let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport), server_name: None };
-        send_to_target(data, &relay_target, inbound.transport, inbound.connection_id, state)
+        send_to_target(data, &relay_target, inbound.transport, inbound.connection_id, send_socket.map(|pin| pin.addr), state)
     };
 
     debug!(
@@ -3299,7 +3411,7 @@ fn handle_response(
                                     transport: Some(transport),
                                     server_name: None,
                                 };
-                                send_to_target(data, &target, transport, ConnectionId::default(), state);
+                                send_to_target(data, &target, transport, ConnectionId::default(), None, state);
                             }
                         } else if status_code >= 300 {
                             state.recording_manager.handle_failure(&session_id, status_code);
@@ -3579,6 +3691,7 @@ fn handle_response(
                             &RelayTarget { address: cb.destination, transport: Some(cb.transport), server_name: None },
                             cb.transport,
                             cb.connection_id,
+                            None,
                             state,
                         );
                         info!(
@@ -4358,10 +4471,16 @@ fn send_to_target(
     target: &RelayTarget,
     fallback_transport: Transport,
     fallback_connection_id: ConnectionId,
+    send_source: Option<SocketAddr>,
     state: &DispatcherState,
 ) -> ConnectionId {
     let transport = target.transport.unwrap_or(fallback_transport);
     let destination = target.address;
+    // A script `send_socket=` egress pin translated to a bind address:
+    // - UDP pins the exact `(ip, port)` listener socket (`source_local_addr`).
+    // - TCP/TLS bind the source *IP* with an ephemeral port (`port 0`) — the
+    //   listen port would collide on the 4-tuple in `TIME_WAIT`.
+    let send_bind_stream = send_source.map(|addr| SocketAddr::new(addr.ip(), 0));
 
     // HEP capture — outbound (sent to network)
     if let Some(ref hep) = state.hep_sender {
@@ -4379,10 +4498,14 @@ fn send_to_target(
             // never matches and the packet is silently dropped.
             let pool = Arc::clone(&state.connection_pool);
             let data_clone = data;
-            let ipsec_source = crate::script::api::ipsec::outbound_local_addr_for(destination);
+            // IPsec's fixed-port source wins over a script send_socket pin (the
+            // kernel XFRM selector requires it); otherwise use the pin's
+            // interface IP with an ephemeral source port.
+            let source = crate::script::api::ipsec::outbound_local_addr_for(destination)
+                .or(send_bind_stream);
             let connect_result = tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
-                    match ipsec_source {
+                    match source {
                         Some(source) => pool.send_tcp_from(source, destination, data_clone).await,
                         None => pool.send_tcp(destination, data_clone).await,
                     }
@@ -4416,6 +4539,40 @@ fn send_to_target(
             }
         }
         Transport::Tls => {
+            // Script send_socket= egress pin over TLS: open (or reuse) a
+            // source-bound pool connection.  The pool keys on the bind address,
+            // so this stays distinct from a default-source connection to the
+            // same peer.  We bypass the generic `reuse` below because that
+            // ignores the source — reusing a connection off the wrong interface
+            // would violate the operator's egress pin.
+            if let Some(bind) = send_bind_stream {
+                let pool = Arc::clone(&state.connection_pool);
+                let server_name = target.server_name.clone();
+                let data_clone = data;
+                return match tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(pool.send_tls_from(
+                        bind,
+                        destination,
+                        server_name.as_deref(),
+                        data_clone,
+                    ))
+                }) {
+                    Ok(connection_id) => {
+                        debug!(
+                            destination = %destination,
+                            connection_id = ?connection_id,
+                            bind = %bind,
+                            "relayed via source-bound TLS pool (send_socket)"
+                        );
+                        connection_id
+                    }
+                    Err(error) => {
+                        error!(destination = %destination, "source-bound TLS pool send failed: {error}");
+                        ConnectionId::default()
+                    }
+                };
+            }
+
             // TLS connection reuse: find an existing inbound (or pool-created
             // outbound) TLS connection to the destination (like OpenSIPS
             // connection reuse).  `reuse` tries an exact SocketAddr match, then
@@ -4530,8 +4687,11 @@ fn send_to_target(
             // Returns `None` for non-IPsec deployments and ordinary
             // (non-UE) destinations — i.e. zero impact on the hot
             // path when no IpsecManager is wired.
+            // IPsec auto-source wins over a script send_socket pin (kernel XFRM
+            // selector); otherwise the pin selects the exact `(ip, port)` UDP
+            // listener socket to egress from (routed via `udp_by_local`).
             let source_local_addr =
-                crate::script::api::ipsec::outbound_local_addr_for(destination);
+                crate::script::api::ipsec::outbound_local_addr_for(destination).or(send_source);
             let outbound_message = OutboundMessage {
                 connection_id: fallback_connection_id,
                 transport,
@@ -5857,7 +6017,7 @@ fn send_b2bua_to_bleg(
         transport: Some(transport),
         server_name: None,
     };
-    send_to_target(data, &target, transport, ConnectionId::default(), state);
+    send_to_target(data, &target, transport, ConnectionId::default(), None, state);
 }
 
 /// Create Rust-backed auth, registrar, log, and proxy utility singletons
@@ -6921,7 +7081,7 @@ fn start_next_fork_branch(
     server_key: &TransactionKey,
     state: &DispatcherState,
 ) {
-    let (original_request, record_routed, source_addr, connection_id, transport, agg, branch_flow) = {
+    let (original_request, record_routed, source_addr, connection_id, transport, agg, branch_flow, send_socket) = {
         let session = match session_arc.read() {
             Ok(s) => s,
             Err(_) => return,
@@ -6934,6 +7094,7 @@ fn start_next_fork_branch(
             session.transport,
             session.fork_aggregator.clone(),
             session.fork_flows.get(next_index).cloned().flatten(),
+            session.fork_send_socket.clone(),
         )
     };
 
@@ -6968,6 +7129,7 @@ fn start_next_fork_branch(
             session_arc,
             &agg,
             branch_flow.as_ref(),
+            send_socket.as_ref(),
             state,
         );
     }
@@ -7181,6 +7343,7 @@ fn handle_ack_via_session(
                 &target,
                 client_branch.transport,
                 ack_connection_id,
+                None,
                 state,
             );
         }
@@ -8156,7 +8319,7 @@ fn handle_b2bua_invite(
             state.call_actors.remove_call(&call_id);
             state.call_event_receivers.remove(&call_id);
         }
-        CallAction::Dial { target, next_hop, flow, route, timeout } => {
+        CallAction::Dial { target, next_hop, flow, route, send_socket, timeout } => {
             debug!(
                 call_id = %call_id,
                 target = %target,
@@ -8165,20 +8328,23 @@ fn handle_b2bua_invite(
                 routes = route.len(),
                 "B2BUA: dialling B-leg",
             );
+            let send_socket = state.resolve_send_socket(send_socket.as_deref());
             b2bua_send_b_leg_invite(
                 &call_id,
                 &target,
                 next_hop.as_deref(),
                 flow.as_ref(),
                 &route,
+                send_socket.as_ref(),
                 &message_guard,
                 &inbound,
                 state,
             );
             set_b2bua_answer_deadline(&call_id, timeout, state);
         }
-        CallAction::Fork { targets, flows, strategy: _, timeout } => {
+        CallAction::Fork { targets, flows, strategy: _, send_socket, timeout } => {
             debug!(call_id = %call_id, targets = ?targets, "B2BUA: forking B-legs");
+            let send_socket = state.resolve_send_socket(send_socket.as_deref());
             for (index, target) in targets.iter().enumerate() {
                 b2bua_send_b_leg_invite(
                     &call_id,
@@ -8186,6 +8352,7 @@ fn handle_b2bua_invite(
                     None,
                     flows.get(index).and_then(|f| f.as_ref()),
                     &[],
+                    send_socket.as_ref(),
                     &message_guard,
                     &inbound,
                     state,
@@ -8267,12 +8434,14 @@ fn build_b_leg_contact(
 /// wire destination instead of `target_uri` — IMS edge use-case where the
 /// R-URI must carry the canonical home-domain IMPU but the message has to
 /// be routed via a fixed next-hop (BGCF, I-CSCF, outbound proxy, …).
+#[allow(clippy::too_many_arguments)]
 fn b2bua_send_b_leg_invite(
     call_id: &str,
     target_uri: &str,
     next_hop: Option<&str>,
     flow: Option<&crate::script::api::registrar::PyFlow>,
     b_leg_route: &[String],
+    send_socket: Option<&crate::transport::SendSocket>,
     original_request: &SipMessage,
     _inbound: &InboundMessage,
     state: &DispatcherState,
@@ -8312,13 +8481,41 @@ fn b2bua_send_b_leg_invite(
         (relay_target.address, relay_target.transport.unwrap_or(Transport::Udp))
     };
 
+    // A script send_socket= egress pin applies to the B-leg only when it has no
+    // captured flow (a flow already pins egress) and its transport matches the
+    // B-leg's outbound transport.  When it applies, the B-leg Via sent-by is the
+    // pinned listener's advertised address so the callee's response comes back
+    // to that socket.
+    let send_socket = match send_socket {
+        _ if flow.is_some() => None,
+        Some(pin) if pin.transport == outbound_transport => Some(pin),
+        Some(pin) => {
+            warn!(
+                call_id = %call_id,
+                send_socket = %pin.addr,
+                requested_transport = %pin.transport,
+                outbound_transport = %outbound_transport,
+                "B2BUA: send_socket transport does not match the B-leg transport — ignoring"
+            );
+            None
+        }
+        None => None,
+    };
+
     // Build a new INVITE for the B-leg
     let branch = TransactionKey::generate_branch();
+    let (via_host, via_port) = match send_socket {
+        Some(pin) => {
+            let (host, port) = pin.via_sent_by();
+            (format_sip_host(&host), port)
+        }
+        None => (state.via_host(&outbound_transport), state.via_port(&outbound_transport)),
+    };
     let via_value = format!(
         "SIP/2.0/{} {}:{};branch={}",
         outbound_transport,
-        state.via_host(&outbound_transport),
-        state.via_port(&outbound_transport),
+        via_host,
+        via_port,
         branch,
     );
 
@@ -8601,7 +8798,7 @@ fn b2bua_send_b_leg_invite(
         }
     } else {
         let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport), server_name: None };
-        send_to_target(data, &relay_target, outbound_transport, ConnectionId::default(), state);
+        send_to_target(data, &relay_target, outbound_transport, ConnectionId::default(), send_socket.map(|pin| pin.addr), state);
     }
 
     // Persist the fully hygiene-processed B-leg INVITE on the leg.
@@ -10289,7 +10486,7 @@ fn handle_b2bua_response(
                         transport: Some(transport),
                         server_name: None,
                     };
-                    send_to_target(data, &target, transport, ConnectionId::default(), state);
+                    send_to_target(data, &target, transport, ConnectionId::default(), None, state);
                 }
             }
         }
@@ -10524,7 +10721,7 @@ fn handle_b2bua_response(
                                 }
 
                                 let data = Bytes::from(retry.to_bytes());
-                                send_to_target(data, &relay_target, transport, reuse_connection_id, state);
+                                send_to_target(data, &relay_target, transport, reuse_connection_id, None, state);
                             }
                             return; // don't forward 422 to A-leg or fire on_failure
                         }
@@ -10794,7 +10991,7 @@ fn handle_b2bua_response(
                                 }
 
                                 let data = Bytes::from(retry.to_bytes());
-                                send_to_target(data, &relay_target, transport, reuse_connection_id, state);
+                                send_to_target(data, &relay_target, transport, reuse_connection_id, None, state);
                             }
                             return; // don't forward 401/407 to A-leg or fire on_failure
                         }
@@ -11272,7 +11469,7 @@ fn handle_b2bua_bye(
             transport: Some(transport),
             server_name: None,
         };
-        send_to_target(data, &target, transport, ConnectionId::default(), state);
+        send_to_target(data, &target, transport, ConnectionId::default(), None, state);
     }
     // RTPEngine unsubscribe: stop media forking for each recording session.
     if let Some(ref rtpengine_set) = state.rtpengine_set {
