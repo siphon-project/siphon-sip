@@ -1705,8 +1705,8 @@ class MockRtpEngine:
         assert rtpengine.operations == [("offer", "srtp_to_rtp")]
 
     Media-injection operations (``play_media``, ``stop_media``, ``play_dtmf``,
-    ``silence_media``, ``unsilence_media``, ``block_media``, ``unblock_media``)
-    are also captured in ``operations`` as ``(name, detail_string)`` tuples so
+    ``silence_media``, ``unsilence_media``, ``block_media``, ``unblock_media``,
+    ``echo``) are also captured in ``operations`` as ``(name, detail)`` tuples so
     downstream apps can unit-test MMTEL announcement flows without a live
     rtpengine. Full parameter dicts are available on ``media_calls``.
 
@@ -1949,6 +1949,17 @@ class MockRtpEngine:
         """Resume forwarding the selected monologue's packets."""
         self.operations.append(("unblock_media", None))
         self.media_calls.append({"op": "unblock_media"})
+        return True
+
+    async def echo(self, target: Any, enabled: bool = True) -> bool:
+        """Toggle echo-test mode on a call — reflect the caller's ingress audio
+        back to itself (single-leg IVR echo).
+
+        ``enabled=False`` stops echoing. Native ``siphon-rtp`` backend only;
+        DTMF and media-timeout events still fire while echoing.
+        """
+        self.operations.append(("echo", enabled))
+        self.media_calls.append({"op": "echo", "enabled": enabled})
         return True
 
     async def subscribe_request(

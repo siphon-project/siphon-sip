@@ -9,6 +9,14 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [1.3.0] — 2026-07-10
 
 ### Added
+- **`rtpengine.echo(target, enabled=True)`** — single-leg IVR echo on the native
+  `siphon-rtp` media backend. After offering the leg, `await rtpengine.echo(call)`
+  reflects the caller's ingress audio back to itself; `enabled=False` stops it.
+  siphon-rtp promotes the plain relay into its processing media path on enable and
+  demotes it on disable, and DTMF and media-timeout events keep firing while
+  echoing. Native `siphon-rtp` backend only: the rtpengine and rtpproxy backends
+  have no echo verb and reject the call with a clear error rather than silently
+  no-op'ing. Requires `siphon-rtp-proto` 0.1.1.
 - **`send_socket=` egress pin on `request.relay()` / `request.fork()` and
   `call.dial()` / `call.fork()`** — the operator equivalent of Kamailio's
   `force_send_socket()` / OpenSIPS' `$fs`. Selects which of siphon's own
