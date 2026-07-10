@@ -193,6 +193,18 @@ impl MediaBackend {
         }
     }
 
+    /// Echo-test mode — reflect a leg's ingress audio back to itself (single-leg
+    /// IVR echo). Native `siphon-rtp` backend only: rtpengine and rtpproxy have
+    /// no echo verb, so those backends reject rather than silently no-op.
+    pub async fn echo(&self, call_id: &str, from_tag: &str, enabled: bool) -> Result<(), RtpEngineError> {
+        match self {
+            Self::SiphonRtp(client) => client.echo(call_id, from_tag, enabled).await,
+            Self::RtpEngine(_) | Self::RtpProxy(_) => Err(RtpEngineError::Protocol(
+                "echo is only supported by the native siphon-rtp backend".to_string(),
+            )),
+        }
+    }
+
     /// Drop the selected monologue's outgoing packets entirely.
     pub async fn block_media(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         match self {
@@ -332,5 +344,55 @@ impl MediaBackend {
             Self::SiphonRtp(client) => client.instance_addresses(),
             Self::RtpProxy(client) => client.instance_addresses(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rtpengine::events::RtpEngineEvent;
+    use tokio::sync::mpsc;
+
+    /// A valid-but-unused loopback address; nothing listens on it. The native
+    /// client dispatches the command and times out; the other backends reject
+    /// `echo` synchronously before any I/O.
+    fn dead_address() -> SocketAddr {
+        "127.0.0.1:1".parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn echo_routes_to_siphon_rtp_backend() {
+        // Reaching the native client is proven by a Timeout (the command was
+        // framed and sent, then no response arrived) — the reject arms below
+        // return synchronously and never time out.
+        let (event_tx, _event_rx) = mpsc::channel::<RtpEngineEvent>(16);
+        let set = SiphonRtpClientSet::new(vec![(dead_address(), 200, 1)], None, event_tx).unwrap();
+        let backend = MediaBackend::SiphonRtp(set);
+
+        let error = backend.echo("call-1", "tag-a", true).await.unwrap_err();
+        assert!(
+            matches!(error, RtpEngineError::Timeout { .. }),
+            "expected the native client path (Timeout), got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn echo_rejected_on_rtpproxy_backend() {
+        let set = RtpProxyClientSet::new(vec![(dead_address(), 200, 1)], 0).await.unwrap();
+        let backend = MediaBackend::RtpProxy(set);
+
+        let error = backend.echo("call-1", "tag-a", true).await.unwrap_err();
+        assert!(matches!(error, RtpEngineError::Protocol(_)));
+        assert!(error.to_string().contains("siphon-rtp"));
+    }
+
+    #[tokio::test]
+    async fn echo_rejected_on_rtpengine_backend() {
+        let set = RtpEngineSet::new(vec![(dead_address(), 200, 1)]).await.unwrap();
+        let backend = MediaBackend::RtpEngine(Arc::new(set));
+
+        let error = backend.echo("call-1", "tag-a", true).await.unwrap_err();
+        assert!(matches!(error, RtpEngineError::Protocol(_)));
+        assert!(error.to_string().contains("siphon-rtp"));
     }
 }

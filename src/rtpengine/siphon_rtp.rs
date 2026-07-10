@@ -67,6 +67,10 @@ pub(crate) fn profile_flags_from_ng(flags: &NgFlags) -> ProfileFlags {
         direction: flags.direction.clone(),
         record_call: flags.record_call,
         record_path: flags.record_path.clone(),
+        // Proto fields siphon's NgFlags has no source for (address_family,
+        // ws_uri, received_from, rtcp_mux). Default them: each carries
+        // skip_serializing_if, so the emitted wire form is unchanged.
+        ..ProfileFlags::default()
     }
 }
 
@@ -369,6 +373,27 @@ impl SiphonRtpClient {
         )
     }
 
+    /// Echo-test mode: the engine reflects a leg's ingress audio back to itself
+    /// (single-leg IVR echo). `enabled=false` stops it. siphon-rtp promotes a
+    /// plain relay to a processing MediaCall automatically; DTMF and
+    /// media-timeout events still fire while echoing.
+    pub async fn echo(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        enabled: bool,
+    ) -> Result<(), RtpEngineError> {
+        expect_ok(
+            self.request(Command::Echo {
+                call_id: call_id.to_string(),
+                from_tag: from_tag.to_string(),
+                to_tag: None,
+                enabled,
+            })
+            .await?,
+        )
+    }
+
     /// Drop the selected monologue's outgoing packets entirely.
     pub async fn block_media(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         expect_ok(
@@ -492,9 +517,10 @@ impl SiphonRtpClient {
         match self.request(Command::Ping).await? {
             CmdResult::Pong => Ok(()),
             CmdResult::Error { reason } => Err(RtpEngineError::EngineError(reason)),
-            CmdResult::Ok { .. } => Err(RtpEngineError::Protocol(
-                "expected 'pong', got 'ok'".to_string(),
-            )),
+            other => Err(RtpEngineError::Protocol(format!(
+                "expected 'pong', got '{}'",
+                result_kind(&other)
+            ))),
         }
     }
 
@@ -713,6 +739,16 @@ impl SiphonRtpClientSet {
         self.select(call_id).unsilence_media(call_id, from_tag).await
     }
 
+    /// Toggle echo-test mode on the affinity-bound instance.
+    pub async fn echo(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        enabled: bool,
+    ) -> Result<(), RtpEngineError> {
+        self.select(call_id).echo(call_id, from_tag, enabled).await
+    }
+
     /// Block egress on the affinity-bound instance.
     pub async fn block_media(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         self.select(call_id).block_media(call_id, from_tag).await
@@ -837,13 +873,37 @@ fn unexpected_result(context: &str, result: CmdResult) -> RtpEngineError {
         CmdResult::Ok { .. } => {
             RtpEngineError::Protocol(format!("unexpected 'ok' response to {context}"))
         }
+        // Results for cluster/stats/query commands siphon never issues on this
+        // control connection (List/Statistics/Load/NodeInfo/Checkpoint). Seeing
+        // one is a protocol violation, not a stub — treat it as such.
+        other => RtpEngineError::Protocol(format!(
+            "unexpected '{}' response to {context}",
+            result_kind(&other)
+        )),
+    }
+}
+
+/// A short, stable tag for a [`CmdResult`] variant, for error messages.
+fn result_kind(result: &CmdResult) -> &'static str {
+    match result {
+        CmdResult::Ok { .. } => "ok",
+        CmdResult::Error { .. } => "error",
+        CmdResult::Pong => "pong",
+        CmdResult::List { .. } => "list",
+        CmdResult::Statistics { .. } => "statistics",
+        CmdResult::Load { .. } => "load",
+        CmdResult::NodeInfo { .. } => "node_info",
+        CmdResult::Checkpoint { .. } => "checkpoint",
     }
 }
 
 /// Convert a proto [`Event`] to siphon's [`RtpEngineEvent`].
 ///
 /// `Event::Dtmf` is a field-for-field twin of [`DtmfEvent`]; `MediaTimeout`
-/// maps to the dedicated variant; anything else becomes `Unknown`.
+/// maps to the dedicated variant. The conference/quality events
+/// (`ActiveSpeaker`, `CallQuality`) are not modelled by a typed handler yet, so
+/// they surface through `Unknown` (logged, not dropped) carrying their stream
+/// identifiers — a typed Python handler is a follow-up.
 fn convert_event(event: Event) -> RtpEngineEvent {
     match event {
         Event::Dtmf {
@@ -866,6 +926,24 @@ fn convert_event(event: Event) -> RtpEngineEvent {
         Event::MediaTimeout { call_id, from_tag } => RtpEngineEvent::MediaTimeout {
             call_id,
             from_tag,
+        },
+        Event::ActiveSpeaker {
+            conference_id,
+            from_tag,
+        } => RtpEngineEvent::Unknown {
+            event: "active_speaker".to_string(),
+            call_id: Some(conference_id),
+            from_tag,
+        },
+        Event::CallQuality {
+            conference_id,
+            call_id,
+            from_tag,
+            ..
+        } => RtpEngineEvent::Unknown {
+            event: "call_quality".to_string(),
+            call_id: call_id.or(conference_id),
+            from_tag: Some(from_tag),
         },
         Event::Unknown => RtpEngineEvent::Unknown {
             event: "unknown".to_string(),
@@ -1083,9 +1161,10 @@ async fn authenticate(
                                 CmdResult::Error { reason } => {
                                     Err(RtpEngineError::EngineError(reason))
                                 }
-                                CmdResult::Pong => Err(RtpEngineError::Protocol(
-                                    "unexpected 'pong' for authenticate".to_string(),
-                                )),
+                                other => Err(RtpEngineError::Protocol(format!(
+                                    "unexpected '{}' response for authenticate",
+                                    result_kind(&other)
+                                ))),
                             };
                         }
                     }
@@ -1511,6 +1590,75 @@ mod tests {
         let error = client.delete("call-x", "tag-a").await.unwrap_err();
         assert!(matches!(error, RtpEngineError::EngineError(_)));
         assert!(error.to_string().contains("no such call"));
+    }
+
+    #[tokio::test]
+    async fn echo_frames_command_with_enabled_flag() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+
+            // First call: echo(enabled=true).
+            let request: Request = read_frame(&mut stream, &mut buffer).await;
+            match request.command {
+                Command::Echo {
+                    call_id,
+                    from_tag,
+                    to_tag,
+                    enabled,
+                } => {
+                    assert_eq!(call_id, "call-echo");
+                    assert_eq!(from_tag, "tag-a");
+                    assert_eq!(to_tag, None);
+                    assert!(enabled, "enabled=true must serialize as true");
+                }
+                other => panic!("expected Echo, got {other:?}"),
+            }
+            write_frame(
+                &mut stream,
+                &Response {
+                    id: request.id,
+                    result: CmdResult::Ok {
+                        sdp: None,
+                        duration_ms: None,
+                        to_tag: None,
+                        stats: None,
+                    },
+                },
+            )
+            .await;
+
+            // Second call on the same persistent connection: echo(enabled=false).
+            let request: Request = read_frame(&mut stream, &mut buffer).await;
+            match request.command {
+                Command::Echo { enabled, .. } => {
+                    assert!(!enabled, "enabled=false must serialize as false");
+                }
+                other => panic!("expected Echo, got {other:?}"),
+            }
+            write_frame(
+                &mut stream,
+                &Response {
+                    id: request.id,
+                    result: CmdResult::Ok {
+                        sdp: None,
+                        duration_ms: None,
+                        to_tag: None,
+                        stats: None,
+                    },
+                },
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let (event_tx, _event_rx) = channel();
+        let client = SiphonRtpClient::new(address, None, 2000, event_tx);
+        client.echo("call-echo", "tag-a", true).await.unwrap();
+        client.echo("call-echo", "tag-a", false).await.unwrap();
     }
 
     #[tokio::test]

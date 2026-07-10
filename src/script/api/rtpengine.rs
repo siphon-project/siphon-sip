@@ -554,6 +554,37 @@ impl PyRtpEngine {
         self.simple_media_command(python, target, "unblock_media")
     }
 
+    /// Enable/disable echo-test mode on a call — reflect the caller's ingress
+    /// audio back to itself (single-leg IVR echo). ``enabled=False`` stops
+    /// echoing. Native ``siphon-rtp`` backend only; DTMF and media-timeout
+    /// events still fire while echoing.
+    ///
+    /// Args:
+    ///     target: A Request, Reply, or Call whose Call-ID / From-tag select
+    ///         the leg to echo (the same message the offer used).
+    ///     enabled: True to start echoing (default), False to stop.
+    #[pyo3(signature = (target, enabled=true))]
+    fn echo<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+        enabled: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let message = extract_message(target)?;
+        let (call_id, from_tag) = extract_delete_params(&message)?;
+        let client = Arc::clone(&self.client);
+
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            client.echo(&call_id, &from_tag, enabled).await.map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "rtpengine.echo failed: {error}"
+                ))
+            })?;
+            debug!(call_id = %call_id, enabled, "rtpengine echo");
+            Ok(true)
+        })
+    }
+
     /// Send a `subscribe request` — create a new subscription to an existing
     /// call's media.
     ///

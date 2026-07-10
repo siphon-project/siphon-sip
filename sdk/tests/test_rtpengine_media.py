@@ -1,7 +1,7 @@
 """Tests for MockRtpEngine media-injection methods.
 
-Covers play_media/stop_media/play_dtmf/silence+unsilence/block+unblock — the
-announcement and DTMF surface added for MMTEL / TAS-style scripts.
+Covers play_media/stop_media/play_dtmf/silence+unsilence/block+unblock/echo —
+the announcement, DTMF, and echo-test surface added for MMTEL / TAS-style scripts.
 """
 
 from __future__ import annotations
@@ -176,6 +176,41 @@ async def route(request):
         harness.send_request("INVITE", "sip:alice@example.com")
         ops = [name for name, _ in harness.rtpengine.operations]
         assert ops == ["block_media", "unblock_media"]
+
+
+class TestEcho:
+    def test_echo_default_enabled(self, harness):
+        harness.load_source(
+            """
+from siphon import proxy, rtpengine
+
+@proxy.on_request
+async def route(request):
+    await rtpengine.echo(request)
+    request.reply(200, "OK")
+"""
+        )
+        harness.send_request("INVITE", "sip:alice@example.com")
+        assert ("echo", True) in harness.rtpengine.operations
+        call = harness.rtpengine.media_calls[-1]
+        assert call["op"] == "echo"
+        assert call["enabled"] is True
+
+    def test_echo_disabled(self, harness):
+        harness.load_source(
+            """
+from siphon import proxy, rtpengine
+
+@proxy.on_request
+async def route(request):
+    await rtpengine.echo(request, enabled=False)
+    request.reply(200, "OK")
+"""
+        )
+        harness.send_request("INVITE", "sip:alice@example.com")
+        assert ("echo", False) in harness.rtpengine.operations
+        call = harness.rtpengine.media_calls[-1]
+        assert call["enabled"] is False
 
 
 class TestClear:
