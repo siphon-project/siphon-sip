@@ -6,6 +6,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-07-10
+
 ### Added
 - **`send_socket=` egress pin on `request.relay()` / `request.fork()` and
   `call.dial()` / `call.fork()`** — the operator equivalent of Kamailio's
@@ -160,6 +162,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   advertised, and the choice flipped between restarts. The default is now the
   first `listen.udp` listener in configuration order, matching the advertised Via
   sent-by. Single-listener and IPsec deployments are unaffected.
+
+## [1.2.1] — 2026-07-09
 
 ### Security
 - **Bump `crossbeam-epoch` 0.9.18 → 0.9.20** to address RUSTSEC-2026-0204: an
