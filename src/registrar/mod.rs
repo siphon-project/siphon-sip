@@ -1445,7 +1445,72 @@ impl Registrar {
     /// REGISTER toward the S-CSCF under `dereg_mode: network_dereg`.  The
     /// per-AoR `service_routes` are deliberately **not** cleared here, so the
     /// caller can still resolve the upstream next hop after removal.
+    ///
+    /// Equivalent to [`close_flow`](Self::close_flow) with an empty `keep`
+    /// set — deregister every stream binding on the connection, keep nothing.
     pub fn unregister_flow_collect(&self, connection_id: u64) -> Vec<(Aor, Contact)> {
+        self.close_flow(connection_id, &std::collections::HashSet::new())
+    }
+
+    /// Read-only peek: the stream `(aor, contact)` bindings currently indexed
+    /// on `connection_id`, cloned, without mutating any store.  Lets a caller
+    /// decide which contacts to keep vs deregister — e.g. retain an IPsec
+    /// binding whose XFRM SA is still warm — *before* committing the close via
+    /// [`close_flow`](Self::close_flow).
+    ///
+    /// Empty for an unknown / transient id.  UDP contacts that happen to
+    /// collide on the id are excluded — only stream transports own a closable
+    /// socket (see [`is_stream_transport`]).
+    pub fn bindings_for_connection(&self, connection_id: u64) -> Vec<(Aor, Contact)> {
+        let aors = match self.connection_index.get(&connection_id) {
+            Some(entry) => entry.value().clone(),
+            None => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        let mut seen: std::collections::HashSet<Aor> = std::collections::HashSet::new();
+        for aor in aors {
+            if !seen.insert(aor.clone()) {
+                continue;
+            }
+            if let Some(entry) = self.bindings.get(&aor) {
+                for contact in entry.value().iter() {
+                    if contact.inbound_connection_id == Some(connection_id)
+                        && is_stream_transport(contact.source_transport.as_deref())
+                    {
+                        out.push((aor.clone(), contact.clone()));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Close a dead stream connection under registrar liveness (RFC 5626
+    /// §4.2.2).  For each stream contact that arrived on `connection_id`:
+    ///
+    ///   - contact URI in `keep` → **detach**: null `inbound_connection_id`
+    ///     (the socket is dead, so a future MT send opens a fresh connection
+    ///     instead of riding a half-open one) but keep the binding, its
+    ///     `flow_token` and Service-Route, and emit no `Deregistered`.  This is
+    ///     RFC 5626 flow recovery — the flow failed but the registration
+    ///     survives.  Used for IPsec bindings whose SA is still warm: the
+    ///     SA-idle sweep (`dispatcher::sweep_registrar_liveness`) owns their
+    ///     liveness, so a benign ECM-IDLE FIN must not deregister them.
+    ///   - otherwise → **remove**: today's flow-failure dereg — drop the
+    ///     binding, prune its `flow_token`, cascade-clear orphaned AS records
+    ///     once the last UE binding is gone (TS 24.229 §5.4.2.1.2), and emit
+    ///     `Deregistered` so `@registrar.on_change` fires the terminated
+    ///     reg-event NOTIFY.
+    ///
+    /// Prunes the `connection_index` entry either way.  Returns the **removed**
+    /// bindings so the caller can run the network-dereg cascade.  A `keep` that
+    /// keeps everything is a pure detach (returns empty); an empty `keep` is
+    /// the remove-all behaviour of the former `unregister_flow_collect`.
+    pub fn close_flow(
+        &self,
+        connection_id: u64,
+        keep: &std::collections::HashSet<String>,
+    ) -> Vec<(Aor, Contact)> {
         let aors = match self.connection_index.remove(&connection_id) {
             Some((_, aors)) => aors,
             None => return Vec::new(),
@@ -1473,16 +1538,23 @@ impl Registrar {
                     // another path.  Harmless: nothing to deregister.
                     None => continue,
                 };
-                // Partition into kept vs removed so the caller gets the dropped
-                // bindings (for the network-dereg cascade), harvesting their
-                // tokens along the way.
+                // Partition into kept vs removed.  A contact on this dead flow
+                // is DETACHED (kept, id nulled) when its URI is in `keep`,
+                // otherwise REMOVED (and its token harvested for pruning).
+                // Contacts on other flows / transports are always kept.
                 let contacts = std::mem::take(entry.value_mut());
                 let before = contacts.len();
                 let mut kept = Vec::with_capacity(before);
-                for contact in contacts {
-                    let drop_contact = contact.inbound_connection_id == Some(connection_id)
+                for mut contact in contacts {
+                    let on_this_flow = contact.inbound_connection_id == Some(connection_id)
                         && is_stream_transport(contact.source_transport.as_deref());
-                    if drop_contact {
+                    if on_this_flow && keep.contains(&contact.uri.to_string()) {
+                        // Detach: the socket is gone but the registration stands
+                        // (RFC 5626 flow recovery).  A future MT send opens a
+                        // fresh connection rather than riding the half-open one.
+                        contact.inbound_connection_id = None;
+                        kept.push(contact);
+                    } else if on_this_flow {
                         if let Some(token) = &contact.flow_token {
                             tokens_to_remove.push(token.clone());
                         }
@@ -1512,8 +1584,14 @@ impl Registrar {
                 self.bindings.remove(&aor);
                 emptied_count += 1;
             }
-            self.persist_aor(&aor, stored);
+            // Only write through / announce a deregistration when a binding was
+            // actually removed or the AoR emptied.  A pure detach mutates only
+            // the process-local `inbound_connection_id` (never part of
+            // `StoredContact`), so it must NOT touch the backend or emit an
+            // event — otherwise a benign flow recovery would look like a
+            // deregistration to watchers and the backend.
             if changed || emptied {
+                self.persist_aor(&aor, stored);
                 deregistered.push(aor);
             }
         }
@@ -1940,6 +2018,250 @@ mod tests {
         );
         // Idempotent: the index entry is consumed.
         assert!(registrar.unregister_flow_collect(77).is_empty());
+    }
+
+    /// Save a P-CSCF-style cache binding: stream transport, a `flow_token`, and
+    /// a UE source IP (so the SA-liveness discriminator has an IP to match).
+    fn save_pcscf_flow(
+        registrar: &Registrar,
+        aor: &str,
+        user: &str,
+        contact_host: &str,
+        ue_ip: &str,
+        connection_id: u64,
+        flow_token: &str,
+    ) {
+        registrar
+            .save_full(
+                aor,
+                contact_uri(user, contact_host),
+                3600,
+                1.0,
+                format!("call-{user}"),
+                1,
+                Some(format!("{ue_ip}:5060").parse().unwrap()),
+                Some("tcp".to_string()),
+                None,
+                None,
+                vec![],
+                FlowCapture {
+                    flow_token: Some(flow_token.to_string()),
+                    inbound_local_addr: None,
+                    inbound_connection_id: Some(connection_id),
+                },
+                Vec::new(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn close_flow_keep_detaches_without_dereg() {
+        let registrar = Registrar::default();
+        save_pcscf_flow(
+            &registrar,
+            "sip:alice@example.com",
+            "alice",
+            "10.0.0.1",
+            "100.65.0.2",
+            7,
+            "tok-1",
+        );
+        registrar.set_service_routes("sip:alice@example.com", vec!["<sip:scscf;lr>".into()]);
+
+        // Retain everything on the flow (the UE's IPsec SA is still warm).
+        let keep: std::collections::HashSet<String> = registrar
+            .bindings_for_connection(7)
+            .into_iter()
+            .map(|(_, contact)| contact.uri.to_string())
+            .collect();
+        assert_eq!(keep.len(), 1);
+
+        let mut events = registrar.subscribe_events();
+        let removed = registrar.close_flow(7, &keep);
+
+        assert!(removed.is_empty(), "a pure detach removes nothing");
+        // Binding survives; flow_token + Service-Route intact.
+        assert!(registrar.is_registered("sip:alice@example.com"));
+        let contacts = registrar.lookup("sip:alice@example.com");
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].flow_token.as_deref(), Some("tok-1"));
+        assert_eq!(
+            contacts[0].inbound_connection_id, None,
+            "detach nulls the dead socket id so a future MT send reconnects"
+        );
+        assert_eq!(
+            registrar.service_routes("sip:alice@example.com"),
+            vec!["<sip:scscf;lr>".to_string()]
+        );
+        // Token still resolvable — not pruned by a detach.
+        assert!(registrar.lookup_by_token("tok-1").is_some());
+        // The connection-index entry is consumed, and NO Deregistered fires.
+        assert!(registrar.bindings_for_connection(7).is_empty());
+        assert!(
+            events.try_recv().is_err(),
+            "a detach must not emit Deregistered (RFC 5626 flow recovery)"
+        );
+    }
+
+    #[test]
+    fn close_flow_no_keep_deregisters() {
+        // Regression guard: an empty `keep` is byte-for-byte the old
+        // `unregister_flow_collect` — remove, prune, emit.
+        let registrar = Registrar::default();
+        save_pcscf_flow(
+            &registrar,
+            "sip:alice@example.com",
+            "alice",
+            "10.0.0.1",
+            "100.65.0.2",
+            7,
+            "tok-1",
+        );
+
+        let mut events = registrar.subscribe_events();
+        let removed = registrar.close_flow(7, &std::collections::HashSet::new());
+
+        assert_eq!(removed.len(), 1);
+        let (aor, contact) = &removed[0];
+        assert_eq!(aor, "sip:alice@example.com");
+        assert_eq!(contact.flow_token.as_deref(), Some("tok-1"));
+        assert!(!registrar.is_registered("sip:alice@example.com"));
+        // Token pruned from the reverse index.
+        assert!(registrar.lookup_by_token("tok-1").is_none());
+        match events.try_recv() {
+            Ok(RegistrationEvent::Deregistered { aor }) => {
+                assert_eq!(aor, "sip:alice@example.com")
+            }
+            other => panic!("expected Deregistered, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn close_flow_mixed() {
+        // Two AoRs multiplexed on connection 7; keep alice, drop bob.
+        let registrar = Registrar::default();
+        save_pcscf_flow(
+            &registrar,
+            "sip:alice@example.com",
+            "alice",
+            "10.0.0.1",
+            "100.65.0.2",
+            7,
+            "tok-a",
+        );
+        save_pcscf_flow(
+            &registrar,
+            "sip:bob@example.com",
+            "bob",
+            "10.0.0.3",
+            "100.65.0.9",
+            7,
+            "tok-b",
+        );
+
+        let keep: std::collections::HashSet<String> =
+            std::iter::once(registrar.lookup("sip:alice@example.com")[0].uri.to_string()).collect();
+        let removed = registrar.close_flow(7, &keep);
+
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].0, "sip:bob@example.com");
+        // alice detached (survives, id nulled); bob removed.
+        assert!(registrar.is_registered("sip:alice@example.com"));
+        assert_eq!(
+            registrar.lookup("sip:alice@example.com")[0].inbound_connection_id,
+            None
+        );
+        assert!(!registrar.is_registered("sip:bob@example.com"));
+    }
+
+    #[test]
+    fn bindings_for_connection_peek() {
+        let registrar = Registrar::default();
+        // A stream contact on connection 7 …
+        save_pcscf_flow(
+            &registrar,
+            "sip:alice@example.com",
+            "alice",
+            "10.0.0.1",
+            "100.65.0.2",
+            7,
+            "tok-1",
+        );
+        // … plus a UDP contact under the same AoR whose stored id collides on 7.
+        registrar
+            .save_full(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.99"),
+                3600,
+                0.5,
+                "call-udp".into(),
+                1,
+                Some("100.65.0.2:5060".parse().unwrap()),
+                Some("udp".to_string()),
+                None,
+                None,
+                vec![],
+                FlowCapture {
+                    flow_token: None,
+                    inbound_local_addr: None,
+                    inbound_connection_id: Some(7),
+                },
+                Vec::new(),
+            )
+            .unwrap();
+
+        let peek = registrar.bindings_for_connection(7);
+        assert_eq!(peek.len(), 1, "UDP contact colliding on the id is excluded");
+        assert_eq!(peek[0].1.source_transport.as_deref(), Some("tcp"));
+        // Peek does not mutate: both contacts still present.
+        assert_eq!(registrar.lookup("sip:alice@example.com").len(), 2);
+        // Unknown id → empty.
+        assert!(registrar.bindings_for_connection(999).is_empty());
+    }
+
+    #[test]
+    fn detach_then_reregister_repoints() {
+        let registrar = Registrar::default();
+        save_pcscf_flow(
+            &registrar,
+            "sip:alice@example.com",
+            "alice",
+            "10.0.0.1",
+            "100.65.0.2",
+            7,
+            "tok-1",
+        );
+
+        // Detach on the dead flow (connection 7).
+        let keep: std::collections::HashSet<String> = registrar
+            .bindings_for_connection(7)
+            .into_iter()
+            .map(|(_, contact)| contact.uri.to_string())
+            .collect();
+        assert!(registrar.close_flow(7, &keep).is_empty());
+        assert!(registrar.bindings_for_connection(7).is_empty());
+
+        // Re-REGISTER of the same AoR/contact arrives on a new connection 9.
+        save_pcscf_flow(
+            &registrar,
+            "sip:alice@example.com",
+            "alice",
+            "10.0.0.1",
+            "100.65.0.2",
+            9,
+            "tok-1",
+        );
+
+        assert_eq!(
+            registrar.lookup("sip:alice@example.com")[0].inbound_connection_id,
+            Some(9),
+            "re-REGISTER re-points the binding to the live connection"
+        );
+        assert_eq!(registrar.bindings_for_connection(9).len(), 1);
+        assert!(
+            registrar.bindings_for_connection(7).is_empty(),
+            "the dead connection is not re-indexed"
+        );
     }
 
     #[test]

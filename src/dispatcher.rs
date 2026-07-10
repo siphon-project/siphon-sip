@@ -1425,6 +1425,81 @@ pub(crate) async fn liveness_flow_failure_network_dereg(
     }
 }
 
+/// The set of contact URIs to **retain** (detach, not deregister) when a stream
+/// flow closes: those whose UE source IP still has a live IPsec SA.  A closed
+/// IPsec flow is a recoverable RFC 5626 §4.2.2 flow failure owned by the
+/// SA-idle sweep, not a death signal — the UE stays reachable via paging and
+/// its XFRM SA stays warm across ECM-IDLE.  A non-IPsec stream close has no SA
+/// to consult and remains an authoritative death signal (keep set excludes it).
+fn flow_close_keep_set(
+    bindings: &[(crate::registrar::Aor, crate::registrar::Contact)],
+    sa_ips: &std::collections::HashSet<std::net::IpAddr>,
+) -> std::collections::HashSet<String> {
+    bindings
+        .iter()
+        .filter(|(_, contact)| {
+            contact
+                .source_addr
+                .map(|addr| sa_ips.contains(&addr.ip()))
+                .unwrap_or(false)
+        })
+        .map(|(_, contact)| contact.uri.to_string())
+        .collect()
+}
+
+/// Handle a stream connection close under registrar liveness (RFC 5626
+/// §4.2.2).  Runs from the `server.rs` close-drain task (which has no
+/// `DispatcherState`), so it reads process globals.
+///
+/// IPsec bindings on the dead flow are **retained** (detached) and left to the
+/// SA-idle sweep ([`sweep_registrar_liveness`]), which ages them on the
+/// authoritative XFRM SA use-time plus an OPTIONS probe.  This stops a VoLTE UE
+/// from being network-deregistered on every benign ECM-IDLE transition: its
+/// SIP-over-TCP flow FINs at the radio inactivity timer, but the IMS
+/// registration must survive so an MT INVITE can page it.  Non-IPsec stream
+/// closes (plain TCP, WSS WebRTC) keep today's immediate flow-failure
+/// deregistration and cascade.
+pub(crate) async fn liveness_on_flow_close(
+    connection_id: u64,
+    dereg_mode: crate::config::LivenessDeregMode,
+) {
+    let registrar = match crate::script::api::registrar_arc() {
+        Some(registrar) => Arc::clone(registrar),
+        None => return,
+    };
+
+    // Same discriminator the SA-idle sweep uses: a UE IP with a live SA.
+    let sa_ips: std::collections::HashSet<std::net::IpAddr> = match crate::ipsec::global_manager() {
+        Some(manager) => manager
+            .liveness_snapshot()
+            .into_iter()
+            .map(|row| row.ue_addr)
+            .collect(),
+        None => std::collections::HashSet::new(),
+    };
+
+    let keep = flow_close_keep_set(&registrar.bindings_for_connection(connection_id), &sa_ips);
+    let retained = keep.len();
+    let removed = registrar.close_flow(connection_id, &keep);
+
+    if retained > 0 {
+        tracing::info!(
+            connection_id,
+            retained,
+            "registrar liveness: stream flow closed — IPsec binding(s) retained, \
+             deferring to SA-idle sweep (RFC 5626 flow recovery)"
+        );
+    }
+    if !removed.is_empty() {
+        tracing::info!(
+            connection_id,
+            removed = removed.len(),
+            "registrar liveness: flow-failure deregistration (non-IPsec stream connection closed)"
+        );
+        liveness_flow_failure_network_dereg(removed, dereg_mode).await;
+    }
+}
+
 /// Part B.4 — an abandoned UE's SA pair was just reaped from the kernel;
 /// remove the matching registrar binding(s) so the registration doesn't
 /// linger to its own `Expires`.  Runs synchronously in the sweep because the
@@ -12968,6 +13043,78 @@ mod tests {
     use crate::sip::parser::parse_sip_message;
     use crate::sip::uri::SipUri;
     use crate::sip::builder::SipMessageBuilder;
+
+    /// Save a stream P-CSCF cache binding directly against a bare `Registrar`,
+    /// so the flow-close decision helpers can be exercised without a running
+    /// server.  `ue_ip` is the UE source address the SA-liveness set matches on.
+    fn save_stream_binding(
+        registrar: &crate::registrar::Registrar,
+        aor: &str,
+        user: &str,
+        ue_ip: &str,
+        connection_id: u64,
+    ) {
+        registrar
+            .save_full(
+                aor,
+                SipUri::new(ue_ip.to_string()).with_user(user.to_string()),
+                3600,
+                1.0,
+                format!("call-{user}"),
+                1,
+                Some(format!("{ue_ip}:5060").parse().unwrap()),
+                Some("tcp".to_string()),
+                None,
+                None,
+                vec![],
+                crate::registrar::FlowCapture {
+                    flow_token: Some(format!("tok-{user}")),
+                    inbound_local_addr: None,
+                    inbound_connection_id: Some(connection_id),
+                },
+                Vec::new(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn flow_close_keep_set_retains_ipsec_ues() {
+        // A closed IPsec flow is a recoverable RFC 5626 flow failure: the UE's
+        // SA is still warm, so the binding must be retained (deferred to the
+        // SA-idle sweep) rather than network-deregistered on the FIN.
+        let registrar = crate::registrar::Registrar::default();
+        save_stream_binding(&registrar, "sip:alice@ims.example.com", "alice", "100.65.0.2", 7);
+        let bindings = registrar.bindings_for_connection(7);
+        assert_eq!(bindings.len(), 1);
+
+        let mut sa_ips = std::collections::HashSet::new();
+        sa_ips.insert("100.65.0.2".parse::<std::net::IpAddr>().unwrap());
+
+        let keep = flow_close_keep_set(&bindings, &sa_ips);
+        assert_eq!(keep.len(), 1);
+        assert!(keep.contains(&bindings[0].1.uri.to_string()));
+
+        // Committing the close with that keep set detaches, never deregisters.
+        assert!(registrar.close_flow(7, &keep).is_empty());
+        assert!(registrar.is_registered("sip:alice@ims.example.com"));
+    }
+
+    #[test]
+    fn flow_close_keep_set_deregs_non_ipsec() {
+        // No SA for the UE IP (plain TCP / WSS WebRTC) — the stream close stays
+        // an authoritative death signal, so nothing is retained and the binding
+        // is removed immediately.
+        let registrar = crate::registrar::Registrar::default();
+        save_stream_binding(&registrar, "sip:bob@example.com", "bob", "100.65.0.9", 9);
+        let bindings = registrar.bindings_for_connection(9);
+
+        let keep = flow_close_keep_set(&bindings, &std::collections::HashSet::new());
+        assert!(keep.is_empty());
+
+        let removed = registrar.close_flow(9, &keep);
+        assert_eq!(removed.len(), 1);
+        assert!(!registrar.is_registered("sip:bob@example.com"));
+    }
 
     #[test]
     fn advertise_supported_methods_sets_allow_when_absent() {

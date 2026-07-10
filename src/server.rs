@@ -1155,29 +1155,17 @@ impl SiphonServer {
                     idle_multiplier = liveness.idle_multiplier,
                     probe_timeout_ms = liveness.probe_timeout_ms,
                     dereg_mode = ?liveness.dereg_mode,
-                    "registrar liveness ENABLED — flow-failure dereg (TCP/TLS/WS/WSS) + UDP+IPsec idle sweep active"
+                    "registrar liveness ENABLED — flow-failure dereg (non-IPsec stream) + IPsec SA-idle sweep active"
                 );
                 let dereg_mode = liveness.dereg_mode;
                 let (close_tx, close_rx) = flume::unbounded::<u64>();
                 tokio::spawn(async move {
+                    // A closed stream flow defers to the SA-idle sweep for IPsec
+                    // bindings (RFC 5626 §4.2.2 flow recovery) and only
+                    // deregisters non-IPsec bindings immediately — see
+                    // `dispatcher::liveness_on_flow_close`.
                     while let Ok(connection_id) = close_rx.recv_async().await {
-                        if let Some(registrar) = crate::script::api::registrar_arc() {
-                            let removed = registrar.unregister_flow_collect(connection_id);
-                            if !removed.is_empty() {
-                                tracing::info!(
-                                    connection_id,
-                                    removed = removed.len(),
-                                    "registrar liveness: flow-failure deregistration (stream connection closed)"
-                                );
-                                // Cascade to the registrar of record: under
-                                // network_dereg, a P-CSCF cache binding also
-                                // de-REGISTERs (Expires: 0) toward the S-CSCF.
-                                crate::dispatcher::liveness_flow_failure_network_dereg(
-                                    removed, dereg_mode,
-                                )
-                                .await;
-                            }
-                        }
+                        crate::dispatcher::liveness_on_flow_close(connection_id, dereg_mode).await;
                     }
                 });
                 Some(close_tx)
