@@ -16,7 +16,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
@@ -86,6 +86,12 @@ pub struct Destination {
     healthy: AtomicBool,
     /// Consecutive failure count.
     failures: AtomicU32,
+    /// Cooldown deadline. When set and not yet elapsed, the health prober must
+    /// not flip this destination back to healthy — used to honor a `503`
+    /// `Retry-After` (RFC 3261 §20.33 / Teams Direct Routing datacenter
+    /// failover): a peer that answered "come back in N seconds" stays out of
+    /// selection for at least that long even if a later probe succeeds.
+    down_until: std::sync::Mutex<Option<Instant>>,
 }
 
 impl Destination {
@@ -106,6 +112,7 @@ impl Destination {
             attrs: HashMap::new(),
             healthy: AtomicBool::new(true),
             failures: AtomicU32::new(0),
+            down_until: std::sync::Mutex::new(None),
         }
     }
 
@@ -136,10 +143,55 @@ impl Destination {
     pub fn mark_up(&self) {
         self.healthy.store(true, Ordering::Relaxed);
         self.failures.store(0, Ordering::Relaxed);
+        // Explicit operator override clears any Retry-After cooldown.
+        *self
+            .down_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     pub fn mark_down(&self) {
         self.healthy.store(false, Ordering::Relaxed);
+    }
+
+    /// Mark down and hold down until at least `until`.
+    ///
+    /// Sets `healthy=false` (so `select()` skips it immediately) and arms the
+    /// cooldown so the prober will not auto-recover it before `until`. Honors a
+    /// `503` `Retry-After`. A later, longer cooldown extends the window; a
+    /// shorter one never shrinks a still-pending one.
+    pub fn mark_down_until(&self, until: Instant) {
+        self.healthy.store(false, Ordering::Relaxed);
+        let mut guard = self
+            .down_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(match *guard {
+            Some(existing) if existing > until => existing,
+            _ => until,
+        });
+    }
+
+    /// Whether a `Retry-After` cooldown is still in effect.
+    ///
+    /// Side effect: clears an elapsed deadline so it is only paid once. Called
+    /// off the hot path (only the prober), so the `Mutex` is fine — selection
+    /// stays a lock-free atomic load via `is_healthy()`, which reads `false`
+    /// for the whole cooldown because `mark_down_until` cleared the flag and
+    /// only a gated `record_success` (or a manual `mark_up`) can set it again.
+    pub fn in_cooldown(&self) -> bool {
+        let mut guard = self
+            .down_until
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match *guard {
+            Some(until) if Instant::now() < until => true,
+            Some(_) => {
+                *guard = None;
+                false
+            }
+            None => false,
+        }
     }
 
     fn record_failure(&self) -> u32 {
@@ -590,46 +642,118 @@ async fn probe_destination(
 
     let result = tokio::time::timeout(Duration::from_secs(5), receiver).await;
 
-    match result {
-        Ok(Ok(crate::uac::UacResult::Response(_))) => {
-            if !dest.is_healthy() {
-                info!(uri = %dest.uri, "destination recovered");
-            }
-            dest.record_success();
-        }
-        _ => {
-            let count = dest.record_failure();
-            debug!(
-                uri = %dest.uri,
-                failures = count,
-                "destination probe failed"
-            );
-            if count >= failure_threshold {
-                if dest.is_healthy() {
-                    warn!(uri = %dest.uri, "marking destination down after {count} failures");
-                }
-                dest.mark_down();
+    // A `Response(_)` means the peer answered; a timeout / transport error is a
+    // hard failure. The health verdict on a response is not "any answer = up":
+    // see `apply_probe_response`.
+    let response = match result {
+        Ok(Ok(crate::uac::UacResult::Response(response))) => Some(response),
+        _ => None,
+    };
+    apply_probe_response(dest, response.as_deref(), failure_threshold);
+}
 
-                // Re-resolve DNS to try a different IP on next probe
-                if let Some(ref address_str) = dest.address_str {
-                    use std::net::ToSocketAddrs;
-                    if let Ok(mut addrs) = address_str.to_socket_addrs() {
-                        let old = dest.address();
-                        // Pick a different address than the current one if available
-                        let new_addr = addrs.find(|a| *a != old)
-                            .or_else(|| address_str.to_socket_addrs().ok()?.next());
-                        if let Some(new_addr) = new_addr {
-                            if new_addr != old {
-                                info!(
-                                    uri = %dest.uri,
-                                    old = %old,
-                                    new = %new_addr,
-                                    "re-resolved destination to different IP"
-                                );
-                                dest.set_address(new_addr);
-                            }
-                        }
-                    }
+/// Update a destination's health from a completed probe.
+///
+/// `response` is `Some` when the peer answered, `None` on timeout / transport
+/// error. Split out from `probe_destination` (which owns the transport) so the
+/// health logic is unit-testable without a live UAC.
+///
+/// Health verdict on a response:
+/// - **`503 Service Unavailable`** (RFC 3261 §21.5.4) is NOT healthy. A `503`
+///   is an explicit "I am temporarily unable to serve this request", which is
+///   exactly what an overloaded Microsoft Teams Direct Routing datacenter
+///   returns (with `Retry-After`) to steer the SBC to the next datacenter. So a
+///   `503` counts as a probe failure, and a `Retry-After` on it pins the
+///   destination down for at least that cooldown.
+/// - **`500` / `502` / `504`** (and any other non-`503` response) still count
+///   as healthy: the peer answered, so it is reachable — it is erroring on this
+///   particular transaction, not shedding load, and OPTIONS is not a real call
+///   anyway. Only `503` carries the "stop sending me traffic" semantics.
+/// - Defensively, a `Retry-After` on ANY response also triggers the cooldown —
+///   a peer that says "retry later" should be believed regardless of code.
+fn apply_probe_response(
+    dest: &Destination,
+    response: Option<&crate::sip::message::SipMessage>,
+    failure_threshold: u32,
+) {
+    let Some(response) = response else {
+        record_probe_failure(dest, failure_threshold, None);
+        return;
+    };
+
+    let status = response.status_code().unwrap_or(0);
+    let cooldown = crate::sip::headers::retry_after::parse_retry_after(&response.headers);
+
+    if status == 503 || cooldown.is_some() {
+        record_probe_failure(dest, failure_threshold, cooldown);
+        return;
+    }
+
+    // Healthy answer. If a prior Retry-After cooldown is still pending, a good
+    // probe does not clear it early — the peer told us to wait.
+    if dest.in_cooldown() {
+        debug!(
+            uri = %dest.uri,
+            "probe answered but destination still in Retry-After cooldown"
+        );
+        return;
+    }
+    if !dest.is_healthy() {
+        info!(uri = %dest.uri, "destination recovered");
+    }
+    dest.record_success();
+}
+
+/// Record a probe failure and, past threshold (or on an explicit `Retry-After`
+/// cooldown), mark the destination down and try a different resolved IP next
+/// probe.
+fn record_probe_failure(dest: &Destination, failure_threshold: u32, cooldown: Option<Duration>) {
+    let count = dest.record_failure();
+    debug!(
+        uri = %dest.uri,
+        failures = count,
+        cooldown_secs = cooldown.map(|c| c.as_secs()),
+        "destination probe failed"
+    );
+
+    // A Retry-After is an explicit directive — honor it immediately, without
+    // waiting for the consecutive-failure threshold. Otherwise fall back to the
+    // usual threshold gate.
+    if cooldown.is_none() && count < failure_threshold {
+        return;
+    }
+
+    if dest.is_healthy() {
+        warn!(
+            uri = %dest.uri,
+            failures = count,
+            cooldown_secs = cooldown.map(|c| c.as_secs()),
+            "marking destination down"
+        );
+    }
+    match cooldown {
+        Some(cooldown) => dest.mark_down_until(Instant::now() + cooldown),
+        None => dest.mark_down(),
+    }
+
+    // Re-resolve DNS to try a different IP on next probe.
+    if let Some(ref address_str) = dest.address_str {
+        use std::net::ToSocketAddrs;
+        if let Ok(mut addrs) = address_str.to_socket_addrs() {
+            let old = dest.address();
+            // Pick a different address than the current one if available.
+            let new_addr = addrs
+                .find(|a| *a != old)
+                .or_else(|| address_str.to_socket_addrs().ok()?.next());
+            if let Some(new_addr) = new_addr {
+                if new_addr != old {
+                    info!(
+                        uri = %dest.uri,
+                        old = %old,
+                        new = %new_addr,
+                        "re-resolved destination to different IP"
+                    );
+                    dest.set_address(new_addr);
                 }
             }
         }
@@ -1705,5 +1829,132 @@ mod tests {
         group.all_destinations()[0].set_address("203.0.113.7:5060".parse().unwrap());
         group.refresh_member_ips();
         assert!(group.contains_source("203.0.113.7".parse().unwrap()));
+    }
+
+    // --- Probe health verdict (apply_probe_response) ---
+
+    fn make_response(status: u16, retry_after: Option<&str>) -> crate::sip::message::SipMessage {
+        use crate::sip::message::{SipMessage, StartLine, StatusLine, Version};
+        let mut headers = crate::sip::headers::SipHeaders::new();
+        if let Some(value) = retry_after {
+            headers.set("Retry-After", value.to_string());
+        }
+        SipMessage {
+            start_line: StartLine::Response(StatusLine {
+                version: Version::sip_2_0(),
+                status_code: status,
+                reason_phrase: "Test".to_string(),
+            }),
+            headers,
+            body: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn probe_200_keeps_healthy() {
+        let dest = make_dest("sip:gw1.example.com", 5060, 1, 1);
+        let response = make_response(200, None);
+        apply_probe_response(&dest, Some(&response), 3);
+        assert!(dest.is_healthy());
+    }
+
+    #[test]
+    fn probe_500_502_504_still_healthy() {
+        // An answering peer is reachable — only 503 sheds load.
+        for status in [500u16, 502, 504] {
+            let dest = make_dest("sip:gw1.example.com", 5060, 1, 1);
+            let response = make_response(status, None);
+            apply_probe_response(&dest, Some(&response), 3);
+            assert!(dest.is_healthy(), "status {status} should stay healthy");
+        }
+    }
+
+    #[test]
+    fn probe_503_without_retry_after_fails_and_marks_down_at_threshold() {
+        let dest = make_dest("sip:gw1.example.com", 5060, 1, 1);
+        // First two 503s: below threshold, not yet down.
+        apply_probe_response(&dest, Some(&make_response(503, None)), 3);
+        assert!(dest.is_healthy());
+        apply_probe_response(&dest, Some(&make_response(503, None)), 3);
+        assert!(dest.is_healthy());
+        // Third 503 reaches the threshold: down.
+        apply_probe_response(&dest, Some(&make_response(503, None)), 3);
+        assert!(!dest.is_healthy());
+    }
+
+    #[test]
+    fn probe_503_with_retry_after_marks_down_immediately_and_holds_cooldown() {
+        let dest = make_dest("sip:gw1.example.com", 5060, 1, 1);
+        // A single 503 + Retry-After marks down at once, without the threshold.
+        apply_probe_response(&dest, Some(&make_response(503, Some("30"))), 3);
+        assert!(!dest.is_healthy(), "503+Retry-After must mark down immediately");
+        assert!(dest.in_cooldown(), "cooldown must be armed");
+
+        // A healthy probe DURING the cooldown does not recover it.
+        apply_probe_response(&dest, Some(&make_response(200, None)), 3);
+        assert!(!dest.is_healthy(), "must stay down while cooling down");
+        assert!(dest.in_cooldown());
+    }
+
+    #[test]
+    fn cooldown_elapses_then_healthy_probe_recovers() {
+        let dest = make_dest("sip:gw1.example.com", 5060, 1, 1);
+        // Arm a very short cooldown directly (seconds granularity in the wire
+        // header would make this test slow).
+        dest.mark_down_until(Instant::now() + Duration::from_millis(40));
+        assert!(!dest.is_healthy());
+        assert!(dest.in_cooldown());
+
+        // Healthy probe while cooling: no recovery.
+        apply_probe_response(&dest, Some(&make_response(200, None)), 3);
+        assert!(!dest.is_healthy());
+
+        std::thread::sleep(Duration::from_millis(70));
+        assert!(!dest.in_cooldown(), "cooldown should have elapsed");
+
+        // Now a healthy probe recovers it.
+        apply_probe_response(&dest, Some(&make_response(200, None)), 3);
+        assert!(dest.is_healthy(), "should recover after cooldown elapses");
+    }
+
+    #[test]
+    fn retry_after_on_non_503_response_also_cools_down() {
+        // Defensive: believe an explicit Retry-After regardless of status code.
+        let dest = make_dest("sip:gw1.example.com", 5060, 1, 1);
+        apply_probe_response(&dest, Some(&make_response(486, Some("15"))), 3);
+        assert!(!dest.is_healthy());
+        assert!(dest.in_cooldown());
+    }
+
+    #[test]
+    fn probe_timeout_marks_down_at_threshold() {
+        let dest = make_dest("sip:gw1.example.com", 5060, 1, 1);
+        for _ in 0..3 {
+            apply_probe_response(&dest, None, 3);
+        }
+        assert!(!dest.is_healthy());
+    }
+
+    #[test]
+    fn mark_up_clears_cooldown() {
+        let dest = make_dest("sip:gw1.example.com", 5060, 1, 1);
+        dest.mark_down_until(Instant::now() + Duration::from_secs(60));
+        assert!(dest.in_cooldown());
+        dest.mark_up();
+        assert!(dest.is_healthy());
+        assert!(!dest.in_cooldown(), "operator mark_up clears the cooldown");
+    }
+
+    #[test]
+    fn mark_down_until_never_shrinks_pending_cooldown() {
+        let dest = make_dest("sip:gw1.example.com", 5060, 1, 1);
+        let long = Instant::now() + Duration::from_secs(120);
+        dest.mark_down_until(long);
+        // A shorter cooldown must not shorten the still-pending long one.
+        dest.mark_down_until(Instant::now() + Duration::from_secs(5));
+        assert!(dest.in_cooldown());
+        // Still down after the short window would have elapsed is implied by the
+        // long deadline; we just assert it is still cooling.
+        assert!(!dest.is_healthy());
     }
 }
