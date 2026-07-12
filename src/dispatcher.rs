@@ -4961,6 +4961,7 @@ fn build_siphon_rtp_backend(
     match crate::rtpengine::SiphonRtpClientSet::new(
         instance_tuples,
         siphon_rtp_config.control_secret.clone(),
+        siphon_rtp_config.play_timeout_ms,
         event_sender,
     ) {
         Ok(set) => {

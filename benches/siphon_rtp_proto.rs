@@ -52,6 +52,7 @@ fn offer_response() -> Response {
             duration_ms: None,
             to_tag: None,
             stats: None,
+            play_id: None,
         },
     }
 }

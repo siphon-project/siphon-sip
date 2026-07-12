@@ -6,6 +6,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Changed
+- **`rtpengine.play_media()` now blocks until the prompt finishes by default**
+  (`wait=True`), on the native `siphon-rtp` backend. `await rtpengine.play_media(...)`
+  returns only once the prompt has fully played out, so an IVR handler can
+  sequence `answer → play → echo` with no overlap; the coroutine parks while it
+  waits (no worker is held). Pass `wait=False` for fire-and-forget playback
+  (music-on-hold / background), which returns as soon as the engine accepts the
+  prompt. Backed by the new `Event::PlayFinished` completion event
+  (`siphon-rtp-proto` 0.1.2): the play accepts immediately with a `play_id` and
+  the engine reports completion asynchronously, correlated by `play_id`. A
+  configurable fallback (`media.siphon_rtp.play_timeout_ms`, default 5 min) caps
+  the wait so a lost event / dead engine can't hang the call. The rtpengine and
+  rtpproxy backends have no completion signal, so they ignore `wait` and return
+  on accept as before. Return value is now the actual played duration (or `None`
+  when the prompt was stopped / superseded before finishing, or the fallback
+  elapsed).
+
 ### Added
 - **`b2bua.terminate(call_id, reason="Normal Clearing") -> bool`** — imperative
   hangup of a B2BUA call by SIP Call-ID. Unlike `call.terminate()` (deferred

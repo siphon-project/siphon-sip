@@ -49,12 +49,14 @@ async fn spawn_fake_siphon_rtp() -> std::net::SocketAddr {
                                 duration_ms: None,
                                 to_tag: None,
                                 stats: None,
+                                play_id: None,
                             },
                             Command::Delete { .. } => CmdResult::Ok {
                                 sdp: None,
                                 duration_ms: None,
                                 to_tag: None,
                                 stats: None,
+                                play_id: None,
                             },
                             Command::Ping => CmdResult::Pong,
                             _ => CmdResult::Error {
@@ -104,7 +106,7 @@ const INVITE_WITH_SDP: &str = concat!(
 async fn media_backend_siphon_rtp_offer_rewrites_sdp() {
     let address = spawn_fake_siphon_rtp().await;
     let (event_tx, _event_rx) = mpsc::channel(16);
-    let set = SiphonRtpClientSet::new(vec![(address, 2000, 1)], None, event_tx).unwrap();
+    let set = SiphonRtpClientSet::new(vec![(address, 2000, 1)], None, 5_000, event_tx).unwrap();
     let backend = MediaBackend::SiphonRtp(set);
 
     // Confirm the abstraction reports the native backend's shape.
@@ -213,7 +215,7 @@ async fn smoke_test_against_real_siphon_rtp() {
     // --- Native JSON-over-TCP path: SiphonRtpClient → --control ---
     let control: SocketAddr = control_addr.parse().unwrap();
     let (event_tx, _event_rx) = mpsc::channel(16);
-    let client = SiphonRtpClient::new(control, None, 2000, event_tx);
+    let client = SiphonRtpClient::new(control, None, 2000, 5_000, event_tx);
     assert!(
         wait_until(|| async { client.ping().await.is_ok() }).await,
         "siphon-rtp control listener did not become ready"

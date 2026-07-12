@@ -21,6 +21,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use tracing::debug;
+
 use super::client::{PlayMediaSource, RtpEngineSet};
 use super::error::RtpEngineError;
 use super::profile::NgFlags;
@@ -79,6 +81,11 @@ impl MediaBackend {
     }
 
     /// Inject an audio prompt; returns the engine-reported duration in ms.
+    ///
+    /// `wait` (native siphon-rtp backend only) blocks until the prompt finishes
+    /// (`Event::PlayFinished`), so a script can sequence a following action after
+    /// it. The rtpengine / rtpproxy backends have no completion event, so they
+    /// ignore `wait` and return on accept (fire-and-forget) as before.
     #[allow(clippy::too_many_arguments)]
     pub async fn play_media(
         &self,
@@ -89,9 +96,13 @@ impl MediaBackend {
         start_pos_ms: Option<u64>,
         duration_ms: Option<u64>,
         to_tag: Option<&str>,
+        wait: bool,
     ) -> Result<Option<u64>, RtpEngineError> {
         match self {
             Self::RtpEngine(set) => {
+                if wait {
+                    debug!(call_id, "play_media(wait=True) ignored on rtpengine backend (no completion event); returning on accept");
+                }
                 set.play_media(
                     call_id,
                     from_tag,
@@ -113,10 +124,14 @@ impl MediaBackend {
                         start_pos_ms,
                         duration_ms,
                         to_tag,
+                        wait,
                     )
                     .await
             }
             Self::RtpProxy(client) => {
+                if wait {
+                    debug!(call_id, "play_media(wait=True) ignored on rtpproxy backend (no completion event); returning on accept");
+                }
                 client
                     .play_media(
                         call_id,
@@ -366,7 +381,7 @@ mod tests {
         // framed and sent, then no response arrived) — the reject arms below
         // return synchronously and never time out.
         let (event_tx, _event_rx) = mpsc::channel::<RtpEngineEvent>(16);
-        let set = SiphonRtpClientSet::new(vec![(dead_address(), 200, 1)], None, event_tx).unwrap();
+        let set = SiphonRtpClientSet::new(vec![(dead_address(), 200, 1)], None, 5_000, event_tx).unwrap();
         let backend = MediaBackend::SiphonRtp(set);
 
         let error = backend.echo("call-1", "tag-a", true).await.unwrap_err();
