@@ -493,6 +493,40 @@ fn b2bua_bye_from_b_leg_bridges_to_a_leg() {
 }
 
 // ---------------------------------------------------------------------------
+// B2BUA imperative terminate (b2bua.terminate) — UAS single-leg precondition
+// ---------------------------------------------------------------------------
+
+#[test]
+fn uas_single_leg_call_is_resolvable_by_sip_call_id_for_terminate() {
+    // A UAS-mode IVR/echo call (call.answer, no dial) has only an A-leg — no
+    // B-leg, no winner. b2bua.terminate(call_id) resolves the SIP Call-ID
+    // (which is what @rtpengine.on_dtmf carries) to the internal call, then
+    // BYEs every present leg; "both legs" degrades to just the A-leg here.
+    let store = CallActorStore::new();
+    let sip_call_id = "ivr-echo@test";
+    let call_id = store.create_call(make_a_leg(sip_call_id));
+
+    // The SIP Call-ID resolves to the internal call id.
+    assert_eq!(store.find_by_sip_call_id(sip_call_id), Some(call_id.clone()));
+
+    let call = store.get_call(&call_id).unwrap();
+    // Single-leg UAS call: no B-leg / winner.
+    assert!(call.winner.is_none());
+    assert!(call.b_legs.is_empty());
+    // The A-leg dialog carries the local_tag that the UAS 200 OK put in its To
+    // header (Change A), so a siphon-originated BYE's From-tag matches the
+    // caller's dialog. build_b2bua_bye reads exactly this local_tag +
+    // remote_tag, so both must be present for the BYE to be accepted (not 481).
+    assert!(!call.a_leg.dialog.local_tag.is_empty());
+    assert_eq!(call.a_leg.dialog.remote_tag.as_deref(), Some("alice-tag"));
+    drop(call);
+
+    // An unknown SIP Call-ID does not resolve — the imperative terminate returns
+    // false (clean no-op) for it.
+    assert!(store.find_by_sip_call_id("not-a-call@test").is_none());
+}
+
+// ---------------------------------------------------------------------------
 // B2BUA CANCEL: A-leg CANCEL → cancel B-legs
 // ---------------------------------------------------------------------------
 

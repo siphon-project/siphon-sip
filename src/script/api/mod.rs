@@ -7,6 +7,7 @@
 //! write into; the Rust engine reads it after script execution.
 
 pub mod auth;
+pub mod b2bua;
 pub mod cache;
 pub mod call;
 pub mod cdr;
@@ -125,6 +126,10 @@ static ISC_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 static SBI_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 static TIMER_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
+
+/// Stateless imperative B2BUA control singleton (`b2bua._control`) — always
+/// available, backs `b2bua.terminate()`.
+static B2BUA_CONTROL_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 static SUBSCRIBE_STATE_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
@@ -395,6 +400,18 @@ pub fn set_sdp_singleton(python: Python<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Store the B2BUA control singleton for injection as `b2bua._control`.
+///
+/// Always called at startup — stateless, reaches the dispatcher via a global
+/// handle; `b2bua.terminate()` returns False before the dispatcher is running.
+pub fn set_b2bua_control_singleton(python: Python<'_>) -> Result<()> {
+    let control_py: Py<PyAny> = Py::new(python, b2bua::PyB2buaControl::new())
+        .map_err(|error| SiphonError::Script(format!("Py::new(b2bua control): {error}")))?
+        .into_any();
+    let _ = B2BUA_CONTROL_SINGLETON.set(control_py);
+    Ok(())
+}
+
 /// Store the QoS namespace singleton for injection into the siphon module.
 ///
 /// Always available — stateless SDP→IPFilterRule helper, no config needed.
@@ -638,6 +655,19 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
             .map_err(|error| {
                 SiphonError::Script(format!("setattr proxy.subscribe_state: {error}"))
             })?;
+    }
+
+    // Inject the imperative B2BUA control onto the b2bua namespace as
+    // `_control` (mirrors `proxy._utils`).  Always available — the pure-Python
+    // `_B2buaNamespace.terminate` forwards to it; unconditional so a script that
+    // imported `b2bua` before the singleton was wired still resolves it.
+    if let Some(b2bua_control_py) = B2BUA_CONTROL_SINGLETON.get() {
+        let b2bua_ns = module
+            .getattr("b2bua")
+            .map_err(|error| SiphonError::Script(format!("getattr b2bua: {error}")))?;
+        b2bua_ns
+            .setattr("_control", b2bua_control_py.bind(python))
+            .map_err(|error| SiphonError::Script(format!("setattr b2bua._control: {error}")))?;
     }
 
     // Inject optional RTPEngine singleton (only when media.rtpengine is configured).
