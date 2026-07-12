@@ -72,16 +72,11 @@ pub enum CallAction {
     AcceptRefer,
     /// Reject a REFER with a status code.
     RejectRefer { code: u16, reason: String },
-    /// UAS-mode answer — siphon sends the final response to the A-leg
-    /// INVITE directly instead of bridging to a B-leg.  ``code`` must
-    /// be 2xx.  ``body`` is an optional answer body (SDP for audio,
-    /// could also be XML for future simservs-Ut responses).
-    Answer {
-        code: u16,
-        reason: String,
-        body: Option<Vec<u8>>,
-        content_type: Option<String>,
-    },
+    /// UAS-mode answer already sent imperatively by `call.answer()` — the final
+    /// 2xx went on the wire during the handler (see `dispatcher::b2bua_answer_call`).
+    /// This marker only tells the dispatcher the call was answered so it keeps
+    /// the actor alive instead of removing it as a silent (no-action) drop.
+    Answered,
 }
 
 /// Which side initiated a BYE.
@@ -327,6 +322,17 @@ impl PyCall {
     /// Get the underlying SIP message.
     pub fn message(&self) -> Arc<Mutex<SipMessage>> {
         Arc::clone(&self.message)
+    }
+
+    /// Lock and clone the A-leg INVITE — the source for an imperative
+    /// `answer()` / `progress()` UAS response. The dispatcher can't read the
+    /// INVITE off the actor during `on_invite` (it's stored only after the
+    /// handler returns), so the `PyCall` supplies it.
+    fn locked_invite(&self) -> PyResult<SipMessage> {
+        let guard = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        Ok(guard.clone())
     }
 
     /// Update the call state (called by the B2BUA core).
@@ -861,8 +867,25 @@ impl PyCall {
     }
 
     /// UAS-mode answer — send a final 2xx response to the A-leg INVITE
-    /// directly instead of bridging to a B-leg.  Useful for MRF /
-    /// announcement servers that own the dialog themselves.
+    /// **immediately**, instead of bridging to a B-leg. Useful for MRF /
+    /// announcement / echo / IVR servers that own the dialog themselves.
+    ///
+    /// The response goes on the wire the moment this is called (not deferred to
+    /// when the handler returns), so an `async` handler can answer and then keep
+    /// working — e.g. play a prompt to completion before starting echo —
+    /// without delaying the 200 OK:
+    ///
+    /// ```python,ignore
+    /// @b2bua.on_invite
+    /// async def on_invite(call):
+    ///     await rtpengine.offer(call, profile="ivr")
+    ///     call.answer(200, "OK", body=call.body, content_type="application/sdp")
+    ///     await rtpengine.play_media(call, file=prompt)   # 200 already sent
+    ///     await rtpengine.echo(call)
+    /// ```
+    ///
+    /// Synchronous — no `await` needed (the send is a queue push). The A-leg
+    /// dialog is confirmed and `@b2bua.on_bye` takes over when the UAC BYEs.
     ///
     /// Args:
     ///     code: Final response status (must be 2xx).
@@ -888,12 +911,60 @@ impl PyCall {
             None => None,
         };
 
-        self.action = CallAction::Answer {
-            code,
-            reason: reason.to_string(),
-            body: body_bytes,
-            content_type: content_type.map(|s| s.to_string()),
+        let invite = self.locked_invite()?;
+        let sent = crate::dispatcher::b2bua_answer_call(
+            &self.id, &invite, code, reason, body_bytes, content_type,
+        );
+        if !sent {
+            tracing::error!(call_id = %self.id, "call.answer(): no live B2BUA call to answer");
+        }
+        // Marker so the dispatcher keeps the actor alive after the handler
+        // returns (the 2xx has already been sent by b2bua_answer_call).
+        self.action = CallAction::Answered;
+        Ok(())
+    }
+
+    /// UAS-mode provisional — send a 1xx response to the A-leg INVITE
+    /// **immediately** (e.g. a ``183 Session Progress`` with early-media SDP, or
+    /// ``180 Ringing``). Does not answer the call: the handler must still
+    /// ``answer()`` / ``dial()`` / ``reject()`` to reach a final response.
+    ///
+    /// Like ``answer()``, the response goes on the wire the moment this is
+    /// called, so a script can send ringback / an announcement as early media
+    /// and then ``answer()`` later. An 18x with SDP opens an early dialog and
+    /// carries the same UAS To-tag ``answer()`` will use.
+    ///
+    /// Args:
+    ///     code: Provisional status (must be 1xx; 100 sends no To-tag).
+    ///     reason: Reason phrase (e.g. ``"Session Progress"``).
+    ///     body: Optional response body (``bytes`` or ``str``) — early-media SDP.
+    ///     content_type: Content-Type for the body (e.g. ``"application/sdp"``).
+    #[pyo3(signature = (code, reason="Ringing", body=None, content_type=None))]
+    fn progress(
+        &mut self,
+        code: u16,
+        reason: &str,
+        body: Option<&Bound<'_, PyAny>>,
+        content_type: Option<&str>,
+    ) -> PyResult<()> {
+        if !(100..200).contains(&code) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "call.progress() requires a 1xx status code (got {code}); use call.answer() for the final response"
+            )));
+        }
+
+        let body_bytes = match body {
+            Some(obj) => Some(super::request::extract_body_bytes(obj)?),
+            None => None,
         };
+
+        let invite = self.locked_invite()?;
+        let sent = crate::dispatcher::b2bua_progress_call(
+            &self.id, &invite, code, reason, body_bytes, content_type,
+        );
+        if !sent {
+            tracing::error!(call_id = %self.id, "call.progress(): no live B2BUA call");
+        }
         Ok(())
     }
 

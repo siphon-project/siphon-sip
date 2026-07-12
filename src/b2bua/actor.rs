@@ -582,6 +582,11 @@ pub struct CallActor {
     pub created_at: std::time::Instant,
     /// Original A-leg INVITE message (for script handler reconstruction).
     pub a_leg_invite: Option<Arc<Mutex<SipMessage>>>,
+    /// Local (listener) address the A-leg INVITE arrived on. Captured at INVITE
+    /// so an imperative `call.answer()` / `call.progress()` sends the UAS
+    /// response back out the same listener (source-socket parity with the
+    /// inbound-driven send path on a multi-homed host).
+    pub a_leg_local_addr: Option<std::net::SocketAddr>,
     /// RFC 4028 session timer state (set after 200 OK negotiation).
     pub session_timer: Option<SessionTimerState>,
     /// Per-call session timer override from Python script.
@@ -664,6 +669,7 @@ impl CallActor {
             winner: None,
             created_at: std::time::Instant::now(),
             a_leg_invite: None,
+            a_leg_local_addr: None,
             session_timer: None,
             session_timer_override: None,
             transfer: None,
