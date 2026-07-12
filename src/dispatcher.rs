@@ -8300,6 +8300,10 @@ fn handle_b2bua_invite(
         // call's life) so the reliable-1xx strip gate can't be defeated by the
         // script mutating the shared INVITE for B-leg header shaping.
         call.a_leg_supports_100rel = a_leg_supports_100rel;
+        // Listener the INVITE arrived on, so an imperative call.answer() /
+        // call.progress() (which has no `inbound` in scope) sends the UAS
+        // response back out the same socket.
+        call.a_leg_local_addr = Some(inbound.local_addr);
     }
     state.call_event_receivers.insert(call_id.clone(), event_rx);
 
@@ -8535,46 +8539,13 @@ fn handle_b2bua_invite(
         CallAction::RejectRefer { code, reason } => {
             debug!(call_id = %call_id, code, reason = %reason, "B2BUA: RejectRefer during INVITE (no-op)");
         }
-        CallAction::Answer { code, reason, body, content_type } => {
-            debug!(call_id = %call_id, code, "B2BUA: UAS-mode answer");
-            // RFC 3261 §12.1.1: a 2xx to a dialog-creating INVITE MUST carry a
-            // To-tag, and for a UAS-mode B2BUA answer it must be the A-leg
-            // dialog's local_tag — otherwise a later siphon-originated in-dialog
-            // BYE (b2bua.terminate / session-timer expiry) carries a From-tag the
-            // caller never saw and is 481-rejected. build_response copies the
-            // INVITE's tagless To verbatim, so inject the tag here.
-            let mut reply_headers: Vec<(crate::script::api::request::ReplyHeaderOp, String, String)> =
-                Vec::new();
-            if (200..300).contains(&code) {
-                if let Some(to_value) = message_guard.headers.to() {
-                    if !to_value.contains(";tag=") {
-                        if let Some(local_tag) = state
-                            .call_actors
-                            .get_call(&call_id)
-                            .map(|call| call.a_leg.dialog.local_tag.clone())
-                        {
-                            reply_headers.push((
-                                crate::script::api::request::ReplyHeaderOp::Replace,
-                                "To".to_string(),
-                                crate::b2bua::actor::ensure_tag(to_value, Some(&local_tag)),
-                            ));
-                        }
-                    }
-                }
-            }
-            let mut response = build_response(
-                &message_guard, code, &reason, state.server_header.as_deref(), &reply_headers,
-            );
-            if let Some(body_bytes) = body {
-                if let Some(ct) = content_type {
-                    response.headers.set("Content-Type", ct);
-                }
-                response.headers.set("Content-Length", body_bytes.len().to_string());
-                response.body = body_bytes;
-            }
-            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
-            // Actor stays alive — the A-leg dialog is now confirmed and the
-            // @b2bua.on_bye handler takes over when the UAC BYEs.
+        CallAction::Answered => {
+            // The script called call.answer() imperatively — the 2xx has already
+            // been sent (see b2bua_answer_call). This marker only tells the
+            // dispatcher the actor was answered so the CallAction::None arm above
+            // doesn't remove_call() it as a silent drop. The A-leg dialog is
+            // confirmed and @b2bua.on_bye takes over when the UAC BYEs.
+            debug!(call_id = %call_id, "B2BUA: UAS-mode answer already sent (imperative)");
         }
     }
 }
@@ -12038,6 +12009,114 @@ pub fn b2bua_terminate_call(sip_call_id: &str, reason: Option<&str>) -> bool {
     )
 }
 
+/// Build and send a UAS response (final 2xx or provisional 1xx) for a B2BUA call
+/// from an imperative `call.answer()` / `call.progress()`.
+///
+/// Unlike the bridged path, the script owns the A-leg dialog and answers it
+/// directly. The response is built from `invite` (the A-leg INVITE, passed from
+/// the `PyCall` because `a_leg_invite` isn't stored on the actor until after the
+/// handler returns) and sent out the listener the INVITE arrived on. For any
+/// code > 100 the To header is tagged with the A-leg dialog's `local_tag`
+/// (RFC 3261 §12.1.1 — a dialog-creating 2xx and an early-dialog 18x both need
+/// it, and it's what makes a later siphon-originated in-dialog BYE match the
+/// caller instead of being 481-rejected).
+///
+/// `final_response` marks the call `Answered` and stamps the CDR answer time.
+/// Returns `false` (never panics) if the call is gone or the dispatcher isn't
+/// running.
+fn b2bua_send_uas_response(
+    internal_call_id: &str,
+    invite: &SipMessage,
+    code: u16,
+    reason: &str,
+    body: Option<Vec<u8>>,
+    content_type: Option<&str>,
+    final_response: bool,
+) -> bool {
+    let Some(control) = B2BUA_CONTROL.get() else {
+        return false;
+    };
+    let state = &control.state;
+    let (transport, remote_addr, connection_id, local_addr, local_tag) =
+        match state.call_actors.get_call(internal_call_id) {
+            Some(call) => (
+                call.a_leg.transport.transport,
+                call.a_leg.transport.remote_addr,
+                call.a_leg.transport.connection_id,
+                call.a_leg_local_addr,
+                call.a_leg.dialog.local_tag.clone(),
+            ),
+            None => return false,
+        };
+    // The send path may spawn (TCP/TLS connect) and the caller may be on a
+    // non-tokio thread (async-pool asyncio loop), so establish the runtime.
+    let _enter = control.runtime.enter();
+
+    // RFC 3261 §12.1.1: tag the To header with the A-leg dialog local_tag for any
+    // dialog-establishing response (2xx) or early-dialog provisional (18x).
+    let mut reply_headers: Vec<(crate::script::api::request::ReplyHeaderOp, String, String)> =
+        Vec::new();
+    if code > 100 {
+        if let Some(to_value) = invite.headers.to() {
+            if !to_value.contains(";tag=") {
+                reply_headers.push((
+                    crate::script::api::request::ReplyHeaderOp::Replace,
+                    "To".to_string(),
+                    crate::b2bua::actor::ensure_tag(to_value, Some(&local_tag)),
+                ));
+            }
+        }
+    }
+
+    let mut response =
+        build_response(invite, code, reason, state.server_header.as_deref(), &reply_headers);
+    if let Some(body_bytes) = body {
+        if let Some(ct) = content_type {
+            response.headers.set("Content-Type", ct.to_string());
+        }
+        response.headers.set("Content-Length", body_bytes.len().to_string());
+        response.body = body_bytes;
+    }
+    send_message_from(response, transport, remote_addr, connection_id, local_addr, state);
+
+    if final_response {
+        // Confirm the A-leg dialog and mark the CDR answered (tracked at INVITE
+        // by cdr_track_b2bua_start) so a later BYE/terminate CDR shows duration.
+        state.call_actors.set_state(internal_call_id, CallState::Answered);
+        if crate::cdr::auto_emit_enabled() {
+            cdr_mark_answer(state, internal_call_id, code);
+        }
+    }
+    true
+}
+
+/// Imperatively send the final 2xx for a UAS-mode B2BUA call (`call.answer()`).
+/// `code` must be 2xx. Returns `false` if the call is gone / dispatcher down.
+pub fn b2bua_answer_call(
+    internal_call_id: &str,
+    invite: &SipMessage,
+    code: u16,
+    reason: &str,
+    body: Option<Vec<u8>>,
+    content_type: Option<&str>,
+) -> bool {
+    b2bua_send_uas_response(internal_call_id, invite, code, reason, body, content_type, true)
+}
+
+/// Imperatively send a provisional (1xx) for a UAS-mode B2BUA call
+/// (`call.progress()`) — e.g. a 183 with early-media SDP. Does not answer the
+/// call. Returns `false` if the call is gone / dispatcher down.
+pub fn b2bua_progress_call(
+    internal_call_id: &str,
+    invite: &SipMessage,
+    code: u16,
+    reason: &str,
+    body: Option<Vec<u8>>,
+    content_type: Option<&str>,
+) -> bool {
+    b2bua_send_uas_response(internal_call_id, invite, code, reason, body, content_type, false)
+}
+
 /// Arm the RFC 3262 §3 retransmit task for a reliable provisional response.
 ///
 /// Stores a [`ReliableProvisional`] entry in the dispatcher state under
@@ -13264,6 +13343,27 @@ mod tests {
             "does-not-exist@nowhere",
             Some("Normal Clearing")
         ));
+    }
+
+    #[test]
+    fn b2bua_answer_and_progress_unknown_id_is_false_no_panic() {
+        // Imperative call.answer()/progress() against an unknown call (and no
+        // running dispatcher in the test binary) is a clean no-op — returns
+        // false, never panics.
+        let raw = concat!(
+            "INVITE sip:echo@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK1\r\n",
+            "From: <sip:alice@example.com>;tag=a\r\n",
+            "To: <sip:echo@example.com>\r\n",
+            "Call-ID: unknown-ivr@example.com\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        let invite = parse_sip_message(raw).expect("test fixture must parse").1;
+        assert!(!b2bua_answer_call("nope", &invite, 200, "OK", None, None));
+        assert!(!b2bua_progress_call("nope", &invite, 183, "Session Progress", None, None));
     }
 
     /// Save a stream P-CSCF cache binding directly against a bare `Registrar`,

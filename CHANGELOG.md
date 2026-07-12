@@ -19,6 +19,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   unknown or already gone, so an IVR racing a caller-initiated BYE is a clean
   no-op. The BYE carries an RFC 3326 `Reason: Q.850;cause=16` header with the
   supplied text.
+- **`call.progress(code, reason, body=None, content_type=None)`** — imperative
+  UAS provisional (18x) for a B2BUA call: send a `183 Session Progress` with
+  early-media SDP, or a `180 Ringing`, immediately from a handler, without
+  answering the call. An 18x with SDP opens an early dialog and carries the same
+  UAS To-tag `call.answer()` uses. The handler must still `answer()` / `dial()` /
+  `reject()` for a final response.
+
+### Changed
+- **`call.answer()` now sends the final 2xx immediately** instead of deferring it
+  to when the handler returns. This lets an `async` `@b2bua.on_invite` answer and
+  then keep working — e.g. `await rtpengine.play_media(...)` a prompt to
+  completion, then `await rtpengine.echo(...)` — without the awaited media
+  delaying the 200 OK (the old deferred behavior held the answer until the whole
+  coroutine finished, so a prompt played *before* the caller was answered). The
+  method stays synchronous (no `await`), and the answer is confirmed with the
+  A-leg dialog To-tag as before. Existing answer-then-return scripts are
+  unaffected; there is no separate `answer_now()`.
 
 ### Fixed
 - **UAS-mode `call.answer()` now emits a To-tag** (RFC 3261 §12.1.1). A B2BUA

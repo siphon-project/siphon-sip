@@ -526,6 +526,36 @@ fn uas_single_leg_call_is_resolvable_by_sip_call_id_for_terminate() {
     assert!(store.find_by_sip_call_id("not-a-call@test").is_none());
 }
 
+#[test]
+fn uas_imperative_answer_marks_answered_and_keeps_actor_alive() {
+    // call.answer() sends the 2xx imperatively then marks the call Answered via
+    // CallAction::Answered so the dispatcher keeps the actor alive (instead of
+    // removing it as a no-action silent drop). Model that at the store level:
+    // set_state(Answered) leaves the actor resolvable, and the A-leg dialog
+    // carries the local_tag the 2xx To header is stamped with.
+    let store = CallActorStore::new();
+    let sip_call_id = "ivr-answer@test";
+    let call_id = store.create_call(make_a_leg(sip_call_id));
+
+    let local_tag = {
+        let call = store.get_call(&call_id).unwrap();
+        assert_eq!(call.state, CallState::Calling);
+        assert!(!call.a_leg.dialog.local_tag.is_empty());
+        call.a_leg.dialog.local_tag.clone()
+    };
+
+    store.set_state(&call_id, CallState::Answered);
+
+    let call = store.get_call(&call_id).unwrap();
+    assert_eq!(call.state, CallState::Answered);
+    // Still a single-leg UAS call; the actor persists so @b2bua.on_bye /
+    // b2bua.terminate can reach it, and the dialog tag is stable.
+    assert!(call.winner.is_none());
+    assert_eq!(call.a_leg.dialog.local_tag, local_tag);
+    drop(call);
+    assert_eq!(store.count(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // B2BUA CANCEL: A-leg CANCEL → cancel B-legs
 // ---------------------------------------------------------------------------

@@ -226,8 +226,13 @@ class Call:
     def answer(self, code: int, reason: str,
                body: Union[str, bytes, None] = None,
                content_type: str | None = None) -> None:
-        """UAS-mode answer — send a final 2xx response to the inbound
-        INVITE directly, without bridging to a B-leg.
+        """UAS-mode answer — send a final 2xx response to the inbound INVITE
+        **immediately**, without bridging to a B-leg.
+
+        The response goes on the wire the moment this is called (not deferred to
+        when the handler returns), so an ``async`` handler can answer and then
+        keep working — e.g. play a prompt to completion before starting echo —
+        without delaying the 200 OK. Synchronous; no ``await`` needed.
 
         Args:
             code: Final 2xx status code (200, 202, etc.).
@@ -237,7 +242,12 @@ class Call:
 
         Example::
 
-            call.answer(200, "OK", body=sdp_bytes, content_type="application/sdp")
+            @b2bua.on_invite
+            async def on_invite(call):
+                await rtpengine.offer(call, profile="ivr")
+                call.answer(200, "OK", body=call.body, content_type="application/sdp")
+                await rtpengine.play_media(call, file=prompt)   # 200 already sent
+                await rtpengine.echo(call)
         """
         if not 200 <= code < 300:
             raise ValueError(
@@ -249,6 +259,38 @@ class Call:
         self._state = "answered"
         self._actions.append(Action(
             kind="answer",
+            status_code=code,
+            reason=reason,
+            extras={"body": body, "content_type": content_type},
+        ))
+
+    def progress(self, code: int, reason: str = "Ringing",
+                 body: Union[str, bytes, None] = None,
+                 content_type: str | None = None) -> None:
+        """UAS-mode provisional — send a 1xx response to the inbound INVITE
+        **immediately** (e.g. ``183 Session Progress`` with early-media SDP, or
+        ``180 Ringing``). Does not answer the call: the handler must still
+        ``answer()`` / ``dial()`` / ``reject()`` for a final response.
+
+        Args:
+            code: Provisional status code (must be 1xx; 100 carries no To-tag).
+            reason: Reason phrase.
+            body: Optional response body (``bytes`` or ``str``) — early-media SDP.
+            content_type: Content-Type for the body (e.g. ``"application/sdp"``).
+
+        Example::
+
+            call.progress(183, "Session Progress", body=sdp, content_type="application/sdp")
+        """
+        if not 100 <= code < 200:
+            raise ValueError(
+                f"call.progress() requires a 1xx status code (got {code}); "
+                f"use call.answer() for the final response"
+            )
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self._actions.append(Action(
+            kind="progress",
             status_code=code,
             reason=reason,
             extras={"body": body, "content_type": content_type},
