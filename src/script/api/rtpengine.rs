@@ -392,11 +392,21 @@ impl PyRtpEngine {
     ///     start_ms: Offset into the file at which to start (milliseconds).
     ///     duration_ms: Cap on playback length (milliseconds).
     ///     to_tag: Optional peer tag for MPTY scoping.
+    ///     wait: When ``True`` (default), block until the prompt finishes playing
+    ///           (``await`` returns only once it has drained), so a script can
+    ///           sequence a following action — e.g. ``echo()`` — after it with no
+    ///           overlap. The coroutine parks while it waits (no worker is held).
+    ///           ``wait=False`` returns as soon as the engine accepts the prompt
+    ///           (fire-and-forget — music-on-hold / background). Native
+    ///           ``siphon-rtp`` backend only; the rtpengine / rtpproxy backends
+    ///           have no completion signal and always return on accept.
     ///
     /// Returns:
-    ///     The prompt duration in milliseconds if rtpengine reports one,
-    ///     else ``None``.
-    #[pyo3(signature = (target, file=None, blob=None, db_id=None, repeat=None, start_ms=None, duration_ms=None, to_tag=None))]
+    ///     The played duration in milliseconds if the engine reports one, else
+    ///     ``None`` (also ``None`` when the prompt was stopped / superseded before
+    ///     it finished, or the fallback timeout elapsed).
+    #[pyo3(signature = (target, file=None, blob=None, db_id=None, repeat=None, start_ms=None, duration_ms=None, to_tag=None, wait=true))]
+    #[allow(clippy::too_many_arguments)]
     fn play_media<'py>(
         &self,
         python: Python<'py>,
@@ -408,6 +418,7 @@ impl PyRtpEngine {
         start_ms: Option<u64>,
         duration_ms: Option<u64>,
         to_tag: Option<String>,
+        wait: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let source = resolve_play_media_source(file, blob, db_id)?;
 
@@ -426,6 +437,7 @@ impl PyRtpEngine {
                     start_ms,
                     duration_ms,
                     to_tag.as_deref(),
+                    wait,
                 )
                 .await
                 .map_err(|error| {

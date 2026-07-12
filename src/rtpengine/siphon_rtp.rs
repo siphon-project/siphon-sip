@@ -28,8 +28,8 @@ use std::time::Duration;
 use dashmap::DashMap;
 use futures_util::future::join_all;
 use siphon_rtp_proto::{
-    frame, CmdResult, Command, Event, PlayMediaSource as ProtoPlayMediaSource, ProfileFlags,
-    Request, Response,
+    frame, CmdResult, Command, Event, PlayEndReason, PlayMediaSource as ProtoPlayMediaSource,
+    ProfileFlags, Request, Response,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -83,16 +83,27 @@ fn proto_play_source(source: &PlayMediaSource) -> ProtoPlayMediaSource {
     }
 }
 
+/// Completion signal for a blocking `play_media(wait=True)`: how the prompt ended
+/// plus the actual played duration (from `Event::PlayFinished`).
+type PlayWaiter = oneshot::Sender<(PlayEndReason, Option<u64>)>;
+
 /// Native JSON-over-TCP control client for `siphon-rtp`.
 pub struct SiphonRtpClient {
     /// Control endpoint (`siphon-rtp --control <addr>`).
     address: SocketAddr,
     /// Per-request response timeout.
     timeout_ms: u64,
+    /// Fallback cap for a blocking `play_media(wait=True)` — how long to wait for
+    /// the `Event::PlayFinished` before giving up (a prompt can be much longer
+    /// than a control request, so this is separate from `timeout_ms`).
+    play_timeout_ms: u64,
     /// Monotonic request id allocator (starts at 1; 0 is reserved for auth).
     next_id: AtomicU64,
     /// In-flight requests awaiting a response, keyed by request id.
     pending: Arc<DashMap<u64, oneshot::Sender<CmdResult>>>,
+    /// Blocking `play_media` waiters keyed by the accept's `play_id`; resolved by
+    /// the reader when the matching `Event::PlayFinished` arrives.
+    play_pending: Arc<DashMap<u64, PlayWaiter>>,
     /// Write half of the live connection, swapped by the connection manager on
     /// (re)connect and cleared (`None`) while disconnected.
     writer: Arc<Mutex<Option<OwnedWriteHalf>>>,
@@ -122,9 +133,12 @@ impl SiphonRtpClient {
         address: SocketAddr,
         control_secret: Option<String>,
         timeout_ms: u64,
+        play_timeout_ms: u64,
         event_tx: mpsc::Sender<RtpEngineEvent>,
     ) -> Arc<Self> {
         let pending: Arc<DashMap<u64, oneshot::Sender<CmdResult>>> = Arc::new(DashMap::new());
+        let play_pending: Arc<DashMap<u64, PlayWaiter>> =
+            Arc::new(DashMap::new());
         let writer: Arc<Mutex<Option<OwnedWriteHalf>>> = Arc::new(Mutex::new(None));
         let (connected_tx, connected_rx) = watch::channel(false);
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
@@ -134,6 +148,7 @@ impl SiphonRtpClient {
             control_secret,
             timeout_ms,
             Arc::clone(&pending),
+            Arc::clone(&play_pending),
             Arc::clone(&writer),
             connected_tx,
             event_tx,
@@ -143,8 +158,10 @@ impl SiphonRtpClient {
         Arc::new(Self {
             address,
             timeout_ms,
+            play_timeout_ms,
             next_id: AtomicU64::new(1),
             pending,
+            play_pending,
             writer,
             connected: connected_rx,
             sessions: DashMap::new(),
@@ -283,6 +300,7 @@ impl SiphonRtpClient {
 
     /// Inject an audio prompt; returns the engine-reported duration in ms.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn play_media(
         &self,
         call_id: &str,
@@ -292,6 +310,7 @@ impl SiphonRtpClient {
         start_pos_ms: Option<u64>,
         duration_ms: Option<u64>,
         to_tag: Option<&str>,
+        wait: bool,
     ) -> Result<Option<u64>, RtpEngineError> {
         let result = self
             .request(Command::PlayMedia {
@@ -304,9 +323,57 @@ impl SiphonRtpClient {
                 to_tag: to_tag.map(str::to_string),
             })
             .await?;
-        match result {
-            CmdResult::Ok { duration_ms, .. } => Ok(duration_ms),
-            other => Err(unexpected_result("play media", other)),
+        // The accept is immediate (proto ≥0.1.2) and carries the play_id the
+        // eventual Event::PlayFinished will echo.
+        let (play_id, accept_duration) = match result {
+            CmdResult::Ok {
+                play_id,
+                duration_ms,
+                ..
+            } => (play_id, duration_ms),
+            other => return Err(unexpected_result("play media", other)),
+        };
+
+        // Fire-and-forget, or an engine that didn't assign a play_id: return on
+        // accept, exactly as before.
+        let (true, Some(play_id)) = (wait, play_id) else {
+            return Ok(accept_duration);
+        };
+
+        // Block until the prompt ends. Register the waiter keyed by play_id (the
+        // reader resolves it when PlayFinished arrives), bounded by the fallback
+        // timeout so a lost event / dead engine can't hang the call. There is a
+        // sub-millisecond race where PlayFinished could arrive before this insert
+        // (vs a seconds-long prompt) — the fallback covers that pathological case.
+        let (sender, receiver) = oneshot::channel::<(PlayEndReason, Option<u64>)>();
+        self.play_pending.insert(play_id, sender);
+        let deadline = Duration::from_millis(self.play_timeout_ms.max(1));
+        match tokio::time::timeout(deadline, receiver).await {
+            // Prompt played out in full.
+            Ok(Ok((PlayEndReason::Completed, played_ms))) => Ok(played_ms.or(accept_duration)),
+            // Ended early (stopped / superseded) — didn't play out; the script decides.
+            Ok(Ok((PlayEndReason::Stopped | PlayEndReason::Superseded, _))) => Ok(None),
+            // Engine reported an aborted playback.
+            Ok(Ok((PlayEndReason::Error, _))) => {
+                warn!(call_id, play_id, "siphon-rtp play_media aborted (engine error)");
+                Ok(None)
+            }
+            // Connection dropped (sender cleared on disconnect) — treat as not completed.
+            Ok(Err(_)) => {
+                warn!(call_id, play_id, "siphon-rtp play_media: connection lost before completion");
+                Ok(None)
+            }
+            // Fallback timeout — no PlayFinished within play_timeout_ms.
+            Err(_) => {
+                self.play_pending.remove(&play_id);
+                warn!(
+                    call_id,
+                    play_id,
+                    timeout_ms = self.play_timeout_ms,
+                    "siphon-rtp play_media: no completion within fallback timeout"
+                );
+                Ok(None)
+            }
         }
     }
 
@@ -577,6 +644,7 @@ impl SiphonRtpClientSet {
     pub fn new(
         instances: Vec<(SocketAddr, u64, u32)>,
         control_secret: Option<String>,
+        play_timeout_ms: u64,
         event_tx: mpsc::Sender<RtpEngineEvent>,
     ) -> Result<Arc<Self>, RtpEngineError> {
         if instances.is_empty() {
@@ -593,6 +661,7 @@ impl SiphonRtpClientSet {
                 *address,
                 control_secret.clone(),
                 *timeout_ms,
+                play_timeout_ms,
                 event_tx.clone(),
             ));
             running_total += weight;
@@ -689,6 +758,7 @@ impl SiphonRtpClientSet {
         start_pos_ms: Option<u64>,
         duration_ms: Option<u64>,
         to_tag: Option<&str>,
+        wait: bool,
     ) -> Result<Option<u64>, RtpEngineError> {
         self.select(call_id)
             .play_media(
@@ -699,6 +769,7 @@ impl SiphonRtpClientSet {
                 start_pos_ms,
                 duration_ms,
                 to_tag,
+                wait,
             )
             .await
     }
@@ -945,6 +1016,16 @@ fn convert_event(event: Event) -> RtpEngineEvent {
             call_id: call_id.or(conference_id),
             from_tag: Some(from_tag),
         },
+        // Intercepted by route_frame before it reaches here (resolves a blocking
+        // play_media). Mapped defensively so the match stays exhaustive and
+        // non-panicking if that ordering ever changes.
+        Event::PlayFinished {
+            call_id, from_tag, ..
+        } => RtpEngineEvent::Unknown {
+            event: "play_finished".to_string(),
+            call_id: Some(call_id),
+            from_tag: Some(from_tag),
+        },
         Event::Unknown => RtpEngineEvent::Unknown {
             event: "unknown".to_string(),
             call_id: None,
@@ -955,11 +1036,13 @@ fn convert_event(event: Event) -> RtpEngineEvent {
 
 /// Background task: maintain the control connection, route responses/events, and
 /// reconnect (with backoff + re-auth) until the client is dropped.
+#[allow(clippy::too_many_arguments)]
 async fn connection_manager(
     address: SocketAddr,
     control_secret: Option<String>,
     timeout_ms: u64,
     pending: Arc<DashMap<u64, oneshot::Sender<CmdResult>>>,
+    play_pending: Arc<DashMap<u64, PlayWaiter>>,
     writer: Arc<Mutex<Option<OwnedWriteHalf>>>,
     connected_tx: watch::Sender<bool>,
     event_tx: mpsc::Sender<RtpEngineEvent>,
@@ -1016,14 +1099,24 @@ async fn connection_manager(
         let _ = connected_tx.send(true);
         info!(%address, "siphon-rtp control connection established");
 
-        let outcome = read_loop(&mut read_half, &mut buffer, &pending, &event_tx, &mut shutdown_rx)
-            .await;
+        let outcome = read_loop(
+            &mut read_half,
+            &mut buffer,
+            &pending,
+            &play_pending,
+            &event_tx,
+            &mut shutdown_rx,
+        )
+        .await;
 
         // Connection is gone: stop accepting commands and fail every in-flight
         // request (dropping the senders makes their receivers resolve to Err).
+        // Blocking play_media waiters likewise unblock (dropped sender → Err →
+        // treated as not-completed) instead of hanging until the fallback.
         let _ = connected_tx.send(false);
         *writer.lock().await = None;
         pending.clear();
+        play_pending.clear();
 
         match outcome {
             ReadOutcome::Shutdown => return,
@@ -1051,6 +1144,7 @@ async fn read_loop(
     read_half: &mut OwnedReadHalf,
     buffer: &mut Vec<u8>,
     pending: &DashMap<u64, oneshot::Sender<CmdResult>>,
+    play_pending: &DashMap<u64, PlayWaiter>,
     event_tx: &mpsc::Sender<RtpEngineEvent>,
     shutdown_rx: &mut mpsc::Receiver<()>,
 ) -> ReadOutcome {
@@ -1061,7 +1155,7 @@ async fn read_loop(
             match frame::decode::<serde_json::Value>(buffer) {
                 Ok(Some((value, consumed))) => {
                     buffer.drain(..consumed);
-                    route_frame(value, pending, event_tx).await;
+                    route_frame(value, pending, play_pending, event_tx).await;
                 }
                 Ok(None) => break,
                 Err(error) => {
@@ -1091,10 +1185,22 @@ async fn read_loop(
 async fn route_frame(
     value: serde_json::Value,
     pending: &DashMap<u64, oneshot::Sender<CmdResult>>,
+    play_pending: &DashMap<u64, PlayWaiter>,
     event_tx: &mpsc::Sender<RtpEngineEvent>,
 ) {
     if value.get("event").is_some() {
         match serde_json::from_value::<Event>(value) {
+            Ok(Event::PlayFinished { play_id, reason, played_ms, .. }) => {
+                // Internal correlation for a blocking play_media(wait=True): hand
+                // the reason + played duration to the waiting call. No waiter
+                // means a wait=False play (or a lost accept/register race, covered
+                // by the play fallback timeout) — drop it, don't surface it as an
+                // event.
+                debug!(play_id, ?reason, played_ms, "siphon-rtp play finished");
+                if let Some((_, sender)) = play_pending.remove(&play_id) {
+                    let _ = sender.send((reason, played_ms));
+                }
+            }
             Ok(event) => {
                 let converted = convert_event(event);
                 debug!(?converted, "siphon-rtp event received");
@@ -1276,12 +1382,14 @@ mod tests {
                                 duration_ms: None,
                                 to_tag: None,
                                 stats: None,
+                                play_id: None,
                             },
                             _ => CmdResult::Ok {
                                 sdp: None,
                                 duration_ms: None,
                                 to_tag: None,
                                 stats: None,
+                                play_id: None,
                             },
                         };
                         write_frame(
@@ -1398,6 +1506,7 @@ mod tests {
                         duration_ms: None,
                         to_tag: None,
                         stats: None,
+                        play_id: None,
                     },
                 },
             )
@@ -1407,7 +1516,7 @@ mod tests {
         });
 
         let (event_tx, _event_rx) = channel();
-        let client = SiphonRtpClient::new(address, None, 2000, event_tx);
+        let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
         let flags = NgFlags {
             transport_protocol: Some("RTP/SAVP".into()),
             ..NgFlags::default()
@@ -1417,6 +1526,123 @@ mod tests {
         assert_eq!(client.active_sessions(), 1);
         assert_eq!(client.instance_count(), 1);
         assert_eq!(client.instance_addresses(), vec![address]);
+    }
+
+    /// Fake engine that accepts one `PlayMedia` with `play_id`, then optionally
+    /// pushes an `Event::PlayFinished` after a short delay. Returns its address.
+    async fn spawn_play_server(
+        play_id: u64,
+        finish: Option<(PlayEndReason, Option<u64>)>,
+    ) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            let request: Request = read_frame(&mut stream, &mut buffer).await;
+            assert!(matches!(request.command, Command::PlayMedia { .. }));
+            // Accept immediately, echoing the play_id.
+            write_frame(
+                &mut stream,
+                &Response {
+                    id: request.id,
+                    result: CmdResult::Ok {
+                        sdp: None,
+                        duration_ms: None,
+                        to_tag: None,
+                        stats: None,
+                        play_id: Some(play_id),
+                    },
+                },
+            )
+            .await;
+            if let Some((reason, played_ms)) = finish {
+                // The prompt "plays", then the engine reports completion.
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                write_frame(
+                    &mut stream,
+                    &Event::PlayFinished {
+                        call_id: "call-play".into(),
+                        from_tag: "tag-a".into(),
+                        to_tag: None,
+                        play_id,
+                        reason,
+                        played_ms,
+                    },
+                )
+                .await;
+            }
+            // Keep the connection open so the client doesn't see EOF.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+        address
+    }
+
+    fn play_source() -> PlayMediaSource {
+        PlayMediaSource::File("/prompts/welcome.wav".to_string())
+    }
+
+    #[tokio::test]
+    async fn play_media_wait_returns_played_ms_on_completed() {
+        // wait=True blocks until the PlayFinished(Completed) for its play_id and
+        // returns the played duration from the event (the accept carried none, so
+        // Some(1234) proves it waited for completion rather than returning early).
+        let address = spawn_play_server(7, Some((PlayEndReason::Completed, Some(1234)))).await;
+        let (event_tx, _event_rx) = channel();
+        let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
+        let played = client
+            .play_media("call-play", "tag-a", &play_source(), None, None, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(played, Some(1234));
+    }
+
+    #[tokio::test]
+    async fn play_media_wait_returns_none_when_stopped() {
+        // Ended early (stopped / superseded) → the prompt didn't play out → None.
+        let address = spawn_play_server(8, Some((PlayEndReason::Stopped, Some(400)))).await;
+        let (event_tx, _event_rx) = channel();
+        let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
+        let played = client
+            .play_media("call-play", "tag-a", &play_source(), None, None, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(played, None);
+    }
+
+    #[tokio::test]
+    async fn play_media_no_wait_returns_on_accept() {
+        // wait=False returns as soon as the engine accepts — it must NOT block for
+        // a completion event (the fake server never sends one).
+        let address = spawn_play_server(9, None).await;
+        let (event_tx, _event_rx) = channel();
+        let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
+        let played = tokio::time::timeout(
+            Duration::from_millis(500),
+            client.play_media("call-play", "tag-a", &play_source(), None, None, None, None, false),
+        )
+        .await
+        .expect("play_media(wait=false) must return on accept, not block")
+        .unwrap();
+        assert_eq!(played, None);
+    }
+
+    #[tokio::test]
+    async fn play_media_wait_fallback_timeout_returns_none() {
+        // No PlayFinished ever arrives; a small play fallback timeout resolves the
+        // await to None instead of hanging the call.
+        let address = spawn_play_server(10, None).await;
+        let (event_tx, _event_rx) = channel();
+        // 100 ms play fallback so the test is fast + deterministic.
+        let client = SiphonRtpClient::new(address, None, 2000, 100, event_tx);
+        let played = tokio::time::timeout(
+            Duration::from_millis(2000),
+            client.play_media("call-play", "tag-a", &play_source(), None, None, None, None, true),
+        )
+        .await
+        .expect("play_media must give up at the fallback timeout, not hang")
+        .unwrap();
+        assert_eq!(played, None);
     }
 
     #[tokio::test]
@@ -1443,6 +1669,7 @@ mod tests {
                         duration_ms: None,
                         to_tag: None,
                         stats: None,
+                        play_id: None,
                     },
                 },
             )
@@ -1462,7 +1689,7 @@ mod tests {
         });
 
         let (event_tx, _event_rx) = channel();
-        let client = SiphonRtpClient::new(address, Some("s3cret".into()), 2000, event_tx);
+        let client = SiphonRtpClient::new(address, Some("s3cret".into()), 2000, 5_000, event_tx);
         client.ping().await.unwrap();
     }
 
@@ -1486,6 +1713,7 @@ mod tests {
                         duration_ms: None,
                         to_tag: None,
                         stats: None,
+                        play_id: None,
                     },
                 },
             )
@@ -1499,6 +1727,7 @@ mod tests {
                         duration_ms: None,
                         to_tag: None,
                         stats: None,
+                        play_id: None,
                     },
                 },
             )
@@ -1507,7 +1736,7 @@ mod tests {
         });
 
         let (event_tx, _event_rx) = channel();
-        let client = SiphonRtpClient::new(address, None, 2000, event_tx);
+        let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
         let flags = NgFlags::default();
         let one = client.offer("call-a", "ta", b"v=0\r\n", &flags);
         let two = client.offer("call-b", "tb", b"v=0\r\n", &flags);
@@ -1548,7 +1777,7 @@ mod tests {
         });
 
         let (event_tx, mut event_rx) = channel();
-        let _client = SiphonRtpClient::new(address, None, 2000, event_tx);
+        let _client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
 
         match event_rx.recv().await.unwrap() {
             RtpEngineEvent::Dtmf(dtmf) => {
@@ -1586,7 +1815,7 @@ mod tests {
         });
 
         let (event_tx, _event_rx) = channel();
-        let client = SiphonRtpClient::new(address, None, 2000, event_tx);
+        let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
         let error = client.delete("call-x", "tag-a").await.unwrap_err();
         assert!(matches!(error, RtpEngineError::EngineError(_)));
         assert!(error.to_string().contains("no such call"));
@@ -1626,6 +1855,7 @@ mod tests {
                         duration_ms: None,
                         to_tag: None,
                         stats: None,
+                        play_id: None,
                     },
                 },
             )
@@ -1648,6 +1878,7 @@ mod tests {
                         duration_ms: None,
                         to_tag: None,
                         stats: None,
+                        play_id: None,
                     },
                 },
             )
@@ -1656,7 +1887,7 @@ mod tests {
         });
 
         let (event_tx, _event_rx) = channel();
-        let client = SiphonRtpClient::new(address, None, 2000, event_tx);
+        let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
         client.echo("call-echo", "tag-a", true).await.unwrap();
         client.echo("call-echo", "tag-a", false).await.unwrap();
     }
@@ -1682,6 +1913,7 @@ mod tests {
                         duration_ms: None,
                         to_tag: None,
                         stats: Some(SessionStats::default()),
+                        play_id: None,
                     },
                 },
             )
@@ -1690,7 +1922,7 @@ mod tests {
         });
 
         let (event_tx, _event_rx) = channel();
-        let client = SiphonRtpClient::new(address, None, 2000, event_tx);
+        let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
         let body = client
             .subscribe_answer("c", "f", "t", b"v=0\r\n", &NgFlags::default())
             .await
@@ -1724,7 +1956,7 @@ mod tests {
         });
 
         let (event_tx, _event_rx) = channel();
-        let client = SiphonRtpClient::new(address, None, 2000, event_tx);
+        let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
         // Give the manager time to see the drop and reconnect (backoff = 200ms).
         tokio::time::sleep(Duration::from_millis(500)).await;
         client.ping().await.unwrap();
@@ -1737,7 +1969,7 @@ mod tests {
         // forever or failing instantly during a transient startup window).
         let address: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let (event_tx, _event_rx) = channel();
-        let client = SiphonRtpClient::new(address, None, 300, event_tx);
+        let client = SiphonRtpClient::new(address, None, 300, 5_000, event_tx);
         let error = client.ping().await.unwrap_err();
         assert!(matches!(error, RtpEngineError::Timeout { .. }));
     }
@@ -1745,7 +1977,7 @@ mod tests {
     #[test]
     fn client_set_requires_at_least_one_instance() {
         let (event_tx, _event_rx) = channel();
-        let result = SiphonRtpClientSet::new(vec![], None, event_tx);
+        let result = SiphonRtpClientSet::new(vec![], None, 5_000, event_tx);
         assert!(matches!(result, Err(RtpEngineError::Protocol(_))));
     }
 
@@ -1759,6 +1991,7 @@ mod tests {
         let set = SiphonRtpClientSet::new(
             vec![(address_one, 2000, 1), (address_two, 2000, 1)],
             None,
+            5_000,
             event_tx,
         )
         .unwrap();

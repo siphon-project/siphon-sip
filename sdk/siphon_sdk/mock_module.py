@@ -1863,6 +1863,7 @@ class MockRtpEngine:
         start_ms: Optional[int] = None,
         duration_ms: Optional[int] = None,
         to_tag: Optional[str] = None,
+        wait: bool = True,
     ) -> Optional[int]:
         """Inject an audio prompt into the call.
 
@@ -1885,6 +1886,13 @@ class MockRtpEngine:
             start_ms: Offset into the file at which to start (ms).
             duration_ms: Cap on playback length (ms).
             to_tag: Optional peer tag for MPTY scoping.
+            wait: When ``True`` (default, native siphon-rtp backend), the real
+                runtime blocks until the prompt finishes playing so a script can
+                sequence a following action (e.g. ``echo()``) after it. The
+                coroutine parks while it waits. ``wait=False`` returns as soon as
+                the engine accepts the prompt (fire-and-forget). In this mock the
+                call always returns immediately (the completion event is a runtime
+                behavior); ``wait`` is recorded for assertions.
 
         Returns:
             Prompt duration in ms if rtpengine reports one (mock returns
@@ -1892,8 +1900,12 @@ class MockRtpEngine:
 
         Example::
 
-            dur = await rtpengine.play_media(call, file="/var/lib/siphon/prompts/cfu.wav")
-            await rtpengine.play_media(call, blob=tts_bytes, to_tag=peer_tag)
+            @b2bua.on_invite
+            async def on_invite(call):
+                await rtpengine.offer(call, profile="ivr")
+                call.answer(200, "OK", body=call.body, content_type="application/sdp")
+                await rtpengine.play_media(call, file="/prompts/welcome.wav")  # wait=True
+                await rtpengine.echo(call)                                     # after prompt
         """
         count = sum(1 for x in (file, blob, db_id) if x is not None)
         if count != 1:
@@ -1911,6 +1923,7 @@ class MockRtpEngine:
             "start_ms": start_ms,
             "duration_ms": duration_ms,
             "to_tag": to_tag,
+            "wait": wait,
         })
         return self._play_media_duration_ms
 

@@ -1670,6 +1670,12 @@ pub struct SiphonRtpConfig {
     /// `timeout_ms` overrides it). Default: 2000.
     #[serde(default = "default_siphon_rtp_timeout_ms")]
     pub timeout_ms: u64,
+    /// Fallback cap in milliseconds for a blocking `rtpengine.play_media()` — how
+    /// long to wait for the prompt-finished event before giving up. A prompt can
+    /// be far longer than a control request, so this is separate from
+    /// `timeout_ms`. Default: 300000 (5 min).
+    #[serde(default = "default_siphon_rtp_play_timeout_ms")]
+    pub play_timeout_ms: u64,
 }
 
 impl SiphonRtpConfig {
@@ -1786,6 +1792,10 @@ fn default_rtpproxy_retries() -> u32 {
 
 fn default_siphon_rtp_timeout_ms() -> u64 {
     2000
+}
+
+fn default_siphon_rtp_play_timeout_ms() -> u64 {
+    300_000
 }
 
 /// A user-defined RTPEngine media profile with separate offer/answer NG flags.
