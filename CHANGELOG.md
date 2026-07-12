@@ -6,7 +6,36 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **`b2bua.terminate(call_id, reason="Normal Clearing") -> bool`** — imperative
+  hangup of a B2BUA call by SIP Call-ID. Unlike `call.terminate()` (deferred
+  until its own handler returns, so a no-op from an out-of-band event), this acts
+  immediately and reads shared Rust dialog state, so it works from an
+  `@rtpengine.on_dtmf` / `@rtpengine.on_media_timeout` callback, a timer, or a
+  normal handler, and needs no stashed `call` object (cross-worker safe). Sends
+  an in-dialog BYE to every leg (a single-leg UAS/IVR call gets just the caller
+  leg) and runs the full teardown — Rf ACR-STOP, CDR, SIPREC stop, media
+  release, dialog cleanup. Returns `False` (never raises) when the Call-ID is
+  unknown or already gone, so an IVR racing a caller-initiated BYE is a clean
+  no-op. The BYE carries an RFC 3326 `Reason: Q.850;cause=16` header with the
+  supplied text.
+
 ### Fixed
+- **UAS-mode `call.answer()` now emits a To-tag** (RFC 3261 §12.1.1). A B2BUA
+  script that answers an INVITE directly (`call.answer(200, ...)` — MRF /
+  announcement / echo / IVR) previously sent a 2xx whose To header was copied
+  verbatim from the tagless INVITE, so the caller's dialog had no remote tag. The
+  2xx now carries the A-leg dialog's local tag, which also makes a
+  siphon-originated in-dialog BYE (from `b2bua.terminate` or session-timer
+  expiry) match the caller's dialog instead of being rejected `481`. Bridged
+  (`call.dial()`) calls are unchanged.
+- **Session-timer expiry (RFC 4028) now completes the call teardown.** Tearing a
+  call down on session-timer expiry previously BYE'd both legs but skipped the
+  Rf ACR-STOP, the CDR, and the SIPREC stop that an inbound BYE performs, leaking
+  those per-call records. It now runs through the same full-teardown funnel as an
+  inbound BYE and the new `b2bua.terminate`, and the BYE carries an RFC 3326
+  `Reason: Q.850;cause=102` (recovery on timer expiry) header.
+
 - **Registrar liveness no longer network-deregisters an IPsec binding when its
   stream flow closes** (RFC 5626 §4.2.2 flow recovery). A closed TCP/TLS flow
   for an IPsec-protected UE is a recoverable flow failure, not a death signal —

@@ -587,6 +587,15 @@ impl SiphonServer {
             }
         });
 
+        // --- Initialize imperative B2BUA control for Python scripts ---
+        // Backs b2bua.terminate() — always available, reaches the dispatcher via
+        // a global handle set once run() starts.
+        pyo3::Python::attach(|python| {
+            if let Err(error) = crate::script::api::set_b2bua_control_singleton(python) {
+                error!("failed to store b2bua control singleton: {error}");
+            }
+        });
+
         // --- Initialize ISC namespace before script load ---
         // Must be registered before ScriptEngine::new() so that
         // install_siphon_module() can inject the Rust-backed isc instance

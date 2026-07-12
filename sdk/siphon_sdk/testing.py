@@ -250,6 +250,11 @@ class SipTestHarness:
         return mock_module._proxy
 
     @property
+    def b2bua(self) -> mock_module.MockB2bua:
+        """Access the mock b2bua namespace to inspect ``terminates``."""
+        return mock_module._b2bua
+
+    @property
     def presence(self) -> mock_module.MockPresence:
         """Access the mock presence store."""
         return mock_module._presence

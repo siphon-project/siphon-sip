@@ -152,6 +152,45 @@ class _ProxyNamespace:
 class _B2buaNamespace:
     """Namespace for B2BUA call event handlers."""
 
+    def __init__(self):
+        # Replaced at startup by the Rust-backed B2buaControl
+        # (set_b2bua_control_singleton / install_siphon_module).  None until
+        # then, so terminate() is a graceful no-op in bare-Python contexts.
+        self._control = None
+
+    def terminate(self, call_id, reason="Normal Clearing"):
+        """Imperatively end a B2BUA call by its SIP Call-ID, sending an in-dialog
+        BYE to every leg immediately.
+
+        Unlike ``call.terminate()`` (which only applies when *its own* handler
+        returns), this acts now and is keyed by SIP Call-ID against shared Rust
+        dialog state — so it works from an out-of-band event callback
+        (``@rtpengine.on_dtmf``, ``@rtpengine.on_media_timeout``), a timer, or a
+        normal handler, and is cross-worker safe (no reliance on a stashed
+        ``call`` object).
+
+        Args:
+            call_id: the SIP Call-ID of the call to end (e.g. the ``call_id``
+                delivered to an ``@rtpengine.on_dtmf`` handler).
+            reason: free-text hangup reason, carried as an RFC 3326
+                ``Reason: Q.850;cause=16`` header on the BYE and into the CDR.
+
+        Returns:
+            bool: True if a matching call was found and torn down, False if the
+            Call-ID is unknown / already gone (e.g. the caller hung up first).
+            Never raises — racing a caller-initiated BYE is a clean no-op.
+
+        Usage:
+            @rtpengine.on_dtmf
+            def on_ivr_dtmf(call_id, from_tag, digit, duration_ms, volume):
+                if digit == "#":
+                    b2bua.terminate(call_id)
+        """
+        control = object.__getattribute__(self, "__dict__").get("_control")
+        if control is None:
+            return False
+        return control.terminate(call_id, reason)
+
     @staticmethod
     def on_invite(fn):
         """Register handler for new INVITE (new call)."""

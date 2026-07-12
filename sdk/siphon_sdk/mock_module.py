@@ -572,7 +572,48 @@ class MockB2bua:
         - ``@b2bua.on_bye`` — call ended
         - ``@b2bua.on_refer`` — call transfer (RFC 3515)
         - ``@b2bua.on_cancel`` — unanswered call cancelled (RFC 3261 §9)
+
+    Imperative:
+        - ``b2bua.terminate(call_id)`` — end a call by SIP Call-ID from any
+          context (records onto ``terminates`` for test assertions)
     """
+
+    def __init__(self) -> None:
+        # Records b2bua.terminate(...) calls for test assertions.
+        self.terminates: list[dict] = []
+
+    def clear(self) -> None:
+        """Reset recorded imperative calls (called by ``reset()``)."""
+        self.terminates.clear()
+
+    def terminate(self, call_id: str, reason: str = "Normal Clearing") -> bool:
+        """Imperatively end a B2BUA call by its SIP Call-ID.
+
+        Unlike ``call.terminate()`` (deferred until its handler returns), this
+        acts immediately and is keyed by SIP Call-ID, so it works from an
+        out-of-band event callback (``@rtpengine.on_dtmf``,
+        ``@rtpengine.on_media_timeout``), a timer, or a normal handler.
+
+        Args:
+            call_id: the SIP Call-ID of the call to end.
+            reason: free-text hangup reason (RFC 3326 ``Reason`` on the BYE).
+
+        Returns:
+            bool: True if a matching call was found and torn down, False if the
+            Call-ID is unknown / already gone. Never raises.
+
+        In the mock, records ``{"call_id", "reason"}`` on ``terminates`` and
+        returns True. Inspect via ``siphon.get_b2bua().terminates``.
+
+        Usage::
+
+            @rtpengine.on_dtmf
+            def on_ivr_dtmf(call_id, from_tag, digit, duration_ms, volume):
+                if digit == "#":
+                    b2bua.terminate(call_id)
+        """
+        self.terminates.append({"call_id": call_id, "reason": reason})
+        return True
 
     @staticmethod
     def on_invite(fn: Callable) -> Callable:
@@ -6060,6 +6101,7 @@ def reset() -> None:
     _proxy._utils._sanity_check_pass = True
     _proxy._utils._enum_results.clear()
     _proxy._utils._memory_pct = 25
+    _b2bua.clear()
 
 
 def get_registry() -> _HandlerRegistry:
@@ -6080,6 +6122,11 @@ def get_http() -> MockHttp:
 def get_proxy() -> MockProxy:
     """Access the mock proxy singleton."""
     return _proxy
+
+
+def get_b2bua() -> MockB2bua:
+    """Access the mock b2bua singleton (test helper) — inspect ``.terminates``."""
+    return _b2bua
 
 
 def get_registrar() -> MockRegistrar:

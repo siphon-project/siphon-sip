@@ -578,6 +578,14 @@ pub async fn run(
     let _ = drain.transaction_manager.set(Arc::clone(&state.transaction_manager));
     let _ = drain.call_actors.set(Arc::clone(&state.call_actors));
 
+    // Publish a handle to the running dispatcher + its tokio runtime so the
+    // imperative `b2bua.terminate` script API can tear a call down by SIP
+    // Call-ID from any thread (event callbacks, timers). First writer wins.
+    let _ = B2BUA_CONTROL.set(B2buaControlHandle {
+        state: Arc::clone(&state),
+        runtime: tokio::runtime::Handle::current(),
+    });
+
     // Install the rf_sessions lookup so the CDR Python API can
     // auto-stamp `rf_session_id` / `rf_result_code` on every CDR
     // emitted while an Rf session is active for the SIP dialog.
@@ -6996,10 +7004,29 @@ fn spawn_rf_b2bua_start(
 /// completes so script-driven `cdr.write()` calls still see the
 /// rf_session for auto-stamping.  See [`spawn_rf_proxy_stop_if_tracked`]
 /// for the full rationale.
+/// Derive a Diameter Q.850 cause code from an RFC 3326 `Reason:` header, if
+/// present. The `cause=` parameter is interpreted as a SIP status code and
+/// mapped via [`crate::diameter::rf::sip_status_to_cause_code`] — the historical
+/// B2BUA BYE behaviour, kept identical when [`spawn_rf_b2bua_stop`] moved from
+/// taking the BYE message to taking the pre-derived cause.
+fn parse_reason_cause(message: &SipMessage) -> Option<i32> {
+    message
+        .headers
+        .get("Reason")
+        .and_then(|r| {
+            r.split(';')
+                .filter_map(|p| p.trim().strip_prefix("cause="))
+                .next()
+                .and_then(|v| v.split_whitespace().next())
+                .and_then(|v| v.parse::<u16>().ok())
+        })
+        .and_then(crate::diameter::rf::sip_status_to_cause_code)
+}
+
 fn spawn_rf_b2bua_stop(
     state: &DispatcherState,
     internal_call_id: &str,
-    bye: &SipMessage,
+    cause_code: Option<i32>,
 ) {
     let charger = match state.rf_charger.as_ref() {
         Some(c) if c.auto_emit_b2bua() => Arc::clone(c),
@@ -7010,17 +7037,6 @@ fn spawn_rf_b2bua_stop(
         return;
     }
 
-    let cause_code = bye
-        .headers
-        .get("Reason")
-        .and_then(|r| {
-            r.split(';')
-                .filter_map(|p| p.trim().strip_prefix("cause="))
-                .next()
-                .and_then(|v| v.split_whitespace().next())
-                .and_then(|v| v.parse::<u16>().ok())
-        })
-        .and_then(crate::diameter::rf::sip_status_to_cause_code);
     let response_timestamp = std::time::SystemTime::now();
 
     let rf_sessions = Arc::clone(&state.rf_sessions);
@@ -8521,8 +8537,33 @@ fn handle_b2bua_invite(
         }
         CallAction::Answer { code, reason, body, content_type } => {
             debug!(call_id = %call_id, code, "B2BUA: UAS-mode answer");
+            // RFC 3261 §12.1.1: a 2xx to a dialog-creating INVITE MUST carry a
+            // To-tag, and for a UAS-mode B2BUA answer it must be the A-leg
+            // dialog's local_tag — otherwise a later siphon-originated in-dialog
+            // BYE (b2bua.terminate / session-timer expiry) carries a From-tag the
+            // caller never saw and is 481-rejected. build_response copies the
+            // INVITE's tagless To verbatim, so inject the tag here.
+            let mut reply_headers: Vec<(crate::script::api::request::ReplyHeaderOp, String, String)> =
+                Vec::new();
+            if (200..300).contains(&code) {
+                if let Some(to_value) = message_guard.headers.to() {
+                    if !to_value.contains(";tag=") {
+                        if let Some(local_tag) = state
+                            .call_actors
+                            .get_call(&call_id)
+                            .map(|call| call.a_leg.dialog.local_tag.clone())
+                        {
+                            reply_headers.push((
+                                crate::script::api::request::ReplyHeaderOp::Replace,
+                                "To".to_string(),
+                                crate::b2bua::actor::ensure_tag(to_value, Some(&local_tag)),
+                            ));
+                        }
+                    }
+                }
+            }
             let mut response = build_response(
-                &message_guard, code, &reason, state.server_header.as_deref(), &[],
+                &message_guard, code, &reason, state.server_header.as_deref(), &reply_headers,
             );
             if let Some(body_bytes) = body {
                 if let Some(ct) = content_type {
@@ -11522,7 +11563,7 @@ fn handle_b2bua_bye(
     // 200 OK is sent so the accounting record reflects the moment the
     // proxy committed to tearing the call down; the SIP path is
     // unaffected (spawn is fire-and-forget per §6.5).
-    spawn_rf_b2bua_stop(state, &call_id, &message);
+    spawn_rf_b2bua_stop(state, &call_id, parse_reason_cause(&message));
 
     // CDR: write the call record on BYE (cdr.auto_emit). `from_a_leg` gives the
     // disconnecting side (caller vs callee).
@@ -11614,32 +11655,7 @@ fn handle_b2bua_bye(
     }
 
     // SIPREC: stop any active recording sessions for this call.
-    // First, collect RTPEngine subscribe info before stop_recording cleans up sessions.
-    let siprec_infos = state.recording_manager.active_session_infos(&call_id);
-    let bye_messages = state.recording_manager.stop_recording(&call_id, state.local_addr);
-    for (bye_msg, destination, transport) in bye_messages {
-        let data = Bytes::from(bye_msg.to_bytes());
-        let target = RelayTarget {
-            address: destination,
-            transport: Some(transport),
-            server_name: None,
-        };
-        send_to_target(data, &target, transport, ConnectionId::default(), None, state);
-    }
-    // RTPEngine unsubscribe: stop media forking for each recording session.
-    if let Some(ref rtpengine_set) = state.rtpengine_set {
-        for (original_call_id, original_from_tag, original_to_tag) in siprec_infos {
-            let set = Arc::clone(rtpengine_set);
-            tokio::spawn(async move {
-                if let Err(error) = set.unsubscribe(&original_call_id, &original_from_tag, &original_to_tag).await {
-                    warn!(
-                        call_id = %original_call_id,
-                        "SIPREC: RTPEngine unsubscribe failed: {error}"
-                    );
-                }
-            });
-        }
-    }
+    b2bua_stop_siprec(&call_id, state);
 
     state.call_actors.set_state(&call_id, CallState::Terminated);
     // remove_call sends Shutdown to any remaining actors, cleans up registry,
@@ -11822,21 +11838,107 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
     }
 }
 
-/// Terminate a call due to session timer expiry — send BYE to both legs.
-fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
-    let (a_leg, winner_b_leg, sip_call_id) = match state.call_actors.get_call(call_id) {
+/// Stop and tear down any SIPREC recording sessions for a B2BUA call: send the
+/// SRC-side BYE to each SRS and unsubscribe the RTPEngine media fork. Shared by
+/// the inbound-BYE teardown ([`handle_b2bua_bye`]) and the framework-initiated
+/// teardown ([`b2bua_terminate_call_inner`]).
+fn b2bua_stop_siprec(internal_call_id: &str, state: &DispatcherState) {
+    // Collect RTPEngine subscribe info before stop_recording cleans up sessions.
+    let siprec_infos = state.recording_manager.active_session_infos(internal_call_id);
+    let bye_messages = state
+        .recording_manager
+        .stop_recording(internal_call_id, state.local_addr);
+    for (bye_msg, destination, transport) in bye_messages {
+        let data = Bytes::from(bye_msg.to_bytes());
+        let target = RelayTarget {
+            address: destination,
+            transport: Some(transport),
+            server_name: None,
+        };
+        send_to_target(data, &target, transport, ConnectionId::default(), None, state);
+    }
+    // RTPEngine unsubscribe: stop media forking for each recording session.
+    if let Some(ref rtpengine_set) = state.rtpengine_set {
+        for (original_call_id, original_from_tag, original_to_tag) in siprec_infos {
+            let set = Arc::clone(rtpengine_set);
+            tokio::spawn(async move {
+                if let Err(error) = set
+                    .unsubscribe(&original_call_id, &original_from_tag, &original_to_tag)
+                    .await
+                {
+                    warn!(
+                        call_id = %original_call_id,
+                        "SIPREC: RTPEngine unsubscribe failed: {error}"
+                    );
+                }
+            });
+        }
+    }
+}
+
+/// Build an RFC 3326 `Reason:` header value for a graceful, script-initiated
+/// call teardown. Q.850 cause 16 = normal call clearing; the script-supplied
+/// text rides along in `text=` (embedded quotes stripped so the header stays
+/// well-formed).
+fn format_normal_clearing_reason(reason: &str) -> String {
+    let text = reason.replace('"', "");
+    format!("Q.850;cause=16;text=\"{text}\"")
+}
+
+/// Full B2BUA call teardown initiated by the framework — session-timer expiry or
+/// an imperative `b2bua.terminate` — NOT by an inbound BYE. Sends an in-dialog
+/// BYE to BOTH legs from stored dialog state (a single-leg UAS call degrades to
+/// just the A-leg), emits Rf ACR-STOP + a CDR + stops SIPREC (matching the
+/// inbound-BYE teardown in [`handle_b2bua_bye`] so those per-call stores drain
+/// here too), tears down media, and removes all dialog/registry state.
+///
+/// `reason_header` is a full RFC 3326 `Reason:` value added to each BYE and
+/// recorded as the CDR `sip_reason`. `disconnect_initiator` is the CDR
+/// disconnecting side (`"b2bua"` for a script terminate, `"timeout"` for
+/// session-timer expiry). Returns `true` if the call existed.
+fn b2bua_terminate_call_inner(
+    internal_call_id: &str,
+    reason_header: Option<&str>,
+    disconnect_initiator: &str,
+    state: &DispatcherState,
+) -> bool {
+    let (a_leg, winner_b_leg, sip_call_id) = match state.call_actors.get_call(internal_call_id) {
         Some(call) => {
             let b_leg = call.winner.and_then(|i| call.b_legs.get(i).cloned());
             (call.a_leg.clone(), b_leg, call.a_leg.dialog.call_id.clone())
         }
-        None => return,
+        None => return false,
     };
 
-    // Build BYE for each leg using the shared build_b2bua_bye helper.
+    // Rf ACR-STOP (TS 32.299 §6.2.2). A framework-initiated teardown maps to the
+    // Diameter "normal" cause (None → 0); the RFC 3326 Reason on the BYE is
+    // informational only here (its Q.850 cause is not a SIP status).
+    spawn_rf_b2bua_stop(state, internal_call_id, None);
+
+    // CDR (cdr.auto_emit): write the record with the framework as the
+    // disconnecting side and the Reason header as sip_reason.
+    if crate::cdr::auto_emit_enabled() {
+        cdr_finalize(
+            state,
+            internal_call_id,
+            disconnect_initiator,
+            None,
+            reason_header.map(|r| r.to_string()),
+        );
+    }
+
+    // Build + send BYE to each leg using the shared build_b2bua_bye helper.
     // Destination derived from the dialog route set (RFC 3261 §12.2.1.1) — see
-    // resolve_in_dialog_destination for why the cached transport.remote_addr
-    // is wrong for routes that don't match the original INVITE next-hop.
-    if let Some(bye_msg) = build_b2bua_bye(&a_leg, state) {
+    // resolve_in_dialog_destination for why the cached transport.remote_addr is
+    // wrong for routes that don't match the original INVITE next-hop.
+    let build_bye = |leg: &Leg| -> Option<SipMessage> {
+        let mut bye = build_b2bua_bye(leg, state)?;
+        if let Some(reason) = reason_header {
+            bye.headers.add("Reason", reason.to_string());
+        }
+        Some(bye)
+    };
+    if let Some(bye_msg) = build_bye(&a_leg) {
         let (destination, transport) = resolve_in_dialog_destination(
             &a_leg.dialog.route_set,
             state,
@@ -11846,7 +11948,7 @@ fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
         send_message(bye_msg, transport, destination, a_leg.transport.connection_id, state);
     }
     if let Some(b_leg) = &winner_b_leg {
-        if let Some(bye_msg) = build_b2bua_bye(b_leg, state) {
+        if let Some(bye_msg) = build_bye(b_leg) {
             let (destination, transport) = resolve_in_dialog_destination(
                 &b_leg.dialog.route_set,
                 state,
@@ -11857,7 +11959,7 @@ fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
         }
     }
 
-    // Safety-net RTPEngine cleanup
+    // Safety-net RTPEngine cleanup.
     if let (Some(rtpengine_set), Some(media_sessions)) =
         (&state.rtpengine_set, &state.rtpengine_sessions)
     {
@@ -11871,10 +11973,69 @@ fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
         }
     }
 
-    state.call_actors.set_state(call_id, CallState::Terminated);
-    state.call_actors.remove_call(call_id);
-    state.call_event_receivers.remove(call_id);
+    // SIPREC: stop any active recording sessions for this call.
+    b2bua_stop_siprec(internal_call_id, state);
+
+    state.call_actors.set_state(internal_call_id, CallState::Terminated);
+    // remove_call sends Shutdown to any remaining actors, cleans up registry,
+    // and moves re-INVITE tracking entries to the zombie map.
+    state.call_actors.remove_call(internal_call_id);
+    state.call_event_receivers.remove(internal_call_id);
     schedule_zombie_reinvite_cleanup(&state.call_actors);
+    true
+}
+
+/// Terminate a call due to session timer expiry (RFC 4028) — BYE both legs and
+/// run the full framework teardown (Rf ACR-STOP + CDR + SIPREC + media), the
+/// same funnel the imperative `b2bua.terminate` uses.
+fn b2bua_session_timer_terminate(call_id: &str, state: &DispatcherState) {
+    // Q.850 cause 102 = "recovery on timer expiry".
+    b2bua_terminate_call_inner(
+        call_id,
+        Some("Q.850;cause=102;text=\"Session timer expired\""),
+        "timeout",
+        state,
+    );
+}
+
+/// Handle to the running dispatcher, published once at startup so imperative
+/// script APIs (e.g. `b2bua.terminate`) can reach dialog state and the tokio
+/// runtime from any thread — an event-callback driver, a timer, or an async-pool
+/// loop, none of which are tokio workers.
+struct B2buaControlHandle {
+    state: Arc<DispatcherState>,
+    runtime: tokio::runtime::Handle,
+}
+
+static B2BUA_CONTROL: std::sync::OnceLock<B2buaControlHandle> = std::sync::OnceLock::new();
+
+/// Imperatively tear down a B2BUA call identified by its SIP Call-ID, sending a
+/// BYE to every leg and running the full teardown ([`b2bua_terminate_call_inner`]).
+///
+/// Safe to call from any thread/context (event callbacks like `@rtpengine.on_dtmf`,
+/// timers, async handlers) — unlike the deferred `call.terminate()`, which only
+/// applies when its own handler returns. Returns `false` (never panics) when the
+/// call-id is unknown / already gone or the dispatcher is not running, so an IVR
+/// that races a caller-initiated BYE is a clean no-op.
+pub fn b2bua_terminate_call(sip_call_id: &str, reason: Option<&str>) -> bool {
+    let Some(control) = B2BUA_CONTROL.get() else {
+        return false;
+    };
+    let Some(internal_call_id) = control.state.call_actors.find_by_sip_call_id(sip_call_id) else {
+        return false;
+    };
+    // The caller may be on a thread with no tokio context (async-pool asyncio
+    // loop, rtpengine event driver); enter the runtime so the teardown's
+    // tokio::spawn calls (RTPEngine delete, Rf ACR-STOP, SIPREC unsubscribe) are
+    // valid.
+    let _enter = control.runtime.enter();
+    let reason_header = reason.map(format_normal_clearing_reason);
+    b2bua_terminate_call_inner(
+        &internal_call_id,
+        reason_header.as_deref(),
+        "b2bua",
+        &control.state,
+    )
 }
 
 /// Arm the RFC 3262 §3 retransmit task for a reliable provisional response.
@@ -13043,6 +13204,67 @@ mod tests {
     use crate::sip::parser::parse_sip_message;
     use crate::sip::uri::SipUri;
     use crate::sip::builder::SipMessageBuilder;
+
+    // -----------------------------------------------------------------------
+    // Imperative B2BUA terminate helpers (b2bua.terminate / session timer)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn format_normal_clearing_reason_is_q850_cause_16() {
+        assert_eq!(
+            format_normal_clearing_reason("Normal Clearing"),
+            "Q.850;cause=16;text=\"Normal Clearing\"",
+        );
+        // Embedded quotes are stripped so the header stays well-formed.
+        assert_eq!(
+            format_normal_clearing_reason("say \"hi\""),
+            "Q.850;cause=16;text=\"say hi\"",
+        );
+    }
+
+    #[test]
+    fn parse_reason_cause_maps_sip_status_or_none() {
+        // Build a BYE with an optional RFC 3326 Reason header via the parser
+        // (the builder setters take String; raw parse matches the other fixtures).
+        fn bye_with_reason(reason: Option<&str>) -> SipMessage {
+            let mut raw = String::from("BYE sip:b@host SIP/2.0\r\n");
+            raw.push_str("Via: SIP/2.0/UDP host:5060;branch=z9hG4bK1\r\n");
+            raw.push_str("From: <sip:a@host>;tag=a\r\n");
+            raw.push_str("To: <sip:b@host>;tag=b\r\n");
+            raw.push_str("Call-ID: c@host\r\n");
+            raw.push_str("CSeq: 1 BYE\r\n");
+            if let Some(value) = reason {
+                raw.push_str(&format!("Reason: {value}\r\n"));
+            }
+            raw.push_str("Content-Length: 0\r\n\r\n");
+            parse_sip_message(&raw).expect("test fixture must parse").1
+        }
+
+        // SIP;cause=<status> maps via sip_status_to_cause_code.
+        assert_eq!(
+            parse_reason_cause(&bye_with_reason(Some("SIP;cause=486;text=\"Busy Here\""))),
+            crate::diameter::rf::sip_status_to_cause_code(486),
+        );
+        // No Reason header → None.
+        assert_eq!(parse_reason_cause(&bye_with_reason(None)), None);
+        // Reason without a cause= param → None.
+        assert_eq!(
+            parse_reason_cause(&bye_with_reason(Some("SIP;text=\"no cause\""))),
+            None,
+        );
+    }
+
+    #[test]
+    fn b2bua_terminate_call_unknown_id_is_false_no_panic() {
+        // Unknown SIP Call-ID (and no running dispatcher in the test binary) is a
+        // clean no-op — never panics, returns false — so an IVR racing a
+        // caller-initiated BYE degrades gracefully.
+        assert!(!b2bua_terminate_call("does-not-exist@nowhere", None));
+        assert!(!b2bua_terminate_call(
+            "does-not-exist@nowhere",
+            Some("Normal Clearing")
+        ));
+    }
 
     /// Save a stream P-CSCF cache binding directly against a bare `Registrar`,
     /// so the flow-close decision helpers can be exercised without a running
