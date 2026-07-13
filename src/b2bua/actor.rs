@@ -282,6 +282,34 @@ pub fn rewrite_uri_host(header_value: &str, new_host: &str) -> String {
     }
 }
 
+/// Rewrite the whole `host[:port]` authority of a SIP URI in a From/To header
+/// value.
+///
+/// Unlike [`rewrite_uri_host`] — which replaces only the host token and leaves
+/// any existing `:port` in place — this replaces the entire `host[:port]`
+/// authority with `new_authority`. Use it when substituting a dial-target
+/// authority that itself carries a port (e.g. topology-hiding the B-leg To to
+/// the next-hop): replacing host-only there would splice the new `host:port` in
+/// front of the retained old port and emit a malformed `host:newport:oldport`
+/// (double port), which some SBCs reject as `400 Wrong URI`.
+pub fn rewrite_uri_authority(header_value: &str, new_authority: &str) -> String {
+    if let Some(at_pos) = header_value.find('@') {
+        let after_at = &header_value[at_pos + 1..];
+        // Split only on the URI-param / bracket terminators, NOT on ':', so the
+        // original port is consumed along with the host.
+        let authority_end = after_at.find(['>', ';']).unwrap_or(after_at.len());
+        let end_pos = at_pos + 1 + authority_end;
+        format!(
+            "{}{}{}",
+            &header_value[..at_pos + 1],
+            new_authority,
+            &header_value[end_pos..],
+        )
+    } else {
+        header_value.to_string()
+    }
+}
+
 /// Generate a fresh SIP tag.
 pub fn generate_tag() -> String {
     format!("sb-{}", &uuid::Uuid::new_v4().as_simple().to_string()[..12])
@@ -2609,9 +2637,65 @@ mod tests {
 
     #[test]
     fn rewrite_uri_host_pai_with_display() {
-        let pai = "\"Outbound Call\" <sip:W5LeMb7O@172.31.47.238>";
-        let result = rewrite_uri_host(pai, "63.176.27.178");
-        assert_eq!(result, "\"Outbound Call\" <sip:W5LeMb7O@63.176.27.178>");
+        let pai = "\"Outbound Call\" <sip:alice@10.0.0.5>";
+        let result = rewrite_uri_host(pai, "203.0.113.5");
+        assert_eq!(result, "\"Outbound Call\" <sip:alice@203.0.113.5>");
+    }
+
+    // --- rewrite_uri_authority tests ---
+
+    #[test]
+    fn rewrite_uri_authority_replaces_host_and_port() {
+        // Regression: the original To carried siphon's inbound port (:5061)
+        // leaked from the A-leg.  Topology-hiding the To to a dial target that
+        // itself carries a port must replace host AND port — replacing host
+        // only left the old port and produced `host:5060:5061` (double port),
+        // which the SBC rejected as 400 Wrong URI.
+        let to = "<sip:bob@pcscf.example.com:5061;user=phone>";
+        let result = rewrite_uri_authority(to, "trunk.example.com:5060");
+        assert_eq!(
+            result,
+            "<sip:bob@trunk.example.com:5060;user=phone>"
+        );
+        // No double port anywhere in the result.
+        assert!(!result.contains(":5060:"));
+        assert!(!result.contains("5060:5061"));
+    }
+
+    #[test]
+    fn rewrite_uri_authority_drops_old_port_when_target_has_none() {
+        let to = "<sip:bob@10.0.0.1:5061;user=phone>";
+        let result = rewrite_uri_authority(to, "trunk.example.com");
+        assert_eq!(result, "<sip:bob@trunk.example.com;user=phone>");
+    }
+
+    #[test]
+    fn rewrite_uri_authority_no_original_port() {
+        let to = "<sip:bob@old.example.com;user=phone>";
+        let result = rewrite_uri_authority(to, "trunk.example.com:5060");
+        assert_eq!(result, "<sip:bob@trunk.example.com:5060;user=phone>");
+    }
+
+    #[test]
+    fn rewrite_uri_authority_no_params_no_port() {
+        let to = "<sip:bob@old.example.com>";
+        let result = rewrite_uri_authority(to, "trunk.example.com:5060");
+        assert_eq!(result, "<sip:bob@trunk.example.com:5060>");
+    }
+
+    #[test]
+    fn rewrite_uri_authority_display_name() {
+        let to = "\"Alice\" <sip:alice@old.example.net:5061;user=phone>";
+        let result = rewrite_uri_authority(to, "gw.example.net:5060");
+        assert_eq!(result, "\"Alice\" <sip:alice@gw.example.net:5060;user=phone>");
+    }
+
+    #[test]
+    fn rewrite_uri_authority_no_at_sign() {
+        let to = "<sip:host.a:5060>";
+        let result = rewrite_uri_authority(to, "gw.b:5060");
+        // No @ sign — returned unchanged.
+        assert_eq!(result, to);
     }
 
     // --- ensure_tag tests ---

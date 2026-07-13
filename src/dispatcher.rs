@@ -9107,29 +9107,28 @@ fn b2bua_send_b_leg_invite(
         if let Some(tag_start) = new_to.find(";tag=") {
             new_to = new_to[..tag_start].to_string();
         }
-        // Rewrite the To URI host.  Default: the dial-target host (topology
-        // hiding).  When the script pinned a host via `call.set_to_host()`,
-        // use that instead (host only — the original To port is preserved).
-        if let Some(at_pos) = new_to.find('@') {
-            let after_at = &new_to[at_pos + 1..];
-            let host_end = after_at.find(['>', ';', ':'])
-                .unwrap_or(after_at.len());
-            let end_pos = at_pos + 1 + host_end;
-            let replacement = if let Some(ref pinned) = to_host_override {
-                pinned.clone()
-            } else if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
-                // Include port if present in target
-                if let Some(port) = target_parsed.port {
-                    format!("{}:{}", target_parsed.host, port)
-                } else {
-                    target_parsed.host.clone()
-                }
-            } else {
-                // Unparseable target and no override — leave the host as-is.
-                new_to[at_pos + 1..end_pos].to_string()
+        // Rewrite the To URI host.
+        if let Some(ref pinned) = to_host_override {
+            // Script pinned a host via `call.set_to_host()`: host only — the
+            // original To port and URI params are preserved (documented
+            // `set_to_host` contract: `value` is a bare host, no port).
+            new_to = crate::b2bua::actor::rewrite_uri_host(&new_to, pinned);
+        } else if let Ok(target_parsed) = parse_uri_standalone(target_uri) {
+            // Default: topology-hide the To to the dial-target authority.  The
+            // original To host+port is siphon's own inbound address (leaked
+            // from the A-leg) and is meaningless on the B-leg, so replace host
+            // AND port with the target's `host[:port]`.  Replacing host-only
+            // here would leave the old `:port` in place and, when the target
+            // carries a port, emit a malformed `host:newport:oldport`
+            // (RFC 3261 §19.1.1 — a URI carries at most one port), which SBCs
+            // reject as `400 Wrong URI`.
+            let target_authority = match target_parsed.port {
+                Some(port) => format!("{}:{}", target_parsed.host, port),
+                None => target_parsed.host.clone(),
             };
-            new_to = format!("{}{}{}", &new_to[..at_pos + 1], replacement, &new_to[end_pos..]);
+            new_to = crate::b2bua::actor::rewrite_uri_authority(&new_to, &target_authority);
         }
+        // Unparseable target and no override — leave the To host untouched.
         b_leg_invite.headers.set("To", new_to);
     }
 

@@ -1401,21 +1401,48 @@ fn rewrite_uri_host_hides_private_ip_in_from() {
     use siphon::b2bua::actor::rewrite_uri_host;
 
     // Simulates BYE forwarding: A-leg From has private IP, must be rewritten
-    let from = "<sip:+alice@10.101.5.124>;tag=sb-17291b99bc2d";
-    let rewritten = rewrite_uri_host(from, "63.176.27.178");
-    assert_eq!(rewritten, "<sip:+alice@63.176.27.178>;tag=sb-17291b99bc2d");
-    assert!(!rewritten.contains("10.101.5.124"), "private IP must not leak");
+    let from = "<sip:alice@10.0.0.5>;tag=sb-17291b99bc2d";
+    let rewritten = rewrite_uri_host(from, "203.0.113.5");
+    assert_eq!(rewritten, "<sip:alice@203.0.113.5>;tag=sb-17291b99bc2d");
+    assert!(!rewritten.contains("10.0.0.5"), "private IP must not leak");
 }
 
 #[test]
 fn rewrite_uri_host_hides_private_ip_in_pai() {
     use siphon::b2bua::actor::rewrite_uri_host;
 
-    // Simulates PAI from A-leg: has RTT's private AWS IP
-    let pai = "<sip:+i52wkmRMaZ4u@172.31.47.238>";
-    let rewritten = rewrite_uri_host(pai, "63.176.27.178");
-    assert_eq!(rewritten, "<sip:+i52wkmRMaZ4u@63.176.27.178>");
-    assert!(!rewritten.contains("172.31.47.238"), "private IP must not leak");
+    // Simulates PAI from A-leg: has a private IP that must not leak downstream
+    let pai = "<sip:alice@10.0.0.6>";
+    let rewritten = rewrite_uri_host(pai, "203.0.113.5");
+    assert_eq!(rewritten, "<sip:alice@203.0.113.5>");
+    assert!(!rewritten.contains("10.0.0.6"), "private IP must not leak");
+}
+
+#[test]
+fn rewrite_uri_authority_no_double_port_when_topology_hiding_to() {
+    use siphon::b2bua::actor::rewrite_uri_authority;
+
+    // Regression: an inbound INVITE carried the callee's To against siphon's
+    // own inbound port (`pcscf.example.com:5061`).  When the B2BUA dials a
+    // trunk that itself advertises a port (`trunk.example.com:5060`), the
+    // To must be topology-hidden to the *whole* target authority.  Replacing
+    // host-only left the old port and emitted `trunk.example.com:5060:5061`
+    // (two ports on one URI, RFC 3261 §19.1.1 violation) which the trunk
+    // rejected with `400 Wrong URI`.
+    let to = "<sip:bob@pcscf.example.com:5061;user=phone>";
+    let rewritten = rewrite_uri_authority(to, "trunk.example.com:5060");
+    assert_eq!(
+        rewritten,
+        "<sip:bob@trunk.example.com:5060;user=phone>"
+    );
+    assert!(
+        !rewritten.contains("5060:5061"),
+        "double port must not appear: {rewritten}"
+    );
+    assert!(
+        !rewritten.contains("pcscf.example.com"),
+        "siphon's inbound host must not leak to the B-leg: {rewritten}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -87,6 +87,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   unaffected; there is no separate `answer_now()`.
 
 ### Fixed
+- **B2BUA no longer emits a malformed double-port To header on the B-leg
+  INVITE.** When topology-hiding the To URI to the dial target, siphon replaced
+  only the host token and left the original To port in place — so an inbound To
+  carrying siphon's own inbound port (e.g. `callee@pcscf.example:5061`) dialed to
+  a next-hop that advertises a port (`gw.example:5060`) produced
+  `gw.example:5060:5061`, two ports on one URI (RFC 3261 §19.1.1), which strict
+  SBCs reject with `400 Wrong URI`. The default (dial-target) rewrite now
+  replaces the whole `host[:port]` authority; the `call.set_to_host()` override
+  still rewrites host-only and preserves the original port per its documented
+  contract. Only the B2BUA was affected — a proxy does not rewrite To/From.
 - **B2BUA no longer emits a spurious `502 Bad Gateway` in response to a caller's
   ACK.** When a B2BUA forwarded a non-2xx final response (e.g. a relayed `407`)
   to the caller and the caller ACKed it, siphon could route that ACK as a fresh
