@@ -955,6 +955,10 @@ pub struct ZombieReInviteEntry {
     pub destination: SocketAddr,
     /// Transport protocol for the ACK.
     pub transport: Transport,
+    /// Local listener the ACK must leave from (the anchored leg's socket), when
+    /// known. Preserves multi-homed source-port parity for the post-teardown
+    /// re-ACK; `None` falls back to the default egress (single-listener hosts).
+    pub local_addr: Option<SocketAddr>,
 }
 
 /// Post-teardown state for a B-leg whose INVITE was CANCELled but might still
@@ -1345,6 +1349,7 @@ impl CallActorStore {
                             ZombieReInviteEntry {
                                 destination: b_leg.transport.remote_addr,
                                 transport: b_leg.transport.transport,
+                                local_addr: b_leg.transport.local_addr,
                             },
                         );
                     }

@@ -3892,9 +3892,14 @@ fn handle_response(
                 if let Some(sip_call_id) = message.headers.call_id() {
                     if let Some(zombie) = state.call_actors.get_zombie_reinvite(sip_call_id) {
                         let transport_str = format!("{}", zombie.transport).to_uppercase();
-                        let outbound_port = state.listen_addrs.get(&zombie.transport)
-                            .map(|a| a.port())
-                            .unwrap_or(state.local_addr.port());
+                        // Anchor the re-ACK Via to the zombie leg's socket (the A-leg's
+                        // arrival listener for a B→A re-INVITE) so it matches the source.
+                        let outbound_port = a_leg_advertised_port(
+                            zombie.local_addr,
+                            state.listen_addrs.get(&zombie.transport)
+                                .map(|a| a.port())
+                                .unwrap_or(state.local_addr.port()),
+                        );
                         let cseq_num = cseq_raw.split_whitespace().next()
                             .unwrap_or("1").to_string();
                         let from = message.headers.from().cloned().unwrap_or_default();
@@ -3924,7 +3929,15 @@ fn handle_response(
                                 return;
                             }
                         };
-                        send_b2bua_to_bleg(ack, zombie.transport, zombie.destination, state);
+                        // Source from the zombie leg's anchored socket (multi-homed
+                        // parity); reuse an established connection as before.
+                        let data = Bytes::from(ack.to_bytes());
+                        let target = RelayTarget {
+                            address: zombie.destination,
+                            transport: Some(zombie.transport),
+                            server_name: None,
+                        };
+                        send_to_target(data, &target, zombie.transport, ConnectionId::default(), zombie.local_addr, state);
                         debug!(
                             call_id = sip_call_id,
                             "B2BUA: zombie re-ACK for post-teardown re-INVITE 200 OK retransmission"
@@ -3985,12 +3998,15 @@ fn handle_response(
                     for action in &actions {
                         match action {
                             Action::SendMessage(ack_message) => {
-                                // RFC 3261 §17.1.1.3: send ACK for non-2xx back toward the UAS
-                                send_message(
+                                // RFC 3261 §17.1.1.3: send ACK for non-2xx back toward
+                                // the UAS, from the socket the response arrived on
+                                // (multi-homed source-port parity).
+                                send_message_from(
                                     ack_message.clone(),
                                     inbound.transport,
                                     inbound.remote_addr,
                                     inbound.connection_id,
+                                    Some(inbound.local_addr),
                                     state,
                                 );
                             }
@@ -6242,22 +6258,14 @@ fn send_outbound_from(
     }
 }
 
-/// Serialize a SIP message and send it to a specific destination.
-fn send_message(
-    message: SipMessage,
-    transport: Transport,
-    destination: SocketAddr,
-    connection_id: ConnectionId,
-    state: &DispatcherState,
-) {
-    send_message_from(message, transport, destination, connection_id, None, state);
-}
-
-/// Like [`send_message`] but pins the local egress address.  Used for
-/// reply-direction sends (responses to inbound requests, server-
-/// transaction retransmits) so the packet leaves on the same SA's
-/// local endpoint that the request arrived on — required by 3GPP
-/// TS 33.203 §7.4 for IPsec-protected REGISTER / MO INVITE cycles.
+/// Serialize a SIP message and send it to a specific destination, pinning the
+/// local egress socket via `source_local_addr`.  Used for reply-direction sends
+/// (responses to inbound requests, server-transaction retransmits, and
+/// siphon-originated in-dialog requests) so the packet leaves on the same local
+/// socket the dialog is anchored on — multi-homed source-port parity, and
+/// required by 3GPP TS 33.203 §7.4 for IPsec-protected REGISTER / MO INVITE
+/// cycles.  Pass `None` to fall back to the default egress (single-listener
+/// hosts / no anchor).
 fn send_message_from(
     message: SipMessage,
     transport: Transport,
@@ -10074,9 +10082,15 @@ fn handle_b2bua_response(
             if let Some((responder_dest, responder_transport)) = b_leg_dest {
                 if let Some((ref responder_cid, ref _responder_ftag)) = b_leg_dialog {
                     let transport_str = format!("{}", responder_transport).to_uppercase();
-                    let outbound_port = state.listen_addrs.get(&responder_transport)
-                        .map(|a| a.port())
-                        .unwrap_or(state.local_addr.port());
+                    // ACK Via sent-by port: the responder's anchored listener. When
+                    // the responder is the A-leg (B→A re-INVITE, !is_a2b) that's the
+                    // arrival socket on a multi-homed host; otherwise the default.
+                    let outbound_port = a_leg_advertised_port(
+                        if is_a2b { None } else { a_leg.transport.local_addr },
+                        state.listen_addrs.get(&responder_transport)
+                            .map(|a| a.port())
+                            .unwrap_or(state.local_addr.port()),
+                    );
                     let cseq_num = message.headers.cseq()
                         .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
                         .unwrap_or_else(|| "1".to_string());
@@ -10123,7 +10137,10 @@ fn handle_b2bua_response(
                     if is_a2b {
                         send_b2bua_to_bleg(ack, responder_transport, responder_dest, state);
                     } else {
-                        send_message(ack, responder_transport, responder_dest, a_leg.transport.connection_id, state);
+                        // ACK to the A-leg responder — source it from the A-leg's
+                        // anchored socket (multi-homed source-port parity; Via above
+                        // matches). No-op for single-listener hosts.
+                        send_message_from(ack, responder_transport, responder_dest, a_leg.transport.connection_id, a_leg.transport.local_addr, state);
                     }
                     debug!(
                         call_id = %call_id,
@@ -10273,9 +10290,15 @@ fn handle_b2bua_response(
             if let Some((responder_dest, responder_transport)) = b_leg_dest {
                 if let Some((ref responder_cid, ref _responder_ftag)) = b_leg_dialog {
                     let transport_str = format!("{}", responder_transport).to_uppercase();
-                    let outbound_port = state.listen_addrs.get(&responder_transport)
-                        .map(|a| a.port())
-                        .unwrap_or(state.local_addr.port());
+                    // ACK Via sent-by port: the responder's anchored listener. When
+                    // the responder is the A-leg (B→A re-INVITE, !is_a2b) that's the
+                    // arrival socket on a multi-homed host; otherwise the default.
+                    let outbound_port = a_leg_advertised_port(
+                        if is_a2b { None } else { a_leg.transport.local_addr },
+                        state.listen_addrs.get(&responder_transport)
+                            .map(|a| a.port())
+                            .unwrap_or(state.local_addr.port()),
+                    );
                     // Use the responder's CSeq (captured before originator CSeq restoration).
                     let cseq_num = responder_cseq_num.clone();
                     let from = message.headers.from().cloned().unwrap_or_default();
@@ -10321,7 +10344,10 @@ fn handle_b2bua_response(
                     if is_a2b {
                         send_b2bua_to_bleg(ack, responder_transport, responder_dest, state);
                     } else {
-                        send_message(ack, responder_transport, responder_dest, a_leg.transport.connection_id, state);
+                        // ACK to the A-leg responder — source it from the A-leg's
+                        // anchored socket (multi-homed source-port parity; Via above
+                        // matches). No-op for single-listener hosts.
+                        send_message_from(ack, responder_transport, responder_dest, a_leg.transport.connection_id, a_leg.transport.local_addr, state);
                     }
                 }
             }
@@ -13167,7 +13193,10 @@ fn handle_b2bua_reinvite(
                 remote_addr: send_dest,
                 connection_id: ConnectionId::default(),
                 transport: send_transport,
-                local_addr: None,
+                // Anchor the tracking leg on the target's socket (the A-leg's arrival
+                // listener for B→A) so a post-teardown zombie re-ACK to this leg
+                // still leaves from the right port on a multi-homed host.
+                local_addr: target_local_addr,
             },
         );
         reinvite_leg.stored_vias = originator_vias;
@@ -13476,7 +13505,10 @@ fn handle_b2bua_update(
                 remote_addr: send_dest,
                 connection_id: ConnectionId::default(),
                 transport: send_transport,
-                local_addr: None,
+                // Anchor the tracking leg on the target's socket (the A-leg's arrival
+                // listener for B→A) so a post-teardown zombie re-ACK to this leg
+                // still leaves from the right port on a multi-homed host.
+                local_addr: target_local_addr,
             },
         );
         update_leg.stored_vias = originator_vias;
