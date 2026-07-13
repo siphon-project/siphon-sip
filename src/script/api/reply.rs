@@ -100,6 +100,29 @@ impl PyReply {
     pub fn a_leg_message(&self) -> Option<Arc<Mutex<SipMessage>>> {
         self.a_leg_message.as_ref().map(Arc::clone)
     }
+
+    /// Source-membership predicate shared by the `from_gateway` pymethod and its
+    /// unit tests. Kept infallible: an absent/unparseable response source, a
+    /// missing manager, or an unknown group all resolve to `false`. The
+    /// `manager` seam lets tests inject a `DispatcherManager` without touching
+    /// the process singleton (a first-writer-wins `OnceLock`).
+    #[allow(clippy::wrong_self_convention)]
+    fn from_gateway_impl(
+        &self,
+        group_name: &str,
+        manager: Option<&Arc<crate::gateway::DispatcherManager>>,
+    ) -> bool {
+        let Some(source) = self.response_source_ip.as_deref() else {
+            return false;
+        };
+        let Ok(source_ip) = source.parse::<std::net::IpAddr>() else {
+            return false;
+        };
+        match manager {
+            Some(manager) => manager.source_in_group(group_name, source_ip),
+            None => false,
+        }
+    }
 }
 
 #[pymethods]
@@ -183,6 +206,52 @@ impl PyReply {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
         Ok(message.headers.content_type().cloned())
+    }
+
+    /// Source IP of the entity that sent this response, or `None` when siphon
+    /// did not observe a single wire source for it.
+    ///
+    /// Populated on `@proxy.on_reply`, `@proxy.on_failure` per-relay callbacks,
+    /// and the B2BUA `@b2bua.on_answer` / `@b2bua.on_early_media` replies (the
+    /// B-leg peer that answered). `None` on a fork-aggregated
+    /// `@proxy.on_failure` reply, where the "best" error is selected across
+    /// branches and no single source applies. Reply-side counterpart of
+    /// `request.source_ip`.
+    #[getter]
+    fn source_ip(&self) -> Option<String> {
+        self.response_source_ip.clone()
+    }
+
+    /// Source port of the entity that sent this response, or `None` (see
+    /// `source_ip` for when it is populated).
+    #[getter]
+    fn source_port(&self) -> Option<u16> {
+        self.response_source_port
+    }
+
+    /// True when the source IP of this response is a member of the resolved
+    /// addresses of the gateway group named `group_name`.
+    ///
+    /// The reply-side counterpart of `request.from_gateway` / `call.from_gateway`
+    /// — a routing-direction / trust predicate (siphon's answer to Kamailio
+    /// `ds_is_from_list()` / OpenSIPS `ds_is_in_list()`). Use it on a response to
+    /// decide which trunk actually answered, e.g. in `@proxy.on_reply` or
+    /// `@b2bua.on_answer`. Matches on IP only (source port ignored) against every
+    /// resolved A/AAAA candidate of every destination in the group.
+    ///
+    /// Infallible — returns `false` (never raises) when the group does not
+    /// exist, no gateway is configured, the response source is unknown (see
+    /// `source_ip`), or the source IP does not parse.
+    ///
+    /// Security: on connection-oriented transports (TCP/TLS/WS/WSS) the source
+    /// IP is handshake-verified and trustworthy as an authorization signal; on
+    /// UDP it is spoofable, so `from_gateway` there is a best-effort direction
+    /// hint, not an auth gate.
+    ///
+    /// Example: `if reply.from_gateway("carriers"): ...`
+    #[allow(clippy::wrong_self_convention)]
+    fn from_gateway(&self, group_name: &str) -> bool {
+        self.from_gateway_impl(group_name, super::gateway_manager())
     }
 
     /// Check if a header exists.
@@ -785,6 +854,99 @@ mod tests {
 
         // Should not error even without Contact header
         reply.fix_nated_contact().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // source_ip / source_port / from_gateway (source-membership predicate)
+    // -----------------------------------------------------------------------
+
+    fn gateway_manager_with_group() -> Arc<crate::gateway::DispatcherManager> {
+        use crate::gateway::{Algorithm, Destination, DispatcherGroup};
+        use crate::transport::Transport;
+
+        let manager = Arc::new(crate::gateway::DispatcherManager::new());
+        manager.add_group(DispatcherGroup::new(
+            "carriers".to_string(),
+            Algorithm::Weighted,
+            vec![Destination::new(
+                "sip:gw1.example.com".to_string(),
+                "10.0.0.1:5060".parse().unwrap(),
+                Transport::Udp,
+                1,
+                1,
+            )],
+        ));
+        manager
+    }
+
+    #[test]
+    fn source_ip_and_port_exposed_when_set() {
+        let message = Arc::new(Mutex::new(make_response(200, "OK")));
+        let reply = PyReply::new(message)
+            .with_response_source("10.0.0.1".to_string(), 5060);
+        assert_eq!(reply.source_ip(), Some("10.0.0.1".to_string()));
+        assert_eq!(reply.source_port(), Some(5060));
+    }
+
+    #[test]
+    fn source_ip_and_port_none_when_unset() {
+        let message = Arc::new(Mutex::new(make_response(200, "OK")));
+        let reply = PyReply::new(message);
+        assert_eq!(reply.source_ip(), None);
+        assert_eq!(reply.source_port(), None);
+    }
+
+    #[test]
+    fn from_gateway_true_for_member_source() {
+        let message = Arc::new(Mutex::new(make_response(200, "OK")));
+        let reply = PyReply::new(message)
+            .with_response_source("10.0.0.1".to_string(), 5060);
+        let manager = gateway_manager_with_group();
+        assert!(reply.from_gateway_impl("carriers", Some(&manager)));
+    }
+
+    #[test]
+    fn from_gateway_false_for_non_member_source() {
+        let message = Arc::new(Mutex::new(make_response(200, "OK")));
+        // RFC 5737 TEST-NET-1 — not a member of the group.
+        let reply = PyReply::new(message)
+            .with_response_source("192.0.2.7".to_string(), 5060);
+        let manager = gateway_manager_with_group();
+        assert!(!reply.from_gateway_impl("carriers", Some(&manager)));
+    }
+
+    #[test]
+    fn from_gateway_false_for_unknown_group() {
+        let message = Arc::new(Mutex::new(make_response(200, "OK")));
+        let reply = PyReply::new(message)
+            .with_response_source("10.0.0.1".to_string(), 5060);
+        let manager = gateway_manager_with_group();
+        assert!(!reply.from_gateway_impl("nonexistent", Some(&manager)));
+    }
+
+    #[test]
+    fn from_gateway_false_when_source_unset() {
+        let message = Arc::new(Mutex::new(make_response(200, "OK")));
+        let reply = PyReply::new(message);
+        let manager = gateway_manager_with_group();
+        assert!(!reply.from_gateway_impl("carriers", Some(&manager)));
+    }
+
+    #[test]
+    fn from_gateway_false_when_no_manager() {
+        let message = Arc::new(Mutex::new(make_response(200, "OK")));
+        let reply = PyReply::new(message)
+            .with_response_source("10.0.0.1".to_string(), 5060);
+        assert!(!reply.from_gateway_impl("carriers", None));
+    }
+
+    #[test]
+    fn from_gateway_false_for_unparseable_source_ip() {
+        let message = Arc::new(Mutex::new(make_response(200, "OK")));
+        let reply = PyReply::new(message)
+            .with_response_source("not-an-ip".to_string(), 5060);
+        let manager = gateway_manager_with_group();
+        assert!(!reply.from_gateway_impl("carriers", Some(&manager)));
     }
 
     // -----------------------------------------------------------------------
