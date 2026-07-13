@@ -915,6 +915,72 @@ auth:
 #     require_tnauthlist: false    # require RFC 8226 TNAuthList on the leaf
 
 # ---------------------------------------------------------------------------
+# E.164 number normalization (identity headers)
+# ---------------------------------------------------------------------------
+# Drives request.rewrite_identities() / call.rewrite_identities() /
+# call.dial(number_policy=…).  One call reformats the dialable userpart of every
+# identity header (From, To, P-Asserted-Identity, P-Preferred-Identity, the
+# Request-URI, and opt-in Referred-By / Remote-Party-ID) into a target shape:
+#   e164          +31612345678     (leading +, country code, NSN)
+#   plain          31612345678     (E.164 digits, no +)
+#   international 0031612345678     (international access prefix + digits)
+#   national         0612345678     (national trunk prefix + NSN; home country
+#                                    only — a foreign number falls back to the
+#                                    international access form)
+# Display names, tags, hosts, non-numbers and preserved service/emergency codes
+# are left untouched.
+#
+# `numbering:` is the home plan used to parse and format.  Country code is the
+# numeric calling code (digits), not an ISO code.
+#
+# numbering:
+#   country_code: "31"           # home country calling code (e.g. 31 = NL)
+#   trunk_prefix: "0"            # national dialling prefix
+#   international_prefix: "00"    # international access prefix
+#   assume: national             # how to read a bare, prefix-less number:
+#                                #   national (prepend the country code) |
+#                                #   international (already full, missing the +)
+#   min_national_digits: 5       # bare/national numbers shorter than this are
+#                                #   treated as short codes and left untouched
+#
+# `number_policies:` are named, versioned presets referenced by
+# request.rewrite_identities("<name>") / call.dial(number_policy="<name>").
+#
+# number_policies:
+#   "ims-e164@2026":                    # canonical +E.164 for the IMS core
+#     default: e164
+#
+#   "teams-outbound@2026":
+#     default: e164
+#     headers:                          # per-header format overrides
+#       request-uri: e164
+#       P-Asserted-Identity: e164
+#
+#   "pstn-national@2026":
+#     default: national
+#     headers:
+#       request-uri: national           # what the trunk dials
+#       From: international              # CLI presented as 00-intl
+#       P-Asserted-Identity: international
+#     on_unparseable: keep              # keep | strip (P-headers only)
+#     preserve_users: ["112", "911", "0800*"]   # never touched (globs ok)
+#     # walk: [From, To, request-uri]   # explicit walk set (else default+headers)
+#     # Per-policy home override (multi-country edges):
+#     # country_code: "44"
+#     # trunk_prefix: "0"
+#     # international_prefix: "00"
+#     # assume: national
+#     diversion:                        # opt-in — Diversion (RFC 5806) +
+#       format: e164                    #   History-Info (RFC 7044) family.
+#       apply_to: [Diversion, History-Info]   # per-entry userpart rewrite;
+#       respect_privacy: true           #   index/reason/cause/order preserved,
+#                                       #   privacy-restricted entries skipped.
+#
+# B2BUA default (applied when a call doesn't pass number_policy=):
+# b2bua:
+#   default_number_policy: "ims-e164@2026"
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 log:

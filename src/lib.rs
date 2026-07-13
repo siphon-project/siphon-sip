@@ -13,6 +13,7 @@ pub mod hep;
 pub mod error;
 pub mod firewall;
 pub mod nat;
+pub mod numbers;
 pub mod presence;
 pub mod proxy;
 pub mod gateway;

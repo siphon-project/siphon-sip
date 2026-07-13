@@ -1104,3 +1104,31 @@ class _QosNamespace:
 
 
 qos = _QosNamespace()
+
+
+# ---------------------------------------------------------------------------
+# numbers namespace (stub — replaced by Rust at startup)
+# ---------------------------------------------------------------------------
+
+class _NumbersNamespace:
+    """E.164 number parsing / formatting (stub).
+
+    Usage:
+        from siphon import numbers
+
+        n = numbers.parse("0031612345678")
+        n.e164        # "+31612345678"
+        n.national    # "0612345678"
+        n.format("plain")
+    """
+
+    def parse(self, raw, home=None):
+        raise NotImplementedError(
+            "numbers.parse() not available — numbers namespace not initialized"
+        )
+
+    def policy_names(self):
+        return []
+
+
+numbers = _NumbersNamespace()

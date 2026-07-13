@@ -24,6 +24,27 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   elapsed).
 
 ### Added
+- **E.164 number normalization for identity headers — the `numbers` namespace,
+  `request.rewrite_identities()` / `call.rewrite_identities()`, and
+  `call.dial(number_policy=…)` / `call.fork(number_policy=…)`.** One call
+  reformats every dialable identity userpart (`From`, `To`,
+  `P-Asserted-Identity`, `P-Preferred-Identity`, the Request-URI, and opt-in
+  `Referred-By` / `Remote-Party-ID`) into a target shape — `e164` (`+31…`),
+  `plain` (`31…`), `international` (`0031…`) or `national` (`0…`) — driven by a
+  home numbering plan (`numbering:`) and named, versioned presets
+  (`number_policies:`). Display names, tags, hosts, non-numbers and preserved
+  service/emergency codes (`preserve_users`) are left untouched; a national form
+  of a foreign number falls back to the international access form. The `numbers`
+  namespace exposes `numbers.parse(raw, home=None)` returning a `Number` with
+  `.e164` / `.plain` / `.international` / `.national` / `.cc` / `.nsn` /
+  `.format(...)`. On the B2BUA path, `number_policy=` (or
+  `b2bua.default_number_policy`) normalizes the A-leg identity headers that flow
+  to the B-leg plus the dial/fork target as the final step before the INVITE is
+  built. An opt-in `diversion:` block extends the walk to the `Diversion` (RFC
+  5806) and `History-Info` (RFC 7044) family with structured, per-entry rewrites
+  that preserve `index`, `reason`, the embedded escaped `cause`, entry ordering,
+  and privacy-restricted entries (`respect_privacy`). Mirrored in the
+  `siphon-sip` SDK (`numbers` mock + `rewrite_identities` / `number_policy=`).
 - **`reply.from_gateway(group)` / `reply.source_ip` / `reply.source_port`** —
   source-membership predicate on the response path, the reply-side counterpart of
   `request.from_gateway` / `call.from_gateway` (Kamailio `ds_is_from_list()` /

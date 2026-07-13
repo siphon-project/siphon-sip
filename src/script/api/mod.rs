@@ -19,6 +19,7 @@ pub mod isc;
 pub mod li;
 pub mod log;
 pub mod metrics;
+pub mod numbers;
 pub mod presence;
 pub mod proxy_utils;
 pub mod qos;
@@ -52,6 +53,7 @@ pub const BUILT_IN_NAMESPACE_NAMES: &[&str] = &[
     "log",
     "cache",
     "metrics",
+    "numbers",
     "sdp",
     "timer",
     "isc",
@@ -115,6 +117,10 @@ static METRICS_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// SDP namespace singleton — always available (stateless parser, no config needed).
 static SDP_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
+
+/// numbers namespace singleton — always available (stateless E.164 parser; the
+/// home locale / policies come from the process-wide number runtime).
+static NUMBERS_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// QoS namespace singleton — always available (stateless SDP→IPFilterRule helper).
 static QOS_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
@@ -397,6 +403,18 @@ pub fn set_sdp_singleton(python: Python<'_>) -> Result<()> {
         .map_err(|error| SiphonError::Script(format!("Py::new(sdp): {error}")))?
         .into_any();
     let _ = SDP_SINGLETON.set(sdp_py);
+    Ok(())
+}
+
+/// Store the numbers namespace singleton for injection into the siphon module.
+///
+/// Always called at startup — stateless E.164 parser; the home locale and named
+/// policies are read from the process-wide number runtime.
+pub fn set_numbers_singleton(python: Python<'_>) -> Result<()> {
+    let numbers_py: Py<PyAny> = Py::new(python, numbers::PyNumbersNamespace::new())
+        .map_err(|error| SiphonError::Script(format!("Py::new(numbers): {error}")))?
+        .into_any();
+    let _ = NUMBERS_SINGLETON.set(numbers_py);
     Ok(())
 }
 
@@ -731,6 +749,13 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
         module
             .setattr("sdp", sdp_py.bind(python))
             .map_err(|error| SiphonError::Script(format!("setattr sdp: {error}")))?;
+    }
+
+    // Inject numbers namespace singleton (always available — E.164 parser).
+    if let Some(numbers_py) = NUMBERS_SINGLETON.get() {
+        module
+            .setattr("numbers", numbers_py.bind(python))
+            .map_err(|error| SiphonError::Script(format!("setattr numbers: {error}")))?;
     }
 
     // Inject QoS namespace singleton (always available — stateless helper).

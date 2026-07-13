@@ -18,8 +18,8 @@ class TestRequestUriSetters:
 
     def test_set_to_uri_replaces_uri(self):
         request = Request(to_uri="sip:bob@biloxi.com")
-        request.set_to_uri("sip:5112@ims.example.org")
-        assert request.to_uri.user == "5112"
+        request.set_to_uri("sip:1000@ims.example.org")
+        assert request.to_uri.user == "1000"
         assert request.to_uri.host == "ims.example.org"
 
     def test_set_contact_uri_replaces_contact(self):
@@ -72,8 +72,8 @@ class TestCallUriSetters:
 
     def test_set_to_uri_replaces_uri(self):
         call = Call(to_uri="sip:bob@example.com")
-        call.set_to_uri("sip:5112@ims.example.org")
-        assert call.to_uri.user == "5112"
+        call.set_to_uri("sip:1000@ims.example.org")
+        assert call.to_uri.user == "1000"
         assert call.to_uri.host == "ims.example.org"
 
     def test_set_contact_user_records_override(self):
