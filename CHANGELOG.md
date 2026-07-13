@@ -37,6 +37,21 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   best-effort direction hint on UDP). Returns `False` / `None` where no single
   source applies — e.g. a fork-aggregated `@proxy.on_failure` reply. Mirrored in
   the SDK mock.
+- **Media CDR from the engine's end-of-call summary** — on the native
+  `siphon-rtp` backend (`siphon-rtp-proto` 0.1.4), the engine now pushes a
+  structured `CallSummary` event when it tears a call down. When `cdr.auto_emit`
+  is on, siphon writes a `method="MEDIA"` CDR keyed on the SIP Call-ID (so a
+  collector joins it to the SIP-side CDR) carrying the per-leg byte/packet
+  counters and, where a userspace media actor measured them, the RFC 3550
+  loss/jitter and ITU-T G.107 MOS shape — the structured twin of the engine's
+  media log, no log scraping. Per-leg figures are flattened under `near_`
+  (offerer) / `far_` (answerer) / `leg{n}_` prefixes (`_codec`, `_packets_in`,
+  `_bytes_out`, `_packets_dropped`, and when measured `_ssrc`, `_packets_lost`,
+  `_loss_percent`, `_jitter_ms`, `_rtt_ms`, `_mos_average`/`_min`/`_max`,
+  `_mos_basis`); top-level `media_reason` (`delete` / `media_timeout`) and
+  `media_duration_ms` accompany the standard `duration_secs`. Unmeasured fields
+  are omitted, not emitted empty. The rtpengine / rtpproxy backends do not
+  surface this event, so no media CDR is written there.
 - **`call.dial(..., auth_passthrough=True)` / `call.fork(..., auth_passthrough=True)`** —
   relay B-leg authentication to the caller end-to-end instead of siphon answering
   it (RFC 3261 §22.3), for device-driven proxy auth where the endpoint (not siphon)

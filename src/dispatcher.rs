@@ -1057,6 +1057,24 @@ pub async fn run(
                         })
                         .await;
                     }
+                    crate::rtpengine::events::RtpEngineEvent::CallSummary(summary) => {
+                        // The media engine reports the end-of-call byte/packet
+                        // counters and (when a userspace actor measured them) the
+                        // RFC 3550 loss/jitter + ITU-T G.107 MOS shape. Write a
+                        // media CDR keyed on the SIP Call-ID so a collector joins
+                        // it to the SIP-side CDR — the structured twin of the
+                        // engine's `siphon_rtp::cdr` log, no log scraping. Gated
+                        // on auto-emit, same as the proxy/b2bua lifecycle CDRs.
+                        tracing::debug!(
+                            call_id = %summary.call_id,
+                            reason = %summary.reason,
+                            legs = summary.legs.len(),
+                            "media engine reported end-of-call summary"
+                        );
+                        if crate::cdr::auto_emit_enabled() {
+                            crate::cdr::write(media_summary_to_cdr(&summary));
+                        }
+                    }
                     crate::rtpengine::events::RtpEngineEvent::Unknown { event, call_id, .. } => {
                         tracing::debug!(
                             %event,
@@ -6684,6 +6702,85 @@ fn cdr_emit_register(aor: &str, event_type: &str) {
     .with_response_code(200)
     .with_extra("reg_event".to_string(), event_type.to_string());
     crate::cdr::write(cdr);
+}
+
+/// Build a media CDR from a media-engine end-of-call summary.
+///
+/// A `method="MEDIA"` record keyed on the SIP Call-ID so a collector joins it to
+/// the SIP-side CDR (which carries the URIs and disconnect side). The SIP URI /
+/// source / transport fields are empty — the media summary carries none; the
+/// join key is the Call-ID. `duration_secs` is the media call lifetime, with the
+/// exact value also in `media_duration_ms`, and `media_reason` records why the
+/// call ended (`"delete"` / `"media_timeout"`).
+///
+/// Each leg's figures are flattened into `extra`: index 0 → `near_`, index 1 →
+/// `far_`, any further leg → `leg{n}_`. Unmeasured optional fields (a plain
+/// in-kernel relay leg has no MOS/loss/jitter) are omitted, not emitted empty.
+fn media_summary_to_cdr(summary: &crate::rtpengine::events::CallSummary) -> crate::cdr::Cdr {
+    let mut cdr = crate::cdr::Cdr::new(
+        summary.call_id.clone(),
+        String::new(), // from_uri — not carried by the media summary
+        String::new(), // to_uri
+        String::new(), // ruri
+        "MEDIA".to_string(),
+        String::new(), // source_ip
+        String::new(), // transport
+    )
+    .with_duration(summary.duration_ms as f64 / 1000.0)
+    .with_extra("media_reason".to_string(), summary.reason.clone())
+    .with_extra(
+        "media_duration_ms".to_string(),
+        summary.duration_ms.to_string(),
+    );
+
+    for (index, leg) in summary.legs.iter().enumerate() {
+        let prefix = match index {
+            0 => "near".to_string(),
+            1 => "far".to_string(),
+            n => format!("leg{n}"),
+        };
+        let extra = &mut cdr.extra;
+        let mut put = |suffix: &str, value: String| {
+            extra.insert(format!("{prefix}_{suffix}"), value);
+        };
+        put("tag", leg.tag.clone());
+        if let Some(codec) = &leg.codec {
+            put("codec", codec.clone());
+        }
+        put("packets_in", leg.packets_in.to_string());
+        put("bytes_in", leg.bytes_in.to_string());
+        put("packets_out", leg.packets_out.to_string());
+        put("bytes_out", leg.bytes_out.to_string());
+        put("packets_dropped", leg.packets_dropped.to_string());
+        if let Some(ssrc) = leg.ssrc {
+            put("ssrc", ssrc.to_string());
+        }
+        if let Some(packets_lost) = leg.packets_lost {
+            put("packets_lost", packets_lost.to_string());
+        }
+        if let Some(loss_percent) = leg.loss_percent {
+            put("loss_percent", loss_percent.to_string());
+        }
+        if let Some(jitter_ms) = leg.jitter_ms {
+            put("jitter_ms", jitter_ms.to_string());
+        }
+        if let Some(rtt_ms) = leg.rtt_ms {
+            put("rtt_ms", rtt_ms.to_string());
+        }
+        if let Some(mos_average) = leg.mos_average {
+            put("mos_average", mos_average.to_string());
+        }
+        if let Some(mos_min) = leg.mos_min {
+            put("mos_min", mos_min.to_string());
+        }
+        if let Some(mos_max) = leg.mos_max {
+            put("mos_max", mos_max.to_string());
+        }
+        if let Some(mos_basis) = &leg.mos_basis {
+            put("mos_basis", mos_basis.clone());
+        }
+    }
+    cdr
 }
 
 /// Proxy CDR START — the proxy is relaying/forking an INVITE. Records the call
@@ -13716,6 +13813,132 @@ mod tests {
     use crate::sip::parser::parse_sip_message;
     use crate::sip::uri::SipUri;
     use crate::sip::builder::SipMessageBuilder;
+
+    // -----------------------------------------------------------------------
+    // Media CDR from an end-of-call summary (media.backend: siphon-rtp)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn media_summary_to_cdr_flattens_legs() {
+        use crate::rtpengine::events::{CallLegSummary, CallSummary};
+
+        fn measured_leg(tag: &str, codec: &str) -> CallLegSummary {
+            CallLegSummary {
+                tag: tag.to_string(),
+                codec: Some(codec.to_string()),
+                packets_in: 2100,
+                bytes_in: 336_000,
+                packets_out: 2098,
+                bytes_out: 335_680,
+                packets_dropped: 2,
+                ssrc: Some(0x0102_0304),
+                packets_lost: Some(6),
+                loss_percent: Some(0.3),
+                jitter_ms: Some(4.2),
+                rtt_ms: Some(21.0),
+                mos_average: Some(4.11),
+                mos_min: Some(3.9),
+                mos_max: Some(4.3),
+                mos_basis: Some("full".to_string()),
+            }
+        }
+
+        // A counters-only far leg (plain in-kernel relay, no actor) — every
+        // quality field is None and must be omitted from the CDR, not empty.
+        let far = CallLegSummary {
+            tag: "far-tag".to_string(),
+            codec: None,
+            packets_in: 2099,
+            bytes_in: 335_840,
+            packets_out: 2100,
+            bytes_out: 336_000,
+            packets_dropped: 0,
+            ssrc: None,
+            packets_lost: None,
+            loss_percent: None,
+            jitter_ms: None,
+            rtt_ms: None,
+            mos_average: None,
+            mos_min: None,
+            mos_max: None,
+            mos_basis: None,
+        };
+
+        let summary = CallSummary {
+            call_id: "call-9".to_string(),
+            reason: "delete".to_string(),
+            duration_ms: 42_500,
+            legs: vec![measured_leg("near-tag", "AMR-WB"), far],
+        };
+
+        let cdr = media_summary_to_cdr(&summary);
+
+        assert_eq!(cdr.call_id, "call-9");
+        assert_eq!(cdr.method, "MEDIA");
+        assert_eq!(cdr.response_code, 0);
+        // Media lifetime surfaces both as the standard duration and precisely.
+        assert!((cdr.duration_secs - 42.5).abs() < 1e-9);
+        assert_eq!(cdr.extra.get("media_duration_ms").map(String::as_str), Some("42500"));
+        assert_eq!(cdr.extra.get("media_reason").map(String::as_str), Some("delete"));
+
+        // Near (measured) leg — counters + quality present under `near_`.
+        assert_eq!(cdr.extra.get("near_tag").map(String::as_str), Some("near-tag"));
+        assert_eq!(cdr.extra.get("near_codec").map(String::as_str), Some("AMR-WB"));
+        assert_eq!(cdr.extra.get("near_packets_in").map(String::as_str), Some("2100"));
+        assert_eq!(cdr.extra.get("near_bytes_out").map(String::as_str), Some("335680"));
+        assert_eq!(cdr.extra.get("near_packets_dropped").map(String::as_str), Some("2"));
+        assert_eq!(cdr.extra.get("near_packets_lost").map(String::as_str), Some("6"));
+        assert_eq!(cdr.extra.get("near_loss_percent").map(String::as_str), Some("0.3"));
+        assert_eq!(cdr.extra.get("near_mos_average").map(String::as_str), Some("4.11"));
+        assert_eq!(cdr.extra.get("near_mos_basis").map(String::as_str), Some("full"));
+
+        // Far (counters-only) leg — quality fields omitted entirely.
+        assert_eq!(cdr.extra.get("far_tag").map(String::as_str), Some("far-tag"));
+        assert_eq!(cdr.extra.get("far_packets_in").map(String::as_str), Some("2099"));
+        assert!(!cdr.extra.contains_key("far_codec"));
+        assert!(!cdr.extra.contains_key("far_ssrc"));
+        assert!(!cdr.extra.contains_key("far_mos_average"));
+        assert!(!cdr.extra.contains_key("far_mos_basis"));
+    }
+
+    #[test]
+    fn media_summary_to_cdr_indexes_extra_legs() {
+        use crate::rtpengine::events::{CallLegSummary, CallSummary};
+
+        fn bare_leg(tag: &str) -> CallLegSummary {
+            CallLegSummary {
+                tag: tag.to_string(),
+                codec: None,
+                packets_in: 1,
+                bytes_in: 2,
+                packets_out: 3,
+                bytes_out: 4,
+                packets_dropped: 0,
+                ssrc: None,
+                packets_lost: None,
+                loss_percent: None,
+                jitter_ms: None,
+                rtt_ms: None,
+                mos_average: None,
+                mos_min: None,
+                mos_max: None,
+                mos_basis: None,
+            }
+        }
+
+        // A third leg (MPTY / conference) indexes as `leg2_`, not near/far.
+        let summary = CallSummary {
+            call_id: "conf-1".to_string(),
+            reason: "media_timeout".to_string(),
+            duration_ms: 1_000,
+            legs: vec![bare_leg("a"), bare_leg("b"), bare_leg("c")],
+        };
+        let cdr = media_summary_to_cdr(&summary);
+        assert_eq!(cdr.extra.get("near_tag").map(String::as_str), Some("a"));
+        assert_eq!(cdr.extra.get("far_tag").map(String::as_str), Some("b"));
+        assert_eq!(cdr.extra.get("leg2_tag").map(String::as_str), Some("c"));
+        assert_eq!(cdr.extra.get("media_reason").map(String::as_str), Some("media_timeout"));
+    }
 
     // -----------------------------------------------------------------------
     // Imperative B2BUA terminate helpers (b2bua.terminate / session timer)

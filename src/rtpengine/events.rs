@@ -35,6 +35,14 @@ pub enum RtpEngineEvent {
         call_id: String,
         from_tag: String,
     },
+    /// End-of-call media summary (the structured twin of the `siphon_rtp::cdr`
+    /// log block), emitted once when the engine tears a call down.  Carries the
+    /// per-leg byte/packet counters and, when a userspace media actor measured
+    /// them, the RFC 3550 loss/jitter and ITU-T G.107 MOS shape — so siphon
+    /// writes a media CDR (correlated to the SIP CDR by Call-ID) instead of
+    /// scraping logs.  Emitted by the `siphon-rtp` native backend only; the
+    /// rtpengine NG backend does not surface it.
+    CallSummary(CallSummary),
     /// An event we didn't recognise — passed through for logging.
     Unknown {
         event: String,
@@ -59,6 +67,63 @@ pub struct DtmfEvent {
     pub volume: i32,
     /// rtpengine's view of the media source (IP:port) — informational.
     pub source: Option<String>,
+}
+
+/// End-of-call media summary for one call, carried by
+/// [`RtpEngineEvent::CallSummary`].  A siphon-sip-owned mirror of the native
+/// backend's `siphon_rtp_proto::Event::CallSummary` payload, so this generic
+/// event enum stays free of the proto type (same posture as `MediaTimeout`
+/// being native-only).
+#[derive(Debug, Clone)]
+pub struct CallSummary {
+    /// SIP Call-ID the media session was keyed on — correlates to the SIP CDR.
+    pub call_id: String,
+    /// Why the call ended: `"delete"` (controller teardown) or `"media_timeout"`
+    /// (dead-path reap).
+    pub reason: String,
+    /// Call lifetime in milliseconds (logical-clock resolution, ~1 s grain).
+    pub duration_ms: u64,
+    /// One entry per leg — index 0 is the near (offerer) leg, index 1 the far
+    /// (answerer) leg.
+    pub legs: Vec<CallLegSummary>,
+}
+
+/// One leg's end-of-call figures in a [`CallSummary`].  The quality fields are
+/// `None` on a leg with no userspace actor (a plain in-kernel relay) or one that
+/// never received media, so a consumer can tell "counters only" from "measured".
+#[derive(Debug, Clone)]
+pub struct CallLegSummary {
+    /// The leg's tag: the offerer's `from_tag` (near) or the answerer's `to_tag`
+    /// (far).
+    pub tag: String,
+    /// The leg's negotiated audio codec name, if known.
+    pub codec: Option<String>,
+    pub packets_in: u64,
+    pub bytes_in: u64,
+    pub packets_out: u64,
+    pub bytes_out: u64,
+    /// Packets dropped on the engine's side of this leg (source-gate / latch /
+    /// jitter overflow), not network loss.
+    pub packets_dropped: u64,
+    /// The inbound stream's SSRC (RFC 3550), when measured.
+    pub ssrc: Option<u32>,
+    /// Cumulative network packets lost on the inbound stream (RFC 3550 §6.4.1),
+    /// when measured.
+    pub packets_lost: Option<u32>,
+    /// Inbound network packet loss as a percentage, when measured.
+    pub loss_percent: Option<f64>,
+    /// Inbound interarrival jitter in milliseconds (RFC 3550 §6.4.1), when measured.
+    pub jitter_ms: Option<f64>,
+    /// Engine↔peer round-trip time in milliseconds, when a reception report
+    /// yielded one.
+    pub rtt_ms: Option<f64>,
+    /// Mean / lowest / highest ITU-T G.107 MOS across the call, when measured.
+    pub mos_average: Option<f64>,
+    pub mos_min: Option<f64>,
+    pub mos_max: Option<f64>,
+    /// `"full"` (MOS includes the G.107 delay term) or `"loss+jitter"` — how the
+    /// MOS was derived.
+    pub mos_basis: Option<String>,
 }
 
 /// Helpers for extracting values from a bencoded event dict.
