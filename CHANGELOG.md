@@ -135,6 +135,25 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   an OPTIONS probe), which reaps only genuinely gone UEs. Non-IPsec stream
   closes (plain TCP, WSS WebRTC) keep the immediate flow-failure deregistration
   and network-dereg cascade unchanged. No config change.
+- **SA-idle liveness sweep no longer network-deregisters a live VoLTE UE that
+  races an ECM-IDLE → paging window.** Two compounding defects made the sweep
+  probe a healthy UE every 30 s and deregister it whenever a probe landed during
+  a normal idle→reconnect transition: (1) it aged bindings only on the kernel
+  XFRM inbound `use_time`, which on some kernels does not advance on an
+  inbound-answered SA, so a UE answering its keepalive/OPTIONS every 30 s still
+  looked perpetually idle; and (2) the OPTIONS probe gave up in ~4 s, shorter
+  than an idle UE's paging + reconnect (seconds), so a probe sent into a paging
+  window false-reaped a live UE. The sweep now folds siphon's own SIP-layer
+  last-seen (refreshed on any message arriving on a P-CSCF protected port —
+  REGISTER, SUBSCRIBE, in-dialog, and the OPTIONS 200) into its idle test, so a
+  UE that just answered anything is not re-probed for a full idle window; and a
+  suspect binding must fail its probe on `registrar.liveness.miss_threshold`
+  consecutive sweeps (default 2) before it is deregistered, so a UE mid-wakeup
+  misses one sweep and survives on the next. The per-attempt probe timeout
+  default is raised 2000 → 4000 ms (one paging + reconnect). A genuinely gone UE
+  (reboot / airplane mode) still reaps after the grace with the network
+  `Expires: 0` de-REGISTER. New knob `registrar.liveness.miss_threshold` (default
+  2); no config change required.
 
 ## [1.3.0] — 2026-07-10
 
