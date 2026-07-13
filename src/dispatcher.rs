@@ -983,6 +983,17 @@ pub async fn run(
                         call_id,
                         from_tag,
                     } => {
+                        // The media engine owns the call and reaped it on timeout
+                        // (the reaper removes the call *before* emitting this
+                        // event), so drop our own per-call media bookkeeping now.
+                        // The teardown that any @rtpengine.on_media_timeout handler
+                        // drives (e.g. b2bua.terminate) then finds no record and
+                        // issues no safety-net delete against a call the engine
+                        // already dropped — no wasted round-trip, no "unknown call".
+                        clear_media_session_on_timeout(
+                            state_for_events.rtpengine_sessions.as_ref(),
+                            &call_id,
+                        );
                         // The media engine tore down a dead-path call. Log it for
                         // visibility regardless of whether a script handles it,
                         // then invoke any @rtpengine.on_media_timeout handlers so
@@ -1064,6 +1075,30 @@ pub async fn run(
     }
 
     info!("dispatcher shutting down (inbound channel closed)");
+}
+
+/// Drop siphon-sip's own media-session bookkeeping for a call the media engine
+/// already reaped (media-timeout). The engine owns the call and tore it down
+/// before emitting the `MediaTimeout` event, so a later safety-net `delete`
+/// would just return "unknown call". Every safety-net delete site is gated on
+/// `if let Some(session) = rtpengine_sessions.remove(&…)`, so removing the
+/// record here makes those sites no-ops — no delete is issued.
+///
+/// Returns true if a record was actually present (i.e. we cleared something).
+fn clear_media_session_on_timeout(
+    rtpengine_sessions: Option<&Arc<crate::rtpengine::session::MediaSessionStore>>,
+    call_id: &str,
+) -> bool {
+    match rtpengine_sessions {
+        Some(store) if store.remove(call_id).is_some() => {
+            debug!(
+                %call_id,
+                "media timeout: dropped media-session bookkeeping (engine already reaped call)"
+            );
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Fire all expired timers in the timer wheel.
@@ -8304,7 +8339,11 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
             let set = Arc::clone(rtpengine_set);
             tokio::spawn(async move {
                 if let Err(error) = set.delete(&session.call_id, &session.from_tag).await {
-                    warn!(call_id = %session.call_id, "safety-net RTPEngine delete failed (timeout): {error}");
+                    if error.is_call_not_found() {
+                        debug!(call_id = %session.call_id, "safety-net RTPEngine delete (timeout): call already gone ({error})");
+                    } else {
+                        warn!(call_id = %session.call_id, "safety-net RTPEngine delete failed (timeout): {error}");
+                    }
                 }
             });
         }
@@ -11484,7 +11523,11 @@ fn handle_b2bua_response(
                 let set = Arc::clone(rtpengine_set);
                 tokio::spawn(async move {
                     if let Err(error) = set.delete(&session.call_id, &session.from_tag).await {
-                        warn!(call_id = %session.call_id, "safety-net RTPEngine delete failed: {error}");
+                        if error.is_call_not_found() {
+                            debug!(call_id = %session.call_id, "safety-net RTPEngine delete: call already gone ({error})");
+                        } else {
+                            warn!(call_id = %session.call_id, "safety-net RTPEngine delete failed: {error}");
+                        }
                     }
                 });
             }
@@ -11822,7 +11865,11 @@ fn handle_b2bua_bye(
             let set = Arc::clone(rtpengine_set);
             tokio::spawn(async move {
                 if let Err(error) = set.delete(&session.call_id, &session.from_tag).await {
-                    warn!(call_id = %session.call_id, "safety-net RTPEngine delete failed: {error}");
+                    if error.is_call_not_found() {
+                        debug!(call_id = %session.call_id, "safety-net RTPEngine delete: call already gone ({error})");
+                    } else {
+                        warn!(call_id = %session.call_id, "safety-net RTPEngine delete failed: {error}");
+                    }
                 }
             });
         }
@@ -12141,7 +12188,11 @@ fn b2bua_terminate_call_inner(
             let set = Arc::clone(rtpengine_set);
             tokio::spawn(async move {
                 if let Err(error) = set.delete(&session.call_id, &session.from_tag).await {
-                    warn!(call_id = %session.call_id, "safety-net RTPEngine delete failed: {error}");
+                    if error.is_call_not_found() {
+                        debug!(call_id = %session.call_id, "safety-net RTPEngine delete: call already gone ({error})");
+                    } else {
+                        warn!(call_id = %session.call_id, "safety-net RTPEngine delete failed: {error}");
+                    }
                 }
             });
         }
@@ -15957,6 +16008,56 @@ a=rtpmap:8 PCMA/8000\r\n";
             parse_contact_expires("<sip:trunk@10.0.0.1:5060>;q=0.8;expires=900;+sip.instance=\"<urn:uuid:abc>\""),
             Some(900),
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // MediaTimeout bookkeeping — clear siphon-sip's own media session so the
+    // downstream safety-net delete (gated on a present record) is a no-op.
+    // -----------------------------------------------------------------------
+
+    fn media_session_fixture(call_id: &str) -> crate::rtpengine::session::MediaSession {
+        crate::rtpengine::session::MediaSession {
+            call_id: call_id.to_string(),
+            from_tag: "a-tag".to_string(),
+            to_tag: None,
+            profile: "srtp_to_rtp".to_string(),
+            created_at: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn clear_media_session_on_timeout_removes_the_record() {
+        let store = Arc::new(crate::rtpengine::session::MediaSessionStore::new());
+        store.insert(media_session_fixture("1-1354742@host"));
+        assert_eq!(store.len(), 1);
+
+        // The event's call_id equals the store key (engine call-id == SIP Call-ID).
+        let cleared = clear_media_session_on_timeout(Some(&store), "1-1354742@host");
+
+        // Record removed → returns true and the store is empty. Because every
+        // safety-net delete site is gated on `if let Some(session) =
+        // media_sessions.remove(&…)`, an empty store means the later teardown
+        // (e.g. via b2bua.terminate) issues NO `set.delete` — no round-trip, no
+        // "unknown call" warn. (MediaBackend is a concrete enum with no trait to
+        // mock, so store-is-empty is the structurally-equivalent assertion to a
+        // spy that expects zero delete calls.)
+        assert!(cleared);
+        assert!(store.get("1-1354742@host").is_none());
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn clear_media_session_on_timeout_no_record_is_noop() {
+        let store = Arc::new(crate::rtpengine::session::MediaSessionStore::new());
+        // Unknown call_id → nothing to clear, returns false, does not panic.
+        assert!(!clear_media_session_on_timeout(Some(&store), "no-such-call@host"));
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn clear_media_session_on_timeout_no_store_is_noop() {
+        // Media backend not configured (rtpengine_sessions is None) → false.
+        assert!(!clear_media_session_on_timeout(None, "1-1354742@host"));
     }
 
 }
