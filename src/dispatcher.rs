@@ -152,6 +152,23 @@ struct DispatcherState {
     /// from `config.registrar.liveness`; `enabled == false` (the default)
     /// makes the whole UDP+IPsec idle sweep a no-op.
     registrar_liveness: crate::config::RegistrarLivenessConfig,
+    /// SIP-layer last-seen per registered IPsec UE (source IP → UNIX secs).
+    /// Refreshed on any inbound message arriving on a P-CSCF protected port
+    /// (REGISTER, SUBSCRIBE, in-dialog, and the OPTIONS 200 answer) and folded
+    /// into the SA-idle sweep's idle test — a more reliable liveness signal
+    /// than the kernel XFRM `use_time`, which on some kernels does not advance
+    /// on an inbound-answered SA and so makes every binding look perpetually
+    /// idle.  Bounded to live SAs: the sweep GCs entries whose IP has no SA,
+    /// and `liveness_dereg_contact` prunes on reap.  Empty (and never written)
+    /// unless `registrar_liveness.enabled`.
+    liveness_last_seen: Arc<DashMap<std::net::IpAddr, u64>>,
+    /// Consecutive-failed-sweep counter per AoR for the SA-idle probe
+    /// hysteresis (AoR → miss count).  A suspect binding must miss its OPTIONS
+    /// probe on `registrar_liveness.miss_threshold` consecutive sweeps before
+    /// it is deregistered, so a UE racing an ECM-IDLE → paging window (misses
+    /// one sweep, answers the next) is not false-reaped.  Cleared on any
+    /// answer / recent activity; GCed with the registration set.
+    liveness_misses: Arc<DashMap<String, u64>>,
     /// Outbound TCP/TLS connection pool for relay to new destinations.
     connection_pool: Arc<ConnectionPool>,
     /// Unified stream-connection registry: peer SocketAddr → (Transport,
@@ -559,6 +576,8 @@ pub async fn run(
         ipsec_manager,
         ipsec_config,
         registrar_liveness: config.registrar.liveness.clone(),
+        liveness_last_seen: Arc::new(DashMap::new()),
+        liveness_misses: Arc::new(DashMap::new()),
         connection_pool,
         stream_connections,
         nat_fix_contact: config.nat.as_ref().map(|n| n.fix_contact).unwrap_or(false),
@@ -1378,6 +1397,16 @@ struct LivenessDeregCtx {
     uac_sender: Arc<UacSender>,
     dns_resolver: Arc<SipResolver>,
     dereg_mode: crate::config::LivenessDeregMode,
+    /// Shared SIP-layer last-seen map (source IP → UNIX secs) — see
+    /// [`DispatcherState::liveness_last_seen`].  The idle sweep reads it, the
+    /// probe stamps it on an answer, and the dereg funnel prunes it on reap.
+    last_seen: Arc<DashMap<std::net::IpAddr, u64>>,
+    /// Shared consecutive-miss counter (AoR → misses) for probe hysteresis —
+    /// see [`DispatcherState::liveness_misses`].
+    misses: Arc<DashMap<String, u64>>,
+    /// Consecutive failed sweeps before a suspect binding is reaped
+    /// (`registrar_liveness.miss_threshold`).
+    miss_threshold: u32,
 }
 
 impl LivenessDeregCtx {
@@ -1388,12 +1417,19 @@ impl LivenessDeregCtx {
             uac_sender: Arc::clone(&state.uac_sender),
             dns_resolver: Arc::clone(&state.dns_resolver),
             dereg_mode: state.registrar_liveness.dereg_mode,
+            last_seen: Arc::clone(&state.liveness_last_seen),
+            misses: Arc::clone(&state.liveness_misses),
+            miss_threshold: state.registrar_liveness.miss_threshold,
         }
     }
 
     /// Build the funnel context from process globals, for the flow-failure
     /// close-drain task (`server.rs`) which has no `DispatcherState`.  Returns
     /// `None` if the registrar / UAC / resolver globals aren't installed yet.
+    ///
+    /// The flow-failure path only synthesizes the upstream de-REGISTER and
+    /// never touches the idle-sweep bookkeeping, so `last_seen` / `misses` are
+    /// fresh empty maps and `miss_threshold` is the config default.
     fn from_globals(dereg_mode: crate::config::LivenessDeregMode) -> Option<Self> {
         Some(Self {
             registrar: crate::script::api::registrar_arc()?.clone(),
@@ -1401,8 +1437,79 @@ impl LivenessDeregCtx {
             uac_sender: crate::script::api::proxy_utils::uac_sender()?.clone(),
             dns_resolver: crate::script::api::proxy_utils::send_resolver()?.clone(),
             dereg_mode,
+            last_seen: Arc::new(DashMap::new()),
+            misses: Arc::new(DashMap::new()),
+            miss_threshold: crate::config::RegistrarLivenessConfig::default().miss_threshold,
         })
     }
+}
+
+/// Current UNIX time in whole seconds, or `None` if the clock is before the
+/// epoch (never, in practice).  Shared by the liveness last-seen stamp sites.
+fn now_unix() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|elapsed| elapsed.as_secs())
+}
+
+/// Most recent liveness evidence for a binding: the kernel XFRM inbound
+/// `use_time` folded with siphon's own SIP-layer last-seen.  The kernel
+/// counter can fail to advance on an inbound-answered SA (making a live UE
+/// look perpetually idle), so the SIP signal — refreshed on every message
+/// arriving on a protected port — is the corrective input.
+fn liveness_last_active(kernel_last_active: u64, sip_last_seen: u64) -> u64 {
+    kernel_last_active.max(sip_last_seen)
+}
+
+/// Whether a binding counts as recently active (inside the idle window) and so
+/// must not be probed this sweep.
+fn liveness_recently_active(now: u64, last_active: u64, idle_window: u64) -> bool {
+    now.saturating_sub(last_active) <= idle_window
+}
+
+/// Hysteresis decision after a suspect binding fails its in-sweep OPTIONS probe
+/// loop.  Given the prior consecutive-miss count and the configured threshold,
+/// returns `(new_count, reap)`: within grace it bumps the counter and keeps the
+/// binding (`reap == false`); once the threshold is reached it resets the
+/// counter and signals a reap (`reap == true`).  A `threshold` of 0 is treated
+/// as 1 (reap on the first miss) so the feature can never be silently disabled
+/// by a zero.
+fn liveness_miss_outcome(before: u64, threshold: u32) -> (u64, bool) {
+    let misses = before.saturating_add(1);
+    if misses < threshold.max(1) as u64 {
+        (misses, false)
+    } else {
+        (0, true)
+    }
+}
+
+/// Record that a UE is alive (answered a probe, or an inbound arrived): stamp
+/// its SIP last-seen and clear any accumulated miss strike so the next sweep
+/// skips it for a full idle window and a later transient miss starts from zero.
+fn liveness_note_alive(
+    last_seen: &DashMap<std::net::IpAddr, u64>,
+    misses: &DashMap<String, u64>,
+    ue_ip: std::net::IpAddr,
+    aor: &str,
+    now: u64,
+) {
+    last_seen.insert(ue_ip, now);
+    misses.remove(aor);
+}
+
+/// Reconcile the liveness bookkeeping with the current registration set: keep
+/// last-seen only for IPs that still have a live SA, and miss counters only for
+/// AoRs still present as IPsec bindings.  This is what drains both maps to
+/// baseline as UEs deregister (project per-module leak rule).
+fn liveness_gc(
+    last_seen: &DashMap<std::net::IpAddr, u64>,
+    misses: &DashMap<String, u64>,
+    live_ips: &std::collections::HashSet<std::net::IpAddr>,
+    live_aors: &std::collections::HashSet<String>,
+) {
+    last_seen.retain(|ip, _| live_ips.contains(ip));
+    misses.retain(|aor, _| live_aors.contains(aor));
 }
 
 /// Run the network-dereg cascade for bindings removed by the **flow-failure**
@@ -1561,29 +1668,44 @@ async fn sweep_registrar_liveness(state: &DispatcherState) {
     };
 
     let use_times = manager.dump_sa_use_times().await;
-    if use_times.is_empty() {
-        return; // no SAs, or the dump is unavailable on this platform
-    }
     let snapshot = manager.liveness_snapshot();
-    if snapshot.is_empty() {
-        return;
-    }
     // One registration per UE IP in an IPsec P-CSCF — index the SA rows by IP.
     let mut sa_by_ip: std::collections::HashMap<std::net::IpAddr, crate::ipsec::SaLivenessRow> =
         std::collections::HashMap::with_capacity(snapshot.len());
     for row in snapshot {
         sa_by_ip.insert(row.ue_addr, row);
     }
+    let context = LivenessDeregCtx::from_state(state, registrar);
+    let live_ips: std::collections::HashSet<std::net::IpAddr> =
+        sa_by_ip.keys().copied().collect();
 
-    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(elapsed) => elapsed.as_secs(),
-        Err(_) => return,
+    // No live SAs, or the kernel use-time dump is unavailable on this platform
+    // → nothing to age this sweep.  Still reconcile the liveness bookkeeping so
+    // last-seen / miss entries for UEs whose SA has gone drain to baseline
+    // instead of accumulating (project per-module leak rule).  No bindings are
+    // eligible, so `live_aors` is empty and every miss counter is cleared.
+    if live_ips.is_empty() || use_times.is_empty() {
+        liveness_gc(
+            &context.last_seen,
+            &context.misses,
+            &live_ips,
+            &std::collections::HashSet::new(),
+        );
+        return;
+    }
+
+    let now = match now_unix() {
+        Some(now) => now,
+        None => return,
     };
     let liveness = &state.registrar_liveness;
     let idle_window =
         liveness.keepalive_interval_secs as u64 * liveness.idle_multiplier.max(1) as u64;
     let probe_timeout = std::time::Duration::from_millis(liveness.probe_timeout_ms);
-    let context = LivenessDeregCtx::from_state(state, registrar);
+    // AoRs of live IPsec bindings seen this sweep — the post-sweep GC keeps miss
+    // counters only for these and drops counters for bindings that have vanished.
+    let mut live_aors: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(sa_by_ip.len());
     let mut total = 0usize;
     let mut ipsec_protected = 0usize;
     let mut suspects = 0usize;
@@ -1607,23 +1729,41 @@ async fn sweep_registrar_liveness(state: &DispatcherState) {
             None => continue, // not an IPsec-protected UE
         };
         ipsec_protected += 1;
+        live_aors.insert(aor.clone());
 
         // Most recent inbound activity across the two inbound SAs (the SAs the
         // UE's keepalive / MO requests land on).
-        let last_active = use_times
+        let kernel_last_active = use_times
             .get(&row.spi_ps)
             .copied()
             .unwrap_or(0)
             .max(use_times.get(&row.spi_pc).copied().unwrap_or(0));
-        if last_active == 0 {
+        if kernel_last_active == 0 {
             // Neither inbound SA is currently in the kernel dump — likely a
             // dump/snapshot race or an SA mid-teardown.  Genuine teardown is
             // handled by the abandoned-SA sweep (Part B.4); skip here to avoid
             // false deregistration.
             continue;
         }
-        if now.saturating_sub(last_active) <= idle_window {
-            continue; // recently active
+        // Fold in siphon's own SIP-layer last-seen: on some kernels the XFRM
+        // inbound use-time does not advance on an inbound-answered SA, so a live
+        // UE that answers its keepalive / OPTIONS every 30 s still looks idle to
+        // the kernel counter alone.  The SIP signal (refreshed on every message
+        // arriving on a protected port) corrects that, collapsing the probe
+        // cadence for a responsive UE from every sweep to at most once per idle
+        // window.
+        let sip_last_seen = context
+            .last_seen
+            .get(&ue_addr.ip())
+            .map(|entry| *entry)
+            .unwrap_or(0);
+        let last_active = liveness_last_active(kernel_last_active, sip_last_seen);
+        if liveness_recently_active(now, last_active, idle_window) {
+            // Recently active → clear any stale miss strike so a UE that
+            // answered normally never carries a partial strike into a later
+            // idle window.
+            context.misses.remove(&aor);
+            continue;
         }
 
         // Suspect.  Probe over the binding's *actual* transport — for a stream
@@ -1675,12 +1815,22 @@ async fn sweep_registrar_liveness(state: &DispatcherState) {
         });
     }
 
+    // Reconcile the liveness bookkeeping with the current registration set so
+    // last-seen / miss entries drain to baseline as UEs deregister (project
+    // per-module leak rule): keep last-seen only for IPs that still have a live
+    // SA, and miss counters only for AoRs still present as IPsec bindings.  A
+    // UE that de-REGISTERs normally has its SA torn down, so its IP leaves
+    // `live_ips` and its entries are dropped on the next sweep.
+    liveness_gc(&context.last_seen, &context.misses, &live_ips, &live_aors);
+
     // Census so an operator can see why a dead UE is (or isn't) being reaped.
     debug!(
         contacts = total,
         ipsec_protected,
         idle_suspect = suspects,
         idle_window_secs = idle_window,
+        tracked_last_seen = context.last_seen.len(),
+        tracked_misses = context.misses.len(),
         "registrar liveness: idle sweep census"
     );
 }
@@ -1697,8 +1847,11 @@ fn transport_from_name(name: Option<&str>) -> Transport {
 }
 
 /// Send one OPTIONS over the captured flow (with a single retry); if the UE
-/// answers, leave the binding alone — its response refreshed the SA use-time.
-/// On no answer, run the dereg funnel.
+/// answers, stamp its SIP-layer last-seen and clear any miss strike so the next
+/// sweep skips it for a full idle window.  On no answer, apply consecutive-miss
+/// hysteresis: keep the binding for `miss_threshold` failed sweeps (a UE racing
+/// an ECM-IDLE → paging → reconnect window misses one sweep and answers the
+/// next) and only run the dereg funnel once the grace is exhausted.
 async fn liveness_probe_then_dereg(
     context: LivenessDeregCtx,
     aor: String,
@@ -1726,17 +1879,39 @@ async fn liveness_probe_then_dereg(
         if let Ok(Ok(crate::uac::UacResult::Response(_))) =
             tokio::time::timeout(probe_timeout, receiver).await
         {
+            // The UE is alive — stamp its SIP last-seen (in case the general
+            // inbound stamp raced or the answer arrived over UDP) and reset the
+            // hysteresis counter so a later transient miss starts from zero.
+            if let Some(now) = now_unix() {
+                liveness_note_alive(&context.last_seen, &context.misses, destination.ip(), &aor, now);
+            }
             debug!(aor = %aor, attempt, "registrar liveness: UE answered OPTIONS probe — keeping binding");
             return;
         }
     }
 
+    // No answer this sweep.  Bump the consecutive-miss counter; only reap once
+    // it reaches `miss_threshold`, so a single missed probe (paging in flight)
+    // never false-deregisters a live UE.
+    let before = context.misses.get(&aor).map(|entry| *entry).unwrap_or(0);
+    let (misses, reap) = liveness_miss_outcome(before, context.miss_threshold);
+    if !reap {
+        context.misses.insert(aor.clone(), misses);
+        info!(
+            aor = %aor,
+            misses,
+            threshold = context.miss_threshold,
+            "registrar liveness: probe unanswered — within grace, re-probing next sweep"
+        );
+        return;
+    }
+    context.misses.remove(&aor);
     liveness_dereg_contact(
         &context,
         &aor,
         &contact,
         Some(ue_port_c),
-        "ipsec idle (no OPTIONS answer)",
+        "ipsec idle (no OPTIONS answer, grace exhausted)",
     )
     .await;
 }
@@ -1782,6 +1957,14 @@ async fn liveness_dereg_contact(
         if let Err(error) = manager.delete_sa_pair(&ue_addr.ip(), ue_port_c).await {
             debug!(aor = %aor, %error, "registrar liveness: IPsec SA teardown failed (may already be gone)");
         }
+    }
+
+    // 4. Prune the liveness bookkeeping for the gone binding so it drains with
+    //    the registration (the sweep GC would also catch it once the SA leaves
+    //    the kernel snapshot, but pruning here keeps both maps tight).
+    context.misses.remove(aor);
+    if let Some(ue_addr) = contact.source_addr {
+        context.last_seen.remove(&ue_addr.ip());
     }
 }
 
@@ -1947,6 +2130,25 @@ fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
             inbound.transport,
             &inbound.data,
         );
+    }
+
+    // Registrar-liveness SIP-layer last-seen (Part B, fix A).  Any message
+    // arriving on a P-CSCF protected port is inbound traffic from a UE with a
+    // live IPsec SA — a direct liveness signal siphon observes even when the
+    // kernel XFRM `use_time` counter fails to advance.  The SA-idle sweep folds
+    // this into its idle test, so a UE that just answered anything (its
+    // keepalive, an MO request, or the OPTIONS probe's 200) is not re-probed
+    // for a full idle window.  Gated on `enabled` first so it is a single bool
+    // read when liveness is off (the default); `is_protected_local_port` bounds
+    // the keyspace to active IPsec UEs.
+    if state.registrar_liveness.enabled
+        && crate::script::api::ipsec::is_protected_local_port(inbound.local_addr.port())
+    {
+        if let Some(now) = now_unix() {
+            state
+                .liveness_last_seen
+                .insert(inbound.remote_addr.ip(), now);
+        }
     }
 
     match &message.start_line {
@@ -13437,6 +13639,175 @@ mod tests {
         let removed = registrar.close_flow(9, &keep);
         assert_eq!(removed.len(), 1);
         assert!(!registrar.is_registered("sip:bob@example.com"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Registrar-liveness SA-idle sweep — SIP last-seen fold-in + probe
+    // hysteresis (Part B, prodcore-1 false-dereg fix)
+    // -----------------------------------------------------------------------
+
+    fn ip(addr: &str) -> std::net::IpAddr {
+        addr.parse().expect("test fixture IP must parse")
+    }
+
+    #[test]
+    fn liveness_last_active_folds_sip_over_stale_kernel() {
+        // The prod scenario: the kernel XFRM use-time is stuck at an old value
+        // (never advances on the inbound-answered SA) while siphon's SIP
+        // last-seen is fresh.  Folding takes the max, so the fresh SIP signal
+        // wins and the binding reads as active.
+        let stale_kernel = 1_000;
+        let fresh_sip = 1_890;
+        assert_eq!(liveness_last_active(stale_kernel, fresh_sip), 1_890);
+        // Either input alone still yields the most recent evidence.
+        assert_eq!(liveness_last_active(0, 42), 42);
+        assert_eq!(liveness_last_active(42, 0), 42);
+    }
+
+    #[test]
+    fn liveness_churn_fresh_sip_keeps_binding_active() {
+        // A UE answered its keepalive 5 s ago (SIP stamp), but the kernel
+        // use-time is stuck 300 s in the past.  With a 90 s idle window the
+        // folded signal must read as recently-active → NOT re-probed.
+        let now = 10_000u64;
+        let idle_window = 90u64;
+        let stale_kernel = now - 300;
+        let fresh_sip = now - 5;
+        let last_active = liveness_last_active(stale_kernel, fresh_sip);
+        assert!(liveness_recently_active(now, last_active, idle_window));
+        // Without the SIP fold-in the stale kernel value alone would look idle
+        // and the UE would be probed every sweep — the bug being fixed.
+        assert!(!liveness_recently_active(now, stale_kernel, idle_window));
+    }
+
+    #[test]
+    fn liveness_recently_active_boundary() {
+        let now = 1_000u64;
+        // Exactly at the window edge counts as active (inclusive).
+        assert!(liveness_recently_active(now, now - 90, 90));
+        // One second past the window is idle.
+        assert!(!liveness_recently_active(now, now - 91, 90));
+        // A last_active in the future (clock skew) is never idle.
+        assert!(liveness_recently_active(now, now + 10, 90));
+    }
+
+    #[test]
+    fn liveness_miss_outcome_survives_then_reaps_at_threshold() {
+        // threshold 2: sweep N is the first miss → keep (counter 1); sweep N+1
+        // is the second consecutive miss → reap (counter reset to 0).  A UE
+        // racing an ECM-IDLE→paging window misses one sweep and answers the
+        // next, so it never reaches the reap.
+        assert_eq!(liveness_miss_outcome(0, 2), (1, false));
+        assert_eq!(liveness_miss_outcome(1, 2), (0, true));
+    }
+
+    #[test]
+    fn liveness_miss_outcome_threshold_floor_of_one() {
+        // A misconfigured threshold of 0 must not silently disable reaping — it
+        // is floored to 1 (reap on the first miss), matching threshold == 1.
+        assert_eq!(liveness_miss_outcome(0, 0), (0, true));
+        assert_eq!(liveness_miss_outcome(0, 1), (0, true));
+    }
+
+    #[test]
+    fn liveness_note_alive_stamps_and_clears_strike() {
+        // The answered-probe / inbound side effect: record last-seen for the UE
+        // IP and wipe any partial miss strike so a later transient miss starts
+        // from zero.
+        let last_seen: DashMap<std::net::IpAddr, u64> = DashMap::new();
+        let misses: DashMap<String, u64> = DashMap::new();
+        let aor = "sip:alice@ims.example.com";
+        misses.insert(aor.to_string(), 1); // one strike already accrued
+
+        liveness_note_alive(&last_seen, &misses, ip("100.65.0.2"), aor, 12_345);
+
+        assert_eq!(last_seen.get(&ip("100.65.0.2")).map(|v| *v), Some(12_345));
+        assert!(!misses.contains_key(aor), "answer must clear the miss strike");
+    }
+
+    #[test]
+    fn liveness_hysteresis_survive_then_reset_on_answer() {
+        // Model the two-sweep sequence against the real maps + decision helper:
+        // sweep N misses (strike 1, kept), then the UE answers on sweep N+1
+        // (strike cleared) — the binding survives with a clean slate.
+        let last_seen: DashMap<std::net::IpAddr, u64> = DashMap::new();
+        let misses: DashMap<String, u64> = DashMap::new();
+        let aor = "sip:alice@ims.example.com";
+
+        // Sweep N: probe unanswered.
+        let before = misses.get(aor).map(|v| *v).unwrap_or(0);
+        let (count, reap) = liveness_miss_outcome(before, 2);
+        assert!(!reap, "first miss is within grace");
+        misses.insert(aor.to_string(), count);
+        assert_eq!(misses.get(aor).map(|v| *v), Some(1));
+
+        // Sweep N+1: UE answers (paging completed) → strike cleared, survives.
+        liveness_note_alive(&last_seen, &misses, ip("100.65.0.2"), aor, 20_000);
+        assert!(!misses.contains_key(aor));
+    }
+
+    #[test]
+    fn liveness_hysteresis_reaps_after_consecutive_misses() {
+        // A genuinely gone UE misses every sweep: strike 1 (kept), strike 2 →
+        // reap.  The vanish path is preserved, just delayed by the grace.
+        let misses: DashMap<String, u64> = DashMap::new();
+        let aor = "sip:gone@ims.example.com";
+
+        let (count, reap) = liveness_miss_outcome(misses.get(aor).map(|v| *v).unwrap_or(0), 2);
+        assert_eq!((count, reap), (1, false));
+        misses.insert(aor.to_string(), count);
+
+        let (count, reap) = liveness_miss_outcome(misses.get(aor).map(|v| *v).unwrap_or(0), 2);
+        assert_eq!((count, reap), (0, true), "second consecutive miss reaps");
+        if reap {
+            misses.remove(aor);
+        }
+        assert!(!misses.contains_key(aor));
+    }
+
+    #[test]
+    fn liveness_gc_drains_bookkeeping_for_gone_ues() {
+        // Leak guard: entries for UEs whose SA is gone (deregistered / vanished)
+        // must drain to baseline.  Reconciling against empty live sets clears
+        // both maps entirely — the "drains to 0" invariant.
+        let last_seen: DashMap<std::net::IpAddr, u64> = DashMap::new();
+        let misses: DashMap<String, u64> = DashMap::new();
+        last_seen.insert(ip("100.65.0.2"), 1);
+        last_seen.insert(ip("100.65.0.3"), 2);
+        misses.insert("sip:a@ims".to_string(), 1);
+        misses.insert("sip:b@ims".to_string(), 1);
+
+        // One UE still live (IP .2 / AoR a), the other gone.
+        let mut live_ips = std::collections::HashSet::new();
+        live_ips.insert(ip("100.65.0.2"));
+        let mut live_aors = std::collections::HashSet::new();
+        live_aors.insert("sip:a@ims".to_string());
+
+        liveness_gc(&last_seen, &misses, &live_ips, &live_aors);
+        assert_eq!(last_seen.len(), 1);
+        assert!(last_seen.contains_key(&ip("100.65.0.2")));
+        assert_eq!(misses.len(), 1);
+        assert!(misses.contains_key("sip:a@ims"));
+
+        // All UEs gone → both maps drain to baseline (0).
+        liveness_gc(
+            &last_seen,
+            &misses,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(last_seen.len(), 0);
+        assert_eq!(misses.len(), 0);
+    }
+
+    #[test]
+    fn registrar_liveness_config_defaults_bias_toward_patience() {
+        // The false-dereg fix ships new defaults: 2-sweep hysteresis and a 4 s
+        // per-attempt probe timeout (one paging + reconnect).  An existing
+        // pcscf.yaml that omits these picks them up via #[serde(default)].
+        let defaults = crate::config::RegistrarLivenessConfig::default();
+        assert_eq!(defaults.miss_threshold, 2);
+        assert_eq!(defaults.probe_timeout_ms, 4000);
     }
 
     #[test]
