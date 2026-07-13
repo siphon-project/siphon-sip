@@ -6,8 +6,12 @@ the announcement, DTMF, and echo-test surface added for MMTEL / TAS-style script
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
+from siphon_sdk.call import Call
+from siphon_sdk.request import Request
 from siphon_sdk.testing import SipTestHarness
 
 
@@ -259,3 +263,107 @@ def route(request):
 """
         )
         assert harness.rtpengine.fire_media_timeout("abc", "ftag1") == 0
+
+
+class TestAnswerLocal:
+    def test_success_returns_answer_sdp(self, harness):
+        call = Call()
+        sdp = asyncio.run(harness.rtpengine.answer_local(call))
+        assert sdp == "v=0\r\nm=audio 40000 RTP/AVP 8 101\r\n"
+        # No prior offer → default profile.
+        assert ("answer_local", "rtp_passthrough") in harness.rtpengine.operations
+
+    def test_configured_answer_sdp(self, harness):
+        harness.rtpengine.set_answer_local_sdp("v=0\r\nm=audio 5004 RTP/AVP 0\r\n")
+        sdp = asyncio.run(harness.rtpengine.answer_local(Call()))
+        assert sdp == "v=0\r\nm=audio 5004 RTP/AVP 0\r\n"
+
+    def test_profile_recovered_from_offer(self, harness):
+        call = Call()
+        asyncio.run(harness.rtpengine.offer(call, profile="ivr"))
+        asyncio.run(harness.rtpengine.answer_local(call))
+        assert ("answer_local", "ivr") in harness.rtpengine.operations
+
+    def test_explicit_profile_wins(self, harness):
+        call = Call()
+        asyncio.run(harness.rtpengine.offer(call, profile="ivr"))
+        asyncio.run(harness.rtpengine.answer_local(call, profile="rtp_passthrough"))
+        assert ("answer_local", "rtp_passthrough") in harness.rtpengine.operations
+
+    def test_no_codec_auto_reject_sets_488_and_returns_none(self, harness):
+        call = Call()
+        harness.rtpengine.set_answer_local_no_codec()
+        result = asyncio.run(harness.rtpengine.answer_local(call))
+        assert result is None
+        action = call._actions[-1]
+        assert action.kind == "reject"
+        assert action.status_code == 488
+        assert action.reason == "Not Acceptable Here"
+        assert call.state == "terminated"
+
+    def test_no_codec_auto_reject_false_raises_value_error(self, harness):
+        harness.rtpengine.set_answer_local_no_codec()
+        with pytest.raises(ValueError, match="no encodable codec"):
+            asyncio.run(harness.rtpengine.answer_local(Call(), auto_reject=False))
+
+    def test_no_codec_non_call_target_raises_value_error(self, harness):
+        # A Request has no reject channel, so even auto_reject=True raises.
+        harness.rtpengine.set_answer_local_no_codec()
+        with pytest.raises(ValueError, match="no encodable codec"):
+            asyncio.run(harness.rtpengine.answer_local(Request(method="INVITE")))
+
+    def test_driven_from_on_invite_handler(self, harness):
+        harness.load_source(
+            """
+from siphon import b2bua, rtpengine
+
+@b2bua.on_invite
+async def on_invite(call):
+    sdp = await rtpengine.answer_local(call, profile="ivr")
+    if sdp is not None:
+        call.answer(200, "OK", body=sdp, content_type="application/sdp")
+"""
+        )
+        result = harness.send_invite(
+            ruri="sip:echo@example.com", from_uri="sip:alice@example.com"
+        )
+        assert result.action == "answer"
+        assert result.call.state == "answered"
+        assert ("answer_local", "ivr") in harness.rtpengine.operations
+
+
+class TestMediaTargetForms:
+    """Media verbs accept a SIP object, a (call_id, from_tag) pair, or a bare
+    call_id string — all resolving to the same recorded (call_id, from_tag)."""
+
+    def test_play_media_target_forms_resolve_equivalently(self, harness):
+        request = Request(method="INVITE", call_id="call-1", from_tag="ftag-1")
+        asyncio.run(harness.rtpengine.play_media(request, file="/a.wav"))
+        asyncio.run(harness.rtpengine.play_media(("call-1", "ftag-1"), file="/a.wav"))
+        asyncio.run(harness.rtpengine.play_media("call-1", file="/a.wav"))
+
+        calls = harness.rtpengine.media_calls
+        assert calls[0]["call_id"] == "call-1" and calls[0]["from_tag"] == "ftag-1"
+        assert calls[1]["call_id"] == "call-1" and calls[1]["from_tag"] == "ftag-1"
+        # Bare string → best-effort, empty from_tag.
+        assert calls[2]["call_id"] == "call-1" and calls[2]["from_tag"] == ""
+
+    def test_echo_target_forms_resolve_equivalently(self, harness):
+        request = Request(method="INVITE", call_id="call-9", from_tag="ftag-9")
+        asyncio.run(harness.rtpengine.echo(request))
+        asyncio.run(harness.rtpengine.echo(("call-9", "ftag-9")))
+        asyncio.run(harness.rtpengine.echo("call-9"))
+
+        calls = [c for c in harness.rtpengine.media_calls if c["op"] == "echo"]
+        assert calls[0]["call_id"] == "call-9" and calls[0]["from_tag"] == "ftag-9"
+        assert calls[1]["call_id"] == "call-9" and calls[1]["from_tag"] == "ftag-9"
+        assert calls[2]["call_id"] == "call-9" and calls[2]["from_tag"] == ""
+
+    def test_dtmf_from_on_dtmf_handler_shape(self, harness):
+        # The @rtpengine.on_dtmf payload is (call_id, from_tag) strings; feeding
+        # a bare call_id / pair straight into a media verb must work.
+        asyncio.run(harness.rtpengine.play_dtmf(("call-7", "ftag-7"), "1"))
+        call = harness.rtpengine.media_calls[-1]
+        assert call["op"] == "play_dtmf"
+        assert call["call_id"] == "call-7"
+        assert call["from_tag"] == "ftag-7"

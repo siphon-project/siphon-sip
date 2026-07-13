@@ -314,6 +314,18 @@ impl PyCall {
         &self.action
     }
 
+    /// Set a deferred reject action on this call — the same effect as the
+    /// Python-level `call.reject(code, reason)`, exposed so the media namespace
+    /// can apply an auto-488 after its async engine round-trip (see
+    /// `rtpengine.answer_local(auto_reject=True)`).  The dispatcher applies the
+    /// deferred [`CallAction::Reject`] when the `on_invite` handler returns.
+    pub fn set_reject(&mut self, code: u16, reason: impl Into<String>) {
+        self.action = CallAction::Reject {
+            code,
+            reason: reason.into(),
+        };
+    }
+
     /// Get the media handle (for the B2BUA core to check after script runs).
     pub fn media_handle(&self) -> &PyMediaHandle {
         &self.media_handle
@@ -1448,6 +1460,22 @@ mod tests {
             &CallAction::Reject {
                 code: 404,
                 reason: "Not Found".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn call_set_reject_sets_reject_action() {
+        // The Rust-side setter used by rtpengine.answer_local(auto_reject=True)
+        // records the same deferred CallAction::Reject as call.reject().
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        call.set_reject(488, "Not Acceptable Here");
+        assert_eq!(
+            call.action(),
+            &CallAction::Reject {
+                code: 488,
+                reason: "Not Acceptable Here".to_string()
             }
         );
     }

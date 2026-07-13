@@ -220,6 +220,28 @@ impl MediaBackend {
         }
     }
 
+    /// Single-leg UAS answer — synthesise an RFC 3264 answer for the offerer's
+    /// SDP with the media engine as the far side (IVR / echo / announcement).
+    /// Returns the answer SDP.  Native `siphon-rtp` backend only: rtpengine and
+    /// rtpproxy have no answer-local verb, so those backends reject rather than
+    /// silently no-op.
+    pub async fn answer_local(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        offer_sdp: &str,
+        flags: &NgFlags,
+    ) -> Result<String, RtpEngineError> {
+        match self {
+            Self::SiphonRtp(client) => {
+                client.answer_local(call_id, from_tag, offer_sdp, flags).await
+            }
+            Self::RtpEngine(_) | Self::RtpProxy(_) => Err(RtpEngineError::Protocol(
+                "answer_local is only supported by the native siphon-rtp backend".to_string(),
+            )),
+        }
+    }
+
     /// Drop the selected monologue's outgoing packets entirely.
     pub async fn block_media(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         match self {
@@ -407,6 +429,52 @@ mod tests {
         let backend = MediaBackend::RtpEngine(Arc::new(set));
 
         let error = backend.echo("call-1", "tag-a", true).await.unwrap_err();
+        assert!(matches!(error, RtpEngineError::Protocol(_)));
+        assert!(error.to_string().contains("siphon-rtp"));
+    }
+
+    #[tokio::test]
+    async fn answer_local_routes_to_siphon_rtp_backend() {
+        // Reaching the native client is proven by a Timeout (the command was
+        // framed and sent, then no response arrived) — the reject arms below
+        // return synchronously and never time out.
+        let (event_tx, _event_rx) = mpsc::channel::<RtpEngineEvent>(16);
+        let set =
+            SiphonRtpClientSet::new(vec![(dead_address(), 200, 1)], None, 5_000, event_tx).unwrap();
+        let backend = MediaBackend::SiphonRtp(set);
+
+        let error = backend
+            .answer_local("call-1", "tag-a", "v=0\r\n", &NgFlags::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, RtpEngineError::Timeout { .. }),
+            "expected the native client path (Timeout), got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_local_rejected_on_rtpproxy_backend() {
+        let set = RtpProxyClientSet::new(vec![(dead_address(), 200, 1)], 0).await.unwrap();
+        let backend = MediaBackend::RtpProxy(set);
+
+        let error = backend
+            .answer_local("call-1", "tag-a", "v=0\r\n", &NgFlags::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RtpEngineError::Protocol(_)));
+        assert!(error.to_string().contains("siphon-rtp"));
+    }
+
+    #[tokio::test]
+    async fn answer_local_rejected_on_rtpengine_backend() {
+        let set = RtpEngineSet::new(vec![(dead_address(), 200, 1)]).await.unwrap();
+        let backend = MediaBackend::RtpEngine(Arc::new(set));
+
+        let error = backend
+            .answer_local("call-1", "tag-a", "v=0\r\n", &NgFlags::default())
+            .await
+            .unwrap_err();
         assert!(matches!(error, RtpEngineError::Protocol(_)));
         assert!(error.to_string().contains("siphon-rtp"));
     }

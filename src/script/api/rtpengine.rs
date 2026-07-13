@@ -18,6 +18,7 @@ use tracing::{debug, warn};
 use crate::rtpengine::client::PlayMediaSource;
 use crate::rtpengine::profile::ProfileRegistry;
 use crate::rtpengine::MediaBackend;
+use crate::rtpengine::RtpEngineError;
 use crate::rtpengine::session::{MediaSession, MediaSessionStore};
 use crate::sip::message::SipMessage;
 
@@ -51,8 +52,7 @@ impl PyRtpEngine {
         target: &Bound<'py, PyAny>,
         method: &'static str,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let message = extract_message(target)?;
-        let (call_id, from_tag) = extract_delete_params(&message)?;
+        let (call_id, from_tag) = resolve_call_from_tag(target)?;
         let client = Arc::clone(&self.client);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
@@ -145,6 +145,52 @@ fn resolve_answer_profile(
     DEFAULT_PROFILE.to_string()
 }
 
+/// The engine's exact `CmdResult::Error` reason when the offer carries no codec
+/// this build can encode (RFC 3264 §6.1) — the signal to render a 488.
+const NO_ENCODABLE_CODEC: &str = "no-encodable-codec";
+
+/// What `answer_local` should do with the backend's [`answer_local`] result,
+/// factored out of the async closure so the mapping is unit-testable without
+/// driving the `future_into_py` awaitable.
+///
+/// [`answer_local`]: MediaBackend::answer_local
+#[derive(Debug, PartialEq, Eq)]
+enum AnswerLocalOutcome {
+    /// Engine synthesised an answer — record the session, resolve to the SDP.
+    Answered(String),
+    /// No encodable codec and the caller opted into auto-reject on a `Call` —
+    /// set a deferred 488 on the call and resolve to `None`.
+    Reject488,
+    /// No encodable codec but no auto-reject target — raise `ValueError`.
+    ValueError,
+    /// Transport / protocol / other engine error — raise `RuntimeError`.
+    RuntimeError(String),
+}
+
+/// Map an `answer_local` backend result to the Python-visible outcome.
+///
+/// `can_reject` is `true` only when the script asked for `auto_reject` *and*
+/// the target was a `Call` (the auto-488 path is defined for the B2BUA call
+/// object — a bare `Request` has no deferred-reject channel).
+fn classify_answer_local(
+    result: Result<String, RtpEngineError>,
+    can_reject: bool,
+) -> AnswerLocalOutcome {
+    match result {
+        Ok(answer_sdp) => AnswerLocalOutcome::Answered(answer_sdp),
+        Err(RtpEngineError::EngineError(reason)) if reason == NO_ENCODABLE_CODEC => {
+            if can_reject {
+                AnswerLocalOutcome::Reject488
+            } else {
+                AnswerLocalOutcome::ValueError
+            }
+        }
+        Err(error) => {
+            AnswerLocalOutcome::RuntimeError(format!("rtpengine.answer_local failed: {error}"))
+        }
+    }
+}
+
 /// Extract `Arc<Mutex<SipMessage>>` from a Python object that is either
 /// a `Request`, `Reply`, or `Call`.
 pub(super) fn extract_message(object: &Bound<'_, PyAny>) -> PyResult<Arc<Mutex<SipMessage>>> {
@@ -162,6 +208,44 @@ pub(super) fn extract_message(object: &Bound<'_, PyAny>) -> PyResult<Arc<Mutex<S
     }
     Err(pyo3::exceptions::PyTypeError::new_err(
         "expected a Request, Reply, or Call object",
+    ))
+}
+
+/// Resolve `(call_id, from_tag)` from a media-verb target.
+///
+/// Accepts three forms so the same verbs work whether the script holds a SIP
+/// object or only the identifiers an event delivered:
+///   * a `Request` / `Reply` / `Call` → today's `extract_message` +
+///     `extract_delete_params` path (behaviour preserved exactly);
+///   * a `(call_id, from_tag)` pair of strings;
+///   * a bare `call_id` string → best-effort with an empty `from_tag`.
+///
+/// The pair / bare-string forms are what let an `@rtpengine.on_dtmf` handler —
+/// which receives `call_id` / `from_tag` strings, not a SIP message — drive
+/// `play_media` / `echo` / `stop_media` / DTMF / gating directly.
+fn resolve_call_from_tag(target: &Bound<'_, PyAny>) -> PyResult<(String, String)> {
+    // SIP object → the exact path the verbs used before (Call-ID + From-tag off
+    // the message), so Request/Reply/Call callers are byte-for-byte unchanged.
+    if target.cast::<PyRequest>().is_ok()
+        || target.cast::<PyReply>().is_ok()
+        || target.cast::<PyCall>().is_ok()
+    {
+        let message = extract_message(target)?;
+        return extract_delete_params(&message);
+    }
+    // Bare `call_id` string → empty from_tag. Checked before the pair form
+    // because a Python `str` is itself a 2-sequence of 1-char strings, so a
+    // `(String, String)` extraction would misread a 2-char id as a pair.
+    if let Ok(call_id) = target.extract::<String>() {
+        return Ok((call_id, String::new()));
+    }
+    // `(call_id, from_tag)` pair of strings.
+    if let Ok((call_id, from_tag)) = target.extract::<(String, String)>() {
+        return Ok((call_id, from_tag));
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(
+        "rtpengine media verb target must be a Request/Reply/Call, a \
+         (call_id, from_tag) tuple, or a call_id string",
     ))
 }
 
@@ -321,6 +405,127 @@ impl PyRtpEngine {
         })
     }
 
+    /// Single-leg UAS answer — synthesise an RFC 3264 answer for the caller's
+    /// **own** offer, with the media engine as the far side (IVR / echo /
+    /// announcement server).  Unlike :meth:`answer`, this takes the offer
+    /// (INVITE) — not a peer's reply — because there is no far leg: the engine
+    /// picks one encodable codec from the offer and returns the answer SDP for
+    /// the script to put in its own 2xx.
+    ///
+    /// Profile precedence matches :meth:`answer`:
+    ///   1. Explicit ``profile=`` argument (script override).
+    ///   2. Profile recorded by a matching ``offer`` (looked up by Call-ID).
+    ///   3. ``DEFAULT_PROFILE`` (``rtp_passthrough``).
+    ///
+    /// When the offer carries no codec this build can encode (RFC 3264 §6.1 —
+    /// the answer must select from the offered formats), the engine cannot
+    /// answer.  With ``auto_reject=True`` (default) and a ``Call`` target, a
+    /// deferred ``488 Not Acceptable Here`` (RFC 3261 §13.3.1.2) is set on the
+    /// call and the coroutine resolves to ``None``.  With ``auto_reject=False``
+    /// (or a non-``Call`` target) it raises ``ValueError`` instead, leaving the
+    /// response to the script.
+    ///
+    /// Native ``siphon-rtp`` backend only; rtpengine and rtpproxy reject.
+    ///
+    /// Args:
+    ///     call: A ``Call`` (B2BUA) — or ``Request`` — carrying the INVITE offer
+    ///           whose Call-ID / From-tag / SDP drive the single-leg answer.
+    ///     profile: RTP profile name.  When omitted, the profile recorded by a
+    ///              matching offer is used; falls back to ``"rtp_passthrough"``.
+    ///     auto_reject: When ``True`` (default) and ``call`` is a ``Call``, a
+    ///                  no-encodable-codec engine result sets a deferred
+    ///                  ``488 Not Acceptable Here`` on the call and returns
+    ///                  ``None``.  When ``False`` it raises ``ValueError``.
+    ///
+    /// Returns:
+    ///     The answer SDP as ``str`` on success, or ``None`` when the offer had
+    ///     no encodable codec and it was auto-rejected with a 488.
+    #[pyo3(signature = (call, profile=None, auto_reject=true))]
+    fn answer_local<'py>(
+        &self,
+        python: Python<'py>,
+        call: &Bound<'py, PyAny>,
+        profile: Option<&str>,
+        auto_reject: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let message = extract_message(call)?;
+        let (call_id, from_tag, offer_sdp_bytes) = extract_offer_params(&message)?;
+        let offer_sdp = String::from_utf8_lossy(&offer_sdp_bytes).into_owned();
+
+        // Resolve the answer-side flags exactly as `answer` does (explicit
+        // profile → offer-recorded profile → default).
+        let profile_name = resolve_answer_profile(profile, &self.sessions, &call_id);
+        let entry = self.registry.get(&profile_name).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown RTP profile '{profile_name}'; valid profiles: {}",
+                self.registry.profile_names().join(", ")
+            ))
+        })?;
+        let flags = entry.answer.clone();
+
+        // Capture an owned handle to the Call for the auto-488 path, cloned
+        // while the GIL is held (free-threaded `Py::clone` rule).  `None` when
+        // auto_reject is off or the target isn't a `Call` (a bare `Request` has
+        // no deferred-reject channel).  `extract_message` above already released
+        // its transient borrow of the object, so borrowing this handle later in
+        // the async block cannot alias.
+        let reject_call: Option<Py<PyCall>> = if auto_reject {
+            call.cast::<PyCall>().ok().map(|bound| bound.clone().unbind())
+        } else {
+            None
+        };
+
+        let client = Arc::clone(&self.client);
+        let sessions = Arc::clone(&self.sessions);
+        let profile_str = profile_name.clone();
+
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            let result = client
+                .answer_local(&call_id, &from_tag, &offer_sdp, &flags)
+                .await;
+            match classify_answer_local(result, reject_call.is_some()) {
+                AnswerLocalOutcome::Answered(answer_sdp) => {
+                    debug!(
+                        call_id = %call_id,
+                        sdp_len = answer_sdp.len(),
+                        "rtpengine.answer_local: answer SDP synthesised"
+                    );
+                    // Record the session exactly as `offer` does, so `delete`,
+                    // active-session accounting, and a later `rtpengine.answer`
+                    // profile-reuse all work.
+                    sessions.insert(MediaSession {
+                        call_id,
+                        from_tag,
+                        to_tag: None,
+                        profile: profile_str,
+                        created_at: std::time::Instant::now(),
+                    });
+                    Ok(Some(answer_sdp))
+                }
+                AnswerLocalOutcome::Reject488 => {
+                    // reject_call is Some here (can_reject implied it).
+                    if let Some(reject_call) = reject_call {
+                        Python::attach(|py| {
+                            let mut call_ref = reject_call.bind(py).borrow_mut();
+                            call_ref.set_reject(488, "Not Acceptable Here");
+                        });
+                    }
+                    debug!(
+                        call_id = %call_id,
+                        "rtpengine.answer_local: no encodable codec, deferred 488 Not Acceptable Here"
+                    );
+                    Ok(None)
+                }
+                AnswerLocalOutcome::ValueError => Err(pyo3::exceptions::PyValueError::new_err(
+                    "no encodable codec in offer",
+                )),
+                AnswerLocalOutcome::RuntimeError(message) => {
+                    Err(pyo3::exceptions::PyRuntimeError::new_err(message))
+                }
+            }
+        })
+    }
+
     /// Send an RTPEngine `delete` command to tear down the media session.
     ///
     /// Args:
@@ -422,8 +627,7 @@ impl PyRtpEngine {
     ) -> PyResult<Bound<'py, PyAny>> {
         let source = resolve_play_media_source(file, blob, db_id)?;
 
-        let message = extract_message(target)?;
-        let (call_id, from_tag) = extract_delete_params(&message)?;
+        let (call_id, from_tag) = resolve_call_from_tag(target)?;
 
         let client = Arc::clone(&self.client);
 
@@ -458,8 +662,7 @@ impl PyRtpEngine {
         python: Python<'py>,
         target: &Bound<'py, PyAny>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let message = extract_message(target)?;
-        let (call_id, from_tag) = extract_delete_params(&message)?;
+        let (call_id, from_tag) = resolve_call_from_tag(target)?;
 
         let client = Arc::clone(&self.client);
 
@@ -495,8 +698,7 @@ impl PyRtpEngine {
         pause_ms: Option<u64>,
         to_tag: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let message = extract_message(target)?;
-        let (call_id, from_tag) = extract_delete_params(&message)?;
+        let (call_id, from_tag) = resolve_call_from_tag(target)?;
 
         let client = Arc::clone(&self.client);
 
@@ -582,8 +784,7 @@ impl PyRtpEngine {
         target: &Bound<'py, PyAny>,
         enabled: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let message = extract_message(target)?;
-        let (call_id, from_tag) = extract_delete_params(&message)?;
+        let (call_id, from_tag) = resolve_call_from_tag(target)?;
         let client = Arc::clone(&self.client);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
@@ -1310,5 +1511,100 @@ mod tests {
         let store = MediaSessionStore::new();
         let chosen = resolve_answer_profile(Some("rtp_passthrough"), &store, "no-such-call");
         assert_eq!(chosen, "rtp_passthrough");
+    }
+
+    // -- answer_local outcome classification ---------------------------------
+
+    #[test]
+    fn classify_answer_local_ok_answers() {
+        let outcome = classify_answer_local(Ok("v=0\r\nm=audio 40000 RTP/AVP 8\r\n".to_string()), true);
+        assert_eq!(
+            outcome,
+            AnswerLocalOutcome::Answered("v=0\r\nm=audio 40000 RTP/AVP 8\r\n".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_answer_local_no_codec_with_call_rejects() {
+        let outcome = classify_answer_local(
+            Err(RtpEngineError::EngineError("no-encodable-codec".to_string())),
+            true,
+        );
+        assert_eq!(outcome, AnswerLocalOutcome::Reject488);
+    }
+
+    #[test]
+    fn classify_answer_local_no_codec_without_call_value_error() {
+        let outcome = classify_answer_local(
+            Err(RtpEngineError::EngineError("no-encodable-codec".to_string())),
+            false,
+        );
+        assert_eq!(outcome, AnswerLocalOutcome::ValueError);
+    }
+
+    #[test]
+    fn classify_answer_local_transport_error_is_runtime() {
+        let outcome =
+            classify_answer_local(Err(RtpEngineError::Timeout { timeout_ms: 2000 }), true);
+        match outcome {
+            AnswerLocalOutcome::RuntimeError(message) => {
+                assert!(message.contains("rtpengine.answer_local failed"));
+            }
+            other => panic!("expected RuntimeError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_answer_local_other_engine_error_is_runtime_not_reject() {
+        // A non-"no-encodable-codec" engine error is a runtime error even when a
+        // reject target is available — the auto-488 is codec-specific.
+        let outcome = classify_answer_local(
+            Err(RtpEngineError::EngineError("no such call".to_string())),
+            true,
+        );
+        assert!(matches!(outcome, AnswerLocalOutcome::RuntimeError(_)));
+    }
+
+    // -- resolve_call_from_tag: object / tuple / bare-str target forms -------
+
+    #[test]
+    fn resolve_call_from_tag_accepts_object_tuple_and_str() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            // (1) SIP object: a Call wrapping an INVITE with Call-ID + From tag.
+            let mut message = test_message(Some("application/sdp"), b"v=0\r\n");
+            message.headers.set("Call-ID", "call-xyz".to_string());
+            message
+                .headers
+                .set("From", "<sip:alice@atlanta.com>;tag=ftag-1".to_string());
+            let call = PyCall::new(
+                "id-1".to_string(),
+                Arc::new(Mutex::new(message)),
+                "10.0.0.1".to_string(),
+                "udp".to_string(),
+            );
+            let py_call = Py::new(py, call).unwrap();
+            let bound_call = py_call.bind(py).clone().into_any();
+            let (call_id, from_tag) = resolve_call_from_tag(&bound_call).unwrap();
+            assert_eq!(call_id, "call-xyz");
+            assert_eq!(from_tag, "ftag-1");
+
+            // (2) (call_id, from_tag) pair — the @rtpengine.on_dtmf shape.
+            let tuple = pyo3::types::PyTuple::new(py, ["call-xyz", "ftag-1"]).unwrap();
+            let (call_id, from_tag) = resolve_call_from_tag(tuple.as_any()).unwrap();
+            assert_eq!(call_id, "call-xyz");
+            assert_eq!(from_tag, "ftag-1");
+
+            // (3) bare call_id str → empty from_tag (best-effort).
+            let string = pyo3::types::PyString::new(py, "call-xyz");
+            let (call_id, from_tag) = resolve_call_from_tag(string.as_any()).unwrap();
+            assert_eq!(call_id, "call-xyz");
+            assert_eq!(from_tag, "");
+
+            // (4) unsupported type → TypeError.
+            let number = 42i64.into_pyobject(py).unwrap();
+            let error = resolve_call_from_tag(number.as_any()).unwrap_err();
+            assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+        });
     }
 }

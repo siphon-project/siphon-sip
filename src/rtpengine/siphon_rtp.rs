@@ -285,6 +285,36 @@ impl SiphonRtpClient {
         expect_sdp(result)
     }
 
+    /// Single-leg UAS `answer_local` — the engine *is* the far side (IVR /
+    /// echo / announcement), so there is no peer `to_tag`.  Given the offerer's
+    /// SDP, the engine synthesises an RFC 3264 answer advertising one encodable
+    /// codec and returns it.  When no offered codec is encodable in this build
+    /// the engine replies `CmdResult::Error { reason: "no-encodable-codec" }`,
+    /// surfaced here as [`RtpEngineError::EngineError`] carrying that reason.
+    ///
+    /// Bookkeeping mirrors [`Self::offer`]: a single-leg answer establishes a
+    /// session, so the call-id is tracked for active-session accounting and a
+    /// later `delete`.
+    pub async fn answer_local(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        offer_sdp: &str,
+        flags: &NgFlags,
+    ) -> Result<String, RtpEngineError> {
+        let result = self
+            .request(Command::AnswerLocal {
+                call_id: call_id.to_string(),
+                from_tag: from_tag.to_string(),
+                sdp: offer_sdp.to_string(),
+                profile: profile_flags_from_ng(flags),
+            })
+            .await?;
+        let answer_sdp = expect_sdp(result)?;
+        self.sessions.insert(call_id.to_string(), ());
+        Ok(String::from_utf8_lossy(&answer_sdp).into_owned())
+    }
+
     /// Send a `delete` to tear down a session and drop its active-session entry.
     pub async fn delete(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
         let result = self
@@ -738,6 +768,23 @@ impl SiphonRtpClientSet {
         self.select(call_id)
             .answer(call_id, from_tag, to_tag, sdp, flags)
             .await
+    }
+
+    /// Single-leg UAS `answer_local` via the affinity-bound instance, binding
+    /// call-id affinity (it establishes a session, like `offer`).
+    pub async fn answer_local(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        offer_sdp: &str,
+        flags: &NgFlags,
+    ) -> Result<String, RtpEngineError> {
+        let result = self
+            .select(call_id)
+            .answer_local(call_id, from_tag, offer_sdp, flags)
+            .await?;
+        self.bind_affinity(call_id);
+        Ok(result)
     }
 
     /// Send a `delete` and drop affinity.
@@ -1890,6 +1937,97 @@ mod tests {
         let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
         client.echo("call-echo", "tag-a", true).await.unwrap();
         client.echo("call-echo", "tag-a", false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn answer_local_returns_answer_sdp_and_records_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            let request: Request = read_frame(&mut stream, &mut buffer).await;
+            match request.command {
+                Command::AnswerLocal {
+                    call_id,
+                    from_tag,
+                    profile,
+                    ..
+                } => {
+                    assert_eq!(call_id, "call-al");
+                    assert_eq!(from_tag, "tag-a");
+                    assert_eq!(profile.transport_protocol.as_deref(), Some("RTP/AVP"));
+                }
+                other => panic!("expected AnswerLocal, got {other:?}"),
+            }
+            write_frame(
+                &mut stream,
+                &Response {
+                    id: request.id,
+                    result: CmdResult::Ok {
+                        sdp: Some("v=0\r\nm=audio 40000 RTP/AVP 8 101\r\n".into()),
+                        duration_ms: None,
+                        to_tag: None,
+                        stats: None,
+                        play_id: None,
+                    },
+                },
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let (event_tx, _event_rx) = channel();
+        let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
+        let flags = NgFlags {
+            transport_protocol: Some("RTP/AVP".into()),
+            ..NgFlags::default()
+        };
+        let sdp = client
+            .answer_local("call-al", "tag-a", "v=0\r\n", &flags)
+            .await
+            .unwrap();
+        assert!(sdp.contains("m=audio"));
+        // Mirrors offer's bookkeeping: a single-leg answer establishes a session.
+        assert_eq!(client.active_sessions(), 1);
+    }
+
+    #[tokio::test]
+    async fn answer_local_no_encodable_codec_maps_to_engine_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            let request: Request = read_frame(&mut stream, &mut buffer).await;
+            assert!(matches!(request.command, Command::AnswerLocal { .. }));
+            write_frame(
+                &mut stream,
+                &Response {
+                    id: request.id,
+                    result: CmdResult::Error {
+                        reason: "no-encodable-codec".into(),
+                    },
+                },
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let (event_tx, _event_rx) = channel();
+        let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
+        let error = client
+            .answer_local("call-al", "tag-a", "v=0\r\n", &NgFlags::default())
+            .await
+            .unwrap_err();
+        match error {
+            RtpEngineError::EngineError(reason) => assert_eq!(reason, "no-encodable-codec"),
+            other => panic!("expected EngineError(no-encodable-codec), got {other:?}"),
+        }
+        // No session recorded on failure — the SDP arm never runs.
+        assert_eq!(client.active_sessions(), 0);
     }
 
     #[tokio::test]
