@@ -71,7 +71,7 @@ them (see the framework-handles-automatically notes in the API reference).
 |---|---|
 | `htable` (`$sht(...)`) | `cache` namespace (local LRU + optional Redis, shared live) |
 | `dispatcher` module + `ds_select_dst()` | `gateway` namespace (`gateway.select(group, key=…)`) + YAML `gateway.groups` |
-| `ds_is_from_list()` / `ds_is_in_list()` | `request.from_gateway(group)` / `call.from_gateway(group)` (source-IP membership of a `gateway` group) |
+| `ds_is_from_list()` / `ds_is_in_list()` | `request.from_gateway(group)` / `call.from_gateway(group)` / `reply.from_gateway(group)` (source-IP membership of a `gateway` group; the `reply` form tests which trunk answered) |
 | `dialog` module (`$dlg_val`, profiles) | the B2BUA call object (`@b2bua.*`, `call.*`) for true call control |
 | `rtpengine_*()` | `call.media.anchor()` / the `rtpengine` namespace |
 | `sqlops` / `avpops` against a DB | plain Python (use a DB client in an `async` handler, off the hot path) |

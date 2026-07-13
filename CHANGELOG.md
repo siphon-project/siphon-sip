@@ -24,6 +24,19 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   elapsed).
 
 ### Added
+- **`reply.from_gateway(group)` / `reply.source_ip` / `reply.source_port`** —
+  source-membership predicate on the response path, the reply-side counterpart of
+  `request.from_gateway` / `call.from_gateway` (Kamailio `ds_is_from_list()` /
+  OpenSIPS `ds_is_in_list()`). `reply.from_gateway("carriers")` is `True` when the
+  entity that sent the response has a source IP resolving into the named gateway
+  group — so a script can tell which trunk actually answered, e.g. in
+  `@proxy.on_reply` or `@b2bua.on_answer` / `@b2bua.on_early_media`. The B2BUA
+  reply now carries the B-leg peer's observed wire source (previously unset), and
+  `reply.source_ip` / `reply.source_port` expose it directly. Same trust
+  semantics as the request/call form (handshake-verified on TCP/TLS/WS/WSS, a
+  best-effort direction hint on UDP). Returns `False` / `None` where no single
+  source applies — e.g. a fork-aggregated `@proxy.on_failure` reply. Mirrored in
+  the SDK mock.
 - **`call.dial(..., auth_passthrough=True)` / `call.fork(..., auth_passthrough=True)`** —
   relay B-leg authentication to the caller end-to-end instead of siphon answering
   it (RFC 3261 §22.3), for device-driven proxy auth where the endpoint (not siphon)

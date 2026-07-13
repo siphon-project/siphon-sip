@@ -3861,7 +3861,7 @@ fn handle_response(
 
     // Check if this response belongs to a B2BUA call
     if let Some(call_id) = state.call_actors.call_id_for_branch(&branch) {
-        handle_b2bua_response(&call_id, &branch, &mut message, status_code, state);
+        handle_b2bua_response(&call_id, &branch, &mut message, status_code, inbound.remote_addr, state);
         return;
     }
 
@@ -4158,7 +4158,11 @@ fn handle_response(
                 let msg_arc = Arc::new(std::sync::Mutex::new(message));
                 let req_arc = Arc::new(std::sync::Mutex::new(original_request.clone()));
                 let (updated_msg, cb_forward, cb_reject): (Option<SipMessage>, bool, Option<(u16, String)>) = Python::attach(|python| {
-                    let py_reply_obj = PyReply::new(Arc::clone(&msg_arc));
+                    let py_reply_obj = PyReply::new(Arc::clone(&msg_arc))
+                        .with_response_source(
+                            inbound.remote_addr.ip().to_string(),
+                            inbound.remote_addr.port(),
+                        );
                     let py_reply = match Py::new(python, py_reply_obj) {
                         Ok(obj) => obj,
                         Err(error) => {
@@ -9730,6 +9734,7 @@ fn handle_b2bua_response(
     branch: &str,
     message: &mut SipMessage,
     status_code: u16,
+    response_source: SocketAddr,
     state: &DispatcherState,
 ) {
     debug!(
@@ -10556,7 +10561,11 @@ fn handle_b2bua_response(
                     format!("{}", a_leg.transport.transport).to_lowercase(),
                 );
                 let py_reply = PyReply::new(Arc::clone(&response_arc))
-                    .with_a_leg(Arc::clone(invite_arc));
+                    .with_a_leg(Arc::clone(invite_arc))
+                    .with_response_source(
+                        response_source.ip().to_string(),
+                        response_source.port(),
+                    );
 
                 Python::attach(|python| {
                     let call_obj = match Py::new(python, py_call) {
@@ -10981,7 +10990,11 @@ fn handle_b2bua_response(
                         format!("{}", a_leg.transport.transport).to_lowercase(),
                     );
                     let py_reply = PyReply::new(Arc::clone(&response_arc))
-                        .with_a_leg(Arc::clone(invite_arc));
+                        .with_a_leg(Arc::clone(invite_arc))
+                        .with_response_source(
+                            response_source.ip().to_string(),
+                            response_source.port(),
+                        );
 
                     Python::attach(|python| {
                         let call_obj = match Py::new(python, py_call) {

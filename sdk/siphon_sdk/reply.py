@@ -42,6 +42,8 @@ class Reply:
         body: Optional[bytes] = None,
         content_type: Optional[str] = None,
         headers: Optional[dict[str, str]] = None,
+        source_ip: Optional[str] = None,
+        source_port: Optional[int] = None,
     ) -> None:
         self._status_code = status_code
         self._reason = reason
@@ -51,6 +53,8 @@ class Reply:
         self._body = body
         self._content_type = content_type
         self._headers: dict[str, str] = dict(headers) if headers else {}
+        self._source_ip = source_ip
+        self._source_port = source_port
         self._actions: list[Action] = []
 
     @property
@@ -87,6 +91,70 @@ class Reply:
     def content_type(self) -> Optional[str]:
         """Content-Type header value."""
         return self._content_type
+
+    @property
+    def source_ip(self) -> Optional[str]:
+        """Source IP of the entity that sent this response, or ``None``.
+
+        Populated on ``@proxy.on_reply``, ``@proxy.on_failure`` per-relay
+        callbacks, and the B2BUA ``@b2bua.on_answer`` / ``@b2bua.on_early_media``
+        replies (the B-leg peer that answered).  ``None`` on a fork-aggregated
+        ``@proxy.on_failure`` reply, where the "best" error is selected across
+        branches and no single source applies.  Reply-side counterpart of
+        ``request.source_ip``.
+        """
+        return self._source_ip
+
+    @property
+    def source_port(self) -> Optional[int]:
+        """Source port of the entity that sent this response, or ``None``
+        (see :attr:`source_ip` for when it is populated)."""
+        return self._source_port
+
+    def from_gateway(self, group_name: str) -> bool:
+        """Check if this response's source IP is a member of a gateway group.
+
+        The reply-side counterpart of ``request.from_gateway`` /
+        ``call.from_gateway`` — returns ``True`` when the source IP of the entity
+        that sent this response is one of the resolved addresses of the gateway
+        group ``group_name`` (configured under ``gateway.groups`` in
+        ``siphon.yaml``, or via ``gateway.add_group``).  Use it on a response to
+        decide which trunk actually answered — siphon's answer to Kamailio
+        ``ds_is_from_list()`` / OpenSIPS ``ds_is_in_list()`` on the reply path.
+
+        The match is on IP only (source port ignored) against **every** resolved
+        address in the group, so a hostname that round-robins across many IPs
+        matches on any of them.
+
+        Infallible: returns ``False`` (never raises) when the group does not
+        exist, no gateway is configured, the response source is unknown (see
+        :attr:`source_ip`), or the source IP does not parse.
+
+        Security: on connection-oriented transports (TCP/TLS/WS/WSS) the source
+        IP is handshake-verified and trustworthy as an authorization signal; on
+        UDP it is spoofable, so ``from_gateway`` there is a best-effort
+        direction hint, not an auth gate.
+
+        Args:
+            group_name: Name of the gateway group to test membership against.
+
+        Returns:
+            ``True`` if the response source IP belongs to the group.
+
+        Example::
+
+            @b2bua.on_answer
+            async def on_answer(call, reply):
+                if reply.from_gateway("carriers"):
+                    log.info("answered by the carrier trunk")
+        """
+        # Lazy import avoids a circular import (mock_module imports from the
+        # request module, which the reply module also imports at load time).
+        from siphon_sdk.mock_module import get_gateway
+
+        if self._source_ip is None:
+            return False
+        return get_gateway().contains_source(group_name, self._source_ip)
 
     # -- Header access ---------------------------------------------------------
 
