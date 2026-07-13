@@ -1736,6 +1736,33 @@ class MockCache:
 # RTPEngine namespace
 # ---------------------------------------------------------------------------
 
+def _resolve_media_target(
+    target: Any,
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve ``(call_id, from_tag)`` from a media-verb target.
+
+    Mirrors the runtime's ``resolve_call_from_tag``: a media verb may be handed
+    a SIP object (``Request``/``Reply``/``Call``), a ``(call_id, from_tag)``
+    pair, or a bare ``call_id`` string — the latter two let an
+    ``@rtpengine.on_dtmf`` handler (which receives ``call_id``/``from_tag``
+    strings) drive media without a SIP message. Tolerant of ``None`` (returns
+    ``(None, None)``) so existing ``play_media(None, …)`` unit tests keep working.
+    """
+    # Bare call_id string → empty from_tag. Checked before the pair form so a
+    # 2-char id is never misread as a pair.
+    if isinstance(target, str):
+        return target, ""
+    # (call_id, from_tag) pair of strings.
+    if (
+        isinstance(target, (tuple, list))
+        and len(target) == 2
+        and all(isinstance(item, str) for item in target)
+    ):
+        return target[0], target[1]
+    # SIP object → best-effort from its call_id / from_tag attributes.
+    return getattr(target, "call_id", None), getattr(target, "from_tag", None)
+
+
 class MockRtpEngine:
     """Mock RTPEngine namespace — records media operations for assertions.
 
@@ -1751,6 +1778,13 @@ class MockRtpEngine:
     downstream apps can unit-test MMTEL announcement flows without a live
     rtpengine. Full parameter dicts are available on ``media_calls``.
 
+    Every media verb's ``target`` accepts three forms (like the runtime's
+    ``resolve_call_from_tag``): a SIP object (``Request``/``Reply``/``Call``), a
+    ``(call_id, from_tag)`` pair, or a bare ``call_id`` string — so an
+    ``@rtpengine.on_dtmf`` handler can drive media from the ``call_id`` /
+    ``from_tag`` it was handed. The resolved ``call_id`` / ``from_tag`` are
+    recorded on each ``media_calls`` entry.
+
     Valid profiles: ``"srtp_to_rtp"``, ``"ws_to_rtp"``, ``"wss_to_rtp"``,
     ``"rtp_passthrough"``.
     """
@@ -1762,6 +1796,8 @@ class MockRtpEngine:
         """Full parameter dicts for each media-injection call."""
         self._healthy = True
         self._play_media_duration_ms: Optional[int] = None
+        self._answer_local_sdp: str = "v=0\r\nm=audio 40000 RTP/AVP 8 101\r\n"
+        self._answer_local_no_codec: bool = False
         self._subscribe_request_sdp: bytes = b""
         self._subscribe_answer_sdp: bytes = b""
         self._dtmf_handlers: list[dict[str, Any]] = []
@@ -1832,6 +1868,91 @@ class MockRtpEngine:
                 profile = "rtp_passthrough"
         self.operations.append(("answer", profile))
         return True
+
+    async def answer_local(
+        self,
+        call: Any,
+        profile: Optional[str] = None,
+        auto_reject: bool = True,
+    ) -> Optional[str]:
+        """Single-leg UAS answer — synthesise an RFC 3264 answer for the
+        caller's **own** offer, with the media engine as the far side (IVR /
+        echo / announcement server).
+
+        Unlike :meth:`answer`, this takes the offer (INVITE), not a peer's
+        reply: there is no far leg, so the engine picks one encodable codec
+        from the offer and returns the answer SDP for the script to put in its
+        own 2xx.
+
+        Profile precedence matches :meth:`answer` (explicit ``profile=`` →
+        profile recorded by a matching ``offer`` → ``"rtp_passthrough"``).
+
+        When the offer has no encodable codec (primed in tests via
+        :meth:`set_answer_local_no_codec`), the engine cannot answer:
+
+        * with ``auto_reject=True`` (default) and a ``Call`` target, a deferred
+          ``488 Not Acceptable Here`` is recorded on the call
+          (``call.reject(488, "Not Acceptable Here")``) and the coroutine
+          resolves to ``None``;
+        * with ``auto_reject=False`` (or a non-``Call`` target) it raises
+          ``ValueError`` instead.
+
+        Native ``siphon-rtp`` backend only.
+
+        Args:
+            call: A ``Call`` (B2BUA) — or ``Request`` — carrying the INVITE
+                  offer whose Call-ID / From-tag drive the single-leg answer.
+            profile: Optional explicit RTP profile name. When omitted, the
+                     profile recorded by a matching offer is used.
+            auto_reject: When ``True`` (default) and ``call`` is a ``Call``, a
+                         no-encodable-codec result records a deferred 488 and
+                         returns ``None``. When ``False`` it raises
+                         ``ValueError``.
+
+        Returns:
+            The answer SDP as ``str`` on success, or ``None`` when the offer had
+            no encodable codec and it was auto-rejected with a 488.
+
+        Example::
+
+            @b2bua.on_invite
+            async def on_invite(call):
+                sdp = await rtpengine.answer_local(call, profile="ivr")
+                if sdp is not None:
+                    call.answer(200, "OK", body=sdp, content_type="application/sdp")
+                    await rtpengine.play_media(call, file="/prompts/welcome.wav")
+        """
+        if profile is None:
+            # Mirror real behavior: recover from the last recorded offer.
+            for op, recorded in reversed(self.operations):
+                if op == "offer":
+                    profile = recorded
+                    break
+            else:
+                profile = "rtp_passthrough"
+
+        if self._answer_local_no_codec:
+            can_reject = auto_reject and hasattr(call, "reject")
+            if can_reject:
+                call.reject(488, "Not Acceptable Here")
+                self.operations.append(("answer_local", None))
+                self.media_calls.append({
+                    "op": "answer_local",
+                    "profile": profile,
+                    "auto_reject": auto_reject,
+                    "answered": False,
+                })
+                return None
+            raise ValueError("no encodable codec in offer")
+
+        self.operations.append(("answer_local", profile))
+        self.media_calls.append({
+            "op": "answer_local",
+            "profile": profile,
+            "auto_reject": auto_reject,
+            "answered": True,
+        })
+        return self._answer_local_sdp
 
     async def delete(self, request: Any) -> bool:
         """Send ``delete`` command to tear down media session.
@@ -1913,9 +2034,12 @@ class MockRtpEngine:
                 "play_media requires exactly one of file=, blob=, or db_id="
             )
         source = "file" if file is not None else "blob" if blob is not None else "db-id"
+        call_id, resolved_from_tag = _resolve_media_target(target)
         self.operations.append(("play_media", source))
         self.media_calls.append({
             "op": "play_media",
+            "call_id": call_id,
+            "from_tag": resolved_from_tag,
             "file": file,
             "blob": blob,
             "db_id": db_id,
@@ -1936,8 +2060,9 @@ class MockRtpEngine:
         Returns:
             ``True`` on success.
         """
+        call_id, from_tag = _resolve_media_target(target)
         self.operations.append(("stop_media", None))
-        self.media_calls.append({"op": "stop_media"})
+        self.media_calls.append({"op": "stop_media", "call_id": call_id, "from_tag": from_tag})
         return True
 
     async def play_dtmf(
@@ -1964,9 +2089,12 @@ class MockRtpEngine:
 
             await rtpengine.play_dtmf(call, "123#", duration_ms=100)
         """
+        call_id, resolved_from_tag = _resolve_media_target(target)
         self.operations.append(("play_dtmf", code))
         self.media_calls.append({
             "op": "play_dtmf",
+            "call_id": call_id,
+            "from_tag": resolved_from_tag,
             "code": code,
             "duration_ms": duration_ms,
             "volume_dbm0": volume_dbm0,
@@ -1980,14 +2108,16 @@ class MockRtpEngine:
 
         Pair with :meth:`unsilence_media` to restore the original stream.
         """
+        call_id, from_tag = _resolve_media_target(target)
         self.operations.append(("silence_media", None))
-        self.media_calls.append({"op": "silence_media"})
+        self.media_calls.append({"op": "silence_media", "call_id": call_id, "from_tag": from_tag})
         return True
 
     async def unsilence_media(self, target: Any) -> bool:
         """Stop replacing outgoing audio with silence (undo :meth:`silence_media`)."""
+        call_id, from_tag = _resolve_media_target(target)
         self.operations.append(("unsilence_media", None))
-        self.media_calls.append({"op": "unsilence_media"})
+        self.media_calls.append({"op": "unsilence_media", "call_id": call_id, "from_tag": from_tag})
         return True
 
     async def block_media(self, target: Any) -> bool:
@@ -1995,14 +2125,16 @@ class MockRtpEngine:
 
         Pair with :meth:`unblock_media` to resume.
         """
+        call_id, from_tag = _resolve_media_target(target)
         self.operations.append(("block_media", None))
-        self.media_calls.append({"op": "block_media"})
+        self.media_calls.append({"op": "block_media", "call_id": call_id, "from_tag": from_tag})
         return True
 
     async def unblock_media(self, target: Any) -> bool:
         """Resume forwarding the selected monologue's packets."""
+        call_id, from_tag = _resolve_media_target(target)
         self.operations.append(("unblock_media", None))
-        self.media_calls.append({"op": "unblock_media"})
+        self.media_calls.append({"op": "unblock_media", "call_id": call_id, "from_tag": from_tag})
         return True
 
     async def echo(self, target: Any, enabled: bool = True) -> bool:
@@ -2012,8 +2144,14 @@ class MockRtpEngine:
         ``enabled=False`` stops echoing. Native ``siphon-rtp`` backend only;
         DTMF and media-timeout events still fire while echoing.
         """
+        call_id, from_tag = _resolve_media_target(target)
         self.operations.append(("echo", enabled))
-        self.media_calls.append({"op": "echo", "enabled": enabled})
+        self.media_calls.append({
+            "op": "echo",
+            "enabled": enabled,
+            "call_id": call_id,
+            "from_tag": from_tag,
+        })
         return True
 
     async def subscribe_request(
@@ -2184,12 +2322,23 @@ class MockRtpEngine:
         """Configure the duration returned by :meth:`play_media` (test helper)."""
         self._play_media_duration_ms = duration_ms
 
+    def set_answer_local_sdp(self, sdp: str) -> None:
+        """Configure the answer SDP returned by :meth:`answer_local` (test helper)."""
+        self._answer_local_sdp = sdp
+
+    def set_answer_local_no_codec(self, no_codec: bool = True) -> None:
+        """Prime :meth:`answer_local` to model a no-encodable-codec offer (test
+        helper) — the next ``answer_local`` records a deferred 488 (auto-reject)
+        or raises ``ValueError`` (``auto_reject=False``)."""
+        self._answer_local_no_codec = no_codec
+
     def clear(self) -> None:
         """Clear recorded operations and registered event handlers (test helper)."""
         self.operations.clear()
         self.media_calls.clear()
         self._dtmf_handlers.clear()
         self._media_timeout_handlers.clear()
+        self._answer_local_no_codec = False
 
 
 # ---------------------------------------------------------------------------

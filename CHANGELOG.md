@@ -24,6 +24,27 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   elapsed).
 
 ### Added
+- **`rtpengine.answer_local(call, profile=None, auto_reject=True)`** — single-leg
+  UAS answer for the caller's own offer, with the media engine as the far side
+  (IVR / echo / announcement server). Unlike `answer()` it takes the INVITE offer,
+  not a peer's reply: there is no far leg, so the engine picks one encodable codec
+  from the offer (RFC 3264 §6.1) and returns a real one-codec answer SDP for the
+  script to put in its own 2xx. Profile precedence matches `answer()` (explicit
+  `profile=` → the profile recorded by a matching `offer` → `rtp_passthrough`).
+  When the offer carries no codec the engine can encode, it can't be answered:
+  with `auto_reject=True` (default) and a `Call` target a deferred
+  `488 Not Acceptable Here` (RFC 3261 §13.3.1.2) is set on the call and the
+  coroutine resolves to `None`; with `auto_reject=False` (or a non-`Call` target)
+  it raises `ValueError` instead, leaving the response to the script. Native
+  `siphon-rtp` backend only (`siphon-rtp-proto` 0.1.3 `AnswerLocal`); rtpengine
+  and rtpproxy reject it.
+- **`rtpengine` media verbs now accept a `(call_id, from_tag)` tuple or a bare
+  `call_id` string** as their target, in addition to a `Request`/`Reply`/`Call`
+  object — `play_media`, `stop_media`, `play_dtmf`, `silence_media` /
+  `unsilence_media`, `block_media` / `unblock_media`, and `echo`. This lets an
+  `@rtpengine.on_dtmf` handler (which is handed `call_id` / `from_tag` strings,
+  not a SIP message) drive media directly, e.g. `await rtpengine.play_dtmf((call_id, from_tag), "1")`.
+  A bare string uses an empty from-tag (best-effort).
 - **`b2bua.terminate(call_id, reason="Normal Clearing") -> bool`** — imperative
   hangup of a B2BUA call by SIP Call-ID. Unlike `call.terminate()` (deferred
   until its own handler returns, so a no-op from an out-of-band event), this acts
