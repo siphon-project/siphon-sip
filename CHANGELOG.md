@@ -88,6 +88,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   live-swappable connector and a watcher on the client cert/key files rebuilds and
   swaps the identity on change, evicting stale pooled TLS connections so the next
   outbound call re-handshakes with the new cert. No config or scripting-API change.
+- **No more spurious `safety-net RTPEngine delete failed: unknown call` WARN on
+  every media-timeout teardown.** The media engine owns the call and reaps it on
+  media timeout (the reaper removes the call before emitting the timeout event),
+  so siphon-sip's own media-session bookkeeping is now dropped when it handles the
+  event. The teardown that an `@rtpengine.on_media_timeout` handler drives (e.g.
+  `b2bua.terminate`) then finds no record and issues no delete against a call the
+  engine already dropped, saving a wasted round-trip and a misleading warning on
+  every timeout. Separately, a safety-net delete that returns "call not found"
+  (rtpengine `Unknown call-id`, siphon-rtp `unknown call`, rtpproxy `E8`) is now
+  logged at `debug` rather than `warn` at all four safety-net delete sites: the
+  media was already cleaned, which is exactly what the safety net is for, so this
+  also quiets double-BYE / glare and caller-BYE-vs-IVR-terminate races.
 - **Compact SIP header forms (RFC 3261 §7.3.3) are now recognized on every
   lookup, not just a few.** Header names are matched by their canonical form, so
   the single-letter compact forms (`v`→Via, `f`→From, `t`→To, `i`→Call-ID,
