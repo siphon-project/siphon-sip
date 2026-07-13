@@ -1290,6 +1290,21 @@ impl SiphonServer {
             tls_client_config,
         ));
 
+        // Hot-reload the outbound client certificate alongside the inbound
+        // acceptor: when `tls.client_certificate` + `tls.client_private_key` are
+        // configured (outbound mutual TLS — Teams Direct Routing, carrier
+        // interconnects), watch them on disk and swap the renewed identity into
+        // the pool so outbound handshakes present the new cert without a restart.
+        if let Some((Some(certificate_path), Some(private_key_path))) =
+            config.tls.as_ref().map(|t| (&t.client_certificate, &t.client_private_key))
+        {
+            transport::pool::ConnectionPool::spawn_client_cert_hot_reload(
+                &connection_pool,
+                certificate_path,
+                private_key_path,
+            );
+        }
+
         // Spawn TCP listeners now that the pool exists.
         for (addr, tos, dscp) in tcp_entries {
             info!(addr = %addr, dscp = ?dscp, "starting TCP transport");

@@ -11,9 +11,11 @@
 //!   - Connections are removed on error and recreated on next use
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -94,8 +96,14 @@ pub struct ConnectionPool {
     local_addr: SocketAddr,
     /// Pre-computed TOS byte (DSCP << 2) for DSCP/DiffServ marking.
     tos: Option<u32>,
-    /// TLS connector for outbound TLS connections.
-    tls_connector: TlsConnector,
+    /// TLS connector for outbound TLS connections. Live-swappable so a renewed
+    /// outbound client certificate (mutual TLS — Teams Direct Routing, carrier
+    /// interconnects) is picked up without a restart: the inbound acceptor
+    /// hot-reloads via its own `ArcSwap` (see [`crate::transport::tls`]), and
+    /// this is the outbound counterpart. Read once per new connection in
+    /// `send_tls_inner`; replaced atomically by the client-cert watcher spawned
+    /// from [`ConnectionPool::spawn_client_cert_hot_reload`].
+    tls_connector: ArcSwap<TlsConnector>,
     /// Unified stream-connection registry — the pool registers the outbound
     /// TLS connections it creates here (tagged `Transport::Tls`) so the
     /// dispatcher can reuse them for inbound routing (e.g., INVITEs to
@@ -293,7 +301,7 @@ impl ConnectionPool {
             inbound_tx,
             local_addr,
             tos,
-            tls_connector: TlsConnector::from(tls_client_config),
+            tls_connector: ArcSwap::from_pointee(TlsConnector::from(tls_client_config)),
             stream_connections,
             crlf_pong_tracker,
             connect_timeout: TCP_CONNECT_TIMEOUT,
@@ -724,10 +732,15 @@ impl ConnectionPool {
 
         // TLS handshake — SNI/certificate hostname from `server_name` when the
         // relay resolved a hostname; else the destination IP literal.
+        //
+        // Read the live connector once per new connection so a hot-reloaded
+        // outbound client certificate is presented on fresh handshakes
+        // (Arc load — negligible; only on establishment, never per message).
         let handshake_name = resolve_server_name(destination, server_name)?;
+        let connector = self.tls_connector.load_full();
         let tls_stream = match tokio::time::timeout(
             self.connect_timeout,
-            self.tls_connector.connect(handshake_name, tcp_stream),
+            connector.connect(handshake_name, tcp_stream),
         )
         .await
         {
@@ -870,6 +883,134 @@ impl ConnectionPool {
     /// Number of active pooled connections.
     pub fn active_connections(&self) -> usize {
         self.connections.len()
+    }
+
+    /// Atomically swap the outbound TLS client config (e.g. after a renewed
+    /// client certificate on disk) so subsequent outbound handshakes present
+    /// the new identity.
+    ///
+    /// Existing pooled `Transport::Tls` connections are dropped from the reuse
+    /// map so the next outbound send re-handshakes with the fresh identity. This
+    /// is non-disruptive: those connections stay live in `connection_map` /
+    /// `stream_connections` and finish any in-flight exchange naturally — they
+    /// are simply no longer offered for reuse. Pooled TCP connections are
+    /// retained (their identity is transport-level, unaffected by the cert).
+    pub fn reload_tls_client_config(
+        &self,
+        new_config: Arc<tokio_rustls::rustls::ClientConfig>,
+    ) {
+        self.tls_connector
+            .store(Arc::new(TlsConnector::from(new_config)));
+        self.connections
+            .retain(|key, _| key.transport != Transport::Tls);
+        info!(
+            "outbound TLS client certificate hot-reloaded — new outbound \
+             handshakes present the updated cert"
+        );
+    }
+
+    /// Spawn a watcher that rebuilds the outbound TLS client identity whenever
+    /// the certificate or private-key file on disk changes, and swaps it into
+    /// the pool via [`ConnectionPool::reload_tls_client_config`].
+    ///
+    /// This is the outbound counterpart to
+    /// [`crate::transport::tls::build_hot_reload_acceptor`] (which hot-reloads
+    /// the inbound *server* acceptor): after a cert renewal, siphon presents the
+    /// renewed identity both when it *accepts* TLS (inbound) and when it *dials*
+    /// TLS (outbound mutual-TLS — Teams Direct Routing, carrier interconnects)
+    /// without a restart. Same notify pattern as the acceptor watcher:
+    /// parent-directory watch (so atomic rename by cert-manager/certbot is
+    /// observed), 150 ms debounce for the key-then-cert write pair, and a `Weak`
+    /// self-reference so the watcher exits when the pool is dropped.
+    pub fn spawn_client_cert_hot_reload(
+        pool: &Arc<ConnectionPool>,
+        certificate_path: &str,
+        private_key_path: &str,
+    ) {
+        let cert_path = PathBuf::from(certificate_path);
+        let key_path = PathBuf::from(private_key_path);
+        let certificate_path = certificate_path.to_owned();
+        let private_key_path = private_key_path.to_owned();
+        // Weak ref so the watcher exits once the last strong reference (the
+        // running server) is dropped — otherwise a spawned watcher would leak
+        // and block runtime shutdown in tests.
+        let weak = Arc::downgrade(pool);
+
+        tokio::task::spawn_blocking(move || {
+            use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+            use std::sync::mpsc;
+
+            let (sender, receiver) = mpsc::channel::<notify::Result<Event>>();
+            let mut watcher = match RecommendedWatcher::new(sender, Config::default()) {
+                Ok(watcher) => watcher,
+                Err(error) => {
+                    error!(%error, "outbound TLS watcher: failed to create file watcher");
+                    return;
+                }
+            };
+
+            // Watch the parent directories so atomic rename (cert-manager,
+            // certbot) is observed — they swap the file rather than rewrite it.
+            for path in [&cert_path, &key_path] {
+                let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+                if let Err(error) = watcher.watch(dir, RecursiveMode::NonRecursive) {
+                    warn!(%error, path = %dir.display(),
+                        "outbound TLS watcher: failed to watch directory; client-cert hot-reload disabled");
+                    return;
+                }
+            }
+            info!(
+                cert = %cert_path.display(),
+                key = %key_path.display(),
+                "outbound TLS client-cert hot-reload watcher started"
+            );
+
+            let cert_name = cert_path.file_name().map(|n| n.to_owned());
+            let key_name = key_path.file_name().map(|n| n.to_owned());
+
+            loop {
+                // Poll with a 1s timeout so we can check Weak::upgrade between
+                // events — when the pool drops we exit.
+                let event = match receiver.recv_timeout(std::time::Duration::from_secs(1)) {
+                    Ok(event) => event,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if weak.upgrade().is_none() {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                let pool = match weak.upgrade() {
+                    Some(pool) => pool,
+                    None => break,
+                };
+                match event {
+                    Ok(Event { kind: EventKind::Modify(_) | EventKind::Create(_), paths, .. }) => {
+                        let touched = paths.iter().any(|p| {
+                            let name = p.file_name().map(|n| n.to_owned());
+                            name == cert_name || name == key_name
+                        });
+                        if !touched {
+                            continue;
+                        }
+                        // Debounce — a renewal typically writes the key first,
+                        // then the cert; wait for the pair to settle.
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        match load_outbound_client_identity(&certificate_path, &private_key_path)
+                            .and_then(|identity| build_outbound_tls_config(Some(identity)))
+                        {
+                            Ok(new_config) => pool.reload_tls_client_config(new_config),
+                            Err(error) => warn!(%error,
+                                "outbound TLS client-cert hot-reload failed — keeping previous cert. Renewal half-written?"),
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!(%error, "outbound TLS watcher: file event error"),
+                }
+            }
+            debug!("outbound TLS watcher exiting (pool dropped)");
+        });
     }
 }
 
@@ -1448,6 +1589,195 @@ mod tests {
         assert!(
             server_rejected,
             "server must reject the handshake when no client cert is presented"
+        );
+    }
+
+    // --- Outbound client-certificate hot-reload --------------------------
+
+    /// A TLS server acceptor that presents `certs`' server cert and requires NO
+    /// client certificate — used to establish a plain outbound pooled TLS
+    /// connection (the pool's `NoVerify` accepts any server cert).
+    fn plain_server_acceptor(certs: &MtlsCerts) -> tokio_rustls::TlsAcceptor {
+        use tokio_rustls::rustls::ServerConfig;
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certs.server_cert_der.clone()],
+                certs.server_key_der.clone_key(),
+            )
+            .expect("server config");
+        tokio_rustls::TlsAcceptor::from(Arc::new(server_config))
+    }
+
+    /// Load an [`OutboundClientIdentity`] from in-memory PEM strings via the
+    /// production loader (files are fully read, so the tempdir can drop after).
+    fn identity_from_pem(cert_pem: &str, key_pem: &str) -> OutboundClientIdentity {
+        let directory = tempfile::tempdir().unwrap();
+        let cert_path = directory.path().join("client.crt");
+        let key_path = directory.path().join("client.key");
+        std::fs::write(&cert_path, cert_pem).unwrap();
+        std::fs::write(&key_path, key_pem).unwrap();
+        load_outbound_client_identity(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+        )
+        .expect("client identity must load")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reload_swaps_outbound_identity_for_new_connections() {
+        // The Teams-cert-renewal path: an outbound handshake with the OLD
+        // (untrusted) client identity must fail, and after
+        // `reload_tls_client_config` swaps in the renewed identity, a fresh
+        // outbound handshake must succeed — proving the live swap reaches new
+        // outbound connections (not just the inbound acceptor).
+        ensure_crypto_provider();
+
+        // Two independent CAs. The mTLS servers trust only CA-B.
+        let certs_a = generate_mtls_certs();
+        let certs_b = generate_mtls_certs();
+
+        // Pool starts with the CA-A client identity (wrong CA for these servers).
+        let identity_a = identity_from_pem(&certs_a.client_cert_pem, &certs_a.client_key_pem);
+        let config_a = build_outbound_tls_config(Some(identity_a)).expect("config a");
+        let connection_map = Arc::new(DashMap::new());
+        let (inbound_tx, _inbound_rx) = flume::unbounded();
+        let pool = ConnectionPool::new(
+            connection_map,
+            inbound_tx,
+            "127.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
+            None,
+            config_a,
+        );
+
+        // (a) Handshake with the wrong-CA client cert must FAIL.
+        let acceptor1 = mtls_server_acceptor(&certs_b);
+        let listener1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr1 = listener1.local_addr().unwrap();
+        let server1 = tokio::spawn(async move {
+            let (tcp, _) = listener1.accept().await.expect("accept");
+            // Server MUST reject — client cert chains to CA-A, not trusted.
+            acceptor1.accept(tcp).await.is_err()
+        });
+        let before = pool
+            .send_tls(addr1, Some("localhost"), Bytes::from_static(b"PING"))
+            .await;
+        assert!(
+            before.is_err(),
+            "handshake with the pre-reload (untrusted) client cert must fail"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), server1)
+                .await
+                .expect("server1 timed out")
+                .expect("server1 panicked"),
+            "server must reject the untrusted client cert"
+        );
+
+        // Swap in the renewed identity signed by CA-B.
+        let identity_b = identity_from_pem(&certs_b.client_cert_pem, &certs_b.client_key_pem);
+        let config_b = build_outbound_tls_config(Some(identity_b)).expect("config b");
+        pool.reload_tls_client_config(config_b);
+
+        // (b) A fresh outbound handshake now SUCCEEDS with the new identity.
+        let acceptor2 = mtls_server_acceptor(&certs_b);
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let server2 = tokio::spawn(async move {
+            let (tcp, _) = listener2.accept().await.expect("accept");
+            let mut tls = acceptor2
+                .accept(tcp)
+                .await
+                .expect("handshake with the renewed client cert must succeed");
+            let mut buffer = vec![0u8; 1024];
+            let size = tls.read(&mut buffer).await.expect("read app data");
+            String::from_utf8_lossy(&buffer[..size]).to_string()
+        });
+        let after = pool
+            .send_tls(
+                addr2,
+                Some("localhost"),
+                Bytes::from_static(b"OPTIONS sip:peer@example.com SIP/2.0\r\n\r\n"),
+            )
+            .await;
+        assert!(
+            after.is_ok(),
+            "after reload, the handshake with the renewed identity must succeed: {:?}",
+            after.err()
+        );
+        let received = tokio::time::timeout(Duration::from_secs(5), server2)
+            .await
+            .expect("server2 timed out")
+            .expect("server2 panicked");
+        assert!(
+            received.contains("OPTIONS"),
+            "server did not receive app data over the reloaded identity: {received}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_evicts_stale_pooled_tls_connection() {
+        // A reload must drop pooled TLS connections from the reuse map (so the
+        // next send re-handshakes with the new cert) while leaving pooled TCP
+        // connections — whose identity is transport-level — untouched.
+        ensure_crypto_provider();
+        let certs = generate_mtls_certs();
+
+        // A plain TLS server (no client auth) to establish a pooled TLS conn.
+        let tls_acceptor = plain_server_acceptor(&certs);
+        let tls_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tls_addr = tls_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((tcp, _)) = tls_listener.accept().await {
+                if let Ok(mut tls) = tls_acceptor.accept(tcp).await {
+                    let mut buffer = vec![0u8; 1024];
+                    let _ = tls.read(&mut buffer).await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        });
+
+        // A plain TCP server to establish a pooled TCP conn that must survive.
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut tcp, _)) = tcp_listener.accept().await {
+                let mut buffer = vec![0u8; 1024];
+                let _ = tcp.read(&mut buffer).await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        });
+
+        let connection_map = Arc::new(DashMap::new());
+        let (inbound_tx, _inbound_rx) = flume::unbounded();
+        let pool = ConnectionPool::new(
+            connection_map,
+            inbound_tx,
+            "127.0.0.1:5060".parse().unwrap(),
+            None,
+            None,
+            None,
+            build_outbound_tls_config(None).expect("outbound tls config"),
+        );
+
+        pool.send_tls(tls_addr, Some("localhost"), Bytes::from_static(b"PING"))
+            .await
+            .expect("establish pooled TLS connection");
+        pool.send_tcp(tcp_addr, Bytes::from_static(b"PING"))
+            .await
+            .expect("establish pooled TCP connection");
+        assert_eq!(pool.active_connections(), 2, "both connections pooled");
+
+        pool.reload_tls_client_config(
+            build_outbound_tls_config(None).expect("outbound tls config"),
+        );
+
+        assert_eq!(
+            pool.active_connections(),
+            1,
+            "reload must evict the pooled TLS connection but keep the TCP one"
         );
     }
 }
