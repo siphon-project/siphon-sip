@@ -76,6 +76,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   unaffected; there is no separate `answer_now()`.
 
 ### Fixed
+- **Outbound TLS client certificate now hot-reloads alongside the inbound
+  acceptor.** Previously a cert renewal only swapped the inbound TLS/WSS *server*
+  acceptor (the `SharedTlsAcceptor` read by every accept loop), while the
+  outbound connection pool kept the client identity it built once at startup from
+  `tls.client_certificate` / `tls.client_private_key`. So on a mutual-TLS trunk
+  where siphon *dials* the peer (Microsoft Teams Direct Routing, carrier
+  interconnects), a renewed client cert was never presented until a restart — the
+  peer rejected the outbound handshake on the stale/expired cert even though the
+  "new handshakes use the updated cert" reload had logged. The pool now holds a
+  live-swappable connector and a watcher on the client cert/key files rebuilds and
+  swaps the identity on change, evicting stale pooled TLS connections so the next
+  outbound call re-handshakes with the new cert. No config or scripting-API change.
 - **Compact SIP header forms (RFC 3261 §7.3.3) are now recognized on every
   lookup, not just a few.** Header names are matched by their canonical form, so
   the single-letter compact forms (`v`→Via, `f`→From, `t`→To, `i`→Call-ID,
