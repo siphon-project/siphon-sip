@@ -653,6 +653,12 @@ pub struct CallActor {
     /// the call is still un-answered. `None` = no application timeout (the 24h
     /// orphan backstop still applies).
     pub answer_deadline: Option<std::time::Instant>,
+    /// When true (`call.dial(auth_passthrough=True)`), a B-leg 401/407 with no
+    /// siphon-side credentials is relayed to the caller as a non-terminal
+    /// challenge: the dispatcher forwards it and keeps the call alive instead of
+    /// firing `@b2bua.on_failure`, deleting media, and removing the call — so the
+    /// caller can authenticate end-to-end and re-INVITE (RFC 3261 §22.3).
+    pub auth_passthrough: bool,
 }
 
 impl CallActor {
@@ -686,6 +692,7 @@ impl CallActor {
             a_leg_supports_100rel: false,
             auth_retry_count: 0,
             answer_deadline: None,
+            auth_passthrough: false,
         }
     }
 

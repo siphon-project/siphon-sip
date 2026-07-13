@@ -1,0 +1,38 @@
+# siphon.b2bua-auth-test.yaml — B2BUA device-driven proxy-auth test config
+#
+# Used with: sipp/docker-compose.yaml (b2bua-auth profile)
+# Script:    scripts/b2bua_auth_passthrough.py
+# Tests:     a B-leg 407 is relayed to the caller (auth_passthrough) and siphon
+#            does NOT emit a spurious 502 in response to the caller's ACK.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.50"
+    - "127.0.0.1"
+
+script:
+  path: "scripts/b2bua_auth_passthrough.py"
+  reload: auto
+
+advertised_address: "172.20.0.50"
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+log:
+  level: debug
+  format: pretty
