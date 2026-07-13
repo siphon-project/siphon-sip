@@ -16,6 +16,7 @@ page); none of the APIs here are invented.
 | [Stateful proxy](proxy.md) | A residential/edge proxy | `request.fork`, `loose_route`, `record_route`, sanity checks |
 | [Load balancer](load-balancer.md) | A front LB over a backend pool | `gateway.select`, health probing, subscriber affinity |
 | [SBC (B2BUA)](sbc.md) | A topology-hiding SBC with media | `@b2bua.*`, `call.dial`/`fork`, **header policies**, RTPEngine |
+| [Number normalization](number-normalization.md) | E.164 identity rewriting at a trunk↔IMS edge | `numbers.parse`, `rewrite_identities`, **number policies**, diversion family |
 | [Media & RTP profiles](media-rtp.md) | SRTP↔RTP, WebRTC, transcoding, hold | `rtpengine.offer`/`answer`, profiles, the `sdp` namespace |
 | [Hardening & security](security.md) | A locked-down edge | rate-limit, scanner/auth bans, TLS/mTLS, STIR/SHAKEN, IPsec |
 | [Monitoring & observability](monitoring.md) | Metrics, CDRs, tracing, probes | custom Prometheus metrics, `/admin/*`, CDR, HEP/Homer |

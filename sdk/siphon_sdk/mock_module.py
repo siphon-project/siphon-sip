@@ -5940,6 +5940,15 @@ _sdp = MockSdpNamespace()
 
 
 # ---------------------------------------------------------------------------
+# numbers namespace — E.164 identity normalization
+# ---------------------------------------------------------------------------
+
+from siphon_sdk.numbers import MockNumbersNamespace
+
+_numbers = MockNumbersNamespace()
+
+
+# ---------------------------------------------------------------------------
 # QoS namespace — SDP → IPFilterRule helper
 # ---------------------------------------------------------------------------
 
@@ -6205,6 +6214,7 @@ def install() -> ModuleType:
     mod.ipsec = _ipsec  # type: ignore[attr-defined]
     mod.stir = _stir  # type: ignore[attr-defined]
     mod.sdp = _sdp  # type: ignore[attr-defined]
+    mod.numbers = _numbers  # type: ignore[attr-defined]
     mod.qos = _qos  # type: ignore[attr-defined]
     # smpp namespace — provided by the siphon-smpp extension at runtime;
     # mocked here so `from siphon import smpp` works under pytest.
@@ -6255,6 +6265,7 @@ def reset() -> None:
     _isc.clear()
     _ipsec.clear()
     _stir.clear()
+    _numbers.clear()
     _smpp.clear()
     _http.clear()
     _auth._allow = False
@@ -6269,6 +6280,18 @@ def reset() -> None:
 def get_registry() -> _HandlerRegistry:
     """Access the handler registry (test helper)."""
     return _registry
+
+
+def get_numbers() -> MockNumbersNamespace:
+    """Access the mock numbers namespace singleton (test helper).
+
+    Configure the home numbering plan and named policies before running a
+    script under test::
+
+        mock_module.get_numbers().configure(country_code="31")
+        mock_module.get_numbers().register_policy("teams-outbound@2026", default="e164")
+    """
+    return _numbers
 
 
 def get_smpp() -> MockSmpp:

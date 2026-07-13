@@ -1030,13 +1030,13 @@ impl PyCall {
     ///
     /// Example:
     ///     call.dial(
-    ///         "sip:5112@ims.mnc088.mcc204.3gppnetwork.org",
-    ///         next_hop="sip:172.16.0.111:4060",
+    ///         "sip:1000@ims.mnc001.mcc001.3gppnetwork.org",
+    ///         next_hop="sip:192.0.2.111:4060",
     ///         header_policy="ims-trust-domain-boundary@2026",
     ///         copy=["X-Operator-Tag"],
     ///         strip=["History-Info"],
     ///     )
-    #[pyo3(signature = (uri, timeout=30, next_hop=None, flow=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), route=Vec::new(), send_socket=None, auth_passthrough=false))]
+    #[pyo3(signature = (uri, timeout=30, next_hop=None, flow=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), route=Vec::new(), send_socket=None, auth_passthrough=false, number_policy=None))]
     #[allow(clippy::too_many_arguments)]
     fn dial(
         &mut self,
@@ -1051,10 +1051,24 @@ impl PyCall {
         route: Vec<String>,
         send_socket: Option<String>,
         auth_passthrough: bool,
+        number_policy: Option<&str>,
     ) -> PyResult<()> {
         super::request::validate_send_socket(send_socket.as_deref())?;
+        // Number normalization (explicit `number_policy=`, else the configured
+        // `b2bua.default_number_policy`): reformat the A-leg identity headers
+        // that flow to the B-leg, plus the dial target itself.
+        let target = {
+            if let Some(policy) = super::numbers::resolve_dial_policy(number_policy)? {
+                let mut message = self.message.lock().map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+                })?;
+                super::numbers::apply_for_dial(&mut message, &policy, uri)
+            } else {
+                uri.to_string()
+            }
+        };
         self.action = CallAction::Dial {
-            target: uri.to_string(),
+            target,
             next_hop: next_hop.map(String::from),
             flow,
             route,
@@ -1077,7 +1091,7 @@ impl PyCall {
     /// connection reuse, mandatory for WebSocket callees (RFC 7118 §5 / RFC
     /// 5626 §5.3).  `header_policy` / `copy` / `strip` / `translate` apply to
     /// every branch — per-branch policy is a follow-up enhancement.
-    #[pyo3(signature = (targets, strategy="parallel", timeout=30, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), send_socket=None, auth_passthrough=false))]
+    #[pyo3(signature = (targets, strategy="parallel", timeout=30, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), send_socket=None, auth_passthrough=false, number_policy=None))]
     #[allow(clippy::too_many_arguments)]
     fn fork(
         &mut self,
@@ -1090,6 +1104,7 @@ impl PyCall {
         translate: Vec<(String, String)>,
         send_socket: Option<String>,
         auth_passthrough: bool,
+        number_policy: Option<&str>,
     ) -> PyResult<()> {
         super::request::validate_send_socket(send_socket.as_deref())?;
         let mut target_uris: Vec<String> = Vec::with_capacity(targets.len());
@@ -1103,6 +1118,14 @@ impl PyCall {
                 target_uris.push(item.extract::<String>()?);
                 flows.push(None);
             }
+        }
+        // Number normalization applies to every branch target plus the A-leg
+        // identity headers (explicit `number_policy=`, else the b2bua default).
+        if let Some(policy) = super::numbers::resolve_dial_policy(number_policy)? {
+            let mut message = self.message.lock().map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+            })?;
+            super::numbers::apply_for_fork(&mut message, &policy, &mut target_uris);
         }
         self.action = CallAction::Fork {
             targets: target_uris,
@@ -1187,6 +1210,34 @@ impl PyCall {
         Ok(())
     }
 
+    /// Rewrite dialable identity userparts into a target E.164 shape.
+    ///
+    /// Walks From, To, P-Asserted-Identity, P-Preferred-Identity (and any
+    /// opted-in header) on the A-leg INVITE, which flows to the B-leg. Pass
+    /// **either** a named `policy` from `number_policies:` **or** an inline
+    /// `format` (`"e164"` | `"plain"` | `"international"` | `"national"`) with
+    /// an optional `headers` list and `home` country-code override. Returns the
+    /// number of headers changed. Must be called before `dial()`.
+    ///
+    /// ```python
+    /// call.rewrite_identities("ims-e164@2026")
+    /// call.rewrite_identities(format="e164")
+    /// ```
+    #[pyo3(signature = (policy=None, format=None, headers=None, home=None))]
+    fn rewrite_identities(
+        &self,
+        policy: Option<&str>,
+        format: Option<&str>,
+        headers: Option<Vec<String>>,
+        home: Option<&str>,
+    ) -> PyResult<usize> {
+        let resolved = super::numbers::resolve_rewrite_policy(policy, format, headers, home)?;
+        let mut message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        Ok(super::numbers::apply_to_message(&mut message, &resolved))
+    }
+
     /// Set the user part of the From header URI.
     ///
     /// Usage in Python:
@@ -1229,8 +1280,8 @@ impl PyCall {
     /// to take effect on the B-leg INVITE — same model as [`set_from_user`].
     ///
     /// Usage in Python:
-    ///   call.set_to_user("5112")
-    ///   call.dial("sip:5112@ims.mnc088.mcc204.3gppnetwork.org")
+    ///   call.set_to_user("1000")
+    ///   call.dial("sip:1000@ims.mnc001.mcc001.3gppnetwork.org")
     fn set_to_user(&self, value: &str) -> PyResult<()> {
         let mut message = self.message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
@@ -1373,7 +1424,7 @@ impl PyCall {
     /// host — same opt-out as [`set_to_host`]). Must be called before [`dial`].
     ///
     /// Usage in Python:
-    ///   call.set_to_uri("sip:5112@ims.mnc088.mcc204.3gppnetwork.org")
+    ///   call.set_to_uri("sip:1000@ims.mnc001.mcc001.3gppnetwork.org")
     fn set_to_uri(&mut self, uri: &str) -> PyResult<()> {
         let host = {
             let mut message = self.message.lock().map_err(|error| {
@@ -1522,7 +1573,7 @@ mod tests {
     fn call_dial() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
-        call.dial("sip:bob@10.0.0.2:5060", 30, None, None, None, vec![], vec![], vec![], vec![], None, false).unwrap();
+        call.dial("sip:bob@10.0.0.2:5060", 30, None, None, None, vec![], vec![], vec![], vec![], None, false, None).unwrap();
         assert_eq!(
             call.action(),
             &CallAction::Dial {
@@ -1543,7 +1594,7 @@ mod tests {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         call.dial(
-            "sip:5112@ims.mnc01.mcc001.3gppnetwork.org",
+            "sip:1000@ims.mnc01.mcc001.3gppnetwork.org",
             30,
             None,
             None,
@@ -1554,6 +1605,7 @@ mod tests {
             vec!["<sip:scscf.ims.mnc01.mcc001.3gppnetwork.org:6060;lr>".to_string()],
             None,
             false,
+            None,
         ).unwrap();
         match call.action() {
             CallAction::Dial { route, .. } => {
@@ -1568,9 +1620,9 @@ mod tests {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         call.dial(
-            "sip:5112@ims.mnc088.mcc204.3gppnetwork.org",
+            "sip:1000@ims.mnc001.mcc001.3gppnetwork.org",
             30,
-            Some("sip:172.16.0.111:4060"),
+            Some("sip:192.0.2.111:4060"),
             None,
             None,
             vec![],
@@ -1579,12 +1631,13 @@ mod tests {
             vec![],
             None,
             false,
+            None,
         ).unwrap();
         assert_eq!(
             call.action(),
             &CallAction::Dial {
-                target: "sip:5112@ims.mnc088.mcc204.3gppnetwork.org".to_string(),
-                next_hop: Some("sip:172.16.0.111:4060".to_string()),
+                target: "sip:1000@ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+                next_hop: Some("sip:192.0.2.111:4060".to_string()),
                 flow: None,
                 route: vec![],
                 send_socket: None,
@@ -1609,6 +1662,7 @@ mod tests {
             vec![],
             None,
             false,
+            None,
         ).unwrap();
         let input = call.header_policy_input().expect("policy input must be captured");
         assert_eq!(input.policy_name.as_deref(), Some("ims-trust-domain-boundary@2026"));
@@ -1629,6 +1683,7 @@ mod tests {
             vec![], vec![], vec![], vec![],
             Some("udp:10.0.0.1:5060".to_string()),
             false,
+            None,
         ).unwrap();
         match call.action() {
             CallAction::Dial { send_socket, .. } => {
@@ -1647,6 +1702,7 @@ mod tests {
             vec![], vec![], vec![], vec![],
             Some("not-a-socket".to_string()),
             false,
+            None,
         );
         assert!(result.is_err());
     }
@@ -1661,7 +1717,7 @@ mod tests {
                 pyo3::types::PyString::new(py, "sip:bob@10.0.0.2").into_any(),
                 pyo3::types::PyString::new(py, "sip:bob@10.0.0.3").into_any(),
             ];
-            call.fork(targets, "parallel", 30, None, vec![], vec![], vec![], None, false).unwrap();
+            call.fork(targets, "parallel", 30, None, vec![], vec![], vec![], None, false, None).unwrap();
             assert_eq!(
                 call.action(),
                 &CallAction::Fork {
@@ -1685,7 +1741,7 @@ mod tests {
                 pyo3::types::PyString::new(py, "sip:bob@10.0.0.2").into_any(),
                 pyo3::types::PyString::new(py, "sip:bob@10.0.0.3").into_any(),
             ];
-            call.fork(targets, "parallel", 30, Some("sip-trunk-edge@2026"), vec![], vec!["X-Internal-Tag".to_string()], vec![], None, false).unwrap();
+            call.fork(targets, "parallel", 30, Some("sip-trunk-edge@2026"), vec![], vec!["X-Internal-Tag".to_string()], vec![], None, false, None).unwrap();
             let input = call.header_policy_input().expect("policy input must be captured");
             assert_eq!(input.policy_name.as_deref(), Some("sip-trunk-edge@2026"));
             assert_eq!(input.deltas_strip, vec!["X-Internal-Tag".to_string()]);
@@ -1696,7 +1752,7 @@ mod tests {
     fn call_dial_auth_passthrough_sets_flag_and_copies_both_auth_headers() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
-        call.dial("sip:bob@pbx.example.com:5060", 30, None, None, None, vec![], vec![], vec![], vec![], None, true).unwrap();
+        call.dial("sip:bob@pbx.example.com:5060", 30, None, None, None, vec![], vec![], vec![], vec![], None, true, None).unwrap();
         assert!(call.auth_passthrough(), "auth_passthrough flag must be set");
         let input = call
             .header_policy_input()
@@ -1717,7 +1773,7 @@ mod tests {
         call.dial(
             "sip:bob@pbx.example.com:5060", 30, None, None, None,
             vec!["proxy-authenticate".to_string(), "X-Keep".to_string()],
-            vec![], vec![], vec![], None, true,
+            vec![], vec![], vec![], None, true, None,
         ).unwrap();
         let input = call.header_policy_input().expect("policy input captured");
         let authenticate_count = input
@@ -1734,7 +1790,7 @@ mod tests {
     fn call_dial_auth_passthrough_defaults_false_zero_cost() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
-        call.dial("sip:bob@10.0.0.2:5060", 30, None, None, None, vec![], vec![], vec![], vec![], None, false).unwrap();
+        call.dial("sip:bob@10.0.0.2:5060", 30, None, None, None, vec![], vec![], vec![], vec![], None, false, None).unwrap();
         assert!(!call.auth_passthrough());
         // No auth_passthrough and no policy kwargs → nothing captured (existing scripts pay zero cost).
         assert!(call.header_policy_input().is_none());
@@ -1866,10 +1922,10 @@ mod tests {
     fn call_set_to_user() {
         let message = Arc::new(Mutex::new(make_invite()));
         let call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string(), "udp".to_string());
-        call.set_to_user("5112").unwrap();
+        call.set_to_user("1000").unwrap();
         let msg = message.lock().unwrap();
         let to = msg.headers.get("To").unwrap();
-        assert!(to.contains("5112@example.com"), "To should contain new user: {to}");
+        assert!(to.contains("1000@example.com"), "To should contain new user: {to}");
         assert!(!to.contains(";tag="), "Initial INVITE To must not gain a tag: {to}");
     }
 
@@ -1879,10 +1935,10 @@ mod tests {
         invite.headers.set("To", "<sip:bob@example.com>;tag=remote-tag".to_string());
         let message = Arc::new(Mutex::new(invite));
         let call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string(), "udp".to_string());
-        call.set_to_user("5112").unwrap();
+        call.set_to_user("1000").unwrap();
         let msg = message.lock().unwrap();
         let to = msg.headers.get("To").unwrap();
-        assert!(to.contains("5112@example.com"), "To should contain new user: {to}");
+        assert!(to.contains("1000@example.com"), "To should contain new user: {to}");
         assert!(to.contains(";tag=remote-tag"), "To should preserve existing tag: {to}");
     }
 
@@ -1960,10 +2016,10 @@ mod tests {
     fn call_set_to_uri_replaces_uri_and_pins_host() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string(), "udp".to_string());
-        call.set_to_uri("sip:5112@ims.example.org").unwrap();
+        call.set_to_uri("sip:1000@ims.example.org").unwrap();
         let msg = message.lock().unwrap();
         let to = msg.headers.get("To").unwrap();
-        assert!(to.contains("5112@ims.example.org"), "user+host: {to}");
+        assert!(to.contains("1000@ims.example.org"), "user+host: {to}");
         assert!(!to.contains("example.com"), "old host gone: {to}");
         assert!(!to.contains(";tag="), "initial INVITE To must not gain a tag: {to}");
         drop(msg);
@@ -1976,11 +2032,11 @@ mod tests {
         invite.headers.set("To", "\"Bob\" <sip:bob@example.com>;tag=remote".to_string());
         let message = Arc::new(Mutex::new(invite));
         let mut call = PyCall::new("test-id".to_string(), message.clone(), "10.0.0.1".to_string(), "udp".to_string());
-        call.set_to_uri("sip:5112@ims.example.org").unwrap();
+        call.set_to_uri("sip:1000@ims.example.org").unwrap();
         let msg = message.lock().unwrap();
         let to = msg.headers.get("To").unwrap();
         assert!(to.contains("\"Bob\""), "display preserved: {to}");
-        assert!(to.contains("5112@ims.example.org"), "uri replaced: {to}");
+        assert!(to.contains("1000@ims.example.org"), "uri replaced: {to}");
         assert!(to.contains(";tag=remote"), "tag preserved: {to}");
     }
 

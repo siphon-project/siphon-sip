@@ -1197,6 +1197,36 @@ impl PyRequest {
         Ok(())
     }
 
+    /// Rewrite dialable identity userparts into a target E.164 shape.
+    ///
+    /// Walks From, To, P-Asserted-Identity, P-Preferred-Identity, the
+    /// Request-URI (and any opted-in `Referred-By` / `Remote-Party-ID`),
+    /// reformatting each dialable number in place. Display names, tags, hosts,
+    /// non-numbers and preserved service codes are left untouched.
+    ///
+    /// Pass **either** a named `policy` from the `number_policies:` config
+    /// **or** an inline `format` (`"e164"` | `"plain"` | `"international"` |
+    /// `"national"`) with an optional `headers` list and a `home`
+    /// country-code override. Returns the number of headers changed.
+    ///
+    /// ```python
+    /// request.rewrite_identities("teams-outbound@2026")
+    /// request.rewrite_identities(format="e164")
+    /// request.rewrite_identities(format="national", headers=["From", "request-uri"])
+    /// ```
+    #[pyo3(signature = (policy=None, format=None, headers=None, home=None))]
+    fn rewrite_identities(
+        &self,
+        policy: Option<&str>,
+        format: Option<&str>,
+        headers: Option<Vec<String>>,
+        home: Option<&str>,
+    ) -> PyResult<usize> {
+        let resolved = super::numbers::resolve_rewrite_policy(policy, format, headers, home)?;
+        let mut message = self.lock_mut()?;
+        Ok(super::numbers::apply_to_message(&mut message, &resolved))
+    }
+
     // -----------------------------------------------------------------------
     // Header manipulation
     // -----------------------------------------------------------------------
@@ -2468,10 +2498,10 @@ mod tests {
     #[test]
     fn set_to_uri_replaces_uri_preserves_display() {
         let request = make_request();
-        request.set_to_uri("sip:5112@ims.example.org").unwrap();
+        request.set_to_uri("sip:1000@ims.example.org").unwrap();
         let to = request.get_header("To").unwrap().unwrap();
         assert!(to.contains("\"Bob\""), "display preserved: {to}");
-        assert!(to.contains("5112@ims.example.org"), "uri replaced: {to}");
+        assert!(to.contains("1000@ims.example.org"), "uri replaced: {to}");
         assert!(!to.contains("biloxi.com"), "old host gone: {to}");
     }
 

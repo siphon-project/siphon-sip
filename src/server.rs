@@ -579,6 +579,43 @@ impl SiphonServer {
             }
         });
 
+        // --- Initialize numbers namespace + number-policy runtime ---
+        // E.164 identity normalization. The parser namespace is always
+        // available; the home locale and named policies come from the config.
+        pyo3::Python::attach(|python| {
+            if let Err(error) = crate::script::api::set_numbers_singleton(python) {
+                error!("failed to store numbers singleton: {error}");
+            }
+        });
+        {
+            let (registry, warnings) = crate::numbers::policy::NumberRegistry::build(
+                &config.numbering,
+                &config.number_policies,
+            );
+            for warning in &warnings {
+                warn!("number policy: {warning}");
+            }
+            let default_b2bua_policy = match &config.b2bua.default_number_policy {
+                Some(name) => match registry.get(name) {
+                    Some(policy) => Some(policy),
+                    None => {
+                        warn!(
+                            "b2bua.default_number_policy {name:?} not found in number_policies; \
+                             no default number normalization will be applied"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            crate::script::api::numbers::set_number_runtime(std::sync::Arc::new(
+                crate::script::api::numbers::NumberRuntime {
+                    registry,
+                    default_b2bua_policy,
+                },
+            ));
+        }
+
         // --- Initialize timer namespace for Python scripts ---
         // Runtime scheduler for timer.set / timer.cancel — always available.
         pyo3::Python::attach(|python| {

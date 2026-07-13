@@ -1563,6 +1563,163 @@ def new_call(call):
     }
 
     #[test]
+    fn proxy_rewrite_identities_inline_normalizes_to_e164() {
+        // End-to-end proof of the proxy identity walk through PyO3: a script
+        // calls request.rewrite_identities(format="e164", home="31") and the
+        // shared message's From/To/Request-URI userparts come back +E.164,
+        // with display name and tag preserved.
+        use crate::script::api::request::PyRequest;
+        use crate::sip::builder::SipMessageBuilder;
+        use crate::sip::message::{Method, StartLine};
+        use crate::sip::uri::SipUri;
+        use std::sync::{Arc, Mutex};
+
+        let source = r#"
+from siphon import proxy
+
+@proxy.on_request("INVITE")
+def route(request):
+    request.rewrite_identities(format="e164", home="31")
+"#;
+        let state = compile_temp_script(source).unwrap();
+
+        let invite = SipMessageBuilder::new()
+            .request(
+                Method::Invite,
+                SipUri::new("example.com".to_string()).with_user("0201234567".to_string()),
+            )
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-num".to_string())
+            .from("\"Alice\" <sip:0612345678@example.com>;tag=num-test".to_string())
+            .to("<sip:0201234567@example.com>".to_string())
+            .call_id("num-rewrite@test".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        let message_arc = Arc::new(Mutex::new(invite));
+        let request = PyRequest::new(
+            Arc::clone(&message_arc),
+            "udp".to_string(),
+            "10.0.0.1".to_string(),
+            5060,
+        );
+
+        Python::attach(|python| {
+            let request_obj = Py::new(python, request).expect("failed to create PyRequest");
+            let callable = state.handlers[0].callable.bind(python);
+            callable
+                .call1((request_obj.bind(python),))
+                .expect("handler invocation failed");
+        });
+
+        let message = message_arc.lock().unwrap();
+        match &message.start_line {
+            StartLine::Request(request_line) => {
+                assert_eq!(request_line.request_uri.user.as_deref(), Some("+31201234567"));
+            }
+            other => panic!("expected request, got {other:?}"),
+        }
+        let from = message.headers.from().unwrap();
+        assert!(from.contains("+31612345678"), "from userpart not rewritten: {from}");
+        assert!(from.contains("\"Alice\""), "display name lost: {from}");
+        assert!(from.contains("tag=num-test"), "From-tag lost: {from}");
+        assert!(message.headers.to().unwrap().contains("+31201234567"));
+    }
+
+    #[test]
+    fn b2bua_dial_number_policy_and_numbers_namespace() {
+        // End-to-end proof of the B2BUA path: a named number policy + the
+        // numbers namespace, both fed from the process-wide runtime. The dial
+        // target and the A-leg From are normalized to +E.164, and numbers.parse
+        // resolves (the handler raises if the Rust namespace didn't graft).
+        use crate::numbers::policy::{NumberPolicyConfig, NumberRegistry, NumberingConfig};
+        use crate::script::api::call::{CallAction, PyCall};
+        use crate::script::api::numbers::{set_number_runtime, NumberRuntime};
+        use crate::sip::builder::SipMessageBuilder;
+        use crate::sip::message::Method;
+        use crate::sip::uri::SipUri;
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        // Install a NL runtime with a named e164 policy.
+        let numbering = NumberingConfig {
+            country_code: "31".to_string(),
+            ..Default::default()
+        };
+        let mut policies = HashMap::new();
+        policies.insert(
+            "test-e164@2026".to_string(),
+            serde_yaml_ng::from_str::<NumberPolicyConfig>("default: e164\n").unwrap(),
+        );
+        let (registry, warnings) = NumberRegistry::build(&numbering, &policies);
+        assert!(warnings.is_empty(), "policy warnings: {warnings:?}");
+        set_number_runtime(Arc::new(NumberRuntime {
+            registry,
+            default_b2bua_policy: None,
+        }));
+
+        // Make the numbers namespace available before the module is installed.
+        Python::initialize();
+        Python::attach(|python| {
+            crate::script::api::set_numbers_singleton(python).unwrap();
+        });
+
+        let source = r#"
+from siphon import b2bua, numbers, log
+
+@b2bua.on_invite
+def on_invite(call):
+    n = numbers.parse("0612345678")
+    log.info(f"parsed {n.e164}")
+    call.dial("sip:0201234567@ims.example.com", number_policy="test-e164@2026")
+"#;
+        let state = compile_temp_script(source).unwrap();
+
+        let invite = SipMessageBuilder::new()
+            .request(
+                Method::Invite,
+                SipUri::new("ims.example.com".to_string()).with_user("0201234567".to_string()),
+            )
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-np".to_string())
+            .from("<sip:0612345678@example.com>;tag=np-test".to_string())
+            .to("<sip:0201234567@ims.example.com>".to_string())
+            .call_id("num-policy@test".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        let message_arc = Arc::new(Mutex::new(invite));
+        let py_call = PyCall::new(
+            "np-test-001".to_string(),
+            Arc::clone(&message_arc),
+            "10.0.0.1".to_string(),
+            "udp".to_string(),
+        );
+
+        Python::attach(|python| {
+            let call_obj = Py::new(python, py_call).expect("failed to create PyCall");
+            let callable = state.handlers[0].callable.bind(python);
+            callable
+                .call1((call_obj.bind(python),))
+                .expect("handler invocation failed");
+
+            let borrowed = call_obj.borrow(python);
+            match borrowed.action() {
+                CallAction::Dial { target, .. } => {
+                    assert_eq!(target, "sip:+31201234567@ims.example.com");
+                }
+                other => panic!("expected Dial, got {other:?}"),
+            }
+        });
+
+        // A-leg From normalized in place (flows to the B-leg build).
+        let message = message_arc.lock().unwrap();
+        assert!(message.headers.from().unwrap().contains("+31612345678"));
+    }
+
+    #[test]
     fn b2bua_dial_next_hop_decouples_ruri_from_routing() {
         // IMS BGCF use case: stamp the canonical home-domain IMPU on the
         // R-URI of the B-leg INVITE (so the receiving S-CSCF's alias-chain
@@ -1583,8 +1740,8 @@ from siphon import b2bua
 @b2bua.on_invite
 def new_call(call):
     call.dial(
-        "sip:5112@ims.mnc088.mcc204.3gppnetwork.org",
-        next_hop="sip:172.16.0.111:4060",
+        "sip:1000@ims.mnc001.mcc001.3gppnetwork.org",
+        next_hop="sip:192.0.2.111:4060",
     )
 "#;
         let state = compile_temp_script(source).unwrap();
@@ -1593,12 +1750,12 @@ def new_call(call):
         let invite = SipMessageBuilder::new()
             .request(
                 Method::Invite,
-                SipUri::new("ims.mnc088.mcc204.3gppnetwork.org".to_string())
-                    .with_user("5112".to_string()),
+                SipUri::new("ims.mnc001.mcc001.3gppnetwork.org".to_string())
+                    .with_user("1000".to_string()),
             )
             .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-bgcf-test".to_string())
             .from("<sip:caller@pstn.example>;tag=bgcf-test".to_string())
-            .to("<sip:5112@ims.mnc088.mcc204.3gppnetwork.org>".to_string())
+            .to("<sip:1000@ims.mnc001.mcc001.3gppnetwork.org>".to_string())
             .call_id("bgcf-next-hop@test".to_string())
             .cseq("1 INVITE".to_string())
             .content_length(0)
@@ -1626,16 +1783,16 @@ def new_call(call):
             // Contract 1: target drives the B-leg R-URI host (preserves IMPU shape).
             let target_parsed = parse_uri_standalone(target)
                 .expect("target_uri must parse");
-            assert_eq!(target_parsed.host, "ims.mnc088.mcc204.3gppnetwork.org");
-            assert_eq!(target_parsed.user.as_deref(), Some("5112"));
+            assert_eq!(target_parsed.host, "ims.mnc001.mcc001.3gppnetwork.org");
+            assert_eq!(target_parsed.user.as_deref(), Some("1000"));
 
             // Contract 2: next_hop is what the dispatcher resolves for the wire
-            // destination — host = 172.16.0.111, port = 4060.
+            // destination — host = 192.0.2.111, port = 4060.
             let next_hop_str = next_hop.as_deref()
                 .expect("next_hop must be set");
             let next_hop_parsed = parse_uri_standalone(next_hop_str)
                 .expect("next_hop_uri must parse");
-            assert_eq!(next_hop_parsed.host, "172.16.0.111");
+            assert_eq!(next_hop_parsed.host, "192.0.2.111");
             assert_eq!(next_hop_parsed.port, Some(4060));
             assert!(next_hop_parsed.user.is_none(),
                 "next_hop is a routing destination, not a called party");

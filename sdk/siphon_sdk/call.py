@@ -309,6 +309,7 @@ class Call:
         route: Optional[list[str]] = None,
         send_socket: Optional[str] = None,
         auth_passthrough: bool = False,
+        number_policy: Optional[str] = None,
     ) -> None:
         """Dial a single B-leg target.
 
@@ -374,6 +375,12 @@ class Call:
                 (e.g. an extension authenticating to its own PBX through the
                 B2BUA).  Mutually exclusive with ``set_credentials()``; if both
                 are set, the stored credentials win.
+            number_policy: Named E.164 number policy (from ``number_policies:``)
+                applied as the final normalization step: reformats the A-leg
+                identity headers that flow to the B-leg plus this dial target.
+                Defaults to ``b2bua.default_number_policy`` from ``siphon.yaml``
+                when unset (no normalization if that is also unset).  Use
+                :meth:`rewrite_identities` for imperative per-identity control.
 
         Example::
 
@@ -387,8 +394,8 @@ class Call:
             # IMS edge: stamp canonical IMPU on R-URI, route via I-CSCF,
             # apply the trust-domain-boundary preset for outbound hygiene.
             call.dial(
-                "sip:5112@ims.mnc088.mcc204.3gppnetwork.org",
-                next_hop="sip:172.16.0.111:4060",
+                "sip:1000@ims.mnc001.mcc001.3gppnetwork.org",
+                next_hop="sip:192.0.2.111:4060",
                 header_policy="ims-trust-domain-boundary@2026",
                 copy=["X-Operator-Tag"],
                 strip=["History-Info"],
@@ -404,6 +411,7 @@ class Call:
             )
         """
         _validate_send_socket(send_socket)
+        uri = self._normalize_dial_targets([uri], number_policy)[0]
         self._actions.append(Action(
             kind="dial",
             targets=[uri],
@@ -432,6 +440,7 @@ class Call:
         translate: Optional[list[tuple[str, str]]] = None,
         send_socket: Optional[str] = None,
         auth_passthrough: bool = False,
+        number_policy: Optional[str] = None,
     ) -> None:
         """Fork to multiple B-leg targets.
 
@@ -458,6 +467,9 @@ class Call:
             auth_passthrough: Relay B-leg authentication to the caller
                 end-to-end — same semantics as :meth:`dial`.  Applies to every
                 branch of the fork.
+            number_policy: Named E.164 number policy applied to every branch
+                target plus the A-leg identity headers — same semantics as
+                :meth:`dial`.
 
         Example::
 
@@ -467,6 +479,7 @@ class Call:
         """
         _validate_send_socket(send_socket)
         uris = [t.uri if isinstance(t, Contact) else str(t) for t in targets]
+        uris = self._normalize_dial_targets(uris, number_policy)
         self._actions.append(Action(
             kind="fork",
             targets=uris,
@@ -635,18 +648,97 @@ class Call:
         change to take effect on the B-leg INVITE.
 
         Args:
-            value: New user part (e.g. ``"5112"``).
+            value: New user part (e.g. ``"1000"``).
 
         Example::
 
             @b2bua.on_invite
             async def on_invite(call):
-                call.set_ruri_user("5112")
-                call.set_to_user("5112")
-                call.dial("sip:5112@ims.mnc088.mcc204.3gppnetwork.org")
+                call.set_ruri_user("1000")
+                call.set_to_user("1000")
+                call.dial("sip:1000@ims.mnc001.mcc001.3gppnetwork.org")
         """
         if self._to_uri is not None:
             self._to_uri.user = value
+
+    def rewrite_identities(
+        self,
+        policy: Optional[str] = None,
+        format: Optional[str] = None,
+        headers: Optional[list[str]] = None,
+        home: Optional[str] = None,
+    ) -> int:
+        """Rewrite dialable identity userparts into a target E.164 shape.
+
+        Walks From, To, P-Asserted-Identity, P-Preferred-Identity (and any
+        opted-in header) on the A-leg INVITE, which flows to the B-leg. Pass
+        **either** a named ``policy`` from ``number_policies:`` **or** an inline
+        ``format`` (``"e164"`` | ``"plain"`` | ``"international"`` |
+        ``"national"``) with an optional ``headers`` list and ``home``
+        country-code override. Returns the number of headers changed. Must be
+        called before :meth:`dial`.
+
+        Example::
+
+            call.rewrite_identities("ims-e164@2026")
+            call.rewrite_identities(format="e164")
+        """
+        from siphon_sdk import mock_module
+
+        resolved = mock_module.get_numbers()._resolve(policy, format, headers, home)
+        return self._apply_number_policy(resolved, include_request_uri=True)
+
+    def _apply_number_policy(self, resolved, include_request_uri: bool) -> int:
+        from siphon_sdk.numbers import rewrite_nameaddr_userpart
+
+        changed = 0
+        for header in resolved.headers:
+            target = resolved.format_for(header)
+            if header == "request-uri":
+                uri = self._ruri
+                if include_request_uri and uri is not None and getattr(uri, "user", None):
+                    new = resolved.reformat_user(uri.user, target)
+                    if new is not None:
+                        uri.user = new
+                        changed += 1
+            elif header in ("From", "To"):
+                uri = self._from_uri if header == "From" else self._to_uri
+                if uri is not None and getattr(uri, "user", None):
+                    new = resolved.reformat_user(uri.user, target)
+                    if new is not None:
+                        uri.user = new
+                        changed += 1
+            else:
+                raw = self._headers.get(header)
+                if raw:
+                    new_value = rewrite_nameaddr_userpart(
+                        raw, lambda user: resolved.reformat_user(user, target)
+                    )
+                    if new_value != raw:
+                        self._headers[header] = new_value
+                        changed += 1
+        return changed
+
+    def _normalize_dial_targets(self, targets: list, number_policy: Optional[str]) -> list:
+        """Apply a B2BUA dial/fork number policy: normalize the A-leg header
+        identities plus each branch target. Returns the (possibly rewritten)
+        targets."""
+        from siphon_sdk import mock_module
+        from siphon_sdk.numbers import rewrite_nameaddr_userpart
+
+        resolved = mock_module.get_numbers()._resolve_dial(number_policy)
+        if resolved is None:
+            return targets
+        self._apply_number_policy(resolved, include_request_uri=False)
+        target_format = resolved.format_for("request-uri")
+        return [
+            rewrite_nameaddr_userpart(
+                target, lambda user: resolved.reformat_user(user, target_format)
+            )
+            if isinstance(target, str)
+            else target
+            for target in targets
+        ]
 
     def set_from_host(self, value: str) -> None:
         """Pin the host part of the B-leg From header URI.
@@ -735,7 +827,7 @@ class Call:
 
         Args:
             value: New To URI, e.g.
-                ``"sip:5112@ims.mnc088.mcc204.3gppnetwork.org"``.
+                ``"sip:1000@ims.mnc001.mcc001.3gppnetwork.org"``.
         """
         self._to_uri = _parse_uri(value)
 

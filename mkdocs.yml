@@ -46,6 +46,7 @@ nav:
       - Stateful proxy: cookbook/proxy.md
       - Load balancer: cookbook/load-balancer.md
       - SBC (B2BUA): cookbook/sbc.md
+      - Number normalization: cookbook/number-normalization.md
       - Media & RTP profiles: cookbook/media-rtp.md
       - Hardening & security: cookbook/security.md
       - Monitoring & observability: cookbook/monitoring.md
@@ -55,6 +56,7 @@ nav:
       - Reply: reference/reply.md
       - Call: reference/call.md
       - SDP: reference/sdp.md
+      - Numbers (E.164): reference/numbers.md
       - SIP types: reference/types.md
       - Proxy & B2BUA: reference/proxy.md
       - Registrar: reference/registrar.md

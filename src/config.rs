@@ -131,6 +131,17 @@ pub struct Config {
     #[serde(default)]
     pub b2bua: B2buaConfig,
 
+    /// Home numbering plan (country code + trunk/international prefixes) that
+    /// drives E.164 number normalization for identity headers.
+    #[serde(default)]
+    pub numbering: crate::numbers::policy::NumberingConfig,
+
+    /// Named number-format policies (`"<name>@<version>" -> policy`) applied by
+    /// `request.rewrite_identities()` / `call.dial(number_policy=…)`.
+    #[serde(default)]
+    pub number_policies:
+        std::collections::HashMap<String, crate::numbers::policy::NumberPolicyConfig>,
+
     /// Call Detail Records — billing and accounting.
     pub cdr: Option<CdrYamlConfig>,
 
@@ -212,6 +223,12 @@ pub struct B2buaConfig {
     /// Qualified preset name (`"<name>@<version>"`).  When `None`, falls
     /// back to `"transparent-b2bua@2026"`.
     pub default_header_policy: Option<String>,
+
+    /// Default number-format policy applied to every B2BUA call when the
+    /// script doesn't pass `number_policy=` on `call.dial()`/`call.fork()`.
+    /// Names an entry in the top-level `number_policies:` map.  When `None`,
+    /// no number normalization is applied unless a call opts in explicitly.
+    pub default_number_policy: Option<String>,
 }
 
 /// Configuration for ``proxy.subscribe_state`` — generic SUBSCRIBE

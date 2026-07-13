@@ -553,6 +553,64 @@ class Request:
         """
         self._headers[name] = value
 
+    def rewrite_identities(
+        self,
+        policy: Optional[str] = None,
+        format: Optional[str] = None,
+        headers: Optional[list[str]] = None,
+        home: Optional[str] = None,
+    ) -> int:
+        """Rewrite dialable identity userparts into a target E.164 shape.
+
+        Walks From, To, P-Asserted-Identity, P-Preferred-Identity, the
+        Request-URI (and any opted-in ``Referred-By`` / ``Remote-Party-ID``),
+        reformatting each dialable number in place. Display names, tags, hosts,
+        non-numbers and preserved service codes are left untouched.
+
+        Pass **either** a named ``policy`` from the ``number_policies:`` config
+        **or** an inline ``format`` (``"e164"`` | ``"plain"`` |
+        ``"international"`` | ``"national"``) with an optional ``headers`` list
+        and a ``home`` country-code override. Returns the number of headers
+        changed.
+
+        Example::
+
+            request.rewrite_identities("teams-outbound@2026")
+            request.rewrite_identities(format="e164")
+            request.rewrite_identities(format="national", headers=["From", "request-uri"])
+        """
+        from siphon_sdk import mock_module
+        from siphon_sdk.numbers import rewrite_nameaddr_userpart
+
+        resolved = mock_module.get_numbers()._resolve(policy, format, headers, home)
+        changed = 0
+        for header in resolved.headers:
+            target = resolved.format_for(header)
+            if header == "request-uri":
+                uri = self._ruri
+                if uri is not None and uri.user:
+                    new = resolved.reformat_user(uri.user, target)
+                    if new is not None:
+                        uri.user = new
+                        changed += 1
+            elif header in ("From", "To"):
+                uri = self._from_uri if header == "From" else self._to_uri
+                if uri is not None and uri.user:
+                    new = resolved.reformat_user(uri.user, target)
+                    if new is not None:
+                        uri.user = new
+                        changed += 1
+            else:
+                raw = self._headers.get(header)
+                if raw:
+                    new_value = rewrite_nameaddr_userpart(
+                        raw, lambda user: resolved.reformat_user(user, target)
+                    )
+                    if new_value != raw:
+                        self._headers[header] = new_value
+                        changed += 1
+        return changed
+
     def set_charging_param(self, name: str, value: str) -> None:
         """Stash a charging-param for the Rf auto-emit hook.
 
@@ -964,7 +1022,7 @@ class Request:
         raw ``set_header("To", "<sip:...>")``.
 
         Args:
-            value: New To URI (e.g. ``"sip:5112@ims.example.org"``).
+            value: New To URI (e.g. ``"sip:1000@ims.example.org"``).
         """
         self._to_uri = _parse_uri(value)
 

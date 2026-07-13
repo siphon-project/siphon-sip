@@ -31,27 +31,27 @@ class TestCallDial:
         # IMS BGCF: stamp canonical home-domain IMPU on R-URI, route via I-CSCF.
         call = Call()
         call.dial(
-            "sip:5112@ims.mnc088.mcc204.3gppnetwork.org",
-            next_hop="sip:172.16.0.111:4060",
+            "sip:1000@ims.mnc001.mcc001.3gppnetwork.org",
+            next_hop="sip:192.0.2.111:4060",
         )
         action = call._actions[0]
         assert action.kind == "dial"
         # `target` is what drives the B-leg R-URI host (preserves IMPU shape).
-        assert action.targets == ["sip:5112@ims.mnc088.mcc204.3gppnetwork.org"]
+        assert action.targets == ["sip:1000@ims.mnc001.mcc001.3gppnetwork.org"]
         # `next_hop` is what the dispatcher resolves for the wire destination.
-        assert action.next_hop == "sip:172.16.0.111:4060"
+        assert action.next_hop == "sip:192.0.2.111:4060"
 
     def test_dial_next_hop_with_timeout(self):
         call = Call()
         call.dial(
-            "sip:5112@ims.example.org",
+            "sip:1000@ims.example.org",
             timeout=15,
             next_hop="sip:icscf.ims.example.org:5060",
         )
         action = call._actions[0]
         assert action.timeout == 15
         assert action.next_hop == "sip:icscf.ims.example.org:5060"
-        assert action.targets == ["sip:5112@ims.example.org"]
+        assert action.targets == ["sip:1000@ims.example.org"]
 
     def test_dial_header_policy_and_deltas(self):
         # Header policy + per-call deltas — the BGCF MT INVITE case that
