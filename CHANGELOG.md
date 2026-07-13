@@ -90,6 +90,12 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   (seen against an upstream registrar answering REGISTER `401` with compact
   headers). The on-the-wire header name is preserved verbatim on forwarding
   (compact stays compact); canonicalization affects lookup only.
+- **Parser no longer panics on a `Content-Length` that points into the middle of
+  a multi-byte UTF-8 body character.** The body was sliced by byte index without
+  a char-boundary check, so a message whose `Content-Length` fell mid-character
+  aborted the parse thread (a DoS on the parse path, found by fuzzing). The
+  parser now degrades to taking the whole remaining input as the body instead of
+  panicking; char-boundary-aligned lengths split exactly as before.
   script that answers an INVITE directly (`call.answer(200, ...)` — MRF /
   announcement / echo / IVR) previously sent a 2xx whose To header was copied
   verbatim from the tagless INVITE, so the caller's dialog had no remote tag. The
