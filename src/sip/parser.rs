@@ -383,7 +383,17 @@ fn parse_body<'a>(input: &'a str, headers: &SipHeaders) -> IResult<&'a str, &'a 
         if content_length == 0 {
             Ok((input, ""))
         } else if input.len() >= content_length {
-            Ok((&input[content_length..], &input[..content_length]))
+            // Content-Length is an octet count (RFC 3261 §20.14). Slice by byte
+            // index, but never split a UTF-8 character: `input.get(..n)` returns
+            // None when `n` is not a char boundary, so a Content-Length that
+            // points into the middle of a multi-byte body character degrades to
+            // "take the whole remaining input as the body" instead of panicking.
+            // (Truly binary bodies should use `parse_sip_message_bytes`, which
+            // slices `&[u8]`.)
+            match (input.get(..content_length), input.get(content_length..)) {
+                (Some(body), Some(rest)) => Ok((rest, body)),
+                _ => Ok(("", input)),
+            }
         } else {
             Ok((input, ""))
         }
@@ -554,6 +564,52 @@ mod tests {
         let input = "sip:0017;phone-context=ims.mnc001.mcc206.3gppnetwork.org@ims.mnc090.mcc208.3gppnetwork.org;user=phone";
         let uri = parse_uri_standalone(input).expect("should parse");
         assert_eq!(uri.to_string(), input);
+    }
+
+    /// Regression (fuzz): a Content-Length that points into the middle of a
+    /// multi-byte UTF-8 body character must not panic the parser. `parse_body`
+    /// slices the `&str` body by byte index; before the `.get()` guard,
+    /// `&input[..n]` panicked with "byte index is not a char boundary".
+    /// Reachable via any Content-Length form — surfaced through the compact
+    /// `l:` once compact forms started being honored.
+    #[test]
+    fn content_length_mid_utf8_char_does_not_panic() {
+        // Body "€" is 3 bytes (0xE2 0x82 0xAC); char boundaries at 0 and 3 only.
+        // Content-Length: 2 lands mid-character.
+        let raw = "SIP/2.0 200 OK\r\n\
+                    Via: SIP/2.0/UDP h:5060;branch=z9hG4bK1\r\n\
+                    l:2\r\n\
+                    \r\n€";
+        let (_, message) = parse_sip_message(raw).expect("must parse without panicking");
+        assert!(matches!(message.start_line, StartLine::Response(_)));
+        // Degrades to taking the whole remaining input as the body.
+        assert_eq!(message.body, "€".as_bytes());
+    }
+
+    /// The exact libFuzzer-minimized crash input for the above panic, replayed
+    /// through the same entry point the fuzz target uses (`parse_sip_message`
+    /// over the UTF-8 view of the bytes). Must not panic.
+    #[test]
+    fn fuzz_crash_content_length_mid_char() {
+        let data: &[u8] = &[
+            83, 73, 80, 47, 48, 46, 48, 32, 48, 32, 18, 0, 9, 9, 9, 13, 10, 108, 58, 55, 32, 13,
+            10, 10, 108, 58, 0, 0, 10, 9, 231, 185, 187, 231, 185, 187, 65, 67, 75, 67, 67, 231,
+            185, 187, 231, 185, 187, 65, 17, 0, 118, 78,
+        ];
+        let input = std::str::from_utf8(data).expect("crash input is valid UTF-8");
+        let _ = parse_sip_message(input); // just must not panic
+    }
+
+    /// A char-boundary-aligned Content-Length still splits exactly as before
+    /// (no behavior change for the common ASCII / aligned case).
+    #[test]
+    fn content_length_aligned_still_splits() {
+        let raw = "SIP/2.0 200 OK\r\n\
+                    Via: SIP/2.0/UDP h:5060;branch=z9hG4bK1\r\n\
+                    Content-Length: 3\r\n\
+                    \r\n€tail";
+        let (_, message) = parse_sip_message(raw).expect("must parse");
+        assert_eq!(message.body, "€".as_bytes());
     }
 
     #[test]

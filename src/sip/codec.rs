@@ -15,15 +15,10 @@ impl SipMessage {
     /// Multiple Via header lines and comma-separated values within a single
     /// header are both handled. Returns them in order (topmost first).
     pub fn typed_vias(&self) -> Result<Vec<Via>, String> {
+        // `get_all` canonicalizes the compact form (`v`) to `Via`
+        // (RFC 3261 §7.3.3), so one lookup covers both wire forms.
         let mut result = Vec::new();
         if let Some(values) = self.headers.get_all("Via") {
-            for raw in values {
-                let mut vias = Via::parse_multi(raw)?;
-                result.append(&mut vias);
-            }
-        }
-        // Also check compact form "v"
-        if let Some(values) = self.headers.get_all("v") {
             for raw in values {
                 let mut vias = Via::parse_multi(raw)?;
                 result.append(&mut vias);
@@ -34,11 +29,7 @@ impl SipMessage {
 
     /// Parse the From header into a typed [`NameAddr`].
     pub fn typed_from(&self) -> Result<Option<NameAddr>, String> {
-        let raw = self
-            .headers
-            .get("From")
-            .or_else(|| self.headers.get("f"));
-        match raw {
+        match self.headers.get("From") {
             Some(value) => Ok(Some(NameAddr::parse(value)?)),
             None => Ok(None),
         }
@@ -46,11 +37,7 @@ impl SipMessage {
 
     /// Parse the To header into a typed [`NameAddr`].
     pub fn typed_to(&self) -> Result<Option<NameAddr>, String> {
-        let raw = self
-            .headers
-            .get("To")
-            .or_else(|| self.headers.get("t"));
-        match raw {
+        match self.headers.get("To") {
             Some(value) => Ok(Some(NameAddr::parse(value)?)),
             None => Ok(None),
         }
@@ -58,11 +45,7 @@ impl SipMessage {
 
     /// Parse Contact headers into typed [`NameAddr`] values.
     pub fn typed_contacts(&self) -> Result<Vec<NameAddr>, String> {
-        let raw = self
-            .headers
-            .get("Contact")
-            .or_else(|| self.headers.get("m"));
-        match raw {
+        match self.headers.get("Contact") {
             Some(value) => NameAddr::parse_multi(value),
             None => Ok(Vec::new()),
         }
@@ -133,6 +116,47 @@ mod tests {
         assert_eq!(vias[1].host, "proxy.example.com");
         assert_eq!(vias[1].transport, "TCP");
         assert_eq!(vias[1].port, Some(5060));
+    }
+
+    /// Regression: a REGISTER `401` whose headers are all in RFC 3261 §7.3.3
+    /// compact form end-to-end (`v`/`f`/`t`/`i`/`k`/`l`), as some registrars and
+    /// PBXes emit. Before compact-form canonicalization the dispatcher's
+    /// `headers.get("Via")` returned `None` on this shape and the response was
+    /// dropped ("response has no Via header"), leaving the peer retransmitting
+    /// REGISTER forever. Two stacked Vias (comma-separated in one `v:` line)
+    /// exercise the top-branch extraction the client transaction keys on.
+    #[test]
+    fn compact_header_response_routes_by_via() {
+        let raw = "SIP/2.0 401 Unauthorized\r\n\
+                    v:SIP/2.0/UDP proxy.example.com:5060;branch=z9hG4bK-proxytop;received=192.0.2.1;rport=5060,SIP/2.0/UDP ua.example.com:5060;branch=z9hG4bK-uabottom;received=192.0.2.9;rport=21571\r\n\
+                    f:<sip:alice@example.com:5060>\r\n\
+                    t:\"Bob\"<sip:bob@example.com:5060>;tag=uastag123\r\n\
+                    i:call-abc@ua.example.com\r\n\
+                    CSeq:1 REGISTER\r\n\
+                    k:timer,path,replaces\r\n\
+                    WWW-Authenticate:Digest realm=\"example.com\",nonce=\"abc123\",algorithm=MD5,qop=\"auth\"\r\n\
+                    l:0\r\n\
+                    \r\n";
+
+        let (_, message) = parse_sip_message(raw).unwrap();
+
+        // The exact lookup the response-routing path does (dispatcher.rs).
+        assert!(
+            message.headers.get("Via").is_some(),
+            "compact `v:` must be visible as Via",
+        );
+
+        // Both stacked Vias parse; the top branch is what keys the client txn.
+        let vias = message.typed_vias().unwrap();
+        assert_eq!(vias.len(), 2);
+        assert_eq!(vias[0].branch.as_deref(), Some("z9hG4bK-proxytop"));
+
+        // The other compact forms resolve to their long names too.
+        assert_eq!(message.headers.call_id().map(String::as_str), Some("call-abc@ua.example.com"));
+        assert_eq!(message.typed_from().unwrap().unwrap().uri.user.as_deref(), Some("alice"));
+        assert_eq!(message.typed_to().unwrap().unwrap().tag.as_deref(), Some("uastag123"));
+        assert_eq!(message.headers.content_length(), Some(0));
+        assert_eq!(message.headers.get("Supported").map(String::as_str), Some("timer,path,replaces"));
     }
 
     #[test]

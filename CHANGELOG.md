@@ -76,7 +76,26 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   unaffected; there is no separate `answer_now()`.
 
 ### Fixed
-- **UAS-mode `call.answer()` now emits a To-tag** (RFC 3261 §12.1.1). A B2BUA
+- **Compact SIP header forms (RFC 3261 §7.3.3) are now recognized on every
+  lookup, not just a few.** Header names are matched by their canonical form, so
+  the single-letter compact forms (`v`→Via, `f`→From, `t`→To, `i`→Call-ID,
+  `m`→Contact, `c`→Content-Type, `e`→Content-Encoding, `l`→Content-Length,
+  `s`→Subject, `k`→Supported, plus the extension forms `o`/`r`/`u`/`x`/`y`/`b`/
+  `a`/`d`/`j`) resolve to the same header as their long name throughout the
+  stack. Previously only a handful of typed accessors expanded the compact form,
+  while the transaction and response-routing layers looked up `Via` literally —
+  so a response arriving with a compact `v:` (some registrars/PBXes send all
+  headers compact) was dropped with "response has no Via header", stranding the
+  transaction and leaving the peer to retransmit its request until it timed out
+  (seen against an upstream registrar answering REGISTER `401` with compact
+  headers). The on-the-wire header name is preserved verbatim on forwarding
+  (compact stays compact); canonicalization affects lookup only.
+- **Parser no longer panics on a `Content-Length` that points into the middle of
+  a multi-byte UTF-8 body character.** The body was sliced by byte index without
+  a char-boundary check, so a message whose `Content-Length` fell mid-character
+  aborted the parse thread (a DoS on the parse path, found by fuzzing). The
+  parser now degrades to taking the whole remaining input as the body instead of
+  panicking; char-boundary-aligned lengths split exactly as before.
   script that answers an INVITE directly (`call.answer(200, ...)` — MRF /
   announcement / echo / IVR) previously sent a 2xx whose To header was copied
   verbatim from the tagless INVITE, so the caller's dialog had no remote tag. The
