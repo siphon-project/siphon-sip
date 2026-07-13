@@ -101,6 +101,30 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the A-leg (it owns the dialog end-to-end), so the 2xx was previously sent once
   with no UAS-core retransmission; it is now resent on the T1→T2 schedule
   (giving up after 64·T1), cancelled the moment the caller's ACK arrives.
+- **Outbound TLS client certificate now hot-reloads alongside the inbound
+  acceptor.** Previously a cert renewal only swapped the inbound TLS/WSS *server*
+  acceptor (the `SharedTlsAcceptor` read by every accept loop), while the
+  outbound connection pool kept the client identity it built once at startup from
+  `tls.client_certificate` / `tls.client_private_key`. So on a mutual-TLS trunk
+  where siphon *dials* the peer (Microsoft Teams Direct Routing, carrier
+  interconnects), a renewed client cert was never presented until a restart — the
+  peer rejected the outbound handshake on the stale/expired cert even though the
+  "new handshakes use the updated cert" reload had logged. The pool now holds a
+  live-swappable connector and a watcher on the client cert/key files rebuilds and
+  swaps the identity on change, evicting stale pooled TLS connections so the next
+  outbound call re-handshakes with the new cert. No config or scripting-API change.
+- **No more spurious `safety-net RTPEngine delete failed: unknown call` WARN on
+  every media-timeout teardown.** The media engine owns the call and reaps it on
+  media timeout (the reaper removes the call before emitting the timeout event),
+  so siphon-sip's own media-session bookkeeping is now dropped when it handles the
+  event. The teardown that an `@rtpengine.on_media_timeout` handler drives (e.g.
+  `b2bua.terminate`) then finds no record and issues no delete against a call the
+  engine already dropped, saving a wasted round-trip and a misleading warning on
+  every timeout. Separately, a safety-net delete that returns "call not found"
+  (rtpengine `Unknown call-id`, siphon-rtp `unknown call`, rtpproxy `E8`) is now
+  logged at `debug` rather than `warn` at all four safety-net delete sites: the
+  media was already cleaned, which is exactly what the safety net is for, so this
+  also quiets double-BYE / glare and caller-BYE-vs-IVR-terminate races.
 - **Compact SIP header forms (RFC 3261 §7.3.3) are now recognized on every
   lookup, not just a few.** Header names are matched by their canonical form, so
   the single-letter compact forms (`v`→Via, `f`→From, `t`→To, `i`→Call-ID,
@@ -148,6 +172,25 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   an OPTIONS probe), which reaps only genuinely gone UEs. Non-IPsec stream
   closes (plain TCP, WSS WebRTC) keep the immediate flow-failure deregistration
   and network-dereg cascade unchanged. No config change.
+- **SA-idle liveness sweep no longer network-deregisters a live VoLTE UE that
+  races an ECM-IDLE → paging window.** Two compounding defects made the sweep
+  probe a healthy UE every 30 s and deregister it whenever a probe landed during
+  a normal idle→reconnect transition: (1) it aged bindings only on the kernel
+  XFRM inbound `use_time`, which on some kernels does not advance on an
+  inbound-answered SA, so a UE answering its keepalive/OPTIONS every 30 s still
+  looked perpetually idle; and (2) the OPTIONS probe gave up in ~4 s, shorter
+  than an idle UE's paging + reconnect (seconds), so a probe sent into a paging
+  window false-reaped a live UE. The sweep now folds siphon's own SIP-layer
+  last-seen (refreshed on any message arriving on a P-CSCF protected port —
+  REGISTER, SUBSCRIBE, in-dialog, and the OPTIONS 200) into its idle test, so a
+  UE that just answered anything is not re-probed for a full idle window; and a
+  suspect binding must fail its probe on `registrar.liveness.miss_threshold`
+  consecutive sweeps (default 2) before it is deregistered, so a UE mid-wakeup
+  misses one sweep and survives on the next. The per-attempt probe timeout
+  default is raised 2000 → 4000 ms (one paging + reconnect). A genuinely gone UE
+  (reboot / airplane mode) still reaps after the grace with the network
+  `Expires: 0` de-REGISTER. New knob `registrar.liveness.miss_threshold` (default
+  2); no config change required.
 
 ## [1.3.0] — 2026-07-10
 

@@ -595,7 +595,21 @@ pub struct RegistrarLivenessConfig {
     pub idle_multiplier: u32,
     /// Per-attempt timeout (milliseconds) for the one-shot OPTIONS liveness
     /// probe sent to a suspect UDP+IPsec binding before deregistration.
+    /// Default 4000 — long enough to cover one ECM-IDLE paging + reconnect
+    /// (an OPTIONS to an idle UE *is* a paging trigger, so the answer can't
+    /// arrive until the radio is back up); with 2 attempts that is ~8 s of
+    /// patience per sweep before a suspect binding counts as one miss.
     pub probe_timeout_ms: u64,
+    /// Consecutive sweeps a suspect binding must fail its OPTIONS probe before
+    /// it is deregistered.  Default 2 — a UE mid-wakeup (ECM-IDLE → paging →
+    /// reconnect) misses one sweep and answers the next, so it survives; a
+    /// genuinely gone UE (reboot / airplane mode) misses every sweep and reaps
+    /// after the grace.  Biased toward patience: a lingering vanished binding
+    /// is benign (it re-registers or ages out on its own `Expires`), whereas a
+    /// false deregistration is a dropped registration + a failed MT call.
+    /// Reap latency for a truly-gone UE grows by `miss_threshold ×` the 30 s
+    /// sweep interval (~60 s), still far inside any registration `Expires`.
+    pub miss_threshold: u32,
     /// What to do once a binding is declared dead.
     pub dereg_mode: LivenessDeregMode,
 }
@@ -606,7 +620,8 @@ impl Default for RegistrarLivenessConfig {
             enabled: false,
             keepalive_interval_secs: 30,
             idle_multiplier: 3,
-            probe_timeout_ms: 2000,
+            probe_timeout_ms: 4000,
+            miss_threshold: 2,
             dereg_mode: LivenessDeregMode::NetworkDereg,
         }
     }
