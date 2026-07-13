@@ -6320,11 +6320,15 @@ fn build_b2bua_bye(
 
     let transport_str = format!("{}", leg.transport.transport).to_uppercase();
     let branch = TransactionKey::generate_branch();
+    // Via sent-by port is the listener this leg is anchored on (the A-leg's arrival
+    // socket on a multi-homed host) so the response comes back to the socket the
+    // request left from. Falls back to via_port for the B-leg (local_addr None) and
+    // single-listener hosts — no change there.
     let via = format!(
         "SIP/2.0/{} {}:{};branch={}",
         transport_str,
         state.via_host(&leg.transport.transport),
-        state.via_port(&leg.transport.transport),
+        a_leg_advertised_port(leg.transport.local_addr, state.via_port(&leg.transport.transport)),
         branch,
     );
 
@@ -6416,11 +6420,15 @@ fn build_b2bua_prack(
 
     let transport_str = format!("{}", leg.transport.transport).to_uppercase();
     let branch = TransactionKey::generate_branch();
+    // Via sent-by port is the listener this leg is anchored on (the A-leg's arrival
+    // socket on a multi-homed host) so the response comes back to the socket the
+    // request left from. Falls back to via_port for the B-leg (local_addr None) and
+    // single-listener hosts — no change there.
     let via = format!(
         "SIP/2.0/{} {}:{};branch={}",
         transport_str,
         state.via_host(&leg.transport.transport),
-        state.via_port(&leg.transport.transport),
+        a_leg_advertised_port(leg.transport.local_addr, state.via_port(&leg.transport.transport)),
         branch,
     );
 
@@ -8656,6 +8664,9 @@ fn handle_b2bua_invite(
             remote_addr: inbound.remote_addr,
             connection_id: inbound.connection_id,
             transport: inbound.transport,
+            // Anchor the A-leg on the listener the INVITE arrived on (multi-homed
+            // source-port parity for siphon-originated requests + Via/Contact).
+            local_addr: Some(inbound.local_addr),
         },
     );
 
@@ -9342,6 +9353,7 @@ fn b2bua_send_b_leg_invite(
             remote_addr: destination,
             connection_id: flow.map(|f| ConnectionId(f.connection_id)).unwrap_or_default(),
             transport: outbound_transport,
+            local_addr: None,
         },
     );
     b_leg.dialog.local_contact = Some(b_contact_value);
@@ -10514,10 +10526,12 @@ fn handle_b2bua_response(
             remote_addr: addr,
             connection_id: ConnectionId::default(),
             transport,
+            local_addr: None,
         }).unwrap_or_else(|| LegTransport {
             remote_addr: state.local_addr,
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
+            local_addr: None,
         });
         match handle_tx.try_send(crate::b2bua::actor::LegMessage::SipInbound {
             message: message.clone(),
@@ -11332,6 +11346,7 @@ fn handle_b2bua_response(
                                         remote_addr: destination,
                                         connection_id: reuse_connection_id,
                                         transport,
+                                        local_addr: None,
                                     },
                                 );
                                 // Stash the retry INVITE so a caller CANCEL during
@@ -11585,6 +11600,7 @@ fn handle_b2bua_response(
                                         remote_addr: destination,
                                         connection_id: reuse_connection_id,
                                         transport,
+                                        local_addr: None,
                                     },
                                 );
                                 // Preserve dialog state from the failed attempt:
@@ -12059,13 +12075,16 @@ fn handle_b2bua_bye(
         None => return,
     };
 
-    // Send 200 OK to the BYE sender
+    // Send 200 OK to the BYE sender on the socket the BYE arrived on (multi-homed
+    // UDP source-port parity — the in-dialog BYE now lands on the A-leg's anchored
+    // listener after the Contact fix, so its 200 must leave from there too).
     let bye_response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
-    send_message(
+    send_message_from(
         bye_response,
         inbound.transport,
         inbound.remote_addr,
         inbound.connection_id,
+        Some(inbound.local_addr),
         state,
     );
 
@@ -12111,11 +12130,15 @@ fn handle_b2bua_bye(
                 call.a_leg.transport.remote_addr,
                 call.a_leg.transport.transport,
             );
-            send_message(
+            // Source the siphon-originated BYE from the A-leg's anchored socket so a
+            // strict peer sees it from the port the dialog runs on (Via matches — see
+            // build_b2bua_bye). No-op for single-listener hosts.
+            send_message_from(
                 bye,
                 transport,
                 destination,
                 call.a_leg.transport.connection_id,
+                call.a_leg.transport.local_addr,
                 state,
             );
         }
@@ -12305,6 +12328,7 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
             remote_addr: b_leg.transport.remote_addr,
             connection_id: ConnectionId::default(),
             transport: b_leg.transport.transport,
+            local_addr: None,
         },
     );
     new_b_leg.stored_vias = vec![];
@@ -12433,7 +12457,8 @@ fn b2bua_terminate_call_inner(
             a_leg.transport.remote_addr,
             a_leg.transport.transport,
         );
-        send_message(bye_msg, transport, destination, a_leg.transport.connection_id, state);
+        // Source the framework BYE from the A-leg's anchored socket (Via matches).
+        send_message_from(bye_msg, transport, destination, a_leg.transport.connection_id, a_leg.transport.local_addr, state);
     }
     if let Some(b_leg) = &winner_b_leg {
         if let Some(bye_msg) = build_bye(b_leg) {
@@ -12944,7 +12969,7 @@ fn handle_b2bua_reinvite(
                 &b_leg.dialog.local_tag,
                 b_leg.dialog.remote_tag.as_deref(),
             );
-            Some((b_leg.transport.remote_addr, b_leg.transport.transport, b_leg.dialog.call_id.clone(), b_leg.dialog.local_tag.clone()))
+            Some((b_leg.transport.remote_addr, b_leg.transport.transport, b_leg.transport.local_addr, b_leg.dialog.call_id.clone(), b_leg.dialog.local_tag.clone()))
         } else {
             warn!(call_id = %call_id, "B2BUA re-INVITE: no winning B-leg");
             return;
@@ -12960,17 +12985,19 @@ fn handle_b2bua_reinvite(
                 Some(&a_leg.dialog.local_tag),
             );
         }
-        Some((a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()))
+        Some((a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.transport.local_addr, a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()))
     };
 
-    if let Some((destination, transport, leg_call_id, leg_from_tag)) = reinvite_target {
+    if let Some((destination, transport, target_local_addr, leg_call_id, leg_from_tag)) = reinvite_target {
         // Set Via with correct transport for the target leg
         let transport_str = format!("{}", transport).to_uppercase();
         let via_value = format!(
             "SIP/2.0/{} {}:{};branch={}",
             transport_str,
             state.via_host(&transport),
-            state.via_port(&transport),
+            // Via port = the target leg's anchored listener (A-leg's arrival socket
+            // when forwarding B→A on a multi-homed host); via_port for the B-leg.
+            a_leg_advertised_port(target_local_addr, state.via_port(&transport)),
             branch,
         );
         forwarded.headers.set("Via", via_value);
@@ -13140,13 +13167,27 @@ fn handle_b2bua_reinvite(
                 remote_addr: send_dest,
                 connection_id: ConnectionId::default(),
                 transport: send_transport,
+                local_addr: None,
             },
         );
         reinvite_leg.stored_vias = originator_vias;
         reinvite_leg.stored_cseq = message.headers.cseq().map(|c| c.to_string());
         state.call_actors.add_b_leg(&call_id, reinvite_leg);
 
-        send_b2bua_to_bleg(forwarded, send_transport, send_dest, state);
+        // Forward B→A on the A-leg's anchored socket (multi-homed source-port
+        // parity — pins the UDP egress; connection selection is unchanged, same as
+        // send_b2bua_to_bleg). A→B (target_local_addr None) egresses as before.
+        if let Some(source) = target_local_addr {
+            let data = Bytes::from(forwarded.to_bytes());
+            let target = RelayTarget {
+                address: send_dest,
+                transport: Some(send_transport),
+                server_name: None,
+            };
+            send_to_target(data, &target, send_transport, ConnectionId::default(), Some(source), state);
+        } else {
+            send_b2bua_to_bleg(forwarded, send_transport, send_dest, state);
+        }
 
         // Increment the target leg's local CSeq after sending the re-INVITE
         if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
@@ -13250,7 +13291,7 @@ fn handle_b2bua_update(
                 &b_leg.dialog.local_tag,
                 b_leg.dialog.remote_tag.as_deref(),
             );
-            Some((b_leg.transport.remote_addr, b_leg.transport.transport, b_leg.dialog.call_id.clone(), b_leg.dialog.local_tag.clone()))
+            Some((b_leg.transport.remote_addr, b_leg.transport.transport, b_leg.transport.local_addr, b_leg.dialog.call_id.clone(), b_leg.dialog.local_tag.clone()))
         } else {
             warn!(call_id = %call_id, "B2BUA UPDATE: no winning B-leg");
             return;
@@ -13265,16 +13306,18 @@ fn handle_b2bua_update(
                 Some(&a_leg.dialog.local_tag),
             );
         }
-        Some((a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()))
+        Some((a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.transport.local_addr, a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()))
     };
 
-    if let Some((destination, transport, leg_call_id, leg_from_tag)) = update_target {
+    if let Some((destination, transport, target_local_addr, leg_call_id, leg_from_tag)) = update_target {
         let transport_str = format!("{}", transport).to_uppercase();
         let via_value = format!(
             "SIP/2.0/{} {}:{};branch={}",
             transport_str,
             state.via_host(&transport),
-            state.via_port(&transport),
+            // Via port = the target leg's anchored listener (A-leg's arrival socket
+            // when forwarding B→A on a multi-homed host); via_port for the B-leg.
+            a_leg_advertised_port(target_local_addr, state.via_port(&transport)),
             branch,
         );
         forwarded.headers.set("Via", via_value);
@@ -13433,13 +13476,27 @@ fn handle_b2bua_update(
                 remote_addr: send_dest,
                 connection_id: ConnectionId::default(),
                 transport: send_transport,
+                local_addr: None,
             },
         );
         update_leg.stored_vias = originator_vias;
         update_leg.stored_cseq = message.headers.cseq().map(|c| c.to_string());
         state.call_actors.add_b_leg(&call_id, update_leg);
 
-        send_b2bua_to_bleg(forwarded, send_transport, send_dest, state);
+        // Forward B→A on the A-leg's anchored socket (multi-homed source-port
+        // parity — pins the UDP egress; connection selection is unchanged, same as
+        // send_b2bua_to_bleg). A→B (target_local_addr None) egresses as before.
+        if let Some(source) = target_local_addr {
+            let data = Bytes::from(forwarded.to_bytes());
+            let target = RelayTarget {
+                address: send_dest,
+                transport: Some(send_transport),
+                server_name: None,
+            };
+            send_to_target(data, &target, send_transport, ConnectionId::default(), Some(source), state);
+        } else {
+            send_b2bua_to_bleg(forwarded, send_transport, send_dest, state);
+        }
 
         // Bump local CSeq on the target leg after sending.
         if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
@@ -15338,6 +15395,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             remote_addr: "10.0.0.2:5060".parse().unwrap(),
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
+            local_addr: None,
         };
 
         // CSeq-1 B-leg: drew the 401 and is now superseded. Dropping its handle
@@ -16091,6 +16149,7 @@ a=rtpmap:8 PCMA/8000\r\n";
                 remote_addr: "10.0.0.1:5060".parse().unwrap(),
                 connection_id: ConnectionId::default(),
                 transport: Transport::Udp,
+                local_addr: None,
             },
         );
         let call_id = manager.create_call(a_leg);
@@ -16113,6 +16172,7 @@ a=rtpmap:8 PCMA/8000\r\n";
                 remote_addr: "10.0.0.1:5060".parse().unwrap(),
                 connection_id: ConnectionId::default(),
                 transport: Transport::Udp,
+                local_addr: None,
             },
         );
         let call_id = manager.create_call(a_leg);
@@ -16126,6 +16186,7 @@ a=rtpmap:8 PCMA/8000\r\n";
                 remote_addr: "10.0.0.2:5060".parse().unwrap(),
                 connection_id: ConnectionId::default(),
                 transport: Transport::Udp,
+                local_addr: None,
             },
         );
         manager.add_b_leg(&call_id, b_leg);
@@ -16179,6 +16240,7 @@ a=rtpmap:8 PCMA/8000\r\n";
                 remote_addr: "10.0.0.1:5060".parse().unwrap(),
                 connection_id: ConnectionId::default(),
                 transport: Transport::Udp,
+                local_addr: None,
             },
         );
         let _call_id = manager.create_call(a_leg);
@@ -16253,6 +16315,7 @@ a=rtpmap:8 PCMA/8000\r\n";
                 remote_addr: "10.0.0.1:5060".parse().unwrap(),
                 connection_id: ConnectionId::default(),
                 transport: Transport::Udp,
+                local_addr: None,
             },
         );
         let call_id = manager.create_call(a_leg);
@@ -16267,6 +16330,7 @@ a=rtpmap:8 PCMA/8000\r\n";
                 remote_addr: "10.0.0.2:5060".parse().unwrap(),
                 connection_id: ConnectionId::default(),
                 transport: Transport::Udp,
+                local_addr: None,
             },
         );
         let b_leg_1 = Leg::new_b_leg(
@@ -16278,6 +16342,7 @@ a=rtpmap:8 PCMA/8000\r\n";
                 remote_addr: "10.0.0.3:5060".parse().unwrap(),
                 connection_id: ConnectionId::default(),
                 transport: Transport::Udp,
+                local_addr: None,
             },
         );
         manager.add_b_leg(&call_id, b_leg_0);
