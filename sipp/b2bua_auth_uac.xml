@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA device-driven proxy-auth UAC scenario (A-leg / caller side).
+
+  Regression gate for the "B-leg 407 -> spurious 502" bug:
+    1. INVITE (CSeq 1) -> siphon B2BUAs to the UAS, which returns 407.
+       siphon (auth_passthrough) forwards the 407 to us  -> recv 407 (asserts
+       the challenge crosses the B2BUA; a 502 here would fail the call).
+    2. We ACK the 407.  On the BUGGY build siphon fabricates a 502 in response
+       to this ACK (CSeq 1 ACK) and sends it to us.
+    3. We send the authenticated re-INVITE (CSeq 2) and wait for its 407.  On
+       the buggy build the stray 502 arrives first and, being unexpected at
+       this recv, ABORTS the call (non-zero UAC exit -> test fails).  On the
+       fixed build no 502 is sent, the second 407 arrives, we ACK, and the
+       scenario ends cleanly (exit 0 -> test passes).
+
+  Run: sipp <siphon>:5060 -sf b2bua_auth_uac.xml -s bob -ap secret -m 1
+  Requires b2bua_auth_uas.xml on the B-leg and bob registered -> the UAS.
+-->
+<scenario name="B2BUA auth UAC">
+
+  <!-- Step 1: initial INVITE (no credentials) -->
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/b2bua-auth-test
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <!-- The B-leg 407 relayed to us (auth_passthrough). A 502 here fails. -->
+  <recv response="407" auth="true" />
+
+  <!-- ACK the 407 (CSeq 1). The buggy build answers THIS ACK with a 502. -->
+  <send>
+    <![CDATA[
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Step 2: authenticated re-INVITE (CSeq 2). -->
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 2 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+[authentication]
+Max-Forwards: 70
+User-Agent: SIPp/b2bua-auth-test
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <!-- Second challenge relayed to us. On the buggy build the stray 502 from
+       the CSeq-1 ACK arrives here instead and aborts the call. -->
+  <recv response="407" auth="true" />
+
+  <!-- ACK the second 407 (CSeq 2) and finish. -->
+  <send>
+    <![CDATA[
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

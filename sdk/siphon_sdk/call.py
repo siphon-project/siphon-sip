@@ -308,6 +308,7 @@ class Call:
         translate: Optional[list[tuple[str, str]]] = None,
         route: Optional[list[str]] = None,
         send_socket: Optional[str] = None,
+        auth_passthrough: bool = False,
     ) -> None:
         """Dial a single B-leg target.
 
@@ -360,11 +361,28 @@ class Call:
                 ephemeral port.  Ignored when ``flow`` is set (the flow already
                 pins egress), and when its transport doesn't match the B-leg
                 transport.  A malformed spec raises ``ValueError``.
+            auth_passthrough: Relay B-leg authentication to the caller
+                end-to-end instead of siphon answering it (RFC 3261 §22.3).
+                When ``True``, siphon copies ``Proxy-Authenticate`` (B→A) and
+                ``Proxy-Authorization`` (A→B) across the B2BUA, and treats a
+                B-leg ``401``/``407`` (with no ``set_credentials()`` on this
+                call) as a *non-terminal* challenge: it forwards the challenge
+                to the caller without firing ``@b2bua.on_failure``, writing a
+                failure CDR, or tearing down the anchored media — so the caller
+                (which holds the credentials) can authenticate and re-INVITE.
+                Use this when the endpoint, not siphon, owns the credentials
+                (e.g. an extension authenticating to its own PBX through the
+                B2BUA).  Mutually exclusive with ``set_credentials()``; if both
+                are set, the stored credentials win.
 
         Example::
 
             # Basic dial (uses configured default policy)
             call.dial("sip:bob@10.0.0.2:5060", timeout=30)
+
+            # Device-driven proxy auth: let the extension authenticate to the
+            # PBX itself; siphon just relays the challenge and credentials.
+            call.dial("sip:bob@pbx.example.com:5060", auth_passthrough=True)
 
             # IMS edge: stamp canonical IMPU on R-URI, route via I-CSCF,
             # apply the trust-domain-boundary preset for outbound hygiene.
@@ -399,6 +417,7 @@ class Call:
                 "translate": translate or [],
                 "route": route or [],
                 "send_socket": send_socket,
+                "auth_passthrough": auth_passthrough,
             },
         ))
 
@@ -412,6 +431,7 @@ class Call:
         strip: Optional[list[str]] = None,
         translate: Optional[list[tuple[str, str]]] = None,
         send_socket: Optional[str] = None,
+        auth_passthrough: bool = False,
     ) -> None:
         """Fork to multiple B-leg targets.
 
@@ -435,6 +455,9 @@ class Call:
             send_socket: Optional egress socket pin applied to every branch
                 (same ``"<transport>:<ip>:<port>"`` form as :meth:`dial`).  A
                 per-branch captured flow still takes precedence for that branch.
+            auth_passthrough: Relay B-leg authentication to the caller
+                end-to-end — same semantics as :meth:`dial`.  Applies to every
+                branch of the fork.
 
         Example::
 
@@ -455,6 +478,7 @@ class Call:
                 "strip": strip or [],
                 "translate": translate or [],
                 "send_socket": send_socket,
+                "auth_passthrough": auth_passthrough,
             },
         ))
 

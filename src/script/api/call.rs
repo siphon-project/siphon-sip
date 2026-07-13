@@ -198,6 +198,14 @@ pub struct PyCall {
     /// the preset registry and applies deltas to produce a
     /// [`crate::b2bua::header_policy::ResolvedPolicy`] on the call actor.
     header_policy_input: Option<HeaderPolicyInput>,
+    /// When true (set via `call.dial(auth_passthrough=True)` / `call.fork(...)`),
+    /// this call relays B-leg auth challenges to the caller end-to-end instead
+    /// of siphon answering them. It copies `Proxy-Authenticate`/`Proxy-Authorization`
+    /// across the B2BUA (injected into `header_policy_input.deltas_copy`) AND, on
+    /// a B-leg 401/407 with no siphon-side credentials, tells the dispatcher to
+    /// forward the challenge without firing `@b2bua.on_failure`, deleting media,
+    /// or tearing the call down — so the caller can authenticate and re-INVITE.
+    auth_passthrough_flag: bool,
 }
 
 /// Per-call header policy input from `call.dial(header_policy=…, copy=…, strip=…, translate=…)`.
@@ -278,6 +286,7 @@ impl PyCall {
             contact_user_override: None,
             contact_override: None,
             header_policy_input: None,
+            auth_passthrough_flag: false,
         }
     }
 
@@ -286,6 +295,25 @@ impl PyCall {
     /// can be attached to the [`crate::b2bua::actor::CallActor`].
     pub fn header_policy_input(&self) -> Option<&HeaderPolicyInput> {
         self.header_policy_input.as_ref()
+    }
+
+    /// Whether this call relays B-leg auth challenges to the caller
+    /// (`call.dial(auth_passthrough=True)`). Read by the dispatcher's 401/407
+    /// handling so a relayed challenge does not tear the call down.
+    pub fn auth_passthrough(&self) -> bool {
+        self.auth_passthrough_flag
+    }
+
+    /// Append the two auth headers to `copy` for `auth_passthrough`, unless the
+    /// script already listed them (case-insensitive) — so the challenge
+    /// (`Proxy-Authenticate`, B→A) and the credentials (`Proxy-Authorization`,
+    /// A→B) both cross the B2BUA verbatim (RFC 3261 §22.3).
+    fn add_auth_passthrough_copies(copy: &mut Vec<String>) {
+        for header in ["Proxy-Authenticate", "Proxy-Authorization"] {
+            if !copy.iter().any(|h| h.eq_ignore_ascii_case(header)) {
+                copy.push(header.to_string());
+            }
+        }
     }
 
     /// Internal helper — called from `dial()` and `fork()` to record the
@@ -1008,7 +1036,7 @@ impl PyCall {
     ///         copy=["X-Operator-Tag"],
     ///         strip=["History-Info"],
     ///     )
-    #[pyo3(signature = (uri, timeout=30, next_hop=None, flow=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), route=Vec::new(), send_socket=None))]
+    #[pyo3(signature = (uri, timeout=30, next_hop=None, flow=None, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), route=Vec::new(), send_socket=None, auth_passthrough=false))]
     #[allow(clippy::too_many_arguments)]
     fn dial(
         &mut self,
@@ -1017,11 +1045,12 @@ impl PyCall {
         next_hop: Option<&str>,
         flow: Option<super::registrar::PyFlow>,
         header_policy: Option<&str>,
-        copy: Vec<String>,
+        mut copy: Vec<String>,
         strip: Vec<String>,
         translate: Vec<(String, String)>,
         route: Vec<String>,
         send_socket: Option<String>,
+        auth_passthrough: bool,
     ) -> PyResult<()> {
         super::request::validate_send_socket(send_socket.as_deref())?;
         self.action = CallAction::Dial {
@@ -1032,6 +1061,10 @@ impl PyCall {
             send_socket,
             timeout,
         };
+        if auth_passthrough {
+            self.auth_passthrough_flag = true;
+            Self::add_auth_passthrough_copies(&mut copy);
+        }
         self.update_header_policy_input(header_policy, copy, strip, translate);
         Ok(())
     }
@@ -1044,7 +1077,7 @@ impl PyCall {
     /// connection reuse, mandatory for WebSocket callees (RFC 7118 §5 / RFC
     /// 5626 §5.3).  `header_policy` / `copy` / `strip` / `translate` apply to
     /// every branch — per-branch policy is a follow-up enhancement.
-    #[pyo3(signature = (targets, strategy="parallel", timeout=30, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), send_socket=None))]
+    #[pyo3(signature = (targets, strategy="parallel", timeout=30, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), send_socket=None, auth_passthrough=false))]
     #[allow(clippy::too_many_arguments)]
     fn fork(
         &mut self,
@@ -1052,10 +1085,11 @@ impl PyCall {
         strategy: &str,
         timeout: u32,
         header_policy: Option<&str>,
-        copy: Vec<String>,
+        mut copy: Vec<String>,
         strip: Vec<String>,
         translate: Vec<(String, String)>,
         send_socket: Option<String>,
+        auth_passthrough: bool,
     ) -> PyResult<()> {
         super::request::validate_send_socket(send_socket.as_deref())?;
         let mut target_uris: Vec<String> = Vec::with_capacity(targets.len());
@@ -1077,6 +1111,10 @@ impl PyCall {
             send_socket,
             timeout,
         };
+        if auth_passthrough {
+            self.auth_passthrough_flag = true;
+            Self::add_auth_passthrough_copies(&mut copy);
+        }
         self.update_header_policy_input(header_policy, copy, strip, translate);
         Ok(())
     }
@@ -1484,7 +1522,7 @@ mod tests {
     fn call_dial() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
-        call.dial("sip:bob@10.0.0.2:5060", 30, None, None, None, vec![], vec![], vec![], vec![], None).unwrap();
+        call.dial("sip:bob@10.0.0.2:5060", 30, None, None, None, vec![], vec![], vec![], vec![], None, false).unwrap();
         assert_eq!(
             call.action(),
             &CallAction::Dial {
@@ -1515,6 +1553,7 @@ mod tests {
             vec![],
             vec!["<sip:scscf.ims.mnc01.mcc001.3gppnetwork.org:6060;lr>".to_string()],
             None,
+            false,
         ).unwrap();
         match call.action() {
             CallAction::Dial { route, .. } => {
@@ -1539,6 +1578,7 @@ mod tests {
             vec![],
             vec![],
             None,
+            false,
         ).unwrap();
         assert_eq!(
             call.action(),
@@ -1568,6 +1608,7 @@ mod tests {
             vec![("Diversion".to_string(), "rfc7044".to_string())],
             vec![],
             None,
+            false,
         ).unwrap();
         let input = call.header_policy_input().expect("policy input must be captured");
         assert_eq!(input.policy_name.as_deref(), Some("ims-trust-domain-boundary@2026"));
@@ -1587,6 +1628,7 @@ mod tests {
             "sip:bob@10.0.0.2:5060", 30, None, None, None,
             vec![], vec![], vec![], vec![],
             Some("udp:10.0.0.1:5060".to_string()),
+            false,
         ).unwrap();
         match call.action() {
             CallAction::Dial { send_socket, .. } => {
@@ -1604,6 +1646,7 @@ mod tests {
             "sip:bob@10.0.0.2:5060", 30, None, None, None,
             vec![], vec![], vec![], vec![],
             Some("not-a-socket".to_string()),
+            false,
         );
         assert!(result.is_err());
     }
@@ -1618,7 +1661,7 @@ mod tests {
                 pyo3::types::PyString::new(py, "sip:bob@10.0.0.2").into_any(),
                 pyo3::types::PyString::new(py, "sip:bob@10.0.0.3").into_any(),
             ];
-            call.fork(targets, "parallel", 30, None, vec![], vec![], vec![], None).unwrap();
+            call.fork(targets, "parallel", 30, None, vec![], vec![], vec![], None, false).unwrap();
             assert_eq!(
                 call.action(),
                 &CallAction::Fork {
@@ -1642,11 +1685,59 @@ mod tests {
                 pyo3::types::PyString::new(py, "sip:bob@10.0.0.2").into_any(),
                 pyo3::types::PyString::new(py, "sip:bob@10.0.0.3").into_any(),
             ];
-            call.fork(targets, "parallel", 30, Some("sip-trunk-edge@2026"), vec![], vec!["X-Internal-Tag".to_string()], vec![], None).unwrap();
+            call.fork(targets, "parallel", 30, Some("sip-trunk-edge@2026"), vec![], vec!["X-Internal-Tag".to_string()], vec![], None, false).unwrap();
             let input = call.header_policy_input().expect("policy input must be captured");
             assert_eq!(input.policy_name.as_deref(), Some("sip-trunk-edge@2026"));
             assert_eq!(input.deltas_strip, vec!["X-Internal-Tag".to_string()]);
         });
+    }
+
+    #[test]
+    fn call_dial_auth_passthrough_sets_flag_and_copies_both_auth_headers() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        call.dial("sip:bob@pbx.example.com:5060", 30, None, None, None, vec![], vec![], vec![], vec![], None, true).unwrap();
+        assert!(call.auth_passthrough(), "auth_passthrough flag must be set");
+        let input = call
+            .header_policy_input()
+            .expect("auth_passthrough must capture policy input via the injected copies");
+        // The challenge (Proxy-Authenticate, B→A) and credentials (Proxy-Authorization,
+        // A→B) must both be copied so device-driven auth crosses the B2BUA (RFC 3261 §22.3).
+        assert!(input.deltas_copy.iter().any(|h| h.eq_ignore_ascii_case("Proxy-Authenticate")));
+        assert!(input.deltas_copy.iter().any(|h| h.eq_ignore_ascii_case("Proxy-Authorization")));
+    }
+
+    #[test]
+    fn call_dial_auth_passthrough_does_not_duplicate_or_clobber_script_copies() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        // Script already listed Proxy-Authenticate (case-insensitive) plus an unrelated
+        // header; auth_passthrough must add only the missing Proxy-Authorization and
+        // preserve the script's own copies.
+        call.dial(
+            "sip:bob@pbx.example.com:5060", 30, None, None, None,
+            vec!["proxy-authenticate".to_string(), "X-Keep".to_string()],
+            vec![], vec![], vec![], None, true,
+        ).unwrap();
+        let input = call.header_policy_input().expect("policy input captured");
+        let authenticate_count = input
+            .deltas_copy
+            .iter()
+            .filter(|h| h.eq_ignore_ascii_case("Proxy-Authenticate"))
+            .count();
+        assert_eq!(authenticate_count, 1, "must not duplicate a script-supplied Proxy-Authenticate");
+        assert!(input.deltas_copy.iter().any(|h| h == "X-Keep"), "script copies preserved");
+        assert!(input.deltas_copy.iter().any(|h| h.eq_ignore_ascii_case("Proxy-Authorization")));
+    }
+
+    #[test]
+    fn call_dial_auth_passthrough_defaults_false_zero_cost() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        call.dial("sip:bob@10.0.0.2:5060", 30, None, None, None, vec![], vec![], vec![], vec![], None, false).unwrap();
+        assert!(!call.auth_passthrough());
+        // No auth_passthrough and no policy kwargs → nothing captured (existing scripts pay zero cost).
+        assert!(call.header_policy_input().is_none());
     }
 
     #[test]

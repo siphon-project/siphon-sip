@@ -175,6 +175,15 @@ struct DispatcherState {
     /// task watches for cancellation, plus the original CSeq number for RAck
     /// validation. Removed when PRACK arrives or the retransmit deadline hits.
     reliable_provisionals: Arc<DashMap<(String, u32), Arc<ReliableProvisional>>>,
+    /// Outstanding B2BUA A-leg 2xx responses awaiting the caller's ACK.
+    /// Keyed by internal call ID. RFC 3261 §13.3.1.4: the UAS *core* (not the
+    /// transaction) retransmits a 2xx until ACK or 64×T1. The B2BUA intercepts
+    /// the A-leg INVITE before an IST exists (see `handle_b2bua_invite`), and
+    /// the IST steps aside on 2xx anyway ("TU owns retransmissions"), so nothing
+    /// else recovers a lost A-leg 200 — without this the caller rings until it
+    /// CANCELs. The entry's `Notify` is fired by the late-ACK handler when the
+    /// caller's ACK arrives; the retransmit task otherwise gives up at 64×T1.
+    uas_2xx_retransmits: Arc<DashMap<String, Arc<tokio::sync::Notify>>>,
     /// Shared drain state — the server flips `drain.is_draining` on
     /// SIGTERM/SIGINT. While set, new INVITEs are rejected with 503 Service
     /// Unavailable; in-dialog requests (ACK, BYE, PRACK, re-INVITE) and
@@ -567,6 +576,7 @@ pub async fn run(
             .unwrap_or_else(|| product_name.to_string()),
         call_event_receivers: Arc::new(DashMap::new()),
         reliable_provisionals: Arc::new(DashMap::new()),
+        uas_2xx_retransmits: Arc::new(DashMap::new()),
         is_draining: drain.clone(),
         rf_charger,
         rf_sessions: Arc::new(DashMap::new()),
@@ -2071,6 +2081,12 @@ fn handle_request(
                     // ACK to the winning B-leg. This completes both legs of the
                     // INVITE transaction simultaneously (RFC 3261 §14.1).
                     if let Some(internal_id) = state.call_actors.find_by_sip_call_id(cid) {
+                        // The caller's ACK stops A-leg 2xx retransmission
+                        // (RFC 3261 §13.3.1.4). Fire the Notify so the retransmit
+                        // task exits; no-op if none is armed (non-2xx ACK).
+                        if let Some((_, notify)) = state.uas_2xx_retransmits.remove(&internal_id) {
+                            notify.notify_one();
+                        }
                         // Take the pending ACK and mark both legs as ACKed
                         let pending_ack = if let Some(mut call) = state.call_actors.get_call_mut(&internal_id) {
                             call.a_leg.initial_acked = true;
@@ -2098,12 +2114,21 @@ fn handle_request(
                         return;
                     }
                 }
-                debug!("ACK has no matching IST or session — passing through");
+                debug!("ACK matched no IST/session/dialog — dropping (RFC 3261: never respond to or route an ACK)");
             }
             Err(error) => {
-                debug!("failed to match ACK to transaction: {error}");
+                debug!("failed to match ACK to transaction: {error} — dropping ACK");
             }
         }
+        // An ACK that matched no server transaction, dialog session, or B2BUA
+        // call is a stray/orphan — e.g. the caller's ACK for a B2BUA-forwarded
+        // non-2xx (407/486/…) whose call was already torn down, or an ACK that
+        // arrives after teardown. RFC 3261 §17: a stateful element MUST NOT
+        // respond to an ACK, and an ACK is never a routable standalone request.
+        // Drop it silently — never fall through to request routing, which would
+        // otherwise fabricate a 502 back to the ACK when its R-URI does not
+        // resolve (a response to an ACK — itself a protocol violation).
+        return;
     }
 
     // --- Server transaction retransmission detection ---
@@ -8340,12 +8365,13 @@ fn handle_b2bua_invite(
         to_host_override,
         contact_user_override,
         contact_override,
+        auth_passthrough,
     ) = Python::attach(|python| {
         let call_obj = match Py::new(python, py_call) {
             Ok(obj) => obj,
             Err(error) => {
                 error!("failed to create PyCall: {error}");
-                return (CallAction::None, None, None, false, false, None, None, None, None, None);
+                return (CallAction::None, None, None, false, false, None, None, None, None, None, false);
             }
         };
 
@@ -8359,7 +8385,7 @@ fn handle_b2bua_invite(
                             return (CallAction::Reject {
                                 code: 500,
                                 reason: "Script Error".to_string(),
-                            }, None, None, false, false, None, None, None, None, None);
+                            }, None, None, false, false, None, None, None, None, None, false);
                         }
                     }
                 }
@@ -8368,7 +8394,7 @@ fn handle_b2bua_invite(
                     return (CallAction::Reject {
                         code: 500,
                         reason: "Script Error".to_string(),
-                    }, None, None, false, false, None, None, None, None, None);
+                    }, None, None, false, false, None, None, None, None, None, false);
                 }
             }
         }
@@ -8384,7 +8410,8 @@ fn handle_b2bua_invite(
         let to_host_ovr = borrowed.to_host_override().map(String::from);
         let contact_user_ovr = borrowed.contact_user_override().map(String::from);
         let contact_ovr = borrowed.contact_override().map(String::from);
-        (action, timer_override, credentials, li_record, preserve_cid, policy_input, from_host_ovr, to_host_ovr, contact_user_ovr, contact_ovr)
+        let auth_passthrough = borrowed.auth_passthrough();
+        (action, timer_override, credentials, li_record, preserve_cid, policy_input, from_host_ovr, to_host_ovr, contact_user_ovr, contact_ovr, auth_passthrough)
     });
 
     // Store the A-leg INVITE for later use by on_answer/on_failure/on_bye handlers
@@ -8430,6 +8457,18 @@ fn handle_b2bua_invite(
         Arc::new(resolved)
     });
 
+    // auth_passthrough (relay the challenge for the endpoint to answer) and
+    // set_credentials (siphon answers the challenge itself) are mutually
+    // exclusive uses of the same 401/407 handling. If both are set, credentials
+    // win (the auth_passthrough branch is only reachable when there are none) —
+    // warn so the misconfiguration is visible.
+    if credentials.is_some() && auth_passthrough {
+        warn!(
+            call_id = %call_id,
+            "call has both set_credentials() and auth_passthrough=True — credentials win; ignoring auth_passthrough"
+        );
+    }
+
     // Store per-call overrides from script
     if timer_override.is_some()
         || credentials.is_some()
@@ -8440,6 +8479,7 @@ fn handle_b2bua_invite(
         || to_host_override.is_some()
         || contact_user_override.is_some()
         || contact_override.is_some()
+        || auth_passthrough
     {
         if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
             if let Some(override_config) = timer_override {
@@ -8467,6 +8507,7 @@ fn handle_b2bua_invite(
             if contact_override.is_some() {
                 call.contact_override = contact_override;
             }
+            call.auth_passthrough = auth_passthrough;
         }
     }
 
@@ -10538,8 +10579,25 @@ fn handle_b2bua_response(
         // Extract SDP body before forwarding (needed for SIPREC)
         let sdp_body = response.body.clone();
 
+        // Clone the sanitized 2xx before it is moved into send_message so the
+        // A-leg retransmit is byte-identical (RFC 3261 §13.3.1.4).
+        let retransmit_2xx = response.clone();
+
         send_message(
             response,
+            a_leg.transport.transport,
+            a_leg.transport.remote_addr,
+            a_leg.transport.connection_id,
+            state,
+        );
+
+        // Arm A-leg 2xx retransmission — the B2BUA has no IST for the A-leg, so
+        // nothing else recovers a lost 200. Cancelled by the caller's ACK in the
+        // late-ACK handler (search `uas_2xx_retransmits`). Done before the SIPREC
+        // block below so its early returns can't skip it.
+        arm_b2bua_2xx_retransmit(
+            call_id,
+            retransmit_2xx,
             a_leg.transport.transport,
             a_leg.transport.remote_addr,
             a_leg.transport.connection_id,
@@ -11168,15 +11226,44 @@ fn handle_b2bua_response(
             }
         }
 
+        // auth_passthrough: a B-leg 401/407 with no siphon-side credentials is a
+        // NON-terminal challenge that we relay to the caller for end-to-end
+        // authentication (RFC 3261 §22.3). We still ACK the B-leg and forward the
+        // challenge to the A-leg below (unconditionally), but must NOT treat the
+        // call as failed: skip the CDR, @b2bua.on_failure, and the media teardown.
+        // The call actor is still removed (the caller re-INVITEs as a fresh call);
+        // the media session — keyed by SIP Call-ID, which the re-INVITE reuses —
+        // is deliberately left in place. The caller's ACK for the forwarded
+        // challenge matches no live call and is dropped by the unmatched-ACK guard
+        // (never answered with a 502).
+        let relay_challenge = (status_code == 401 || status_code == 407)
+            && outbound_credentials.is_none()
+            && state
+                .call_actors
+                .get_call(call_id)
+                .map(|call| call.auth_passthrough)
+                .unwrap_or(false);
+        if relay_challenge {
+            debug!(
+                call_id = %call_id,
+                status = status_code,
+                "B2BUA: relaying auth challenge to A-leg (auth_passthrough) — not a failure"
+            );
+        }
+
         // CDR: the call failed before answer (cdr.auto_emit). Fire regardless of
         // whether a @b2bua.on_failure handler is registered — the record must be
-        // written for the failed call either way.
-        cdr_finalize_b2bua_fail(state, call_id, status_code);
+        // written for the failed call either way. Skipped for a relayed challenge
+        // (the call has not failed).
+        if !relay_challenge {
+            cdr_finalize_b2bua_fail(state, call_id, status_code);
+        }
 
-        // Error response — invoke @b2bua.on_failure with (PyCall, code, reason)
+        // Error response — invoke @b2bua.on_failure with (PyCall, code, reason).
+        // Skipped for a relayed challenge (not a failure — the caller authenticates).
         let engine_state = state.engine.state();
         let handlers = engine_state.handlers_for(&HandlerKind::B2buaFailure);
-        if !handlers.is_empty() {
+        if !relay_challenge && !handlers.is_empty() {
             let reason = match &message.start_line {
                 StartLine::Response(status_line) => status_line.reason_phrase.clone(),
                 _ => "Unknown".to_string(),
@@ -11274,17 +11361,22 @@ fn handle_b2bua_response(
 
         // Safety-net: if RTPEngine was offered but call failed, clean up the session.
         // Only runs when the call is truly ending (script called reject, not retry).
-        let a_sip_call_id = a_leg.dialog.call_id.clone();
-        if let (Some(rtpengine_set), Some(media_sessions)) =
-            (&state.rtpengine_set, &state.rtpengine_sessions)
-        {
-            if let Some(session) = media_sessions.remove(&a_sip_call_id) {
-                let set = Arc::clone(rtpengine_set);
-                tokio::spawn(async move {
-                    if let Err(error) = set.delete(&session.call_id, &session.from_tag).await {
-                        warn!(call_id = %session.call_id, "safety-net RTPEngine delete failed: {error}");
-                    }
-                });
+        // Skipped for a relayed auth challenge: the imminent authenticated
+        // re-INVITE reuses the media session (keyed by SIP Call-ID), so deleting
+        // it here would just force a needless re-offer (and could race that offer).
+        if !relay_challenge {
+            let a_sip_call_id = a_leg.dialog.call_id.clone();
+            if let (Some(rtpengine_set), Some(media_sessions)) =
+                (&state.rtpengine_set, &state.rtpengine_sessions)
+            {
+                if let Some(session) = media_sessions.remove(&a_sip_call_id) {
+                    let set = Arc::clone(rtpengine_set);
+                    tokio::spawn(async move {
+                        if let Err(error) = set.delete(&session.call_id, &session.from_tag).await {
+                            warn!(call_id = %session.call_id, "safety-net RTPEngine delete failed: {error}");
+                        }
+                    });
+                }
             }
         }
 
@@ -12180,6 +12272,80 @@ fn arm_reliable_provisional_retransmit(
                     debug!(
                         call_id = %key.0, rseq = key.1, interval_ms = interval.as_millis() as u64,
                         "retransmitting reliable 1xx (RFC 3262)"
+                    );
+                    let _ = outbound.send(OutboundMessage {
+                        connection_id,
+                        transport,
+                        destination,
+                        data: bytes.clone(),
+                        source_local_addr: None,
+                        server_name: None,
+                    });
+                    interval = (interval * 2).min(cap);
+                }
+            }
+        }
+    });
+}
+
+/// Arm B2BUA A-leg 2xx retransmission (RFC 3261 §13.3.1.4).
+///
+/// The B2BUA intercepts the A-leg INVITE before a server transaction is
+/// created (see `handle_b2bua_invite`), so the transaction layer never
+/// retransmits the A-leg 2xx — and the IST would step aside on 2xx anyway
+/// ("TU owns retransmissions"). Without this, a single lost 200 leaves the
+/// caller ringing until it CANCELs. Stores a `Notify` under the internal call
+/// ID and spawns a task that resends `response` on the RFC 3261 §17.2.1 UAS
+/// schedule (T1 = 500 ms doubling to T2 = 4 s, give up after 64×T1 = 32 s).
+/// The late-ACK handler fires the `Notify` when the caller's ACK arrives.
+///
+/// Mirrors [`arm_reliable_provisional_retransmit`]. On give-up it removes its
+/// own entry and warns (a genuinely abandoned answered call is reclaimed by the
+/// session timer / orphan sweep) rather than tearing down from the task, which
+/// would need a `&DispatcherState` the spawned future cannot hold.
+fn arm_b2bua_2xx_retransmit(
+    internal_call_id: &str,
+    response: SipMessage,
+    transport: Transport,
+    destination: SocketAddr,
+    connection_id: ConnectionId,
+    state: &DispatcherState,
+) {
+    let entry = Arc::new(tokio::sync::Notify::new());
+    state
+        .uas_2xx_retransmits
+        .insert(internal_call_id.to_string(), Arc::clone(&entry));
+
+    let store = Arc::clone(&state.uas_2xx_retransmits);
+    let outbound = Arc::clone(&state.outbound);
+    let key = internal_call_id.to_string();
+
+    tokio::spawn(async move {
+        // RFC 3261 §17.2.1 UAS timing: start at T1 = 500 ms, double on each
+        // retransmit up to T2 = 4 s, give up after 64 × T1 = 32 s if no ACK.
+        let mut interval = std::time::Duration::from_millis(500);
+        let cap = std::time::Duration::from_secs(4);
+        let started = tokio::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(32);
+        let bytes = bytes::Bytes::from(response.to_bytes());
+
+        loop {
+            let sleep = tokio::time::sleep(interval);
+            tokio::pin!(sleep);
+            tokio::select! {
+                _ = entry.notified() => break,
+                _ = &mut sleep => {
+                    if tokio::time::Instant::now() >= deadline {
+                        warn!(
+                            call_id = %key,
+                            "RFC 3261 §13.3.1.4: no ACK after 32s — giving up A-leg 2xx retransmits"
+                        );
+                        store.remove(&key);
+                        break;
+                    }
+                    debug!(
+                        call_id = %key, interval_ms = interval.as_millis() as u64,
+                        "retransmitting A-leg 2xx (RFC 3261 §13.3.1.4)"
                     );
                     let _ = outbound.send(OutboundMessage {
                         connection_id,

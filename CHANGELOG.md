@@ -24,6 +24,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   elapsed).
 
 ### Added
+- **`call.dial(..., auth_passthrough=True)` / `call.fork(..., auth_passthrough=True)`** —
+  relay B-leg authentication to the caller end-to-end instead of siphon answering
+  it (RFC 3261 §22.3), for device-driven proxy auth where the endpoint (not siphon)
+  holds the credentials — e.g. an extension authenticating to its own PBX through
+  the B2BUA. One knob: it copies `Proxy-Authenticate` (B→A) and `Proxy-Authorization`
+  (A→B) across the B2BUA, and treats a B-leg `401`/`407` (when the call has no
+  `set_credentials()`) as a *non-terminal* challenge — the challenge is forwarded
+  to the caller without firing `@b2bua.on_failure`, writing a failure CDR, or
+  tearing down the anchored media, so the caller can authenticate and re-INVITE.
+  Mutually exclusive with `set_credentials()`; if both are set the stored
+  credentials win (siphon answers the challenge itself). Mirrored in the SDK mock.
 - **`rtpengine.answer_local(call, profile=None, auto_reject=True)`** — single-leg
   UAS answer for the caller's own offer, with the media engine as the far side
   (IVR / echo / announcement server). Unlike `answer()` it takes the INVITE offer,
@@ -76,6 +87,20 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   unaffected; there is no separate `answer_now()`.
 
 ### Fixed
+- **B2BUA no longer emits a spurious `502 Bad Gateway` in response to a caller's
+  ACK.** When a B2BUA forwarded a non-2xx final response (e.g. a relayed `407`)
+  to the caller and the caller ACKed it, siphon could route that ACK as a fresh
+  request and — when its Request-URI failed to resolve — fabricate a `502` back
+  to the caller (a response to an ACK, which RFC 3261 §17 forbids). An ACK that
+  matches no server transaction, dialog session, or B2BUA call is now dropped
+  silently, as required. Surfaced with device-driven proxy auth
+  (`auth_passthrough`), where the caller ACKs the forwarded challenge.
+- **B2BUA now retransmits the A-leg `2xx` until the caller ACKs** (RFC 3261
+  §13.3.1.4), so a single lost `200 OK` on the caller leg no longer leaves the
+  call ringing until it CANCELs. The B2BUA has no INVITE server transaction for
+  the A-leg (it owns the dialog end-to-end), so the 2xx was previously sent once
+  with no UAS-core retransmission; it is now resent on the T1→T2 schedule
+  (giving up after 64·T1), cancelled the moment the caller's ACK arrives.
 - **Compact SIP header forms (RFC 3261 §7.3.3) are now recognized on every
   lookup, not just a few.** Header names are matched by their canonical form, so
   the single-letter compact forms (`v`→Via, `f`→From, `t`→To, `i`→Call-ID,

@@ -30,6 +30,7 @@ RUN_RTPENGINE=false
 RUN_RTPPROXY=false
 RUN_REINVITE=false
 RUN_B2BUA=false
+RUN_B2BUA_AUTH=false
 RUN_GATEWAY=false
 RUN_AUTO100=false
 RUN_HTTP_AUTH=false
@@ -48,6 +49,7 @@ for arg in "$@"; do
     --rtpproxy)   RUN_RTPPROXY=true ;;
     --reinvite)   RUN_REINVITE=true ;;
     --b2bua)      RUN_B2BUA=true ;;
+    --b2bua-auth) RUN_B2BUA_AUTH=true ;;
     --gateway)    RUN_GATEWAY=true ;;
     --auto100)    RUN_AUTO100=true ;;
     --http-auth)  RUN_HTTP_AUTH=true ;;
@@ -57,7 +59,7 @@ for arg in "$@"; do
     --webrtc)     RUN_WEBRTC=true ;;
     --skip-rust)  SKIP_RUST=true ;;
     --help|-h)
-      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--rtpproxy] [--reinvite] [--b2bua] [--gateway] [--auto100] [--http-auth] [--wedge] [--banscan] [--security] [--webrtc] [--skip-rust]"
+      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--rtpproxy] [--reinvite] [--b2bua] [--b2bua-auth] [--gateway] [--auto100] [--http-auth] [--wedge] [--banscan] [--security] [--webrtc] [--skip-rust]"
       exit 0
       ;;
     *)
@@ -195,6 +197,22 @@ if [[ "$RUN_B2BUA" == true ]]; then
   echo "=== B2BUA topology hiding test (CSeq/Max-Forwards/From host/SDP/PAI) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-topology up --abort-on-container-exit --exit-code-from sipp-b2bua-topology-uac sipp-b2bua-topology-uac sipp-b2bua-topology-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-topology rm -sf sipp-b2bua-topology-uac sipp-b2bua-topology-uas 2>/dev/null || true
+fi
+
+# ── Step 9b: B2BUA device-driven proxy-auth test (optional) ─────────────────
+# A B-leg 407 relayed to the caller (auth_passthrough) must NOT draw a spurious
+# 502 in response to the caller's ACK for that 407. The UAC scenario aborts on
+# an unexpected 502, so --exit-code-from makes it a hard FAIL on the buggy build.
+if [[ "$RUN_B2BUA_AUTH" == true ]]; then
+  echo "=== Building siphon-b2bua-auth image ==="
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-auth build siphon-b2bua-auth
+
+  echo "=== Starting siphon-b2bua-auth ==="
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-auth up -d --wait siphon-b2bua-auth
+
+  echo "=== B2BUA auth-passthrough test (outbound call to a PBX that 407s; challenge relayed, no spurious 502) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-auth up --abort-on-container-exit --exit-code-from sipp-b2bua-auth-uac sipp-b2bua-auth-uac sipp-b2bua-auth-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-auth rm -sf sipp-b2bua-auth-uac sipp-b2bua-auth-uas 2>/dev/null || true
 fi
 
 # ── Step 10: Gateway routing tests (optional) ──────────────────────────────────

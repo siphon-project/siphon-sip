@@ -960,6 +960,86 @@ services:
     profiles:
       - b2bua
 
+  # --- B2BUA device-driven proxy-auth test (auth_passthrough) ---
+  # A B-leg 407 must be relayed to the caller (auth_passthrough) and the
+  # caller's ACK for that 407 must NOT draw a spurious 502 — regression gate
+  # for the auth_passthrough fix. Uses the b2bua_auth_passthrough.py script.
+
+  siphon-b2bua-auth:
+    build:
+      context: ..
+    container_name: siphon-b2bua-auth-test
+    volumes:
+      - ./configs/siphon.b2bua-auth-test.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.50
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - b2bua-auth
+
+  sipp-b2bua-auth-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-auth:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_auth_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "2"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-auth
+
+  sipp-b2bua-auth-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-auth:
+        condition: service_healthy
+      sipp-b2bua-auth-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_auth_uac.xml
+      - -au
+      - alice
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-auth
+
   # --- B2BUA early media test (183 with SDP) ---
 
   sipp-b2bua-early-media-uas:

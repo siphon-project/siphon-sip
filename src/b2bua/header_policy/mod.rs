@@ -842,6 +842,22 @@ mod tests {
         assert!(msg.headers.has("Proxy-Authenticate"), "delta copy should override preset strip");
     }
 
+    #[test]
+    fn transparent_proxy_can_opt_in_to_proxy_authorization_passthrough() {
+        // The A→B (request) half of device-driven auth (auth_passthrough): the
+        // caller's re-INVITE carries Proxy-Authorization, which must survive to
+        // the challenging B-leg.  The preset strips it by default; a per-call
+        // copy delta (what call.dial(auth_passthrough=True) injects) overrides that.
+        let mut policy = ResolvedPolicy::from_preset(transparent());
+        policy.deltas_copy.push("Proxy-Authorization".to_string());
+        let mut msg = invite_with(&[("Proxy-Authorization", "Digest username=\"a\"")]);
+        apply_to_request(&mut msg, &policy, &ctx());
+        assert!(
+            msg.headers.has("Proxy-Authorization"),
+            "delta copy should override preset strip on the request"
+        );
+    }
+
     // ----- transparent-b2bua@2026: behaviour equivalence with pre-migration -----
 
     #[test]
