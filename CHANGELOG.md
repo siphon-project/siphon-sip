@@ -6,6 +6,27 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Fixed
+- **B2BUA on a multi-homed host now answers on the socket the call arrived on.**
+  When siphon listens on more than one UDP port (e.g. `5060` and `5066`), the
+  B2BUA sent every A-leg response (100 Trying, 18x, 2xx, 4xx–6xx, 487, 408, PRACK
+  200, and the reliable-1xx / 2xx retransmits) out the *first-configured* UDP
+  listener instead of the one the INVITE arrived on, so a peer doing symmetric
+  signalling (received on `:5066`) rejected replies sourced from `:5060`. Every
+  A-leg reply path now pins the egress socket to the arrival listener. This is
+  UDP-only — TCP/TLS/WS/WSS already answer on the accepted connection. Separately,
+  the `Contact` siphon advertises to the A-leg (and the stored A-leg dialog
+  Contact) carried the default listener's port on *all* transports; it now
+  carries the arrival port, so in-dialog requests (ACK/BYE/re-INVITE) reach the
+  port the dialog is anchored on (over a stream transport RFC 5923 connection
+  reuse had been masking this). siphon-*originated* in-dialog requests to the
+  A-leg (framework BYE on `b2bua.terminate` / session-timer teardown, the
+  forwarded B→A BYE / re-INVITE / UPDATE) now also carry the arrival port in their
+  Via and leave from the arrival socket, and the 200-to-BYE answers on the socket
+  the BYE arrived on — so the whole call (setup, hold/re-INVITE, teardown) stays
+  on one listener. Single-listener deployments are unaffected (the arrival port
+  equals the default), so the performance baseline is unchanged.
+
 ### Changed
 - **`rtpengine.play_media()` now blocks until the prompt finishes by default**
   (`wait=True`), on the native `siphon-rtp` backend. `await rtpengine.play_media(...)`

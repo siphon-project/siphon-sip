@@ -238,6 +238,7 @@ fn make_a_leg(call_id: &str) -> Leg {
             remote_addr: "10.0.0.1:5060".parse().unwrap(),
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
+            local_addr: None,
         },
     )
 }
@@ -253,6 +254,7 @@ fn make_b_leg(target: &str) -> Leg {
             remote_addr: addr,
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
+            local_addr: None,
         },
     )
 }
@@ -333,6 +335,7 @@ fn b2bua_auth_retry_supersedes_failed_leg_for_single_cancel() {
             remote_addr: "10.0.0.2:5060".parse().unwrap(),
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
+            local_addr: None,
         },
     );
     leg1.b_leg_invite = Some(Arc::new(Mutex::new(cseq1_invite)));
@@ -367,6 +370,7 @@ fn b2bua_auth_retry_supersedes_failed_leg_for_single_cancel() {
             remote_addr: "10.0.0.2:5060".parse().unwrap(),
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
+            local_addr: None,
         },
     );
     leg2.b_leg_invite = Some(Arc::new(Mutex::new(cseq2_invite)));
@@ -618,6 +622,7 @@ fn b2bua_multi_leg_forking() {
                 remote_addr: format!("10.0.0.{}:5060", i + 2).parse().unwrap(),
                 connection_id: ConnectionId::default(),
                 transport: Transport::Udp,
+                local_addr: None,
             },
         );
         store.add_b_leg(&call_id, b_leg);
@@ -1023,6 +1028,7 @@ fn reinvite_b_leg_non2xx_removed() {
             remote_addr: "10.0.0.2:5060".parse().unwrap(),
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
+            local_addr: None,
         },
     );
     store.add_b_leg(&call_id, reinvite_leg);
@@ -1069,6 +1075,7 @@ fn reinvite_b_leg_2xx_marked_done() {
             remote_addr: "10.0.0.1:5060".parse().unwrap(),
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
+            local_addr: None,
         },
     );
     store.add_b_leg(&call_id, reinvite_leg);
@@ -1115,6 +1122,7 @@ fn reinvite_done_entry_cleaned_on_call_removal() {
             remote_addr: "10.0.0.2:5060".parse().unwrap(),
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
+            local_addr: None,
         },
     );
     store.add_b_leg(&call_id, reinvite_leg);
@@ -1170,6 +1178,7 @@ fn zombie_reinvite_created_for_pending_reinvite() {
             remote_addr: "10.0.0.5:5060".parse().unwrap(),
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
+            local_addr: None,
         },
     );
     let reinvite_cid = reinvite_leg.dialog.call_id.clone();
@@ -1199,6 +1208,7 @@ fn zombie_reinvite_manual_removal() {
             remote_addr: "10.0.0.2:5060".parse().unwrap(),
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
+            local_addr: None,
         },
     );
     let reinvite_cid = reinvite_leg.dialog.call_id.clone();
@@ -1237,6 +1247,7 @@ fn update_b_leg_non2xx_removed() {
             remote_addr: "10.0.0.2:5060".parse().unwrap(),
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
+            local_addr: None,
         },
     );
     store.add_b_leg(&call_id, update_leg);
@@ -1277,6 +1288,7 @@ fn update_b_leg_2xx_marked_done() {
             remote_addr: "10.0.0.1:5060".parse().unwrap(),
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
+            local_addr: None,
         },
     );
     store.add_b_leg(&call_id, update_leg);
@@ -1313,6 +1325,7 @@ fn update_concurrent_with_reinvite_distinct_slots() {
             remote_addr: "10.0.0.2:5060".parse().unwrap(),
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
+            local_addr: None,
         },
     );
     store.add_b_leg(&call_id, reinvite_leg);
@@ -1327,6 +1340,7 @@ fn update_concurrent_with_reinvite_distinct_slots() {
             remote_addr: "10.0.0.1:5060".parse().unwrap(),
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
+            local_addr: None,
         },
     );
     store.add_b_leg(&call_id, update_leg);
@@ -1364,6 +1378,7 @@ fn update_done_entry_cleaned_on_call_removal() {
             remote_addr: "10.0.0.2:5060".parse().unwrap(),
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
+            local_addr: None,
         },
     );
     store.add_b_leg(&call_id, update_leg);

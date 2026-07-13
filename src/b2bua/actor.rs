@@ -333,6 +333,15 @@ pub struct TransportInfo {
     pub connection_id: ConnectionId,
     /// Transport protocol.
     pub transport: Transport,
+    /// Local listener socket this leg is anchored on, when known. Set for the
+    /// A-leg to the address the inbound INVITE arrived on so siphon-originated
+    /// requests to this leg (framework BYE, forwarded in-dialog requests) and the
+    /// advertised Via/Contact use the *arrival* listener, not the first-configured
+    /// one — the multi-homed-host source-port parity the response paths already
+    /// enforce. `None` for outbound B-legs (source socket chosen by the send path /
+    /// `send_socket=`) and in tests; consumers fall back to the default listener,
+    /// so on a single-listener host this is a no-op.
+    pub local_addr: Option<SocketAddr>,
 }
 
 // ---------------------------------------------------------------------------
@@ -946,6 +955,10 @@ pub struct ZombieReInviteEntry {
     pub destination: SocketAddr,
     /// Transport protocol for the ACK.
     pub transport: Transport,
+    /// Local listener the ACK must leave from (the anchored leg's socket), when
+    /// known. Preserves multi-homed source-port parity for the post-teardown
+    /// re-ACK; `None` falls back to the default egress (single-listener hosts).
+    pub local_addr: Option<SocketAddr>,
 }
 
 /// Post-teardown state for a B-leg whose INVITE was CANCELled but might still
@@ -1336,6 +1349,7 @@ impl CallActorStore {
                             ZombieReInviteEntry {
                                 destination: b_leg.transport.remote_addr,
                                 transport: b_leg.transport.transport,
+                                local_addr: b_leg.transport.local_addr,
                             },
                         );
                     }
@@ -1674,6 +1688,7 @@ mod tests {
             remote_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5060),
             connection_id: ConnectionId::default(),
             transport: Transport::Udp,
+            local_addr: None,
         }
     }
 
@@ -1696,6 +1711,7 @@ mod tests {
                 remote_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 5060),
                 connection_id: ConnectionId::default(),
                 transport: Transport::Udp,
+                local_addr: None,
             },
         )
     }
