@@ -81,7 +81,7 @@ futures-util = "0.3"
 # with the siphon-rtp media engine. Only the tiny `proto` crate is pulled in
 # (serde types + length-prefixed framing); the engine/codec/datapath crates
 # stay out of siphon. Used by the `media.backend: siphon-rtp` path.
-siphon-rtp-proto = "0.1.3"
+siphon-rtp-proto = "0.1.4"
 # SIP-over-SCTP (RFC 4168) + Diameter-over-SCTP transport. Optional because it
 # links the `libsctp` system library (libsctp-dev to build, libsctp1 at runtime)
 # and needs the kernel SCTP module — most SIP proxy/B2BUA deployments never use
@@ -173,7 +173,7 @@ rcgen = "0.14"
 # Build siphon-rtp control frames in the integration test's in-process fake
 # engine (the lib already depends on this crate; integration-test crates need
 # it listed here to name it directly).
-siphon-rtp-proto = "0.1.3"
+siphon-rtp-proto = "0.1.4"
 # Per-message hot-path microbenchmarks (benches/sip_hot_path.rs). The
 # release-cut gate (scripts/cut-release.sh) runs these via `critcmp` against a
 # committed baseline; CI only proves they compile (`cargo bench --no-run`).

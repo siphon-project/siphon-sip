@@ -28,8 +28,8 @@ use std::time::Duration;
 use dashmap::DashMap;
 use futures_util::future::join_all;
 use siphon_rtp_proto::{
-    frame, CmdResult, Command, Event, PlayEndReason, PlayMediaSource as ProtoPlayMediaSource,
-    ProfileFlags, Request, Response,
+    frame, CmdResult, Command, Event, LegSummary as ProtoLegSummary, PlayEndReason,
+    PlayMediaSource as ProtoPlayMediaSource, ProfileFlags, Request, Response,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -39,7 +39,7 @@ use tracing::{debug, info, trace, warn};
 
 use super::client::PlayMediaSource;
 use super::error::RtpEngineError;
-use super::events::{DtmfEvent, RtpEngineEvent};
+use super::events::{CallLegSummary, CallSummary, DtmfEvent, RtpEngineEvent};
 use super::profile::NgFlags;
 
 /// Reserved request id for the auth handshake (real requests start at 1).
@@ -1045,6 +1045,17 @@ fn convert_event(event: Event) -> RtpEngineEvent {
             call_id,
             from_tag,
         },
+        Event::CallSummary {
+            call_id,
+            reason,
+            duration_ms,
+            legs,
+        } => RtpEngineEvent::CallSummary(CallSummary {
+            call_id,
+            reason,
+            duration_ms,
+            legs: legs.into_iter().map(convert_leg_summary).collect(),
+        }),
         Event::ActiveSpeaker {
             conference_id,
             from_tag,
@@ -1078,6 +1089,29 @@ fn convert_event(event: Event) -> RtpEngineEvent {
             call_id: None,
             from_tag: None,
         },
+    }
+}
+
+/// Convert a proto [`ProtoLegSummary`] into siphon's [`CallLegSummary`] — a
+/// field-for-field copy that keeps the generic event enum free of the proto type.
+fn convert_leg_summary(leg: ProtoLegSummary) -> CallLegSummary {
+    CallLegSummary {
+        tag: leg.tag,
+        codec: leg.codec,
+        packets_in: leg.packets_in,
+        bytes_in: leg.bytes_in,
+        packets_out: leg.packets_out,
+        bytes_out: leg.bytes_out,
+        packets_dropped: leg.packets_dropped,
+        ssrc: leg.ssrc,
+        packets_lost: leg.packets_lost,
+        loss_percent: leg.loss_percent,
+        jitter_ms: leg.jitter_ms,
+        rtt_ms: leg.rtt_ms,
+        mos_average: leg.mos_average,
+        mos_min: leg.mos_min,
+        mos_max: leg.mos_max,
+        mos_basis: leg.mos_basis,
     }
 }
 
@@ -1520,6 +1554,84 @@ mod tests {
                 assert_eq!(from_tag, "f");
             }
             other => panic!("expected MediaTimeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_event_call_summary() {
+        // A measured near leg (actor quality present) + a counters-only far leg
+        // (no actor) — the two shapes the summary must carry through.
+        let near = ProtoLegSummary {
+            tag: "near-tag".into(),
+            codec: Some("AMR-WB".into()),
+            packets_in: 2100,
+            bytes_in: 336_000,
+            packets_out: 2098,
+            bytes_out: 335_680,
+            packets_dropped: 2,
+            ssrc: Some(0xDEAD_BEEF),
+            packets_lost: Some(6),
+            loss_percent: Some(0.3),
+            jitter_ms: Some(4.2),
+            rtt_ms: Some(21.0),
+            mos_average: Some(4.11),
+            mos_min: Some(3.9),
+            mos_max: Some(4.3),
+            mos_basis: Some("full".into()),
+        };
+        let far = ProtoLegSummary {
+            tag: "far-tag".into(),
+            codec: Some("PCMU".into()),
+            packets_in: 2099,
+            bytes_in: 335_840,
+            packets_out: 2100,
+            bytes_out: 336_000,
+            packets_dropped: 0,
+            ssrc: None,
+            packets_lost: None,
+            loss_percent: None,
+            jitter_ms: None,
+            rtt_ms: None,
+            mos_average: None,
+            mos_min: None,
+            mos_max: None,
+            mos_basis: None,
+        };
+        match convert_event(Event::CallSummary {
+            call_id: "call-9".into(),
+            reason: "delete".into(),
+            duration_ms: 42_000,
+            legs: vec![near, far],
+        }) {
+            RtpEngineEvent::CallSummary(summary) => {
+                assert_eq!(summary.call_id, "call-9");
+                assert_eq!(summary.reason, "delete");
+                assert_eq!(summary.duration_ms, 42_000);
+                assert_eq!(summary.legs.len(), 2);
+
+                let near = &summary.legs[0];
+                assert_eq!(near.tag, "near-tag");
+                assert_eq!(near.codec.as_deref(), Some("AMR-WB"));
+                assert_eq!(near.packets_in, 2100);
+                assert_eq!(near.bytes_out, 335_680);
+                assert_eq!(near.packets_dropped, 2);
+                assert_eq!(near.ssrc, Some(0xDEAD_BEEF));
+                assert_eq!(near.packets_lost, Some(6));
+                assert_eq!(near.loss_percent, Some(0.3));
+                assert_eq!(near.jitter_ms, Some(4.2));
+                assert_eq!(near.rtt_ms, Some(21.0));
+                assert_eq!(near.mos_average, Some(4.11));
+                assert_eq!(near.mos_basis.as_deref(), Some("full"));
+
+                let far = &summary.legs[1];
+                assert_eq!(far.tag, "far-tag");
+                assert_eq!(far.codec.as_deref(), Some("PCMU"));
+                assert_eq!(far.ssrc, None);
+                assert_eq!(far.packets_lost, None);
+                assert_eq!(far.mos_average, None);
+                assert_eq!(far.mos_basis, None);
+            }
+            other => panic!("expected CallSummary, got {other:?}"),
         }
     }
 
