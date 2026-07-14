@@ -6,6 +6,28 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **Embedded web dashboard on the admin listener** (opt-in `ui` cargo feature +
+  `admin.ui.enabled`). Serves a single-page operator dashboard same-origin with
+  the admin API — Overview (live tiles + charts for dialogs, SIP request rate,
+  and memory), Registrations (searchable, with force-unregister), Security
+  (threat counters + active bans, with lift-ban), System (jemalloc/glibc memory,
+  Python executor pool, runtime facts), and Integrations (Diameter / rtpengine /
+  SBI). Assets are baked into the binary (no external files, no runtime fetch);
+  the feature is off by default so the default build and any library consumer
+  pull none of it. A binary built without `--features ui` logs a warning and
+  serves no UI when `admin.ui.enabled` is set.
+- **`GET /admin/metrics.json`** — a curated JSON snapshot of the live gauges and
+  counters (SIP, memory, Python executor, Diameter, rtpengine, SBI, security),
+  intended for the dashboard and any custom tooling that would rather not parse
+  the Prometheus text format. Cumulative counters are exposed raw so a client
+  diffs them over time to derive rates.
+- **Bearer-token auth for the admin API** (`admin.auth.token`). When set, the
+  mutating `DELETE` routes (force-unregister, lift-ban) require
+  `Authorization: Bearer <token>`, compared in constant time; set
+  `admin.auth.protect_reads: true` to require it on the read routes and
+  `/metrics` too. Unset leaves the admin API open exactly as before.
+
 ## [1.4.0] — 2026-07-14
 
 _Codename: bjorn._

@@ -133,6 +133,12 @@ prometheus = { version = "0.14", features = ["process"] }
 axum = { version = "0.8.8", features = ["tokio"] }
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.6.8", features = ["cors"] }
+# Embedded operator web UI (opt-in via the `ui` feature). rust-embed bakes the
+# dashboard assets into the binary; mime_guess types them on the way out. Both
+# are compiled only under `--features ui`, so the default library build (and any
+# consumer embedding siphon as a lib) pulls neither.
+rust-embed = { version = "8", optional = true }
+mime_guess = { version = "2", optional = true }
 
 # Lawful Intercept — ETSI ASN.1/BER + XML
 rasn = "0.28"
@@ -220,6 +226,13 @@ postgres-backend = ["dep:tokio-postgres"]
 # listener is started and a configured `listen.sctp` block is ignored with a
 # loud warning; a Diameter peer with `transport: sctp` errors at connect time.
 sctp = ["dep:tokio-sctp"]
+
+# Embedded operator web dashboard, served by the admin HTTP listener behind
+# `admin.ui.enabled`. Off by default so the default binary and any library
+# consumer stay free of the asset-embedding deps. When disabled, an
+# `admin.ui.enabled: true` block still parses and is skipped with a loud warning
+# (mirrors the `sctp` contract).
+ui = ["dep:rust-embed", "dep:mime_guess"]
 
 # --- Lint policy ---
 # The codebase is clippy-clean (see `clippy.toml` for the one tuned threshold).

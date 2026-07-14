@@ -20,6 +20,9 @@ fn test_state() -> AdminState {
         registrar: Arc::new(Registrar::new(RegistrarConfig::default())),
         start_time: Instant::now(),
         draining: None,
+        auth_token: None,
+        protect_reads: false,
+        instance_id: None,
     }
 }
 

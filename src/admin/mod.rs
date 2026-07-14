@@ -11,9 +11,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Json};
+use axum::extract::{Path, Request, State};
+use axum::http::{header, Method, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get};
 use axum::Router;
 use serde::Serialize;
@@ -32,6 +33,16 @@ pub struct AdminState {
     /// draining so a load balancer / orchestrator stops sending new work. `None`
     /// (e.g. in tests) means "never draining".
     pub draining: Option<Arc<DrainState>>,
+    /// Bearer token gating the admin API. `None` = no auth (network-placement
+    /// trust only). Stored as `Arc<str>` for a cheap per-request clone in the
+    /// auth layer.
+    pub auth_token: Option<Arc<str>>,
+    /// When true, the token is required on the read routes too, not only the
+    /// mutating `DELETE` routes.
+    pub protect_reads: bool,
+    /// This node's instance id, surfaced in `/admin/metrics.json`. `None` when
+    /// `server.instance_id` is unset and `$HOSTNAME` is absent.
+    pub instance_id: Option<String>,
 }
 
 /// Start the HTTP admin API server.
@@ -39,8 +50,26 @@ pub struct AdminState {
 /// `cors` optionally attaches an `Access-Control-Allow-Origin` policy so a
 /// browser dashboard served from another origin can `fetch()` the admin API
 /// (and the `/metrics` it also serves). `None` = no CORS headers.
-pub async fn serve(listen_addr: SocketAddr, state: AdminState, cors: Option<CorsConfig>) {
-    let app = router(state, cors.as_ref());
+///
+/// `ui_enabled` serves the embedded web dashboard at `/` (and its assets),
+/// same-origin with the API. It only has an effect on a binary built with the
+/// `ui` cargo feature; without that feature a `true` here is a loud warning and
+/// nothing is served.
+pub async fn serve(
+    listen_addr: SocketAddr,
+    state: AdminState,
+    cors: Option<CorsConfig>,
+    ui_enabled: bool,
+) {
+    #[cfg(not(feature = "ui"))]
+    if ui_enabled {
+        tracing::warn!(
+            "admin.ui.enabled is set but this binary was built without the `ui` \
+             feature; no dashboard will be served (rebuild with --features ui)"
+        );
+    }
+
+    let app = router(state, cors.as_ref(), ui_enabled);
 
     info!("Admin API listening on {}", listen_addr);
 
@@ -58,9 +87,16 @@ pub async fn serve(listen_addr: SocketAddr, state: AdminState, cors: Option<Cors
 }
 
 /// Build the router (also used by tests without binding a port).
-fn router(state: AdminState, cors: Option<&CorsConfig>) -> Router {
-    let mut app = Router::new()
+///
+/// Layer order (outermost first): CORS → bearer auth → routes. CORS is
+/// outermost so an unauthenticated `401` still carries the
+/// `Access-Control-Allow-Origin` echo (else the browser hides the body from the
+/// dashboard). The auth layer gates mutating routes (and reads when
+/// `protect_reads`) on the configured bearer token.
+fn router(state: AdminState, cors: Option<&CorsConfig>, ui_enabled: bool) -> Router {
+    let base = Router::new()
         .route("/metrics", get(metrics_handler))
+        .route("/admin/metrics.json", get(metrics_json_handler))
         .route("/admin/health", get(health_handler))
         .route("/admin/ready", get(ready_handler))
         .route("/admin/stats", get(stats_handler))
@@ -68,12 +104,80 @@ fn router(state: AdminState, cors: Option<&CorsConfig>) -> Router {
         .route("/admin/registrations/{aor}", get(registration_detail_handler))
         .route("/admin/registrations/{aor}", delete(registration_delete_handler))
         .route("/admin/bans", get(bans_handler))
-        .route("/admin/bans/{ip}", delete(ban_delete_handler))
+        .route("/admin/bans/{ip}", delete(ban_delete_handler));
+
+    // Everything not matched by an API route falls through to the embedded
+    // dashboard (single-page app), so `/` and any client route serve it.
+    #[cfg(feature = "ui")]
+    let base = if ui_enabled {
+        base.fallback(get(ui_handler))
+    } else {
+        base
+    };
+    #[cfg(not(feature = "ui"))]
+    let _ = ui_enabled;
+
+    let app = base
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_auth,
+        ))
         .with_state(state);
-    if let Some(layer) = cors.and_then(crate::cors::build_cors_layer) {
-        app = app.layer(layer);
+
+    match cors.and_then(crate::cors::build_cors_layer) {
+        Some(layer) => app.layer(layer),
+        None => app,
     }
-    app
+}
+
+/// Bearer-token gate for the admin API (RFC 6750). No-op when no token is
+/// configured. Always lets CORS preflight (`OPTIONS`) through so the browser
+/// can complete a preflight before it holds the token. Otherwise requires
+/// `Authorization: Bearer <token>` on `DELETE` (and, when `protect_reads`, on
+/// every method), comparing in constant time.
+async fn require_admin_auth(State(state): State<AdminState>, request: Request, next: Next) -> Response {
+    let method = request.method();
+    let needs_auth = state.auth_token.is_some()
+        && method != Method::OPTIONS
+        && (state.protect_reads || method == Method::DELETE);
+
+    if needs_auth {
+        let presented = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        let authorized = match (presented, state.auth_token.as_deref()) {
+            (Some(presented), Some(expected)) => {
+                constant_time_eq(presented.as_bytes(), expected.as_bytes())
+            }
+            _ => false,
+        };
+        if !authorized {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+                Json(serde_json::json!({ "error": "unauthorized" })),
+            )
+                .into_response();
+        }
+    }
+
+    next.run(request).await
+}
+
+/// Length-checked constant-time byte comparison, so a wrong token can't be
+/// recovered by timing the response. (Length is allowed to leak — a bearer
+/// token's length is not the secret.)
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (left, right) in a.iter().zip(b.iter()) {
+        difference |= left ^ right;
+    }
+    difference == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +242,85 @@ async fn stats_handler(State(state): State<AdminState>) -> impl IntoResponse {
         uptime_seconds: uptime,
         registrations_active: registrations,
     })
+}
+
+/// `GET /admin/metrics.json` — a curated JSON snapshot of the live gauges and
+/// counters for the embedded dashboard. Deliberately not the Prometheus text
+/// format: the browser polls this and diffs the cumulative counters over time
+/// to derive rates, so no server-side time series is needed. Returns a minimal
+/// shape (version/uptime/registrations) when metrics are not initialised.
+async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoResponse {
+    // Refresh jemalloc gauges so `memory.*` isn't stale between dispatcher ticks.
+    crate::metrics::update_memory_stats();
+
+    let uptime = state.start_time.elapsed().as_secs();
+    let registrations = state.registrar.aor_count();
+    let version = env!("CARGO_PKG_VERSION");
+
+    let Some(metrics) = crate::metrics::try_metrics() else {
+        return Json(serde_json::json!({
+            "version": version,
+            "instance_id": state.instance_id,
+            "uptime_seconds": uptime,
+            "registrations_active": registrations,
+            "metrics": "uninitialized",
+        }));
+    };
+
+    let connections = crate::metrics::gauge_vec_by_label(&metrics.connections_active, "transport");
+
+    Json(serde_json::json!({
+        "version": version,
+        "instance_id": state.instance_id,
+        "uptime_seconds": uptime,
+        "jemalloc_active": crate::metrics::jemalloc_is_active(),
+        "registrations_active": registrations,
+        "sip": {
+            "dialogs_active": metrics.dialogs_active.get(),
+            "transactions_active": metrics.transactions_active.get(),
+            "uac_pending": metrics.uac_pending_requests.get(),
+            "subscribe_dialogs": metrics.subscribe_dialogs.get(),
+            "cdr_sessions": metrics.cdr_sessions.get(),
+            "connections": connections,
+        },
+        "counters": {
+            "requests_total": crate::metrics::sum_int_counter_vec(&metrics.requests_total),
+            "responses_total": crate::metrics::sum_int_counter_vec(&metrics.responses_total),
+            "auth_failures_total": metrics.auth_failures_total.get(),
+            "credential_failures_total": metrics.credential_failures_total.get(),
+            "scanner_blocked_total": metrics.scanner_blocked_total.get(),
+            "rate_limited_total": metrics.rate_limited_total.get(),
+            "malformed_messages_total": metrics.malformed_messages_total.get(),
+            "script_errors_total": metrics.script_errors_total.get(),
+        },
+        "memory": {
+            "allocated": metrics.memory_allocated_bytes.get(),
+            "resident": metrics.memory_resident_bytes.get(),
+            "active": metrics.memory_active_bytes.get(),
+            "retained": metrics.memory_retained_bytes.get(),
+            "mapped": metrics.memory_mapped_bytes.get(),
+            "glibc_system": metrics.glibc_system_bytes.get(),
+            "glibc_in_use": metrics.glibc_in_use_bytes.get(),
+            "glibc_arenas": metrics.glibc_arena_count.get(),
+            "python_allocated_blocks": metrics.python_allocated_blocks.get(),
+        },
+        "pyexec": {
+            "pool_size": metrics.pyexec_pool_size.get(),
+            "pool_max": metrics.pyexec_pool_max.get(),
+            "inflight": metrics.pyexec_inflight.get(),
+            "queue_depth": metrics.pyexec_queue_depth.get(),
+            "jobs_completed": metrics.pyexec_jobs_completed_total.get(),
+            "jobs_shed": metrics.pyexec_jobs_shed_total.get(),
+        },
+        "diameter": { "peers_connected": metrics.diameter_peers_connected.get() },
+        "rtpengine": {
+            "up": metrics.rtpengine_instances_up.get(),
+            "total": metrics.rtpengine_instances_total.get(),
+        },
+        "sbi": { "npcf_sessions_active": metrics.sbi_npcf_app_sessions_active.get() },
+        "ipsec": { "sa_pairs": metrics.ipsec_sa_pairs.get() },
+        "security": { "banned_ips": metrics.banned_ips.get() },
+    }))
 }
 
 /// `GET /admin/registrations` — list all active AoRs with their contacts.
@@ -264,6 +447,49 @@ async fn ban_delete_handler(Path(ip): Path<String>) -> impl IntoResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Embedded web dashboard (feature = "ui")
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "ui")]
+mod embedded {
+    use rust_embed::RustEmbed;
+
+    /// Dashboard assets baked into the binary at compile time from the `ui/`
+    /// directory (a single self-contained `index.html` today — no build step).
+    #[derive(RustEmbed)]
+    #[folder = "ui"]
+    pub struct Assets;
+}
+
+/// Serve an embedded dashboard asset by path, falling back to `index.html` for
+/// any unmatched path (single-page-app routing). Content-type is guessed from
+/// the served file's name.
+#[cfg(feature = "ui")]
+async fn ui_handler(uri: axum::http::Uri) -> Response {
+    let requested = uri.path().trim_start_matches('/');
+    let requested = if requested.is_empty() {
+        "index.html"
+    } else {
+        requested
+    };
+
+    let (name, asset) = match embedded::Assets::get(requested) {
+        Some(asset) => (requested, asset),
+        None => match embedded::Assets::get("index.html") {
+            Some(asset) => ("index.html", asset),
+            None => return (StatusCode::NOT_FOUND, "not found").into_response(),
+        },
+    };
+
+    let mime = mime_guess::from_path(name).first_or_octet_stream();
+    (
+        [(header::CONTENT_TYPE, mime.as_ref())],
+        asset.data.into_owned(),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Response types
 // ---------------------------------------------------------------------------
 
@@ -295,11 +521,22 @@ mod tests {
             registrar: Arc::new(Registrar::new(crate::registrar::RegistrarConfig::default())),
             start_time: Instant::now(),
             draining: None,
+            auth_token: None,
+            protect_reads: false,
+            instance_id: None,
+        }
+    }
+
+    fn authed_state(token: &str, protect_reads: bool) -> AdminState {
+        AdminState {
+            auth_token: Some(Arc::from(token)),
+            protect_reads,
+            ..test_state()
         }
     }
 
     fn test_app() -> Router {
-        router(test_state(), None)
+        router(test_state(), None, false)
     }
 
     #[tokio::test]
@@ -345,8 +582,11 @@ mod tests {
             registrar: Arc::new(Registrar::new(crate::registrar::RegistrarConfig::default())),
             start_time: Instant::now(),
             draining: Some(drain),
+            auth_token: None,
+            protect_reads: false,
+            instance_id: None,
         };
-        let app = router(state, None);
+        let app = router(state, None, false);
 
         let response = app
             .oneshot(Request::get("/admin/ready").body(Body::empty()).unwrap())
@@ -491,7 +731,7 @@ mod tests {
         let cors = CorsConfig {
             allowed_origins: vec!["http://localhost:5173".to_owned()],
         };
-        let app = router(test_state(), Some(&cors));
+        let app = router(test_state(), Some(&cors), false);
 
         // A simple cross-origin GET must come back with the allow-origin echo,
         // or the browser hides the body from the dashboard.
@@ -520,7 +760,7 @@ mod tests {
         let cors = CorsConfig {
             allowed_origins: vec!["http://localhost:5173".to_owned()],
         };
-        let app = router(test_state(), Some(&cors));
+        let app = router(test_state(), Some(&cors), false);
 
         // The admin DELETE routes are non-simple requests, so the browser sends
         // an OPTIONS preflight first; the layer must answer it 2xx with the echo.
@@ -551,7 +791,7 @@ mod tests {
     async fn no_cors_config_emits_no_header() {
         crate::metrics::init().unwrap();
         // Default (no cors block) stays byte-for-byte as before — no CORS header.
-        let app = router(test_state(), None);
+        let app = router(test_state(), None, false);
 
         let response = app
             .oneshot(
@@ -567,5 +807,176 @@ mod tests {
             .headers()
             .get("access-control-allow-origin")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn metrics_json_endpoint_shape() {
+        crate::metrics::init().unwrap();
+        let app = test_app();
+
+        let response = app
+            .oneshot(
+                Request::get("/admin/metrics.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+        assert!(json["uptime_seconds"].as_u64().is_some());
+        // Metrics are initialised in this test, so the rich shape is present.
+        assert!(json["sip"]["dialogs_active"].as_i64().is_some());
+        assert!(json["counters"]["requests_total"].as_u64().is_some());
+        assert!(json["memory"]["allocated"].as_i64().is_some());
+    }
+
+    #[tokio::test]
+    async fn auth_rejects_delete_without_bearer() {
+        crate::metrics::init().unwrap();
+        // A token is configured, so the mutating DELETE route must present it.
+        let app = router(authed_state("s3cret", false), None, false);
+
+        let response = app
+            .oneshot(
+                Request::delete("/admin/registrations/sip:alice@example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_allows_delete_with_bearer() {
+        crate::metrics::init().unwrap();
+        let app = router(authed_state("s3cret", false), None, false);
+
+        let response = app
+            .oneshot(
+                Request::delete("/admin/registrations/sip:nobody@example.com")
+                    .header("authorization", "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Passed the auth layer; the AoR isn't registered, so it's a 404, not 401.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn auth_wrong_bearer_is_rejected() {
+        crate::metrics::init().unwrap();
+        let app = router(authed_state("s3cret", false), None, false);
+
+        let response = app
+            .oneshot(
+                Request::delete("/admin/registrations/sip:alice@example.com")
+                    .header("authorization", "Bearer wrong")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn reads_open_by_default_even_with_token() {
+        crate::metrics::init().unwrap();
+        // Token set but protect_reads = false: GET routes stay open.
+        let app = router(authed_state("s3cret", false), None, false);
+
+        let response = app
+            .oneshot(
+                Request::get("/admin/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn protect_reads_requires_bearer_on_get() {
+        crate::metrics::init().unwrap();
+        let app = router(authed_state("s3cret", true), None, false);
+
+        let unauth = app
+            .clone()
+            .oneshot(Request::get("/admin/stats").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+
+        let authed = app
+            .oneshot(
+                Request::get("/admin/stats")
+                    .header("authorization", "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authed.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn constant_time_eq_matches_and_rejects() {
+        assert!(constant_time_eq(b"token", b"token"));
+        assert!(!constant_time_eq(b"token", b"tokeX"));
+        assert!(!constant_time_eq(b"token", b"tok"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[cfg(feature = "ui")]
+    #[tokio::test]
+    async fn ui_served_at_root_when_enabled() {
+        let app = router(test_state(), None, true);
+
+        let response = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(content_type.starts_with("text/html"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.windows(6).any(|window| window == b"SIPhon"));
+    }
+
+    #[cfg(feature = "ui")]
+    #[tokio::test]
+    async fn ui_absent_when_disabled() {
+        // Feature is on but the operator left admin.ui.enabled off.
+        let app = router(test_state(), None, false);
+
+        let response = app
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }
