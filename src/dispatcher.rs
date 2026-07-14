@@ -4835,6 +4835,46 @@ struct RelayTarget {
 /// ([`resolve_in_dialog_flow_uri`]) needs the *whole* set to test whether the
 /// dialog's established peer is still among the next hop's members.
 fn resolve_candidates(uri_string: &str, resolver: &SipResolver) -> Vec<RelayTarget> {
+    // Inject the process-wide gateway manager (the same one `from_gateway`
+    // reads) so a next hop that is a configured gateway FQDN can reuse the
+    // prober's already-resolved address instead of a per-call DNS lookup.
+    resolve_candidates_inner(
+        uri_string,
+        resolver,
+        crate::script::api::gateway_manager().map(|manager| &**manager),
+    )
+}
+
+/// Map a SIP `transport=` token (or SRV proto hint) to the internal
+/// [`Transport`]. Case-insensitive; `None` for an unrecognised token.
+fn transport_from_token(token: &str) -> Option<Transport> {
+    match token.to_lowercase().as_str() {
+        "tcp" => Some(Transport::Tcp),
+        "tls" => Some(Transport::Tls),
+        "udp" => Some(Transport::Udp),
+        "ws" => Some(Transport::WebSocket),
+        "wss" => Some(Transport::WebSocketSecure),
+        _ => None,
+    }
+}
+
+/// Core of [`resolve_candidates`] with the gateway address cache injected, so it
+/// is unit-testable without the process-wide gateway singleton.
+///
+/// Before falling back to a blocking DNS resolve, this checks whether the next
+/// hop is a configured gateway hostname destination whose address the health
+/// prober has already resolved (and `set_address`'d every probe cycle). A hit
+/// returns that cached, health-checked address with **zero** DNS on the hot
+/// path — the fix for a per-call ~1s stall routing to an FQDN trunk / Teams
+/// Direct Routing SBC on a low-traffic node where the resolver's own cache has
+/// gone cold between calls. The hostname is preserved as `server_name` so TLS
+/// SNI is unchanged, and the R-URI (built elsewhere from the same URI) is
+/// untouched.
+fn resolve_candidates_inner(
+    uri_string: &str,
+    resolver: &SipResolver,
+    gateway: Option<&crate::gateway::DispatcherManager>,
+) -> Vec<RelayTarget> {
     // Try as bare IP:port first (cheapest check)
     if let Ok(addr) = uri_string.parse::<SocketAddr>() {
         return vec![RelayTarget { address: addr, transport: None, server_name: None }];
@@ -4844,6 +4884,27 @@ fn resolve_candidates(uri_string: &str, resolver: &SipResolver) -> Vec<RelayTarg
     if let Ok(uri) = parse_uri_standalone(uri_string) {
         // Extract transport hint from URI params (e.g. ;transport=tcp)
         let transport_hint = uri.get_param("transport").map(|s| s.to_string());
+
+        // Gateway hot-path shortcut: if this next hop is a gateway hostname
+        // destination, reuse the address the prober already resolved instead of
+        // a blocking resolver.resolve on every call. Keyed on the same
+        // normalized `host:port` the gateway stored (extract_address_from_uri).
+        if let Some(gateway) = gateway {
+            let host_port = crate::gateway::extract_address_from_uri(uri_string);
+            if let Some((address, gateway_transport)) = gateway.cached_address_for(&host_port) {
+                // A script-supplied ;transport= wins; else the destination's
+                // configured transport.
+                let transport = transport_hint
+                    .as_deref()
+                    .and_then(transport_from_token)
+                    .or(Some(gateway_transport));
+                return vec![RelayTarget {
+                    address,
+                    transport,
+                    server_name: Some(uri.host.clone()),
+                }];
+            }
+        }
 
         let results = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(resolver.resolve(
@@ -4861,14 +4922,7 @@ fn resolve_candidates(uri_string: &str, resolver: &SipResolver) -> Vec<RelayTarg
                     .transport
                     .as_deref()
                     .or(transport_hint.as_deref())
-                    .and_then(|t| match t.to_lowercase().as_str() {
-                        "tcp" => Some(Transport::Tcp),
-                        "tls" => Some(Transport::Tls),
-                        "udp" => Some(Transport::Udp),
-                        "ws" => Some(Transport::WebSocket),
-                        "wss" => Some(Transport::WebSocketSecure),
-                        _ => None,
-                    });
+                    .and_then(transport_from_token);
                 // All candidates from one URI share the target hostname — carry
                 // it for TLS SNI so a hostname-vhost peer routes the handshake.
                 RelayTarget { address: r.address, transport, server_name: Some(uri.host.clone()) }
@@ -15575,6 +15629,80 @@ a=rtpmap:8 PCMA/8000\r\n";
     async fn resolve_target_unresolvable_domain() {
         let resolver = test_resolver();
         assert!(resolve_target("sip:alice@this-domain-should-not-exist-xyzzy.invalid", &resolver).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_candidates_inner_uses_gateway_cache_without_dns() {
+        use crate::gateway::{Algorithm, Destination, DispatcherGroup, DispatcherManager};
+        let resolver = test_resolver();
+        // `.invalid` never resolves in DNS (RFC 6761), so a fallthrough to
+        // resolver.resolve returns an empty set — a non-empty result here proves
+        // the gateway cache served the address with zero DNS.
+        let destination = Destination::new(
+            "sip:gw.test.invalid:5061;transport=tls".to_string(),
+            "127.0.0.9:5061".parse().unwrap(),
+            Transport::Tls,
+            1,
+            1,
+        )
+        .with_address_str("gw.test.invalid:5061".to_string());
+        let group =
+            DispatcherGroup::new("teams".to_string(), Algorithm::Weighted, vec![destination]);
+        // Simulate the health prober having resolved the FQDN.
+        let resolved: SocketAddr = "203.0.113.77:5061".parse().unwrap();
+        group.all_destinations()[0].set_address(resolved);
+        let manager = DispatcherManager::new();
+        manager.add_group(group);
+
+        let candidates = resolve_candidates_inner(
+            "sip:gw.test.invalid:5061;transport=tls",
+            &resolver,
+            Some(&manager),
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].address, resolved);
+        // Hostname preserved for TLS SNI to the FQDN peer.
+        assert_eq!(candidates[0].server_name.as_deref(), Some("gw.test.invalid"));
+        assert_eq!(candidates[0].transport, Some(Transport::Tls));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_candidates_inner_falls_through_when_host_not_a_gateway() {
+        use crate::gateway::{Algorithm, Destination, DispatcherGroup, DispatcherManager};
+        let resolver = test_resolver();
+        let destination = Destination::new(
+            "sip:gw.test.invalid:5061;transport=tls".to_string(),
+            "127.0.0.9:5061".parse().unwrap(),
+            Transport::Tls,
+            1,
+            1,
+        )
+        .with_address_str("gw.test.invalid:5061".to_string());
+        let group =
+            DispatcherGroup::new("teams".to_string(), Algorithm::Weighted, vec![destination]);
+        let manager = DispatcherManager::new();
+        manager.add_group(group);
+
+        // A different unresolvable host is not a gateway member → no cache hit →
+        // DNS fallthrough → empty (does NOT borrow the gateway's cached address).
+        let candidates = resolve_candidates_inner(
+            "sip:other.host.invalid:5061;transport=tls",
+            &resolver,
+            Some(&manager),
+        );
+        assert!(candidates.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_candidates_inner_bare_ip_short_circuits_before_gateway() {
+        let resolver = test_resolver();
+        let candidates = resolve_candidates_inner("203.0.113.5:5060", &resolver, None);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].address,
+            "203.0.113.5:5060".parse::<SocketAddr>().unwrap()
+        );
+        assert!(candidates[0].server_name.is_none());
     }
 
     // --- In-dialog connection reuse (RFC 5923) ---

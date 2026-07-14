@@ -189,6 +189,20 @@ _Codename: bjorn._
   unaffected; there is no separate `answer_now()`.
 
 ### Fixed
+- **Routing a call to a gateway FQDN no longer pays a per-call DNS resolve.** When
+  a next hop is a configured `gateway` destination with a hostname URI (an FQDN SIP
+  trunk, a Teams Direct Routing SBC `sip*.pstnhub.microsoft.com`), the datapath now
+  reuses the address the health prober already resolved for that destination
+  instead of doing a blocking `resolve()` on every relay/dial. On a low-traffic
+  node the resolver's own cache goes cold between calls, so each call was blocking
+  the worker on a fresh A/AAAA lookup — visible as a ~1 second gap between "call
+  received" and the outbound request going on the wire (and a matching gap in the
+  SIP trace). The cached address is the prober's, refreshed every probe cycle and
+  health-checked, and the hostname is still carried through for the R-URI and TLS
+  SNI, so nothing on the wire changes. Static-IP destinations and non-gateway next
+  hops are unaffected (a bare `IP:port` already skips DNS; an unknown host still
+  resolves normally). Enable probing on the group (the default) so the cache stays
+  fresh.
 - **HEP/Homer captures no longer report siphon's own side as `0.0.0.0`.** When
   siphon binds to the wildcard address (`listen.udp: 0.0.0.0:5060`, the usual
   production config), every captured leg carried siphon's endpoint as the raw

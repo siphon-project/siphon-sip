@@ -537,6 +537,35 @@ impl DispatcherManager {
         self.groups.iter().map(|e| e.key().clone()).collect()
     }
 
+    /// The probe-maintained resolved address for a next-hop `host:port`, if it
+    /// belongs to a configured gateway **hostname** destination.
+    ///
+    /// The request datapath calls this before a blocking DNS resolve (see
+    /// `crate::dispatcher::resolve_candidates`): a gateway FQDN — an SBC trunk,
+    /// Teams Direct Routing `*.pstnhub.microsoft.com` — is re-resolved and
+    /// `set_address`'d by the health prober every cycle, so routing a call to it
+    /// can reuse that address with zero DNS on the hot path. That closes a
+    /// per-call ~1s stall on a low-traffic node where the resolver's own cache
+    /// has gone cold between calls.
+    ///
+    /// Static-IP destinations carry no `address_str` and are skipped — a bare
+    /// `IP:port` next hop already short-circuits DNS. `host_port` must be the
+    /// normalized form produced by [`extract_address_from_uri`]; the match is
+    /// case-insensitive. Returns the destination's current address and its
+    /// configured transport, or `None` when no gateway hostname matches.
+    pub fn cached_address_for(&self, host_port: &str) -> Option<(SocketAddr, Transport)> {
+        for group in self.groups.iter() {
+            for destination in group.value().all_destinations() {
+                if let Some(ref address_str) = destination.address_str {
+                    if address_str.eq_ignore_ascii_case(host_port) {
+                        return Some((destination.address(), destination.transport));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Select a destination from a named group.
     pub fn select(
         &self,
@@ -1768,6 +1797,73 @@ mod tests {
     #[test]
     fn resolve_address_rejects_garbage() {
         assert!(resolve_address("not_valid").is_err());
+    }
+
+    // --- cached_address_for (datapath DNS-skip for gateway FQDNs) ---
+
+    #[test]
+    fn cached_address_for_returns_probe_address_for_hostname_dest() {
+        let dest = Destination::new(
+            "sip:gw.test.invalid:5060".to_string(),
+            "127.0.0.9:5060".parse().unwrap(),
+            Transport::Udp,
+            1,
+            1,
+        )
+        .with_address_str("gw.test.invalid:5060".to_string());
+        let group = DispatcherGroup::new("t".to_string(), Algorithm::Weighted, vec![dest]);
+        // Simulate the prober having re-resolved the FQDN to a concrete IP.
+        let resolved: SocketAddr = "203.0.113.77:5060".parse().unwrap();
+        group.all_destinations()[0].set_address(resolved);
+        let manager = DispatcherManager::new();
+        manager.add_group(group);
+
+        assert_eq!(
+            manager.cached_address_for("gw.test.invalid:5060"),
+            Some((resolved, Transport::Udp))
+        );
+        // Host match is case-insensitive (DNS names are).
+        assert_eq!(
+            manager.cached_address_for("GW.TEST.INVALID:5060"),
+            Some((resolved, Transport::Udp))
+        );
+    }
+
+    #[test]
+    fn cached_address_for_none_for_unknown_host_or_wrong_port() {
+        let dest = Destination::new(
+            "sip:gw.test.invalid:5061;transport=tls".to_string(),
+            "127.0.0.9:5061".parse().unwrap(),
+            Transport::Tls,
+            1,
+            1,
+        )
+        .with_address_str("gw.test.invalid:5061".to_string());
+        let group = DispatcherGroup::new("t".to_string(), Algorithm::Weighted, vec![dest]);
+        let manager = DispatcherManager::new();
+        manager.add_group(group);
+
+        assert!(manager.cached_address_for("other.host.invalid:5061").is_none());
+        // Same host, different port → not the same destination.
+        assert!(manager.cached_address_for("gw.test.invalid:5060").is_none());
+    }
+
+    #[test]
+    fn cached_address_for_ignores_static_ip_destinations() {
+        // A static IP:port destination carries no address_str, so it never
+        // shadows a resolve — a bare IP next hop short-circuits DNS anyway.
+        let dest = Destination::new(
+            "sip:198.51.100.5:5060".to_string(),
+            "198.51.100.5:5060".parse().unwrap(),
+            Transport::Udp,
+            1,
+            1,
+        );
+        let group = DispatcherGroup::new("t".to_string(), Algorithm::Weighted, vec![dest]);
+        let manager = DispatcherManager::new();
+        manager.add_group(group);
+
+        assert!(manager.cached_address_for("198.51.100.5:5060").is_none());
     }
 
     // --- Member-IP set / source membership (from_gateway backing store) ---
