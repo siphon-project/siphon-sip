@@ -11,6 +11,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 _Codename: bjorn._
 
 ### Added
+- **CORS for the `/metrics` and admin HTTP endpoints.** A browser dashboard
+  served from a different origin can now `fetch()` the Prometheus `/metrics`
+  listener and/or the admin API — previously the browser hid the response
+  because no `Access-Control-Allow-Origin` header was sent. Opt in per endpoint
+  with `metrics.prometheus.cors.allowed_origins: [ ... ]` and/or
+  `admin.cors.allowed_origins: [ ... ]` (full origins including scheme and
+  port; a single `"*"` allows any origin, but an explicit list is recommended
+  — the admin API can force-unregister AoRs and lift bans). Omitting the block
+  emits no CORS headers, so same-origin callers and Prometheus scrapers are
+  unaffected. The layer also answers CORS preflight (`OPTIONS`) requests, so a
+  dashboard that sends custom headers or hits the admin `DELETE` routes works.
 - **Scripts can `import` sibling `.py` helper modules.** A script's own directory
   is now added to the Python `sys.path`, so `import helpers` resolves a
   `helpers.py` sitting next to the main script — no `sys.path.insert` boilerplate.

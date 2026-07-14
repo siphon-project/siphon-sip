@@ -607,6 +607,15 @@ auth:
 #   prometheus:
 #     listen: "0.0.0.0:8888"
 #     path: "/metrics"
+#     # Optional CORS policy so a browser dashboard served from a different
+#     # origin can fetch() /metrics (a browser hides a cross-origin response
+#     # from page JS unless the server echoes Access-Control-Allow-Origin).
+#     # Omit the block entirely for no CORS headers (the default). List full
+#     # origins (scheme + host + port); a single "*" allows any origin
+#     # (handy for local dev, but prefer an explicit list).
+#     cors:
+#       allowed_origins:
+#         - "http://localhost:5173"
 
 # ---------------------------------------------------------------------------
 # HTTP admin API (health/readiness probes + registration inspection)
@@ -624,6 +633,12 @@ auth:
 #   GET    /metrics                   Prometheus scrape (same body as the metrics port)
 # admin:
 #   listen: "0.0.0.0:9091"
+#   # Optional CORS policy for the admin API (and the /metrics it also serves),
+#   # same shape as metrics.prometheus.cors. Prefer an explicit origin list
+#   # here — the admin API can force-unregister AoRs and lift auto-bans.
+#   cors:
+#     allowed_origins:
+#       - "http://localhost:5173"
 
 # ---------------------------------------------------------------------------
 # Gateway dispatcher (named groups with load balancing + health probing)

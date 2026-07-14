@@ -19,6 +19,7 @@ use axum::Router;
 use serde::Serialize;
 use tracing::{error, info};
 
+use crate::config::CorsConfig;
 use crate::dispatcher::DrainState;
 use crate::registrar::Registrar;
 
@@ -34,8 +35,12 @@ pub struct AdminState {
 }
 
 /// Start the HTTP admin API server.
-pub async fn serve(listen_addr: SocketAddr, state: AdminState) {
-    let app = router(state);
+///
+/// `cors` optionally attaches an `Access-Control-Allow-Origin` policy so a
+/// browser dashboard served from another origin can `fetch()` the admin API
+/// (and the `/metrics` it also serves). `None` = no CORS headers.
+pub async fn serve(listen_addr: SocketAddr, state: AdminState, cors: Option<CorsConfig>) {
+    let app = router(state, cors.as_ref());
 
     info!("Admin API listening on {}", listen_addr);
 
@@ -53,8 +58,8 @@ pub async fn serve(listen_addr: SocketAddr, state: AdminState) {
 }
 
 /// Build the router (also used by tests without binding a port).
-fn router(state: AdminState) -> Router {
-    Router::new()
+fn router(state: AdminState, cors: Option<&CorsConfig>) -> Router {
+    let mut app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/admin/health", get(health_handler))
         .route("/admin/ready", get(ready_handler))
@@ -64,7 +69,11 @@ fn router(state: AdminState) -> Router {
         .route("/admin/registrations/{aor}", delete(registration_delete_handler))
         .route("/admin/bans", get(bans_handler))
         .route("/admin/bans/{ip}", delete(ban_delete_handler))
-        .with_state(state)
+        .with_state(state);
+    if let Some(layer) = cors.and_then(crate::cors::build_cors_layer) {
+        app = app.layer(layer);
+    }
+    app
 }
 
 // ---------------------------------------------------------------------------
@@ -290,7 +299,7 @@ mod tests {
     }
 
     fn test_app() -> Router {
-        router(test_state())
+        router(test_state(), None)
     }
 
     #[tokio::test]
@@ -337,7 +346,7 @@ mod tests {
             start_time: Instant::now(),
             draining: Some(drain),
         };
-        let app = router(state);
+        let app = router(state, None);
 
         let response = app
             .oneshot(Request::get("/admin/ready").body(Body::empty()).unwrap())
@@ -474,5 +483,89 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "invalid IP address");
+    }
+
+    #[tokio::test]
+    async fn cors_echoes_configured_origin_on_metrics() {
+        crate::metrics::init().unwrap();
+        let cors = CorsConfig {
+            allowed_origins: vec!["http://localhost:5173".to_owned()],
+        };
+        let app = router(test_state(), Some(&cors));
+
+        // A simple cross-origin GET must come back with the allow-origin echo,
+        // or the browser hides the body from the dashboard.
+        let response = app
+            .oneshot(
+                Request::get("/metrics")
+                    .header("origin", "http://localhost:5173")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("http://localhost:5173"),
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_is_answered_for_admin_delete() {
+        let cors = CorsConfig {
+            allowed_origins: vec!["http://localhost:5173".to_owned()],
+        };
+        let app = router(test_state(), Some(&cors));
+
+        // The admin DELETE routes are non-simple requests, so the browser sends
+        // an OPTIONS preflight first; the layer must answer it 2xx with the echo.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/admin/registrations/sip:alice@example.com")
+                    .header("origin", "http://localhost:5173")
+                    .header("access-control-request-method", "DELETE")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.status().is_success());
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .and_then(|value| value.to_str().ok()),
+            Some("http://localhost:5173"),
+        );
+    }
+
+    #[tokio::test]
+    async fn no_cors_config_emits_no_header() {
+        crate::metrics::init().unwrap();
+        // Default (no cors block) stays byte-for-byte as before — no CORS header.
+        let app = router(test_state(), None);
+
+        let response = app
+            .oneshot(
+                Request::get("/metrics")
+                    .header("origin", "http://localhost:5173")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none());
     }
 }
