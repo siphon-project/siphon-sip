@@ -6,6 +6,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-07-14
+
 _Codename: bjorn._
 
 ### Added
