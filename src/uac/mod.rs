@@ -360,9 +360,15 @@ impl UacSender {
 
         let data = Bytes::from(message.to_bytes());
 
-        // HEP capture — outbound OPTIONS
+        // HEP capture — outbound OPTIONS.  For a captured-flow probe `addr` is
+        // the inbound flow's local socket, which is `0.0.0.0`/`[::]` when the
+        // listener is wildcard-bound; resolve it to the advertised address so the
+        // capture doesn't report an unspecified source (the `addr_for` fallback is
+        // already resolved, so this is a no-op there).
         if let Some(ref hep) = self.hep_sender {
-            hep.capture_outbound(addr, destination, transport, &data);
+            let hep_local =
+                resolve_via_addr(addr, &transport, &self.advertised_addrs, self.advertised_address.as_deref());
+            hep.capture_outbound(hep_local, destination, transport, &data);
         }
 
         let outbound_message = OutboundMessage {
