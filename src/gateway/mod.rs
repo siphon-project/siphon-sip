@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
+use ipnet::IpNet;
 use tracing::{debug, info, warn};
 
 use crate::sip::uri::SipUri;
@@ -263,6 +264,12 @@ pub struct DispatcherGroup {
     /// hot path by `refresh_member_ips` (startup + each probe cycle). The
     /// `ArcSwap` gives an atomic swap with no empty window during refresh.
     member_ips: ArcSwap<HashSet<IpAddr>>,
+    /// Static source CIDR ranges (from `gateway.groups[].source_networks`) whose
+    /// senders also count as members, checked by `contains_source` on top of
+    /// `member_ips`. For a peer that sources SIP from a whole published subnet
+    /// rather than only the IPs its FQDNs resolve to, so membership is stable
+    /// regardless of DNS. Configured once at startup — not refreshed.
+    source_networks: Vec<IpNet>,
 }
 
 impl DispatcherGroup {
@@ -276,6 +283,7 @@ impl DispatcherGroup {
             destinations,
             counters: DashMap::new(),
             member_ips: ArcSwap::from_pointee(HashSet::new()),
+            source_networks: Vec::new(),
         };
         // Startup resolution — sync context, `to_socket_addrs` is fine here.
         group.refresh_member_ips();
@@ -284,6 +292,13 @@ impl DispatcherGroup {
 
     pub fn with_probe_config(mut self, config: ProbeConfig) -> Self {
         self.probe_config = config;
+        self
+    }
+
+    /// Set the static source CIDR ranges that also count as group members for
+    /// `contains_source` (`request.from_gateway` / `call.from_gateway`).
+    pub fn with_source_networks(mut self, networks: Vec<IpNet>) -> Self {
+        self.source_networks = networks;
         self
     }
 
@@ -458,13 +473,32 @@ impl DispatcherGroup {
         self.member_ips.store(Arc::new(set));
     }
 
-    /// True when `ip` is a member of this group's cached resolved-address set.
+    /// True when `ip` is a member of this group — either in the cached
+    /// resolved-address set (the destinations' current DNS) or inside one of the
+    /// configured static `source_networks` CIDR ranges.
     ///
     /// Matches on IP only (source port is ignored — gateways answer from
-    /// varied ports). Reads the lock-free cache; never resolves DNS.
+    /// varied ports). Reads the lock-free cache and a small static CIDR list;
+    /// never resolves DNS.
     pub fn contains_source(&self, ip: IpAddr) -> bool {
         self.member_ips.load().contains(&ip)
+            || self.source_networks.iter().any(|network| network.contains(&ip))
     }
+}
+
+/// Parse a `source_networks` entry into an [`IpNet`].
+///
+/// Accepts either a CIDR (`"203.0.113.0/24"`) or a bare IP address
+/// (`"203.0.113.7"`), which is treated as a host route (`/32` for IPv4, `/128`
+/// for IPv6). Returns `None` for anything that is neither, so the caller can
+/// warn and skip a malformed entry rather than fail startup.
+pub fn parse_source_network(spec: &str) -> Option<IpNet> {
+    if let Ok(network) = spec.parse::<IpNet>() {
+        return Some(network);
+    }
+    let ip = spec.parse::<IpAddr>().ok()?;
+    let host_prefix = if ip.is_ipv4() { 32 } else { 128 };
+    IpNet::new(ip, host_prefix).ok()
 }
 
 
@@ -1829,6 +1863,60 @@ mod tests {
         group.all_destinations()[0].set_address("203.0.113.7:5060".parse().unwrap());
         group.refresh_member_ips();
         assert!(group.contains_source("203.0.113.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn parse_source_network_accepts_cidr_and_bare_ip() {
+        // CIDR, IPv4 and IPv6.
+        assert!(parse_source_network("203.0.113.0/24").is_some());
+        assert!(parse_source_network("2001:db8::/32").is_some());
+        // Bare IP → host route (/32 for v4, /128 for v6).
+        assert_eq!(parse_source_network("203.0.113.7").unwrap().prefix_len(), 32);
+        assert_eq!(parse_source_network("2001:db8::1").unwrap().prefix_len(), 128);
+        // Neither a CIDR nor an IP → None (caller warns and skips).
+        assert!(parse_source_network("not-an-ip").is_none());
+        assert!(parse_source_network("203.0.113.0/99").is_none());
+        assert!(parse_source_network("").is_none());
+    }
+
+    #[test]
+    fn contains_source_matches_static_source_networks_v4_and_v6() {
+        // The whole point: a peer that sources SIP from a published range, not
+        // only the IPs its destination FQDNs resolve to. The floor destination
+        // resolves to 10.0.0.1; the ranges add membership independent of DNS.
+        let group = DispatcherGroup::new(
+            "range-peer".to_string(),
+            Algorithm::Weighted,
+            vec![make_dest("sip:gw1.example.com", 5060, 1, 1)],
+        )
+        .with_source_networks(vec![
+            parse_source_network("203.0.113.0/24").unwrap(),
+            parse_source_network("2001:db8::/32").unwrap(),
+        ]);
+
+        // Inside a configured range, though it never resolved from any FQDN.
+        assert!(group.contains_source("203.0.113.199".parse().unwrap()));
+        assert!(group.contains_source("2001:db8::dead:beef".parse().unwrap()));
+        // The resolved-destination floor still counts.
+        assert!(group.contains_source("10.0.0.1".parse().unwrap()));
+        // Outside both the resolved set and the ranges → not a member.
+        assert!(!group.contains_source("198.51.100.5".parse().unwrap()));
+        assert!(!group.contains_source("2001:db9::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn source_in_group_honours_source_networks() {
+        let manager = DispatcherManager::new();
+        manager.add_group(
+            DispatcherGroup::new(
+                "range-peer".to_string(),
+                Algorithm::Weighted,
+                vec![make_dest("sip:gw1.example.com", 5060, 1, 1)],
+            )
+            .with_source_networks(vec![parse_source_network("203.0.113.0/24").unwrap()]),
+        );
+        assert!(manager.source_in_group("range-peer", "203.0.113.42".parse().unwrap()));
+        assert!(!manager.source_in_group("range-peer", "198.51.100.1".parse().unwrap()));
     }
 
     // --- Probe health verdict (apply_probe_response) ---

@@ -1974,6 +1974,20 @@ pub struct GatewayGroupConfig {
     pub probe: GatewayProbeConfig,
     /// Destinations in this group.
     pub destinations: Vec<GatewayDestConfig>,
+    /// Source IP CIDR ranges whose senders count as members of this group for
+    /// `request.from_gateway` / `call.from_gateway`, in addition to the
+    /// destinations' resolved addresses.
+    ///
+    /// Use this for a peer that sources SIP from a whole published subnet rather
+    /// than only the IPs its signalling FQDNs resolve to — a carrier trunk or
+    /// cloud voice service whose inbound signalling can arrive from any address
+    /// in a documented range, not just what its SIP FQDNs currently resolve to.
+    /// Listing the ranges here makes membership stable regardless of DNS. Each
+    /// entry is a CIDR or a bare IP, IPv4 or IPv6: `"203.0.113.0/24"`,
+    /// `"2001:db8::/32"`, or a bare address (`"203.0.113.7"` → `/32`,
+    /// `"2001:db8::1"` → `/128`).
+    #[serde(default)]
+    pub source_networks: Vec<String>,
 }
 
 /// Per-group health probe settings.

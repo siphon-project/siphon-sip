@@ -7,6 +7,7 @@ Passed to ``@b2bua.on_invite``, ``@b2bua.on_early_media``,
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from typing import Optional, Union
 
@@ -135,6 +136,33 @@ class Call:
         from siphon_sdk.mock_module import get_gateway
 
         return get_gateway().contains_source(group_name, self._source_ip)
+
+    def source_ip_in(self, cidr_list: list[str]) -> bool:
+        """Check if the A-leg source IP is within any of the given CIDR ranges.
+
+        The B2BUA counterpart of :meth:`Request.source_ip_in`.  Use it to gate on
+        a peer's published source subnets directly, when that peer sources SIP
+        from a whole range rather than only the IPs its signalling FQDNs resolve
+        to — the case :meth:`from_gateway` (which tracks the destinations' DNS)
+        cannot cover.  Accepts IPv4 and IPv6 CIDRs.
+
+        Args:
+            cidr_list: List of CIDR strings (e.g. ``["203.0.113.0/24"]``).
+
+        Returns:
+            ``True`` if the A-leg source IP falls within any range; ``False`` if
+            the source IP does not parse.
+
+        Example::
+
+            if call.source_ip_in(["203.0.113.0/24", "2001:db8::/32"]):
+                ...
+        """
+        try:
+            addr = ipaddress.ip_address(self._source_ip)
+        except ValueError:
+            return False
+        return any(addr in ipaddress.ip_network(cidr) for cidr in cidr_list)
 
     @property
     def from_uri(self) -> Optional[SipUri]:

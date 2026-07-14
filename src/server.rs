@@ -2315,9 +2315,28 @@ fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {
             from_domain: group_config.probe.from_domain.clone(),
         };
 
+        // Static source CIDR membership (for from_gateway) — peers that source
+        // SIP from a whole published subnet, not only their FQDN-resolved IPs.
+        let source_networks: Vec<ipnet::IpNet> = group_config
+            .source_networks
+            .iter()
+            .filter_map(|spec| {
+                let parsed = crate::gateway::parse_source_network(spec);
+                if parsed.is_none() {
+                    warn!(
+                        group = %group_config.name,
+                        entry = %spec,
+                        "ignoring invalid gateway source_networks entry (not a CIDR or IP)"
+                    );
+                }
+                parsed
+            })
+            .collect();
+
         manager.add_group(
             DispatcherGroup::new(group_config.name.clone(), algorithm, destinations)
-                .with_probe_config(probe),
+                .with_probe_config(probe)
+                .with_source_networks(source_networks),
         );
     }
 
