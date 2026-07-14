@@ -72,6 +72,7 @@ them (see the framework-handles-automatically notes in the API reference).
 | `htable` (`$sht(...)`) | `cache` namespace (local LRU + optional Redis, shared live) |
 | `dispatcher` module + `ds_select_dst()` | `gateway` namespace (`gateway.select(group, key=…)`) + YAML `gateway.groups` |
 | `ds_is_from_list()` / `ds_is_in_list()` | `request.from_gateway(group)` / `call.from_gateway(group)` / `reply.from_gateway(group)` (source-IP membership of a `gateway` group; the `reply` form tests which trunk answered) |
+| `permissions` module (`allow_source_address()`, the address table with CIDR) | `gateway.groups[].source_networks` (static CIDR/IP ranges that count as group members for `from_gateway`, for a peer that sources from a whole published subnet, not only its FQDN-resolved IPs) + `request.source_ip_in([...])` / `call.source_ip_in([...])` for inline CIDR checks |
 | `dialog` module (`$dlg_val`, profiles) | the B2BUA call object (`@b2bua.*`, `call.*`) for true call control |
 | `rtpengine_*()` | `call.media.anchor()` / the `rtpengine` namespace |
 | `sqlops` / `avpops` against a DB | plain Python (use a DB client in an `async` handler, off the hot path) |

@@ -127,3 +127,23 @@ def test_reply_from_gateway_false_for_bad_source_ip():
     _register_teams_group()
     reply = Reply(status_code=200, source_ip="not-an-ip")
     assert reply.from_gateway("teams") is False
+
+
+# --- Call.source_ip_in (CIDR membership, the from_gateway complement) -------
+
+
+def test_call_source_ip_in_matches_v4_and_v6():
+    # For a peer that sources from a whole published subnet rather than only its
+    # FQDN-resolved IPs, a script gates on the ranges directly.
+    call = Call(source_ip="203.0.113.9")
+    assert call.source_ip_in(["203.0.113.0/24"]) is True
+    assert call.source_ip_in(["198.51.100.0/24"]) is False
+    # IPv6 source inside a documented /32.
+    call6 = Call(source_ip="2001:db8::5")
+    assert call6.source_ip_in(["2001:db8::/32"]) is True
+    assert call6.source_ip_in(["2001:db9::/32"]) is False
+
+
+def test_call_source_ip_in_false_for_unparseable_source():
+    call = Call(source_ip="not-an-ip")
+    assert call.source_ip_in(["203.0.113.0/24"]) is False

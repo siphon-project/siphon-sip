@@ -702,6 +702,33 @@ impl PyCall {
         self.from_gateway_impl(group_name, super::gateway_manager())
     }
 
+    /// Check if the A-leg source IP is within any of the given CIDR ranges.
+    ///
+    /// The B2BUA counterpart of `request.source_ip_in`. Use it to gate on a
+    /// peer's published source subnets directly, when that peer sources SIP from
+    /// a whole range rather than only the IPs its signalling FQDNs resolve to —
+    /// the case `from_gateway` (which tracks the destinations' DNS) cannot cover.
+    /// Same trust semantics as `from_gateway`: handshake-verified on
+    /// TCP/TLS/WS/WSS, a best-effort direction hint on UDP.
+    ///
+    /// Raises `ValueError` only if the A-leg source IP itself is unparseable;
+    /// malformed CIDR entries in the list are skipped.
+    ///
+    /// Example: `if call.source_ip_in(["203.0.113.0/24"]): ...`
+    fn source_ip_in(&self, cidr_list: Vec<String>) -> PyResult<bool> {
+        let source_ip: std::net::IpAddr = self.source_ip.parse().map_err(|error| {
+            pyo3::exceptions::PyValueError::new_err(format!("bad source IP: {error}"))
+        })?;
+        for cidr in &cidr_list {
+            if let Ok(network) = cidr.parse::<ipnet::IpNet>() {
+                if network.contains(&source_ip) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// Media anchoring handle.
     ///
     /// Usage:
@@ -2135,6 +2162,40 @@ mod tests {
         let call = PyCall::new("test-id".to_string(), message, "not-an-ip".to_string(), "udp".to_string());
         let manager = gateway_manager_with_group();
         assert!(!call.from_gateway_impl("trunks", Some(&manager)));
+    }
+
+    #[test]
+    fn call_source_ip_in_matches_v4_and_v6_cidrs() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        // IPv4 source inside a /24; outside another; malformed entries skipped.
+        let call = PyCall::new(
+            "t".to_string(),
+            Arc::clone(&message),
+            "203.0.113.9".to_string(),
+            "tls".to_string(),
+        );
+        assert!(call.source_ip_in(vec!["203.0.113.0/24".to_string()]).unwrap());
+        assert!(!call.source_ip_in(vec!["198.51.100.0/24".to_string()]).unwrap());
+        assert!(call
+            .source_ip_in(vec!["garbage".to_string(), "203.0.113.0/24".to_string()])
+            .unwrap());
+
+        // IPv6 source inside a /32; outside another.
+        let call6 = PyCall::new(
+            "t".to_string(),
+            Arc::clone(&message),
+            "2001:db8::5".to_string(),
+            "tls".to_string(),
+        );
+        assert!(call6.source_ip_in(vec!["2001:db8::/32".to_string()]).unwrap());
+        assert!(!call6.source_ip_in(vec!["2001:db9::/32".to_string()]).unwrap());
+    }
+
+    #[test]
+    fn call_source_ip_in_raises_on_bad_source_ip() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new("t".to_string(), message, "not-an-ip".to_string(), "udp".to_string());
+        assert!(call.source_ip_in(vec!["203.0.113.0/24".to_string()]).is_err());
     }
 
     #[test]

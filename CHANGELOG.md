@@ -20,6 +20,18 @@ _Codename: bjorn._
   absolute imports are supported (the script is not a package, so `from . import`
   does not work), and the "no cross-request module state" rule applies to helper
   modules too.
+- **`gateway.groups[].source_networks` + `call.source_ip_in(cidr_list)`** — source
+  membership for a peer that sends SIP from a whole published subnet, not only the
+  IPs its signalling FQDNs resolve to. `from_gateway` matches the source IP against
+  a group's *resolved destination addresses* (it tracks DNS) — correct for a
+  fixed-IP trunk, but it silently misses a peer whose inbound can arrive from any
+  address in a documented range: the FQDNs resolve to a moving subset, so
+  `from_gateway` flaps as DNS rotates and rejects a legitimate source it just
+  hasn't resolved. List those ranges under a group's `source_networks` (CIDR or
+  bare IP, IPv4 or IPv6) and they count as members regardless of DNS.
+  `call.source_ip_in(["203.0.113.0/24"])` is the B2BUA counterpart of
+  `request.source_ip_in` for gating on ranges inline without a gateway group.
+  Mirrored in the SDK mock.
 - **`presence.refresh(subscription_id, expires)` + `presence.find_by_dialog(call_id, from_tag)`** —
   the two pieces needed to handle an in-dialog SUBSCRIBE (RFC 6665 §4.4.1) as a
   notifier. `find_by_dialog` resolves a subscription id from an in-dialog
@@ -37,45 +49,6 @@ _Codename: bjorn._
   subscription down with a terminal NOTIFY — fixing reg-event refresh and
   un-SUBSCRIBE, which previously 404'd for every subscriber.
 
-### Fixed
-- **B2BUA on a multi-homed host now answers on the socket the call arrived on.**
-  When siphon listens on more than one UDP port (e.g. `5060` and `5066`), the
-  B2BUA sent every A-leg response (100 Trying, 18x, 2xx, 4xx–6xx, 487, 408, PRACK
-  200, and the reliable-1xx / 2xx retransmits) out the *first-configured* UDP
-  listener instead of the one the INVITE arrived on, so a peer doing symmetric
-  signalling (received on `:5066`) rejected replies sourced from `:5060`. Every
-  A-leg reply path now pins the egress socket to the arrival listener. This is
-  UDP-only — TCP/TLS/WS/WSS already answer on the accepted connection. Separately,
-  the `Contact` siphon advertises to the A-leg (and the stored A-leg dialog
-  Contact) carried the default listener's port on *all* transports; it now
-  carries the arrival port, so in-dialog requests (ACK/BYE/re-INVITE) reach the
-  port the dialog is anchored on (over a stream transport RFC 5923 connection
-  reuse had been masking this). siphon-*originated* in-dialog requests to the
-  A-leg (framework BYE on `b2bua.terminate` / session-timer teardown, the
-  forwarded B→A BYE / re-INVITE / UPDATE) now also carry the arrival port in their
-  Via and leave from the arrival socket, and the 200-to-BYE answers on the socket
-  the BYE arrived on — so the whole call (setup, hold/re-INVITE, teardown) stays
-  on one listener. Single-listener deployments are unaffected (the arrival port
-  equals the default), so the performance baseline is unchanged.
-
-### Changed
-- **`rtpengine.play_media()` now blocks until the prompt finishes by default**
-  (`wait=True`), on the native `siphon-rtp` backend. `await rtpengine.play_media(...)`
-  returns only once the prompt has fully played out, so an IVR handler can
-  sequence `answer → play → echo` with no overlap; the coroutine parks while it
-  waits (no worker is held). Pass `wait=False` for fire-and-forget playback
-  (music-on-hold / background), which returns as soon as the engine accepts the
-  prompt. Backed by the new `Event::PlayFinished` completion event
-  (`siphon-rtp-proto` 0.1.2): the play accepts immediately with a `play_id` and
-  the engine reports completion asynchronously, correlated by `play_id`. A
-  configurable fallback (`media.siphon_rtp.play_timeout_ms`, default 5 min) caps
-  the wait so a lost event / dead engine can't hang the call. The rtpengine and
-  rtpproxy backends have no completion signal, so they ignore `wait` and return
-  on accept as before. Return value is now the actual played duration (or `None`
-  when the prompt was stopped / superseded before finishing, or the fallback
-  elapsed).
-
-### Added
 - **`registrar.lookup_contact(uri)` / `registrar.is_registered_contact(uri)` —
   reverse-lookup a binding by its Contact URI.** `registrar.lookup(uri)` keys on
   the AoR (`user@domain`); these key on the stored **Contact** (user + host +
@@ -189,6 +162,22 @@ _Codename: bjorn._
   `reject()` for a final response.
 
 ### Changed
+- **`rtpengine.play_media()` now blocks until the prompt finishes by default**
+  (`wait=True`), on the native `siphon-rtp` backend. `await rtpengine.play_media(...)`
+  returns only once the prompt has fully played out, so an IVR handler can
+  sequence `answer → play → echo` with no overlap; the coroutine parks while it
+  waits (no worker is held). Pass `wait=False` for fire-and-forget playback
+  (music-on-hold / background), which returns as soon as the engine accepts the
+  prompt. Backed by the new `Event::PlayFinished` completion event
+  (`siphon-rtp-proto` 0.1.2): the play accepts immediately with a `play_id` and
+  the engine reports completion asynchronously, correlated by `play_id`. A
+  configurable fallback (`media.siphon_rtp.play_timeout_ms`, default 5 min) caps
+  the wait so a lost event / dead engine can't hang the call. The rtpengine and
+  rtpproxy backends have no completion signal, so they ignore `wait` and return
+  on accept as before. Return value is now the actual played duration (or `None`
+  when the prompt was stopped / superseded before finishing, or the fallback
+  elapsed).
+
 - **`call.answer()` now sends the final 2xx immediately** instead of deferring it
   to when the handler returns. This lets an `async` `@b2bua.on_invite` answer and
   then keep working — e.g. `await rtpengine.play_media(...)` a prompt to
@@ -200,6 +189,26 @@ _Codename: bjorn._
   unaffected; there is no separate `answer_now()`.
 
 ### Fixed
+- **B2BUA on a multi-homed host now answers on the socket the call arrived on.**
+  When siphon listens on more than one UDP port (e.g. `5060` and `5066`), the
+  B2BUA sent every A-leg response (100 Trying, 18x, 2xx, 4xx–6xx, 487, 408, PRACK
+  200, and the reliable-1xx / 2xx retransmits) out the *first-configured* UDP
+  listener instead of the one the INVITE arrived on, so a peer doing symmetric
+  signalling (received on `:5066`) rejected replies sourced from `:5060`. Every
+  A-leg reply path now pins the egress socket to the arrival listener. This is
+  UDP-only — TCP/TLS/WS/WSS already answer on the accepted connection. Separately,
+  the `Contact` siphon advertises to the A-leg (and the stored A-leg dialog
+  Contact) carried the default listener's port on *all* transports; it now
+  carries the arrival port, so in-dialog requests (ACK/BYE/re-INVITE) reach the
+  port the dialog is anchored on (over a stream transport RFC 5923 connection
+  reuse had been masking this). siphon-*originated* in-dialog requests to the
+  A-leg (framework BYE on `b2bua.terminate` / session-timer teardown, the
+  forwarded B→A BYE / re-INVITE / UPDATE) now also carry the arrival port in their
+  Via and leave from the arrival socket, and the 200-to-BYE answers on the socket
+  the BYE arrived on — so the whole call (setup, hold/re-INVITE, teardown) stays
+  on one listener. Single-listener deployments are unaffected (the arrival port
+  equals the default), so the performance baseline is unchanged.
+
 - **B2BUA no longer emits a malformed double-port To header on the B-leg
   INVITE.** When topology-hiding the To URI to the dial target, siphon replaced
   only the host token and left the original To port in place — so an inbound To
@@ -268,6 +277,7 @@ _Codename: bjorn._
   aborted the parse thread (a DoS on the parse path, found by fuzzing). The
   parser now degrades to taking the whole remaining input as the body instead of
   panicking; char-boundary-aligned lengths split exactly as before.
+- **B2BUA UAS-mode answer now tags the 2xx To header (RFC 3261 §12.1.1).** A
   script that answers an INVITE directly (`call.answer(200, ...)` — MRF /
   announcement / echo / IVR) previously sent a 2xx whose To header was copied
   verbatim from the tagless INVITE, so the caller's dialog had no remote tag. The
