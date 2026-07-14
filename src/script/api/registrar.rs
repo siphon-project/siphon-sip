@@ -449,6 +449,21 @@ impl PyRegistrar {
         let aor = normalize_aor(uri);
         self.inner.is_registered(&aor)
     }
+
+    /// Rust-side contact lookup by string (for tests and internal use).
+    pub fn lookup_contact_str(&self, uri: &str) -> Vec<PyContact> {
+        let inner = &self.inner;
+        inner
+            .lookup_contact(uri)
+            .iter()
+            .map(|c| PyContact::from_rust_contact_with_registrar(c, Some(inner)))
+            .collect()
+    }
+
+    /// Rust-side is_registered_contact by string (for tests and internal use).
+    pub fn is_registered_contact_str(&self, uri: &str) -> bool {
+        self.inner.is_registered_contact(uri)
+    }
 }
 
 #[pymethods]
@@ -1099,6 +1114,38 @@ impl PyRegistrar {
         Ok(self.inner.is_registered(&aor))
     }
 
+    /// Reverse lookup by **Contact** URI: return the registered contacts whose
+    /// stored Contact matches `uri` (user + host + port; URI parameters and
+    /// default ports are ignored). Accepts a string or a SipUri.
+    ///
+    /// Use this on the terminating edge when the only thing you have is the
+    /// contact — e.g. a PBX in front of siphon retargets the INVITE at the
+    /// cached Contact and loose-routes it back, so `call.ruri` is the contact
+    /// (`sip:1001@203.0.113.7:17514`), not the registration AoR
+    /// (`sip:1001@pbx.example`). `lookup()` keys on the AoR and would miss;
+    /// `lookup_contact()` matches the binding regardless of AoR domain.
+    ///
+    /// Returns a list of `Contact` objects (sorted by q descending), empty if
+    /// no binding has that contact.
+    fn lookup_contact(&self, uri: &Bound<'_, PyAny>) -> PyResult<Vec<PyContact>> {
+        let uri_string = extract_uri_string(uri)?;
+        let inner = &self.inner;
+        Ok(inner
+            .lookup_contact(&uri_string)
+            .iter()
+            .map(|c| PyContact::from_rust_contact_with_registrar(c, Some(inner)))
+            .collect())
+    }
+
+    /// Whether any registered binding has a **Contact** URI matching `uri`.
+    /// Contact-keyed twin of `is_registered()`; see `lookup_contact()` for
+    /// when the terminating edge needs to match on the contact, not the AoR.
+    /// Accepts a string or a SipUri.
+    fn is_registered_contact(&self, uri: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let uri_string = extract_uri_string(uri)?;
+        Ok(self.inner.is_registered_contact(&uri_string))
+    }
+
     /// Number of currently registered AoRs across the deployment.
     ///
     /// Async — when a persistent backend (Redis, Postgres) is configured this
@@ -1393,6 +1440,35 @@ mod tests {
         assert!(contacts[0].uri().contains("10.0.0.1"));
         assert_eq!(contacts[0].q(), 1.0);
         assert!(contacts[0].expires() > 3500);
+    }
+
+    #[test]
+    fn lookup_contact_finds_binding_when_lookup_by_aor_misses() {
+        // Terminating-edge scenario: the binding is keyed by the REGISTER AoR
+        // (`1001@pbx.example`), but a PBX in front loose-routes the INVITE
+        // back with the cached contact as Request-URI. `lookup` on that
+        // contact misses; `lookup_contact` matches.
+        let registrar = make_registrar();
+        let (mut request, py_reg) = make_register_request(
+            "<sip:1001@pbx.example>",
+            "<sip:1001@203.0.113.7:17514>",
+            &registrar,
+        );
+        py_reg.save(&mut request, false, vec![], None).unwrap();
+
+        // AoR-keyed lookup on the contact URI misses.
+        assert!(py_reg.lookup_str("sip:1001@203.0.113.7:17514").is_empty());
+        assert!(!py_reg.is_registered_str("sip:1001@203.0.113.7:17514"));
+
+        // Contact-keyed lookup recovers the binding.
+        let found = py_reg.lookup_contact_str("sip:1001@203.0.113.7:17514");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].uri().contains("1001"));
+        assert!(found[0].uri().contains("203.0.113.7"));
+        assert!(py_reg.is_registered_contact_str("sip:1001@203.0.113.7:17514"));
+
+        // Unknown contact still misses on the reverse path.
+        assert!(!py_reg.is_registered_contact_str("sip:1001@198.51.100.9:17514"));
     }
 
     #[test]

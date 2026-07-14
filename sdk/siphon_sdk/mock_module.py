@@ -962,6 +962,49 @@ class MockRegistrar:
         ]
         return sorted(contacts, key=lambda c: c.q, reverse=True)
 
+    def lookup_contact(self, uri: Union[str, SipUri]) -> list[Contact]:
+        """Reverse lookup by **Contact** URI.
+
+        :meth:`lookup` resolves a *logical* address (``user@domain``);
+        this resolves a *physical* one — it returns every registered
+        UE-side binding whose stored Contact matches ``uri`` (user +
+        host + port; URI parameters and default ports are ignored).
+
+        Use it on the terminating edge when the only thing you have is
+        the contact. A common case: a PBX in front of siphon retargets
+        the INVITE straight at the cached Contact and loose-routes it
+        back, so ``call.ruri`` is the contact
+        (``sip:1001@203.0.113.7:17514``), not the registration AoR
+        (``sip:1001@pbx.example``). ``lookup()`` keys on the AoR and
+        misses; ``lookup_contact()`` matches the binding regardless of
+        the AoR domain::
+
+            @b2bua.on_invite
+            def route(call):
+                if not registrar.lookup_contact(str(call.ruri)):
+                    call.reject(404, "No extension Found")
+                    return
+                call.dial(str(call.ruri))
+
+        Args:
+            uri: Contact URI as string or :class:`SipUri`.
+
+        Returns:
+            List of matching UE-side :class:`Contact` objects sorted by
+            q-value (descending). AS-side capability records are
+            excluded, matching :meth:`lookup`. Empty list if no binding
+            has that contact.
+        """
+        target = self._normalize_aor(str(uri))
+        matches = [
+            c
+            for contacts in self._store.values()
+            for c in contacts
+            if getattr(c, "kind", "ue") == "ue"
+            and self._normalize_aor(str(c.uri)) == target
+        ]
+        return sorted(matches, key=lambda c: c.q, reverse=True)
+
     def save_as_contact(
         self,
         aor: Union[str, SipUri],
@@ -1119,6 +1162,18 @@ class MockRegistrar:
             uri: AoR as string or :class:`SipUri`.
         """
         return len(self.lookup(uri)) > 0
+
+    def is_registered_contact(self, uri: Union[str, SipUri]) -> bool:
+        """Whether any registered binding has a **Contact** URI matching ``uri``.
+
+        Contact-keyed twin of :meth:`is_registered`; see
+        :meth:`lookup_contact` for when the terminating edge needs to
+        match on the contact rather than the AoR.
+
+        Args:
+            uri: Contact URI as string or :class:`SipUri`.
+        """
+        return len(self.lookup_contact(uri)) > 0
 
     async def aor_count(self) -> int:
         """Number of currently registered AoRs across the deployment.

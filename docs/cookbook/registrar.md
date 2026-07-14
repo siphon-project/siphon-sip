@@ -81,6 +81,34 @@ A few things worth knowing:
 - **`request.fix_nated_register()`** rewrites the Contact with the source the packet
   actually came from, so NAT'd clients are reachable. Pair it with `nat:` config.
 
+## Look up by Contact, not just by AoR
+
+`registrar.lookup(uri)` and `registrar.is_registered(uri)` key on the **AoR**
+(`user@domain`, taken from the REGISTER's To). That is what you want when the
+terminating Request-URI is the AoR. But if an upstream registrar of record (a
+PBX in front of siphon) has already resolved the user and retargets the INVITE
+straight at the cached **contact**, then loose-routes it back through siphon,
+the Request-URI carries the contact (`sip:1001@203.0.113.7:17514`), not the
+registration domain (`sip:1001@pbx.example`). An AoR-keyed lookup misses even
+though the binding is present (and visible in `/admin/registrations`).
+
+`registrar.lookup_contact(uri)` / `registrar.is_registered_contact(uri)` match on
+the stored **Contact** instead (user + host + port; URI parameters and default
+ports ignored), so the guard works on that edge:
+
+```python
+@b2bua.on_invite
+def route(call):
+    if not registrar.lookup_contact(str(call.ruri)):
+        call.reject(404, "No extension Found")
+        return
+    call.dial(str(call.ruri))   # the R-URI is already the reachable contact
+```
+
+AS-side capability records are excluded, same as `lookup()`. The scan is over
+all bindings, so use it as a per-call guard on edge / PBX-front deployments, not
+as a per-packet framework path.
+
 ## React to registration changes
 
 ```python
