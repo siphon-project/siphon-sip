@@ -825,9 +825,19 @@ fn purge_user_modules(python: Python<'_>, dirs: &[PathBuf]) -> Result<()> {
         .cast_into::<PyDict>()
         .map_err(|error| SiphonError::Script(format!("sys.modules not a dict: {error}")))?;
 
-    // Collect first, delete after — never mutate the dict mid-iteration.
+    // Iterate a *snapshot*, not the live dict. `sys.modules` is process-global,
+    // so another thread — a handler lazily importing a module under free-threaded
+    // Python (3.14t), or a parallel test compiling a script — can change its size
+    // mid-iteration, which CPython rejects with "dictionary changed size during
+    // iteration" (a panic here, e.g. on hot-reload). `dict.copy()` is atomic under
+    // the free-threaded build's per-object lock and the copy is thread-local, so
+    // iterating it is race-free. Deletions below still target the live `modules`;
+    // a key already removed by a concurrent purge just makes `del_item` warn.
+    let snapshot = modules
+        .copy()
+        .map_err(|error| SiphonError::Script(format!("snapshot sys.modules: {error}")))?;
     let mut to_remove: Vec<String> = Vec::new();
-    for (name, module) in modules.iter() {
+    for (name, module) in snapshot.iter() {
         let Ok(file_attr) = module.getattr("__file__") else {
             continue; // builtins / namespace packages have no __file__
         };
