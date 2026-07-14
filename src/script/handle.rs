@@ -199,6 +199,7 @@ mod tests {
                 sync_pool_max: None,
                 handler_stall_abort_secs: 30,
                 executor_queue_capacity: 1024,
+                include_paths: Vec::new(),
             })
             .unwrap(),
         )

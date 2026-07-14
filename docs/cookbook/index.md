@@ -20,6 +20,7 @@ page); none of the APIs here are invented.
 | [Media & RTP profiles](media-rtp.md) | SRTP↔RTP, WebRTC, transcoding, hold | `rtpengine.offer`/`answer`, profiles, the `sdp` namespace |
 | [Hardening & security](security.md) | A locked-down edge | rate-limit, scanner/auth bans, TLS/mTLS, STIR/SHAKEN, IPsec |
 | [Monitoring & observability](monitoring.md) | Metrics, CDRs, tracing, probes | custom Prometheus metrics, `/admin/*`, CDR, HEP/Homer |
+| [Multi-file scripts](multi-file-scripts.md) | Splitting a script into helper modules | sibling `import`, `include_paths`, helper hot-reload |
 
 ## How to run any recipe
 

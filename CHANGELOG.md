@@ -9,6 +9,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 _Codename: bjorn._
 
 ### Added
+- **Scripts can `import` sibling `.py` helper modules.** A script's own directory
+  is now added to the Python `sys.path`, so `import helpers` resolves a
+  `helpers.py` sitting next to the main script — no `sys.path.insert` boilerplate.
+  A new `script.include_paths: [ ... ]` config lists extra directories to add for
+  helper libraries shared across scripts (e.g. a common `/etc/siphon/lib`).
+  Helper modules hot-reload on change just like the main script: the file watcher
+  now reacts to any `*.py` change in a watched directory, and stale helper modules
+  are dropped from `sys.modules` on reload so the new source is re-imported. Only
+  absolute imports are supported (the script is not a package, so `from . import`
+  does not work), and the "no cross-request module state" rule applies to helper
+  modules too.
 - **`presence.refresh(subscription_id, expires)` + `presence.find_by_dialog(call_id, from_tag)`** —
   the two pieces needed to handle an in-dialog SUBSCRIBE (RFC 6665 §4.4.1) as a
   notifier. `find_by_dialog` resolves a subscription id from an in-dialog
