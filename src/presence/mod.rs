@@ -345,6 +345,33 @@ impl PresenceStore {
         }
     }
 
+    /// Find a subscription by its dialog identifiers `(Call-ID, From-tag)`.
+    ///
+    /// An in-dialog SUBSCRIBE (RFC 6665 §4.4.1 refresh, or an un-SUBSCRIBE with
+    /// `Expires: 0`) carries the dialog's Call-ID and the subscriber's From-tag —
+    /// stable across the dialog's life. This resolves that pair back to the
+    /// subscription id so the notifier can refresh, terminate, or NOTIFY it. The
+    /// dialog's To-tag (the notifier's own tag) is intentionally not part of the
+    /// key: `(Call-ID, From-tag)` already identifies a subscriber's dialog
+    /// uniquely, and it's what the script has cheaply on the in-dialog request.
+    ///
+    /// Terminated subscriptions are skipped so a lingering pre-removal entry can't
+    /// shadow a fresh re-SUBSCRIBE that reused the Call-ID. Returns the first
+    /// live match, or `None`.
+    pub fn find_subscription_by_dialog(&self, call_id: &str, from_tag: &str) -> Option<String> {
+        self.subscriptions.iter().find_map(|entry| {
+            let subscription = entry.value();
+            if subscription.state != SubscriptionState::Terminated
+                && subscription.call_id.as_deref() == Some(call_id)
+                && subscription.from_tag.as_deref() == Some(from_tag)
+            {
+                Some(subscription.id.clone())
+            } else {
+                None
+            }
+        })
+    }
+
     /// Terminate a subscription (sets state to `Terminated` but does not remove it).
     pub fn terminate_subscription(&self, id: &str) {
         if let Some(mut entry) = self.subscriptions.get_mut(id) {
@@ -1032,5 +1059,73 @@ mod tests {
             subscription.dialog_id.as_deref(),
             Some("call-id-123:from-tag:to-tag")
         );
+    }
+
+    fn dialog_sub(id: &str, call_id: &str, from_tag: &str) -> Subscription {
+        Subscription::with_dialog(
+            id.to_string(),
+            "sip:alice@ims.example.com".to_string(),
+            "sip:alice@ims.example.com".to_string(),
+            "reg".to_string(),
+            Duration::from_secs(3600),
+            vec![],
+            call_id.to_string(),
+            from_tag.to_string(),
+            "scscf-notif".to_string(),
+            vec![],
+        )
+    }
+
+    #[test]
+    fn find_subscription_by_dialog_resolves_pair() {
+        let store = PresenceStore::new();
+        store.add_subscription(dialog_sub("sub-a", "callA", "ftagA"));
+        store.add_subscription(dialog_sub("sub-b", "callB", "ftagB"));
+
+        assert_eq!(
+            store.find_subscription_by_dialog("callA", "ftagA").as_deref(),
+            Some("sub-a")
+        );
+        assert_eq!(
+            store.find_subscription_by_dialog("callB", "ftagB").as_deref(),
+            Some("sub-b")
+        );
+        // A mismatched pair (right Call-ID, wrong From-tag) does not match.
+        assert_eq!(store.find_subscription_by_dialog("callA", "ftagB"), None);
+        assert_eq!(store.find_subscription_by_dialog("nope", "nope"), None);
+    }
+
+    #[test]
+    fn find_subscription_by_dialog_skips_terminated() {
+        // A terminated-but-not-yet-removed dialog must not shadow a re-SUBSCRIBE
+        // that reused the same Call-ID/From-tag.
+        let store = PresenceStore::new();
+        store.add_subscription(dialog_sub("sub-a", "callA", "ftagA"));
+        store.terminate_subscription("sub-a");
+        assert_eq!(store.find_subscription_by_dialog("callA", "ftagA"), None);
+    }
+
+    #[test]
+    fn find_subscription_by_dialog_ignores_non_dialog_subscription() {
+        // subscribe() (no dialog state) carries no call_id/from_tag → unfindable.
+        let store = PresenceStore::new();
+        store.add_subscription(Subscription::new(
+            "sub-plain".to_string(),
+            "sip:alice@ims.example.com".to_string(),
+            "sip:alice@ims.example.com".to_string(),
+            "reg".to_string(),
+            Duration::from_secs(3600),
+            None,
+            vec![],
+        ));
+        assert_eq!(store.find_subscription_by_dialog("", ""), None);
+    }
+
+    #[test]
+    fn refresh_subscription_reports_found_and_missing() {
+        let store = PresenceStore::new();
+        store.add_subscription(dialog_sub("sub-x", "callX", "ftagX"));
+        assert!(store.refresh_subscription("sub-x", Duration::from_secs(7200)));
+        assert!(!store.refresh_subscription("sub-missing", Duration::from_secs(7200)));
     }
 }

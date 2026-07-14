@@ -198,6 +198,44 @@ impl PyPresence {
         exists
     }
 
+    /// Refresh a subscription's expiry (RFC 6665 §4.4.1 in-dialog re-SUBSCRIBE).
+    ///
+    /// Resets the subscription's timer to `expires` seconds from now, keeping the
+    /// same dialog. Pair with [`find_by_dialog`] to resolve the id from an
+    /// in-dialog SUBSCRIBE before refreshing.
+    ///
+    /// Args:
+    ///     subscription_id: The subscription ID (from ``subscribe*`` or
+    ///         ``find_by_dialog``).
+    ///     expires: New subscription duration in seconds.
+    ///
+    /// Returns:
+    ///     True if the subscription was found and refreshed, False otherwise
+    ///     (unknown id, or the subscription is already terminated).
+    fn refresh(&self, subscription_id: &str, expires: u64) -> bool {
+        self.store
+            .refresh_subscription(subscription_id, Duration::from_secs(expires))
+    }
+
+    /// Resolve a subscription id from its dialog `(Call-ID, From-tag)`.
+    ///
+    /// An in-dialog SUBSCRIBE — a refresh, or an un-SUBSCRIBE with ``Expires: 0`` —
+    /// arrives with the dialog's Call-ID and the subscriber's From-tag but not the
+    /// original subscription id. This maps that pair back to the id so a notifier
+    /// (e.g. an S-CSCF handling reg-event) can ``refresh()`` or ``unsubscribe()``
+    /// the right dialog. Only a subscription created with dialog state
+    /// (``subscribe_dialog``) is findable; terminated ones are skipped.
+    ///
+    /// Args:
+    ///     call_id: Call-ID of the in-dialog SUBSCRIBE.
+    ///     from_tag: From-tag of the in-dialog SUBSCRIBE (subscriber's tag).
+    ///
+    /// Returns:
+    ///     The subscription ID string, or None if no live dialog matches.
+    fn find_by_dialog(&self, call_id: &str, from_tag: &str) -> Option<String> {
+        self.store.find_subscription_by_dialog(call_id, from_tag)
+    }
+
     /// List subscribers (watchers) for a resource.
     ///
     /// Returns active, non-expired subscriptions for the given resource URI.
@@ -571,6 +609,42 @@ mod tests {
         let presence = PyPresence::new(store);
 
         assert!(!presence.unsubscribe("sub-nonexistent"));
+    }
+
+    #[test]
+    fn find_by_dialog_then_refresh_and_unsubscribe() {
+        // Models the S-CSCF reg-event flow: an initial subscribe_dialog, then an
+        // in-dialog SUBSCRIBE that resolves the id by (Call-ID, From-tag) and
+        // refreshes it, then an un-SUBSCRIBE that removes it.
+        let store = make_store();
+        let presence = PyPresence::new(store);
+
+        let sub_id = presence.subscribe_dialog(
+            "sip:alice@ims.example.com",
+            "sip:alice@ims.example.com",
+            "reg",
+            3600,
+            "call-abc",
+            "ftag-alice",
+            "scscf-notif",
+            None,
+        );
+
+        // In-dialog refresh path: resolve by dialog, then refresh.
+        assert_eq!(
+            presence.find_by_dialog("call-abc", "ftag-alice").as_deref(),
+            Some(sub_id.as_str())
+        );
+        assert!(presence.refresh(&sub_id, 7200));
+        // Unknown dialog / unknown id return None / false.
+        assert!(presence.find_by_dialog("call-xyz", "ftag-alice").is_none());
+        assert!(!presence.refresh("sub-nope", 7200));
+
+        // Un-SUBSCRIBE path: resolve then remove.
+        let resolved = presence.find_by_dialog("call-abc", "ftag-alice").unwrap();
+        assert!(presence.unsubscribe(&resolved));
+        assert!(presence.find_by_dialog("call-abc", "ftag-alice").is_none());
+        assert_eq!(presence.subscription_count(), 0);
     }
 
     #[test]
