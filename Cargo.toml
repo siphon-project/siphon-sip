@@ -132,6 +132,7 @@ tokio-postgres = { version = "0.7", optional = true }
 prometheus = { version = "0.14", features = ["process"] }
 axum = { version = "0.8.8", features = ["tokio"] }
 tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.6.8", features = ["cors"] }
 
 # Lawful Intercept — ETSI ASN.1/BER + XML
 rasn = "0.28"

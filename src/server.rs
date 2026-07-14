@@ -1476,11 +1476,15 @@ impl SiphonServer {
                     std::process::exit(1);
                 });
                 let path = prom_config.path.clone();
+                let cors = prom_config.cors.clone();
                 tokio::spawn(async move {
                     use axum::{routing::get, Router};
-                    let app = Router::new().route(&path, get(|| async {
+                    let mut app = Router::new().route(&path, get(|| async {
                         crate::metrics::encode_metrics()
                     }));
+                    if let Some(layer) = cors.as_ref().and_then(crate::cors::build_cors_layer) {
+                        app = app.layer(layer);
+                    }
                     info!(addr = %listen_addr, path = %path, "Prometheus metrics endpoint started");
                     match tokio::net::TcpListener::bind(listen_addr).await {
                         Ok(listener) => {
@@ -1905,7 +1909,11 @@ impl SiphonServer {
                             start_time: std::time::Instant::now(),
                             draining: Some(Arc::clone(&drain)),
                         };
-                        tokio::spawn(crate::admin::serve(listen_addr, admin_state));
+                        tokio::spawn(crate::admin::serve(
+                            listen_addr,
+                            admin_state,
+                            admin_config.cors.clone(),
+                        ));
                     } else {
                         error!("admin API enabled but registrar is not initialized; not starting");
                     }

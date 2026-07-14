@@ -1471,10 +1471,40 @@ pub struct PrometheusConfig {
     pub listen: String,
     #[serde(default = "default_metrics_path")]
     pub path: String,
+    /// Optional CORS policy so a browser dashboard served from another origin
+    /// can `fetch()` this endpoint. Unset = no CORS headers (default).
+    #[serde(default)]
+    pub cors: Option<CorsConfig>,
 }
 
 fn default_metrics_path() -> String {
     "/metrics".to_owned()
+}
+
+// ---------------------------------------------------------------------------
+// CORS (browser-facing HTTP endpoints)
+// ---------------------------------------------------------------------------
+
+/// Cross-Origin Resource Sharing policy for a browser-facing HTTP endpoint
+/// (the Prometheus `/metrics` listener and/or the admin API).
+///
+/// A browser blocks a cross-origin `fetch()` of these endpoints unless the
+/// server echoes an `Access-Control-Allow-Origin` header. Set this to let a
+/// monitoring dashboard served from a different origin (e.g. a local dev
+/// server on `http://localhost:5173`) read the endpoint. Leaving it unset
+/// emits no CORS headers at all — same-origin callers and Prometheus scrapers
+/// are unaffected either way, so this is opt-in and backwards compatible.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CorsConfig {
+    /// Origins allowed to read this endpoint from a browser, echoed into
+    /// `Access-Control-Allow-Origin`. Each entry is a full origin including
+    /// scheme and port (`http://localhost:5173`, `https://dash.example.com`).
+    /// A single `"*"` entry allows any origin — convenient for local
+    /// development, but prefer an explicit list in production, especially for
+    /// the admin API (which can force-unregister AoRs and lift bans). An empty
+    /// list disables CORS.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1496,6 +1526,12 @@ fn default_metrics_path() -> String {
 pub struct AdminConfig {
     /// Address to expose the admin API on (e.g. "0.0.0.0:9091").
     pub listen: String,
+    /// Optional CORS policy so a browser dashboard served from another origin
+    /// can `fetch()` the admin API (and the `/metrics` it also serves). Unset =
+    /// no CORS headers (default). Prefer an explicit origin list here — the
+    /// admin API can force-unregister AoRs and lift auto-bans.
+    #[serde(default)]
+    pub cors: Option<CorsConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -3117,6 +3153,89 @@ auth:
             config.script.include_paths,
             vec!["/etc/siphon/lib".to_string(), "shared".to_string()]
         );
+    }
+
+    #[test]
+    fn parses_metrics_and_admin_cors() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/main.py"
+auth:
+  realm: "example.com"
+metrics:
+  prometheus:
+    listen: "0.0.0.0:8888"
+    cors:
+      allowed_origins:
+        - "http://localhost:5173"
+        - "https://dash.example.com"
+admin:
+  listen: "0.0.0.0:9091"
+  cors:
+    allowed_origins:
+      - "*"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+
+        let prom_cors = config
+            .metrics
+            .as_ref()
+            .and_then(|metrics| metrics.prometheus.as_ref())
+            .and_then(|prom| prom.cors.as_ref())
+            .expect("metrics.prometheus.cors must parse");
+        assert_eq!(
+            prom_cors.allowed_origins,
+            vec![
+                "http://localhost:5173".to_string(),
+                "https://dash.example.com".to_string()
+            ]
+        );
+
+        let admin_cors = config
+            .admin
+            .as_ref()
+            .and_then(|admin| admin.cors.as_ref())
+            .expect("admin.cors must parse");
+        assert_eq!(admin_cors.allowed_origins, vec!["*".to_string()]);
+    }
+
+    #[test]
+    fn metrics_without_cors_leaves_it_none() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/main.py"
+auth:
+  realm: "example.com"
+metrics:
+  prometheus:
+    listen: "0.0.0.0:8888"
+admin:
+  listen: "0.0.0.0:9091"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert!(config
+            .metrics
+            .as_ref()
+            .and_then(|metrics| metrics.prometheus.as_ref())
+            .and_then(|prom| prom.cors.as_ref())
+            .is_none());
+        assert!(config
+            .admin
+            .as_ref()
+            .and_then(|admin| admin.cors.as_ref())
+            .is_none());
     }
 
     #[test]
