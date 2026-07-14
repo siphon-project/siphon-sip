@@ -496,6 +496,15 @@ pub struct ScriptConfig {
     /// high-throughput NFs so normal bursts never shed.  Clamped to at least 1.
     #[serde(default = "default_executor_queue_capacity")]
     pub executor_queue_capacity: usize,
+    /// Extra directories added to the Python `sys.path` so a script can
+    /// `import` shared helper modules that live outside its own directory.
+    /// The script's *own* directory (the parent of `path`) is always added
+    /// automatically; this list is only for helpers shared across scripts/NFs
+    /// (e.g. a common `/etc/siphon/lib`).  Modules imported from any of these
+    /// directories (and from the script's own directory) hot-reload on change
+    /// just like the main script.  Defaults to empty.
+    #[serde(default)]
+    pub include_paths: Vec<String>,
 }
 
 fn default_script_path() -> String {
@@ -520,6 +529,7 @@ impl Default for ScriptConfig {
             sync_pool_max: None,
             handler_stall_abort_secs: default_handler_stall_abort_secs(),
             executor_queue_capacity: default_executor_queue_capacity(),
+            include_paths: Vec::new(),
         }
     }
 }
@@ -3044,6 +3054,7 @@ log:
         assert_eq!(config.domain.local, vec!["example.com"]);
         assert_eq!(config.script.path, "scripts/proxy_default.py");
         assert_eq!(config.script.reload, ReloadMode::Auto);
+        assert!(config.script.include_paths.is_empty());
         assert_eq!(config.registrar.backend, RegistrarBackendType::Memory);
         assert_eq!(config.registrar.default_expires, 3600);
         assert_eq!(config.registrar.max_expires, 7200);
@@ -3068,6 +3079,30 @@ log:
         assert!(config.registrant.is_none());
         assert!(config.lawful_intercept.is_none());
         assert!(config.diameter.is_none());
+    }
+
+    #[test]
+    fn parses_script_include_paths() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/main.py"
+  include_paths:
+    - "/etc/siphon/lib"
+    - "shared"
+auth:
+  realm: "example.com"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert_eq!(
+            config.script.include_paths,
+            vec!["/etc/siphon/lib".to_string(), "shared".to_string()]
+        );
     }
 
     #[test]

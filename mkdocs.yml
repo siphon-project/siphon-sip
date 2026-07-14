@@ -50,6 +50,7 @@ nav:
       - Media & RTP profiles: cookbook/media-rtp.md
       - Hardening & security: cookbook/security.md
       - Monitoring & observability: cookbook/monitoring.md
+      - Multi-file scripts: cookbook/multi-file-scripts.md
   - API reference:
       - Overview: reference/index.md
       - Request: reference/request.md

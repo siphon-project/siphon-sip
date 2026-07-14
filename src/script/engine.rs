@@ -33,6 +33,12 @@ use crate::error::{Result, SiphonError};
 /// is fine — the request hot path never touches it.
 static REGISTRY_COMPILE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Sentinel `script_path` for scripts loaded from an in-memory source string or
+/// pre-compiled bytecode rather than a file on disk. Such scripts have no
+/// directory and no sibling files, so `sys.path` / `sys.modules` handling is
+/// skipped for them.
+const EMBEDDED_SCRIPT_PATH: &str = "<embedded>";
+
 // ---------------------------------------------------------------------------
 // Handler kind — each decorator type maps to one variant
 // ---------------------------------------------------------------------------
@@ -283,6 +289,10 @@ pub struct ScriptEngine {
     state: Arc<ArcSwap<ScriptState>>,
     /// Script file path (from config).
     script_path: PathBuf,
+    /// Extra directories added to `sys.path` for shared helper modules
+    /// (`script.include_paths`). The script's own directory is derived from
+    /// `script_path` and is always included — these are additional dirs only.
+    include_paths: Vec<PathBuf>,
     /// Reload mode (auto = inotify, sighup = manual).
     reload_mode: ReloadMode,
     /// Active timer task handles — aborted and re-spawned on reload.
@@ -310,7 +320,10 @@ impl ScriptEngine {
         // Initialise the free-threaded Python interpreter (no-op if already done).
         Python::initialize();
 
-        let state = Self::compile_script(&script_path)?;
+        let include_paths: Vec<PathBuf> =
+            config.include_paths.iter().map(PathBuf::from).collect();
+
+        let state = Self::compile_script(&script_path, &include_paths)?;
 
         info!(
             path = %script_path.display(),
@@ -323,6 +336,7 @@ impl ScriptEngine {
         Ok(Self {
             state,
             script_path,
+            include_paths,
             reload_mode: config.reload.clone(),
             timer_handles: std::sync::Mutex::new(Vec::new()),
         })
@@ -333,7 +347,7 @@ impl ScriptEngine {
     /// The script is compiled directly from the provided source — no file is
     /// read from disk and hot-reload is disabled (reload mode forced to Sighup).
     pub fn new_embedded(source: &str) -> Result<Self> {
-        let script_path = PathBuf::from("<embedded>");
+        let script_path = PathBuf::from(EMBEDDED_SCRIPT_PATH);
 
         // Initialise the free-threaded Python interpreter (no-op if already done).
         Python::initialize();
@@ -350,6 +364,7 @@ impl ScriptEngine {
         Ok(Self {
             state,
             script_path,
+            include_paths: Vec::new(),
             reload_mode: ReloadMode::Sighup,
             timer_handles: std::sync::Mutex::new(Vec::new()),
         })
@@ -360,7 +375,7 @@ impl ScriptEngine {
     /// The bytecode is loaded via `marshal.loads()` and executed directly,
     /// skipping the compilation step. Hot-reload is disabled.
     pub fn new_from_bytecode(pyc: &[u8]) -> Result<Self> {
-        let script_path = PathBuf::from("<embedded>");
+        let script_path = PathBuf::from(EMBEDDED_SCRIPT_PATH);
 
         Python::initialize();
 
@@ -376,6 +391,7 @@ impl ScriptEngine {
         Ok(Self {
             state,
             script_path,
+            include_paths: Vec::new(),
             reload_mode: ReloadMode::Sighup,
             timer_handles: std::sync::Mutex::new(Vec::new()),
         })
@@ -399,7 +415,7 @@ impl ScriptEngine {
     pub fn reload(&self) -> Result<()> {
         info!(path = %self.script_path.display(), "reloading script");
 
-        match Self::compile_script(&self.script_path) {
+        match Self::compile_script(&self.script_path, &self.include_paths) {
             Ok(new_state) => {
                 info!(
                     handlers = new_state.handlers.len(),
@@ -425,6 +441,29 @@ impl ScriptEngine {
     /// The path being watched.
     pub fn script_path(&self) -> &Path {
         &self.script_path
+    }
+
+    /// Directories the file watcher should observe for hot-reload: the script's
+    /// own directory plus every configured `include_paths` directory. A change
+    /// to any `*.py` file under one of these triggers a reload (helper modules
+    /// hot-reload alongside the main script). De-duplicated; missing dirs are
+    /// dropped by the watcher when it fails to watch them.
+    pub fn watch_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        if let Some(parent) = self.script_path.parent() {
+            let parent = if parent.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                parent.to_path_buf()
+            };
+            dirs.push(parent);
+        }
+        for extra in &self.include_paths {
+            if !dirs.contains(extra) {
+                dirs.push(extra.clone());
+            }
+        }
+        dirs
     }
 
     /// Cancel all running timer tasks and spawn new ones from the current state.
@@ -478,7 +517,7 @@ impl ScriptEngine {
 
     /// Read, compile, and execute a Python script file. Returns the extracted
     /// handler registrations.
-    fn compile_script(path: &Path) -> Result<ScriptState> {
+    fn compile_script(path: &Path, include_paths: &[PathBuf]) -> Result<ScriptState> {
         let source = std::fs::read_to_string(path).map_err(|error| {
             SiphonError::Script(format!("cannot read {}: {error}", path.display()))
         })?;
@@ -487,7 +526,7 @@ impl ScriptEngine {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Python::attach(|python| {
-            Self::compile_source(python, path, &source)
+            Self::compile_source(python, path, &source, include_paths)
         })
     }
 
@@ -569,7 +608,7 @@ impl ScriptEngine {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         Python::attach(|python| {
-            Self::compile_source(python, path, source)
+            Self::compile_source(python, path, source, &[])
         })
     }
 
@@ -578,6 +617,7 @@ impl ScriptEngine {
         python: Python<'_>,
         path: &Path,
         source: &str,
+        include_paths: &[PathBuf],
     ) -> Result<ScriptState> {
         // Create (or get) the registry module first — siphon_package.py imports it.
         let registry_module = get_or_create_registry(python)?;
@@ -592,6 +632,16 @@ impl ScriptEngine {
         clear_fn
             .call0()
             .map_err(|error| SiphonError::Script(format!("registry.clear(): {error}")))?;
+
+        // Make the script's own directory (and any configured include dirs)
+        // importable so a script can `import helpers` for a sibling module,
+        // then drop any stale helper modules so a reload re-imports them fresh.
+        // Both are no-ops for the `<embedded>` path (no parent directory).
+        let script_dirs = user_script_dirs(path, include_paths);
+        if !script_dirs.is_empty() {
+            ensure_sys_path(python, &script_dirs)?;
+            purge_user_modules(python, &script_dirs)?;
+        }
 
         // Compile and execute the script in a fresh globals dict.
         //
@@ -660,6 +710,153 @@ impl ScriptEngine {
 }
 
 // ---------------------------------------------------------------------------
+// Script-directory imports (sibling `.py` helper modules)
+// ---------------------------------------------------------------------------
+
+/// The directories that should be importable from a script: the script's own
+/// directory (parent of `path`) followed by the configured `include_paths`.
+///
+/// Paths are canonicalised so `sys.path` membership and the `sys.modules` purge
+/// filter compare absolute paths regardless of the process working directory.
+/// A directory that cannot be canonicalised (e.g. an `include_paths` entry that
+/// does not exist yet) is passed through as-is. Returns an empty vec for the
+/// `<embedded>` path (no parent), so embedded/bytecode scripts are unaffected.
+fn user_script_dirs(path: &Path, include_paths: &[PathBuf]) -> Vec<PathBuf> {
+    fn normalise(dir: &Path) -> PathBuf {
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+    }
+
+    // Embedded / bytecode scripts have no directory on disk (the sentinel path
+    // has an empty parent, which would otherwise resolve to the cwd). They also
+    // cannot have sibling files, so add nothing.
+    if path == Path::new(EMBEDDED_SCRIPT_PATH) {
+        return Vec::new();
+    }
+
+    let mut dirs: Vec<PathBuf> = Vec::new();
+
+    // The script's own directory. A bare filename ("script.py") yields an empty
+    // parent — that means the current directory, so sibling imports still work.
+    if let Some(parent) = path.parent() {
+        dirs.push(normalise(parent));
+    }
+
+    for extra in include_paths {
+        let normalised = normalise(extra);
+        if !dirs.contains(&normalised) {
+            dirs.push(normalised);
+        }
+    }
+
+    dirs
+}
+
+/// Insert each directory at the front of `sys.path` if not already present.
+/// Idempotent: repeated calls (every reload) never grow `sys.path`.
+fn ensure_sys_path(python: Python<'_>, dirs: &[PathBuf]) -> Result<()> {
+    let sys = python
+        .import("sys")
+        .map_err(|error| SiphonError::Script(format!("import sys: {error}")))?;
+
+    // Don't write `.pyc` caches for script imports. Two reasons:
+    //   1. Hot-reload correctness — CPython's timestamp-based `.pyc`
+    //      invalidation has 1-second granularity, so a helper edit with the
+    //      same byte size within the same second as the last import would load
+    //      the stale cached bytecode instead of recompiling. Purging
+    //      `sys.modules` re-runs the *import*, but the import would still read
+    //      the stale `.pyc`. Compiling from source every time removes that race.
+    //   2. It keeps `__pycache__` directories out of the operator's script dir.
+    // Set on every compile — idempotent, and only for file-based scripts (this
+    // runs solely when there are script dirs to manage).
+    sys.setattr("dont_write_bytecode", true)
+        .map_err(|error| SiphonError::Script(format!("sys.dont_write_bytecode: {error}")))?;
+
+    let sys_path = sys
+        .getattr("path")
+        .map_err(|error| SiphonError::Script(format!("sys.path: {error}")))?;
+
+    // Insert in reverse so the first dir ends up at index 0 (highest priority,
+    // matching CPython's script-directory convention).
+    for dir in dirs.iter().rev() {
+        let Some(dir_str) = dir.to_str() else {
+            warn!(path = %dir.display(), "skipping non-UTF-8 script dir for sys.path");
+            continue;
+        };
+        let already_present = sys_path
+            .contains(dir_str)
+            .map_err(|error| SiphonError::Script(format!("sys.path.__contains__: {error}")))?;
+        if already_present {
+            continue;
+        }
+        sys_path
+            .call_method1("insert", (0, dir_str))
+            .map_err(|error| SiphonError::Script(format!("sys.path.insert: {error}")))?;
+        debug!(path = %dir.display(), "added script dir to sys.path");
+    }
+
+    Ok(())
+}
+
+/// Drop from `sys.modules` every module whose `__file__` lives under one of the
+/// script directories, so a reload re-imports the current source rather than
+/// returning the stale cached module.
+///
+/// Only user helper modules match — `siphon`, `_siphon_registry`, the stdlib
+/// and site-packages live outside the script directories and are left intact.
+/// On the first load nothing matches (the modules were never imported), so this
+/// is a no-op there.
+///
+/// Purging is safe while old handlers still run on other threads: a handler's
+/// `__globals__` holds a strong reference to the old module object, so removing
+/// the `sys.modules` entry only drops the registry reference — the module stays
+/// alive until the last in-flight handler finishes.
+fn purge_user_modules(python: Python<'_>, dirs: &[PathBuf]) -> Result<()> {
+    let sys = python
+        .import("sys")
+        .map_err(|error| SiphonError::Script(format!("import sys: {error}")))?;
+    let modules = sys
+        .getattr("modules")
+        .map_err(|error| SiphonError::Script(format!("sys.modules: {error}")))?
+        .cast_into::<PyDict>()
+        .map_err(|error| SiphonError::Script(format!("sys.modules not a dict: {error}")))?;
+
+    // Collect first, delete after — never mutate the dict mid-iteration.
+    let mut to_remove: Vec<String> = Vec::new();
+    for (name, module) in modules.iter() {
+        let Ok(file_attr) = module.getattr("__file__") else {
+            continue; // builtins / namespace packages have no __file__
+        };
+        if file_attr.is_none() {
+            continue;
+        }
+        let Ok(file_str) = file_attr.extract::<String>() else {
+            continue;
+        };
+        let module_path = std::fs::canonicalize(&file_str).unwrap_or_else(|_| PathBuf::from(&file_str));
+        if dirs.iter().any(|dir| module_path.starts_with(dir)) {
+            if let Ok(module_name) = name.extract::<String>() {
+                to_remove.push(module_name);
+            }
+        }
+    }
+
+    for module_name in to_remove {
+        if let Err(error) = modules.del_item(&module_name) {
+            warn!(module = %module_name, %error, "failed to purge stale script module");
+        } else {
+            debug!(module = %module_name, "purged stale script module for reload");
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // File watcher task
 // ---------------------------------------------------------------------------
 
@@ -675,6 +872,7 @@ pub fn spawn_file_watcher(engine: Arc<ScriptEngine>) {
     }
 
     let path = engine.script_path().to_owned();
+    let watch_dirs = engine.watch_dirs();
 
     // `notify` v8 uses std channels for sync, we bridge to tokio via spawn_blocking.
     tokio::task::spawn_blocking(move || {
@@ -688,11 +886,25 @@ pub fn spawn_file_watcher(engine: Arc<ScriptEngine>) {
             }
         };
 
-        // Watch the parent directory so we catch renames/recreates
-        // (editors like vim write to a temp file then rename).
-        let watch_dir = path.parent().unwrap_or(Path::new("."));
-        if let Err(error) = watcher.watch(watch_dir, RecursiveMode::NonRecursive) {
-            error!(%error, path = %watch_dir.display(), "failed to watch directory");
+        // Watch the script directory (and any include dirs) so we catch both the
+        // main script and sibling helper `.py` files, and renames/recreates
+        // (editors like vim write to a temp file then rename). NonRecursive: only
+        // direct children fire events.
+        let mut watched_any = false;
+        for watch_dir in &watch_dirs {
+            match watcher.watch(watch_dir, RecursiveMode::NonRecursive) {
+                Ok(()) => {
+                    watched_any = true;
+                    info!(path = %watch_dir.display(), "watching script directory");
+                }
+                Err(error) => {
+                    // A missing include dir is not fatal — keep watching the rest.
+                    warn!(%error, path = %watch_dir.display(), "failed to watch directory");
+                }
+            }
+        }
+        if !watched_any {
+            error!("no script directories could be watched; hot-reload disabled");
             return;
         }
 
@@ -707,9 +919,13 @@ pub fn spawn_file_watcher(engine: Arc<ScriptEngine>) {
                     paths,
                     ..
                 }) => {
-                    // Only reload if the event is about our specific file.
-                    let is_our_file = paths.iter().any(|p| p.file_name() == file_name);
-                    if !is_our_file {
+                    // Reload on a change to the main script OR any `.py` file in a
+                    // watched dir (a sibling helper module the script imports).
+                    let is_relevant = paths.iter().any(|p| {
+                        p.file_name() == file_name
+                            || p.extension().is_some_and(|ext| ext == "py")
+                    });
+                    if !is_relevant {
                         continue;
                     }
 
@@ -1074,7 +1290,229 @@ mod tests {
         file.flush().unwrap();
 
         Python::initialize();
-        ScriptEngine::compile_script(file.path())
+        ScriptEngine::compile_script(file.path(), &[])
+    }
+
+    // --- Sibling `.py` imports (script.include_paths) --------------------------
+
+    /// Read `sys.path` as a Vec<String> for assertions.
+    fn sys_path_entries() -> Vec<String> {
+        Python::attach(|python| {
+            python
+                .import("sys")
+                .unwrap()
+                .getattr("path")
+                .unwrap()
+                .extract::<Vec<String>>()
+                .unwrap()
+        })
+    }
+
+    #[test]
+    fn user_script_dirs_skips_embedded() {
+        let dirs = user_script_dirs(Path::new(EMBEDDED_SCRIPT_PATH), &[]);
+        assert!(dirs.is_empty(), "embedded scripts contribute no dirs");
+    }
+
+    #[test]
+    fn user_script_dirs_includes_parent_and_extras() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let extra = tempfile::TempDir::new().unwrap();
+        let script = dir.path().join("main.py");
+        std::fs::write(&script, "pass\n").unwrap();
+
+        let dirs = user_script_dirs(&script, &[extra.path().to_path_buf()]);
+        let canonical_parent = std::fs::canonicalize(dir.path()).unwrap();
+        let canonical_extra = std::fs::canonicalize(extra.path()).unwrap();
+        assert_eq!(dirs.first(), Some(&canonical_parent), "script dir is first");
+        assert!(dirs.contains(&canonical_extra), "include dir present");
+    }
+
+    #[test]
+    fn sibling_import_resolves() {
+        Python::initialize();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Helper module next to the main script — unique name to avoid colliding
+        // with other tests that also add temp dirs to the shared sys.path.
+        std::fs::write(
+            dir.path().join("sib_helper_alpha.py"),
+            "def value():\n    return 111\n",
+        )
+        .unwrap();
+
+        let script = dir.path().join("main.py");
+        std::fs::write(
+            &script,
+            concat!(
+                "from siphon import proxy\n",
+                "import sib_helper_alpha\n",
+                "assert sib_helper_alpha.value() == 111\n",
+                "\n",
+                "@proxy.on_request\n",
+                "def handle(request):\n",
+                "    pass\n",
+            ),
+        )
+        .unwrap();
+
+        let state =
+            ScriptEngine::compile_script(&script, &[]).expect("sibling import should resolve");
+        assert_eq!(state.handlers.len(), 1, "handler still registers");
+    }
+
+    #[test]
+    fn include_path_import_resolves() {
+        Python::initialize();
+        let script_dir = tempfile::TempDir::new().unwrap();
+        let lib_dir = tempfile::TempDir::new().unwrap();
+
+        // Helper lives in a *separate* directory reachable only via include_paths.
+        std::fs::write(
+            lib_dir.path().join("sib_helper_beta.py"),
+            "GREETING = \"hi\"\n",
+        )
+        .unwrap();
+
+        let script = script_dir.path().join("main.py");
+        std::fs::write(
+            &script,
+            concat!(
+                "from siphon import proxy\n",
+                "import sib_helper_beta\n",
+                "assert sib_helper_beta.GREETING == \"hi\"\n",
+                "\n",
+                "@proxy.on_request\n",
+                "def handle(request):\n",
+                "    pass\n",
+            ),
+        )
+        .unwrap();
+
+        let include = vec![lib_dir.path().to_path_buf()];
+        ScriptEngine::compile_script(&script, &include)
+            .expect("include_paths import should resolve");
+    }
+
+    #[test]
+    fn helper_edit_hot_reloads_via_reload() {
+        Python::initialize();
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // The main script records the helper's current VALUE to an output file at
+        // import time — a side effect we can read from Rust to see which version
+        // of the helper was imported.
+        let output = dir.path().join("out.txt");
+        let helper = dir.path().join("sib_reload_helper.py");
+        let script = dir.path().join("main.py");
+
+        std::fs::write(&helper, "VALUE = \"v1\"\n").unwrap();
+        std::fs::write(
+            &script,
+            format!(
+                concat!(
+                    "from siphon import proxy\n",
+                    "import sib_reload_helper\n",
+                    "with open(r\"{}\", \"w\") as f:\n",
+                    "    f.write(sib_reload_helper.VALUE)\n",
+                    "\n",
+                    "@proxy.on_request\n",
+                    "def handle(request):\n",
+                    "    pass\n",
+                ),
+                output.display()
+            ),
+        )
+        .unwrap();
+
+        let config = ScriptConfig {
+            path: script.to_str().unwrap().to_owned(),
+            reload: ReloadMode::Auto,
+            async_pool_size: None,
+            sync_pool_size: None,
+            sync_pool_max: None,
+            handler_stall_abort_secs: 30,
+            executor_queue_capacity: 1024,
+            include_paths: Vec::new(),
+        };
+        let engine = ScriptEngine::new(&config).expect("initial load");
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "v1");
+
+        // Edit the helper and reload (this is exactly what the file watcher does
+        // when a `.py` file in the script dir changes) — the stale helper must be
+        // purged so the new source is re-imported.
+        std::fs::write(&helper, "VALUE = \"v2\"\n").unwrap();
+        engine.reload().expect("reload after helper edit");
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "v2",
+            "reload re-imports the edited helper (sys.modules purge)"
+        );
+    }
+
+    #[test]
+    fn purge_removes_user_helper_keeps_stdlib() {
+        Python::initialize();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("sib_purge_helper.py"), "MARKER = 1\n").unwrap();
+        let canonical_dir = std::fs::canonicalize(dir.path()).unwrap();
+
+        // Serialize against other Python-touching tests the way compile_source
+        // does — concurrent first-time imports race on free-threaded 3.14t.
+        let _guard = REGISTRY_COMPILE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Python::attach(|python| {
+            ensure_sys_path(python, std::slice::from_ref(&canonical_dir)).unwrap();
+
+            // Import the helper and a stdlib module that has a __file__.
+            python.import("sib_purge_helper").unwrap();
+            python.import("json").unwrap();
+
+            let modules = python
+                .import("sys")
+                .unwrap()
+                .getattr("modules")
+                .unwrap()
+                .cast_into::<PyDict>()
+                .unwrap();
+            assert!(modules.contains("sib_purge_helper").unwrap());
+
+            purge_user_modules(python, std::slice::from_ref(&canonical_dir)).unwrap();
+
+            assert!(
+                !modules.contains("sib_purge_helper").unwrap(),
+                "helper under the script dir is purged"
+            );
+            assert!(
+                modules.contains("json").unwrap(),
+                "stdlib module outside the script dir survives"
+            );
+            assert!(
+                modules.contains("sys").unwrap(),
+                "sys (no __file__) survives"
+            );
+        });
+    }
+
+    #[test]
+    fn sys_path_not_duplicated_on_reload() {
+        Python::initialize();
+        let dir = tempfile::TempDir::new().unwrap();
+        let canonical_dir = std::fs::canonicalize(dir.path()).unwrap();
+        let dir_str = canonical_dir.to_str().unwrap().to_string();
+
+        let _guard = REGISTRY_COMPILE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Python::attach(|python| {
+            ensure_sys_path(python, std::slice::from_ref(&canonical_dir)).unwrap();
+            ensure_sys_path(python, std::slice::from_ref(&canonical_dir)).unwrap();
+            ensure_sys_path(python, std::slice::from_ref(&canonical_dir)).unwrap();
+        });
+
+        let occurrences = sys_path_entries().iter().filter(|p| **p == dir_str).count();
+        assert_eq!(occurrences, 1, "sys.path entry is not duplicated on reload");
     }
 
     #[test]
@@ -1351,6 +1789,7 @@ async def route(request):
             sync_pool_max: None,
             handler_stall_abort_secs: 30,
             executor_queue_capacity: 1024,
+            include_paths: Vec::new(),
         };
         let result = ScriptEngine::new(&config);
         assert!(result.is_err());
@@ -1380,6 +1819,7 @@ def route(request):
             sync_pool_max: None,
             handler_stall_abort_secs: 30,
             executor_queue_capacity: 1024,
+            include_paths: Vec::new(),
         };
         let engine = ScriptEngine::new(&config).unwrap();
         assert_eq!(engine.state().handlers.len(), 1);
@@ -1431,6 +1871,7 @@ def route(request):
             sync_pool_max: None,
             handler_stall_abort_secs: 30,
             executor_queue_capacity: 1024,
+            include_paths: Vec::new(),
         };
         let engine = ScriptEngine::new(&config).unwrap();
         assert_eq!(engine.state().handlers.len(), 1);
@@ -2245,7 +2686,7 @@ assert probe_ns.answer() == 42
         file.write_all(source.as_bytes()).unwrap();
         file.flush().unwrap();
 
-        ScriptEngine::compile_script(file.path()).unwrap();
+        ScriptEngine::compile_script(file.path(), &[]).unwrap();
 
         crate::script::api::clear_user_namespaces();
     }

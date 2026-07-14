@@ -99,6 +99,12 @@ domain:
 script:
   path: "scripts/proxy_default.py"
   reload: auto    # auto = inotify (change without restart) | sighup = signal only
+  # The script's own directory is on sys.path, so a script can `import helpers`
+  # for a sibling `helpers.py`. include_paths adds extra directories for helper
+  # libraries shared across scripts. Absolute imports only (the script is not a
+  # package); helper modules hot-reload on change like the main script.
+  # include_paths:
+  #   - "/etc/siphon/lib"
   # Timer routes: use @timer.every(seconds=N) in scripts for periodic callbacks.
   # No YAML config needed — all parameters are per-decorator in the script.
   # See examples/timer_example.py for usage patterns.
