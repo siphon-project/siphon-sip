@@ -1034,6 +1034,55 @@ impl Registrar {
         }
     }
 
+    /// Reverse lookup: non-expired UE-side contacts whose stored **Contact**
+    /// URI matches `contact_uri` (user + host + port, ignoring URI parameters
+    /// and default ports — the same canonicalisation `normalize_aor` applies).
+    ///
+    /// [`lookup`](Self::lookup) resolves a *logical* address (`user@domain`);
+    /// this resolves a *physical* one.  It exists for the terminating edge
+    /// where an upstream registrar-of-record (a PBX sitting in front of
+    /// siphon) retargets the INVITE straight at the cached Contact and
+    /// loose-routes it back through siphon: the Request-URI / To then carry
+    /// the contact (`sip:1001@203.0.113.7:17514`), not the registration
+    /// domain (`sip:1001@pbx.example`), so an AoR-keyed `lookup` misses even
+    /// though the binding is present.  Matching on the Contact recovers it.
+    ///
+    /// This is an **O(total contacts)** scan intended as a per-terminating-call
+    /// guard on edge / PBX-front deployments (moderate registration counts),
+    /// not a per-packet framework path.  AS-side contacts are excluded and the
+    /// result is sorted by q descending, both matching `lookup`.
+    pub fn lookup_contact(&self, contact_uri: &str) -> Vec<Contact> {
+        let target = normalize_aor(contact_uri);
+        let mut out: Vec<Contact> = Vec::new();
+        for entry in self.bindings.iter() {
+            for contact in entry.value().iter() {
+                if contact.kind == ContactKind::Ue
+                    && !contact.is_expired()
+                    && normalize_aor(&contact.uri.to_string()) == target
+                {
+                    out.push(contact.clone());
+                }
+            }
+        }
+        out.sort_by(|a, b| b.q.partial_cmp(&a.q).unwrap_or(std::cmp::Ordering::Equal));
+        out
+    }
+
+    /// Whether any non-expired UE-side binding has a **Contact** URI matching
+    /// `contact_uri`.  Contact-keyed twin of [`is_registered`](Self::is_registered);
+    /// see [`lookup_contact`](Self::lookup_contact) for why the terminating
+    /// edge needs to match on the Contact rather than the AoR.
+    pub fn is_registered_contact(&self, contact_uri: &str) -> bool {
+        let target = normalize_aor(contact_uri);
+        self.bindings.iter().any(|entry| {
+            entry.value().iter().any(|c| {
+                c.kind == ContactKind::Ue
+                    && !c.is_expired()
+                    && normalize_aor(&c.uri.to_string()) == target
+            })
+        })
+    }
+
     /// Number of registered AoRs (with at least one non-expired UE-side
     /// contact) known to *this* instance's in-memory map.
     ///
@@ -2379,6 +2428,123 @@ mod tests {
         assert_eq!(contacts[0].uri.host, "10.0.0.2"); // q=1.0
         assert_eq!(contacts[1].uri.host, "10.0.0.3"); // q=0.8
         assert_eq!(contacts[2].uri.host, "10.0.0.1"); // q=0.5
+    }
+
+    // PBX-in-front scenario: the binding is keyed by the REGISTER's AoR
+    // (`1001@pbx.example`) but the terminating INVITE the PBX loose-routes
+    // back carries the cached *contact* (`1001@203.0.113.7:17514`) in its
+    // Request-URI. `lookup` keys on the AoR and misses; `lookup_contact`
+    // matches the binding by its contact.
+    #[test]
+    fn lookup_contact_matches_by_contact_uri_not_aor() {
+        let registrar = Registrar::default();
+        let contact = SipUri::new("203.0.113.7".to_string())
+            .with_user("1001".into())
+            .with_port(17514);
+        registrar
+            .save(
+                "sip:1001@pbx.example",
+                contact,
+                3600, 1.0, "call-1".into(), 1,
+            )
+            .unwrap();
+
+        // AoR-keyed lookup on the contact URI misses (documents the mismatch).
+        assert!(registrar.lookup("sip:1001@203.0.113.7:17514").is_empty());
+        assert!(!registrar.is_registered("sip:1001@203.0.113.7:17514"));
+
+        // Contact-keyed lookup recovers the binding.
+        let found = registrar.lookup_contact("sip:1001@203.0.113.7:17514");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].uri.host, "203.0.113.7");
+        assert_eq!(found[0].uri.port, Some(17514));
+        assert!(registrar.is_registered_contact("sip:1001@203.0.113.7:17514"));
+
+        // Sanity: the AoR still resolves the same binding by its real key.
+        assert_eq!(registrar.lookup("sip:1001@pbx.example").len(), 1);
+    }
+
+    #[test]
+    fn lookup_contact_ignores_params_and_default_port() {
+        let registrar = Registrar::default();
+        // Contact carries a transport param; a default sip port (5060).
+        let contact = SipUri::new("203.0.113.9".to_string())
+            .with_user("2001".into())
+            .with_port(5060);
+        registrar
+            .save("sip:2001@pbx.example", contact, 3600, 1.0, "c".into(), 1)
+            .unwrap();
+
+        // Trailing param + explicit default port both normalise away.
+        assert!(registrar.is_registered_contact("sip:2001@203.0.113.9;transport=udp"));
+        assert!(registrar.is_registered_contact("sip:2001@203.0.113.9:5060"));
+        assert_eq!(registrar.lookup_contact("sip:2001@203.0.113.9").len(), 1);
+    }
+
+    #[test]
+    fn lookup_contact_wrong_user_or_host_misses() {
+        let registrar = Registrar::default();
+        let contact = SipUri::new("203.0.113.7".to_string())
+            .with_user("1001".into())
+            .with_port(17514);
+        registrar
+            .save("sip:1001@pbx.example", contact, 3600, 1.0, "c".into(), 1)
+            .unwrap();
+
+        assert!(!registrar.is_registered_contact("sip:9999@203.0.113.7:17514")); // user
+        assert!(!registrar.is_registered_contact("sip:1001@203.0.113.7:5555")); // port
+        assert!(!registrar.is_registered_contact("sip:1001@198.51.100.1:17514")); // host
+        assert!(registrar.lookup_contact("sip:1001@203.0.113.7:17514").len() == 1);
+    }
+
+    #[test]
+    fn lookup_contact_excludes_expired() {
+        let registrar = Registrar::default();
+        let contact = SipUri::new("203.0.113.7".to_string())
+            .with_user("1001".into())
+            .with_port(17514);
+        // Zero expiry: the retain in save_full drops it, but even a live-then-
+        // expired binding must not surface. Use a 0-expiry deregister path via
+        // a short save then manual expiry is awkward; assert the empty case.
+        registrar
+            .save("sip:1001@pbx.example", contact.clone(), 3600, 1.0, "c".into(), 1)
+            .unwrap();
+        assert!(registrar.is_registered_contact("sip:1001@203.0.113.7:17514"));
+
+        // Deregister (Expires: 0) removes it — contact lookup then misses.
+        registrar
+            .save("sip:1001@pbx.example", contact, 0, 1.0, "c".into(), 2)
+            .unwrap();
+        assert!(!registrar.is_registered_contact("sip:1001@203.0.113.7:17514"));
+        assert!(registrar.lookup_contact("sip:1001@203.0.113.7:17514").is_empty());
+    }
+
+    #[test]
+    fn lookup_contact_unknown_returns_empty() {
+        let registrar = Registrar::default();
+        assert!(registrar.lookup_contact("sip:nobody@203.0.113.7:17514").is_empty());
+        assert!(!registrar.is_registered_contact("sip:nobody@203.0.113.7:17514"));
+    }
+
+    #[test]
+    fn lookup_contact_excludes_as_contacts() {
+        // An AS-side capability record shares no routing role; a contact
+        // lookup on the AS URI must not surface it (mirrors lookup()).
+        let registrar = Registrar::default();
+        save_ue(&registrar, "sip:alice@ims.example.com", "alice", "10.0.0.1");
+        let as_uri = SipUri::new("ims.example.com".to_string()).with_user("mmtel".into());
+        assert!(registrar
+            .save_as_contact(
+                "sip:alice@ims.example.com",
+                as_uri,
+                3600, 1.0,
+                vec![("+g.3gpp.smsip".to_string(), None)],
+            )
+            .unwrap());
+
+        // The UE contact matches; the AS contact does not.
+        assert!(registrar.is_registered_contact("sip:alice@10.0.0.1"));
+        assert!(registrar.lookup_contact("sip:mmtel@ims.example.com").is_empty());
     }
 
     #[test]

@@ -45,6 +45,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   elapsed).
 
 ### Added
+- **`registrar.lookup_contact(uri)` / `registrar.is_registered_contact(uri)` —
+  reverse-lookup a binding by its Contact URI.** `registrar.lookup(uri)` keys on
+  the AoR (`user@domain`); these key on the stored **Contact** (user + host +
+  port, ignoring URI parameters and default ports). For the terminating edge
+  where an upstream registrar-of-record (a PBX in front of siphon) retargets the
+  INVITE straight at the cached contact and loose-routes it back, the
+  Request-URI / To carry the contact (`sip:1001@203.0.113.7:17514`), not the
+  registration domain (`sip:1001@pbx.example`) — so an AoR-keyed `lookup` misses
+  even though the binding is present and shows in `/admin/registrations`.
+  Matching on the contact recovers it, so a script can guard
+  `if not registrar.lookup_contact(str(call.ruri)): call.reject(404, …)` before
+  dialing. AS-side capability records are excluded, matching `lookup`.
 - **E.164 number normalization for identity headers — the `numbers` namespace,
   `request.rewrite_identities()` / `call.rewrite_identities()`, and
   `call.dial(number_policy=…)` / `call.fork(number_policy=…)`.** One call
