@@ -302,6 +302,37 @@ mod tests {
     }
 
     #[test]
+    fn encode_hep3_wildcard_local_resolves_to_advertised() {
+        use crate::uac::resolve_via_addr;
+        use std::collections::HashMap;
+
+        let payload = sample_sip_payload();
+
+        // siphon bound to the wildcard address — the usual production `listen`
+        // config. The raw bind/recv address is unspecified.
+        let wildcard = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5060);
+
+        // The encoder is a faithful writer: hand it the raw wildcard and it emits
+        // `0.0.0.0`, which is exactly the leak the pre-fix HEP path produced.
+        let raw = CaptureInfo { source: wildcard, ..make_capture_info(payload) };
+        let raw_chunks = parse_chunks(&encode_hep3(&raw)[6..]);
+        assert_eq!(raw_chunks.get(&CHUNK_IPV4_SRC).unwrap(), &[0, 0, 0, 0]);
+
+        // The dispatcher/uac resolve the local addr through `resolve_via_addr`
+        // before encoding, substituting the advertised address for the wildcard
+        // and preserving the port.
+        let mut advertised = HashMap::new();
+        advertised.insert(Transport::Udp, "203.0.113.7".to_string());
+        let resolved = resolve_via_addr(wildcard, &Transport::Udp, &advertised, None);
+        assert_eq!(resolved.ip(), IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)));
+        assert_eq!(resolved.port(), 5060);
+
+        let fixed = CaptureInfo { source: resolved, ..make_capture_info(payload) };
+        let fixed_chunks = parse_chunks(&encode_hep3(&fixed)[6..]);
+        assert_eq!(fixed_chunks.get(&CHUNK_IPV4_SRC).unwrap(), &[203, 0, 113, 7]);
+    }
+
+    #[test]
     fn encode_hep3_ipv6_chunks() {
         let payload = sample_sip_payload();
         let source = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5060);

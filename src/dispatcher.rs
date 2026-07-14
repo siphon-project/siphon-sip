@@ -335,6 +335,22 @@ impl DispatcherState {
             .unwrap_or(self.local_addr.port())
     }
 
+    /// Resolve siphon's own endpoint to report in a HEP capture for `transport`.
+    ///
+    /// When siphon binds to the wildcard address (`0.0.0.0` / `[::]`, the usual
+    /// production `listen` config), the raw bind/recv address is unspecified and
+    /// renders as `0.0.0.0` in Homer — hiding which node/interface the leg
+    /// belongs to and breaking IP-based correlation. Substitute the advertised
+    /// address (the same resolution Via/Contact use, per transport) so the
+    /// capture carries siphon's real address. The candidate's port is preserved,
+    /// and a non-unspecified candidate passes through unchanged.
+    fn hep_local_addr(&self, candidate: SocketAddr, transport: Transport) -> SocketAddr {
+        // `advertised_addrs` is the merged map — the global `advertised_address`
+        // is already folded into every listener transport at startup — so the
+        // trailing `None` never drops the global fallback.
+        crate::uac::resolve_via_addr(candidate, &transport, &self.advertised_addrs, None)
+    }
+
     /// Resolve a script `send_socket=` spec against the configured listeners.
     ///
     /// Returns `Some(SendSocket)` only when the spec is well-formed AND names a
@@ -2189,7 +2205,7 @@ fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
     if let Some(ref hep) = state.hep_sender {
         hep.capture_inbound(
             inbound.remote_addr,
-            inbound.local_addr,
+            state.hep_local_addr(inbound.local_addr, inbound.transport),
             inbound.transport,
             &inbound.data,
         );
@@ -4895,7 +4911,7 @@ fn send_to_target(
     // HEP capture — outbound (sent to network)
     if let Some(ref hep) = state.hep_sender {
         let local = state.listen_addrs.get(&transport).copied().unwrap_or(state.local_addr);
-        hep.capture_outbound(local, destination, transport, &data);
+        hep.capture_outbound(state.hep_local_addr(local, transport), destination, transport, &data);
     }
 
     match transport {
@@ -6241,7 +6257,7 @@ fn send_outbound_from(
         let local = source_local_addr
             .or_else(|| state.listen_addrs.get(&transport).copied())
             .unwrap_or(state.local_addr);
-        hep.capture_outbound(local, destination, transport, &data);
+        hep.capture_outbound(state.hep_local_addr(local, transport), destination, transport, &data);
     }
 
     let outbound_message = OutboundMessage {

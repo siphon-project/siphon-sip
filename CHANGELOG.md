@@ -189,6 +189,17 @@ _Codename: bjorn._
   unaffected; there is no separate `answer_now()`.
 
 ### Fixed
+- **HEP/Homer captures no longer report siphon's own side as `0.0.0.0`.** When
+  siphon binds to the wildcard address (`listen.udp: 0.0.0.0:5060`, the usual
+  production config), every captured leg carried siphon's endpoint as the raw
+  bind/recv address — unspecified — so Homer showed `0.0.0.0` as the source of
+  outbound messages and the destination of inbound ones (the remote peer rendered
+  correctly). The capture path now resolves the local endpoint to the advertised
+  address per transport, the same substitution Via/Contact already apply, so a
+  leg shows which node/interface it belongs to and IP-based correlation works. The
+  SIP on the wire was always correct — this was capture metadata only. Set
+  `advertised_address` (or a per-transport `advertise`) for the real IP; without
+  it the substitute is loopback, exactly as Via behaves today.
 - **B2BUA on a multi-homed host now answers on the socket the call arrived on.**
   When siphon listens on more than one UDP port (e.g. `5060` and `5066`), the
   B2BUA sent every A-leg response (100 Trying, 18x, 2xx, 4xx–6xx, 487, 408, PRACK
