@@ -6,6 +6,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+_Codename: bjorn._
+
 ### Added
 - **`presence.refresh(subscription_id, expires)` + `presence.find_by_dialog(call_id, from_tag)`** —
   the two pieces needed to handle an in-dialog SUBSCRIBE (RFC 6665 §4.4.1) as a
