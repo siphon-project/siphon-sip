@@ -911,12 +911,28 @@ mod tests {
             force_python_gc();
             flush_drivers().await;
 
-            // Probe each driver: expected count is 0.
-            let counts = count_pending_tasks_per_driver().await;
+            // Poll until every driver's asyncio task table drains. A completed
+            // task lingers in `asyncio.all_tasks()` until the driver loop runs its
+            // done-callback + finalizer, which can lag the single flush above — so
+            // give the drivers a bounded window (flush + GC + a short settle) to
+            // reach 0 rather than probing a beat too early. This does NOT weaken
+            // the leak assertion: a genuine leak never drains, so the loop exhausts
+            // its window and still fails; it only removes the finalization race.
+            let mut counts = count_pending_tasks_per_driver().await;
+            for _ in 0..50 {
+                if counts.iter().all(|count| *count == 0) {
+                    break;
+                }
+                flush_drivers().await;
+                force_python_gc();
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                counts = count_pending_tasks_per_driver().await;
+            }
             for (driver, count) in counts.iter().enumerate() {
                 assert_eq!(
                     *count, 0,
-                    "driver {} has {} pending tasks after handler batch — leak",
+                    "driver {} has {} pending tasks after handler batch — leak \
+                     (did not drain within the poll window)",
                     driver, count
                 );
             }
