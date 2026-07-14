@@ -30,6 +30,11 @@ from siphon import proxy, registrar, auth, diameter, presence, isc, log
 
 REALM = "ims.example.com"
 SCSCF_URI = f"sip:scscf.{REALM}:6060"
+# Notifier (S-CSCF) To-tag for reg-event dialogs. One stable tag is enough: a
+# reg-event dialog is keyed on (Call-ID, subscriber From-tag), both unique per
+# UE, so the notifier tag need not vary. Keeping it stable lets the initial 2xx,
+# every in-dialog NOTIFY, and the on_change broadcast all address the same dialog.
+SCSCF_NOTIFIER_TAG = "scscf-notif"
 
 # Server-Assignment-Type values (3GPP TS 29.228 §6.3.15)
 SAT_NO_ASSIGNMENT = 0
@@ -114,34 +119,84 @@ def handle_register(request):
 
 @proxy.on_request("SUBSCRIBE")
 async def handle_subscribe(request):
-    """Handle SUBSCRIBE for reg event and other packages."""
+    """Handle SUBSCRIBE for the reg event package (RFC 3680) and others.
+
+    The S-CSCF is the notifier for reg-event, so it terminates the SUBSCRIBE
+    dialog locally rather than relaying it. To make refresh and un-SUBSCRIBE
+    work, the initial 2xx establishes a real dialog (our To-tag, RFC 6665
+    §4.1.3) and the subscription is stored with its dialog identifiers. A later
+    in-dialog SUBSCRIBE is then matched back by dialog (Call-ID + From-tag) and
+    either refreshes the timer or, on Expires:0, tears the subscription down
+    with a terminal NOTIFY.
+    """
+    expires = int(request.get_header("Expires") or "3600")
+
+    # --- In-dialog SUBSCRIBE: refresh or un-SUBSCRIBE (RFC 6665 §4.4.1) ---
     if request.in_dialog:
-        if request.loose_route():
-            request.relay()
+        sub_id = presence.find_by_dialog(request.call_id, request.from_tag)
+        if sub_id is None:
+            # Not one of our local reg-event dialogs — it's a subscription we
+            # proxy for someone else; loose-route it onward. If it isn't
+            # routable either, the dialog is unknown (RFC 6665 §4.4.1).
+            if request.loose_route():
+                request.relay()
+            else:
+                request.reply(481, "Subscription Does Not Exist")
+            return
+
+        # reg-event is a self-subscription: the watched AoR is the subscriber,
+        # and From-URI is stable across the dialog, so it is the resource.
+        aor = str(request.from_uri)
+        if expires == 0:
+            presence.unsubscribe(sub_id)
+            sub_state = "terminated;reason=timeout"
         else:
-            request.reply(404, "Not Here")
+            presence.refresh(sub_id, expires)
+            sub_state = f"active;expires={expires}"
+
+        # 200 echoes the dialog To-tag from the request; the in-dialog NOTIFY
+        # reflects the new state, From-tag = our dialog tag (the To-tag the
+        # subscriber addressed this request to).
+        request.reply(200, "OK")
+        body = registrar.reginfo_xml(aor, state="full")
+        await proxy.send_request("NOTIFY", str(request.from_uri), headers={
+            "Event": "reg",
+            "Subscription-State": sub_state,
+            "Content-Type": "application/reginfo+xml",
+            "To": str(request.from_uri),
+            "From": f"<{SCSCF_URI}>;tag={request.to_tag}",
+        }, body=body)
+        log.info(f"reg {'un-' if expires == 0 else 're-'}SUBSCRIBE from "
+                 f"{request.from_uri}: {sub_state}")
         return
 
-    # For reg event subscriptions (RFC 3680), respond locally and send NOTIFY.
+    # --- Initial reg SUBSCRIBE (RFC 3680): respond locally, establish dialog ---
     if request.event == "reg":
         aor = str(request.ruri)
-        expires = int(request.get_header("Expires") or "3600")
 
-        # Store the subscription so on_change can notify this watcher.
-        presence.subscribe(str(request.from_uri), aor,
-                           event="reg", expires=expires)
+        # Assign our To-tag on the 2xx (RFC 6665 §4.1.3) so the subscriber's
+        # later in-dialog refresh / un-SUBSCRIBE lands back here and
+        # find_by_dialog() can resolve it. Store the subscription WITH its
+        # dialog identifiers (Call-ID + tags) so the lookup has something to
+        # match — subscribe() (no dialog state) would not be findable.
+        request.set_reply_to_tag(SCSCF_NOTIFIER_TAG)
+        presence.subscribe_dialog(
+            str(request.from_uri), aor, "reg", expires,
+            request.call_id, request.from_tag, SCSCF_NOTIFIER_TAG,
+        )
 
         request.set_header("Subscription-State", f"active;expires={expires}")
         request.reply(200, "OK")
 
-        # Send initial NOTIFY with full reginfo (RFC 3680 §3.2).
+        # Initial NOTIFY with full reginfo (RFC 3680 §3.2), in-dialog: From-tag
+        # is the To-tag we just assigned.
         body = registrar.reginfo_xml(aor, state="full", version=0)
         await proxy.send_request("NOTIFY", str(request.from_uri), headers={
             "Event": "reg",
             "Subscription-State": f"active;expires={expires}",
             "Content-Type": "application/reginfo+xml",
             "To": str(request.from_uri),
-            "From": f"<{SCSCF_URI}>;tag=scscf-notif",
+            "From": f"<{SCSCF_URI}>;tag={SCSCF_NOTIFIER_TAG}",
         }, body=body)
         log.info(f"reg SUBSCRIBE from {request.from_uri} for {aor}: "
                  f"sent 200 + initial NOTIFY")
@@ -171,7 +226,7 @@ async def on_registration_change(aor, event_type, contacts):
             "Subscription-State": "active",
             "Content-Type": "application/reginfo+xml",
             "To": watcher["subscriber"],
-            "From": f"<{SCSCF_URI}>;tag=scscf-notif",
+            "From": f"<{SCSCF_URI}>;tag={SCSCF_NOTIFIER_TAG}",
         }, body=body)
     log.info(f"reg change: {event_type} for {aor}, "
              f"notified {len(list(presence.subscribers(aor)))} watchers")

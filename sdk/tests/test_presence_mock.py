@@ -99,3 +99,40 @@ def test_notify_with_active_state_does_not_remove():
     )
     presence.notify(sub_id, subscription_state="active;expires=3600")
     assert presence.subscription_count() == 1
+
+
+def test_find_by_dialog_resolves_refresh_and_unsubscribe():
+    """In-dialog SUBSCRIBE flow: resolve by (Call-ID, From-tag), refresh, remove."""
+    presence = _fresh_presence()
+    sub_id = presence.subscribe_dialog(
+        subscriber="sip:alice@ims.example.com",
+        resource="sip:alice@ims.example.com",
+        event="reg",
+        expires=3600,
+        call_id="call-abc",
+        from_tag="ftag-alice",
+        to_tag="scscf-notif",
+    )
+
+    assert presence.find_by_dialog("call-abc", "ftag-alice") == sub_id
+    # Wrong pair / unknown dialog → None.
+    assert presence.find_by_dialog("call-abc", "ftag-bob") is None
+    assert presence.find_by_dialog("call-xyz", "ftag-alice") is None
+
+    # Refresh the resolved subscription.
+    assert presence.refresh(sub_id, 7200) is True
+    assert presence.refresh("sub-nope", 7200) is False
+
+    # Un-SUBSCRIBE: resolve then remove.
+    resolved = presence.find_by_dialog("call-abc", "ftag-alice")
+    assert presence.unsubscribe(resolved) is True
+    assert presence.find_by_dialog("call-abc", "ftag-alice") is None
+    assert presence.subscription_count() == 0
+
+
+def test_find_by_dialog_ignores_non_dialog_subscription():
+    """subscribe() (no dialog state) is not findable by dialog."""
+    presence = _fresh_presence()
+    presence.subscribe("sip:alice@ims.example.com", "sip:alice@ims.example.com",
+                       event="reg", expires=3600)
+    assert presence.find_by_dialog("", "") is None

@@ -6,6 +6,24 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **`presence.refresh(subscription_id, expires)` + `presence.find_by_dialog(call_id, from_tag)`** —
+  the two pieces needed to handle an in-dialog SUBSCRIBE (RFC 6665 §4.4.1) as a
+  notifier. `find_by_dialog` resolves a subscription id from an in-dialog
+  SUBSCRIBE's `(Call-ID, From-tag)` — which a refresh or `Expires: 0`
+  un-SUBSCRIBE carries but the original id it does not — and `refresh` resets
+  that subscription's timer without recreating the dialog (the store already had
+  `refresh_subscription`; it just wasn't exposed). Only subscriptions created
+  with `subscribe_dialog` (which store dialog state) are findable; terminated
+  ones are skipped so a lingering entry can't shadow a re-SUBSCRIBE that reused
+  the Call-ID. Mirrored in the `siphon-sip` SDK mock. The IMS S-CSCF example
+  (`examples/ims_scscf.py`) is rewritten to use them: the initial reg-event
+  SUBSCRIBE now establishes a real dialog (assigns the notifier To-tag on the
+  2xx, RFC 6665 §4.1.3, and stores it via `subscribe_dialog`), and the in-dialog
+  branch keys on the dialog to refresh the timer or, on `Expires: 0`, tear the
+  subscription down with a terminal NOTIFY — fixing reg-event refresh and
+  un-SUBSCRIBE, which previously 404'd for every subscriber.
+
 ### Fixed
 - **B2BUA on a multi-homed host now answers on the socket the call arrived on.**
   When siphon listens on more than one UDP port (e.g. `5060` and `5066`), the

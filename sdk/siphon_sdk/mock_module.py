@@ -4389,6 +4389,49 @@ class MockPresence:
         """
         return self._subscriptions.pop(subscription_id, None) is not None
 
+    def refresh(self, subscription_id: str, expires: int) -> bool:
+        """Refresh a subscription's expiry (RFC 6665 §4.4.1 re-SUBSCRIBE).
+
+        Resets the subscription timer to ``expires`` seconds, keeping the dialog.
+        Pair with :meth:`find_by_dialog` to resolve the id from an in-dialog
+        SUBSCRIBE before refreshing.
+
+        Args:
+            subscription_id: The subscription ID (from ``subscribe*`` or
+                :meth:`find_by_dialog`).
+            expires: New subscription duration in seconds.
+
+        Returns:
+            ``True`` if the subscription was found and refreshed.
+        """
+        sub = self._subscriptions.get(subscription_id)
+        if sub is None:
+            return False
+        sub["expires"] = expires
+        return True
+
+    def find_by_dialog(self, call_id: str, from_tag: str) -> Optional[str]:
+        """Resolve a subscription id from its dialog ``(Call-ID, From-tag)``.
+
+        An in-dialog SUBSCRIBE (a refresh, or an un-SUBSCRIBE with ``Expires: 0``)
+        carries the dialog's Call-ID and the subscriber's From-tag but not the
+        original subscription id. This maps that pair back so a notifier
+        (e.g. an S-CSCF handling reg-event) can :meth:`refresh` or
+        :meth:`unsubscribe` the right dialog. Only subscriptions created with
+        :meth:`subscribe_dialog` (which store dialog state) are findable.
+
+        Args:
+            call_id: Call-ID of the in-dialog SUBSCRIBE.
+            from_tag: From-tag of the in-dialog SUBSCRIBE (subscriber's tag).
+
+        Returns:
+            The subscription ID string, or ``None`` if no dialog matches.
+        """
+        for sub_id, value in self._subscriptions.items():
+            if value.get("call_id") == call_id and value.get("from_tag") == from_tag:
+                return sub_id
+        return None
+
     def subscribers(self, resource: str) -> list[dict]:
         """List subscribers (watchers) for a resource.
 
