@@ -15,7 +15,7 @@ use axum::extract::{Path, Request, State};
 use axum::http::{header, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::{delete, get};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use serde::Serialize;
 use tracing::{error, info};
@@ -105,7 +105,11 @@ fn router(state: AdminState, cors: Option<&CorsConfig>, ui_enabled: bool) -> Rou
         .route("/admin/registrations/{aor}", delete(registration_delete_handler))
         .route("/admin/bans", get(bans_handler))
         .route("/admin/bans/{ip}", delete(ban_delete_handler))
-        .route("/admin/gateways", get(gateways_handler));
+        .route("/admin/gateways", get(gateways_handler))
+        .route(
+            "/admin/gateways/{group}/{destination}/{action}",
+            post(gateway_action_handler),
+        );
 
     // Everything not matched by an API route falls through to the embedded
     // dashboard (single-page app), so `/` and any client route serve it.
@@ -134,13 +138,15 @@ fn router(state: AdminState, cors: Option<&CorsConfig>, ui_enabled: bool) -> Rou
 /// Bearer-token gate for the admin API (RFC 6750). No-op when no token is
 /// configured. Always lets CORS preflight (`OPTIONS`) through so the browser
 /// can complete a preflight before it holds the token. Otherwise requires
-/// `Authorization: Bearer <token>` on `DELETE` (and, when `protect_reads`, on
-/// every method), comparing in constant time.
+/// `Authorization: Bearer <token>` on every mutating method (`POST`, `PUT`,
+/// `PATCH`, `DELETE`) — and, when `protect_reads`, on the read methods too —
+/// comparing in constant time.
 async fn require_admin_auth(State(state): State<AdminState>, request: Request, next: Next) -> Response {
     let method = request.method();
+    let is_read = method == Method::GET || method == Method::HEAD || method == Method::OPTIONS;
     let needs_auth = state.auth_token.is_some()
         && method != Method::OPTIONS
-        && (state.protect_reads || method == Method::DELETE);
+        && (state.protect_reads || !is_read);
 
     if needs_auth {
         let presented = request
@@ -500,6 +506,48 @@ fn gateways_json(manager: &crate::gateway::DispatcherManager) -> serde_json::Val
     // Stable order for the dashboard (DashMap iteration order is arbitrary).
     groups.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     serde_json::Value::Array(groups)
+}
+
+/// `POST /admin/gateways/{group}/{destination}/{action}` — mark a gateway
+/// destination `up` or `down` by hand (drain a bad carrier, then restore it).
+/// `destination` is the destination URI exactly as returned by
+/// `GET /admin/gateways`. Mutating, so it sits behind the bearer gate.
+async fn gateway_action_handler(
+    Path((group, destination, action)): Path<(String, String, String)>,
+) -> impl IntoResponse {
+    let Some(manager) = crate::script::api::gateway_manager() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "no gateway groups configured" })),
+        );
+    };
+    let Some(dispatcher_group) = manager.get_group(&group) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown group", "group": group })),
+        );
+    };
+    let changed = match action.as_str() {
+        "down" => dispatcher_group.mark_down(&destination),
+        "up" => dispatcher_group.mark_up(&destination),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "action must be 'up' or 'down'", "action": action })),
+            );
+        }
+    };
+    if changed {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": action, "group": group, "destination": destination })),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "unknown destination", "group": group, "destination": destination })),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1044,6 +1092,40 @@ mod tests {
         assert_eq!(destinations[0]["weight"], 3);
         assert_eq!(destinations[0]["healthy"], true);
         assert_eq!(destinations[0]["address"], "10.0.0.1:5060");
+    }
+
+    #[tokio::test]
+    async fn gateway_action_post_requires_bearer() {
+        crate::metrics::init().unwrap();
+        // The write action is a POST — the generalized gate must cover it, not
+        // just DELETE.
+        let app = router(authed_state("s3cret", false), None, false);
+        let response = app
+            .oneshot(
+                Request::post("/admin/gateways/carriers/sip:gw1.example.com:5060/down")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn gateway_action_unknown_group_is_404_with_token() {
+        crate::metrics::init().unwrap();
+        let app = router(authed_state("s3cret", false), None, false);
+        let response = app
+            .oneshot(
+                Request::post("/admin/gateways/nope/sip:gw1.example.com:5060/down")
+                    .header("authorization", "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // No gateway manager is wired in unit tests -> no groups configured.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[cfg(feature = "ui")]

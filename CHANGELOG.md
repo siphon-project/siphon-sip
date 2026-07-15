@@ -27,11 +27,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   priority, address, transport, and attributes, read from the shared dispatcher
   (no new state or probing). Surfaced as a Gateways panel on the dashboard's
   Integrations page.
-- **Bearer-token auth for the admin API** (`admin.auth.token`). When set, the
-  mutating `DELETE` routes (force-unregister, lift-ban) require
-  `Authorization: Bearer <token>`, compared in constant time; set
-  `admin.auth.protect_reads: true` to require it on the read routes and
-  `/metrics` too. Unset leaves the admin API open exactly as before.
+- **`POST /admin/gateways/{group}/{destination}/{up|down}`** — manually mark a
+  gateway destination up or down (drain a bad carrier from the dashboard, then
+  restore it), with a per-destination button on the Gateways panel. Mutating, so
+  it requires the admin bearer token.
+- **Bearer-token auth for the admin API** (`admin.auth.token`). When set, every
+  mutating route (`POST`/`PUT`/`PATCH`/`DELETE` — force-unregister, lift-ban,
+  gateway up/down) requires `Authorization: Bearer <token>`, compared in
+  constant time; set `admin.auth.protect_reads: true` to require it on the read
+  routes and `/metrics` too. Unset leaves the admin API open exactly as before.
 
 ## [1.4.0] — 2026-07-14
 

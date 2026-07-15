@@ -562,17 +562,28 @@
     $('gw-groups').innerHTML = groups.map(function(g){
       var rows = (g.destinations||[]).map(function(d){
         var attrs = Object.keys(d.attrs||{}).map(function(k){ return k+'='+d.attrs[k]; }).join(' ');
+        var act = d.healthy ? 'down' : 'up', actLabel = d.healthy ? 'drain' : 'enable';
         return '<tr><td class="aor">'+esc(d.uri)+'</td><td class="contact">'+esc(d.address)+' '+esc(d.transport)+'</td>'
           + '<td>'+(d.healthy?'<span class="spill up">● up</span>':'<span class="spill down">● down</span>')+'</td>'
-          + '<td class="q">'+d.weight+'</td><td class="q">'+d.priority+'</td><td class="contact">'+esc(attrs)+'</td></tr>';
+          + '<td class="q">'+d.weight+'</td><td class="q">'+d.priority+'</td><td class="contact">'+esc(attrs)+'</td>'
+          + '<td><button class="rowbtn'+(unlocked?' armed':'')+'" data-gw="'+esc(g.name)+'|'+esc(d.uri)+'|'+act+'">'+actLabel+'</button></td></tr>';
       }).join('');
       var col = g.up === g.total ? 'var(--up)' : (g.up > 0 ? 'var(--warn)' : 'var(--crit)');
       return '<div class="card" style="margin-bottom:14px"><div class="panelhead">'
         + '<span class="t">'+esc(g.name)+' <span class="count-pill" style="margin-left:8px">'+esc(g.algorithm)+'</span></span>'
         + '<span class="count-pill"><b style="color:'+col+'">'+g.up+' / '+g.total+'</b> up</span></div>'
-        + '<div class="tblscroll"><table class="tbl"><thead><tr><th>Destination</th><th>Address</th><th>Health</th><th>Weight</th><th>Priority</th><th>Attrs</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+        + '<div class="tblscroll"><table class="tbl"><thead><tr><th>Destination</th><th>Address</th><th>Health</th><th>Weight</th><th>Priority</th><th>Attrs</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
     }).join('');
   }
+  document.getElementById('gw-groups').addEventListener('click', function(e){
+    var b = e.target.closest('[data-gw]'); if (!b) return;
+    if (!unlocked){ say('Locked — press Unlock and enter an admin token', true); return; }
+    var parts = b.getAttribute('data-gw').split('|');
+    api('/admin/gateways/'+encodeURIComponent(parts[0])+'/'+encodeURIComponent(parts[1])+'/'+parts[2], { method:'POST' }).then(function(r){
+      if (r.status === 401){ say('Unauthorized — check the admin token', true); return; }
+      if (r.ok){ say('Gateway '+parts[1]+' marked '+parts[2]); loadGateways(); } else { say('Failed ('+r.status+')', true); }
+    }).catch(function(){ say('Request failed', true); });
+  });
 
   // ---- overview recent-registrations preview ----
   async function loadOverviewRegs(){
