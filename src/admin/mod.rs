@@ -104,7 +104,8 @@ fn router(state: AdminState, cors: Option<&CorsConfig>, ui_enabled: bool) -> Rou
         .route("/admin/registrations/{aor}", get(registration_detail_handler))
         .route("/admin/registrations/{aor}", delete(registration_delete_handler))
         .route("/admin/bans", get(bans_handler))
-        .route("/admin/bans/{ip}", delete(ban_delete_handler));
+        .route("/admin/bans/{ip}", delete(ban_delete_handler))
+        .route("/admin/gateways", get(gateways_handler));
 
     // Everything not matched by an API route falls through to the embedded
     // dashboard (single-page app), so `/` and any client route serve it.
@@ -444,6 +445,61 @@ async fn ban_delete_handler(Path(ip): Path<String>) -> impl IntoResponse {
             Json(serde_json::json!({ "error": "auto-ban not enabled", "ip": address.to_string() })),
         ),
     }
+}
+
+/// `GET /admin/gateways` — per-group gateway dispatcher status: every configured
+/// group with its algorithm and each destination's health, weight, priority,
+/// address, transport, and attributes. Reads the shared dispatcher the routing
+/// datapath and `from_gateway` predicates already use (no new state, no probe).
+/// Empty array when no `gateway` block is configured.
+async fn gateways_handler() -> impl IntoResponse {
+    match crate::script::api::gateway_manager() {
+        Some(manager) => Json(gateways_json(manager)),
+        None => Json(serde_json::Value::Array(Vec::new())),
+    }
+}
+
+/// Serialize the gateway dispatcher state. Split from the handler so it can be
+/// unit-tested against a locally-built manager without the process-global.
+fn gateways_json(manager: &crate::gateway::DispatcherManager) -> serde_json::Value {
+    let mut groups: Vec<serde_json::Value> = Vec::new();
+    for name in manager.group_names() {
+        let Some(group) = manager.get_group(&name) else {
+            continue;
+        };
+        let destinations: Vec<serde_json::Value> = group
+            .list_destinations()
+            .iter()
+            .map(|destination| {
+                serde_json::json!({
+                    "uri": destination.uri,
+                    "address": destination
+                        .address_str
+                        .clone()
+                        .unwrap_or_else(|| destination.address().to_string()),
+                    "transport": destination.transport.to_string(),
+                    "healthy": destination.is_healthy(),
+                    "weight": destination.weight,
+                    "priority": destination.priority,
+                    "attrs": destination.attrs,
+                })
+            })
+            .collect();
+        let up = destinations
+            .iter()
+            .filter(|value| value.get("healthy").and_then(|h| h.as_bool()).unwrap_or(false))
+            .count();
+        groups.push(serde_json::json!({
+            "name": group.name,
+            "algorithm": group.algorithm.as_str(),
+            "up": up,
+            "total": destinations.len(),
+            "destinations": destinations,
+        }));
+    }
+    // Stable order for the dashboard (DashMap iteration order is arbitrary).
+    groups.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    serde_json::Value::Array(groups)
 }
 
 // ---------------------------------------------------------------------------
@@ -940,6 +996,54 @@ mod tests {
         assert!(!constant_time_eq(b"token", b"tok"));
         assert!(!constant_time_eq(b"", b"x"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn gateways_json_empty_manager_is_empty_array() {
+        let manager = crate::gateway::DispatcherManager::new();
+        assert_eq!(gateways_json(&manager), serde_json::json!([]));
+    }
+
+    #[test]
+    fn gateways_json_serializes_groups_and_destinations() {
+        use crate::gateway::{Algorithm, Destination, DispatcherGroup, DispatcherManager};
+        use crate::transport::Transport;
+
+        let manager = DispatcherManager::new();
+        let dest_one = Destination::new(
+            "sip:gw1.carrier.com:5060".to_string(),
+            "10.0.0.1:5060".parse().unwrap(),
+            Transport::Udp,
+            3,
+            1,
+        );
+        let dest_two = Destination::new(
+            "sip:gw2.carrier.com:5061".to_string(),
+            "10.0.0.2:5061".parse().unwrap(),
+            Transport::Udp,
+            1,
+            2,
+        );
+        manager.add_group(DispatcherGroup::new(
+            "carriers".to_string(),
+            Algorithm::Weighted,
+            vec![dest_one, dest_two],
+        ));
+
+        let json = gateways_json(&manager);
+        let groups = json.as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["name"], "carriers");
+        assert_eq!(groups[0]["algorithm"], "weighted");
+        assert_eq!(groups[0]["total"], 2);
+        // Fresh destinations start healthy.
+        assert_eq!(groups[0]["up"], 2);
+        let destinations = groups[0]["destinations"].as_array().unwrap();
+        assert_eq!(destinations.len(), 2);
+        assert_eq!(destinations[0]["uri"], "sip:gw1.carrier.com:5060");
+        assert_eq!(destinations[0]["weight"], 3);
+        assert_eq!(destinations[0]["healthy"], true);
+        assert_eq!(destinations[0]["address"], "10.0.0.1:5060");
     }
 
     #[cfg(feature = "ui")]

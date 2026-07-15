@@ -142,6 +142,7 @@
   .irow .rt{margin-left:auto;text-align:right}
   .spill{font-family:var(--font-mono);font-size:10.5px;padding:2px 9px;border-radius:999px;border:1px solid var(--border);color:var(--muted)}
   .spill.up{color:var(--up);border-color:color-mix(in srgb,var(--up) 40%,var(--border));background:color-mix(in srgb,var(--up) 8%,transparent)}
+  .spill.down{color:var(--crit);border-color:color-mix(in srgb,var(--crit) 40%,var(--border))}
   .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:11px 16px;box-shadow:var(--shadow);font-family:var(--font-mono);font-size:12.5px;color:var(--text);opacity:0;pointer-events:none;transition:all .25s;z-index:40;display:flex;align-items:center;gap:9px}
   .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
   .toast .di{width:8px;height:8px;border-radius:50%;background:var(--up)}
@@ -281,6 +282,8 @@
 
       <!-- INTEGRATIONS -->
       <div class="view" id="view-integrations">
+        <div class="sectlabel">Gateway groups</div>
+        <div id="gw-groups"><div class="card"><div class="panelbody empty">loading…</div></div></div>
         <div class="sectlabel">Connected subsystems</div>
         <div class="charts">
           <div class="card"><div class="panelhead"><span class="t">Diameter</span><span class="count-pill"><b id="dia-n">—</b> peers up</span></div><div class="panelbody"><div class="metaline"><span>Peers connected</span><b id="dia-peers">—</b></div></div></div>
@@ -346,6 +349,7 @@
     if (view === 'overview') charts.forEach(function(c){ c.resize(); });
     if (view === 'registrations') loadRegistrations();
     if (view === 'security') loadBans();
+    if (view === 'integrations') loadGateways();
   }
   $('nav').addEventListener('click', function(e){ var it = e.target.closest('.navitem'); if (!it) return; e.preventDefault(); go(it.getAttribute('data-view')); });
   document.querySelectorAll('[data-goto]').forEach(function(a){ a.addEventListener('click', function(){ go(a.getAttribute('data-goto')); }); });
@@ -545,6 +549,30 @@
       if (r.ok){ say('Ban lifted for '+ip); loadBans(); } else { say('Failed ('+r.status+')', true); }
     }).catch(function(){ say('Request failed', true); });
   });
+
+  // ---- gateways ----
+  async function loadGateways(){
+    var groups;
+    try {
+      var r = await api('/admin/gateways');
+      if (r.status === 401){ $('gw-groups').innerHTML = '<div class="card"><div class="panelbody empty">read access is protected — Unlock with an admin token</div></div>'; return; }
+      groups = await r.json();
+    } catch(e){ $('gw-groups').innerHTML = '<div class="card"><div class="panelbody empty">failed to load</div></div>'; return; }
+    if (!groups.length){ $('gw-groups').innerHTML = '<div class="card"><div class="panelbody empty">no gateway groups configured</div></div>'; return; }
+    $('gw-groups').innerHTML = groups.map(function(g){
+      var rows = (g.destinations||[]).map(function(d){
+        var attrs = Object.keys(d.attrs||{}).map(function(k){ return k+'='+d.attrs[k]; }).join(' ');
+        return '<tr><td class="aor">'+esc(d.uri)+'</td><td class="contact">'+esc(d.address)+' '+esc(d.transport)+'</td>'
+          + '<td>'+(d.healthy?'<span class="spill up">● up</span>':'<span class="spill down">● down</span>')+'</td>'
+          + '<td class="q">'+d.weight+'</td><td class="q">'+d.priority+'</td><td class="contact">'+esc(attrs)+'</td></tr>';
+      }).join('');
+      var col = g.up === g.total ? 'var(--up)' : (g.up > 0 ? 'var(--warn)' : 'var(--crit)');
+      return '<div class="card" style="margin-bottom:14px"><div class="panelhead">'
+        + '<span class="t">'+esc(g.name)+' <span class="count-pill" style="margin-left:8px">'+esc(g.algorithm)+'</span></span>'
+        + '<span class="count-pill"><b style="color:'+col+'">'+g.up+' / '+g.total+'</b> up</span></div>'
+        + '<div class="tblscroll"><table class="tbl"><thead><tr><th>Destination</th><th>Address</th><th>Health</th><th>Weight</th><th>Priority</th><th>Attrs</th></tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+    }).join('');
+  }
 
   // ---- overview recent-registrations preview ----
   async function loadOverviewRegs(){

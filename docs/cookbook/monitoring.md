@@ -62,6 +62,7 @@ admin:
 | `GET /admin/registrations[/{aor}]` | inspect bindings |
 | `DELETE /admin/registrations/{aor}` | force-unregister |
 | `GET /admin/bans` / `DELETE /admin/bans/{ip}` | list / lift auto-bans |
+| `GET /admin/gateways` | per-group dispatcher status (destinations, health, weight, priority) |
 | `GET /admin/metrics.json` | curated JSON snapshot of the live gauges + counters |
 
 Point Kubernetes liveness at `/admin/health` and readiness at `/admin/ready` so a
