@@ -6,6 +6,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.4.1] — 2026-07-15
+
 ### Added
 - **Embedded web dashboard on the admin listener — EXPERIMENTAL** (`ui` cargo
   feature + `admin.ui.enabled`). Serves a single-page operator dashboard
