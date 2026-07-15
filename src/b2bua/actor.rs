@@ -1561,6 +1561,28 @@ impl Default for CallActorStore {
 }
 
 // ---------------------------------------------------------------------------
+// Process-wide call store handle (read-only observability)
+// ---------------------------------------------------------------------------
+
+/// The dispatcher-owned B2BUA call store, published for read-only consumers
+/// (the admin API `/admin/calls`) that need to enumerate active calls without
+/// owning the dispatcher.
+static GLOBAL_CALL_STORE: std::sync::OnceLock<std::sync::Arc<CallActorStore>> =
+    std::sync::OnceLock::new();
+
+/// Register the process-wide B2BUA call store. Called once at dispatcher
+/// construction; a no-op if a store was already registered.
+pub fn set_global_call_store(store: std::sync::Arc<CallActorStore>) {
+    let _ = GLOBAL_CALL_STORE.set(store);
+}
+
+/// The process-wide B2BUA call store, or `None` in headless / unit-test
+/// contexts that never constructed a dispatcher.
+pub fn global_call_store() -> Option<&'static std::sync::Arc<CallActorStore>> {
+    GLOBAL_CALL_STORE.get()
+}
+
+// ---------------------------------------------------------------------------
 // LegActor — async actor for B-leg message classification
 // ---------------------------------------------------------------------------
 

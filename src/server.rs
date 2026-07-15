@@ -1904,15 +1904,30 @@ impl SiphonServer {
             match admin_config.listen.parse::<std::net::SocketAddr>() {
                 Ok(listen_addr) => {
                     if let Some(registrar) = crate::script::api::registrar_arc() {
+                        let auth = admin_config.auth.clone().unwrap_or_default();
+                        let ui_enabled =
+                            admin_config.ui.as_ref().map(|ui| ui.enabled).unwrap_or(false);
+                        let instance_id = config
+                            .server
+                            .as_ref()
+                            .and_then(|server| server.instance_id.clone())
+                            .or_else(|| std::env::var("HOSTNAME").ok());
                         let admin_state = crate::admin::AdminState {
                             registrar: Arc::clone(registrar),
                             start_time: std::time::Instant::now(),
                             draining: Some(Arc::clone(&drain)),
+                            auth_token: auth
+                                .token
+                                .filter(|token| !token.is_empty())
+                                .map(|token| std::sync::Arc::from(token.as_str())),
+                            protect_reads: auth.protect_reads,
+                            instance_id,
                         };
                         tokio::spawn(crate::admin::serve(
                             listen_addr,
                             admin_state,
                             admin_config.cors.clone(),
+                            ui_enabled,
                         ));
                     } else {
                         error!("admin API enabled but registrar is not initialized; not starting");

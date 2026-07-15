@@ -425,37 +425,6 @@ impl DispatcherState {
     }
 }
 
-/// Resolve the address SIPhon advertises in Via/Contact (and uses as its
-/// `local_addr`) when the listener is bound to a wildcard address.
-///
-/// Precedence: an explicit `advertised_address` IP literal wins; otherwise, for
-/// a wildcard bind, the host's auto-detected routable local IP
-/// ([`crate::transport::detect_routable_local_ip`]); loopback is the last resort
-/// (a truly loopback-only host, or an advertised hostname that isn't an IP
-/// literal on a host with no default route). A non-wildcard bind is returned
-/// unchanged.
-///
-/// `advertised_address` may be a hostname (used verbatim for the Via/Contact
-/// host via `via_host`); it does not parse to an IP here, so this falls through
-/// to auto-detect for `local_addr` — still routable, unlike the old loopback.
-fn resolve_via_addr(local_addr: SocketAddr, advertised_address: Option<&str>) -> SocketAddr {
-    if !local_addr.ip().is_unspecified() {
-        return local_addr;
-    }
-    if let Some(ip) = advertised_address.and_then(|host| host.parse::<std::net::IpAddr>().ok()) {
-        return SocketAddr::new(ip, local_addr.port());
-    }
-    if let Some(ip) = crate::transport::detect_routable_local_ip(local_addr.is_ipv6()) {
-        return SocketAddr::new(ip, local_addr.port());
-    }
-    let loopback = if local_addr.is_ipv6() {
-        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-    } else {
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-    };
-    SocketAddr::new(loopback, local_addr.port())
-}
-
 /// Run the core dispatcher loop.
 ///
 /// Reads inbound messages from transport, parses, invokes Python handlers,
@@ -491,10 +460,18 @@ pub async fn run(
     product_name: &'static str,
     product_version: &'static str,
 ) {
-    // Resolve the local address for Via insertion. When bound to a wildcard
-    // (0.0.0.0 / [::]), prefer an explicit `advertised_address`, else the host's
-    // auto-detected routable IP, else loopback (see resolve_via_addr).
-    let via_addr = resolve_via_addr(local_addr, config.advertised_address.as_deref());
+    // Resolve the generic local address for Via insertion. When bound to a
+    // wildcard (0.0.0.0 / [::]), the shared resolver prefers an explicit global
+    // `advertised_address`, else the host's auto-detected routable IP, else
+    // loopback. Pass an empty per-transport map: this is the transport-agnostic
+    // fallback (`state.local_addr`); `via_host` layers per-transport advertised
+    // addresses on top of it. The transport arg is therefore a throwaway.
+    let via_addr = crate::uac::resolve_via_addr(
+        local_addr,
+        &Transport::Udp,
+        &std::collections::HashMap::new(),
+        config.advertised_address.as_deref(),
+    );
     if local_addr.ip().is_unspecified() && config.advertised_address.is_none() {
         if via_addr.ip().is_loopback() {
             warn!(
@@ -588,6 +565,11 @@ pub async fn run(
                 .expect("builtin transparent-b2bua@2026 must exist")
         });
 
+    // Publish the call store for read-only observability (admin `/admin/calls`)
+    // before it's moved into the dispatcher state.
+    let call_actors = Arc::new(CallActorStore::new());
+    crate::b2bua::actor::set_global_call_store(Arc::clone(&call_actors));
+
     let state = Arc::new(DispatcherState {
         engine,
         outbound,
@@ -599,7 +581,7 @@ pub async fn run(
         server_header,
         user_agent_header,
         transaction_timeout,
-        call_actors: Arc::new(CallActorStore::new()),
+        call_actors,
         transaction_manager,
         timer_wheel: Arc::new(DashMap::new()),
         session_store: Arc::new(ProxySessionStore::new()),
@@ -17040,39 +17022,6 @@ a=rtpmap:8 PCMA/8000\r\n";
     fn clear_media_session_on_timeout_no_store_is_noop() {
         // Media backend not configured (rtpengine_sessions is None) → false.
         assert!(!clear_media_session_on_timeout(None, "1-1354742@host"));
-    }
-
-    #[test]
-    fn resolve_via_addr_explicit_ip_wins() {
-        let bind: SocketAddr = "0.0.0.0:5060".parse().unwrap();
-        // Explicit advertised IP literal is used verbatim (port from the bind).
-        let got = resolve_via_addr(bind, Some("203.0.113.9"));
-        assert_eq!(got, "203.0.113.9:5060".parse().unwrap());
-    }
-
-    #[test]
-    fn resolve_via_addr_specific_bind_unchanged() {
-        // A non-wildcard bind is returned as-is, advertised_address irrelevant.
-        let bind: SocketAddr = "198.51.100.5:5060".parse().unwrap();
-        assert_eq!(resolve_via_addr(bind, None), bind);
-        assert_eq!(resolve_via_addr(bind, Some("203.0.113.9")), bind);
-    }
-
-    #[test]
-    fn resolve_via_addr_wildcard_never_loopback_when_route_exists() {
-        // Wildcard bind, no advertised_address: auto-detect. Never loopback when
-        // a routable IP is available; falls back to loopback only otherwise.
-        let bind: SocketAddr = "0.0.0.0:5060".parse().unwrap();
-        let got = resolve_via_addr(bind, None);
-        assert_eq!(got.port(), 5060);
-        if crate::transport::detect_routable_local_ip(false).is_some() {
-            assert!(!got.ip().is_loopback(), "expected a routable IP, got {got}");
-        }
-        // A hostname (not an IP literal) falls through to auto-detect, not loopback.
-        let host = resolve_via_addr(bind, Some("sip.example.com"));
-        if crate::transport::detect_routable_local_ip(false).is_some() {
-            assert!(!host.ip().is_loopback(), "hostname should auto-detect, got {host}");
-        }
     }
 
 }

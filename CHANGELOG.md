@@ -6,6 +6,55 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **Embedded web dashboard on the admin listener — EXPERIMENTAL** (`ui` cargo
+  feature + `admin.ui.enabled`). Serves a single-page operator dashboard
+  same-origin with the admin API — Overview (live tiles + charts for dialogs, SIP
+  request rate, and memory), Calls (active B2BUA calls), Registrations
+  (searchable, with force-unregister), Security (threat counters + active bans,
+  with lift-ban), Gateways (per-group destination health, with drain/enable),
+  System (jemalloc/glibc memory, Python executor pool, runtime facts), and
+  Integrations (Diameter / rtpengine / SBI). Assets are baked into the binary (no
+  external files, no runtime fetch). The **release Docker image compiles it in by
+  default**; the plain `cargo build` leaves it off, so any library consumer pulls
+  none of it. Serving the dashboard logs an EXPERIMENTAL warning; a binary built
+  without `--features ui` warns and serves nothing when `admin.ui.enabled` is set.
+- **`GET /admin/metrics.json`** — a curated JSON snapshot of the live gauges and
+  counters (SIP, memory, Python executor, Diameter, rtpengine, SBI, security),
+  intended for the dashboard and any custom tooling that would rather not parse
+  the Prometheus text format. Cumulative counters are exposed raw so a client
+  diffs them over time to derive rates.
+- **`GET /admin/gateways`** — per-group gateway dispatcher status: every
+  configured group with its algorithm and each destination's health, weight,
+  priority, address, transport, and attributes, read from the shared dispatcher
+  (no new state or probing). Surfaced as a Gateways panel on the dashboard's
+  Integrations page.
+- **`POST /admin/gateways/{group}/{destination}/{up|down}`** — manually mark a
+  gateway destination up or down (drain a bad carrier from the dashboard, then
+  restore it), with a per-destination button on the Gateways panel. Mutating, so
+  it requires the admin bearer token.
+- **`GET /admin/calls`** — active B2BUA calls (internal id, SIP Call-ID, state,
+  A-leg From, B-leg target, and B-leg count), read from the dispatcher's call
+  store. Surfaced as a dedicated Calls view on the dashboard (which now groups
+  the nav into Monitor / Routing / System, with Gateways in its own Routing
+  section). Empty on a proxy-only node.
+- **Bearer-token auth for the admin API** (`admin.auth.token`). When set, every
+  mutating route (`POST`/`PUT`/`PATCH`/`DELETE` — force-unregister, lift-ban,
+  gateway up/down) requires `Authorization: Bearer <token>`, compared in
+  constant time; set `admin.auth.protect_reads: true` to require it on the read
+  routes and `/metrics` too. Unset leaves the admin API open exactly as before.
+
+### Changed
+- **Bound to a wildcard address with no `advertised_address`, Via/Contact and the
+  outbound socket source now use the host's auto-detected routable local IP
+  instead of `127.0.0.1`.** An instance listening on `0.0.0.0` / `[::]` without
+  `advertised_address` used to advertise loopback, which no remote peer can reach
+  and from which no new outbound TLS connection can be opened. The shared
+  address resolver now performs a dependency-free route lookup to pick the
+  primary local address; loopback remains only as a last resort on a host with no
+  default route. Setting `advertised_address` explicitly is still recommended
+  behind NAT, where the auto-detected address is the private one.
+
 ### Fixed
 - **In-dialog re-INVITE / UPDATE / BYE are now routed by SIP dialog identity, not
   by source socket.** A B2BUA decided which leg an in-dialog request belonged to
@@ -24,17 +73,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   live connection (falling back to the remote-target Contact when a TLS
   connection has closed) instead of dialing the peer's dead ephemeral source
   port.
-
-### Changed
-- **Bound to a wildcard address with no `advertised_address`, Via/Contact now use
-  the host's auto-detected routable local IP instead of `127.0.0.1`.** An
-  instance listening on `0.0.0.0` / `[::]` without `advertised_address` used to
-  advertise loopback, which no remote peer can reach and from which no new
-  outbound TLS connection can be opened. It now performs a dependency-free route
-  lookup to pick the primary local address; loopback remains only as a last
-  resort on a host with no default route. Setting `advertised_address`
-  explicitly is still recommended behind NAT, where the auto-detected address is
-  the private one.
 
 ## [1.4.0] — 2026-07-14
 

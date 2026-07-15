@@ -74,13 +74,18 @@ RUN cargo chef prepare --recipe-path recipe.json
 # ── Build dependencies (cached until Cargo.toml/lock change) ─────────────────
 FROM chef AS builder
 COPY --from=planner /build/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release --features ui --recipe-path recipe.json
 
-# Build the real binary
+# Build the real binary. The embedded operator web UI (`ui` feature) is compiled
+# in by default in the image — it's an EXPERIMENTAL dashboard, served only when
+# `admin.ui.enabled` is set in siphon.yaml. `ui/` is a single self-contained HTML
+# file baked in by rust-embed (no Node/build step). Drop `--features ui` on both
+# the cook and build lines to produce a leaner image without it.
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY benches/ benches/
-RUN cargo build --release
+COPY ui/ ui/
+RUN cargo build --release --features ui
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
 FROM debian:trixie-slim
