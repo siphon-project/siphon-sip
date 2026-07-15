@@ -457,6 +457,20 @@ impl Leg {
             auth_challenged: false,
         }
     }
+
+    /// True for the re-INVITE/UPDATE response-tracking pseudo-legs the
+    /// dispatcher inserts as B-legs. Their `target_uri` is a direction marker
+    /// (`reinvite:`/`update:`/`…_done:`) and they deliberately reuse another
+    /// leg's Call-ID for response routing, so they must be excluded from
+    /// dialog-identity direction matching.
+    pub fn is_tracking_leg(&self) -> bool {
+        self.dialog.target_uri.as_deref().is_some_and(|target| {
+            target.starts_with("reinvite:")
+                || target.starts_with("reinvite_done:")
+                || target.starts_with("update:")
+                || target.starts_with("update_done:")
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -730,6 +744,60 @@ impl CallActor {
             auth_retry_count: 0,
             answer_deadline: None,
             auth_passthrough: false,
+        }
+    }
+
+    /// Which leg an in-dialog request (re-INVITE / UPDATE / BYE) arrived on,
+    /// determined by SIP dialog identity (RFC 3261 §12 — Call-ID, with the
+    /// From-tag only as a tie-breaker), never by source socket.
+    ///
+    /// A peer that reconnects per transaction (TLS) or rebinds its NAT port
+    /// sends the in-dialog request from a *different* source address than its
+    /// original INVITE, so comparing sockets misroutes the request (it gets
+    /// reflected back at the leg it came from). The Call-ID is stable across
+    /// the dialog, so it is the correct discriminator.
+    ///
+    /// Returns `None` when the Call-ID matches no live dialog on this call —
+    /// the caller answers 481 Call/Transaction Does Not Exist.
+    pub fn request_direction(&self, sip_call_id: &str, from_tag: Option<&str>) -> Option<LegSide> {
+        let a_match = self.a_leg.dialog.call_id == sip_call_id;
+        let winner_b = self.winner.and_then(|index| self.b_legs.get(index));
+        let b_match = winner_b.is_some_and(|leg| leg.dialog.call_id == sip_call_id);
+
+        match (a_match, b_match) {
+            (true, false) => Some(LegSide::A),
+            (false, true) => Some(LegSide::B),
+            (true, true) => {
+                // Both legs carry the same Call-ID — `preserve_call_id` copies
+                // the A-leg Call-ID onto the B-leg. Disambiguate by From-tag:
+                // an in-dialog request's From-tag is the *peer's* own tag,
+                // which is what we stored as each leg's `remote_tag`.
+                let from_tag = from_tag?;
+                if self.a_leg.dialog.remote_tag.as_deref() == Some(from_tag) {
+                    Some(LegSide::A)
+                } else if winner_b.and_then(|leg| leg.dialog.remote_tag.as_deref())
+                    == Some(from_tag)
+                {
+                    Some(LegSide::B)
+                } else {
+                    None
+                }
+            }
+            (false, false) => {
+                // No winner yet (early dialog): an UPDATE (RFC 3311 §5.2) may
+                // arrive on a not-yet-won fork leg. Match any real
+                // (non-tracking) B-leg's Call-ID.
+                if self.winner.is_none()
+                    && self
+                        .b_legs
+                        .iter()
+                        .any(|leg| !leg.is_tracking_leg() && leg.dialog.call_id == sip_call_id)
+                {
+                    Some(LegSide::B)
+                } else {
+                    None
+                }
+            }
         }
     }
 

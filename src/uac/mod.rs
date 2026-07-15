@@ -29,48 +29,53 @@ pub fn resolve_via_addr(
     advertised_addrs: &HashMap<Transport, String>,
     advertised_address: Option<&str>,
 ) -> SocketAddr {
-    if local_addr.ip().is_unspecified() {
-        // Check per-transport advertised address first
-        if let Some(adv) = advertised_addrs.get(transport) {
-            if let Ok(ip) = adv.parse::<std::net::IpAddr>() {
-                return SocketAddr::new(ip, local_addr.port());
-            }
-            // Not an IP literal (e.g. an FQDN). This resolves the *socket
-            // source* address, which needs an IP; the FQDN is carried into
-            // the Via/Contact/From host separately via `resolve_via_host`.
-            debug!(
-                transport = %transport,
-                value = %adv,
-                "per-transport advertised address is not an IP literal; \
-                 using the local IP for the socket source"
-            );
-        }
-        // Fall back to global advertised_address
-        let fallback = if local_addr.is_ipv6() { "::1" } else { "127.0.0.1" };
-        let host = advertised_address.unwrap_or(fallback);
-        match host.parse::<std::net::IpAddr>() {
-            Ok(ip) => SocketAddr::new(ip, local_addr.port()),
-            Err(_) => {
-                // FQDN (or otherwise non-IP) advertised_address. Expected and
-                // benign: the socket source falls back to localhost, while the
-                // SIP header host is taken from the advertised value via
-                // `resolve_via_host` (RFC 3261 §20.42 permits an FQDN there).
-                debug!(
-                    value = %host,
-                    "advertised_address is not an IP literal; using localhost \
-                     for the socket source (the SIP header host uses the FQDN)"
-                );
-                let ip = if local_addr.is_ipv6() {
-                    std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-                } else {
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-                };
-                SocketAddr::new(ip, local_addr.port())
-            }
-        }
-    } else {
-        local_addr
+    if !local_addr.ip().is_unspecified() {
+        return local_addr;
     }
+    // Per-transport advertised IP literal wins.
+    if let Some(adv) = advertised_addrs.get(transport) {
+        if let Ok(ip) = adv.parse::<std::net::IpAddr>() {
+            return SocketAddr::new(ip, local_addr.port());
+        }
+        // Not an IP literal (e.g. an FQDN). This resolves the *socket source*
+        // address, which needs an IP; the FQDN is carried into the
+        // Via/Contact/From host separately via `resolve_via_host`.
+        debug!(
+            transport = %transport,
+            value = %adv,
+            "per-transport advertised address is not an IP literal; \
+             auto-detecting the local IP for the socket source"
+        );
+    }
+    // Global advertised IP literal wins.
+    if let Some(global) = advertised_address {
+        if let Ok(ip) = global.parse::<std::net::IpAddr>() {
+            return SocketAddr::new(ip, local_addr.port());
+        }
+        // FQDN (or otherwise non-IP) advertised_address. Expected and benign:
+        // the SIP header host is taken from the advertised value via
+        // `resolve_via_host` (RFC 3261 §20.42 permits an FQDN there); the socket
+        // source falls through to auto-detection below.
+        debug!(
+            value = %global,
+            "advertised_address is not an IP literal; auto-detecting the socket \
+             source (the SIP header host uses the FQDN)"
+        );
+    }
+    // No advertised IP literal. Auto-detect the host's routable local IP (a
+    // dependency-free UDP route lookup) rather than advertising loopback, which
+    // no remote peer can reach and from which no new outbound TLS connection can
+    // be opened. Loopback stays only as a last resort (loopback-only host / no
+    // default route).
+    if let Some(ip) = crate::transport::detect_routable_local_ip(local_addr.is_ipv6()) {
+        return SocketAddr::new(ip, local_addr.port());
+    }
+    let loopback = if local_addr.is_ipv6() {
+        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+    } else {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    };
+    SocketAddr::new(loopback, local_addr.port())
 }
 
 /// Resolve the host (IP literal or FQDN) to advertise in the Via/From/Contact
@@ -1053,24 +1058,43 @@ mod tests {
     }
 
     #[test]
-    fn resolve_via_addr_localhost_fallback_on_no_config() {
+    fn resolve_via_addr_autodetects_when_no_config() {
+        // No advertised address: auto-detect the routable local IP instead of
+        // advertising loopback (which no remote peer can reach). Loopback only
+        // remains as a last resort on a host with no default route.
         let addr: SocketAddr = "0.0.0.0:5060".parse().unwrap();
         let result = resolve_via_addr(addr, &Transport::Udp, &HashMap::new(), None);
-        assert_eq!(result, "127.0.0.1:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(result.port(), 5060);
+        assert!(!result.ip().is_unspecified());
+        if crate::transport::detect_routable_local_ip(false).is_some() {
+            assert!(!result.ip().is_loopback(), "expected a routable IP, got {result}");
+        }
     }
 
     #[test]
-    fn resolve_via_addr_ipv6_localhost_fallback() {
+    fn resolve_via_addr_ipv6_autodetect_or_loopback() {
+        // IPv6 wildcard bind, no advertised address: auto-detect a routable v6
+        // when one exists, else loopback (::1). Never unspecified.
         let addr: SocketAddr = "[::]:5060".parse().unwrap();
         let result = resolve_via_addr(addr, &Transport::Udp, &HashMap::new(), None);
-        assert_eq!(result, "[::1]:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(result.port(), 5060);
+        assert!(!result.ip().is_unspecified());
+        if crate::transport::detect_routable_local_ip(true).is_some() {
+            assert!(!result.ip().is_loopback(), "expected a routable v6, got {result}");
+        }
     }
 
     #[test]
-    fn resolve_via_addr_invalid_global_falls_back_to_localhost() {
+    fn resolve_via_addr_non_ip_global_autodetects_source() {
+        // A non-IP advertised_address (FQDN) leaves the socket source to
+        // auto-detection, not loopback (the FQDN is used for the SIP header host
+        // separately via resolve_via_host).
         let addr: SocketAddr = "0.0.0.0:5060".parse().unwrap();
         let result = resolve_via_addr(addr, &Transport::Udp, &HashMap::new(), Some("not-an-ip"));
-        assert_eq!(result, "127.0.0.1:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(result.port(), 5060);
+        if crate::transport::detect_routable_local_ip(false).is_some() {
+            assert!(!result.ip().is_loopback(), "FQDN should auto-detect source, got {result}");
+        }
     }
 
     #[test]

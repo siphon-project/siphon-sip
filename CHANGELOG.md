@@ -44,6 +44,36 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   constant time; set `admin.auth.protect_reads: true` to require it on the read
   routes and `/metrics` too. Unset leaves the admin API open exactly as before.
 
+### Changed
+- **Bound to a wildcard address with no `advertised_address`, Via/Contact and the
+  outbound socket source now use the host's auto-detected routable local IP
+  instead of `127.0.0.1`.** An instance listening on `0.0.0.0` / `[::]` without
+  `advertised_address` used to advertise loopback, which no remote peer can reach
+  and from which no new outbound TLS connection can be opened. The shared
+  address resolver now performs a dependency-free route lookup to pick the
+  primary local address; loopback remains only as a last resort on a host with no
+  default route. Setting `advertised_address` explicitly is still recommended
+  behind NAT, where the auto-detected address is the private one.
+
+### Fixed
+- **In-dialog re-INVITE / UPDATE / BYE are now routed by SIP dialog identity, not
+  by source socket.** A B2BUA decided which leg an in-dialog request belonged to
+  by comparing the request's source address against that leg's original INVITE
+  socket. A peer that opens a fresh connection per transaction (a new TLS
+  connection has a new source port, as some carrier SBCs do) or rebinds its NAT
+  port therefore looked like it came from the wrong leg: the request was
+  reflected back at the leg it arrived on instead of being bridged to the far
+  leg. The consequence was a re-INVITE that never reached the other side, media
+  that was never renegotiated, and the call being torn down seconds later.
+  Direction is now taken from the Call-ID (with the From-tag as a tie-breaker for
+  `preserve_call_id` dialogs); an in-dialog request whose Call-ID matches no live
+  dialog leg is answered `481 Call/Transaction Does Not Exist`. The originating
+  leg's flow is refreshed on every in-dialog request so the response and later
+  requests reach the peer's live connection, and a B-to-A forward reuses that
+  live connection (falling back to the remote-target Contact when a TLS
+  connection has closed) instead of dialing the peer's dead ephemeral source
+  port.
+
 ## [1.4.0] — 2026-07-14
 
 _Codename: bjorn._

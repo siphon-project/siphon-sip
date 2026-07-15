@@ -460,34 +460,36 @@ pub async fn run(
     product_name: &'static str,
     product_version: &'static str,
 ) {
-    // Resolve the local address for Via insertion.
-    // If bound to 0.0.0.0 / [::], use advertised_address from config, or loopback.
-    let via_addr = if local_addr.ip().is_unspecified() {
-        let fallback = if local_addr.is_ipv6() { "::1" } else { "127.0.0.1" };
-        let host = config
-            .advertised_address
-            .as_deref()
-            .unwrap_or(fallback);
-        if config.advertised_address.is_none() {
+    // Resolve the generic local address for Via insertion. When bound to a
+    // wildcard (0.0.0.0 / [::]), the shared resolver prefers an explicit global
+    // `advertised_address`, else the host's auto-detected routable IP, else
+    // loopback. Pass an empty per-transport map: this is the transport-agnostic
+    // fallback (`state.local_addr`); `via_host` layers per-transport advertised
+    // addresses on top of it. The transport arg is therefore a throwaway.
+    let via_addr = crate::uac::resolve_via_addr(
+        local_addr,
+        &Transport::Udp,
+        &std::collections::HashMap::new(),
+        config.advertised_address.as_deref(),
+    );
+    if local_addr.ip().is_unspecified() && config.advertised_address.is_none() {
+        if via_addr.ip().is_loopback() {
             warn!(
                 bind = %local_addr,
-                "binding to unspecified address with no `advertised_address` configured — \
-                 Via/Contact will use {fallback}; remote peers will not be able to reach this instance"
+                "bound to an unspecified address with no `advertised_address` and no routable \
+                 local IP detected — Via/Contact will use loopback; remote peers cannot reach \
+                 this instance. Set `advertised_address`."
+            );
+        } else {
+            warn!(
+                bind = %local_addr,
+                advertised = %via_addr.ip(),
+                "bound to an unspecified address with no `advertised_address` — using the \
+                 auto-detected local IP for Via/Contact. Behind NAT, set `advertised_address` \
+                 to the public address."
             );
         }
-        let ip: std::net::IpAddr = host
-            .parse()
-            .unwrap_or_else(|_| {
-                if local_addr.is_ipv6() {
-                    std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-                } else {
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-                }
-            });
-        SocketAddr::new(ip, local_addr.port())
-    } else {
-        local_addr
-    };
+    }
 
     let default_server = format!("{product_name}/{product_version}");
     let server_header = Some(
@@ -4945,6 +4947,45 @@ fn resolve_candidates_inner(
 /// weighted-random / shuffled pick on every call.
 fn resolve_target(uri_string: &str, resolver: &SipResolver) -> Option<RelayTarget> {
     resolve_candidates(uri_string, resolver).into_iter().next()
+}
+
+/// For a B→A in-dialog forward over **TLS**, decide whether to dial the remote
+/// target Contact instead of the target leg's cached socket.
+///
+/// A peer that opens a fresh TLS connection per transaction (e.g. a Teams
+/// Direct Routing SBC) closes its old connection; the leg's cached
+/// `remote_addr` is then the peer's dead *source* port and its cached
+/// `connection_id` is gone from the connection map, so both the reuse path and
+/// the cached-socket fallback would time out. In that case dial the remote
+/// target Contact's resolved host:port (RFC 3261 §12.2.1.1 — e.g. the SBC's
+/// `…pstnhub…:443`), carrying the SNI needed for the new TLS handshake.
+///
+/// Returns `None` (keep the default reuse / cached-socket path) unless: the
+/// forward is B→A, over TLS, there is no dialog route set to follow, and the
+/// leg's TLS connection is no longer registered as alive. Scoped to TLS
+/// because only the TLS listener registers inbound connections in
+/// `stream_connections` (a TCP inbound connection is invisible there, so its
+/// liveness can't be judged this way, and a NAT'd peer must keep its cached
+/// source socket).
+fn contact_fallback_target(
+    from_a_leg: bool,
+    send_dest: SocketAddr,
+    send_transport: Transport,
+    target_connection_id: ConnectionId,
+    route_set_empty: bool,
+    remote_contact: Option<&str>,
+    state: &DispatcherState,
+) -> Option<RelayTarget> {
+    if from_a_leg
+        || send_transport != Transport::Tls
+        || !route_set_empty
+        || state
+            .stream_connections
+            .is_alive(send_dest, send_transport, target_connection_id)
+    {
+        return None;
+    }
+    resolve_target(remote_contact?, &state.dns_resolver)
 }
 
 /// Send a relayed request to a resolved target, using the connection pool for
@@ -12093,18 +12134,42 @@ fn handle_b2bua_bye(
         }
     };
 
-    // Extract everything from the DashMap ref and drop it before entering Python
-    let (from_a_leg, a_leg_invite, a_leg_source_ip, a_leg_transport) =
+    // In-dialog direction by dialog identity (RFC 3261 §12 — Call-ID + From-tag),
+    // never by source socket: a peer that reconnects per transaction (TLS) or
+    // rebinds its NAT port sends the BYE from a different address than its
+    // INVITE. A Call-ID that matches no live dialog leg is answered 481 here,
+    // before the Python on_bye handlers + CDR finalize below, so a stray BYE
+    // can't close a CDR with a bogus direction.
+    let from_tag = message.typed_from().ok().flatten().and_then(|na| na.tag);
+    let from_a_leg = match state
+        .call_actors
+        .get_call(&call_id)
+        .and_then(|call| call.request_direction(&sip_call_id, from_tag.as_deref()))
+    {
+        Some(crate::b2bua::actor::LegSide::A) => true,
+        Some(crate::b2bua::actor::LegSide::B) => false,
+        None => {
+            warn!(sip_call_id = %sip_call_id, "B2BUA BYE: Call-ID matches no dialog leg — 481");
+            let response = build_response(
+                &message, 481, "Call/Transaction Does Not Exist",
+                state.server_header.as_deref(), &[],
+            );
+            send_message_from(
+                response, inbound.transport, inbound.remote_addr,
+                inbound.connection_id, Some(inbound.local_addr), state,
+            );
+            return;
+        }
+    };
+
+    // Extract the rest from the DashMap ref and drop it before entering Python
+    let (a_leg_invite, a_leg_source_ip, a_leg_transport) =
         match state.call_actors.get_call(&call_id) {
-            Some(call) => {
-                let from_a = inbound.remote_addr == call.a_leg.transport.remote_addr;
-                (
-                    from_a,
-                    call.a_leg_invite.clone(),
-                    call.a_leg.transport.remote_addr.ip().to_string(),
-                    format!("{}", call.a_leg.transport.transport).to_lowercase(),
-                )
-            }
+            Some(call) => (
+                call.a_leg_invite.clone(),
+                call.a_leg.transport.remote_addr.ip().to_string(),
+                format!("{}", call.a_leg.transport.transport).to_lowercase(),
+            ),
             None => return,
         };
 
@@ -12427,7 +12492,9 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
         branch.clone(),
         LegTransport {
             remote_addr: b_leg.transport.remote_addr,
-            connection_id: ConnectionId::default(),
+            // Track the B-leg's live connection (consistent with the in-dialog
+            // re-INVITE/UPDATE forward reuse) rather than a placeholder.
+            connection_id: b_leg.transport.connection_id,
             transport: b_leg.transport.transport,
             local_addr: None,
         },
@@ -12972,12 +13039,71 @@ fn handle_b2bua_reinvite(
         }
     };
 
-    // Determine direction and extract routing info + per-leg contacts
-    let (from_a_leg, a_leg, winner_b_leg) = match state.call_actors.get_call(&call_id) {
+    // In-dialog direction by dialog identity (RFC 3261 §12 — Call-ID + From-tag),
+    // never by source socket: a Teams-style peer opens a NEW TLS connection (new
+    // source port) for its re-INVITE, so a socket comparison misclassifies the
+    // direction and reflects the re-INVITE back at the leg it came from.
+    let from_tag = message.typed_from().ok().flatten().and_then(|na| na.tag);
+    let from_a_leg = match state
+        .call_actors
+        .get_call(&call_id)
+        .and_then(|call| call.request_direction(&sip_call_id, from_tag.as_deref()))
+    {
+        Some(crate::b2bua::actor::LegSide::A) => true,
+        Some(crate::b2bua::actor::LegSide::B) => false,
+        None => {
+            warn!(sip_call_id = %sip_call_id, "B2BUA re-INVITE: Call-ID matches no dialog leg — 481");
+            let response = build_response(
+                &message, 481, "Call/Transaction Does Not Exist",
+                state.server_header.as_deref(), &[],
+            );
+            send_message_from(
+                response, inbound.transport, inbound.remote_addr,
+                inbound.connection_id, Some(inbound.local_addr), state,
+            );
+            return;
+        }
+    };
+
+    // Flow refresh (RFC 5626 / RFC 3261 §12.2.2): the peer may have sent this
+    // in-dialog re-INVITE on a new flow (TLS reconnect / NAT rebind). Re-anchor
+    // the originating leg's transport + remote target on the arrival flow so the
+    // 200 OK toward that peer — and later in-dialog requests — reach the live
+    // connection instead of the peer's dead original socket. Done before the
+    // snapshot below so the clones carry the live flow.
+    let refreshed_contact = message
+        .headers
+        .get("Contact")
+        .or_else(|| message.headers.get("m"))
+        .map(|value| crate::b2bua::actor::extract_contact_uri(value));
+    if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
+        let winner_index = call.winner;
+        let origin_leg: Option<&mut Leg> = if from_a_leg {
+            Some(&mut call.a_leg)
+        } else if let Some(index) = winner_index {
+            call.b_legs.get_mut(index)
+        } else {
+            None
+        };
+        if let Some(leg) = origin_leg {
+            if leg.transport.remote_addr != inbound.remote_addr
+                || leg.transport.connection_id != inbound.connection_id
+            {
+                leg.transport.remote_addr = inbound.remote_addr;
+                leg.transport.connection_id = inbound.connection_id;
+                leg.transport.local_addr = Some(inbound.local_addr);
+            }
+            if let Some(ref contact) = refreshed_contact {
+                leg.dialog.remote_contact = Some(contact.clone());
+            }
+        }
+    }
+
+    // Snapshot routing info + per-leg contacts AFTER the flow refresh.
+    let (a_leg, winner_b_leg) = match state.call_actors.get_call(&call_id) {
         Some(call) => {
-            let from_a = inbound.remote_addr == call.a_leg.transport.remote_addr;
             let b_leg = call.winner.and_then(|i| call.b_legs.get(i).cloned());
-            (from_a, call.a_leg.clone(), b_leg)
+            (call.a_leg.clone(), b_leg)
         }
         None => return,
     };
@@ -13070,7 +13196,7 @@ fn handle_b2bua_reinvite(
                 &b_leg.dialog.local_tag,
                 b_leg.dialog.remote_tag.as_deref(),
             );
-            Some((b_leg.transport.remote_addr, b_leg.transport.transport, b_leg.transport.local_addr, b_leg.dialog.call_id.clone(), b_leg.dialog.local_tag.clone()))
+            Some((b_leg.transport.remote_addr, b_leg.transport.transport, b_leg.transport.local_addr, b_leg.transport.connection_id, b_leg.dialog.call_id.clone(), b_leg.dialog.local_tag.clone()))
         } else {
             warn!(call_id = %call_id, "B2BUA re-INVITE: no winning B-leg");
             return;
@@ -13086,10 +13212,10 @@ fn handle_b2bua_reinvite(
                 Some(&a_leg.dialog.local_tag),
             );
         }
-        Some((a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.transport.local_addr, a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()))
+        Some((a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.transport.local_addr, a_leg.transport.connection_id, a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()))
     };
 
-    if let Some((destination, transport, target_local_addr, leg_call_id, leg_from_tag)) = reinvite_target {
+    if let Some((destination, transport, target_local_addr, target_connection_id, leg_call_id, leg_from_tag)) = reinvite_target {
         // Set Via with correct transport for the target leg
         let transport_str = format!("{}", transport).to_uppercase();
         let via_value = format!(
@@ -13266,7 +13392,10 @@ fn handle_b2bua_reinvite(
             branch.clone(),
             LegTransport {
                 remote_addr: send_dest,
-                connection_id: ConnectionId::default(),
+                // Reuse the target leg's live connection (mirrors the framework
+                // BYE) so a B→A forward writes on the connection the peer is on
+                // rather than dialing its dead ephemeral source port.
+                connection_id: target_connection_id,
                 transport: send_transport,
                 // Anchor the tracking leg on the target's socket (the A-leg's arrival
                 // listener for B→A) so a post-teardown zombie re-ACK to this leg
@@ -13278,19 +13407,32 @@ fn handle_b2bua_reinvite(
         reinvite_leg.stored_cseq = message.headers.cseq().map(|c| c.to_string());
         state.call_actors.add_b_leg(&call_id, reinvite_leg);
 
-        // Forward B→A on the A-leg's anchored socket (multi-homed source-port
-        // parity — pins the UDP egress; connection selection is unchanged, same as
-        // send_b2bua_to_bleg). A→B (target_local_addr None) egresses as before.
-        if let Some(source) = target_local_addr {
-            let data = Bytes::from(forwarded.to_bytes());
-            let target = RelayTarget {
-                address: send_dest,
-                transport: Some(send_transport),
-                server_name: None,
-            };
-            send_to_target(data, &target, send_transport, ConnectionId::default(), Some(source), state);
-        } else {
+        // Forward to the target leg. A→B: destination-keyed reuse via
+        // stream_connections + pool/SNI. B→A: reuse the target leg's live
+        // connection via the connection_map exactly like the framework BYE
+        // (send_message_from → OutboundRouter → TLS/TCP distributor connection_map
+        // lookup, dialing only on a miss); target_local_addr keeps the UDP egress
+        // pinned for multi-homed source-port parity. If the target's TLS
+        // connection is dead, dial its remote-target Contact instead of the dead
+        // cached socket (RFC 3261 §12.2.1.1).
+        let contact_fallback = contact_fallback_target(
+            from_a_leg, send_dest, send_transport, target_connection_id,
+            target_route_set.is_empty(), target_remote_contact.as_deref(), state,
+        );
+        if from_a_leg {
             send_b2bua_to_bleg(forwarded, send_transport, send_dest, state);
+        } else if let Some(target) = contact_fallback {
+            warn!(
+                call_id = %call_id, dest = %target.address,
+                "B2BUA re-INVITE B→A: stored TLS connection dead — dialing remote target Contact"
+            );
+            let data = Bytes::from(forwarded.to_bytes());
+            send_to_target(data, &target, send_transport, ConnectionId::default(), target_local_addr, state);
+        } else {
+            send_message_from(
+                forwarded, send_transport, send_dest,
+                target_connection_id, target_local_addr, state,
+            );
         }
 
         // Increment the target leg's local CSeq after sending the re-INVITE
@@ -13343,11 +13485,67 @@ fn handle_b2bua_update(
         }
     };
 
-    let (from_a_leg, a_leg, winner_b_leg) = match state.call_actors.get_call(&call_id) {
+    // In-dialog direction by dialog identity (RFC 3261 §12 — Call-ID + From-tag),
+    // never by source socket (RFC 3311 UPDATE; same reconnect/NAT hazard as the
+    // re-INVITE path). A Call-ID matching no live dialog leg is answered 481.
+    let from_tag = message.typed_from().ok().flatten().and_then(|na| na.tag);
+    let from_a_leg = match state
+        .call_actors
+        .get_call(&call_id)
+        .and_then(|call| call.request_direction(&sip_call_id, from_tag.as_deref()))
+    {
+        Some(crate::b2bua::actor::LegSide::A) => true,
+        Some(crate::b2bua::actor::LegSide::B) => false,
+        None => {
+            warn!(sip_call_id = %sip_call_id, "B2BUA UPDATE: Call-ID matches no dialog leg — 481");
+            let response = build_response(
+                &message, 481, "Call/Transaction Does Not Exist",
+                state.server_header.as_deref(), &[],
+            );
+            send_message_from(
+                response, inbound.transport, inbound.remote_addr,
+                inbound.connection_id, Some(inbound.local_addr), state,
+            );
+            return;
+        }
+    };
+
+    // Flow refresh (RFC 5626 / RFC 3261 §12.2.2): re-anchor the originating leg
+    // on the arrival flow so the UPDATE 200 OK and later in-dialog requests reach
+    // the live connection. Done before the snapshot so the clones carry it.
+    let refreshed_contact = message
+        .headers
+        .get("Contact")
+        .or_else(|| message.headers.get("m"))
+        .map(|value| crate::b2bua::actor::extract_contact_uri(value));
+    if let Some(mut call) = state.call_actors.get_call_mut(&call_id) {
+        let winner_index = call.winner;
+        let origin_leg: Option<&mut Leg> = if from_a_leg {
+            Some(&mut call.a_leg)
+        } else if let Some(index) = winner_index {
+            call.b_legs.get_mut(index)
+        } else {
+            None
+        };
+        if let Some(leg) = origin_leg {
+            if leg.transport.remote_addr != inbound.remote_addr
+                || leg.transport.connection_id != inbound.connection_id
+            {
+                leg.transport.remote_addr = inbound.remote_addr;
+                leg.transport.connection_id = inbound.connection_id;
+                leg.transport.local_addr = Some(inbound.local_addr);
+            }
+            if let Some(ref contact) = refreshed_contact {
+                leg.dialog.remote_contact = Some(contact.clone());
+            }
+        }
+    }
+
+    // Snapshot routing info + per-leg contacts AFTER the flow refresh.
+    let (a_leg, winner_b_leg) = match state.call_actors.get_call(&call_id) {
         Some(call) => {
-            let from_a = inbound.remote_addr == call.a_leg.transport.remote_addr;
             let b_leg = call.winner.and_then(|i| call.b_legs.get(i).cloned());
-            (from_a, call.a_leg.clone(), b_leg)
+            (call.a_leg.clone(), b_leg)
         }
         None => return,
     };
@@ -13395,7 +13593,7 @@ fn handle_b2bua_update(
                 &b_leg.dialog.local_tag,
                 b_leg.dialog.remote_tag.as_deref(),
             );
-            Some((b_leg.transport.remote_addr, b_leg.transport.transport, b_leg.transport.local_addr, b_leg.dialog.call_id.clone(), b_leg.dialog.local_tag.clone()))
+            Some((b_leg.transport.remote_addr, b_leg.transport.transport, b_leg.transport.local_addr, b_leg.transport.connection_id, b_leg.dialog.call_id.clone(), b_leg.dialog.local_tag.clone()))
         } else {
             warn!(call_id = %call_id, "B2BUA UPDATE: no winning B-leg");
             return;
@@ -13410,10 +13608,10 @@ fn handle_b2bua_update(
                 Some(&a_leg.dialog.local_tag),
             );
         }
-        Some((a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.transport.local_addr, a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()))
+        Some((a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.transport.local_addr, a_leg.transport.connection_id, a_leg.dialog.call_id.clone(), a_leg.dialog.remote_tag.clone().unwrap_or_default()))
     };
 
-    if let Some((destination, transport, target_local_addr, leg_call_id, leg_from_tag)) = update_target {
+    if let Some((destination, transport, target_local_addr, target_connection_id, leg_call_id, leg_from_tag)) = update_target {
         let transport_str = format!("{}", transport).to_uppercase();
         let via_value = format!(
             "SIP/2.0/{} {}:{};branch={}",
@@ -13578,7 +13776,10 @@ fn handle_b2bua_update(
             branch.clone(),
             LegTransport {
                 remote_addr: send_dest,
-                connection_id: ConnectionId::default(),
+                // Reuse the target leg's live connection (mirrors the framework
+                // BYE) so a B→A forward writes on the connection the peer is on
+                // rather than dialing its dead ephemeral source port.
+                connection_id: target_connection_id,
                 transport: send_transport,
                 // Anchor the tracking leg on the target's socket (the A-leg's arrival
                 // listener for B→A) so a post-teardown zombie re-ACK to this leg
@@ -13590,19 +13791,32 @@ fn handle_b2bua_update(
         update_leg.stored_cseq = message.headers.cseq().map(|c| c.to_string());
         state.call_actors.add_b_leg(&call_id, update_leg);
 
-        // Forward B→A on the A-leg's anchored socket (multi-homed source-port
-        // parity — pins the UDP egress; connection selection is unchanged, same as
-        // send_b2bua_to_bleg). A→B (target_local_addr None) egresses as before.
-        if let Some(source) = target_local_addr {
-            let data = Bytes::from(forwarded.to_bytes());
-            let target = RelayTarget {
-                address: send_dest,
-                transport: Some(send_transport),
-                server_name: None,
-            };
-            send_to_target(data, &target, send_transport, ConnectionId::default(), Some(source), state);
-        } else {
+        // Forward to the target leg. A→B: destination-keyed reuse via
+        // stream_connections + pool/SNI. B→A: reuse the target leg's live
+        // connection via the connection_map exactly like the framework BYE
+        // (send_message_from → OutboundRouter → TLS/TCP distributor connection_map
+        // lookup, dialing only on a miss); target_local_addr keeps the UDP egress
+        // pinned for multi-homed source-port parity. If the target's TLS
+        // connection is dead, dial its remote-target Contact instead of the dead
+        // cached socket (RFC 3261 §12.2.1.1).
+        let contact_fallback = contact_fallback_target(
+            from_a_leg, send_dest, send_transport, target_connection_id,
+            target_route_set.is_empty(), target_remote_contact.as_deref(), state,
+        );
+        if from_a_leg {
             send_b2bua_to_bleg(forwarded, send_transport, send_dest, state);
+        } else if let Some(target) = contact_fallback {
+            warn!(
+                call_id = %call_id, dest = %target.address,
+                "B2BUA UPDATE B→A: stored TLS connection dead — dialing remote target Contact"
+            );
+            let data = Bytes::from(forwarded.to_bytes());
+            send_to_target(data, &target, send_transport, ConnectionId::default(), target_local_addr, state);
+        } else {
+            send_message_from(
+                forwarded, send_transport, send_dest,
+                target_connection_id, target_local_addr, state,
+            );
         }
 
         // Bump local CSeq on the target leg after sending.

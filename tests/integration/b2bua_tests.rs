@@ -4,7 +4,7 @@
 //! registrar lookups for routing B2BUA calls, and transaction key handling.
 
 use siphon::b2bua::actor::{
-    CallActor, CallActorStore, CallEvent, CallState, Leg, LegActor, TransportInfo,
+    CallActor, CallActorStore, CallEvent, CallState, Leg, LegActor, LegSide, TransportInfo,
     SessionTimerState, generate_call_id, generate_tag,
 };
 use siphon::b2bua::header_policy::{
@@ -2008,4 +2008,117 @@ fn validator_accepts_intra_trust_with_per_call_authorization_copy() {
     apply_to_request(&mut invite, &policy, &test_ctx());
     // Authorization copied through (case-c transparent auth)
     assert!(invite.headers.has("Authorization"));
+}
+
+// ---------------------------------------------------------------------------
+// In-dialog direction detection (re-INVITE / UPDATE / BYE) by SIP dialog
+// identity, NOT by source socket. A peer that reconnects per transaction (TLS)
+// or rebinds its NAT port sends the in-dialog request from a *different* source
+// address than its INVITE; a socket comparison misroutes it (reflecting it back
+// at the leg it came from). `request_direction` takes no socket input, so these
+// state-level tests encode exactly that regression.
+// ---------------------------------------------------------------------------
+
+/// Build a winning-B-leg call and return (store, call_id, b_call_id, b_tag).
+fn make_answered_call(a_call_id: &str) -> (CallActorStore, String, String, String) {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg(a_call_id));
+    let mut b_leg = make_b_leg("198.51.100.20:5060");
+    let b_call_id = b_leg.dialog.call_id.clone();
+    let b_tag = "bob-tag".to_string();
+    b_leg.dialog.remote_tag = Some(b_tag.clone());
+    store.add_b_leg(&call_id, b_leg);
+    store.set_winner(&call_id, 0);
+    (store, call_id, b_call_id, b_tag)
+}
+
+#[test]
+fn direction_from_a_ignores_source_socket() {
+    // The A-leg's stored socket is 10.0.0.1:5060 (make_a_leg). The re-INVITE in
+    // the real trace arrived from a *new* TLS source port — but direction is
+    // decided by the A-leg Call-ID + From-tag, which are stable, so no socket is
+    // consulted at all.
+    let (store, call_id, _b_call_id, _b_tag) = make_answered_call("teams-cid");
+    let call = store.get_call(&call_id).unwrap();
+    assert_eq!(
+        call.request_direction("teams-cid", Some("alice-tag")),
+        Some(LegSide::A),
+    );
+}
+
+#[test]
+fn direction_from_b() {
+    let (store, call_id, b_call_id, b_tag) = make_answered_call("teams-cid");
+    let call = store.get_call(&call_id).unwrap();
+    assert_eq!(
+        call.request_direction(&b_call_id, Some(&b_tag)),
+        Some(LegSide::B),
+    );
+}
+
+#[test]
+fn direction_unknown_call_id_is_none() {
+    // A Call-ID that matches neither leg → None (the handler answers 481 rather
+    // than bridging to a guessed leg).
+    let (store, call_id, _b_call_id, _b_tag) = make_answered_call("teams-cid");
+    let call = store.get_call(&call_id).unwrap();
+    assert_eq!(call.request_direction("stranger-cid", Some("who-tag")), None);
+}
+
+#[test]
+fn preserve_call_id_disambiguates_by_from_tag() {
+    // With preserve_call_id both legs carry the same Call-ID, so the From-tag
+    // (the peer's own tag = our stored remote_tag for that leg) breaks the tie.
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("shared-cid"));
+    let mut b_leg = make_b_leg("198.51.100.20:5060");
+    b_leg.dialog.call_id = "shared-cid".to_string();
+    b_leg.dialog.remote_tag = Some("bob-tag".to_string());
+    store.add_b_leg(&call_id, b_leg);
+    store.set_winner(&call_id, 0);
+    let call = store.get_call(&call_id).unwrap();
+
+    assert_eq!(call.request_direction("shared-cid", Some("alice-tag")), Some(LegSide::A));
+    assert_eq!(call.request_direction("shared-cid", Some("bob-tag")), Some(LegSide::B));
+    // Unknown tag or missing tag can't be disambiguated → None (safe 481).
+    assert_eq!(call.request_direction("shared-cid", Some("ghost-tag")), None);
+    assert_eq!(call.request_direction("shared-cid", None), None);
+}
+
+#[test]
+fn tracking_leg_call_id_never_flips_direction() {
+    // The dispatcher inserts response-tracking pseudo-legs that reuse the A-leg
+    // Call-ID with a "reinvite:"/"update:" target_uri. They must be excluded
+    // from direction matching, so an A-leg Call-ID still resolves to A.
+    let (store, call_id, _b_call_id, _b_tag) = make_answered_call("teams-cid");
+    let mut tracking = make_b_leg("198.51.100.20:5060");
+    tracking.dialog.call_id = "teams-cid".to_string();
+    tracking.dialog.target_uri = Some("reinvite:b2a".to_string());
+    store.add_b_leg(&call_id, tracking);
+
+    let call = store.get_call(&call_id).unwrap();
+    assert_eq!(
+        call.request_direction("teams-cid", Some("alice-tag")),
+        Some(LegSide::A),
+    );
+}
+
+#[test]
+fn early_update_from_unanswered_b_leg_is_from_b() {
+    // Before a winner is chosen (RFC 3311 §5.2 UPDATE), match any real B-leg's
+    // Call-ID; a co-resident tracking leg with the same Call-ID must be skipped.
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("a-cid"));
+    let mut b_leg = make_b_leg("198.51.100.20:5060");
+    b_leg.dialog.call_id = "b-early-cid".to_string();
+    store.add_b_leg(&call_id, b_leg);
+    let mut tracking = make_b_leg("198.51.100.20:5060");
+    tracking.dialog.call_id = "b-early-cid".to_string();
+    tracking.dialog.target_uri = Some("update:a2b".to_string());
+    store.add_b_leg(&call_id, tracking);
+    // No set_winner — call is still early.
+
+    let call = store.get_call(&call_id).unwrap();
+    assert_eq!(call.request_direction("b-early-cid", None), Some(LegSide::B));
+    assert_eq!(call.request_direction("a-cid", Some("alice-tag")), Some(LegSide::A));
 }
