@@ -638,6 +638,43 @@ pub fn encode_metrics() -> String {
     String::from_utf8(buffer).unwrap_or_default()
 }
 
+/// Sum every series of a labelled counter vector across all label
+/// combinations. Used to expose a single scalar total (e.g. all SIP requests
+/// regardless of method) in the JSON metrics snapshot the web dashboard polls,
+/// where the browser diffs the total over time to derive a rate.
+pub fn sum_int_counter_vec(vector: &IntCounterVec) -> u64 {
+    use prometheus::core::Collector;
+    vector
+        .collect()
+        .iter()
+        .flat_map(|family| family.get_metric())
+        .map(|metric| metric.get_counter().value() as u64)
+        .sum()
+}
+
+/// Collapse a labelled gauge vector into a `label-value -> summed gauge` map,
+/// keyed on one label name (e.g. `"transport"` for `siphon_connections_active`).
+/// Series missing the label are grouped under the empty string.
+pub fn gauge_vec_by_label(
+    vector: &GaugeVec,
+    label: &str,
+) -> std::collections::BTreeMap<String, f64> {
+    use prometheus::core::Collector;
+    let mut out = std::collections::BTreeMap::new();
+    for family in vector.collect() {
+        for metric in family.get_metric() {
+            let key = metric
+                .get_label()
+                .iter()
+                .find(|pair| pair.name() == label)
+                .map(|pair| pair.value().to_owned())
+                .unwrap_or_default();
+            *out.entry(key).or_insert(0.0) += metric.get_gauge().value();
+        }
+    }
+    out
+}
+
 /// Refresh the jemalloc memory-stat gauges from the allocator's internal
 /// counters.  Call periodically (the dispatcher does so on its cleanup tick).
 /// No-op when metrics aren't initialised or jemalloc isn't the allocator.
@@ -871,6 +908,29 @@ mod tests {
             metrics.connections_active.with_label_values(&["TCP"]).get(),
             10.0
         );
+    }
+
+    #[test]
+    fn sum_int_counter_vec_totals_all_series() {
+        // Built on a local, isolated vector so the shared global registry can't
+        // perturb the total.
+        let vector =
+            IntCounterVec::new(Opts::new("test_reqs_total", "test"), &["method"]).unwrap();
+        vector.with_label_values(&["INVITE"]).inc_by(3);
+        vector.with_label_values(&["REGISTER"]).inc_by(5);
+        assert_eq!(sum_int_counter_vec(&vector), 8);
+    }
+
+    #[test]
+    fn gauge_vec_by_label_groups_by_key() {
+        let vector =
+            GaugeVec::new(Opts::new("test_conns_active", "test"), &["transport"]).unwrap();
+        vector.with_label_values(&["udp"]).set(6.0);
+        vector.with_label_values(&["tcp"]).set(2.0);
+        let map = gauge_vec_by_label(&vector, "transport");
+        assert_eq!(map.get("udp"), Some(&6.0));
+        assert_eq!(map.get("tcp"), Some(&2.0));
+        assert_eq!(map.len(), 2);
     }
 
     #[test]

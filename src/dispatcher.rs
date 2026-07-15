@@ -563,6 +563,11 @@ pub async fn run(
                 .expect("builtin transparent-b2bua@2026 must exist")
         });
 
+    // Publish the call store for read-only observability (admin `/admin/calls`)
+    // before it's moved into the dispatcher state.
+    let call_actors = Arc::new(CallActorStore::new());
+    crate::b2bua::actor::set_global_call_store(Arc::clone(&call_actors));
+
     let state = Arc::new(DispatcherState {
         engine,
         outbound,
@@ -574,7 +579,7 @@ pub async fn run(
         server_header,
         user_agent_header,
         transaction_timeout,
-        call_actors: Arc::new(CallActorStore::new()),
+        call_actors,
         transaction_manager,
         timer_wheel: Arc::new(DashMap::new()),
         session_store: Arc::new(ProxySessionStore::new()),

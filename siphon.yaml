@@ -639,6 +639,21 @@ auth:
 #   cors:
 #     allowed_origins:
 #       - "http://localhost:5173"
+#   # Optional bearer-token auth (RFC 6750). When `token` is set, the mutating
+#   # DELETE routes (force-unregister, lift-ban) require
+#   # `Authorization: Bearer <token>`. Set protect_reads to require it on the GET
+#   # routes and /metrics too. Unset leaves the admin API open (network-placement
+#   # trust only, as before). Strongly recommended once the web UI is exposed.
+#   auth:
+#     token: "${ADMIN_TOKEN}"     # keep the literal out of YAML; expand from env
+#     protect_reads: false        # true = also gate GET routes + /metrics
+#   # Optional embedded web dashboard (EXPERIMENTAL), served at the admin listener
+#   # root (/). Compiled into the release Docker image by default; a plain
+#   # `cargo build` needs `--features ui`, and a binary without it warns and serves
+#   # nothing here. Same-origin with the API, so no CORS is needed for it. Bind
+#   # `listen` to an internal/loopback address and set auth.token.
+#   ui:
+#     enabled: true
 
 # ---------------------------------------------------------------------------
 # Gateway dispatcher (named groups with load balancing + health probing)

@@ -1532,6 +1532,47 @@ pub struct AdminConfig {
     /// admin API can force-unregister AoRs and lift auto-bans.
     #[serde(default)]
     pub cors: Option<CorsConfig>,
+    /// Optional bearer-token auth for the admin API. The admin API can
+    /// force-unregister AoRs and lift auto-bans, so when the embedded UI is
+    /// exposed a token should protect at least the mutating routes. Unset =
+    /// no auth (network-placement trust only, unchanged from before).
+    #[serde(default)]
+    pub auth: Option<AdminAuthConfig>,
+    /// Optional embedded web dashboard served from this listener. Requires a
+    /// binary built with the `ui` cargo feature; on a binary without it,
+    /// `enabled: true` warns and no UI is served.
+    #[serde(default)]
+    pub ui: Option<AdminUiConfig>,
+}
+
+/// Bearer-token auth for the admin API (RFC 6750). When `token` is set, the
+/// `DELETE` routes (force-unregister, lift-ban) require
+/// `Authorization: Bearer <token>`; set `protect_reads` to require it on the
+/// `GET` routes and `/metrics` too. Same-origin dashboard callers send the
+/// token themselves; Prometheus scrapers of a `protect_reads` endpoint must be
+/// configured with the bearer token.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct AdminAuthConfig {
+    /// Shared bearer token. Empty/unset disables auth. Supports `${VAR}`
+    /// expansion, so keep the literal out of the YAML: `token: "${ADMIN_TOKEN}"`.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Also require the token on the read routes (`GET`, `/metrics`,
+    /// `/admin/metrics.json`), not only the mutating `DELETE` routes. Default
+    /// false — reads stay open (back-compat), writes are gated as soon as a
+    /// token is set.
+    #[serde(default)]
+    pub protect_reads: bool,
+}
+
+/// Embedded web-dashboard settings for the admin listener.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct AdminUiConfig {
+    /// Serve the embedded dashboard at the admin listener root (`/`). Default
+    /// false. Requires a binary built with `--features ui`; otherwise a loud
+    /// warning is logged and no UI is served.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 // ---------------------------------------------------------------------------

@@ -61,9 +61,53 @@ admin:
 | `GET /admin/stats` | uptime + active registration count |
 | `GET /admin/registrations[/{aor}]` | inspect bindings |
 | `DELETE /admin/registrations/{aor}` | force-unregister |
+| `GET /admin/bans` / `DELETE /admin/bans/{ip}` | list / lift auto-bans |
+| `GET /admin/gateways` | per-group dispatcher status (destinations, health, weight, priority) |
+| `POST /admin/gateways/{group}/{destination}/{up\|down}` | mark a gateway destination up/down (drain / restore a carrier) |
+| `GET /admin/calls` | active B2BUA calls (Call-ID, state, From, target, B-legs) |
+| `GET /admin/metrics.json` | curated JSON snapshot of the live gauges + counters |
 
 Point Kubernetes liveness at `/admin/health` and readiness at `/admin/ready` so a
 draining pod leaves rotation cleanly — see [Deployment & operations](../deployment.md).
+
+### Bearer-token auth
+
+The admin API can force-unregister bindings and lift bans, so gate it once it is
+reachable by anything but localhost:
+
+```yaml
+admin:
+  listen: "127.0.0.1:9091"
+  auth:
+    token: "${ADMIN_TOKEN}"     # keep the literal out of YAML
+    protect_reads: false         # true = also require it on GET + /metrics
+```
+
+With a token set, the `DELETE` routes require `Authorization: Bearer <token>`
+(constant-time compared). Reads stay open unless `protect_reads` is true. Unset
+leaves the API open, exactly as before.
+
+### Web dashboard (experimental)
+
+A single-page operator dashboard is baked into the binary and served
+same-origin on the admin listener. **It's experimental** — expect changes. The
+release Docker image compiles it in; you just enable it in config:
+
+```yaml
+admin:
+  listen: "127.0.0.1:9091"
+  ui:
+    enabled: true
+```
+
+A plain `cargo build` leaves the `ui` feature off, so any project embedding
+siphon as a library carries none of it; a binary built without `--features ui`
+logs a warning and serves nothing when `enabled` is set. Serving the dashboard
+logs an EXPERIMENTAL warning. The dashboard reads `/admin/metrics.json` (Overview,
+System), `/admin/registrations`, and `/admin/bans`, and performs
+force-unregister / lift-ban through the same token — click **Unlock** and paste
+the `admin.auth.token`. Bind the listener internally and put it behind your own
+ingress auth for anything beyond a trusted network.
 
 ## Call Detail Records
 
