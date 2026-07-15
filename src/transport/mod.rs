@@ -31,6 +31,37 @@ pub fn next_connection_id() -> ConnectionId {
     ConnectionId(NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed))
 }
 
+/// Best-effort detection of the host's primary routable local IP for the given
+/// address family.
+///
+/// Uses a UDP "route lookup": bind a wildcard socket, `connect()` it to a
+/// documentation-range reference address, and read back the source IP the
+/// kernel selected. `connect()` on a UDP socket performs no network I/O — it
+/// only sets the default peer and triggers the routing-table lookup — so no
+/// packets are sent and the reference address need not be reachable. Returns
+/// `None` on a host with no matching route (e.g. loopback-only), so callers can
+/// fall back.
+///
+/// This is what lets an instance bound to `0.0.0.0` / `[::]` with no
+/// `advertised_address` emit a routable Via/Contact instead of a loopback
+/// placeholder.
+pub fn detect_routable_local_ip(ipv6: bool) -> Option<IpAddr> {
+    // RFC 5737 TEST-NET-1 / RFC 3849 documentation prefix — never real peers.
+    let (bind, reference) = if ipv6 {
+        ("[::]:0", "[2001:db8::1]:9")
+    } else {
+        ("0.0.0.0:0", "192.0.2.1:9")
+    };
+    let socket = std::net::UdpSocket::bind(bind).ok()?;
+    socket.connect(reference).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    if ip.is_unspecified() || ip.is_loopback() {
+        None
+    } else {
+        Some(ip)
+    }
+}
+
 /// Default idle timeout for connection-oriented transports (TCP/TLS/WS/WSS).
 /// Connections with no activity for this duration are closed to prevent
 /// zombie connections from accumulating (especially behind NAT).
@@ -440,6 +471,23 @@ impl StreamConnections {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detect_routable_local_ip_never_loopback_or_unspecified() {
+        // On a host with a default route this returns the primary egress IP; on a
+        // loopback-only host it returns None. It must never return a loopback or
+        // unspecified address — that placeholder (127.0.0.1) was the foot-gun this
+        // replaced. Guarded on Some() so a CI host without a default route passes.
+        if let Some(ip) = detect_routable_local_ip(false) {
+            assert!(!ip.is_loopback(), "IPv4 detect returned loopback: {ip}");
+            assert!(!ip.is_unspecified(), "IPv4 detect returned unspecified: {ip}");
+            assert!(ip.is_ipv4(), "requested IPv4, got {ip}");
+        }
+        if let Some(ip) = detect_routable_local_ip(true) {
+            assert!(!ip.is_loopback(), "IPv6 detect returned loopback: {ip}");
+            assert!(!ip.is_unspecified(), "IPv6 detect returned unspecified: {ip}");
+        }
+    }
 
     #[tokio::test]
     async fn configure_tcp_socket_sets_nodelay_and_keepalive() {
