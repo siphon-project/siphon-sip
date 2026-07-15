@@ -69,6 +69,14 @@ pub async fn serve(
         );
     }
 
+    #[cfg(feature = "ui")]
+    if ui_enabled {
+        tracing::warn!(
+            "admin web UI enabled — this is an EXPERIMENTAL feature and may change \
+             or be removed in a future release"
+        );
+    }
+
     let app = router(state, cors.as_ref(), ui_enabled);
 
     info!("Admin API listening on {}", listen_addr);

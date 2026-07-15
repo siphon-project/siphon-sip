@@ -227,11 +227,12 @@ postgres-backend = ["dep:tokio-postgres"]
 # loud warning; a Diameter peer with `transport: sctp` errors at connect time.
 sctp = ["dep:tokio-sctp"]
 
-# Embedded operator web dashboard, served by the admin HTTP listener behind
-# `admin.ui.enabled`. Off by default so the default binary and any library
-# consumer stay free of the asset-embedding deps. When disabled, an
-# `admin.ui.enabled: true` block still parses and is skipped with a loud warning
-# (mirrors the `sctp` contract).
+# Embedded operator web dashboard (EXPERIMENTAL), served by the admin HTTP
+# listener behind `admin.ui.enabled`. Off by default for the plain `cargo build`
+# so the default binary and any library consumer stay free of the asset-embedding
+# deps; the release Docker image compiles it in (`--features ui`). When the
+# feature is disabled, an `admin.ui.enabled: true` block still parses and is
+# skipped with a loud warning (mirrors the `sctp` contract).
 ui = ["dep:rust-embed", "dep:mime_guess"]
 
 # --- Lint policy ---

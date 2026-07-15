@@ -7,16 +7,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
-- **Embedded web dashboard on the admin listener** (opt-in `ui` cargo feature +
-  `admin.ui.enabled`). Serves a single-page operator dashboard same-origin with
-  the admin API — Overview (live tiles + charts for dialogs, SIP request rate,
-  and memory), Registrations (searchable, with force-unregister), Security
-  (threat counters + active bans, with lift-ban), System (jemalloc/glibc memory,
-  Python executor pool, runtime facts), and Integrations (Diameter / rtpengine /
-  SBI). Assets are baked into the binary (no external files, no runtime fetch);
-  the feature is off by default so the default build and any library consumer
-  pull none of it. A binary built without `--features ui` logs a warning and
-  serves no UI when `admin.ui.enabled` is set.
+- **Embedded web dashboard on the admin listener — EXPERIMENTAL** (`ui` cargo
+  feature + `admin.ui.enabled`). Serves a single-page operator dashboard
+  same-origin with the admin API — Overview (live tiles + charts for dialogs, SIP
+  request rate, and memory), Calls (active B2BUA calls), Registrations
+  (searchable, with force-unregister), Security (threat counters + active bans,
+  with lift-ban), Gateways (per-group destination health, with drain/enable),
+  System (jemalloc/glibc memory, Python executor pool, runtime facts), and
+  Integrations (Diameter / rtpengine / SBI). Assets are baked into the binary (no
+  external files, no runtime fetch). The **release Docker image compiles it in by
+  default**; the plain `cargo build` leaves it off, so any library consumer pulls
+  none of it. Serving the dashboard logs an EXPERIMENTAL warning; a binary built
+  without `--features ui` warns and serves nothing when `admin.ui.enabled` is set.
 - **`GET /admin/metrics.json`** — a curated JSON snapshot of the live gauges and
   counters (SIP, memory, Python executor, Diameter, rtpengine, SBI, security),
   intended for the dashboard and any custom tooling that would rather not parse

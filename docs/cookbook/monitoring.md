@@ -87,11 +87,11 @@ With a token set, the `DELETE` routes require `Authorization: Bearer <token>`
 (constant-time compared). Reads stay open unless `protect_reads` is true. Unset
 leaves the API open, exactly as before.
 
-### Web dashboard
+### Web dashboard (experimental)
 
 A single-page operator dashboard is baked into the binary and served
-same-origin on the admin listener. It is opt-in twice — build with the `ui`
-cargo feature, then enable it in config:
+same-origin on the admin listener. **It's experimental** — expect changes. The
+release Docker image compiles it in; you just enable it in config:
 
 ```yaml
 admin:
@@ -100,9 +100,10 @@ admin:
     enabled: true
 ```
 
-The default binary and any project embedding siphon as a library carry none of
-it; a binary built without `--features ui` logs a warning and serves nothing
-when `enabled` is set. The dashboard reads `/admin/metrics.json` (Overview,
+A plain `cargo build` leaves the `ui` feature off, so any project embedding
+siphon as a library carries none of it; a binary built without `--features ui`
+logs a warning and serves nothing when `enabled` is set. Serving the dashboard
+logs an EXPERIMENTAL warning. The dashboard reads `/admin/metrics.json` (Overview,
 System), `/admin/registrations`, and `/admin/bans`, and performs
 force-unregister / lift-ban through the same token — click **Unlock** and paste
 the `admin.auth.token`. Bind the listener internally and put it behind your own

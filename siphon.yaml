@@ -647,10 +647,11 @@ auth:
 #   auth:
 #     token: "${ADMIN_TOKEN}"     # keep the literal out of YAML; expand from env
 #     protect_reads: false        # true = also gate GET routes + /metrics
-#   # Optional embedded web dashboard, served at the admin listener root (/).
-#   # Requires a binary built with `--features ui`; on a binary without it, this
-#   # warns and serves nothing. Same-origin with the API, so no CORS is needed
-#   # for it. Bind `listen` to an internal/loopback address and set auth.token.
+#   # Optional embedded web dashboard (EXPERIMENTAL), served at the admin listener
+#   # root (/). Compiled into the release Docker image by default; a plain
+#   # `cargo build` needs `--features ui`, and a binary without it warns and serves
+#   # nothing here. Same-origin with the API, so no CORS is needed for it. Bind
+#   # `listen` to an internal/loopback address and set auth.token.
 #   ui:
 #     enabled: true
 
