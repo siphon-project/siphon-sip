@@ -207,6 +207,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Admin API — bearer auth | Implemented | `admin.auth.token` / `admin.auth.protect_reads` | Constant-time bearer check; gates `DELETE` (and, with `protect_reads`, reads + `/metrics`). Unset = open (unchanged) |
 | Admin API — gateways | Implemented | `GET /admin/gateways` | Per-group dispatcher status: each destination's health/weight/priority/address/transport/attrs, read from the shared dispatcher (no new state or probing) |
 | Admin API — gateway control | Implemented | `POST /admin/gateways/{group}/{dest}/{up\|down}` | Manual mark-up/down of a destination (drain a bad carrier, then restore it); mutating, so it sits behind the bearer gate |
+| Admin API — calls | Implemented | `GET /admin/calls` | Active B2BUA calls (SIP Call-ID, state, A-leg From, B-leg target, B-leg count), read from the dispatcher-owned call store. Empty on a proxy-only node |
 | Web dashboard (embedded) | Implemented (opt-in) | `ui` cargo feature + `admin.ui.enabled` | Single-page operator UI baked into the binary, served same-origin on the admin listener: Overview / Registrations / Security / System / Integrations. Off by default; library consumers unaffected. Feature-off + `enabled: true` warns and serves nothing |
 
 ## Logging

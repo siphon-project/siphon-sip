@@ -31,6 +31,11 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   gateway destination up or down (drain a bad carrier from the dashboard, then
   restore it), with a per-destination button on the Gateways panel. Mutating, so
   it requires the admin bearer token.
+- **`GET /admin/calls`** — active B2BUA calls (internal id, SIP Call-ID, state,
+  A-leg From, B-leg target, and B-leg count), read from the dispatcher's call
+  store. Surfaced as a dedicated Calls view on the dashboard (which now groups
+  the nav into Monitor / Routing / System, with Gateways in its own Routing
+  section). Empty on a proxy-only node.
 - **Bearer-token auth for the admin API** (`admin.auth.token`). When set, every
   mutating route (`POST`/`PUT`/`PATCH`/`DELETE` — force-unregister, lift-ban,
   gateway up/down) requires `Authorization: Bearer <token>`, compared in

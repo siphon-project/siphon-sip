@@ -109,7 +109,8 @@ fn router(state: AdminState, cors: Option<&CorsConfig>, ui_enabled: bool) -> Rou
         .route(
             "/admin/gateways/{group}/{destination}/{action}",
             post(gateway_action_handler),
-        );
+        )
+        .route("/admin/calls", get(calls_handler));
 
     // Everything not matched by an API route falls through to the embedded
     // dashboard (single-page app), so `/` and any client route serve it.
@@ -548,6 +549,49 @@ async fn gateway_action_handler(
             Json(serde_json::json!({ "error": "unknown destination", "group": group, "destination": destination })),
         )
     }
+}
+
+/// `GET /admin/calls` — active B2BUA calls: internal id, SIP Call-ID, state,
+/// A-leg From, B-leg target, and B-leg count. Reads the dispatcher-owned call
+/// store (published at construction). Empty array on a proxy-only node (no
+/// B2BUA calls) or before a dispatcher exists.
+async fn calls_handler() -> impl IntoResponse {
+    match crate::b2bua::actor::global_call_store() {
+        Some(store) => Json(calls_json(store)),
+        None => Json(serde_json::Value::Array(Vec::new())),
+    }
+}
+
+/// Serialize the active B2BUA calls. Split from the handler so it can be
+/// unit-tested against a locally-built store without the process-global.
+fn calls_json(store: &crate::b2bua::actor::CallActorStore) -> serde_json::Value {
+    use crate::b2bua::actor::CallState;
+
+    let mut calls: Vec<serde_json::Value> = Vec::new();
+    for entry in store.iter_calls() {
+        let call = entry.value();
+        let state = match call.state {
+            CallState::Calling => "calling",
+            CallState::Ringing => "ringing",
+            CallState::Answered => "answered",
+            CallState::Terminated => "terminated",
+        };
+        let target = call
+            .b_legs
+            .first()
+            .and_then(|leg| leg.dialog.target_uri.clone());
+        calls.push(serde_json::json!({
+            "id": call.id,
+            "call_id": call.a_leg.dialog.call_id,
+            "state": state,
+            "from": call.a_leg.dialog.local_from_uri,
+            "to": target,
+            "b_legs": call.b_legs.len(),
+        }));
+    }
+    // Stable order for the dashboard (DashMap iteration order is arbitrary).
+    calls.sort_by(|a, b| a["call_id"].as_str().cmp(&b["call_id"].as_str()));
+    serde_json::Value::Array(calls)
 }
 
 // ---------------------------------------------------------------------------
@@ -1126,6 +1170,40 @@ mod tests {
             .unwrap();
         // No gateway manager is wired in unit tests -> no groups configured.
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn calls_json_empty_store_is_empty_array() {
+        let store = crate::b2bua::actor::CallActorStore::new();
+        assert_eq!(calls_json(&store), serde_json::json!([]));
+    }
+
+    #[test]
+    fn calls_json_serializes_active_calls() {
+        use crate::b2bua::actor::{CallActorStore, Leg, TransportInfo};
+        use crate::transport::{ConnectionId, Transport};
+
+        let store = CallActorStore::new();
+        let a_leg = Leg::new_a_leg(
+            "call-abc@example.com".to_string(),
+            "fromtag".to_string(),
+            "z9hG4bKbranch".to_string(),
+            TransportInfo {
+                remote_addr: "10.0.0.1:5060".parse().unwrap(),
+                connection_id: ConnectionId(1),
+                transport: Transport::Udp,
+                local_addr: None,
+            },
+        );
+        store.create_call(a_leg);
+
+        let json = calls_json(&store);
+        let calls = json.as_array().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["call_id"], "call-abc@example.com");
+        // A freshly created call is in the Calling state with no B-legs yet.
+        assert_eq!(calls[0]["state"], "calling");
+        assert_eq!(calls[0]["b_legs"], 0);
     }
 
     #[cfg(feature = "ui")]

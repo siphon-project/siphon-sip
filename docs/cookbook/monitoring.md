@@ -64,6 +64,7 @@ admin:
 | `GET /admin/bans` / `DELETE /admin/bans/{ip}` | list / lift auto-bans |
 | `GET /admin/gateways` | per-group dispatcher status (destinations, health, weight, priority) |
 | `POST /admin/gateways/{group}/{destination}/{up\|down}` | mark a gateway destination up/down (drain / restore a carrier) |
+| `GET /admin/calls` | active B2BUA calls (Call-ID, state, From, target, B-legs) |
 | `GET /admin/metrics.json` | curated JSON snapshot of the live gauges + counters |
 
 Point Kubernetes liveness at `/admin/health` and readiness at `/admin/ready` so a

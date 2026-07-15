@@ -177,8 +177,12 @@
     <nav id="nav">
       <div class="lbl">Monitor</div>
       <a class="navitem active" data-view="overview"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>Overview</a>
+      <a class="navitem" data-view="calls"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M4 5c0 9 6 15 15 15a1.5 1.5 0 001.5-1.5v-2.6a1 1 0 00-.8-1L16 13.5a1 1 0 00-1 .4l-.9 1.2a12 12 0 01-4.7-4.7l1.2-.9a1 1 0 00.4-1L9.6 4.3a1 1 0 00-1-.8H6A1.5 1.5 0 004 5z"/></svg>Calls <span class="count" id="nav-calls"></span></a>
       <a class="navitem" data-view="registrations"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M4 7h16M4 12h16M4 17h10"/></svg>Registrations <span class="count" id="nav-regs"></span></a>
       <a class="navitem" data-view="security"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6z"/></svg>Security <span class="count" id="nav-bans"></span></a>
+      <div class="lbl">Routing</div>
+      <a class="navitem" data-view="gateways"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><rect x="4" y="4" width="16" height="6" rx="1.5"/><rect x="4" y="14" width="16" height="6" rx="1.5"/><path d="M7.5 7h.01M7.5 17h.01"/></svg>Gateways <span class="count" id="nav-gw"></span></a>
+      <div class="lbl">System</div>
       <a class="navitem" data-view="system"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>System</a>
       <a class="navitem" data-view="integrations"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><circle cx="6" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><circle cx="18" cy="6" r="2.5"/><path d="M8.5 6H18M6 8.5V15a3 3 0 003 3h6"/></svg>Integrations</a>
     </nav>
@@ -280,10 +284,27 @@
         </div>
       </div>
 
-      <!-- INTEGRATIONS -->
-      <div class="view" id="view-integrations">
+      <!-- CALLS -->
+      <div class="view" id="view-calls">
+        <div class="toolbar">
+          <span class="count-pill"><b id="call-count">0</b> active B2BUA calls</span>
+          <span class="grow"></span>
+          <button class="iconbtn" id="call-refresh" title="Refresh"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M20 11a8 8 0 10-2 5.3M20 5v6h-6"/></svg></button>
+        </div>
+        <div class="card"><div class="tblscroll"><table class="tbl">
+          <thead><tr><th>Call-ID</th><th>State</th><th>From</th><th>Target</th><th>B-legs</th></tr></thead>
+          <tbody id="call-rows"><tr><td colspan="5" class="empty">loading…</td></tr></tbody>
+        </table></div></div>
+      </div>
+
+      <!-- GATEWAYS -->
+      <div class="view" id="view-gateways">
         <div class="sectlabel">Gateway groups</div>
         <div id="gw-groups"><div class="card"><div class="panelbody empty">loading…</div></div></div>
+      </div>
+
+      <!-- INTEGRATIONS -->
+      <div class="view" id="view-integrations">
         <div class="sectlabel">Connected subsystems</div>
         <div class="charts">
           <div class="card"><div class="panelhead"><span class="t">Diameter</span><span class="count-pill"><b id="dia-n">—</b> peers up</span></div><div class="panelbody"><div class="metaline"><span>Peers connected</span><b id="dia-peers">—</b></div></div></div>
@@ -341,7 +362,7 @@
   applyUnlock();
 
   // ---- router ----
-  var CRUMBS = { overview:'Overview', registrations:'Registrations', security:'Security', system:'System', integrations:'Integrations' };
+  var CRUMBS = { overview:'Overview', calls:'Calls', registrations:'Registrations', security:'Security', gateways:'Gateways', system:'System', integrations:'Integrations' };
   function go(view){
     document.querySelectorAll('.navitem').forEach(function(n){ n.classList.toggle('active', n.getAttribute('data-view') === view); });
     document.querySelectorAll('.view').forEach(function(v){ v.classList.toggle('show', v.id === 'view-' + view); });
@@ -349,7 +370,8 @@
     if (view === 'overview') charts.forEach(function(c){ c.resize(); });
     if (view === 'registrations') loadRegistrations();
     if (view === 'security') loadBans();
-    if (view === 'integrations') loadGateways();
+    if (view === 'calls') loadCalls();
+    if (view === 'gateways') loadGateways();
   }
   $('nav').addEventListener('click', function(e){ var it = e.target.closest('.navitem'); if (!it) return; e.preventDefault(); go(it.getAttribute('data-view')); });
   document.querySelectorAll('[data-goto]').forEach(function(a){ a.addEventListener('click', function(){ go(a.getAttribute('data-goto')); }); });
@@ -558,6 +580,7 @@
       if (r.status === 401){ $('gw-groups').innerHTML = '<div class="card"><div class="panelbody empty">read access is protected — Unlock with an admin token</div></div>'; return; }
       groups = await r.json();
     } catch(e){ $('gw-groups').innerHTML = '<div class="card"><div class="panelbody empty">failed to load</div></div>'; return; }
+    $('nav-gw').textContent = groups.length || '';
     if (!groups.length){ $('gw-groups').innerHTML = '<div class="card"><div class="panelbody empty">no gateway groups configured</div></div>'; return; }
     $('gw-groups').innerHTML = groups.map(function(g){
       var rows = (g.destinations||[]).map(function(d){
@@ -585,6 +608,25 @@
     }).catch(function(){ say('Request failed', true); });
   });
 
+  // ---- calls (B2BUA) ----
+  function callStateColor(s){ return s==='answered'?'var(--up)':s==='ringing'?'var(--warn)':s==='terminated'?'var(--faint)':'var(--cyan)'; }
+  async function loadCalls(){
+    var calls;
+    try {
+      var r = await api('/admin/calls');
+      if (r.status === 401){ $('call-rows').innerHTML = '<tr><td colspan="5" class="empty">read access is protected — Unlock with an admin token</td></tr>'; return; }
+      calls = await r.json();
+    } catch(e){ $('call-rows').innerHTML = '<tr><td colspan="5" class="empty">failed to load</td></tr>'; return; }
+    $('call-count').textContent = calls.length; $('nav-calls').textContent = calls.length || '';
+    $('call-rows').innerHTML = calls.length ? calls.map(function(c){
+      var col = callStateColor(c.state);
+      return '<tr><td class="aor">'+esc(c.call_id)+'</td>'
+        + '<td><span class="spill" style="color:'+col+';border-color:'+col+'">'+esc(c.state)+'</span></td>'
+        + '<td class="contact">'+esc(c.from||'—')+'</td><td class="contact">'+esc(c.to||'—')+'</td><td class="q">'+c.b_legs+'</td></tr>';
+    }).join('') : '<tr><td colspan="5" class="empty">no active B2BUA calls</td></tr>';
+  }
+  document.getElementById('call-refresh').addEventListener('click', loadCalls);
+
   // ---- overview recent-registrations preview ----
   async function loadOverviewRegs(){
     try { var r = await api('/admin/registrations'); if (!r.ok) return; var list = await r.json();
@@ -596,6 +638,8 @@
   poll(); loadOverviewRegs();
   setInterval(poll, 2000);
   setInterval(function(){ if (document.getElementById('view-overview').classList.contains('show')) loadOverviewRegs(); }, 10000);
+  // Calls churn quickly — auto-refresh while the Calls view is open.
+  setInterval(function(){ if (document.getElementById('view-calls').classList.contains('show')) loadCalls(); }, 3000);
 })();
 </script>
 </body>
