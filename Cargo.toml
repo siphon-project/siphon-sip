@@ -114,7 +114,7 @@ base64 = "0.22"                                                    # base64url (
 
 # Utilities
 md5 = "0.8"
-sha2 = "0.10"
+sha2 = "0.11"
 uuid = { version = "1.22", features = ["v4", "fast-rng"] }
 # Cryptographic randomness — used by Milenage AKA RAND generation
 # (3GPP TS 35.206) and any other place that needs unpredictable bytes.
