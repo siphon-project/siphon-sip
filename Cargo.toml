@@ -132,7 +132,7 @@ tokio-postgres = { version = "0.7", optional = true }
 prometheus = { version = "0.14", features = ["process"] }
 axum = { version = "0.8.8", features = ["tokio"] }
 tower = { version = "0.5.3", features = ["util"] }
-tower-http = { version = "0.6.8", features = ["cors"] }
+tower-http = { version = "0.7.0", features = ["cors"] }
 # Embedded operator web UI (opt-in via the `ui` feature). rust-embed bakes the
 # dashboard assets into the binary; mime_guess types them on the way out. Both
 # are compiled only under `--features ui`, so the default library build (and any
