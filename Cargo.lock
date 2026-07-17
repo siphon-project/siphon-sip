@@ -3148,7 +3148,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "siphon-rtp-proto",
  "socket2 0.6.4",
  "tempfile",
