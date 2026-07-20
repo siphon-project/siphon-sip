@@ -6,6 +6,29 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **Dashboard charts now have a scale and hover history** (experimental web UI).
+  Each sparkline draws its actual y-axis min/max on-chart, and hovering any point
+  shows a tooltip with the exact value and how long ago it was sampled, so a dip
+  reads as a real number instead of an unlabelled wiggle. Memory is shown to one
+  decimal (MB) so a sub-MB change tracks the line instead of looking frozen.
+- **Overview flags gateway trouble at a glance** — a "Gateway groups" line in the
+  Connections & health block shows how many groups have an unhealthy destination
+  (green when all healthy, amber with a count when not), click-through to the
+  Gateways view. Backed by a new `gateways` summary in `GET /admin/metrics.json`.
+- **Gateways view shows missed health-checks** — a destination that has failed
+  consecutive probes shows an `n/threshold missed` badge (amber while still up as
+  an early warning, red once down). `GET /admin/gateways` destinations gain
+  `checks_missed` and each group gains `failure_threshold`.
+
+### Changed
+- **Calls view shows both the caller and the dialed callee.** Previously it showed
+  the A-leg From (which is actually the dialed identity, not the caller) and the
+  B-leg target, so a bridged call looked like it only had one side. `GET /admin/calls`
+  now returns `a_party` (caller) and `b_party` (dialed callee) in place of
+  `from`/`to`, and the B-leg count excludes the re-INVITE/UPDATE response-tracking
+  pseudo-legs, so a plain call that re-INVITEd no longer reports two B-legs.
+
 ## [1.4.1] — 2026-07-15
 
 ### Added

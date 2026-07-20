@@ -285,12 +285,18 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
 
     let connections = crate::metrics::gauge_vec_by_label(&metrics.connections_active, "transport");
 
+    // Gateway-health rollup for the overview's "Connections & health" block. Only
+    // present when a gateway block is configured (proxy-only nodes omit it, and the
+    // dashboard hides the line accordingly).
+    let gateways = crate::script::api::gateway_manager().map(|manager| gateways_summary_json(manager));
+
     Json(serde_json::json!({
         "version": version,
         "instance_id": state.instance_id,
         "uptime_seconds": uptime,
         "jemalloc_active": crate::metrics::jemalloc_is_active(),
         "registrations_active": registrations,
+        "gateways": gateways,
         "sip": {
             "dialogs_active": metrics.dialogs_active.get(),
             "transactions_active": metrics.transactions_active.get(),
@@ -494,6 +500,7 @@ fn gateways_json(manager: &crate::gateway::DispatcherManager) -> serde_json::Val
                         .unwrap_or_else(|| destination.address().to_string()),
                     "transport": destination.transport.to_string(),
                     "healthy": destination.is_healthy(),
+                    "checks_missed": destination.consecutive_failures(),
                     "weight": destination.weight,
                     "priority": destination.priority,
                     "attrs": destination.attrs,
@@ -509,12 +516,46 @@ fn gateways_json(manager: &crate::gateway::DispatcherManager) -> serde_json::Val
             "algorithm": group.algorithm.as_str(),
             "up": up,
             "total": destinations.len(),
+            // Consecutive probe failures that mark a destination down — lets the
+            // dashboard render "n/threshold missed" against each destination.
+            "failure_threshold": group.probe_config.failure_threshold,
             "destinations": destinations,
         }));
     }
     // Stable order for the dashboard (DashMap iteration order is arbitrary).
     groups.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     serde_json::Value::Array(groups)
+}
+
+/// One-line gateway-health rollup for the overview poll (`/admin/metrics.json`),
+/// so the dashboard can flag "N groups with issues" without fetching the full
+/// per-group `/admin/gateways` payload. A group "has issues" when any of its
+/// destinations is unhealthy (`up < total`). Reads the same shared dispatcher as
+/// `gateways_json` — no new state, no probe.
+fn gateways_summary_json(manager: &crate::gateway::DispatcherManager) -> serde_json::Value {
+    let mut groups_total = 0usize;
+    let mut groups_with_issues = 0usize;
+    let mut destinations_up = 0usize;
+    let mut destinations_total = 0usize;
+    for name in manager.group_names() {
+        let Some(group) = manager.get_group(&name) else {
+            continue;
+        };
+        let destinations = group.list_destinations();
+        let up = destinations.iter().filter(|d| d.is_healthy()).count();
+        groups_total += 1;
+        destinations_up += up;
+        destinations_total += destinations.len();
+        if up < destinations.len() {
+            groups_with_issues += 1;
+        }
+    }
+    serde_json::json!({
+        "groups_total": groups_total,
+        "groups_with_issues": groups_with_issues,
+        "destinations_up": destinations_up,
+        "destinations_total": destinations_total,
+    })
 }
 
 /// `POST /admin/gateways/{group}/{destination}/{action}` — mark a gateway
@@ -560,8 +601,9 @@ async fn gateway_action_handler(
 }
 
 /// `GET /admin/calls` — active B2BUA calls: internal id, SIP Call-ID, state,
-/// A-leg From, B-leg target, and B-leg count. Reads the dispatcher-owned call
-/// store (published at construction). Empty array on a proxy-only node (no
+/// A-party (caller), B-party (dialed callee), and the count of real B-legs
+/// (re-INVITE/UPDATE tracking pseudo-legs excluded). Reads the dispatcher-owned
+/// call store (published at construction). Empty array on a proxy-only node (no
 /// B2BUA calls) or before a dispatcher exists.
 async fn calls_handler() -> impl IntoResponse {
     match crate::b2bua::actor::global_call_store() {
@@ -570,10 +612,18 @@ async fn calls_handler() -> impl IntoResponse {
     }
 }
 
+/// Clean a From/To header value into a bare display URI (`sip:user@host`) by
+/// dropping the display name, angle brackets, and any `;tag=`/URI params — for
+/// the calls listing's caller/callee columns.
+fn display_party(header_value: &str) -> String {
+    let uri = crate::b2bua::actor::extract_contact_uri(header_value);
+    uri.split(';').next().unwrap_or(&uri).trim().to_string()
+}
+
 /// Serialize the active B2BUA calls. Split from the handler so it can be
 /// unit-tested against a locally-built store without the process-global.
 fn calls_json(store: &crate::b2bua::actor::CallActorStore) -> serde_json::Value {
-    use crate::b2bua::actor::CallState;
+    use crate::b2bua::actor::{CallState, Leg};
 
     let mut calls: Vec<serde_json::Value> = Vec::new();
     for entry in store.iter_calls() {
@@ -584,17 +634,29 @@ fn calls_json(store: &crate::b2bua::actor::CallActorStore) -> serde_json::Value 
             CallState::Answered => "answered",
             CallState::Terminated => "terminated",
         };
-        let target = call
-            .b_legs
+        // A-party = the caller. The inbound INVITE's From is stored as the
+        // A-leg's `remote_to_uri` (as UAS, our in-dialog To is the caller). The
+        // A-leg's `local_from_uri` is the INVITE *To* (the dialed identity), NOT
+        // the caller — surfacing that as "from" was why a bridged call looked
+        // like it only showed one leg.
+        let a_party = call.a_leg.dialog.remote_to_uri.as_deref().map(display_party);
+        // B-party = the real dialed/forked callee. Exclude the re-INVITE/UPDATE
+        // response-tracking pseudo-legs (their `target_uri` is a direction
+        // marker) from both the displayed callee and the leg count, so a plain
+        // call that did one re-INVITE no longer reports two B-legs.
+        let real_b_legs: Vec<&Leg> =
+            call.b_legs.iter().filter(|leg| !leg.is_tracking_leg()).collect();
+        let b_party = real_b_legs
             .first()
-            .and_then(|leg| leg.dialog.target_uri.clone());
+            .and_then(|leg| leg.dialog.target_uri.as_deref())
+            .map(display_party);
         calls.push(serde_json::json!({
             "id": call.id,
             "call_id": call.a_leg.dialog.call_id,
             "state": state,
-            "from": call.a_leg.dialog.local_from_uri,
-            "to": target,
-            "b_legs": call.b_legs.len(),
+            "a_party": a_party,
+            "b_party": b_party,
+            "b_legs": real_b_legs.len(),
         }));
     }
     // Stable order for the dashboard (DashMap iteration order is arbitrary).
@@ -1138,12 +1200,62 @@ mod tests {
         assert_eq!(groups[0]["total"], 2);
         // Fresh destinations start healthy.
         assert_eq!(groups[0]["up"], 2);
+        // Default probe threshold is surfaced for the "n/threshold missed" render.
+        assert_eq!(groups[0]["failure_threshold"], 3);
         let destinations = groups[0]["destinations"].as_array().unwrap();
         assert_eq!(destinations.len(), 2);
         assert_eq!(destinations[0]["uri"], "sip:gw1.carrier.com:5060");
         assert_eq!(destinations[0]["weight"], 3);
         assert_eq!(destinations[0]["healthy"], true);
+        // A passing destination has missed zero checks.
+        assert_eq!(destinations[0]["checks_missed"], 0);
         assert_eq!(destinations[0]["address"], "10.0.0.1:5060");
+    }
+
+    #[test]
+    fn gateways_summary_json_empty_manager_is_zeroes() {
+        let manager = crate::gateway::DispatcherManager::new();
+        let summary = gateways_summary_json(&manager);
+        assert_eq!(summary["groups_total"], 0);
+        assert_eq!(summary["groups_with_issues"], 0);
+        assert_eq!(summary["destinations_up"], 0);
+        assert_eq!(summary["destinations_total"], 0);
+    }
+
+    #[test]
+    fn gateways_summary_json_counts_degraded_group() {
+        use crate::gateway::{Algorithm, Destination, DispatcherGroup, DispatcherManager};
+        use crate::transport::Transport;
+
+        let manager = DispatcherManager::new();
+        let healthy = Destination::new(
+            "sip:gw1.carrier.com:5060".to_string(),
+            "10.0.0.1:5060".parse().unwrap(),
+            Transport::Udp,
+            1,
+            1,
+        );
+        let sick = Destination::new(
+            "sip:gw2.carrier.com:5061".to_string(),
+            "10.0.0.2:5061".parse().unwrap(),
+            Transport::Udp,
+            1,
+            1,
+        );
+        let group = DispatcherGroup::new(
+            "carriers".to_string(),
+            Algorithm::Weighted,
+            vec![healthy, sick],
+        );
+        // Drain one destination so the group is degraded (up < total).
+        assert!(group.mark_down("sip:gw2.carrier.com:5061"));
+        manager.add_group(group);
+
+        let summary = gateways_summary_json(&manager);
+        assert_eq!(summary["groups_total"], 1);
+        assert_eq!(summary["groups_with_issues"], 1);
+        assert_eq!(summary["destinations_up"], 1);
+        assert_eq!(summary["destinations_total"], 2);
     }
 
     #[tokio::test]
@@ -1191,27 +1303,62 @@ mod tests {
         use crate::b2bua::actor::{CallActorStore, Leg, TransportInfo};
         use crate::transport::{ConnectionId, Transport};
 
+        let transport = || TransportInfo {
+            remote_addr: "10.0.0.1:5060".parse().unwrap(),
+            connection_id: ConnectionId(1),
+            transport: Transport::Udp,
+            local_addr: None,
+        };
+
         let store = CallActorStore::new();
-        let a_leg = Leg::new_a_leg(
+        let mut a_leg = Leg::new_a_leg(
             "call-abc@example.com".to_string(),
             "fromtag".to_string(),
             "z9hG4bKbranch".to_string(),
-            TransportInfo {
-                remote_addr: "10.0.0.1:5060".parse().unwrap(),
-                connection_id: ConnectionId(1),
-                transport: Transport::Udp,
-                local_addr: None,
-            },
+            transport(),
         );
-        store.create_call(a_leg);
+        // The caller (INVITE From) is stored on the A-leg as remote_to_uri.
+        a_leg.dialog.remote_to_uri =
+            Some("\"Alice\" <sip:alice@example.com>;tag=abc".to_string());
+        let id = store.create_call(a_leg);
 
+        // A freshly created call: caller surfaced, no B-party yet, zero B-legs.
         let json = calls_json(&store);
         let calls = json.as_array().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["call_id"], "call-abc@example.com");
-        // A freshly created call is in the Calling state with no B-legs yet.
         assert_eq!(calls[0]["state"], "calling");
+        assert_eq!(calls[0]["a_party"], "sip:alice@example.com");
+        assert!(calls[0]["b_party"].is_null());
         assert_eq!(calls[0]["b_legs"], 0);
+
+        // Dial a real B-leg, plus a re-INVITE response-tracking pseudo-leg.
+        store.add_b_leg(
+            &id,
+            Leg::new_b_leg(
+                "bleg-1@example.com".to_string(),
+                "btag".to_string(),
+                "sip:bob@10.0.0.2:5060".to_string(),
+                "z9hG4bKb1".to_string(),
+                transport(),
+            ),
+        );
+        store.add_b_leg(
+            &id,
+            Leg::new_b_leg(
+                "call-abc@example.com".to_string(),
+                "btag2".to_string(),
+                "reinvite:0".to_string(),
+                "z9hG4bKb2".to_string(),
+                transport(),
+            ),
+        );
+
+        let json = calls_json(&store);
+        let calls = json.as_array().unwrap();
+        // The tracking pseudo-leg is excluded from both the callee and the count.
+        assert_eq!(calls[0]["b_party"], "sip:bob@10.0.0.2:5060");
+        assert_eq!(calls[0]["b_legs"], 1);
     }
 
     #[cfg(feature = "ui")]

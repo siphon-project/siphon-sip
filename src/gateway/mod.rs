@@ -141,6 +141,14 @@ impl Destination {
         self.healthy.load(Ordering::Relaxed)
     }
 
+    /// Consecutive health-probe failures since the last success (0 when passing).
+    /// Reset to 0 by `record_success` / `mark_up`. Surfaced by the admin API as
+    /// the "checks missed" count so operators can see a destination degrading
+    /// before it crosses `failure_threshold` and is marked down.
+    pub fn consecutive_failures(&self) -> u32 {
+        self.failures.load(Ordering::Relaxed)
+    }
+
     pub fn mark_up(&self) {
         self.healthy.store(true, Ordering::Relaxed);
         self.failures.store(0, Ordering::Relaxed);
@@ -1718,6 +1726,28 @@ mod tests {
         // Further failures start from 0
         let count = destination.record_failure();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn consecutive_failures_accessor_tracks_and_resets() {
+        let destination = Destination::new(
+            "sip:degrading.example.com".to_string(),
+            "10.0.0.1:5060".parse().unwrap(),
+            Transport::Udp,
+            1,
+            1,
+        );
+
+        // Passing destination reports zero missed checks.
+        assert_eq!(destination.consecutive_failures(), 0);
+
+        destination.record_failure();
+        destination.record_failure();
+        assert_eq!(destination.consecutive_failures(), 2);
+
+        // A success clears the missed-check counter.
+        destination.record_success();
+        assert_eq!(destination.consecutive_failures(), 0);
     }
 
     // --- extract_address_from_uri ---
