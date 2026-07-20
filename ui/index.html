@@ -407,16 +407,20 @@
   Chart.prototype.resize = function(){ var dpr = devicePixelRatio || 1, r = this.cv.getBoundingClientRect(); this.w = r.width; this.h = r.height; this.cv.width = r.width * dpr; this.cv.height = r.height * dpr; this.ctx.setTransform(dpr,0,0,dpr,0,0); this.draw(); };
   Chart.prototype.push = function(v){ this.data.push(v); this.times.push(Date.now()); if (this.data.length > 64){ this.data.shift(); this.times.shift(); } this.draw(); };
   Chart.prototype.cssvar = function(n){ return getComputedStyle(root).getPropertyValue(n).trim(); };
-  // Shared geometry (data min/max + point mapping) used by both draw and hover.
+  // Shared geometry (axis bounds + point mapping) used by both draw and hover.
+  // Bounds are the data min/max plus a symmetric margin, so the printed labels
+  // are the true top/bottom edges of the plot and the line floats inside with
+  // matching headroom — instead of the label sitting away from where the data is.
   Chart.prototype.geom = function(){
     var d = this.data, n = d.length, w = this.w, h = this.h; if (n < 2 || !w || !h) return null;
     var pad = 6, gh = h - pad*2;
-    var dmin = Math.min.apply(null,d), dmax = Math.max.apply(null,d), range = (dmax-dmin)||1;
-    var min = dmin - range*0.35, span = (dmax + range*0.25) - min;
+    var dmin = Math.min.apply(null,d), dmax = Math.max.apply(null,d), range = dmax - dmin;
+    if (range < 1e-9) range = Math.max(Math.abs(dmax) * 0.1, 1); // flat series: synthesize a window
+    var margin = range * 0.18, lo = dmin - margin, hi = dmax + margin, span = hi - lo;
     return {
-      pad: pad, n: n, dmin: dmin, dmax: dmax,
+      pad: pad, n: n, lo: lo, hi: hi,
       X: function(i){ return pad + (w-pad*2)*(i/(n-1)); },
-      Y: function(v){ return pad + gh - ((v-min)/span)*gh; }
+      Y: function(v){ return pad + gh - ((v-lo)/span)*gh; }
     };
   };
   Chart.prototype.draw = function(){
@@ -438,10 +442,10 @@
       ctx.lineWidth = 1.5; ctx.strokeStyle = this.cssvar('--panel'); ctx.stroke();
     }
     var ex = X(n-1), ey = Y(d[n-1]); ctx.beginPath(); ctx.arc(ex,ey,3.2,0,7); ctx.fillStyle = this.color; ctx.fill();
-    // Y-axis scale labels — the actual data max (top) and min (bottom), with a
-    // panel-colored halo so they stay legible over the line/fill.
-    this.label(G.dmax, pad + 9, 'top');
-    this.label(G.dmin, h - pad - 3, 'alphabetic');
+    // Y-axis scale labels — the top/bottom axis bounds, aligned to the plot
+    // edges, with a panel-colored halo so they stay legible over the line/fill.
+    this.label(G.hi, pad + 2, 'top');
+    this.label(G.lo, h - pad - 2, 'alphabetic');
   };
   Chart.prototype.label = function(v, y, baseline){
     var ctx = this.ctx, txt = this.fmt(v), x = this.w - 8;
