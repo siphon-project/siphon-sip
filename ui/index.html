@@ -147,6 +147,11 @@
   .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
   .toast .di{width:8px;height:8px;border-radius:50%;background:var(--up)}
   .toast.err .di{background:var(--crit)}
+  .charttip{position:fixed;z-index:50;pointer-events:none;background:var(--panel);border:1px solid var(--border);border-radius:7px;padding:5px 9px;font-family:var(--font-mono);font-size:11.5px;color:var(--text);box-shadow:var(--shadow);opacity:0;transform:translateY(3px);transition:opacity .12s;white-space:nowrap}
+  .charttip.show{opacity:1;transform:none}
+  .charttip b{color:var(--cyan);font-weight:600}
+  .missed{font-family:var(--font-mono);font-size:10px;padding:1px 6px;border-radius:999px;margin-left:6px;border:1px solid color-mix(in srgb,var(--warn) 45%,var(--border));color:var(--warn);background:color-mix(in srgb,var(--warn) 10%,transparent)}
+  .missed.crit{border-color:color-mix(in srgb,var(--crit) 45%,var(--border));color:var(--crit);background:color-mix(in srgb,var(--crit) 10%,transparent)}
   @media (max-width:1200px){.kpis{grid-template-columns:repeat(3,1fr)}.charts{grid-template-columns:1fr}.lower,.grid2{grid-template-columns:1fr}}
   @media (max-width:780px){.app{grid-template-columns:1fr}.sidebar{display:none}.kpis{grid-template-columns:repeat(2,1fr)}}
   @media (prefers-reduced-motion:reduce){.badge.ok .led{animation:none}}
@@ -293,7 +298,7 @@
           <button class="iconbtn" id="call-refresh" title="Refresh"><svg viewBox="0 0 24 24" fill="none" stroke-width="1.8"><path d="M20 11a8 8 0 10-2 5.3M20 5v6h-6"/></svg></button>
         </div>
         <div class="card"><div class="tblscroll"><table class="tbl">
-          <thead><tr><th>Call-ID</th><th>State</th><th>From</th><th>Target</th><th>B-legs</th></tr></thead>
+          <thead><tr><th>Call-ID</th><th>State</th><th>Caller</th><th>Callee</th><th>B-legs</th></tr></thead>
           <tbody id="call-rows"><tr><td colspan="5" class="empty">loading…</td></tr></tbody>
         </table></div></div>
       </div>
@@ -376,30 +381,100 @@
   }
   $('nav').addEventListener('click', function(e){ var it = e.target.closest('.navitem'); if (!it) return; e.preventDefault(); go(it.getAttribute('data-view')); });
   document.querySelectorAll('[data-goto]').forEach(function(a){ a.addEventListener('click', function(){ go(a.getAttribute('data-goto')); }); });
+  // The health-meta rows are re-rendered every poll, so bind their data-goto via delegation.
+  $('health-meta').addEventListener('click', function(e){ var g = e.target.closest('[data-goto]'); if (g) go(g.getAttribute('data-goto')); });
 
   // ---- charts ----
-  function Chart(id, color){ this.cv = $(id); this.ctx = this.cv.getContext('2d'); this.data = []; this.color = color; this.resize(); var s = this; addEventListener('resize', function(){ s.resize(); }); }
+  // One shared tooltip for all sparklines — follows the cursor, shows the exact
+  // value + how long ago that sample was polled (the "no scale / no history"
+  // feedback: hover any point to read it; the y-axis min/max are drawn on-chart).
+  var chartTip = document.createElement('div');
+  chartTip.className = 'charttip';
+  document.body.appendChild(chartTip);
+  function hideChartTip(){ chartTip.classList.remove('show'); }
+
+  function Chart(id, color, opts){
+    this.cv = $(id); this.ctx = this.cv.getContext('2d');
+    this.data = []; this.times = []; this.color = color;
+    this.fmt = (opts && opts.fmt) || comma;
+    this.hoverIndex = null;
+    var s = this;
+    this.resize();
+    addEventListener('resize', function(){ s.resize(); });
+    this.cv.addEventListener('mousemove', function(e){ s.onHover(e); });
+    this.cv.addEventListener('mouseleave', function(){ s.hoverIndex = null; hideChartTip(); s.draw(); });
+  }
   Chart.prototype.resize = function(){ var dpr = devicePixelRatio || 1, r = this.cv.getBoundingClientRect(); this.w = r.width; this.h = r.height; this.cv.width = r.width * dpr; this.cv.height = r.height * dpr; this.ctx.setTransform(dpr,0,0,dpr,0,0); this.draw(); };
-  Chart.prototype.push = function(v){ this.data.push(v); if (this.data.length > 64) this.data.shift(); this.draw(); };
+  Chart.prototype.push = function(v){ this.data.push(v); this.times.push(Date.now()); if (this.data.length > 64){ this.data.shift(); this.times.shift(); } this.draw(); };
   Chart.prototype.cssvar = function(n){ return getComputedStyle(root).getPropertyValue(n).trim(); };
+  // Shared geometry (axis bounds + point mapping) used by both draw and hover.
+  // Bounds are the data min/max plus a symmetric margin, so the printed labels
+  // are the true top/bottom edges of the plot and the line floats inside with
+  // matching headroom — instead of the label sitting away from where the data is.
+  Chart.prototype.geom = function(){
+    var d = this.data, n = d.length, w = this.w, h = this.h; if (n < 2 || !w || !h) return null;
+    var pad = 6, gh = h - pad*2;
+    var dmin = Math.min.apply(null,d), dmax = Math.max.apply(null,d), range = dmax - dmin;
+    if (range < 1e-9) range = Math.max(Math.abs(dmax) * 0.1, 1); // flat series: synthesize a window
+    var margin = range * 0.18, lo = dmin - margin, hi = dmax + margin, span = hi - lo;
+    return {
+      pad: pad, n: n, lo: lo, hi: hi,
+      X: function(i){ return pad + (w-pad*2)*(i/(n-1)); },
+      Y: function(v){ return pad + gh - ((v-lo)/span)*gh; }
+    };
+  };
   Chart.prototype.draw = function(){
     var ctx = this.ctx, w = this.w, h = this.h, d = this.data, n = d.length; if (!w || !h) return;
     var pad = 6, gh = h - pad*2; ctx.clearRect(0,0,w,h);
     ctx.strokeStyle = this.cssvar('--grid'); ctx.lineWidth = 1;
     for (var g=0; g<=3; g++){ var yy = pad + gh*g/3; ctx.beginPath(); ctx.moveTo(pad,yy); ctx.lineTo(w-pad,yy); ctx.stroke(); }
     if (n < 2) return;
-    var min = Math.min.apply(null,d), max = Math.max.apply(null,d), range = (max-min)||1; min -= range*0.35; max += range*0.25; var span = max-min;
-    var X = function(i){ return pad + (w-pad*2)*(i/(n-1)); }, Y = function(v){ return pad + gh - ((v-min)/span)*gh; };
+    var G = this.geom(), X = G.X, Y = G.Y;
     var grad = ctx.createLinearGradient(0,pad,0,h); grad.addColorStop(0,this.color+'55'); grad.addColorStop(1,this.color+'00');
     ctx.beginPath(); ctx.moveTo(X(0),Y(d[0])); for (var i=1;i<n;i++) ctx.lineTo(X(i),Y(d[i])); ctx.lineTo(X(n-1),h-pad); ctx.lineTo(X(0),h-pad); ctx.closePath(); ctx.fillStyle = grad; ctx.fill();
     ctx.beginPath(); ctx.moveTo(X(0),Y(d[0])); for (var j=1;j<n;j++) ctx.lineTo(X(j),Y(d[j])); ctx.strokeStyle = this.color; ctx.lineWidth = 2; ctx.lineJoin = 'round'; ctx.stroke();
+    // Crosshair at the hovered sample.
+    if (this.hoverIndex != null && this.hoverIndex >= 0 && this.hoverIndex < n){
+      var hx = X(this.hoverIndex), hy = Y(d[this.hoverIndex]);
+      ctx.strokeStyle = this.cssvar('--faint'); ctx.lineWidth = 1; ctx.setLineDash([3,3]);
+      ctx.beginPath(); ctx.moveTo(hx,pad); ctx.lineTo(hx,h-pad); ctx.stroke(); ctx.setLineDash([]);
+      ctx.beginPath(); ctx.arc(hx,hy,3.4,0,7); ctx.fillStyle = this.color; ctx.fill();
+      ctx.lineWidth = 1.5; ctx.strokeStyle = this.cssvar('--panel'); ctx.stroke();
+    }
     var ex = X(n-1), ey = Y(d[n-1]); ctx.beginPath(); ctx.arc(ex,ey,3.2,0,7); ctx.fillStyle = this.color; ctx.fill();
+    // Y-axis scale labels — the top/bottom axis bounds, aligned to the plot
+    // edges, with a panel-colored halo so they stay legible over the line/fill.
+    this.label(G.hi, pad + 2, 'top');
+    this.label(G.lo, h - pad - 2, 'alphabetic');
   };
-  var rps = new Chart('c-rps', '#22d3ee'), dlg = new Chart('c-dlg', '#818cf8'), mem = new Chart('c-mem', '#0ea5e9');
+  Chart.prototype.label = function(v, y, baseline){
+    var ctx = this.ctx, txt = this.fmt(v), x = this.w - 8;
+    ctx.font = '10px ui-monospace, "JetBrains Mono", monospace';
+    ctx.textAlign = 'right'; ctx.textBaseline = baseline;
+    ctx.lineWidth = 3; ctx.lineJoin = 'round'; ctx.strokeStyle = this.cssvar('--panel'); ctx.strokeText(txt, x, y);
+    ctx.fillStyle = this.cssvar('--faint'); ctx.fillText(txt, x, y);
+  };
+  Chart.prototype.onHover = function(e){
+    var G = this.geom(); if (!G) return;
+    var frac = (e.offsetX - G.pad) / (this.w - G.pad*2);
+    var idx = Math.round(frac * (G.n - 1)); if (idx < 0) idx = 0; if (idx > G.n-1) idx = G.n-1;
+    this.hoverIndex = idx; this.draw();
+    var age = Math.max(0, Math.round((Date.now() - this.times[idx]) / 1000));
+    chartTip.innerHTML = '<b>' + esc(this.fmt(this.data[idx])) + '</b> · ' + (age <= 1 ? 'now' : age + 's ago');
+    chartTip.style.left = (e.clientX + 12) + 'px';
+    chartTip.style.top = (e.clientY + 12) + 'px';
+    chartTip.classList.add('show');
+  };
+  var rps = new Chart('c-rps', '#22d3ee', {fmt: function(v){ return comma(v) + ' req/s'; }});
+  var dlg = new Chart('c-dlg', '#818cf8');
+  var mem = new Chart('c-mem', '#0ea5e9', {fmt: function(v){ return fmtMB(v) + ' MB'; }});
   var charts = [rps, dlg, mem];
 
   // ---- helpers ----
   function comma(v){ return Math.round(v).toLocaleString('en-US'); }
+  // Memory in MB: one decimal below 100 MB so a 5.9 -> 6.2 change is visible in
+  // the number (and tracks the chart line), integer above where it doesn't matter.
+  function fmtMB(v){ return v < 100 ? v.toLocaleString('en-US', {minimumFractionDigits:1, maximumFractionDigits:1}) : comma(v); }
   function mb(bytes){ return bytes / 1048576; }
   function bar(name, valMB, maxMB, color){
     var pct = maxMB > 0 ? Math.max(2, Math.min(100, Math.round(valMB/maxMB*100))) : 0;
@@ -435,14 +510,14 @@
     $('k-rps').textContent = comma(rpsVal); $('k-resp').textContent = comma(respVal);
     $('k-regs').textContent = comma(regs);
     $('k-txn').textContent = comma(txn);
-    $('k-mem').innerHTML = comma(memMB) + '<small>MB</small>';
+    $('k-mem').innerHTML = fmtMB(memMB) + '<small>MB</small>';
     $('nav-regs').textContent = comma(regs);
     var pool = (py.pool_size!=null?py.pool_size:'—'), pmax = (py.pool_max!=null?py.pool_max:'—');
     $('k-py').innerHTML = pool + '<small>/' + pmax + '</small>';
     $('k-py-foot').textContent = (py.inflight||0) + ' inflight · ' + (py.jobs_shed||0) + ' shed';
 
     rps.push(rpsVal); dlg.push(dialogs); mem.push(memMB);
-    $('n-rps').textContent = comma(rpsVal); $('n-dlg').textContent = comma(dialogs); $('n-mem').textContent = comma(memMB);
+    $('n-rps').textContent = comma(rpsVal); $('n-dlg').textContent = comma(dialogs); $('n-mem').textContent = fmtMB(memMB);
 
     // connection mix
     var conns = sip.connections || {}, total = 0, keys = Object.keys(conns);
@@ -456,10 +531,19 @@
     $('conn-stack').innerHTML = stack || '<i style="width:100%;background:var(--border)"></i>';
     $('conn-legend').innerHTML = legend || '<div class="legrow"><span class="n">no active connections</span></div>';
 
-    var dia = m.diameter || {}, rtp = m.rtpengine || {}, sbi = m.sbi || {}, sec = m.security || {};
+    var dia = m.diameter || {}, rtp = m.rtpengine || {}, sbi = m.sbi || {}, sec = m.security || {}, gw = m.gateways;
+    // Gateway health at a glance — only when a gateway block is configured.
+    var gwLine = '';
+    if (gw && (gw.groups_total||0) > 0){
+      var gwIssues = gw.groups_with_issues||0;
+      var gwCol = gwIssues > 0 ? 'var(--warn)' : 'var(--up)';
+      var gwTxt = gwIssues > 0 ? (gw.groups_total+' · '+gwIssues+' with issues') : (gw.groups_total+' · all healthy');
+      gwLine = '<div class="metaline" data-goto="gateways" style="cursor:pointer" title="View gateways"><span>Gateway groups</span><b style="color:'+gwCol+'">'+gwTxt+'</b></div>';
+    }
     $('health-meta').innerHTML =
       '<div class="metaline"><span>Draining</span><b id="hm-drain">—</b></div>' +
       '<div class="metaline"><span>rtpengine</span><b>'+(rtp.up||0)+' / '+(rtp.total||0)+' up</b></div>' +
+      gwLine +
       '<div class="metaline"><span>Diameter peers</span><b>'+(dia.peers_connected||0)+' connected</b></div>' +
       '<div class="metaline"><span>Banned sources</span><b style="color:'+((sec.banned_ips||0)>0?'var(--warn)':'var(--text)')+'">'+(sec.banned_ips||0)+' active</b></div>';
     refreshReady();
@@ -587,8 +671,12 @@
       var rows = (g.destinations||[]).map(function(d){
         var attrs = Object.keys(d.attrs||{}).map(function(k){ return k+'='+d.attrs[k]; }).join(' ');
         var act = d.healthy ? 'down' : 'up', actLabel = d.healthy ? 'drain' : 'enable';
+        // Consecutive probe failures — shown while degrading (warn) or down (crit).
+        var missed = (d.checks_missed||0) > 0
+          ? ' <span class="missed'+(d.healthy?'':' crit')+'" title="consecutive health-probe failures">'+d.checks_missed+'/'+(g.failure_threshold||'?')+' missed</span>'
+          : '';
         return '<tr><td class="aor">'+esc(d.uri)+'</td><td class="contact">'+esc(d.address)+' '+esc(d.transport)+'</td>'
-          + '<td>'+(d.healthy?'<span class="spill up">● up</span>':'<span class="spill down">● down</span>')+'</td>'
+          + '<td>'+(d.healthy?'<span class="spill up">● up</span>':'<span class="spill down">● down</span>')+missed+'</td>'
           + '<td class="q">'+d.weight+'</td><td class="q">'+d.priority+'</td><td class="contact">'+esc(attrs)+'</td>'
           + '<td><button class="rowbtn'+(unlocked?' armed':'')+'" data-gw="'+esc(g.name)+'|'+esc(d.uri)+'|'+act+'">'+actLabel+'</button></td></tr>';
       }).join('');
@@ -623,7 +711,7 @@
       var col = callStateColor(c.state);
       return '<tr><td class="aor">'+esc(c.call_id)+'</td>'
         + '<td><span class="spill" style="color:'+col+';border-color:'+col+'">'+esc(c.state)+'</span></td>'
-        + '<td class="contact">'+esc(c.from||'—')+'</td><td class="contact">'+esc(c.to||'—')+'</td><td class="q">'+c.b_legs+'</td></tr>';
+        + '<td class="contact">'+esc(c.a_party||'—')+'</td><td class="contact">'+esc(c.b_party||'—')+'</td><td class="q">'+c.b_legs+'</td></tr>';
     }).join('') : '<tr><td colspan="5" class="empty">no active B2BUA calls</td></tr>';
   }
   document.getElementById('call-refresh').addEventListener('click', loadCalls);
