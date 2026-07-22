@@ -82,11 +82,32 @@ impl fmt::Display for TransferSide {
     }
 }
 
-/// Build a NOTIFY body with `message/sipfrag` content (RFC 3515 §2.4).
+/// Build a NOTIFY body with `message/sipfrag` content (RFC 3515 §2.4 / RFC
+/// 3420).
 ///
-/// The body is a SIP status line, e.g. `SIP/2.0 200 OK`.
+/// The body is a SIP Status-Line, e.g. `SIP/2.0 200 OK`. Per RFC 3261 §25 the
+/// Status-Line is CRLF-terminated, and message/sipfrag inherits that grammar
+/// (RFC 3420), so the trailing CRLF is included.
 pub fn build_sipfrag_body(status_code: u16, reason: &str) -> String {
-    format!("SIP/2.0 {status_code} {reason}")
+    format!("SIP/2.0 {status_code} {reason}\r\n")
+}
+
+/// Build a `Subscription-State` header value for a REFER-subscription NOTIFY
+/// (RFC 3515 §2.4.4 / RFC 6665 §4.1.3).
+///
+/// While the transfer is still pending or trying the subscription is
+/// `active;expires=<n>`; once it reaches a final state (success or failure) the
+/// implicit subscription is `terminated;reason=noresource` and the dialog is
+/// torn down.
+pub fn subscription_state_header(state: &TransferState, expires_secs: u32) -> String {
+    match state {
+        TransferState::Pending | TransferState::Trying => {
+            format!("active;expires={expires_secs}")
+        }
+        TransferState::Succeeded | TransferState::Failed { .. } => {
+            "terminated;reason=noresource".to_string()
+        }
+    }
 }
 
 /// Determine which NOTIFY status to send based on an INVITE response.
@@ -161,19 +182,19 @@ mod tests {
     #[test]
     fn build_sipfrag_100_trying() {
         let body = build_sipfrag_body(100, "Trying");
-        assert_eq!(body, "SIP/2.0 100 Trying");
+        assert_eq!(body, "SIP/2.0 100 Trying\r\n");
     }
 
     #[test]
     fn build_sipfrag_200_ok() {
         let body = build_sipfrag_body(200, "OK");
-        assert_eq!(body, "SIP/2.0 200 OK");
+        assert_eq!(body, "SIP/2.0 200 OK\r\n");
     }
 
     #[test]
     fn build_sipfrag_503() {
         let body = build_sipfrag_body(503, "Service Unavailable");
-        assert_eq!(body, "SIP/2.0 503 Service Unavailable");
+        assert_eq!(body, "SIP/2.0 503 Service Unavailable\r\n");
     }
 
     #[test]
@@ -208,6 +229,36 @@ mod tests {
             }
             other => panic!("Expected Failed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn subscription_state_active_while_pending_or_trying() {
+        assert_eq!(
+            subscription_state_header(&TransferState::Pending, 60),
+            "active;expires=60"
+        );
+        assert_eq!(
+            subscription_state_header(&TransferState::Trying, 120),
+            "active;expires=120"
+        );
+    }
+
+    #[test]
+    fn subscription_state_terminated_on_final() {
+        assert_eq!(
+            subscription_state_header(&TransferState::Succeeded, 60),
+            "terminated;reason=noresource"
+        );
+        assert_eq!(
+            subscription_state_header(
+                &TransferState::Failed {
+                    code: 486,
+                    reason: "Busy Here".to_string()
+                },
+                60
+            ),
+            "terminated;reason=noresource"
+        );
     }
 
     #[test]

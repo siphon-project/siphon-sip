@@ -15,6 +15,24 @@ from siphon_sdk.types import Action, Contact, Flow, MediaHandle, SipUri
 from siphon_sdk.request import _parse_uri, _validate_send_socket
 
 
+def _validate_replaces(replaces: Optional[dict]) -> None:
+    """Validate an attended-transfer ``replaces`` dict (RFC 3891).
+
+    ``None`` (a blind transfer) is always valid.  A dict must carry
+    ``call_id``, ``from_tag`` and ``to_tag`` (``early_only`` is optional).
+    Raises :class:`ValueError` otherwise.
+    """
+    if replaces is None:
+        return
+    required = ("call_id", "from_tag", "to_tag")
+    missing = [key for key in required if key not in replaces]
+    if missing:
+        raise ValueError(
+            f"replaces dict must contain {', '.join(required)} "
+            f"(missing: {', '.join(missing)})"
+        )
+
+
 class Call:
     """A B2BUA call with two legs (A-leg = caller, B-leg = callee).
 
@@ -225,9 +243,11 @@ class Call:
     def refer_replaces(self) -> Optional[dict]:
         """Parsed Replaces parameter from the Refer-To header.
 
-        Returns a dict with ``call_id``, ``from_tag``, and ``to_tag`` if
-        the REFER includes a Replaces header (attended transfer), or
-        ``None`` for a blind transfer.
+        Returns a dict with **four** keys — ``call_id``, ``from_tag``,
+        ``to_tag`` and ``early_only`` (a ``bool``) — if the REFER includes a
+        Replaces header (attended transfer, RFC 3891), or ``None`` for a blind
+        transfer.  ``early_only`` is ``True`` when the Replaces carried the
+        ``early-only`` flag (match only a dialog still in the early state).
 
         Example::
 
@@ -235,7 +255,10 @@ class Call:
             def handle_refer(call):
                 repl = call.refer_replaces
                 if repl:
-                    log.info(f"Attended transfer, replaces {repl['call_id']}")
+                    log.info(
+                        f"Attended transfer, replaces {repl['call_id']} "
+                        f"(early_only={repl['early_only']})"
+                    )
         """
         return self._refer_replaces
 
@@ -604,20 +627,66 @@ class Call:
         self._state = "terminated"
         self._actions.append(Action(kind="terminate"))
 
-    def accept_refer(self) -> None:
-        """Accept an incoming REFER and initiate the transfer.
+    def accept_refer(self, target: Optional[str] = None,
+                     next_hop: Optional[str] = None,
+                     mode: Optional[str] = None) -> None:
+        """Accept an incoming REFER and honour the transfer.
 
         Call this from a ``@b2bua.on_refer`` handler to proceed with the
-        call transfer.  The B2BUA will send 202 Accepted to the REFER
-        originator and initiate a new INVITE to the Refer-To target.
+        transfer the remote party asked for.
+
+        Args:
+            target: Optionally rewrite the transfer destination before
+                honouring it.  Defaults to :attr:`refer_to` (the URI carried
+                in the incoming Refer-To header).
+            next_hop: Optionally steer egress to a specific next-hop, exactly
+                like ``dial(next_hop=...)`` — the R-URI is still built from
+                ``target`` (so the referred-to identity is preserved on the
+                wire) but the message is sent to ``next_hop``.
+            mode: How siphon honours the REFER:
+
+                - ``"terminate"`` — siphon **terminates** the transfer: it
+                  answers ``202 Accepted`` locally, re-resolves ``target``
+                  (the Refer-To) through the dial plan as a brand-new leg,
+                  re-bridges the surviving leg to it, and sends BYE to the
+                  referred-away leg.  The transferor drops out; siphon owns
+                  both new legs.  The transferee never sees the REFER.
+                - ``"transparent"`` — siphon **re-emits** the REFER on the far
+                  leg and relays the far leg's ``202 Accepted`` plus the
+                  sipfrag ``NOTIFY`` progress reports back to the transferor,
+                  staying out of the transfer decision.
+                - ``None`` (default) — use the configured
+                  ``b2bua.default_refer_mode`` from ``siphon.yaml`` (which
+                  itself defaults to ``"terminate"``).
+
+        Raises:
+            ValueError: if ``mode`` is not one of ``None``, ``"terminate"``,
+                or ``"transparent"``.
 
         Example::
 
             @b2bua.on_refer
             def handle_refer(call):
+                # Blind transfer — let siphon terminate + re-bridge (default).
                 call.accept_refer()
+
+            @b2bua.on_refer
+            def handle_refer(call):
+                # Steer the referred-to leg out a specific trunk, transparently.
+                call.accept_refer(next_hop="sip:trunk.example.com:5060",
+                                  mode="transparent")
         """
-        self._actions.append(Action(kind="accept_refer"))
+        if mode not in (None, "terminate", "transparent"):
+            raise ValueError(
+                f"accept_refer(mode=...) must be None, 'terminate', or "
+                f"'transparent' (got {mode!r})"
+            )
+        self._actions.append(Action(
+            kind="accept_refer",
+            targets=[target] if target else None,
+            next_hop=next_hop,
+            extras={"mode": mode},
+        ))
 
     def reject_refer(self, code: int, reason: str) -> None:
         """Reject an incoming REFER.
@@ -633,6 +702,58 @@ class Call:
                 call.reject_refer(403, "Forbidden")
         """
         self._actions.append(Action(kind="reject_refer", status_code=code, reason=reason))
+
+    def refer(self, target: str, replaces: Optional[dict] = None) -> None:
+        """Originate an outbound REFER — siphon is the *referrer*.
+
+        Use this when siphon itself drives the transfer, e.g. a UAS/IVR
+        offload that answers the call, plays a menu, then transfers the caller
+        onward.  This is the mirror of :meth:`accept_refer` (which honours a
+        REFER siphon *received*).
+
+        Args:
+            target: The Refer-To URI — where the remote party should be
+                transferred to.
+            replaces: For an **attended** transfer, a dict identifying the
+                dialog to replace (RFC 3891) with keys ``call_id``,
+                ``from_tag`` and ``to_tag`` (and an optional ``early_only``
+                bool).  Omit / ``None`` for a **blind** transfer.
+
+        Raises:
+            ValueError: if ``replaces`` is given but is missing any of
+                ``call_id`` / ``from_tag`` / ``to_tag``.
+
+        Note:
+            This is a **deferred** call action — it is honoured after the
+            handler returns, so it works from a call-scoped handler like
+            ``@b2bua.on_answer``.  From an out-of-band event callback
+            (``@rtpengine.on_dtmf``, a timer) where no ``call`` is in scope and
+            deferred actions are no-ops, use the imperative
+            :func:`b2bua.refer` (keyed by Call-ID) instead.
+
+        Example::
+
+            @b2bua.on_answer
+            def on_answer(call, reply):
+                # Blind transfer the freshly answered call onward.
+                call.refer("sip:+15550142@example.com")
+
+            @b2bua.on_answer
+            def attended(call, reply):
+                call.refer(
+                    "sip:+15550142@example.com",
+                    replaces={"call_id": "held-dialog@example.com",
+                              "from_tag": "ft-held",
+                              "to_tag": "tt-held"},
+                )
+        """
+        _validate_replaces(replaces)
+        self._actions.append(Action(
+            kind="refer",
+            targets=[target],
+            next_hop=None,
+            extras={"replaces": replaces},
+        ))
 
     def session_timer(self, expires: int, min_se: int = 90,
                       refresher: str = "uac") -> None:

@@ -1,0 +1,37 @@
+# siphon.b2bua-refer-modes-test.yaml — B2BUA REFER acceptance configuration
+#
+# Used with: sipp/docker-compose.yaml (b2bua-refer-modes profile)
+# Script:    scripts/b2bua_refer_modes.py (dispatches on X-Refer-Mode)
+# Tests:     REFER reject (603) and siphon-terminated transfer
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.60"
+    - "127.0.0.1"
+
+script:
+  path: "scripts/b2bua_refer_modes.py"
+  reload: auto
+
+advertised_address: "172.20.0.60"
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+log:
+  level: debug
+  format: pretty

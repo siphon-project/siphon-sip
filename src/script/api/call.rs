@@ -68,15 +68,77 @@ pub enum CallAction {
     },
     /// Terminate the call (BYE both legs).
     Terminate,
-    /// Accept a REFER (call transfer).
-    AcceptRefer,
+    /// Accept a REFER (call transfer). `mode` selects siphon-terminated
+    /// (`Terminate`) vs transparent forward (`Transparent`); `None` defers to
+    /// the configured `b2bua.default_refer_mode`. `target` optionally rewrites
+    /// the transfer destination before it is honored; `next_hop` steers egress.
+    AcceptRefer {
+        target: Option<String>,
+        next_hop: Option<String>,
+        mode: Option<ReferMode>,
+    },
     /// Reject a REFER with a status code.
     RejectRefer { code: u16, reason: String },
+    /// Originate an outbound REFER on a connected leg (`call.refer(...)`) —
+    /// siphon is the referrer (IVR / UAS-mode offload). Carries the target and
+    /// an optional Replaces (attended transfer).
+    SendRefer {
+        refer_to: crate::sip::headers::refer::ReferTo,
+    },
     /// UAS-mode answer already sent imperatively by `call.answer()` — the final
     /// 2xx went on the wire during the handler (see `dispatcher::b2bua_answer_call`).
     /// This marker only tells the dispatcher the call was answered so it keeps
     /// the actor alive instead of removing it as a silent (no-action) drop.
     Answered,
+}
+
+/// REFER transfer mode selected by `call.accept_refer(mode=...)` (and the
+/// configured `b2bua.default_refer_mode` fallback).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReferMode {
+    /// siphon terminates the transfer: answer 202 locally, re-resolve the
+    /// Refer-To through the dial plan as a new leg, re-bridge the media, and BYE
+    /// the referred-away leg. Correct for trunk-facing SBCs (the far end need not
+    /// support REFER) and keeps media anchored.
+    Terminate,
+    /// siphon forwards the REFER transparently on the far leg's own dialog and
+    /// relays the far end's 202 + `message/sipfrag` NOTIFYs back to the referrer.
+    /// Correct for UA-to-UA (PBX / softphone) topologies where both ends handle
+    /// REFER themselves.
+    Transparent,
+}
+
+/// Parse a Python Replaces dict (`{call_id, from_tag, to_tag, early_only?}`)
+/// into the internal [`Replaces`](crate::sip::headers::refer::Replaces). Shared
+/// by `call.refer(replaces=…)` and the imperative `b2bua.refer(...)`. Returns
+/// `None` when `dict` is `None` (a blind transfer).
+pub(crate) fn parse_replaces_dict(
+    dict: Option<&Bound<'_, pyo3::types::PyDict>>,
+) -> PyResult<Option<crate::sip::headers::refer::Replaces>> {
+    let Some(dict) = dict else {
+        return Ok(None);
+    };
+    let required = |key: &str| -> PyResult<String> {
+        match dict.get_item(key)? {
+            Some(value) => value.extract::<String>(),
+            None => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "replaces dict requires a '{key}' key"
+            ))),
+        }
+    };
+    let call_id = required("call_id")?;
+    let from_tag = required("from_tag")?;
+    let to_tag = required("to_tag")?;
+    let early_only = match dict.get_item("early_only")? {
+        Some(value) => value.extract::<bool>()?,
+        None => false,
+    };
+    Ok(Some(crate::sip::headers::refer::Replaces {
+        call_id,
+        from_tag,
+        to_tag,
+        early_only,
+    }))
 }
 
 /// Which side initiated a BYE.
@@ -1574,8 +1636,48 @@ impl PyCall {
     }
 
     /// Accept the REFER and proceed with the transfer.
-    fn accept_refer(&mut self) {
-        self.action = CallAction::AcceptRefer;
+    ///
+    /// `mode` selects how siphon honors the transfer:
+    ///   - `"terminate"`   — siphon terminates the transfer: answer 202 locally,
+    ///     re-resolve the Refer-To through the dial plan as a new leg, re-bridge
+    ///     the media, and BYE the referred-away leg. Works even when the far end
+    ///     cannot handle REFER; keeps media anchored.
+    ///   - `"transparent"` — siphon re-emits the REFER on the far leg's own
+    ///     dialog and relays the far end's 202 + sipfrag NOTIFYs back.
+    ///   - `None` (default) — use the configured `b2bua.default_refer_mode`.
+    ///
+    /// `target` optionally rewrites the transfer destination (e.g. E.164
+    /// canonicalization or gateway selection) before it is honored; it defaults
+    /// to `call.refer_to`. `next_hop` steers egress without changing the target
+    /// URI shape (same semantics as `call.dial(next_hop=...)`).
+    ///
+    /// Usage in Python:
+    ///   call.accept_refer()
+    ///   call.accept_refer(mode="transparent")
+    ///   call.accept_refer(target="sip:+15550142@example.com", mode="terminate")
+    #[pyo3(signature = (target=None, next_hop=None, mode=None))]
+    fn accept_refer(
+        &mut self,
+        target: Option<String>,
+        next_hop: Option<String>,
+        mode: Option<&str>,
+    ) -> PyResult<()> {
+        let mode = match mode {
+            None => None,
+            Some("terminate") => Some(ReferMode::Terminate),
+            Some("transparent") => Some(ReferMode::Transparent),
+            Some(other) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "accept_refer(mode=…) must be 'terminate' or 'transparent', got {other:?}"
+                )));
+            }
+        };
+        self.action = CallAction::AcceptRefer {
+            target,
+            next_hop,
+            mode,
+        };
+        Ok(())
     }
 
     /// Reject the REFER with a status code and reason.
@@ -1584,6 +1686,37 @@ impl PyCall {
             code,
             reason: reason.to_string(),
         };
+    }
+
+    /// Originate an outbound REFER on this call's connected leg — siphon is the
+    /// referrer (UAS-mode / IVR offload). `target` is the Refer-To URI the peer
+    /// should contact; `replaces` (a dict with keys `call_id` / `from_tag` /
+    /// `to_tag` and optional `early_only`) makes it an attended transfer, or
+    /// `None` for a blind transfer.
+    ///
+    /// Deferred: takes effect when the handler returns (use from
+    /// `@b2bua.on_answer`). For event-callback contexts such as
+    /// `@rtpengine.on_dtmf` — where deferred call actions are silent no-ops —
+    /// use the imperative `b2bua.refer(call_id, target)` instead.
+    ///
+    /// Usage in Python:
+    ///   call.refer("sip:+15550142@example.com")
+    ///   call.refer("sip:carol@example.com",
+    ///              replaces={"call_id": "abc", "from_tag": "a", "to_tag": "b"})
+    #[pyo3(signature = (target, replaces=None))]
+    fn refer(
+        &mut self,
+        target: &str,
+        replaces: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<()> {
+        let replaces = parse_replaces_dict(replaces)?;
+        self.action = CallAction::SendRefer {
+            refer_to: crate::sip::headers::refer::ReferTo {
+                uri: target.to_string(),
+                replaces,
+            },
+        };
+        Ok(())
     }
 }
 
@@ -1925,8 +2058,60 @@ mod tests {
     fn call_accept_refer() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
-        call.accept_refer();
-        assert_eq!(call.action(), &CallAction::AcceptRefer);
+        call.accept_refer(None, None, None).unwrap();
+        assert_eq!(
+            call.action(),
+            &CallAction::AcceptRefer {
+                target: None,
+                next_hop: None,
+                mode: None
+            }
+        );
+    }
+
+    #[test]
+    fn call_accept_refer_transparent_with_target() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        call.accept_refer(
+            Some("sip:+15550142@example.com".to_string()),
+            Some("sip:198.51.100.1:5060".to_string()),
+            Some("transparent"),
+        )
+        .unwrap();
+        assert_eq!(
+            call.action(),
+            &CallAction::AcceptRefer {
+                target: Some("sip:+15550142@example.com".to_string()),
+                next_hop: Some("sip:198.51.100.1:5060".to_string()),
+                mode: Some(ReferMode::Transparent),
+            }
+        );
+    }
+
+    #[test]
+    fn call_accept_refer_terminate_mode() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        call.accept_refer(None, None, Some("terminate")).unwrap();
+        assert_eq!(
+            call.action(),
+            &CallAction::AcceptRefer {
+                target: None,
+                next_hop: None,
+                mode: Some(ReferMode::Terminate),
+            }
+        );
+    }
+
+    #[test]
+    fn call_accept_refer_rejects_bad_mode() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        let result = call.accept_refer(None, None, Some("bridge"));
+        assert!(result.is_err());
+        // The invalid call must not have mutated the action.
+        assert_eq!(call.action(), &CallAction::None);
     }
 
     #[test]
@@ -1941,6 +2126,62 @@ mod tests {
                 reason: "Forbidden".to_string()
             }
         );
+    }
+
+    #[test]
+    fn call_refer_blind() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        call.refer("sip:+15550142@example.com", None).unwrap();
+        match call.action() {
+            CallAction::SendRefer { refer_to } => {
+                assert_eq!(refer_to.uri, "sip:+15550142@example.com");
+                assert!(refer_to.replaces.is_none());
+            }
+            other => panic!("expected SendRefer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_refer_attended() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let message = Arc::new(Mutex::new(make_invite()));
+            let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("call_id", "abc@example.com").unwrap();
+            dict.set_item("from_tag", "a-tag").unwrap();
+            dict.set_item("to_tag", "b-tag").unwrap();
+            dict.set_item("early_only", true).unwrap();
+            call.refer("sip:carol@example.com", Some(&dict)).unwrap();
+            match call.action() {
+                CallAction::SendRefer { refer_to } => {
+                    assert_eq!(refer_to.uri, "sip:carol@example.com");
+                    let replaces = refer_to.replaces.as_ref().expect("attended → Some(Replaces)");
+                    assert_eq!(replaces.call_id, "abc@example.com");
+                    assert_eq!(replaces.from_tag, "a-tag");
+                    assert_eq!(replaces.to_tag, "b-tag");
+                    assert!(replaces.early_only);
+                }
+                other => panic!("expected SendRefer, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn parse_replaces_dict_missing_key_errors() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let dict = pyo3::types::PyDict::new(py);
+            dict.set_item("call_id", "abc@example.com").unwrap();
+            // from_tag / to_tag missing → ValueError
+            assert!(parse_replaces_dict(Some(&dict)).is_err());
+        });
+    }
+
+    #[test]
+    fn parse_replaces_dict_none_is_none() {
+        assert!(parse_replaces_dict(None).unwrap().is_none());
     }
 
     #[test]

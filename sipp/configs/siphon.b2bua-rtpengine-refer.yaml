@@ -1,0 +1,44 @@
+# siphon.b2bua-rtpengine-refer.yaml — anchored B2BUA REFER-terminate test config
+#
+# Used with: sipp/docker-compose.yaml (b2bua-rtpengine-refer profile)
+# Script:    scripts/b2bua_rtpengine_refer.py (anchors media + on_refer terminate)
+# Media:     REAL rtpengine (drachtio/rtpengine) at 172.20.0.44:22222
+# Proves:    the terminate-transfer media recipe (rtpengine offer/answer/delete)
+#            against a real media engine, not the SDP-echo mock.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.61"
+    - "127.0.0.1"
+
+script:
+  path: "scripts/b2bua_rtpengine_refer.py"
+  reload: auto
+
+advertised_address: "172.20.0.61"
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+media:
+  rtpengine:
+    address: "172.20.0.44:22222"
+    timeout_ms: 2000
+
+log:
+  level: debug
+  format: pretty

@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA siphon-originated (outbound) REFER UAC scenario — Alice, the referee:
+  INVITE (X-Outbound-Refer: carol) → 200 → ACK
+  → receive siphon's REFER (Refer-To: carol) → 202
+  → send sipfrag NOTIFY (200 OK) → 200
+  → BYE → 200
+
+  The script's @b2bua.on_answer calls call.refer(target) once the call is up, so
+  siphon originates an in-dialog REFER to the caller (the IVR / TAS offload
+  pattern). This validates the outbound path (CallAction::SendRefer) end to end.
+-->
+<scenario name="B2BUA outbound REFER UAC">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+X-Outbound-Refer: sip:+15550142@example.com
+User-Agent: SIPp/b2bua-refer-outbound-test
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=sendrecv
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <label id="1" />
+  <recv response="180" optional="true" next="1" />
+
+  <recv response="200" rtd="true" crlf="true" />
+
+  <send>
+    <![CDATA[
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- siphon originates the REFER (from @b2bua.on_answer → call.refer). -->
+  <recv request="REFER" crlf="true" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 202 Accepted
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="200" />
+
+  <!-- Report the transfer complete: sipfrag NOTIFY back to siphon (which absorbs
+       it — siphon owns this subscription as the referrer). From/To are the
+       received REFER's To/From (dialog roles reversed). -->
+  <send retrans="500">
+    <![CDATA[
+NOTIFY sip:[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 NOTIFY
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Event: refer
+Subscription-State: terminated;reason=noresource
+User-Agent: SIPp/b2bua-refer-outbound-test
+Content-Type: message/sipfrag
+Content-Length: [len]
+
+SIP/2.0 200 OK
+]]>
+  </send>
+
+  <recv response="200" crlf="true" />
+
+  <pause milliseconds="200" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 3 BYE
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+</scenario>
