@@ -2432,6 +2432,156 @@ services:
     profiles:
       - webrtc
 
+  # ── Charging: real CGRateS OCS/CDF (profile: charging) ─────────────────────
+  # Rf + Ro against a real go-diameter peer. Requires docker; opt-in like ipsec.
+  #   docker compose -f sipp/docker-compose.yaml --profile charging up -d cgrates siphon-charging
+  #   scripts/charging_test.sh
+  cgrates:
+    image: cgrates/cgrates:latest
+    container_name: cgrates-charging
+    command: ["cgr-engine", "-config_path", "/etc/cgrates"]
+    volumes:
+      - ./cgrates/cgrates.json:/etc/cgrates/cgrates.json:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.70
+    healthcheck:
+      test: ["CMD-SHELL", "cgr-console 'status' >/dev/null 2>&1 || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 8s
+    profiles:
+      - charging
+
+  siphon-charging:
+    image: sipp-siphon
+    container_name: siphon-charging
+    depends_on:
+      cgrates:
+        condition: service_healthy
+    volumes:
+      - ./configs/siphon.charging-test.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.71
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 12s
+    profiles:
+      - charging
+
+  # Register bob FROM the UAS IP (.73) so the B2BUA forks over the captured
+  # inbound flow to where the UAS actually listens (same pattern as sipp-b2bua-register).
+  sipp-charging-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-charging:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.73
+    entrypoint:
+      - sipp
+      - "172.20.0.71:5060"
+      - -sf
+      - /sipp/scenarios/register_alice_contact.xml
+      - -inf
+      - /sipp/scenarios/b2bua_bob_contact.csv
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - charging
+
+  sipp-charging-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-charging-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.73
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "60"
+      - -trace_err
+    profiles:
+      - charging
+
+  # Happy path: prepaid balance sufficient → call completes (CCR-I/U/T + CDR).
+  sipp-charging-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-charging-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.74
+    entrypoint:
+      - sipp
+      - "172.20.0.71:5060"
+      - -sf
+      - /sipp/scenarios/charging_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "60"
+      - -trace_err
+    profiles:
+      - charging
+
+  # Enforcement: balance = 0 → siphon must BYE the call. sipp exits non-zero if
+  # the BYE never arrives, which is the gate.
+  sipp-charging-deny-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-charging-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.75
+    entrypoint:
+      - sipp
+      - "172.20.0.71:5060"
+      - -sf
+      - /sipp/scenarios/charging_deny_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - charging
+
 # ── Network ────────────────────────────────────────────────────────────────
 networks:
   sipnet:

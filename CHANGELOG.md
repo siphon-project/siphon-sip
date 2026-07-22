@@ -7,6 +7,24 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **Diameter Ro online charging (prepaid), reserve-before-connect.** A B2BUA
+  reserves credit with a Credit-Control CCR-INITIAL in `@b2bua.on_invite` via
+  `await call.ro_authorize()` BEFORE the B-leg is dialed: a grant dials, a denial
+  rejects (402) and no B-leg is ever created (no call unless the OCS allows it).
+  After the grant siphon runs the SCUR lifecycle itself — CCR-UPDATE on the
+  OCS-granted cadence, mid-call disconnect on `4012 CREDIT_LIMIT_REACHED` /
+  Final-Unit-Indication, CCR-TERMINATION on BYE (and a zero-usage release on
+  pre-answer failure/CANCEL). Configured via a new `ro:` block
+  (`reauth_interval_secs`, `requested_seconds`, `service_context_id`, `charge`,
+  `on_ocs_failure`, `rating_group`, ...). Voice is SCUR; SMS/RCS is one-shot IEC
+  (`diameter.ro_ccr_event`, `Requested-Action = DIRECT_DEBITING`). B2BUA-only:
+  mid-call teardown needs session ownership, which is why 3GPP triggers Ro at the
+  AS/MMTel-AS, not the P-CSCF. Interoperates with CGRateS. New cookbook
+  `docs/cookbook/online-charging-ocs.md` + example `scripts/b2bua_ro_charging.py`.
+- **The Ro credit-control scripting methods are now async** (`await`-able):
+  `diameter.ro_ccr_initial` / `ro_ccr_update` / `ro_ccr_terminate` / `ro_ccr_event`
+  and `call.ro_authorize()` return coroutines, so a slow OCS round-trip runs off
+  the Python driver thread instead of blocking it.
 - **Dashboard charts now have a scale and hover history** (experimental web UI).
   Each sparkline draws its actual y-axis min/max on-chart, and hovering any point
   shows a tooltip with the exact value and how long ago it was sampled, so a dip
@@ -28,6 +46,61 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   now returns `a_party` (caller) and `b_party` (dialed callee) in place of
   `from`/`to`, and the B-leg count excludes the re-INVITE/UPDATE response-tracking
   pseudo-legs, so a plain call that re-INVITEd no longer reports two B-legs.
+
+### Fixed
+- **Diameter Session-Id uniqueness under concurrency** — `new_session_id` read
+  the Hop-by-Hop/End-to-End counters without reserving them, so two requests
+  built concurrently could mint the *same* Session-Id, collapsing two accounting
+  or credit-control sessions into one at the CDF/OCS (cross-charging; one STOP
+  ending both). Session-Ids now come from a dedicated atomic sequence with a
+  wall-clock-seeded high part (RFC 6733 §8.8). Affects Rf and Ro.
+- **Diameter charging AVP codes corrected to RFC 8506 / IANA** — the
+  Credit-Control (Ro/Gy) AVP dictionary used a self-consistent but non-standard
+  numbering (e.g. Granted-Service-Unit, CC-Time, CC-Total-Octets, Final-Unit-*,
+  Rating-Group and Multiple-Services-Credit-Control were all on the wrong codes,
+  MSCC even under the 3GPP vendor namespace). They now match the on-the-wire
+  values a real OCS expects, so Ro requests interoperate instead of being
+  rejected/misparsed. A known-answer test pins every code to the registry.
+  **Wire-affecting** for anyone already driving Ro/Gy from scripts.
+- **Diameter offline-charging (Rf) SMS AVP codes** — SMS-Result (was 3408 =
+  SM-Sequence-Number, now 3409) and MTC-IWF-Address (was 3413, now 3406) are
+  emitted on the correct codes, so a CDF parses the SMS record fields instead of
+  mislabeling them.
+- **CER application advertisement** — the Rf accounting application (id 3) was
+  advertised as an `Auth-Application-Id` inside a `Vendor-Specific-Application-Id`
+  with `Vendor-Id: 0`, two RFC 6733 violations that make strict peers
+  (go-diameter/CGRateS) answer `DIAMETER_NO_COMMON_APPLICATION`. Accounting apps
+  are now advertised via `Acct-Application-Id`, and base (vendor-0) apps are no
+  longer wrapped in a VSAI.
+- **Rf accounting hardening** — IMS-Information and SMS-Information now nest under
+  a single `Service-Information` (TS 32.299 §7.2.87 allows only one, was two);
+  the non-conformant `User-Session-Id` directly under `Service-Information` is
+  dropped; a rejected ACR-START no longer opens a local session or INTERIM timer;
+  an explicit `Acct-Interim-Interval: 0` from the CDF is honored; and an
+  abandoned session (no ACR-STOP) is released by a max-lifetime backstop.
+
+### Added
+- **Diameter Ro online charging** (RFC 8506 / 3GPP TS 32.299). A new `ro:`
+  config block turns on prepaid charging: for **voice** (SCUR) siphon reserves
+  credit at call setup (CCR-INITIAL), re-authorizes on the OCS-granted quota
+  (CCR-UPDATE, configurable fallback cadence `reauth_interval_secs`, default
+  30s), and **disconnects the call** when the OCS refuses further credit or
+  sends a Final-Unit-Indication; for **SMS/RCS** (IEC) it does a one-shot
+  CCR-EVENT (DIRECT_DEBITING). A `credit_control_not_applicable` (4011) result
+  lets a call proceed free of charge, and `on_ocs_failure` picks fail-closed vs
+  fail-open. Interoperates with CGRateS. **Enforcement is B2BUA-only** —
+  disconnecting a live call requires owning the session, which is why 3GPP
+  triggers Ro at the AS/MMTel-AS and not the P-CSCF; run the charging siphon as
+  a B2BUA. There is no proxy-mode auto-emit.
+- **Ro scripting API** — `diameter.ro_ccr_initial / ro_ccr_update /
+  ro_ccr_terminate / ro_ccr_event` for full script-driven credit control
+  (returns `{result_code, session_id, request_number, granted_time,
+  validity_time, final_unit_action}`). Mirrored in the `siphon-sip` SDK mock
+  with `set_ro_result_code` / `set_ro_granted_time` / `captured_ccrs` helpers.
+- **`siphon_rf_sessions` / `siphon_ro_sessions` metrics** — gauges of live Rf
+  accounting and Ro credit-control sessions (START/INITIAL without a matching
+  STOP/TERMINATION); a monotonic climb under a steady, completed-call workload
+  flags a charging-session leak.
 
 ## [1.4.1] — 2026-07-15
 

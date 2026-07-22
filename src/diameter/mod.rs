@@ -22,6 +22,7 @@ pub mod server;
 pub mod rf;
 pub mod rf_service;
 pub mod ro;
+pub mod ro_service;
 pub mod rx;
 pub mod s6a;
 pub mod s6c;

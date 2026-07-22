@@ -24,6 +24,7 @@ run_sipp() {
 
 COMPOSE_FILE="sipp/docker-compose.yaml"
 RUN_IPSEC=false
+RUN_CHARGING=false
 RUN_CALL=false
 RUN_PRESENCE=false
 RUN_RTPENGINE=false
@@ -43,6 +44,7 @@ SKIP_RUST=false
 for arg in "$@"; do
   case "$arg" in
     --ipsec)      RUN_IPSEC=true ;;
+    --charging)   RUN_CHARGING=true ;;
     --call)       RUN_CALL=true ;;
     --presence)   RUN_PRESENCE=true ;;
     --rtpengine)  RUN_RTPENGINE=true ;;
@@ -59,7 +61,7 @@ for arg in "$@"; do
     --webrtc)     RUN_WEBRTC=true ;;
     --skip-rust)  SKIP_RUST=true ;;
     --help|-h)
-      echo "Usage: $0 [--ipsec] [--call] [--presence] [--rtpengine] [--rtpproxy] [--reinvite] [--b2bua] [--b2bua-auth] [--gateway] [--auto100] [--http-auth] [--wedge] [--banscan] [--security] [--webrtc] [--skip-rust]"
+      echo "Usage: $0 [--ipsec] [--charging] [--call] [--presence] [--rtpengine] [--rtpproxy] [--reinvite] [--b2bua] [--b2bua-auth] [--gateway] [--auto100] [--http-auth] [--wedge] [--banscan] [--security] [--webrtc] [--skip-rust]"
       exit 0
       ;;
     *)
@@ -243,6 +245,15 @@ fi
 if [[ "$RUN_IPSEC" == true ]]; then
   echo "=== SIPp IPsec VoLTE registration test ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile ipsec run --rm sipp-ipsec
+fi
+
+# ── Step 11b: Charging against a real CGRateS OCS/CDF (optional) ──────────────
+# Rf + Ro end-to-end: proves the CER Acct-Application-Id fix (a strict
+# go-diameter peer rejects otherwise), a completed-call CDR, and Ro credit
+# reservation + 4012-driven disconnect. Self-contained (CGRateS internal DBs).
+if [[ "$RUN_CHARGING" == true ]]; then
+  echo "=== Rf + Ro charging against CGRateS ==="
+  ./scripts/charging_test.sh
 fi
 
 # ── Step 12: HTTP-auth deadlock regression (optional) ────────────────────────

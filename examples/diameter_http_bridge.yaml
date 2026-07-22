@@ -1,0 +1,40 @@
+# diameter_http_bridge.yaml — a standalone siphon instance that fronts a plain
+# HTTP billing API as a Diameter Ro OCS. Pair with diameter_http_bridge.py.
+#
+#   siphon --config examples/diameter_http_bridge.yaml
+#
+# This instance does NO SIP. It listens for Diameter, runs CER/DWR/framing, and
+# hands every CCR to the @diameter.on_request handler, which bridges to HTTP.
+#
+# Point your CTF (another siphon's `ro:` peer, or any 3GPP node) at this box's
+# Diameter listener. Point the handler at your API with BILLING_API=... .
+
+# A Diameter-only node still needs a listen: block; bind SIP to a throwaway
+# loopback port so nothing external reaches it.
+listen:
+  udp:
+    - "127.0.0.1:55060"
+
+script:
+  path: "examples/diameter_http_bridge.py"
+  reload: auto
+  # async_pool_size defaults to the CPU count — each driver runs one CCR handler
+  # concurrently, so a slow HTTP backend on one call never stalls the others.
+
+diameter:
+  origin_host: "ocs.example.org"
+  origin_realm: "example.org"
+  transport: tcp
+  # Diameter server listener — the CTF connects here and sends CCR.
+  listen:
+    tcp: "0.0.0.0:3868"
+
+log:
+  level: info
+  format: pretty
+
+# The handler reads these from the environment (shown here for reference):
+#   BILLING_API          base URL of your REST API   (default http://127.0.0.1:8080)
+#   BRIDGE_FAIL_OPEN     "1" = grant on backend outage (default fail-closed)
+#   BRIDGE_HTTP_TIMEOUT  per-request seconds          (default 3.0)
+#   BRIDGE_DEFAULT_GRANT fallback granted CC-Time      (default 30)

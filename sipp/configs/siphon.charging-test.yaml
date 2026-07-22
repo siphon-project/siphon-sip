@@ -1,0 +1,83 @@
+# siphon.charging-test.yaml — Ro online + Rf offline charging against CGRateS
+#
+# Pair with: the `charging` docker-compose profile (cgrates + siphon-charging +
+# sipp UAC/UAS) driven by scripts/charging_test.sh.
+#
+# What this exercises end-to-end against a REAL OCS/CDF (CGRateS DiameterAgent):
+#   - Rf:  INVITE → 200 forwarding emits ACR-START, in-dialog BYE emits ACR-STOP,
+#          a CDR lands in CGRateS (proves the CER Acct-Application-Id fix — a
+#          strict go-diameter peer would answer NO_COMMON_APPLICATION otherwise).
+#   - Ro:  B2BUA call reserves credit (CCR-INITIAL), re-authorizes (CCR-UPDATE),
+#          and — when the account balance is drained to 0 — the OCS returns 4012
+#          and siphon BYEs the call (CCR-TERMINATION follows).
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+  tcp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.71"
+
+# B2BUA is the enforced Ro path (mid-call disconnect reuses b2bua_terminate_call).
+# The charging script reserves credit in @b2bua.on_invite via call.ro_authorize()
+# BEFORE forking the B-leg (reserve-before-connect).
+script:
+  path: "scripts/b2bua_ro_charging.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+
+diameter:
+  origin_host: "scscf.siphon.test"
+  origin_realm: "siphon.test"
+  peers:
+    - name: "cgrates"
+      host: "172.20.0.70"
+      port: 3868
+      destination_realm: "cgrates.org"
+  routes:
+    - application: rf
+      peers: ["cgrates"]
+    - application: ro
+      peers: ["cgrates"]
+
+# Rf offline charging (proves CER app advertisement + writes a CDR).
+rf:
+  enabled: true
+  auto_emit_b2bua: true
+  auto_emit_proxy: true
+  interim_interval_secs: 0
+  node_functionality: scscf
+  service_context_id: "32260@3gpp.org"
+  peer: cgrates
+
+# Ro online charging (SCUR voice) — B2BUA-only enforcement (this siphon runs the
+# B2BUA script above). reauth_interval_secs is deliberately short so the held
+# call re-authorizes within the SIPp scenario's hold window.
+ro:
+  enabled: true
+  reauth_interval_secs: 5
+  requested_seconds: 5
+  service_context_id: "32260@3gpp.org"
+  sms_service_context_id: "32274@3gpp.org"
+  node_functionality: pcscf
+  charge: orig
+  on_ocs_failure: terminate
+  rating_group: 100
+  peer: cgrates
+
+# Prometheus so scripts/charging_test.sh can gate on siphon_ro_sessions
+# draining back to 0 (the leak gate) and read charging counters.
+metrics:
+  prometheus:
+    listen: "0.0.0.0:9090"
+
+log:
+  level: debug
+  format: pretty

@@ -18,6 +18,7 @@ page); none of the APIs here are invented.
 | [SBC (B2BUA)](sbc.md) | A topology-hiding SBC with media | `@b2bua.*`, `call.dial`/`fork`, **header policies**, RTPEngine |
 | [Number normalization](number-normalization.md) | E.164 identity rewriting at a trunk↔IMS edge | `numbers.parse`, `rewrite_identities`, **number policies**, diversion family |
 | [Media & RTP profiles](media-rtp.md) | SRTP↔RTP, WebRTC, transcoding, hold | `rtpengine.offer`/`answer`, profiles, the `sdp` namespace |
+| [Online charging (OCS)](online-charging-ocs.md) | Prepaid voice + SMS/RCS over Diameter Ro | `ro:` config, `diameter.ro_ccr_*`, SCUR reserve/re-auth/disconnect, IEC, CGRateS |
 | [Hardening & security](security.md) | A locked-down edge | rate-limit, scanner/auth bans, TLS/mTLS, STIR/SHAKEN, IPsec |
 | [Monitoring & observability](monitoring.md) | Metrics, CDRs, tracing, probes | custom Prometheus metrics, `/admin/*`, CDR, HEP/Homer |
 | [Multi-file scripts](multi-file-scripts.md) | Splitting a script into helper modules | sibling `import`, `include_paths`, helper hot-reload |

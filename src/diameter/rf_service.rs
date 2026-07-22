@@ -15,9 +15,15 @@
 //! - Spawns and tracks the per-session INTERIM timer when the CDF
 //!   negotiates an `Acct-Interim-Interval` in ACA-START.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
+
+/// Hard backstop on the INTERIM timer: an accounting session whose ACR-STOP is
+/// never delivered (abandoned dialog, no BYE, no session-timer) would otherwise
+/// keep emitting INTERIM records forever and hold its `rf_sessions` slot. After
+/// this many seconds the timer self-terminates and releases the session.
+const MAX_RF_SESSION_LIFETIME_SECS: u64 = 24 * 60 * 60;
 
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -92,6 +98,12 @@ pub struct RfChargingService {
     /// at construction time so every emit path doesn't pay the parse
     /// cost on the hot path.
     node_functionality: Option<NodeFunctionality>,
+    /// Count of live accounting sessions (ACR-START without a matching
+    /// ACR-STOP). Incremented when a session is created, decremented exactly
+    /// once when it is claimed for stop. Mirrors the `siphon_rf_sessions`
+    /// Prometheus gauge and is the per-module leak gate: after a batch of
+    /// completed calls it must return to its baseline.
+    active_sessions: Arc<AtomicUsize>,
 }
 
 impl RfChargingService {
@@ -107,11 +119,46 @@ impl RfChargingService {
             manager,
             config,
             node_functionality,
+            active_sessions: Arc::new(AtomicUsize::new(0)),
         })
     }
 
     pub fn config(&self) -> &RfConfig {
         &self.config
+    }
+
+    /// Number of live accounting sessions. The per-module leak gate asserts
+    /// this drains back to its starting value after a batch of completed calls.
+    pub fn active_session_count(&self) -> usize {
+        self.active_sessions.load(Ordering::Relaxed)
+    }
+
+    /// Register a newly created accounting session in the active count and the
+    /// `siphon_rf_sessions` gauge.
+    fn track_session_started(&self) {
+        self.active_sessions.fetch_add(1, Ordering::Relaxed);
+        if let Some(metrics) = crate::metrics::metrics() {
+            metrics.rf_sessions.inc();
+        }
+    }
+
+    /// Flip `session` to stopped exactly once and release its slot from the
+    /// active count and gauge. Returns `true` only for the caller that won the
+    /// race — used by both `acr_stop` (to gate the wire STOP) and the interim
+    /// timer's max-lifetime backstop (to release an abandoned session).
+    fn claim_stop(&self, session: &RfChargingSession) -> bool {
+        let won = session
+            .inner
+            .stopped
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok();
+        if won {
+            self.active_sessions.fetch_sub(1, Ordering::Relaxed);
+            if let Some(metrics) = crate::metrics::metrics() {
+                metrics.rf_sessions.dec();
+            }
+        }
+        won
     }
 
     pub fn node_functionality(&self) -> Option<NodeFunctionality> {
@@ -174,10 +221,23 @@ impl RfChargingService {
             }
         };
 
+        // A non-success ACA (RFC 6733 §9.8.7) means the CDF did not open the
+        // session — do not create local state or an INTERIM timer that would
+        // emit records the CDF has no record of (and would leak the slot).
+        if !answer.is_success() {
+            warn!(
+                result_code = answer.result_code,
+                "rf: ACR-START rejected by CDF, not opening session"
+            );
+            return None;
+        }
+
         let session_id = answer.session_id.clone()?;
+        // Honor the CDF's Acct-Interim-Interval verbatim, including an explicit
+        // 0 which means "do not send INTERIMs" (RFC 6733 §9.8.2). Only fall
+        // back to the local default when the ACA carried no value at all.
         let interim = answer
             .interim_interval
-            .filter(|v| *v > 0)
             .unwrap_or(self.config.interim_interval_secs);
         let session = RfChargingSession {
             inner: Arc::new(RfSessionInner {
@@ -189,6 +249,7 @@ impl RfChargingService {
                 last_result_code: AtomicU32::new(answer.result_code),
             }),
         };
+        self.track_session_started();
 
         if interim > 0 {
             self.spawn_interim_timer(&session, ims_data.clone(), user_name.clone())
@@ -303,13 +364,9 @@ impl RfChargingService {
         if !self.config.enabled {
             return None;
         }
-        // Atomic flip of the stopped flag — only the first caller proceeds.
-        if session
-            .inner
-            .stopped
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
+        // Flip to stopped exactly once and release the session slot from the
+        // active count/gauge — only the first caller proceeds to the wire STOP.
+        if !self.claim_stop(session) {
             return None;
         }
         if let Some(handle) = session.inner.interim_handle.lock().await.take() {
@@ -365,14 +422,30 @@ impl RfChargingService {
         let interval = std::time::Duration::from_secs(session.inner.interim_interval_secs as u64);
         let service = Arc::clone(self);
         let task_session = session.clone();
+        let max_ticks = (MAX_RF_SESSION_LIFETIME_SECS
+            / session.inner.interim_interval_secs.max(1) as u64)
+            .max(1);
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             // Skip the immediate first tick (which `tokio::time::interval`
             // emits as soon as the future is polled).
             ticker.tick().await;
+            let mut ticks: u64 = 0;
             loop {
                 ticker.tick().await;
                 if task_session.inner.stopped.load(Ordering::Relaxed) != 0 {
+                    break;
+                }
+                ticks += 1;
+                // Max-lifetime backstop: an abandoned session (no ACR-STOP ever)
+                // must not emit INTERIMs forever nor hold its rf_sessions slot.
+                if ticks >= max_ticks {
+                    if service.claim_stop(&task_session) {
+                        warn!(
+                            session_id = %task_session.inner.session_id,
+                            "rf: accounting session exceeded max lifetime with no STOP, releasing"
+                        );
+                    }
                     break;
                 }
                 let _ = service
@@ -1055,6 +1128,241 @@ mod tests {
             ims.calling_party.as_deref(),
             Some("sip:alice@home.example.com"),
             "P-Asserted-Identity should override From for Calling-Party-Address"
+        );
+    }
+
+    /// PeerConfig for the loopback client half of the mock CDF. Watchdog is set
+    /// far beyond any test run so no DWR perturbs the accounting exchange.
+    fn mock_cdf_peer_config() -> crate::diameter::peer::PeerConfig {
+        crate::diameter::peer::PeerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            origin_host: "siphon.test".to_string(),
+            origin_realm: "test".to_string(),
+            destination_host: None,
+            destination_realm: "test".to_string(),
+            local_ip: "127.0.0.1".parse().unwrap(),
+            application_ids: vec![(0, crate::diameter::dictionary::RF_APP_ID)],
+            watchdog_interval: 3600,
+            reconnect_delay: 5,
+            product_name: "SIPhon".to_string(),
+            firmware_revision: 1,
+        }
+    }
+
+    /// Stand up a loopback mock CDF and return a [`DiameterManager`] with the
+    /// connected client registered. The far end answers every ACR with
+    /// `ACA(Result-Code = 2001)`, echoing Session-Id / Accounting-Record-Type /
+    /// Accounting-Record-Number, so the CTF's real send→await→parse path runs.
+    /// The returned receiver must be held so the incoming channel stays open.
+    async fn mock_cdf_manager() -> (
+        Arc<DiameterManager>,
+        tokio::sync::mpsc::Receiver<crate::diameter::peer::IncomingRequest>,
+    ) {
+        use crate::diameter::codec::{
+            self, encode_avp_u32, encode_avp_utf8, encode_diameter_message,
+        };
+        use crate::diameter::dictionary::{self, avp};
+        use crate::diameter::peer::spawn_connection_tasks;
+        use crate::diameter::DiameterClient;
+        use tokio::io::{AsyncWriteExt, BufReader};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read_half);
+            while let Ok(bytes) = codec::read_diameter_message(&mut reader).await {
+                let Some(msg) = codec::decode_diameter(&bytes) else {
+                    continue;
+                };
+                if !msg.is_request {
+                    continue;
+                }
+                if msg.command_code == dictionary::CMD_ACCOUNTING {
+                    let mut avps = Vec::new();
+                    if let Some(sid) = msg.avps.get("Session-Id").and_then(|v| v.as_str()) {
+                        avps.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, sid));
+                    }
+                    avps.extend_from_slice(&encode_avp_u32(
+                        avp::RESULT_CODE,
+                        dictionary::DIAMETER_SUCCESS,
+                    ));
+                    if let Some(rt) = msg
+                        .avps
+                        .get("Accounting-Record-Type")
+                        .and_then(|v| v.as_u64())
+                    {
+                        avps.extend_from_slice(&encode_avp_u32(
+                            avp::ACCOUNTING_RECORD_TYPE,
+                            rt as u32,
+                        ));
+                    }
+                    if let Some(rn) = msg
+                        .avps
+                        .get("Accounting-Record-Number")
+                        .and_then(|v| v.as_u64())
+                    {
+                        avps.extend_from_slice(&encode_avp_u32(
+                            avp::ACCOUNTING_RECORD_NUMBER,
+                            rn as u32,
+                        ));
+                    }
+                    let aca = encode_diameter_message(
+                        0,
+                        dictionary::CMD_ACCOUNTING,
+                        dictionary::RF_APP_ID,
+                        msg.hop_by_hop,
+                        msg.end_to_end,
+                        &avps,
+                    );
+                    if write_half.write_all(&aca).await.is_err() {
+                        break;
+                    }
+                } else {
+                    // Any other request (e.g. a stray DWR) is echoed as an answer.
+                    let mut answer = bytes;
+                    if answer.len() > 4 {
+                        answer[4] &= !codec::FLAG_REQUEST;
+                    }
+                    if write_half.write_all(&answer).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        let client_stream = TcpStream::connect(addr).await.unwrap();
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(16);
+        let peer = spawn_connection_tasks(mock_cdf_peer_config(), client_stream, incoming_tx);
+        let manager = Arc::new(DiameterManager::new());
+        manager.register("cdf".to_string(), Arc::new(DiameterClient::new(peer)));
+        (manager, incoming_rx)
+    }
+
+    /// Per-module leak gate (project policy): after a batch of *complete*
+    /// START→STOP accounting cycles driven against the in-process mock CDF, the
+    /// live-session count must return to its baseline. A non-zero residue is a
+    /// per-call session that was never released — the classic "inserted into a
+    /// store, never evicted" leak. Uses `interim_interval_secs = 0` so no
+    /// INTERIM timer runs, keeping the count deterministic.
+    #[tokio::test]
+    async fn rf_sessions_drain_to_baseline_after_completed_calls() {
+        let (manager, _incoming_rx) = mock_cdf_manager().await;
+        let cfg = RfConfig {
+            enabled: true,
+            interim_interval_secs: 0,
+            ..Default::default()
+        };
+        let service = RfChargingService::new(manager, cfg);
+        let baseline = service.active_session_count();
+
+        for i in 0..50 {
+            let ims = ImsChargingData {
+                user_session_id: Some(format!("call-{i}")),
+                node_functionality: Some(NodeFunctionality::SCscf),
+                ..Default::default()
+            };
+            let session = service
+                .acr_start(ims.clone(), Some("sip:alice@example.com".into()))
+                .await
+                .expect("ACR-START should open a session against the mock CDF");
+            assert!(
+                service.active_session_count() > baseline,
+                "an open call must be counted as a live rf session"
+            );
+            service
+                .acr_stop(&session, ims, None, termination_cause::DIAMETER_LOGOUT)
+                .await;
+        }
+
+        assert_eq!(
+            service.active_session_count(),
+            baseline,
+            "rf accounting sessions must drain to baseline after completed calls"
+        );
+    }
+
+    /// A CDF that rejects ACR-START (non-2001) must NOT leave a live session
+    /// behind — the skip-on-error path must not increment the session count.
+    #[tokio::test]
+    async fn rf_rejected_start_leaves_no_session() {
+        use crate::diameter::codec::{
+            self, encode_avp_u32, encode_avp_utf8, encode_diameter_message,
+        };
+        use crate::diameter::dictionary::{self, avp};
+        use crate::diameter::peer::spawn_connection_tasks;
+        use crate::diameter::DiameterClient;
+        use tokio::io::{AsyncWriteExt, BufReader};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read_half);
+            while let Ok(bytes) = codec::read_diameter_message(&mut reader).await {
+                let Some(msg) = codec::decode_diameter(&bytes) else {
+                    continue;
+                };
+                if !msg.is_request {
+                    continue;
+                }
+                let mut avps = Vec::new();
+                if let Some(sid) = msg.avps.get("Session-Id").and_then(|v| v.as_str()) {
+                    avps.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, sid));
+                }
+                // DIAMETER_UNABLE_TO_COMPLY — a hard rejection of the START.
+                avps.extend_from_slice(&encode_avp_u32(
+                    avp::RESULT_CODE,
+                    dictionary::DIAMETER_UNABLE_TO_COMPLY,
+                ));
+                let answer = encode_diameter_message(
+                    0,
+                    msg.command_code,
+                    dictionary::RF_APP_ID,
+                    msg.hop_by_hop,
+                    msg.end_to_end,
+                    &avps,
+                );
+                if write_half.write_all(&answer).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let client_stream = TcpStream::connect(addr).await.unwrap();
+        let (incoming_tx, _incoming_rx) = tokio::sync::mpsc::channel(16);
+        let peer = spawn_connection_tasks(mock_cdf_peer_config(), client_stream, incoming_tx);
+        let manager = Arc::new(DiameterManager::new());
+        manager.register("cdf".to_string(), Arc::new(DiameterClient::new(peer)));
+
+        let service = RfChargingService::new(
+            manager,
+            RfConfig {
+                enabled: true,
+                interim_interval_secs: 0,
+                ..Default::default()
+            },
+        );
+        let ims = ImsChargingData {
+            node_functionality: Some(NodeFunctionality::SCscf),
+            ..Default::default()
+        };
+        let session = service.acr_start(ims, Some("sip:alice@example.com".into())).await;
+        assert!(session.is_none(), "a rejected ACR-START must not open a session");
+        assert_eq!(
+            service.active_session_count(),
+            0,
+            "a rejected START must not leave a live session behind"
         );
     }
 }

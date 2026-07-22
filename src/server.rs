@@ -524,6 +524,7 @@ impl SiphonServer {
 
         // --- Rf offline charging service (TS 32.299) ---
         let rf_charger = init_rf_charging(&config, diameter_manager.as_ref());
+        let ro_charger = init_ro_charging(&config, diameter_manager.as_ref());
 
         // --- Initialize metrics ---
         if let Err(error) = crate::metrics::init() {
@@ -1960,6 +1961,7 @@ impl SiphonServer {
             diameter_incoming_rx,
             rtpengine_events_rx,
             rf_charger.clone(),
+            ro_charger.clone(),
             Arc::clone(&drain),
             product_name,
             product_version,
@@ -2549,6 +2551,35 @@ fn init_rf_charging(
         auto_emit_register = rf_config.auto_emit_register,
         interim_secs = rf_config.interim_interval_secs,
         "Rf offline charging enabled"
+    );
+    Some(service)
+}
+
+/// Build the Ro online-charging service from `ro:` config. Returns `None` when
+/// `ro:` is absent/disabled or no Diameter peers are configured. The dispatcher
+/// installs the call-teardown hook after construction.
+fn init_ro_charging(
+    config: &Config,
+    diameter_manager: Option<&Arc<crate::diameter::DiameterManager>>,
+) -> Option<Arc<crate::diameter::ro_service::RoChargingService>> {
+    let ro_config = config.ro.as_ref()?;
+    if !ro_config.enabled {
+        return None;
+    }
+    let manager = match diameter_manager {
+        Some(m) => Arc::clone(m),
+        None => {
+            warn!("ro.enabled = true but no diameter: peers configured — disabling Ro");
+            return None;
+        }
+    };
+    let service = crate::diameter::ro_service::RoChargingService::new(manager, ro_config.clone());
+    info!(
+        node_functionality = %ro_config.node_functionality,
+        service_context_id = %ro_config.service_context_id,
+        reauth_secs = ro_config.reauth_interval_secs,
+        charge = %ro_config.charge,
+        "Ro online charging enabled (B2BUA-only, reserve-before-connect via call.ro_authorize())"
     );
     Some(service)
 }
