@@ -57,6 +57,16 @@ def call_answered(call, reply):
     log.info(f"Call {call.id} answered ({reply.status_code})")
 
 
+@b2bua.on_refer
+def call_transfer(call):
+    # A connected party asked to transfer the call (RFC 3515). In this
+    # residential B2BUA both legs are real user agents, so forward the REFER
+    # transparently on the far leg and let the endpoints complete the transfer
+    # between themselves — siphon relays the 202 and the sipfrag NOTIFY progress.
+    log.info(f"Call {call.id} REFER -> {call.refer_to}")
+    call.accept_refer(mode="transparent")
+
+
 @b2bua.on_failure
 def call_failed(call, code, reason):
     log.warn(f"All B legs failed {code} {reason} for call {call.id}")

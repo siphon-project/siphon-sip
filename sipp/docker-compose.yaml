@@ -862,6 +862,7 @@ services:
       - b2bua-cancel
       - b2bua-early-media
       - b2bua-topology
+      - b2bua-refer
 
   # Register bob with Contact pointing to the basic UAS IP (172.20.0.52)
   sipp-b2bua-register:
@@ -906,6 +907,7 @@ services:
       - b2bua-cancel
       - b2bua-early-media
       - b2bua-topology
+      - b2bua-refer
 
   # --- B2BUA basic call test ---
 
@@ -1312,6 +1314,297 @@ services:
       - -trace_err
     profiles:
       - b2bua-update
+
+  # --- B2BUA REFER test (RFC 3515 transparent blind transfer) ---
+
+  sipp-b2bua-refer-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_refer_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-refer
+
+  sipp-b2bua-refer-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-refer-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_refer_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-refer
+
+  # --- B2BUA REFER acceptance modes (reject 603 + siphon-terminated) ---
+  # A separate siphon (172.20.0.60) running the mode-dispatch script; on_refer
+  # picks the mode from the X-Refer-Mode header.
+
+  siphon-b2bua-refer-modes:
+    build:
+      context: ..
+    container_name: siphon-b2bua-refer-modes-test
+    volumes:
+      - ./configs/siphon.b2bua-refer-modes-test.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.60
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - b2bua-refer-reject
+      - b2bua-refer-terminate
+      - b2bua-refer-outbound
+
+  sipp-b2bua-refer-modes-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-refer-modes:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - "172.20.0.60:5060"
+      - -sf
+      - /sipp/scenarios/register_alice_contact.xml
+      - -inf
+      - /sipp/scenarios/b2bua_bob_contact.csv
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - b2bua-refer-reject
+      - b2bua-refer-terminate
+      - b2bua-refer-outbound
+
+  sipp-b2bua-refer-reject-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-refer-modes-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-refer-reject
+
+  sipp-b2bua-refer-reject-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-refer-modes:
+        condition: service_healthy
+      sipp-b2bua-refer-reject-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.60:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_refer_reject_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-refer-reject
+
+  # siphon-terminated transfer: bob is the surviving far leg, carol the target.
+
+  sipp-b2bua-refer-terminate-bob-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-refer-modes-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_refer_terminate_bob_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-refer-terminate
+
+  sipp-b2bua-refer-terminate-carol-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-refer-modes:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.54
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_refer_carol_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-refer-terminate
+
+  sipp-b2bua-refer-terminate-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-refer-modes:
+        condition: service_healthy
+      sipp-b2bua-refer-terminate-bob-uas:
+        condition: service_started
+      sipp-b2bua-refer-terminate-carol-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.60:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_refer_terminate_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-refer-terminate
+
+  # siphon-originated (outbound) REFER: siphon REFERs the caller after answer.
+
+  sipp-b2bua-refer-outbound-bob-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-refer-modes-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-refer-outbound
+
+  sipp-b2bua-refer-outbound-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-refer-modes:
+        condition: service_healthy
+      sipp-b2bua-refer-outbound-bob-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.60:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_refer_outbound_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-refer-outbound
 
   # --- B2BUA failure test ---
 
@@ -2431,6 +2724,245 @@ services:
         ipv4_address: 172.20.0.83
     profiles:
       - webrtc
+
+  # ── Proxy-mode REFER (passthrough via loose-routing) ─────────────────────
+  # Reuses the base `siphon` proxy (172.20.0.10, proxy_default.py, which
+  # record-routes and loose-routes in-dialog requests). Proves an in-dialog
+  # REFER on a proxy dialog is loose-routed to the far end exactly once
+  # (never proxy-relayed by R-URI into a loop) and the far end's 202 + sipfrag
+  # NOTIFYs relay straight back. No B2BUA, no siphon-side subscription state.
+
+  # Register bob from the UAS IP so the proxy routes the INVITE to him.
+  sipp-proxy-refer-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.70
+    entrypoint:
+      - sipp
+      - "172.20.0.10:5060"
+      - -sf
+      - /sipp/scenarios/register.xml
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - proxy-refer
+
+  # Bob, the transferee/far end.
+  sipp-proxy-refer-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-proxy-refer-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.70
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/proxy_refer_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - proxy-refer
+
+  # Alice, the referrer.
+  sipp-proxy-refer-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon:
+        condition: service_healthy
+      sipp-proxy-refer-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.71
+    entrypoint:
+      - sipp
+      - "172.20.0.10:5060"
+      - -sf
+      - /sipp/scenarios/proxy_refer_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - proxy-refer
+
+  # ── Anchored REFER-terminate against a REAL rtpengine ────────────────────
+  # Proves the terminate-transfer media recipe (siphon issues rtpengine
+  # offer/answer/delete to re-anchor survivor↔target on a fresh media session
+  # and tears down the old anchor) end-to-end against a real media engine, not
+  # the SDP-echo mock. Alice(.53) calls bob(.52) through the anchored B2BUA
+  # siphon(.61); the SDP is rewritten to rtpengine(.44); Alice REFERs to
+  # carol(.54); siphon re-anchors bob↔carol and BYEs alice.
+
+  rtpengine-real:
+    image: drachtio/rtpengine:latest
+    container_name: rtpengine-real
+    # Entrypoint auto-detects the container IP → interface + listen-ng=IP:22222.
+    # --table=-1 forces userspace forwarding (no kernel module in the container).
+    command: ["rtpengine", "--table=-1", "--log-level=6"]
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.44
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'hc d7:command4:pinge', ('172.20.0.44',22222)); d=s.recv(1024); s.close(); exit(0 if b'pong' in d else 1)\" || nc -zu 172.20.0.44 22222"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 3s
+    profiles:
+      - b2bua-rtpengine-refer
+
+  siphon-b2bua-rtpengine-refer:
+    build:
+      context: ..
+    container_name: siphon-b2bua-rtpengine-refer-test
+    depends_on:
+      rtpengine-real:
+        condition: service_started
+    volumes:
+      - ./configs/siphon.b2bua-rtpengine-refer.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.61
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - b2bua-rtpengine-refer
+
+  sipp-anchored-refer-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-rtpengine-refer:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - "172.20.0.61:5060"
+      - -sf
+      - /sipp/scenarios/register.xml
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - b2bua-rtpengine-refer
+
+  sipp-anchored-refer-bob-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-anchored-refer-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_refer_terminate_bob_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-rtpengine-refer
+
+  sipp-anchored-refer-carol-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-anchored-refer-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.54
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_refer_carol_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-rtpengine-refer
+
+  sipp-anchored-refer-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-rtpengine-refer:
+        condition: service_healthy
+      sipp-anchored-refer-bob-uas:
+        condition: service_started
+      sipp-anchored-refer-carol-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.61:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_refer_terminate_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-rtpengine-refer
 
 # ── Network ────────────────────────────────────────────────────────────────
 networks:

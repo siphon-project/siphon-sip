@@ -4,9 +4,10 @@
 //! registrar lookups for routing B2BUA calls, and transaction key handling.
 
 use siphon::b2bua::actor::{
-    CallActor, CallActorStore, CallEvent, CallState, Leg, LegActor, LegSide, TransportInfo,
-    SessionTimerState, generate_call_id, generate_tag,
+    CallActor, CallActorStore, CallEvent, CallState, Leg, LegActor, LegSide, ReferSubscription,
+    TransportInfo, SessionTimerState, generate_call_id, generate_tag,
 };
+use siphon::b2bua::transfer::TransferState;
 use siphon::b2bua::header_policy::{
     apply_to_request, apply_to_response, builtin_presets, validate_preset,
     DirectionPolicy, HeaderPattern, PolicyContext, Preset, PresetError,
@@ -823,6 +824,7 @@ fn media_session_store_lifecycle() {
     // Offer: create session (from_tag known, to_tag not yet)
     let session = MediaSession {
         call_id: "media-lifecycle@test".to_string(),
+        rtpengine_call_id: "media-lifecycle@test".to_string(),
         from_tag: "alice-tag".to_string(),
         to_tag: None,
         profile: "srtp_to_rtp".to_string(),
@@ -2121,4 +2123,165 @@ fn early_update_from_unanswered_b_leg_is_from_b() {
     let call = store.get_call(&call_id).unwrap();
     assert_eq!(call.request_direction("b-early-cid", None), Some(LegSide::B));
     assert_eq!(call.request_direction("a-cid", Some("alice-tag")), Some(LegSide::A));
+}
+
+// ---------------------------------------------------------------------------
+// REFER / call-transfer primitives
+// ---------------------------------------------------------------------------
+
+#[test]
+fn refer_call_matched_by_call_id_gates_loop_killer() {
+    // The B2BUA REFER dispatch branch keys on find_by_sip_call_id: an in-dialog
+    // REFER whose Call-ID matches a tracked B2BUA call is intercepted and handled
+    // per @b2bua.on_refer instead of falling through to the proxy relay (the loop).
+    let store = CallActorStore::new();
+    let sip_call_id = "refer-loopkiller@test";
+    let internal = store.create_call(make_a_leg(sip_call_id));
+    assert_eq!(
+        store.find_by_sip_call_id(sip_call_id).as_deref(),
+        Some(internal.as_str()),
+        "a REFER on this Call-ID is intercepted, not proxy-relayed",
+    );
+    // A REFER on an unknown Call-ID doesn't match — it falls through (out-of-dialog).
+    assert!(store.find_by_sip_call_id("someone-elses-call@test").is_none());
+}
+
+#[test]
+fn is_tracking_leg_recognizes_transfer_markers() {
+    for marker in [
+        "refer:a2b",
+        "refer_done:b2a",
+        "notify:a2b",
+        "notify_done:b2a",
+        "refer_out:a",
+    ] {
+        let mut leg = make_b_leg("10.0.0.2:5060");
+        leg.dialog.target_uri = Some(marker.to_string());
+        assert!(leg.is_tracking_leg(), "{marker} must be a tracking leg");
+    }
+    // A real dialed leg (URI target) is NOT a tracking leg — it takes part in
+    // dialog-identity direction matching.
+    let real = make_b_leg("10.0.0.2:5060");
+    assert!(!real.is_tracking_leg());
+}
+
+#[test]
+fn refer_subscription_push_query_clear() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("sub@test"));
+    assert!(!store.has_subscriber_refer_subscription(&call_id, true));
+
+    store.push_refer_subscription(
+        &call_id,
+        ReferSubscription {
+            on_a_leg: true,
+            siphon_notifies: false, // subscriber role (siphon-originated REFER)
+            event_id: 4,
+            notify_cseq: 4,
+            state: TransferState::Trying,
+            target_leg_call_id: None,
+        },
+    );
+    assert!(store.has_subscriber_refer_subscription(&call_id, true));
+    // Wrong leg → no match.
+    assert!(!store.has_subscriber_refer_subscription(&call_id, false));
+
+    store.clear_refer_subscriptions_on_leg(&call_id, true);
+    assert!(!store.has_subscriber_refer_subscription(&call_id, true));
+}
+
+#[test]
+fn refer_notifier_subscription_is_not_a_subscriber_one() {
+    // A siphon-terminated transfer records a *notifier* subscription (siphon
+    // sends the sipfrag NOTIFYs). It must not be mistaken for a subscriber one,
+    // or handle_b2bua_notify would absorb the far end's transparent NOTIFYs.
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("notifier@test"));
+    store.push_refer_subscription(
+        &call_id,
+        ReferSubscription {
+            on_a_leg: true,
+            siphon_notifies: true,
+            event_id: 2,
+            notify_cseq: 2,
+            state: TransferState::Trying,
+            target_leg_call_id: None,
+        },
+    );
+    assert!(!store.has_subscriber_refer_subscription(&call_id, true));
+}
+
+#[test]
+fn promote_transfer_target_referrer_on_a_leg() {
+    // Microsoft Teams blind-transfer shape: the referrer is the A-leg, the
+    // surviving party is the winning B-leg, and the dialed target replaces the
+    // A-leg. The old A-leg (referrer) is returned so the caller can BYE it.
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("teams-referrer@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060")); // idx 0 = surviving party
+    store.set_winner(&call_id, 0);
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.9:5060")); // idx 1 = transfer target Z
+
+    let (old_a_call_id, surviving_call_id, target_call_id) = {
+        let call = store.get_call(&call_id).unwrap();
+        (
+            call.a_leg.dialog.call_id.clone(),
+            call.b_legs[0].dialog.call_id.clone(),
+            call.b_legs[1].dialog.call_id.clone(),
+        )
+    };
+
+    let referrer = store
+        .promote_transfer_target(&call_id, 1, /*referrer_on_a_leg=*/ true)
+        .expect("promotion returns the referrer leg to BYE");
+    assert_eq!(referrer.dialog.call_id, old_a_call_id);
+
+    let call = store.get_call(&call_id).unwrap();
+    assert_eq!(
+        call.a_leg.dialog.call_id, target_call_id,
+        "the transfer target is promoted into the A-leg slot",
+    );
+    assert_eq!(call.b_legs.len(), 1, "target removed from b_legs");
+    assert_eq!(call.winner, Some(0), "surviving party stays the winner");
+    assert_eq!(
+        call.b_legs[0].dialog.call_id, surviving_call_id,
+        "surviving party is preserved and bridged to the target",
+    );
+}
+
+#[test]
+fn promote_transfer_target_referrer_on_b_leg() {
+    // The referrer is the winning B-leg; the surviving party is the A-leg. The
+    // dialed target becomes the new winner and the old winning B-leg is returned.
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("b-referrer@test")); // surviving = A-leg
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060")); // idx 0 = referrer (winner)
+    store.set_winner(&call_id, 0);
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.9:5060")); // idx 1 = transfer target Z
+
+    let (referrer_call_id, target_call_id) = {
+        let call = store.get_call(&call_id).unwrap();
+        (
+            call.b_legs[0].dialog.call_id.clone(),
+            call.b_legs[1].dialog.call_id.clone(),
+        )
+    };
+
+    let referrer = store
+        .promote_transfer_target(&call_id, 1, /*referrer_on_a_leg=*/ false)
+        .expect("promotion returns the referrer leg to BYE");
+    assert_eq!(referrer.dialog.call_id, referrer_call_id);
+
+    let call = store.get_call(&call_id).unwrap();
+    assert_eq!(call.winner, Some(1), "transfer target is the new winner");
+    assert_eq!(call.b_legs[1].dialog.call_id, target_call_id);
+}
+
+#[test]
+fn promote_transfer_target_out_of_range_is_none() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("oob@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+    assert!(store.promote_transfer_target(&call_id, 5, true).is_none());
 }

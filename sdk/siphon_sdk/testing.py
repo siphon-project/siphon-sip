@@ -618,6 +618,59 @@ class SipTestHarness:
 
         return CallResult(call=call, actions=list(call.actions))
 
+    def send_refer(
+        self,
+        call: Optional[Call] = None,
+        refer_to: str = "sip:+15550111@example.com",
+        refer_replaces: Optional[dict] = None,
+        **kwargs: Any,
+    ) -> CallResult:
+        """Dispatch a REFER (call transfer) to ``@b2bua.on_refer`` handlers.
+
+        Mirrors :meth:`send_invite` for the transfer path.  Builds an answered
+        :class:`Call` carrying the transfer target on :attr:`Call.refer_to`
+        (and :attr:`Call.refer_replaces` for an attended transfer), then
+        dispatches it to the registered ``@b2bua.on_refer`` handler with a
+        **single** ``(call,)`` argument — a REFER is a request, so there is no
+        reply object.  Supports both sync and async handlers.
+
+        Note:
+            With **no** registered handler this returns an empty
+            :class:`CallResult` (no action recorded).  In production the
+            Rust dispatcher locally rejects an un-handled REFER (501 / 603) —
+            that default is a dispatcher concern, out of scope for the mock.
+
+        Args:
+            call: Call object (auto-created answered if ``None``).
+            refer_to: The Refer-To URI (transfer target).
+            refer_replaces: Optional attended-transfer dict with ``call_id`` /
+                ``from_tag`` / ``to_tag`` (and optional ``early_only``);
+                ``None`` for a blind transfer.
+            **kwargs: Passed to the :class:`Call` constructor when
+                auto-creating.
+
+        Returns:
+            :class:`CallResult` with the actions the handler took.
+        """
+        if call is None:
+            call = Call(
+                state="answered",
+                refer_to=refer_to,
+                refer_replaces=refer_replaces,
+                **kwargs,
+            )
+
+        registry = mock_module.get_registry()
+        handlers = registry.get("b2bua.on_refer")
+
+        for fn, is_async in handlers:
+            if is_async:
+                self._loop.run_until_complete(fn(call))
+            else:
+                fn(call)
+
+        return CallResult(call=call, actions=list(call.actions))
+
     @property
     def diameter(self) -> mock_module.MockDiameter:
         """Access the mock Diameter namespace (Cx/Rx operations)."""
