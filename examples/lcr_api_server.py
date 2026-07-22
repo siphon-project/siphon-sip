@@ -29,7 +29,9 @@ RATE_TABLE: dict[str, list[Route]] = {
         # so treat 404 as a reroute cause for this carrier.
         Route(carrier_id="carrier-a", gateway_group="carrier-a", rate=0.0042,
               currency="USD", billing_increment=60, timeout_secs=12,
-              tech_prefix="1010288", headers={"X-Account": "42"},
+              tech_prefix="1010288", number_policy="pstn-national@2026",
+              headers={"X-Account": "42"},
+              cdr_fields={"carrier_zone": "us-east", "rate_deck": "premium"},
               reroute_causes=[404, 408, 500, 502, 503, 504]),
         Route(carrier_id="carrier-b", gateway_group="carrier-b", rate=0.0051,
               currency="USD", billing_increment=60, timeout_secs=12),

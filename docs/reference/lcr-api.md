@@ -69,12 +69,14 @@ one of `gateway_group` / `next_hop` / `ruri`.
 | `next_hop` | string? | Explicit next-hop URI (when no group, or to pin the wire destination). |
 | `ruri` | string? | Full Request-URI override (carrier IMPU shape / number format). |
 | `tech_prefix` | string? | Dial/tech-prefix prepended to the R-URI userpart for this carrier (e.g. `"1010288"`). |
+| `number_policy` | string? | Named `number_policies:` preset applied to this carrier's B-leg From/To/PAI (per-carrier CLI/identity shape). R-URI stays controlled by `tech_prefix`/`ruri`. |
 | `rate` | number? | Per-minute rate (CDR/charging). |
 | `currency` | string? | ISO 4217. |
 | `billing_increment` | int? | Seconds (60 = per-minute, 1 = per-second). |
 | `min_duration` | int? | Minimum billable seconds. |
 | `timeout_secs` | int? | Per-attempt ring timeout (else the call-level default). |
 | `headers` | object? | Headers to inject on this carrier's B-leg INVITE (applied after the header policy). |
+| `cdr_fields` | object? | Fields siphon auto-stamps onto the CDR when this carrier wins (no per-field script). |
 | `reroute_causes` | int[]? | SIP codes from this carrier that fail over to the next (overrides per-gateway + global). |
 
 Top-level:

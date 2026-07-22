@@ -168,11 +168,23 @@ pub struct Route {
     /// Per-attempt ring timeout in seconds (else the call-level default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u32>,
+    /// Named `number_policies:` preset applied to *this carrier's* B-leg identity
+    /// headers (From / To / P-Asserted-Identity / P-Preferred-Identity) — so the
+    /// From/To shape can differ per carrier and a failover to a second carrier
+    /// reshapes independently. The R-URI is controlled by `tech_prefix` / `ruri`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number_policy: Option<String>,
     /// Headers to inject on this carrier's B-leg INVITE (e.g. a carrier account
     /// token or routing tag). Applied after the header policy, so they always
     /// land on the wire.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
+    /// Fields siphon auto-stamps onto the CDR when this carrier wins — the API
+    /// can push billing/routing metadata straight into the record without the
+    /// script naming each field. Merged into the auto-emitted CDR's `extra`
+    /// (a manual `cdr.write(extra=…)` still overrides on key collision).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub cdr_fields: HashMap<String, String>,
     /// SIP response codes from *this* carrier that trigger failover to the next
     /// carrier. When set, overrides the per-gateway and global reroute sets for
     /// this route (for a carrier the API knows misbehaves — e.g. one that sends
@@ -486,11 +498,14 @@ mod tests {
     #[test]
     fn route_per_carrier_fields_round_trip() {
         let json = r#"{ "carrier_id": "carrier-a", "gateway_group": "pool-a",
-            "tech_prefix": "1010288", "headers": { "X-Account": "42" },
+            "tech_prefix": "1010288", "number_policy": "pstn-national@2026",
+            "headers": { "X-Account": "42" }, "cdr_fields": { "billing_id": "B-9" },
             "reroute_causes": [404, 503] }"#;
         let route: Route = serde_json::from_str(json).expect("parse route");
         assert_eq!(route.tech_prefix.as_deref(), Some("1010288"));
+        assert_eq!(route.number_policy.as_deref(), Some("pstn-national@2026"));
         assert_eq!(route.headers.get("X-Account").map(String::as_str), Some("42"));
+        assert_eq!(route.cdr_fields.get("billing_id").map(String::as_str), Some("B-9"));
         assert_eq!(route.reroute_causes, vec![404, 503]);
 
         let reparsed: Route =

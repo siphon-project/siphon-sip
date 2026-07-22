@@ -127,6 +127,14 @@ pub fn apply_to_message(message: &mut SipMessage, policy: &NumberPolicy) -> usiz
     apply(message, policy).changed()
 }
 
+/// Reshape only the identity headers (From / To / P-Asserted-Identity /
+/// P-Preferred-Identity) of a message, leaving the Request-URI untouched. Used
+/// by the LCR per-carrier `number_policy` so a carrier's From/To shape can
+/// differ while `tech_prefix` / `ruri` own the R-URI.
+pub fn apply_identity_headers(message: &mut SipMessage, policy: &NumberPolicy) {
+    apply_headers_only(message, policy);
+}
+
 /// B2BUA dial path: normalize the header identities on the A-leg INVITE (which
 /// flow to the B-leg) and return the normalized dial target. The A-leg
 /// Request-URI is left alone; the dial `target` carries the B-leg R-URI.

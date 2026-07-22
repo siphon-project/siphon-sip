@@ -19,7 +19,13 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   config (`api_url`, `timeout_ms`, `cache`, `cache_ttl_secs`, `auth_header`,
   `fallback_gateway_group`, `reroute_causes`). Per-carrier shaping: a
   **`tech_prefix`** (dial-prefix prepended to the R-URI userpart), a full `ruri`
-  override, and injected `headers`. **Reroute causes** — which SIP codes fail
+  override, a **`number_policy`** (per-carrier From/To/PAI reshaping via a named
+  `number_policies:` preset), injected `headers`, and **`cdr_fields`** the API
+  auto-stamps onto the CDR when a carrier wins (no per-field script). A route's
+  `gateway_group` is resolved to a healthy member (skip a dead pool); an unknown
+  group is warned, not silently dropped, and `gateway.add_group`/`remove_group`
+  let routes reference groups added at runtime (no restart). **Reroute causes** —
+  which SIP codes fail
   over vs. forward to the caller — are selectable at three levels (per-route from
   the API > per-gateway `gateway.groups[].reroute_causes` > global
   `lcr.reroute_causes`, default `[408, 500, 502, 503, 504]`), so a carrier that

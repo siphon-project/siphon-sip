@@ -108,6 +108,14 @@ siphon picks a healthy member (weighted/round-robin/hash per the group), and
 configured, no round-trip to the LCR API. A route may instead pin an explicit
 `next_hop`, or override the whole Request-URI with `ruri`.
 
+If the API names a `gateway_group` siphon doesn't know (a typo, or a group not
+yet created), siphon **warns** and falls back to the route's `next_hop` if it has
+one, else skips that carrier and fails over — never a silent hang. Groups don't
+need a restart: `gateway.add_group(...)` / `gateway.remove_group(...)` add and
+remove them at runtime from a script (e.g. a timer that syncs your carrier
+inventory), and LCR routes that name them work immediately. Only YAML-defined
+groups are fixed at boot.
+
 ## Per-carrier shaping (prefix, headers)
 
 Carriers want the number in different shapes:
@@ -118,8 +126,16 @@ Carriers want the number in different shapes:
   `1010288+12025550123` toward that carrier only.
 - **`ruri`** — full Request-URI override when a carrier wants a specific number
   format or its own host.
+- **`number_policy`** — a named `number_policies:` preset applied to *this*
+  carrier's From/To/PAI, so the CLI/identity shape can differ per carrier (a
+  failover to a second carrier reshapes independently). The R-URI stays owned by
+  `tech_prefix`/`ruri`.
 - **`headers`** — per-carrier headers injected on the B-leg INVITE (an account
   token, a routing tag), applied after the header policy so they always land.
+- **`cdr_fields`** — key/value fields siphon **auto-stamps onto the CDR** when
+  this carrier wins, so the API can push billing/routing metadata straight into
+  the record without the script naming each field (`cdr.write(extra=…)` still
+  overrides on a key clash).
 
 ```json
 { "carrier_id": "carrier-a", "gateway_group": "carrier-a",

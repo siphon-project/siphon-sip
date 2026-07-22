@@ -16,12 +16,16 @@ class TestContract:
     def test_route_round_trip_with_per_carrier_fields(self):
         route = Route(
             carrier_id="carrier-a", gateway_group="pool-a", tech_prefix="1010288",
-            rate=0.0042, currency="USD", billing_increment=60,
-            headers={"X-Account": "42"}, reroute_causes=[404, 503], timeout_secs=12,
+            number_policy="pstn-national@2026", rate=0.0042, currency="USD",
+            billing_increment=60, headers={"X-Account": "42"},
+            cdr_fields={"carrier_zone": "us-east"}, reroute_causes=[404, 503],
+            timeout_secs=12,
         )
         data = route.to_dict()
         assert data["tech_prefix"] == "1010288"
+        assert data["number_policy"] == "pstn-national@2026"
         assert data["headers"] == {"X-Account": "42"}
+        assert data["cdr_fields"] == {"carrier_zone": "us-east"}
         assert data["reroute_causes"] == [404, 503]
         assert Route.from_dict(data) == route
 

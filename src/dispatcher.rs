@@ -7057,6 +7057,22 @@ fn cdr_mark_b2bua_answer(state: &DispatcherState, internal_call_id: &str, respon
     cdr_mark_answer(state, internal_call_id, response_code);
 }
 
+/// Auto-stamp a winning LCR carrier's `cdr_fields` onto the call's CDR session,
+/// so the external API can push billing/routing metadata straight into the
+/// record without the script naming each field. No-op when CDR auto-emit is off.
+fn cdr_stamp_route_fields(
+    state: &DispatcherState,
+    internal_call_id: &str,
+    fields: &std::collections::HashMap<String, String>,
+) {
+    if fields.is_empty() || !crate::cdr::auto_emit_enabled() {
+        return;
+    }
+    if let Some(mut session) = state.cdr_sessions.get_mut(internal_call_id) {
+        session.merge_extra(fields);
+    }
+}
+
 /// B2BUA CDR STOP — a BYE tore the call down. `from_a_leg` gives the side.
 fn cdr_finalize_b2bua_stop(
     state: &DispatcherState,
@@ -8618,18 +8634,27 @@ fn b2bua_advance_route(
             None => return false,
         };
         // Prefer a healthy gateway-group member; fall back to an explicit
-        // next-hop. A carrier whose group is down and has no next-hop / R-URI
-        // is unroutable — skip it.
-        let next_hop = route
+        // next-hop. Warn (not silent) when the API named a group that siphon
+        // doesn't know or that's entirely down, so a misconfig is visible; the
+        // route is still usable if it carries an explicit next_hop / ruri.
+        let group_member = route
             .gateway_group
             .as_deref()
-            .and_then(b2bua_resolve_gateway_member)
-            .or_else(|| route.next_hop.clone());
+            .and_then(b2bua_resolve_gateway_member);
+        if route.gateway_group.is_some() && group_member.is_none() {
+            warn!(
+                call_id = %call_id,
+                carrier = %route.carrier_id,
+                group = route.gateway_group.as_deref().unwrap_or_default(),
+                "LCR: gateway group unknown or all members down — falling back to next_hop / skipping carrier",
+            );
+        }
+        let next_hop = group_member.or_else(|| route.next_hop.clone());
         if next_hop.is_none() && route.ruri.is_none() {
             debug!(
                 call_id = %call_id,
                 carrier = %route.carrier_id,
-                "LCR: carrier unroutable (group down, no next-hop), skipping",
+                "LCR: carrier unroutable (group unknown/down, no next-hop), skipping",
             );
             continue;
         }
@@ -8655,6 +8680,7 @@ fn b2bua_advance_route(
             &[],
             send_socket.as_ref(),
             original_request,
+            route.number_policy.as_deref(),
             &extra_headers,
             state,
         );
@@ -9263,6 +9289,7 @@ fn handle_b2bua_invite(
                 &route,
                 send_socket.as_ref(),
                 &message_guard,
+                None,
                 &[],
                 state,
             );
@@ -9280,6 +9307,7 @@ fn handle_b2bua_invite(
                     &[],
                     send_socket.as_ref(),
                     &message_guard,
+                    None,
                     &[],
                     state,
                 );
@@ -9393,6 +9421,7 @@ fn b2bua_send_b_leg_invite(
     b_leg_route: &[String],
     send_socket: Option<&crate::transport::SendSocket>,
     original_request: &SipMessage,
+    number_policy: Option<&str>,
     extra_headers: &[(String, String)],
     state: &DispatcherState,
 ) {
@@ -9659,6 +9688,23 @@ fn b2bua_send_b_leg_invite(
             server_header: state.server_header.as_deref(),
         };
         crate::b2bua::header_policy::apply_to_request(&mut b_leg_invite, &policy, &ctx);
+    }
+
+    // Per-carrier (LCR) number policy: reshape this B-leg's identity headers
+    // (From / To / P-Asserted-Identity / P-Preferred-Identity) to the carrier's
+    // format. The R-URI is owned by tech_prefix / ruri, so it is left untouched.
+    if let Some(policy_name) = number_policy {
+        match crate::script::api::numbers::resolve_dial_policy(Some(policy_name)) {
+            Ok(Some(policy)) => {
+                crate::script::api::numbers::apply_identity_headers(&mut b_leg_invite, &policy);
+            }
+            Ok(None) => {}
+            Err(_) => warn!(
+                call_id = %call_id,
+                policy = %policy_name,
+                "LCR: unknown number_policy on route, skipping identity reshape"
+            ),
+        }
     }
 
     // Inject per-carrier (LCR) headers after the header policy, so a carrier's
@@ -11095,6 +11141,11 @@ fn handle_b2bua_response(
 
         // CDR: stamp the answer time (cdr.auto_emit).
         cdr_mark_b2bua_answer(state, call_id, status_code);
+
+        // LCR: auto-stamp the winning carrier's cdr_fields onto the CDR.
+        if let Some(route) = state.call_actors.active_route(call_id) {
+            cdr_stamp_route_fields(state, call_id, &route.cdr_fields);
+        }
 
         // Rf ACR-START on B2BUA call answer (TS 32.299 §6.2.2).
         // Fire-and-forget per TS 32.299 §6.5.

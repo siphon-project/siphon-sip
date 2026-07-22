@@ -158,9 +158,19 @@ class Route:
     timeout_secs: Optional[int] = None
     """Per-attempt ring timeout in seconds (else the call-level default)."""
 
+    number_policy: Optional[str] = None
+    """Named ``number_policies:`` preset applied to this carrier's B-leg identity
+    headers (From/To/PAI) so the From/To shape can differ per carrier. The R-URI
+    is controlled by ``tech_prefix`` / ``ruri``."""
+
     headers: Dict[str, str] = field(default_factory=dict)
     """Headers to inject on this carrier's B-leg INVITE (account token, routing
     tag). Applied after the header policy, so they always land on the wire."""
+
+    cdr_fields: Dict[str, str] = field(default_factory=dict)
+    """Fields siphon auto-stamps onto the CDR when this carrier wins — push
+    billing/routing metadata straight into the record without naming each field
+    in the script."""
 
     reroute_causes: List[int] = field(default_factory=list)
     """SIP codes from this carrier that fail over to the next (overrides the
@@ -182,12 +192,15 @@ class Route:
             "billing_increment",
             "min_duration",
             "timeout_secs",
+            "number_policy",
         ):
             value = getattr(self, name)
             if value is not None:
                 out[name] = value
         if self.headers:
             out["headers"] = dict(self.headers)
+        if self.cdr_fields:
+            out["cdr_fields"] = dict(self.cdr_fields)
         if self.reroute_causes:
             out["reroute_causes"] = list(self.reroute_causes)
         return out
@@ -205,7 +218,9 @@ class Route:
             billing_increment=data.get("billing_increment"),
             min_duration=data.get("min_duration"),
             timeout_secs=data.get("timeout_secs"),
+            number_policy=data.get("number_policy"),
             headers=dict(data.get("headers", {})),
+            cdr_fields=dict(data.get("cdr_fields", {})),
             reroute_causes=list(data.get("reroute_causes", [])),
         )
 

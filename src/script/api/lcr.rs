@@ -67,10 +67,22 @@ impl PyRoute {
         self.inner.tech_prefix.as_deref()
     }
 
+    /// Named number policy applied to this carrier's B-leg identity headers.
+    #[getter]
+    fn number_policy(&self) -> Option<&str> {
+        self.inner.number_policy.as_deref()
+    }
+
     /// Extra headers injected on this carrier's B-leg INVITE.
     #[getter]
     fn headers(&self) -> HashMap<String, String> {
         self.inner.headers.clone()
+    }
+
+    /// Fields auto-stamped onto the CDR when this carrier wins.
+    #[getter]
+    fn cdr_fields(&self) -> HashMap<String, String> {
+        self.inner.cdr_fields.clone()
     }
 
     /// Per-carrier reroute causes (SIP codes that fail over to the next carrier).
