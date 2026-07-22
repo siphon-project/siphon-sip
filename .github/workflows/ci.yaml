@@ -223,6 +223,13 @@ jobs:
       - name: SIPp REGISTER test
         run: docker compose -f sipp/docker-compose.yaml run --rm sipp-register
 
+      - name: Proxy REFER passthrough (in-dialog REFER loose-routed once, no loop)
+        run: docker compose -f sipp/docker-compose.yaml --profile proxy-refer up --abort-on-container-exit --exit-code-from sipp-proxy-refer-uac sipp-proxy-refer-uac sipp-proxy-refer-uas
+
+      - name: Cleanup proxy-refer containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile proxy-refer rm -sf sipp-proxy-refer-uac sipp-proxy-refer-uas sipp-proxy-refer-register 2>/dev/null || true
+
       - name: Collect siphon logs
         if: always()
         run: docker compose -f sipp/docker-compose.yaml logs siphon > siphon.log 2>&1 || true
@@ -301,6 +308,72 @@ jobs:
           name: sipp-b2bua-logs
           path: |
             siphon-b2bua.log
+            *.log
+
+  # ── B2BUA REFER / call-transfer functional tests ────────────────────────
+  # In-dialog REFER on a tracked B2BUA call: transparent forward, loop-safe
+  # 603 reject, siphon-terminated transfer (non-anchored), and the terminated
+  # transfer re-anchored through a REAL rtpengine (offer/answer on a fresh
+  # media session + delete of the old anchor).
+  sipp-b2bua-refer:
+    runs-on: ubuntu-latest
+    needs: rust-tests
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build B2BUA / refer-modes / anchored siphon images
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-refer-terminate --profile b2bua-rtpengine-refer build siphon-b2bua siphon-b2bua-refer-modes siphon-b2bua-rtpengine-refer
+
+      - name: Start siphon-b2bua
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua up -d --wait siphon-b2bua
+
+      - name: B2BUA REFER transparent (RFC 3515 blind transfer, forwarded on the far leg's dialog)
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-refer up --abort-on-container-exit --exit-code-from sipp-b2bua-refer-uac sipp-b2bua-refer-uac sipp-b2bua-refer-uas
+
+      - name: Cleanup transparent containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer rm -sf sipp-b2bua-refer-uac sipp-b2bua-refer-uas 2>/dev/null || true
+
+      - name: Start siphon-b2bua-refer-modes
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-reject up -d --wait siphon-b2bua-refer-modes
+
+      - name: B2BUA REFER reject (loop-safe 603 default, zero egress)
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-reject up --abort-on-container-exit --exit-code-from sipp-b2bua-refer-reject-uac sipp-b2bua-refer-reject-uac sipp-b2bua-refer-reject-uas
+
+      - name: Cleanup reject containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-reject rm -sf sipp-b2bua-refer-reject-uac sipp-b2bua-refer-reject-uas 2>/dev/null || true
+
+      - name: B2BUA REFER siphon-terminated (dial target + promote + BYE)
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-terminate up --abort-on-container-exit --exit-code-from sipp-b2bua-refer-terminate-uac sipp-b2bua-refer-terminate-uac sipp-b2bua-refer-terminate-bob-uas sipp-b2bua-refer-terminate-carol-uas
+
+      - name: Cleanup terminate containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-terminate rm -sf sipp-b2bua-refer-terminate-uac sipp-b2bua-refer-terminate-bob-uas sipp-b2bua-refer-terminate-carol-uas 2>/dev/null || true
+
+      - name: B2BUA REFER terminate + REAL rtpengine (media re-anchor offer/answer/delete)
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-rtpengine-refer up --abort-on-container-exit --exit-code-from sipp-anchored-refer-uac sipp-anchored-refer-uac sipp-anchored-refer-bob-uas sipp-anchored-refer-carol-uas
+
+      - name: Collect logs
+        if: always()
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs siphon-b2bua > siphon-b2bua-refer.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-refer-modes >> siphon-b2bua-refer.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-rtpengine-refer >> siphon-b2bua-refer.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs rtpengine-real > rtpengine-real.log 2>&1 || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-refer --profile b2bua-refer-reject --profile b2bua-refer-terminate --profile b2bua-rtpengine-refer down --remove-orphans
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-b2bua-refer-logs
+          path: |
+            siphon-b2bua-refer.log
+            rtpengine-real.log
             *.log
 
   # ── rtpproxy functional test ───────────────────────────────────────────
