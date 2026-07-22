@@ -577,15 +577,20 @@ class MockB2bua:
     Imperative:
         - ``b2bua.terminate(call_id)`` — end a call by SIP Call-ID from any
           context (records onto ``terminates`` for test assertions)
+        - ``b2bua.refer(call_id, target)`` — transfer a call by SIP Call-ID
+          from any context (records onto ``refers`` for test assertions)
     """
 
     def __init__(self) -> None:
         # Records b2bua.terminate(...) calls for test assertions.
         self.terminates: list[dict] = []
+        # Records b2bua.refer(...) calls for test assertions.
+        self.refers: list[dict] = []
 
     def clear(self) -> None:
         """Reset recorded imperative calls (called by ``reset()``)."""
         self.terminates.clear()
+        self.refers.clear()
 
     def terminate(self, call_id: str, reason: str = "Normal Clearing") -> bool:
         """Imperatively end a B2BUA call by its SIP Call-ID.
@@ -614,6 +619,52 @@ class MockB2bua:
                     b2bua.terminate(call_id)
         """
         self.terminates.append({"call_id": call_id, "reason": reason})
+        return True
+
+    def refer(self, call_id: str, target: str,
+              replaces: Optional[dict] = None) -> bool:
+        """Imperatively transfer a B2BUA call by its SIP Call-ID.
+
+        The imperative twin of :meth:`Call.refer`.  Unlike ``call.refer()``
+        (a deferred call action, honoured after its handler returns), this
+        acts immediately and is keyed by SIP Call-ID, so it works from an
+        out-of-band event callback (``@rtpengine.on_dtmf``, a timer) where
+        no ``call`` object is in scope and deferred actions are no-ops — the
+        same reason :meth:`terminate` exists alongside ``call.terminate()``.
+
+        Args:
+            call_id: the SIP Call-ID of the call to transfer.
+            target: the Refer-To URI (transfer destination).
+            replaces: optional attended-transfer dict (RFC 3891) with
+                ``call_id`` / ``from_tag`` / ``to_tag`` (and an optional
+                ``early_only``); ``None`` for a blind transfer.
+
+        Returns:
+            bool: True if a matching call was found and the REFER was
+            originated, False if the Call-ID is unknown / already gone.
+            Never raises for a missing call.
+
+        Raises:
+            ValueError: if ``replaces`` is given but missing any of
+                ``call_id`` / ``from_tag`` / ``to_tag``.
+
+        In the mock, records ``{"call_id", "target", "replaces"}`` on
+        ``refers`` and returns True. Inspect via
+        ``siphon.get_b2bua().refers``.
+
+        Usage::
+
+            @rtpengine.on_dtmf
+            def on_ivr_dtmf(call_id, from_tag, digit, duration_ms, volume):
+                if digit == "*":
+                    b2bua.refer(call_id, "sip:+15550142@example.com")
+        """
+        from siphon_sdk.call import _validate_replaces
+
+        _validate_replaces(replaces)
+        self.refers.append(
+            {"call_id": call_id, "target": target, "replaces": replaces}
+        )
         return True
 
     @staticmethod
@@ -683,7 +734,19 @@ class MockB2bua:
     def on_refer(fn: Callable) -> Callable:
         """Register handler for REFER (call transfer, RFC 3515).
 
-        Handler signature: ``(call) -> None``
+        Handler signature is **single-arg** ``(call) -> None``.  A REFER is a
+        SIP *request*, not a response, so there is **no** ``reply`` object —
+        do NOT write ``(call, reply)`` and do NOT call ``rtpengine.answer()``
+        here.  Read the transfer target off :attr:`Call.refer_to` (and
+        :attr:`Call.refer_replaces` for an attended transfer), then decide
+        with :meth:`Call.accept_refer` or :meth:`Call.reject_refer`.
+
+        Example::
+
+            @b2bua.on_refer
+            def handle_refer(call):
+                log.info(f"Transfer requested to {call.refer_to}")
+                call.accept_refer()
         """
         is_async = asyncio.iscoroutinefunction(fn)
         _registry.register("b2bua.on_refer", None, fn, is_async)

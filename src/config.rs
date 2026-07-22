@@ -235,6 +235,34 @@ pub struct B2buaConfig {
     /// Names an entry in the top-level `number_policies:` map.  When `None`,
     /// no number normalization is applied unless a call opts in explicitly.
     pub default_number_policy: Option<String>,
+
+    /// Default REFER transfer mode applied when an `@b2bua.on_refer` handler
+    /// calls `accept_refer()` without an explicit `mode=`.
+    ///
+    /// - `"terminate"` (default) — siphon terminates the transfer: answer 202
+    ///   locally, re-resolve the Refer-To through the dial plan as a new leg,
+    ///   re-bridge the media, and BYE the referred-away leg. Correct for
+    ///   trunk-facing SBCs (the far end need not support REFER) and keeps media
+    ///   anchored.
+    /// - `"transparent"` — siphon re-emits the REFER on the far leg's own dialog
+    ///   and relays the far end's 202 + `message/sipfrag` NOTIFYs back. Correct
+    ///   for UA-to-UA (PBX / softphone) topologies.
+    ///
+    /// Unset → `"terminate"`.
+    pub default_refer_mode: Option<String>,
+}
+
+impl B2buaConfig {
+    /// Resolve the configured default REFER mode. `None`, empty, or an
+    /// unrecognized value fall back to the safe trunk-facing default
+    /// (`Terminate`); only an explicit `"transparent"` selects transparent
+    /// forwarding.
+    pub fn resolved_default_refer_mode(&self) -> crate::script::api::call::ReferMode {
+        match self.default_refer_mode.as_deref().map(str::trim) {
+            Some("transparent") => crate::script::api::call::ReferMode::Transparent,
+            _ => crate::script::api::call::ReferMode::Terminate,
+        }
+    }
 }
 
 /// Configuration for ``proxy.subscribe_state`` — generic SUBSCRIBE

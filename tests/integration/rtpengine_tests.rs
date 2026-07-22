@@ -208,6 +208,7 @@ async fn session_store_tracks_offer_and_answer() {
     // Offer creates a session.
     store.insert(MediaSession {
         call_id: "call-1".to_string(),
+        rtpengine_call_id: "call-1".to_string(),
         from_tag: "tag-a".to_string(),
         to_tag: None,
         profile: "srtp_to_rtp".to_string(),

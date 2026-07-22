@@ -301,6 +301,7 @@ impl PyRtpEngine {
             replace_body(&message, &rewritten_sdp)?;
 
             sessions.insert(MediaSession {
+                rtpengine_call_id: call_id.clone(),
                 call_id,
                 from_tag,
                 to_tag: None,
@@ -494,6 +495,7 @@ impl PyRtpEngine {
                     // active-session accounting, and a later `rtpengine.answer`
                     // profile-reuse all work.
                     sessions.insert(MediaSession {
+                        rtpengine_call_id: call_id.clone(),
                         call_id,
                         from_tag,
                         to_tag: None,
@@ -1476,6 +1478,7 @@ mod tests {
     fn make_session(call_id: &str, profile: &str) -> MediaSession {
         MediaSession {
             call_id: call_id.to_string(),
+            rtpengine_call_id: call_id.to_string(),
             from_tag: "tag-a".to_string(),
             to_tag: None,
             profile: profile.to_string(),

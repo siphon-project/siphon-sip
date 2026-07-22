@@ -78,6 +78,62 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `from`/`to`, and the B-leg count excludes the re-INVITE/UPDATE response-tracking
   pseudo-legs, so a plain call that re-INVITEd no longer reports two B-legs.
 
+### Fixed
+- **in-dialog REFER on a tracked B2BUA call no longer proxy-relays and can no
+  longer loop.** a REFER arriving inside a bridged B2BUA dialog used to fall
+  through to the proxy relay path, which could bounce it back through the same
+  B2BUA and loop. it is now intercepted at the B2BUA and dispatched to
+  `@b2bua.on_refer`. with no `@b2bua.on_refer` handler registered siphon rejects
+  it locally with `603 Decline` and relays nothing (loop-safe default).
+
+### Added
+- **B2BUA call transfer (REFER, RFC 3515 / 3891 / 5589) with three modes.**
+  `@b2bua.on_refer(call)` handles an in-dialog REFER on a tracked call (single
+  arg, no reply object, REFER is a request). read the target off `call.refer_to`
+  and, for attended transfers, `call.refer_replaces` (Replaces dict:
+  `call_id` / `from_tag` / `to_tag` / `early_only`).
+- **`call.accept_refer(target=None, next_hop=None, mode=None)`** accepts a
+  transfer in one of three modes: `"terminate"` (siphon-terminated, the default)
+  answers `202` and the sipfrag NOTIFYs itself, re-resolves `Refer-To` through the
+  dial plan as a new leg, re-bridges the surviving party, and BYEs the
+  referred-away leg; `"transparent"` re-emits the REFER on the far leg's own
+  dialog and relays its `202` + `message/sipfrag` NOTIFYs back to the referrer;
+  `None` uses `b2bua.default_refer_mode`. `target=` rewrites the destination and
+  `next_hop=` steers egress. `call.reject_refer(code, reason)` declines.
+- **siphon-originated (outbound) REFER.** `call.refer(target, replaces=None)`
+  sends a REFER deferred from a `@b2bua.*` handler that holds a `call`;
+  `b2bua.refer(call_id, target, replaces=None)` is the imperative twin for event
+  callbacks that only have a `call_id` (e.g. `@rtpengine.on_dtmf`). use for
+  IVR / TAS offload: answer, play a prompt, then hand the caller off.
+- **`b2bua.default_refer_mode` config knob** (`terminate` | `transparent`,
+  default `terminate`) sets the mode used when `accept_refer(mode=None)`.
+- **proxy-mode REFER passthrough** is documented and covered by a SIPp test: in
+  proxy mode an in-dialog REFER is loose-routed to the far end (record-route
+  required) and its `202` + sipfrag NOTIFYs relay straight back, so the transfer
+  runs endpoint-to-endpoint with no siphon-side state. no code change (the generic
+  in-dialog branch already handled it); the loop fix above is B2BUA-only.
+
+- **terminate-mode transfer now re-anchors media correctly.** the transfer target
+  is offered the **surviving** party's media (not the referrer's, who is being
+  dropped), and the survivor is re-INVITEd with the target's answer, so RTP is
+  aimed correctly end to end. when the call is media-anchored (rtpengine /
+  siphon-rtp) siphon re-anchors the survivor↔target pair on a fresh media session
+  and tears down the old survivor↔referrer anchor, keeping the anchor in the media
+  path across the transfer (LI / transcoding / NAT preserved).
+- **siphon now owns the SDP `o=` line per leg** (a stable session-id with a
+  monotonic version) on every offer/answer it emits into a B2BUA dialog. a
+  re-anchor (transfer, hold) presents a strictly greater version under the same
+  session identity, so a strict RFC 3264 §8 answerer re-negotiates cleanly rather
+  than reading a changed offer as unchanged. previously the peer's `o=` was passed
+  through with only the username masked.
+
+### Fixed
+- **B2BUA rtpengine session cleanup on a B-leg-originated BYE.** the media-session
+  safety-net delete keyed on the incoming BYE's Call-ID, which is not the store
+  key (the A-leg Call-ID) when the BYE comes from the callee (or from the
+  survivor / target after a terminate-transfer re-anchor); it now keys on the
+  A-leg Call-ID so the session is always cleaned up.
+
 ## [1.4.1] — 2026-07-15
 
 ### Added

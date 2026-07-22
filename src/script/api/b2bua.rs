@@ -43,4 +43,29 @@ impl PyB2buaControl {
     fn terminate(&self, call_id: &str, reason: &str) -> bool {
         crate::dispatcher::b2bua_terminate_call(call_id, Some(reason))
     }
+
+    /// Imperatively send an outbound REFER on a live B2BUA call by SIP Call-ID.
+    ///
+    /// Refers the A-leg (the caller / IVR-connected party) to `target`.
+    /// `replaces` is an attended-transfer Replaces dict (keys `call_id` /
+    /// `from_tag` / `to_tag`, optional `early_only`) or `None` for a blind
+    /// transfer. Works from any context — including event callbacks like
+    /// `@rtpengine.on_dtmf` and timers — where the deferred `call.refer()` is a
+    /// silent no-op (no handler-return to act on). Returns True if the call was
+    /// found and the REFER emitted, False if the Call-ID is unknown / already
+    /// gone. Never raises (except on a malformed `replaces` dict).
+    #[pyo3(signature = (call_id, target, replaces=None))]
+    fn refer(
+        &self,
+        call_id: &str,
+        target: &str,
+        replaces: Option<&Bound<'_, pyo3::types::PyDict>>,
+    ) -> PyResult<bool> {
+        let replaces = crate::script::api::call::parse_replaces_dict(replaces)?;
+        let refer_to = crate::sip::headers::refer::ReferTo {
+            uri: target.to_string(),
+            replaces,
+        };
+        Ok(crate::dispatcher::b2bua_refer_call(call_id, refer_to))
+    }
 }
