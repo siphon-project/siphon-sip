@@ -33,6 +33,7 @@ pub mod shutdown;
 pub mod media;
 pub mod ifc;
 pub mod ipsec;
+pub mod lcr;
 pub mod li;
 pub mod sbi;
 pub mod security;

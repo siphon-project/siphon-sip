@@ -685,6 +685,11 @@ pub async fn run(
         tokio::spawn(async move {
             // Timer check interval: 100ms for responsive retransmissions
             let mut timer_interval = tokio::time::interval(std::time::Duration::from_millis(100));
+            // B2BUA answer-timeout check: 500ms so a short per-carrier LCR ring
+            // timeout re-routes within ~0.5s of its deadline (previously this was
+            // folded into the 30s sweep, making short ring timeouts unusable).
+            let mut answer_timeout_interval =
+                tokio::time::interval(std::time::Duration::from_millis(500));
             // Stale entry cleanup: every 30s
             let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
@@ -692,6 +697,9 @@ pub async fn run(
                 tokio::select! {
                     _ = timer_interval.tick() => {
                         fire_expired_timers(&state);
+                    }
+                    _ = answer_timeout_interval.tick() => {
+                        check_b2bua_answer_timeouts(&state);
                     }
                     _ = cleanup_interval.tick() => {
                         sweep_stale_entries(&state).await;
@@ -1345,13 +1353,9 @@ async fn sweep_stale_entries(state: &DispatcherState) {
         store.sweep_stale(ORPHAN_CALL_TTL);
     }
 
-    // B2BUA answer-timeout: fail calls still un-answered past their
-    // fork/dial `timeout=` deadline with a 408 (CANCEL pending legs, fire
-    // @b2bua.on_failure, respond to the A-leg). Without this a non-responding
-    // B-leg would only be caught by the 24h orphan backstop below.
-    for timed_out in state.call_actors.take_timed_out_calls(now) {
-        fail_b2bua_call_on_timeout(&timed_out, state);
-    }
+    // (B2BUA answer-timeout is checked on a dedicated fast interval — see
+    // `check_b2bua_answer_timeouts` in the dispatcher loop — so a short per-carrier
+    // LCR ring timeout fails over promptly instead of waiting for this 30s sweep.)
 
     // B2BUA call actors — ages by CallActor::created_at (set once at creation,
     // never refreshed), returns the number reaped.
@@ -8496,6 +8500,169 @@ fn set_b2bua_answer_deadline(call_id: &str, timeout_secs: u32, state: &Dispatche
     state.call_actors.set_answer_deadline(call_id, deadline);
 }
 
+/// Fail (or, for an LCR sequence, re-route) every B2BUA call still un-answered
+/// past its per-attempt answer deadline (`call.fork`/`call.dial`/`call.route`
+/// `timeout`). Runs on a fast dispatcher-loop interval so a short per-carrier
+/// LCR ring timeout re-routes promptly (CANCEL the carrier, advance to the next
+/// carrier, or 408 to the A-leg when the list is exhausted) — see
+/// [`fail_b2bua_call_on_timeout`].
+fn check_b2bua_answer_timeouts(state: &DispatcherState) {
+    let now = std::time::Instant::now();
+    for timed_out in state.call_actors.take_timed_out_calls(now) {
+        fail_b2bua_call_on_timeout(&timed_out, state);
+    }
+}
+
+/// Resolve a gateway group to a healthy member's next-hop URI (LCR carrier
+/// pools). `None` when the group is unknown or entirely down — the caller skips
+/// that carrier. The transport is baked into the URI so a TLS/TCP carrier pool
+/// routes over the right protocol even if the configured URI omitted it.
+fn b2bua_resolve_gateway_member(group: &str) -> Option<String> {
+    let manager = crate::script::api::gateway_manager()?;
+    let destination = manager.select(group, None, None)?;
+    let uri = destination.uri.clone();
+    if destination.transport == crate::transport::Transport::Udp
+        || uri.to_ascii_lowercase().contains("transport=")
+    {
+        Some(uri)
+    } else {
+        Some(format!(
+            "{uri};transport={}",
+            destination.transport.to_string().to_ascii_lowercase()
+        ))
+    }
+}
+
+/// Whether a carrier's failure `status` should trigger LCR failover to the next
+/// carrier, per the effective reroute-cause set for the carrier currently in
+/// flight: the active route's own set (from the API) > its gateway group's
+/// override (`gateway.groups[].reroute_causes`) > the global set
+/// (`lcr.reroute_causes`, else the built-in default). Some carriers don't play
+/// nice with the standard codes, hence the per-gateway / per-route overrides.
+fn b2bua_status_reroutes(call_id: &str, status: u16, state: &DispatcherState) -> bool {
+    if let Some(route) = state.call_actors.active_route(call_id) {
+        if !route.reroute_causes.is_empty() {
+            return route.reroute_causes.contains(&status);
+        }
+        if let Some(group) = route.gateway_group.as_deref() {
+            if let Some(manager) = crate::script::api::gateway_manager() {
+                let group_causes = manager.group_reroute_causes(group);
+                if !group_causes.is_empty() {
+                    return group_causes.contains(&status);
+                }
+            }
+        }
+    }
+    crate::lcr::global_reroute_contains(status)
+}
+
+/// Build the B-leg R-URI for a carrier route: base is the route's `ruri` (else
+/// the A-leg R-URI), with the carrier's tech-prefix prepended to the userpart.
+/// For a bare dialed-number route (no `ruri`) dialed via a carrier next-hop, the
+/// R-URI host is pointed at the carrier so it sees itself as the target.
+fn b2bua_carrier_ruri(
+    route: &crate::lcr::Route,
+    a_leg_ruri: &str,
+    next_hop: Option<&str>,
+) -> String {
+    let base = route.ruri.as_deref().unwrap_or(a_leg_ruri);
+    let mut uri = match parse_uri_standalone(base) {
+        Ok(uri) => uri,
+        Err(_) => {
+            // Unparseable base — best-effort string prefix so the prefix is
+            // never silently dropped.
+            return match route.tech_prefix.as_deref().filter(|p| !p.is_empty()) {
+                Some(prefix) => format!("{prefix}{base}"),
+                None => base.to_string(),
+            };
+        }
+    };
+    if let Some(prefix) = route.tech_prefix.as_deref().filter(|p| !p.is_empty()) {
+        let user = uri.user.clone().unwrap_or_default();
+        uri.user = Some(format!("{prefix}{user}"));
+    }
+    if route.ruri.is_none() {
+        if let Some(next_hop_uri) = next_hop.and_then(|nh| parse_uri_standalone(nh).ok()) {
+            uri.host = next_hop_uri.host;
+            uri.port = next_hop_uri.port;
+        }
+    }
+    uri.to_string()
+}
+
+/// Dial the next routable carrier in a call's sequential-failover queue (LCR
+/// `call.route(...)` or `fork(strategy="sequential")`).
+///
+/// Pops carriers off the pending queue until one resolves — a `gateway_group`
+/// to a healthy member (skipping a group that is entirely down), an explicit
+/// `next_hop`, or an `ruri` — then sends its B-leg INVITE (a **fresh** dialog:
+/// `b2bua_send_b_leg_invite` mints a new Call-ID/From-tag/CSeq) and arms the
+/// per-attempt answer deadline. Returns `true` if a carrier was dialed, `false`
+/// once the queue is exhausted. `original_request` is the stored A-leg INVITE
+/// (its R-URI is the default dial target when a route omits its own `ruri`);
+/// the caller passes the locked message so this never re-locks it.
+fn b2bua_advance_route(
+    call_id: &str,
+    original_request: &SipMessage,
+    state: &DispatcherState,
+) -> bool {
+    let send_socket_str = state.call_actors.route_send_socket(call_id);
+    let send_socket = state.resolve_send_socket(send_socket_str.as_deref());
+    let a_leg_ruri = match &original_request.start_line {
+        StartLine::Request(request_line) => request_line.request_uri.to_string(),
+        _ => String::new(),
+    };
+    loop {
+        let route = match state.call_actors.take_next_route(call_id) {
+            Some(route) => route,
+            None => return false,
+        };
+        // Prefer a healthy gateway-group member; fall back to an explicit
+        // next-hop. A carrier whose group is down and has no next-hop / R-URI
+        // is unroutable — skip it.
+        let next_hop = route
+            .gateway_group
+            .as_deref()
+            .and_then(b2bua_resolve_gateway_member)
+            .or_else(|| route.next_hop.clone());
+        if next_hop.is_none() && route.ruri.is_none() {
+            debug!(
+                call_id = %call_id,
+                carrier = %route.carrier_id,
+                "LCR: carrier unroutable (group down, no next-hop), skipping",
+            );
+            continue;
+        }
+        let target = b2bua_carrier_ruri(&route, &a_leg_ruri, next_hop.as_deref());
+        let extra_headers: Vec<(String, String)> = route
+            .headers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        let timeout = route.timeout_secs.unwrap_or(30);
+        debug!(
+            call_id = %call_id,
+            carrier = %route.carrier_id,
+            target = %target,
+            next_hop = ?next_hop,
+            "LCR: dialing carrier",
+        );
+        b2bua_send_b_leg_invite(
+            call_id,
+            &target,
+            next_hop.as_deref(),
+            None,
+            &[],
+            send_socket.as_ref(),
+            original_request,
+            &extra_headers,
+            state,
+        );
+        set_b2bua_answer_deadline(call_id, timeout, state);
+        return true;
+    }
+}
+
 /// Fail a B2BUA call whose answer deadline passed while it was still
 /// un-answered — the B-leg never produced a final 2xx (dead/partitioned trunk,
 /// or a B-leg that silently went away).
@@ -8546,6 +8713,33 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
             }
             None => return,
         };
+
+    // LCR / sequential failover: the current carrier did not answer within its
+    // ring timeout. If more carriers remain and 408 is a reroute cause for this
+    // carrier, CANCEL this attempt and advance instead of failing the call.
+    if state.call_actors.has_pending_routes(call_id)
+        && b2bua_status_reroutes(call_id, 408, state)
+    {
+        state.call_actors.record_route_failure(call_id, 408);
+        // CANCEL the timed-out carrier's pending B-leg(s) (RFC 3261 §9.1) and
+        // mark them cancelled so their stray 487s are absorbed.
+        for (cancel_msg, transport, dest) in &cancel_targets {
+            send_b2bua_to_bleg(cancel_msg.clone(), *transport, *dest, state);
+        }
+        for tx in &handle_txs {
+            let _ = tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
+        }
+        state.call_actors.mark_active_b_legs_cancelled(call_id);
+        let advanced = match a_leg_invite.as_ref().map(|arc| arc.lock()) {
+            Some(Ok(guard)) => b2bua_advance_route(call_id, &guard, state),
+            _ => false,
+        };
+        if advanced {
+            debug!(call_id = %call_id, "LCR: carrier ring-timeout, advanced to next carrier");
+            return;
+        }
+        // else fall through to the normal 408 teardown (queue exhausted).
+    }
 
     warn!(
         call_id = %call_id,
@@ -9069,7 +9263,7 @@ fn handle_b2bua_invite(
                 &route,
                 send_socket.as_ref(),
                 &message_guard,
-                &inbound,
+                &[],
                 state,
             );
             set_b2bua_answer_deadline(&call_id, timeout, state);
@@ -9086,11 +9280,43 @@ fn handle_b2bua_invite(
                     &[],
                     send_socket.as_ref(),
                     &message_guard,
-                    &inbound,
+                    &[],
                     state,
                 );
             }
             set_b2bua_answer_deadline(&call_id, timeout, state);
+        }
+        CallAction::RouteSequence { mut routes, send_socket, default_timeout } => {
+            // LCR / sequential failover: dial the first routable carrier, keep
+            // the rest as the call's failover queue, and advance on B-leg
+            // reject/timeout (see b2bua_advance_route). Each attempt is a fresh
+            // B-leg dialog (no reused Call-ID — the serial-fork footgun).
+            for route in &mut routes {
+                if route.timeout_secs.is_none() {
+                    route.timeout_secs = Some(default_timeout);
+                }
+            }
+            let carrier_count = routes.len();
+            debug!(call_id = %call_id, carriers = carrier_count, "B2BUA: LCR sequential routing");
+            state.call_actors.start_route_sequence(
+                &call_id,
+                crate::b2bua::actor::RouteSequenceState {
+                    pending: routes.into(),
+                    active: None,
+                    best_error: None,
+                    send_socket,
+                    default_timeout,
+                },
+            );
+            if !b2bua_advance_route(&call_id, &message_guard, state) {
+                // No carrier was routable (e.g. every gateway group down and no
+                // explicit next-hop) — answer the A-leg 503 instead of stalling.
+                debug!(call_id = %call_id, "B2BUA: LCR — no routable carrier");
+                let response = build_response(&message_guard, 503, "No Route", state.server_header.as_deref(), &[]);
+                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+                state.call_actors.remove_call(&call_id);
+                state.call_event_receivers.remove(&call_id);
+            }
         }
         CallAction::Terminate => {
             debug!(call_id = %call_id, "B2BUA: terminate on invite (unusual)");
@@ -9167,7 +9393,7 @@ fn b2bua_send_b_leg_invite(
     b_leg_route: &[String],
     send_socket: Option<&crate::transport::SendSocket>,
     original_request: &SipMessage,
-    _inbound: &InboundMessage,
+    extra_headers: &[(String, String)],
     state: &DispatcherState,
 ) {
     // Resolve the wire destination: over the captured inbound flow (RFC 5626
@@ -9433,6 +9659,13 @@ fn b2bua_send_b_leg_invite(
             server_header: state.server_header.as_deref(),
         };
         crate::b2bua::header_policy::apply_to_request(&mut b_leg_invite, &policy, &ctx);
+    }
+
+    // Inject per-carrier (LCR) headers after the header policy, so a carrier's
+    // account token / routing tag always lands on the wire regardless of the
+    // policy's strip set.
+    for (name, value) in extra_headers {
+        b_leg_invite.headers.set(name, value.clone());
     }
 
     // Inject RFC 4028 session timer headers if configured.
@@ -10051,6 +10284,26 @@ fn handle_b2bua_response(
             return;
         }
     };
+
+    // A `2xx` to a B-leg CANCEL shares the INVITE's top Via branch (RFC 3261
+    // §9.1), so branch-matching alone would misclassify it as the carrier's
+    // INVITE answer and mark the cancelled leg the winner — sending the late
+    // ACK and the BYE to the wrong (cancelled) carrier. A CANCEL response needs
+    // no action here (siphon initiated the CANCEL; the 487 to the INVITE is
+    // handled separately), so absorb any non-INVITE-CSeq response.
+    let response_cseq_method = message
+        .headers
+        .cseq()
+        .and_then(|cseq| cseq.split_whitespace().nth(1).map(str::to_string))
+        .unwrap_or_default();
+    if response_cseq_method.eq_ignore_ascii_case("CANCEL") {
+        debug!(
+            call_id = %call_id,
+            status = status_code,
+            "B2BUA: absorbing 2xx/response to a B-leg CANCEL (not an INVITE answer)"
+        );
+        return;
+    }
 
     // The A-leg peer's advertised reliable-provisional capability (RFC 3262 §3),
     // snapshotted from the on-wire INVITE at receipt (CallActor.a_leg_supports_100rel)
@@ -10857,12 +11110,17 @@ fn handle_b2bua_response(
         let handlers = engine_state.handlers_for(&HandlerKind::B2buaAnswer);
         if !handlers.is_empty() {
             if let Some(invite_arc) = &a_leg_invite {
-                let py_call = PyCall::new(
+                let mut py_call = PyCall::new(
                     call_id.to_string(),
                     Arc::clone(invite_arc),
                     a_leg.transport.remote_addr.ip().to_string(),
                     format!("{}", a_leg.transport.transport).to_lowercase(),
                 );
+                // LCR: surface the carrier that won as `call.active_route` so the
+                // script can stamp it onto a CDR / charging record.
+                if let Some(route) = state.call_actors.active_route(call_id) {
+                    py_call.set_active_route(route);
+                }
                 let py_reply = PyReply::new(Arc::clone(&response_arc))
                     .with_a_leg(Arc::clone(invite_arc))
                     .with_response_source(
@@ -11281,6 +11539,19 @@ fn handle_b2bua_response(
     } ResponseClass::Provisional => {
     // --- 1xx provisional handling ---
     {
+        // Drop a stray provisional that arrives after the call is already
+        // answered — e.g. a carrier's 180 reordered behind its 200 under the
+        // multi-worker UDP receive (seen on an LCR reroute where the winning
+        // carrier's 180/200 land in a tight window), or a losing fork branch's
+        // late 18x. A B2BUA must not forward a provisional after the final
+        // response, nor downgrade the confirmed dialog back to Ringing
+        // (RFC 3261 §12.1). Absorb it.
+        if call_state == CallState::Answered {
+            debug!(call_id = %call_id, status = status_code,
+                "B2BUA: dropping provisional received after answer");
+            return;
+        }
+
         // 1xx provisional — forward to A-leg
         state.call_actors.set_state(call_id, CallState::Ringing);
 
@@ -11821,6 +12092,81 @@ fn handle_b2bua_response(
             );
         }
 
+        // LCR / sequential failover: this carrier produced a final failure. If
+        // it is a configured reroute cause and more carriers remain, advance to
+        // the next instead of failing the call — the A-leg sees an error only
+        // once the list is exhausted or the response is definitive.
+        let mut b_leg_acked_for_reroute = false;
+        if !relay_challenge && state.call_actors.is_route_sequence(call_id) {
+            // Absorb a straggler that must NEVER reach the A-leg: a leg we
+            // cancelled during a failover-advance (its `487 Request Terminated`),
+            // or ANY non-2xx arriving after another carrier already answered.
+            // Without this, a cancelled carrier's 487 tears down the bridged
+            // call. We still ACK it (RFC 3261 §17.1.1.3) so the carrier stops
+            // retransmitting, then drop it — no forward, no teardown, no advance.
+            let already_cancelled = b_leg_index
+                .and_then(|idx| {
+                    state
+                        .call_actors
+                        .get_call(call_id)
+                        .and_then(|call| call.b_leg_status.get(idx).cloned())
+                })
+                .is_some_and(|status| {
+                    matches!(status, crate::b2bua::actor::BLegStatus::Cancelled)
+                });
+            if already_cancelled || status_code == 487 || call_state == CallState::Answered {
+                if let Some((b_dest, b_transport)) = b_leg_dest {
+                    let ack = build_b2bua_ack_for_non2xx(
+                        message,
+                        branch,
+                        b_leg_target.as_deref(),
+                        b_transport,
+                        &state.via_host(&b_transport),
+                        state.via_port(&b_transport),
+                    );
+                    send_b2bua_to_bleg(ack, b_transport, b_dest, state);
+                }
+                debug!(call_id = %call_id, status = status_code,
+                    "LCR: absorbing straggler carrier response (cancelled / post-answer / 487)");
+                return;
+            }
+            state.call_actors.record_route_failure(call_id, status_code);
+            // Fail over only on a configured reroute cause (per-route from the
+            // API > per-gateway override > global set). A definitive response
+            // (486 Busy, 603 Decline, …) is forwarded to the A-leg as-is —
+            // trying another carrier won't help.
+            let reroute = b2bua_status_reroutes(call_id, status_code, state);
+            if reroute && state.call_actors.has_pending_routes(call_id) {
+                // ACK this carrier's non-2xx (RFC 3261 §17.1.1.3) before the
+                // next try. The failed carrier's media session is keyed by the
+                // A-leg Call-ID and reused by the next carrier's B-leg, so it is
+                // intentionally NOT torn down here.
+                if let Some((b_dest, b_transport)) = b_leg_dest {
+                    let ack = build_b2bua_ack_for_non2xx(
+                        message,
+                        branch,
+                        b_leg_target.as_deref(),
+                        b_transport,
+                        &state.via_host(&b_transport),
+                        state.via_port(&b_transport),
+                    );
+                    send_b2bua_to_bleg(ack, b_transport, b_dest, state);
+                    b_leg_acked_for_reroute = true;
+                }
+                let advanced = match a_leg_invite.as_ref().map(|arc| arc.lock()) {
+                    Some(Ok(guard)) => b2bua_advance_route(call_id, &guard, state),
+                    _ => false,
+                };
+                if advanced {
+                    debug!(call_id = %call_id, status = status_code,
+                        "LCR: carrier failed, advanced to next carrier");
+                    return;
+                }
+            }
+            debug!(call_id = %call_id, status = status_code, reroute,
+                "LCR: forwarding carrier response to A-leg (definitive or exhausted)");
+        }
+
         // CDR: the call failed before answer (cdr.auto_emit). Fire regardless of
         // whether a @b2bua.on_failure handler is registered — the record must be
         // written for the failed call either way. Skipped for a relayed challenge
@@ -11884,16 +12230,20 @@ fn handle_b2bua_response(
         // Send ACK to B-leg for non-2xx final response (RFC 3261 §17.1.1.3).
         // The B2BUA must acknowledge non-2xx responses hop-by-hop.
         // Use send_b2bua_to_bleg (not send_message) so TCP goes through the pool.
+        // Skipped when the LCR reroute path already ACKed this carrier before
+        // trying (and failing to route) the next one — no double ACK.
         if let Some((b_dest, b_transport)) = b_leg_dest {
-            let ack = build_b2bua_ack_for_non2xx(
-                message,
-                branch,
-                b_leg_target.as_deref(),
-                b_transport,
-                &state.via_host(&b_transport),
-                state.via_port(&b_transport),
-            );
-            send_b2bua_to_bleg(ack, b_transport, b_dest, state);
+            if !b_leg_acked_for_reroute {
+                let ack = build_b2bua_ack_for_non2xx(
+                    message,
+                    branch,
+                    b_leg_target.as_deref(),
+                    b_transport,
+                    &state.via_host(&b_transport),
+                    state.via_port(&b_transport),
+                );
+                send_b2bua_to_bleg(ack, b_transport, b_dest, state);
+            }
         }
 
         // Forward error to A-leg — rewrite B-leg dialog headers back to A-leg

@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  LCR failover test — carrier A (the cheapest carrier, which REJECTS).
+
+  Receive INVITE → 100 → 503 Service Unavailable → ACK.
+
+  503 is a reroute cause, so siphon must fail over to carrier B (a fresh B-leg
+  dialog with a new Call-ID) instead of failing the call to the caller.
+-->
+<scenario name="LCR carrier A (reject 503)">
+
+  <recv request="INVITE" crlf="true" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 100 Trying
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 503 Service Unavailable
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTagA[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="ACK" timeout="5000" />
+
+</scenario>

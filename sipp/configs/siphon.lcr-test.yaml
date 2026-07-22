@@ -1,0 +1,25 @@
+# siphon config for the LCR sequential-failover SIPp test
+# (scripts/lcr_sipp_test.sh). The mock LCR API returns two carriers by
+# next-hop; carrier-a rejects 503 (a reroute cause) so siphon fails over to
+# carrier-b, which answers.
+
+listen:
+  udp:
+    - "127.0.0.1:5060"
+
+domain:
+  local:
+    - "127.0.0.1"
+
+advertised_address: "127.0.0.1"
+
+script:
+  path: "scripts/lcr_test.py"
+
+lcr:
+  api_url: "http://127.0.0.1:8088/route"
+  timeout_ms: 2000
+  reroute_causes: [408, 500, 502, 503, 504]
+
+log:
+  level: info
