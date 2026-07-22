@@ -124,6 +124,22 @@ pub struct Dialog {
     pub local_from_uri: Option<String>,
     /// Remote To URI for this dialog (for mid-dialog requests like BYE).
     pub remote_to_uri: Option<String>,
+    /// siphon's owned SDP `o=` session-id for SDP it emits toward this leg's
+    /// peer (RFC 4566 §5.2). Stable for the dialog's life — generated once at
+    /// creation — so every offer/answer siphon sends this peer shares one
+    /// session identity (RFC 3264 §8).
+    pub sdp_session_id: u64,
+    /// Monotonic SDP `o=` version for SDP siphon emits toward this leg's peer.
+    /// Incremented on every emit so a re-INVITE that changes the media (e.g. a
+    /// transfer re-anchor) presents a strictly greater version than the last
+    /// SDP the peer saw — otherwise a strict RFC 3264 §8 answerer may treat the
+    /// changed offer as unchanged and skip re-answering.
+    pub sdp_version: u64,
+}
+
+/// Generate a fresh SDP `o=` session-id (RFC 4566 §5.2 — a numeric identifier).
+pub fn generate_sdp_session_id() -> u64 {
+    uuid::Uuid::new_v4().as_u128() as u64
 }
 
 impl Dialog {
@@ -142,6 +158,8 @@ impl Dialog {
             route_set: vec![],
             local_from_uri: None,
             remote_to_uri: None,
+            sdp_session_id: generate_sdp_session_id(),
+            sdp_version: 0,
         }
     }
 
@@ -161,6 +179,8 @@ impl Dialog {
             route_set: vec![],
             local_from_uri: None,
             remote_to_uri: None,
+            sdp_session_id: generate_sdp_session_id(),
+            sdp_version: 0,
         }
     }
 
@@ -370,6 +390,22 @@ pub struct Leg {
     pub stored_vias: Vec<String>,
     /// Stored CSeq from re-INVITE originator (for response CSeq restoration).
     pub stored_cseq: Option<String>,
+    /// Stored From header of the request that created this (pseudo-)leg, kept
+    /// verbatim so a response relayed back to the originator echoes it exactly
+    /// (RFC 3261 §8.2.6.2). Used by the transparent REFER/NOTIFY relay: the
+    /// dialog-derived URI can differ from what the peer actually sent (e.g. a
+    /// `:5060` the peer omitted), so reconstructing From/To from dialog state
+    /// would break the verbatim-echo MUST. `None` for legs that don't need it.
+    pub stored_from: Option<String>,
+    /// Stored To header of the request that created this (pseudo-)leg. See
+    /// [`Leg::stored_from`].
+    pub stored_to: Option<String>,
+    /// This leg's own most-recent endpoint SDP, stored **raw** (the peer's true
+    /// media address, before any rtpengine rewrite or topology masking). Kept so
+    /// a siphon-terminated transfer can offer the *surviving* leg's real media
+    /// to the transfer target (or feed it to an rtpengine re-anchor) instead of
+    /// the referrer's SDP. `None` until the leg has negotiated a body.
+    pub last_sdp: Option<Vec<u8>>,
     /// Whether the initial INVITE on this leg has been ACKed.
     pub initial_acked: bool,
     /// Whether a re-INVITE toward this leg is currently in flight
@@ -424,6 +460,9 @@ impl Leg {
             branch,
             stored_vias: Vec::new(),
             stored_cseq: None,
+            stored_from: None,
+            stored_to: None,
+            last_sdp: None,
             initial_acked: false,
             pending_reinvite: false,
             prack_acked_rseq: None,
@@ -449,6 +488,9 @@ impl Leg {
             branch,
             stored_vias: Vec::new(),
             stored_cseq: None,
+            stored_from: None,
+            stored_to: None,
+            last_sdp: None,
             initial_acked: false,
             pending_reinvite: false,
             prack_acked_rseq: None,
@@ -458,17 +500,23 @@ impl Leg {
         }
     }
 
-    /// True for the re-INVITE/UPDATE response-tracking pseudo-legs the
-    /// dispatcher inserts as B-legs. Their `target_uri` is a direction marker
-    /// (`reinvite:`/`update:`/`…_done:`) and they deliberately reuse another
-    /// leg's Call-ID for response routing, so they must be excluded from
-    /// dialog-identity direction matching.
+    /// True for the re-INVITE/UPDATE/REFER/NOTIFY response-tracking pseudo-legs
+    /// the dispatcher inserts as B-legs. Their `target_uri` is a direction
+    /// marker (`reinvite:`/`update:`/`refer:`/`notify:`/`refer_out:`/`…_done:`)
+    /// and they deliberately reuse another leg's Call-ID for response routing,
+    /// so they must be excluded from dialog-identity direction matching.
     pub fn is_tracking_leg(&self) -> bool {
         self.dialog.target_uri.as_deref().is_some_and(|target| {
             target.starts_with("reinvite:")
                 || target.starts_with("reinvite_done:")
                 || target.starts_with("update:")
                 || target.starts_with("update_done:")
+                || target.starts_with("refer:")
+                || target.starts_with("refer_done:")
+                || target.starts_with("notify:")
+                || target.starts_with("notify_done:")
+                || target.starts_with("refer_out:")
+                || target.starts_with("refer_out_done:")
         })
     }
 }
@@ -590,6 +638,45 @@ pub enum CallState {
 // CallActor — per-call supervisor
 // ---------------------------------------------------------------------------
 
+/// A REFER subscription (RFC 3515) that siphon owns for a transfer in progress
+/// on a B2BUA call.
+///
+/// Two roles:
+/// - **notifier** (`siphon_notifies == true`) — the siphon-terminated inbound
+///   path: a UA sent siphon a REFER, siphon answered `202`, and now sends the
+///   `message/sipfrag` NOTIFY progress to that referrer as the new leg it dialed
+///   makes progress.
+/// - **subscriber** (`siphon_notifies == false`) — the siphon-originated path
+///   (`call.refer()`): siphon sent a REFER to a connected UA and receives that
+///   UA's sipfrag NOTIFYs, which it `200 OK`s and reads for teardown.
+///
+/// The transparent-forward path owns no subscription — it bridges the peers'
+/// own NOTIFYs across the two dialogs.
+#[derive(Debug, Clone)]
+pub struct ReferSubscription {
+    /// Which leg of this call carries the subscription dialog (the leg the REFER
+    /// was received on for a terminated transfer, or sent on for an originated
+    /// one).
+    pub on_a_leg: bool,
+    /// True when siphon is the notifier, false when siphon is the subscriber.
+    pub siphon_notifies: bool,
+    /// The subscription `id` token — the CSeq number of the REFER that created
+    /// it (RFC 3515 §2.4.4) — surfaced as `Event: refer;id=<n>` to disambiguate
+    /// concurrent transfers on one dialog.
+    pub event_id: u32,
+    /// Next CSeq for a siphon-originated NOTIFY on this subscription (notifier
+    /// role only).
+    pub notify_cseq: u32,
+    /// Current transfer progress (drives the sipfrag body and teardown).
+    pub state: super::transfer::TransferState,
+    /// For a siphon-terminated inbound transfer: the dialog Call-ID of the leg
+    /// siphon dialed to the transfer target. The response path matches an
+    /// answering b_leg against this exact Call-ID (not just "a non-winner leg")
+    /// so an unrelated leg dialed while a transfer is pending can't be mistaken
+    /// for the transfer target. `None` for the subscriber (outbound) role.
+    pub target_leg_call_id: Option<String>,
+}
+
 /// Per-call supervisor managing A-leg + B-leg(s).
 ///
 /// Each call actor owns its legs as independent entities. The dispatcher
@@ -644,6 +731,14 @@ pub struct CallActor {
     pub session_timer_override: Option<crate::script::api::call::SessionTimerOverride>,
     /// Active transfer context (REFER handling).
     pub transfer: Option<super::transfer::TransferContext>,
+    /// REFER subscriptions siphon owns for transfers in progress (RFC 3515).
+    /// Present for the siphon-terminated inbound path (siphon is the notifier,
+    /// sending `message/sipfrag` NOTIFYs to the referrer) and the
+    /// siphon-originated path (`call.refer()`, siphon is the subscriber,
+    /// receiving them from the referee). The transparent-forward path owns none
+    /// — it bridges the peers' own NOTIFYs. A `Vec` so concurrent transfers on
+    /// one dialog are disambiguated by the `Event: refer;id` token.
+    pub refer_subscriptions: Vec<ReferSubscription>,
     /// Outbound digest credentials for B-leg 401/407 retry.
     pub outbound_credentials: Option<(String, String)>,
     /// Per-call digest nonce-count tracker (RFC 7616 §3.3). Resets to 1 when
@@ -730,6 +825,7 @@ impl CallActor {
             session_timer: None,
             session_timer_override: None,
             transfer: None,
+            refer_subscriptions: Vec::new(),
             outbound_credentials: None,
             digest_nc: crate::auth::NonceCounter::new(),
             li_record: false,
@@ -1393,6 +1489,167 @@ impl CallActorStore {
         }
     }
 
+    /// Record a siphon-owned REFER subscription for a transfer in progress.
+    pub fn push_refer_subscription(&self, call_id: &str, subscription: ReferSubscription) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.refer_subscriptions.push(subscription);
+        }
+    }
+
+    /// True if the call carries a siphon-owned *subscriber* REFER subscription
+    /// on the given leg (siphon-originated transfer: siphon sent the REFER and
+    /// receives the referee's sipfrag NOTIFYs, rather than sending them).
+    pub fn has_subscriber_refer_subscription(&self, call_id: &str, on_a_leg: bool) -> bool {
+        self.calls
+            .get(call_id)
+            .map(|call| {
+                call.refer_subscriptions
+                    .iter()
+                    .any(|subscription| !subscription.siphon_notifies && subscription.on_a_leg == on_a_leg)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Drop any REFER subscriptions recorded on the given leg (e.g. on the
+    /// terminating NOTIFY of a siphon-owned subscription).
+    pub fn clear_refer_subscriptions_on_leg(&self, call_id: &str, on_a_leg: bool) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.refer_subscriptions
+                .retain(|subscription| subscription.on_a_leg != on_a_leg);
+        }
+    }
+
+    /// Reserve the next local CSeq for one leg of a call (increments the stored
+    /// value and returns the number to use). Returns `None` if the call or the
+    /// requested leg is not present. Used for siphon-originated in-dialog
+    /// requests on a leg (REFER-subscription NOTIFYs, outbound REFER).
+    pub fn reserve_leg_cseq(&self, call_id: &str, on_a_leg: bool) -> Option<u32> {
+        let mut call = self.calls.get_mut(call_id)?;
+        let winner = call.winner;
+        let leg = if on_a_leg {
+            Some(&mut call.a_leg)
+        } else {
+            winner.and_then(|index| call.b_legs.get_mut(index))
+        }?;
+        let cseq = leg.dialog.local_cseq;
+        leg.dialog.local_cseq += 1;
+        Some(cseq)
+    }
+
+    /// Reserve siphon's owned SDP `o=` identity for the next SDP emitted toward
+    /// one leg of a call: returns `(sdp_session_id, sdp_version)` and
+    /// post-increments the stored version so the next emit is strictly greater
+    /// (RFC 3264 §8). Returns `None` if the call or the requested leg is absent.
+    /// The session-id is stable for the dialog's life; only the version advances.
+    pub fn reserve_leg_sdp_version(&self, call_id: &str, on_a_leg: bool) -> Option<(u64, u64)> {
+        let mut call = self.calls.get_mut(call_id)?;
+        let winner = call.winner;
+        let leg = if on_a_leg {
+            Some(&mut call.a_leg)
+        } else {
+            winner.and_then(|index| call.b_legs.get_mut(index))
+        }?;
+        let identity = (leg.dialog.sdp_session_id, leg.dialog.sdp_version);
+        leg.dialog.sdp_version += 1;
+        Some(identity)
+    }
+
+    /// Reserve the SDP `o=` identity for a specific B-leg by index (used for a
+    /// freshly-dialed leg — e.g. a transfer target — that is not the winner).
+    pub fn reserve_b_leg_sdp_version_by_index(
+        &self,
+        call_id: &str,
+        index: usize,
+    ) -> Option<(u64, u64)> {
+        let mut call = self.calls.get_mut(call_id)?;
+        let leg = call.b_legs.get_mut(index)?;
+        let identity = (leg.dialog.sdp_session_id, leg.dialog.sdp_version);
+        leg.dialog.sdp_version += 1;
+        Some(identity)
+    }
+
+    /// Record one leg's own most-recent endpoint SDP (raw). Stored so a
+    /// siphon-terminated transfer can offer the surviving leg's real media to
+    /// the transfer target. `on_a_leg` selects the A-leg or the winning B-leg;
+    /// a no-op if the call or leg is absent, or if `sdp` is empty.
+    pub fn set_leg_last_sdp(&self, call_id: &str, on_a_leg: bool, sdp: &[u8]) {
+        if sdp.is_empty() {
+            return;
+        }
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            let winner = call.winner;
+            let leg = if on_a_leg {
+                Some(&mut call.a_leg)
+            } else {
+                winner.and_then(|index| call.b_legs.get_mut(index))
+            };
+            if let Some(leg) = leg {
+                leg.last_sdp = Some(sdp.to_vec());
+            }
+        }
+    }
+
+    /// Clone one leg of a call (the A-leg, or the winning B-leg). Used to build
+    /// siphon-originated in-dialog requests off a snapshot without holding the
+    /// call lock across the send.
+    pub fn clone_leg(&self, call_id: &str, on_a_leg: bool) -> Option<Leg> {
+        let call = self.calls.get(call_id)?;
+        if on_a_leg {
+            Some(call.a_leg.clone())
+        } else {
+            call.winner.and_then(|index| call.b_legs.get(index).cloned())
+        }
+    }
+
+    /// Complete a siphon-terminated transfer: promote the just-answered transfer
+    /// target (`target_idx` in `b_legs`) to be the surviving party's new peer,
+    /// and return the referrer leg (the party being transferred away) so the
+    /// caller can BYE it.
+    ///
+    /// - `referrer_on_a_leg == true` — the referrer is the A-leg and the
+    ///   surviving party is the winning B-leg: the target replaces the A-leg (it
+    ///   becomes the new `a_leg`, the winner is preserved, the old A-leg is
+    ///   returned). This is the Microsoft Teams blind-transfer shape.
+    /// - `referrer_on_a_leg == false` — the referrer is the winning B-leg and the
+    ///   surviving party is the A-leg: the target becomes the new winner and the
+    ///   old winning B-leg is returned.
+    ///
+    /// The parallel per-B-leg vectors are kept aligned when a slot is removed.
+    pub fn promote_transfer_target(
+        &self,
+        call_id: &str,
+        target_idx: usize,
+        referrer_on_a_leg: bool,
+    ) -> Option<Leg> {
+        let mut call = self.calls.get_mut(call_id)?;
+        if target_idx >= call.b_legs.len() {
+            return None;
+        }
+        if referrer_on_a_leg {
+            let target = call.b_legs.remove(target_idx);
+            if target_idx < call.b_leg_status.len() {
+                call.b_leg_status.remove(target_idx);
+            }
+            if target_idx < call.b_leg_handles.len() {
+                call.b_leg_handles.remove(target_idx);
+            }
+            // Removing the slot shifts higher indices down by one — fix the
+            // winner pointer (the surviving B-leg) accordingly.
+            match call.winner {
+                Some(winner) if winner == target_idx => call.winner = None,
+                Some(winner) if winner > target_idx => call.winner = Some(winner - 1),
+                _ => {}
+            }
+            let old_referrer = std::mem::replace(&mut call.a_leg, target);
+            Some(old_referrer)
+        } else {
+            let old_winner_idx = call.winner?;
+            let old_referrer = call.b_legs.get(old_winner_idx).cloned()?;
+            call.winner = Some(target_idx);
+            Some(old_referrer)
+        }
+    }
+
     /// Remove a call and clean up all registry entries.
     ///
     /// Sends `Shutdown` to all active B-leg actor handles before removing.
@@ -1813,6 +2070,106 @@ mod tests {
         let id1 = LegId::new();
         let id2 = LegId::new();
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn dialog_has_stable_sdp_session_id_and_zero_version() {
+        // Each dialog is born with a stable siphon-owned SDP session-id and a
+        // version starting at 0 (RFC 4566 §5.2 / RFC 3264 §8).
+        let a = Dialog::from_inbound("c@h".to_string(), "rt".to_string());
+        assert_eq!(a.sdp_version, 0);
+        let b = Dialog::new_outbound("c@h".to_string(), "lt".to_string(), "sip:x@h".to_string());
+        assert_eq!(b.sdp_version, 0);
+        // Distinct dialogs get distinct session-ids (overwhelmingly — u64 from a
+        // v4 UUID).
+        assert_ne!(a.sdp_session_id, b.sdp_session_id);
+    }
+
+    #[test]
+    fn reserve_leg_sdp_version_is_monotonic_and_session_stable() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        store.add_b_leg(&call_id, make_b_leg(0));
+        store.set_winner(&call_id, 0);
+
+        // A-leg: same session-id across reservations, version steps 0,1,2.
+        let (a_sess0, v0) = store.reserve_leg_sdp_version(&call_id, true).unwrap();
+        let (a_sess1, v1) = store.reserve_leg_sdp_version(&call_id, true).unwrap();
+        let (a_sess2, v2) = store.reserve_leg_sdp_version(&call_id, true).unwrap();
+        assert_eq!((v0, v1, v2), (0, 1, 2));
+        assert_eq!(a_sess0, a_sess1);
+        assert_eq!(a_sess1, a_sess2);
+
+        // Winning B-leg counts independently under its own session-id.
+        let (b_sess, bv0) = store.reserve_leg_sdp_version(&call_id, false).unwrap();
+        let (_, bv1) = store.reserve_leg_sdp_version(&call_id, false).unwrap();
+        assert_eq!((bv0, bv1), (0, 1));
+        assert_ne!(a_sess0, b_sess, "each leg owns a distinct SDP session-id");
+
+        // By-index variant advances the same B-leg counter.
+        let (b_sess_idx, bv2) = store.reserve_b_leg_sdp_version_by_index(&call_id, 0).unwrap();
+        assert_eq!(bv2, 2);
+        assert_eq!(b_sess_idx, b_sess);
+
+        // Unknown call / index → None.
+        assert!(store.reserve_leg_sdp_version("nope", true).is_none());
+        assert!(store.reserve_b_leg_sdp_version_by_index(&call_id, 99).is_none());
+    }
+
+    #[test]
+    fn set_leg_last_sdp_records_per_leg_raw_body() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        store.add_b_leg(&call_id, make_b_leg(0));
+        store.set_winner(&call_id, 0);
+
+        // Default: no SDP captured.
+        assert!(store.get_call(&call_id).unwrap().a_leg.last_sdp.is_none());
+
+        store.set_leg_last_sdp(&call_id, true, b"v=0\r\no=alice 1 1 IN IP4 192.0.2.1\r\n");
+        store.set_leg_last_sdp(&call_id, false, b"v=0\r\no=bob 2 2 IN IP4 192.0.2.2\r\n");
+        let call = store.get_call(&call_id).unwrap();
+        assert_eq!(
+            call.a_leg.last_sdp.as_deref(),
+            Some(&b"v=0\r\no=alice 1 1 IN IP4 192.0.2.1\r\n"[..])
+        );
+        assert_eq!(
+            call.b_legs[0].last_sdp.as_deref(),
+            Some(&b"v=0\r\no=bob 2 2 IN IP4 192.0.2.2\r\n"[..])
+        );
+
+        // Empty SDP is a no-op (does not clobber a stored body).
+        store.set_leg_last_sdp(&call_id, true, b"");
+        assert!(store.get_call(&call_id).unwrap().a_leg.last_sdp.is_some());
+    }
+
+    #[test]
+    fn leg_stored_request_from_to_default_none_and_round_trip() {
+        // Both constructors leave the verbatim request From/To capture empty —
+        // only the transparent REFER/NOTIFY pseudo-legs populate it (RFC 3261
+        // §8.2.6.2 verbatim echo). A leg that never captures them keeps the
+        // dialog-reconstruction fallback.
+        let mut a_leg = make_a_leg();
+        assert_eq!(a_leg.stored_from, None);
+        assert_eq!(a_leg.stored_to, None);
+        let mut b_leg = make_b_leg(1);
+        assert_eq!(b_leg.stored_from, None);
+        assert_eq!(b_leg.stored_to, None);
+
+        a_leg.stored_from = Some("<sip:bob@192.0.2.52>;tag=abc".to_string());
+        a_leg.stored_to = Some("<sip:alice@192.0.2.50>;tag=xyz".to_string());
+        assert_eq!(
+            a_leg.stored_from.as_deref(),
+            Some("<sip:bob@192.0.2.52>;tag=abc")
+        );
+        assert_eq!(
+            a_leg.stored_to.as_deref(),
+            Some("<sip:alice@192.0.2.50>;tag=xyz")
+        );
+        // A clone preserves the capture (the dispatcher clones legs when
+        // snapshotting the call actor before relaying a response).
+        b_leg.stored_from = a_leg.stored_from.clone();
+        assert_eq!(b_leg.clone().stored_from, a_leg.stored_from);
     }
 
     #[test]

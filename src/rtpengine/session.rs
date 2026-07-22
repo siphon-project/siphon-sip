@@ -7,8 +7,16 @@ use dashmap::DashMap;
 /// An active RTPEngine media session associated with a SIP dialog.
 #[derive(Debug, Clone)]
 pub struct MediaSession {
-    /// SIP Call-ID header value.
+    /// SIP Call-ID header value. This is the **store key** — the dispatcher
+    /// looks sessions up by the A-leg's SIP Call-ID.
     pub call_id: String,
+    /// The opaque call-id used in rtpengine NG commands (`offer`/`answer`/
+    /// `delete`). Normally equal to [`MediaSession::call_id`], but decoupled so
+    /// a siphon-terminated transfer can re-anchor the surviving pair on a
+    /// **fresh** rtpengine call-id while the store key stays the (post-promotion)
+    /// SIP Call-ID that later re-INVITEs/teardown look up. Use
+    /// [`MediaSession::rtpengine_id`] rather than reading this directly.
+    pub rtpengine_call_id: String,
     /// SIP From-tag (A leg).
     pub from_tag: String,
     /// SIP To-tag (B leg) — set after the answer.
@@ -17,6 +25,20 @@ pub struct MediaSession {
     pub profile: String,
     /// When this session was created.
     pub created_at: Instant,
+}
+
+impl MediaSession {
+    /// The call-id to address rtpengine with. Falls back to the SIP `call_id`
+    /// when `rtpengine_call_id` was left empty (back-compat for sessions created
+    /// before the decoupling), so all existing anchored calls talk to rtpengine
+    /// on their SIP Call-ID exactly as before.
+    pub fn rtpengine_id(&self) -> &str {
+        if self.rtpengine_call_id.is_empty() {
+            &self.call_id
+        } else {
+            &self.rtpengine_call_id
+        }
+    }
 }
 
 /// Thread-safe store of active media sessions, keyed by SIP Call-ID.
@@ -89,6 +111,7 @@ mod tests {
     fn make_session(call_id: &str) -> MediaSession {
         MediaSession {
             call_id: call_id.to_string(),
+            rtpengine_call_id: call_id.to_string(),
             from_tag: "tag-a".to_string(),
             to_tag: None,
             profile: "srtp_to_rtp".to_string(),
@@ -199,5 +222,22 @@ mod tests {
     fn default_trait() {
         let store = MediaSessionStore::default();
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn rtpengine_id_uses_field_then_falls_back_to_call_id() {
+        // Normal session: rtpengine_call_id == call_id → both agree.
+        let mut session = make_session("sip-cid");
+        assert_eq!(session.rtpengine_id(), "sip-cid");
+
+        // Decoupled (transfer re-anchor): store key stays the SIP Call-ID, but
+        // rtpengine is addressed on the fresh id.
+        session.rtpengine_call_id = "b2b-fresh-anchor".to_string();
+        assert_eq!(session.call_id, "sip-cid");
+        assert_eq!(session.rtpengine_id(), "b2b-fresh-anchor");
+
+        // Back-compat: an empty rtpengine_call_id falls back to the SIP Call-ID.
+        session.rtpengine_call_id = String::new();
+        assert_eq!(session.rtpengine_id(), "sip-cid");
     }
 }

@@ -104,6 +104,10 @@ run_sipp docker compose -f "$COMPOSE_FILE" run --rm sipp-register
 if [[ "$RUN_CALL" == true ]]; then
   echo "=== SIPp call test (UAC + UAS) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile call up --abort-on-container-exit sipp-uac sipp-uas
+
+  echo "=== Proxy REFER passthrough test (in-dialog REFER loose-routed, no loop) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile proxy-refer up --abort-on-container-exit --exit-code-from sipp-proxy-refer-uac sipp-proxy-refer-uac sipp-proxy-refer-uas
+  docker compose -f "$COMPOSE_FILE" --profile proxy-refer rm -sf sipp-proxy-refer-uac sipp-proxy-refer-uas sipp-proxy-refer-register 2>/dev/null || true
 fi
 
 # ── Step 6: Presence/event tests (optional) ─────────────────────────────────
@@ -184,6 +188,23 @@ if [[ "$RUN_B2BUA" == true ]]; then
   echo "=== B2BUA UPDATE test (RFC 3311 in-dialog UPDATE bridging) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-update up --abort-on-container-exit --exit-code-from sipp-b2bua-update-uac sipp-b2bua-update-uac sipp-b2bua-update-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-update rm -sf sipp-b2bua-update-uac sipp-b2bua-update-uas 2>/dev/null || true
+
+  echo "=== B2BUA REFER test (RFC 3515 transparent blind transfer) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-refer up --abort-on-container-exit --exit-code-from sipp-b2bua-refer-uac sipp-b2bua-refer-uac sipp-b2bua-refer-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-refer rm -sf sipp-b2bua-refer-uac sipp-b2bua-refer-uas 2>/dev/null || true
+
+  echo "=== B2BUA REFER reject test (loop-safe 603 default, no egress) ==="
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-refer-reject up -d --wait siphon-b2bua-refer-modes
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-refer-reject up --abort-on-container-exit --exit-code-from sipp-b2bua-refer-reject-uac sipp-b2bua-refer-reject-uac sipp-b2bua-refer-reject-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-refer-reject rm -sf sipp-b2bua-refer-reject-uac sipp-b2bua-refer-reject-uas 2>/dev/null || true
+
+  echo "=== B2BUA REFER siphon-terminated test (dial target + promote + BYE) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-refer-terminate up --abort-on-container-exit --exit-code-from sipp-b2bua-refer-terminate-uac sipp-b2bua-refer-terminate-uac sipp-b2bua-refer-terminate-bob-uas sipp-b2bua-refer-terminate-carol-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-refer-terminate down 2>/dev/null || true
+
+  echo "=== B2BUA REFER terminate + REAL rtpengine (media re-anchor: offer/answer/delete) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-rtpengine-refer up --abort-on-container-exit --exit-code-from sipp-anchored-refer-uac sipp-anchored-refer-uac sipp-anchored-refer-bob-uas sipp-anchored-refer-carol-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-rtpengine-refer down 2>/dev/null || true
 
   echo "=== B2BUA CANCEL test (INVITE → CANCEL → 487) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-cancel up --abort-on-container-exit --exit-code-from sipp-b2bua-cancel-uac sipp-b2bua-cancel-uac sipp-b2bua-cancel-uas

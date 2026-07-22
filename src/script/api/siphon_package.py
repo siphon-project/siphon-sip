@@ -191,6 +191,38 @@ class _B2buaNamespace:
             return False
         return control.terminate(call_id, reason)
 
+    def refer(self, call_id, target, replaces=None):
+        """Imperatively send an outbound REFER on a live B2BUA call by SIP Call-ID.
+
+        Refers the A-leg (the caller / IVR-connected party) to ``target``.
+        ``replaces`` is an attended-transfer Replaces dict (keys ``call_id`` /
+        ``from_tag`` / ``to_tag``, optional ``early_only``) or ``None`` for a
+        blind transfer. Like ``b2bua.terminate``, this acts now and works from an
+        out-of-band event callback (``@rtpengine.on_dtmf``), a timer, or a normal
+        handler — where the deferred ``call.refer()`` is a silent no-op.
+
+        Args:
+            call_id: the SIP Call-ID of the call to transfer.
+            target: the Refer-To URI the connected party should contact.
+            replaces: attended-transfer Replaces dict, or None for a blind
+                transfer.
+
+        Returns:
+            bool: True if a matching call was found and the REFER emitted, False
+            if the Call-ID is unknown / already gone. Never raises (except on a
+            malformed ``replaces`` dict).
+
+        Usage:
+            @rtpengine.on_dtmf
+            def on_ivr_dtmf(call_id, from_tag, digit, duration_ms, volume):
+                if digit == "1":
+                    b2bua.refer(call_id, "sip:+15550142@example.com")
+        """
+        control = object.__getattribute__(self, "__dict__").get("_control")
+        if control is None:
+            return False
+        return control.refer(call_id, target, replaces)
+
     @staticmethod
     def on_invite(fn):
         """Register handler for new INVITE (new call)."""
