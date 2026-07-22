@@ -81,6 +81,19 @@ pub struct SiphonMetrics {
     /// `cdr_sessions` store. Zero when `cdr.auto_emit` is off.
     pub cdr_sessions: IntGauge,
 
+    /// Live Rf offline-charging accounting sessions (ACR-START without a
+    /// matching ACR-STOP). Returns to ~0 when calls are idle; a monotonic climb
+    /// under a steady, completed-call workload means an ACR-STOP hook (or the
+    /// interim-timer max-lifetime backstop) isn't draining the session table.
+    /// Zero when `rf.enabled` is off.
+    pub rf_sessions: IntGauge,
+
+    /// Live Ro online-charging sessions (CCR-INITIAL without a matching
+    /// CCR-TERMINATION). A monotonic climb under a steady, completed-call
+    /// workload means a call teardown hook isn't draining the credit sessions.
+    /// Zero when `ro.enabled` is off.
+    pub ro_sessions: IntGauge,
+
     /// Live SUBSCRIBE dialogs in the L1 `subscribe_state` store.  A monotonic
     /// climb under a steady subscribe/expire workload means expired dialogs
     /// are leaking (L1 has no TTL; the sweep reaps them).
@@ -274,6 +287,16 @@ impl SiphonMetrics {
         let cdr_sessions = IntGauge::new(
             "siphon_cdr_sessions",
             "Live cdr.auto_emit per-call tracking entries (INVITE to BYE)",
+        )?;
+
+        let rf_sessions = IntGauge::new(
+            "siphon_rf_sessions",
+            "Live Rf accounting sessions (ACR-START without a matching ACR-STOP)",
+        )?;
+
+        let ro_sessions = IntGauge::new(
+            "siphon_ro_sessions",
+            "Live Ro online-charging sessions (CCR-INITIAL without CCR-TERMINATION)",
         )?;
 
         let subscribe_dialogs = IntGauge::new(
@@ -517,6 +540,8 @@ impl SiphonMetrics {
         registry.register(Box::new(uac_pending_requests.clone()))?;
         registry.register(Box::new(proxy_dialog_sessions.clone()))?;
         registry.register(Box::new(cdr_sessions.clone()))?;
+        registry.register(Box::new(rf_sessions.clone()))?;
+        registry.register(Box::new(ro_sessions.clone()))?;
         registry.register(Box::new(subscribe_dialogs.clone()))?;
         registry.register(Box::new(ipsec_sa_pairs.clone()))?;
         registry.register(Box::new(registrations_active.clone()))?;
@@ -572,6 +597,8 @@ impl SiphonMetrics {
             uac_pending_requests,
             proxy_dialog_sessions,
             cdr_sessions,
+            rf_sessions,
+            ro_sessions,
             subscribe_dialogs,
             ipsec_sa_pairs,
             registrations_active,

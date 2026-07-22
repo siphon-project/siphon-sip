@@ -729,6 +729,63 @@ impl PyCall {
         &self.id
     }
 
+    /// Reserve prepaid credit (Ro CCR-INITIAL) for this call BEFORE dialing the
+    /// B-leg — the reserve-before-connect gate. Call it from `@b2bua.on_invite`
+    /// and branch on the result:
+    ///
+    /// ```python
+    /// @b2bua.on_invite
+    /// async def on_invite(call):
+    ///     decision = await call.ro_authorize()
+    ///     if not decision["authorized"]:
+    ///         call.reject(402, "Payment Required")   # no B-leg is dialed
+    ///         return
+    ///     call.dial("sip:bob@carrier")               # credit reserved -> connect
+    /// ```
+    ///
+    /// On a grant siphon opens the credit-control session, runs the re-auth loop
+    /// (CCR-UPDATE on the OCS-granted cadence), disconnects the call mid-stream
+    /// if the OCS later refuses credit, and sends CCR-TERMINATION on BYE — all
+    /// autonomously. `subscription_id` overrides the charged identity; when
+    /// omitted, the party is derived from the `ro.charge` config (orig = caller,
+    /// term = callee) and a `sip:` URI is typed as a SIP URI, never mislabeled
+    /// as an E.164 number. The rating group, requested quota and Service-Context
+    /// come from the `ro:` config block.
+    ///
+    /// Returns a dict `{"authorized": bool, "result_code": int|None,
+    /// "granted_time": int|None, "session_id": str|None}`. When Ro is not
+    /// configured the gate is a no-op that authorizes (uncharged).
+    #[pyo3(signature = (*, subscription_id=None, subscription_id_type=None))]
+    fn ro_authorize<'py>(
+        &self,
+        python: Python<'py>,
+        subscription_id: Option<String>,
+        subscription_id_type: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let invite = match self.message.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let internal_call_id = self.id.clone();
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            let outcome = crate::dispatcher::ro_authorize_b2bua(
+                internal_call_id,
+                invite,
+                subscription_id,
+                subscription_id_type,
+            )
+            .await;
+            Python::attach(|py| {
+                let dict = pyo3::types::PyDict::new(py);
+                dict.set_item("authorized", outcome.authorized)?;
+                dict.set_item("result_code", outcome.result_code)?;
+                dict.set_item("granted_time", outcome.granted_time)?;
+                dict.set_item("session_id", outcome.session_id)?;
+                Ok(dict.into_any().unbind())
+            })
+        })
+    }
+
     /// Call state: "calling", "ringing", "answered", "terminated".
     #[getter]
     fn state(&self) -> &str {

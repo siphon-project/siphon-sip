@@ -7,37 +7,30 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
-- **Dashboard charts now have a scale and hover history** (experimental web UI).
-  Each sparkline draws its actual y-axis min/max on-chart, and hovering any point
-  shows a tooltip with the exact value and how long ago it was sampled, so a dip
-  reads as a real number instead of an unlabelled wiggle. Memory is shown to one
-  decimal (MB) so a sub-MB change tracks the line instead of looking frozen.
-- **Overview flags gateway trouble at a glance** — a "Gateway groups" line in the
-  Connections & health block shows how many groups have an unhealthy destination
-  (green when all healthy, amber with a count when not), click-through to the
-  Gateways view. Backed by a new `gateways` summary in `GET /admin/metrics.json`.
-- **Gateways view shows missed health-checks** — a destination that has failed
-  consecutive probes shows an `n/threshold missed` badge (amber while still up as
-  an early warning, red once down). `GET /admin/gateways` destinations gain
-  `checks_missed` and each group gains `failure_threshold`.
-
-### Changed
-- **Calls view shows both the caller and the dialed callee.** Previously it showed
-  the A-leg From (which is actually the dialed identity, not the caller) and the
-  B-leg target, so a bridged call looked like it only had one side. `GET /admin/calls`
-  now returns `a_party` (caller) and `b_party` (dialed callee) in place of
-  `from`/`to`, and the B-leg count excludes the re-INVITE/UPDATE response-tracking
-  pseudo-legs, so a plain call that re-INVITEd no longer reports two B-legs.
-
-### Fixed
-- **in-dialog REFER on a tracked B2BUA call no longer proxy-relays and can no
-  longer loop.** a REFER arriving inside a bridged B2BUA dialog used to fall
-  through to the proxy relay path, which could bounce it back through the same
-  B2BUA and loop. it is now intercepted at the B2BUA and dispatched to
-  `@b2bua.on_refer`. with no `@b2bua.on_refer` handler registered siphon rejects
-  it locally with `603 Decline` and relays nothing (loop-safe default).
-
-### Added
+- **Diameter Ro online charging (prepaid), reserve-before-connect.** A B2BUA
+  reserves credit with a Credit-Control CCR-INITIAL in `@b2bua.on_invite` via
+  `await call.ro_authorize()` BEFORE the B-leg is dialed: a grant dials, a denial
+  rejects (402) and no B-leg is ever created (no call unless the OCS allows it).
+  After the grant siphon runs the SCUR lifecycle itself — CCR-UPDATE on the
+  OCS-granted cadence, mid-call disconnect on `4012 CREDIT_LIMIT_REACHED` /
+  Final-Unit-Indication, CCR-TERMINATION on BYE (and a zero-usage release on
+  pre-answer failure/CANCEL). Configured via a new `ro:` block
+  (`reauth_interval_secs`, `requested_seconds`, `service_context_id`, `charge`,
+  `on_ocs_failure`, `rating_group`, ...). Voice is SCUR; SMS/RCS is one-shot IEC
+  (`diameter.ro_ccr_event`, `Requested-Action = DIRECT_DEBITING`). `4011
+  CREDIT_CONTROL_NOT_APPLICABLE` lets a call run free of charge. B2BUA-only:
+  mid-call teardown needs session ownership, which is why 3GPP triggers Ro at the
+  AS/MMTel-AS, not the P-CSCF. Interoperates with CGRateS. New cookbook
+  `docs/cookbook/online-charging-ocs.md` + example `scripts/b2bua_ro_charging.py`.
+- **The Ro credit-control scripting methods are now async** (`await`-able):
+  `diameter.ro_ccr_initial` / `ro_ccr_update` / `ro_ccr_terminate` / `ro_ccr_event`
+  and `call.ro_authorize()` return coroutines, so a slow OCS round-trip runs off
+  the Python driver thread instead of blocking it. Mirrored in the `siphon-sip`
+  SDK mock (`set_ro_result_code` / `set_ro_granted_time` / `captured_ccrs`).
+- **`siphon_rf_sessions` / `siphon_ro_sessions` metrics** — gauges of live Rf
+  accounting and Ro credit-control sessions (START/INITIAL without a matching
+  STOP/TERMINATION); a monotonic climb under a steady, completed-call workload
+  flags a charging-session leak.
 - **B2BUA call transfer (REFER, RFC 3515 / 3891 / 5589) with three modes.**
   `@b2bua.on_refer(call)` handles an in-dialog REFER on a tracked call (single
   arg, no reply object, REFER is a request). read the target off `call.refer_to`
@@ -62,8 +55,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   proxy mode an in-dialog REFER is loose-routed to the far end (record-route
   required) and its `202` + sipfrag NOTIFYs relay straight back, so the transfer
   runs endpoint-to-endpoint with no siphon-side state. no code change (the generic
-  in-dialog branch already handled it); the loop fix above is B2BUA-only.
-
+  in-dialog branch already handled it); the loop fix below is B2BUA-only.
 - **terminate-mode transfer now re-anchors media correctly.** the transfer target
   is offered the **surviving** party's media (not the referrer's, who is being
   dropped), and the survivor is re-INVITEd with the target's answer, so RTP is
@@ -77,8 +69,65 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   session identity, so a strict RFC 3264 §8 answerer re-negotiates cleanly rather
   than reading a changed offer as unchanged. previously the peer's `o=` was passed
   through with only the username masked.
+- **Dashboard charts now have a scale and hover history** (experimental web UI).
+  Each sparkline draws its actual y-axis min/max on-chart, and hovering any point
+  shows a tooltip with the exact value and how long ago it was sampled, so a dip
+  reads as a real number instead of an unlabelled wiggle. Memory is shown to one
+  decimal (MB) so a sub-MB change tracks the line instead of looking frozen.
+- **Overview flags gateway trouble at a glance** — a "Gateway groups" line in the
+  Connections & health block shows how many groups have an unhealthy destination
+  (green when all healthy, amber with a count when not), click-through to the
+  Gateways view. Backed by a new `gateways` summary in `GET /admin/metrics.json`.
+- **Gateways view shows missed health-checks** — a destination that has failed
+  consecutive probes shows an `n/threshold missed` badge (amber while still up as
+  an early warning, red once down). `GET /admin/gateways` destinations gain
+  `checks_missed` and each group gains `failure_threshold`.
+
+### Changed
+- **Calls view shows both the caller and the dialed callee.** Previously it showed
+  the A-leg From (which is actually the dialed identity, not the caller) and the
+  B-leg target, so a bridged call looked like it only had one side. `GET /admin/calls`
+  now returns `a_party` (caller) and `b_party` (dialed callee) in place of
+  `from`/`to`, and the B-leg count excludes the re-INVITE/UPDATE response-tracking
+  pseudo-legs, so a plain call that re-INVITEd no longer reports two B-legs.
 
 ### Fixed
+- **Diameter Session-Id uniqueness under concurrency** — `new_session_id` read
+  the Hop-by-Hop/End-to-End counters without reserving them, so two requests
+  built concurrently could mint the *same* Session-Id, collapsing two accounting
+  or credit-control sessions into one at the CDF/OCS (cross-charging; one STOP
+  ending both). Session-Ids now come from a dedicated atomic sequence with a
+  wall-clock-seeded high part (RFC 6733 §8.8). Affects Rf and Ro.
+- **Diameter charging AVP codes corrected to RFC 8506 / IANA** — the
+  Credit-Control (Ro/Gy) AVP dictionary used a self-consistent but non-standard
+  numbering (e.g. Granted-Service-Unit, CC-Time, CC-Total-Octets, Final-Unit-*,
+  Rating-Group and Multiple-Services-Credit-Control were all on the wrong codes,
+  MSCC even under the 3GPP vendor namespace). They now match the on-the-wire
+  values a real OCS expects, so Ro requests interoperate instead of being
+  rejected/misparsed. A known-answer test pins every code to the registry.
+  **Wire-affecting** for anyone already driving Ro/Gy from scripts.
+- **Diameter offline-charging (Rf) SMS AVP codes** — SMS-Result (was 3408 =
+  SM-Sequence-Number, now 3409) and MTC-IWF-Address (was 3413, now 3406) are
+  emitted on the correct codes, so a CDF parses the SMS record fields instead of
+  mislabeling them.
+- **CER application advertisement** — the Rf accounting application (id 3) was
+  advertised as an `Auth-Application-Id` inside a `Vendor-Specific-Application-Id`
+  with `Vendor-Id: 0`, two RFC 6733 violations that make strict peers
+  (go-diameter/CGRateS) answer `DIAMETER_NO_COMMON_APPLICATION`. Accounting apps
+  are now advertised via `Acct-Application-Id`, and base (vendor-0) apps are no
+  longer wrapped in a VSAI.
+- **Rf accounting hardening** — IMS-Information and SMS-Information now nest under
+  a single `Service-Information` (TS 32.299 §7.2.87 allows only one, was two);
+  the non-conformant `User-Session-Id` directly under `Service-Information` is
+  dropped; a rejected ACR-START no longer opens a local session or INTERIM timer;
+  an explicit `Acct-Interim-Interval: 0` from the CDF is honored; and an
+  abandoned session (no ACR-STOP) is released by a max-lifetime backstop.
+- **in-dialog REFER on a tracked B2BUA call no longer proxy-relays and can no
+  longer loop.** a REFER arriving inside a bridged B2BUA dialog used to fall
+  through to the proxy relay path, which could bounce it back through the same
+  B2BUA and loop. it is now intercepted at the B2BUA and dispatched to
+  `@b2bua.on_refer`. with no `@b2bua.on_refer` handler registered siphon rejects
+  it locally with `603 Decline` and relays nothing (loop-safe default).
 - **B2BUA rtpengine session cleanup on a B-leg-originated BYE.** the media-session
   safety-net delete keyed on the incoming BYE's Call-ID, which is not the store
   key (the A-leg Call-ID) when the BYE comes from the callee (or from the

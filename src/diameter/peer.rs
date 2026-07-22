@@ -106,6 +106,14 @@ pub struct IncomingRequest {
 }
 
 /// Handle to a connected Diameter peer.
+/// Wall-clock-seeded high bits for Session-Id uniqueness across restarts.
+fn session_high_seed() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0)
+}
+
 pub struct DiameterPeer {
     config: PeerConfig,
     /// Channel to send outgoing messages to the writer task
@@ -115,6 +123,13 @@ pub struct DiameterPeer {
     /// Monotonic HbH and E2E ID generators
     hbh_counter: Arc<AtomicU32>,
     e2e_counter: Arc<AtomicU32>,
+    /// Dedicated monotonic Session-Id sequence (RFC 6733 §8.8 low bits). Atomic
+    /// so two concurrent `new_session_id()` calls never mint the same id — a
+    /// collision would collapse two credit-control sessions into one at the OCS.
+    session_counter: Arc<AtomicU32>,
+    /// Session-Id high bits, seeded once from wall-clock at construction so ids
+    /// stay unique across process restarts.
+    session_high: u32,
     /// Connection lifecycle state (see [`PeerState`]).
     state: Arc<AtomicU8>,
     /// Shutdown signal
@@ -132,11 +147,13 @@ impl DiameterPeer {
         self.e2e_counter.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Generate a session ID: "{origin_host};{high32};{low32}"
+    /// Generate a globally-unique Session-Id "{origin_host};{high32};{low32}"
+    /// (RFC 6733 §8.8). The low bits come from a dedicated atomic counter so
+    /// concurrent callers cannot collide; the high bits are wall-clock-seeded
+    /// so ids don't repeat across restarts.
     pub fn new_session_id(&self) -> String {
-        let hi = self.hbh_counter.load(Ordering::Relaxed);
-        let lo = self.e2e_counter.load(Ordering::Relaxed);
-        format!("{};{};{}", self.config.origin_host, hi, lo)
+        let low = self.session_counter.fetch_add(1, Ordering::Relaxed);
+        format!("{};{};{}", self.config.origin_host, self.session_high, low)
     }
 
     /// Get the peer config (for building messages with origin/dest fields).
@@ -234,6 +251,8 @@ impl DiameterPeer {
             pending: Arc::new(Mutex::new(HashMap::new())),
             hbh_counter: Arc::new(AtomicU32::new(1)),
             e2e_counter: Arc::new(AtomicU32::new(1)),
+            session_counter: Arc::new(AtomicU32::new(1)),
+            session_high: session_high_seed(),
             state: Arc::new(AtomicU8::new(PeerState::Open.as_u8())),
             shutdown: Arc::new(Notify::new()),
         }
@@ -247,6 +266,29 @@ impl DiameterPeer {
 }
 
 /// Build a CER (Capabilities-Exchange-Request) message.
+/// Advertise supported applications in a CER/CEA (RFC 6733 §5.3).
+///
+/// Each entry is `(vendor_id, app_id)`. Correctness rules the prior code
+/// violated:
+///   * A `Vendor-Specific-Application-Id` is emitted only for a **non-zero**
+///     Vendor-Id (§6.11) — wrapping a base app (Rf id 3, Ro id 4) in a
+///     `VSAI{Vendor-Id: 0}` is malformed.
+///   * An **accounting** application (Rf, id 3) is advertised via
+///     `Acct-Application-Id (259)`, not `Auth-Application-Id (258)` — otherwise
+///     a strict peer answers `DIAMETER_NO_COMMON_APPLICATION` (§2.4 / §6.9).
+fn encode_application_ids(avps: &mut Vec<u8>, application_ids: &[(u32, u32)]) {
+    for &(vendor_id, app_id) in application_ids {
+        if vendor_id != 0 {
+            avps.extend_from_slice(&encode_vendor_specific_app_id(vendor_id, app_id));
+        }
+        if dictionary::is_accounting_application(app_id) {
+            avps.extend_from_slice(&encode_avp_u32(avp::ACCT_APPLICATION_ID, app_id));
+        } else {
+            avps.extend_from_slice(&encode_avp_u32(avp::AUTH_APPLICATION_ID, app_id));
+        }
+    }
+}
+
 pub fn build_cer(config: &PeerConfig, hbh: u32, e2e: u32) -> Vec<u8> {
     let mut avps = Vec::new();
 
@@ -258,10 +300,7 @@ pub fn build_cer(config: &PeerConfig, hbh: u32, e2e: u32) -> Vec<u8> {
     avps.extend_from_slice(&encode_avp_u32(avp::FIRMWARE_REVISION, config.firmware_revision));
     avps.extend_from_slice(&encode_avp_u32(avp::SUPPORTED_VENDOR_ID, dictionary::VENDOR_3GPP));
 
-    for &(vendor_id, auth_app_id) in &config.application_ids {
-        avps.extend_from_slice(&encode_vendor_specific_app_id(vendor_id, auth_app_id));
-        avps.extend_from_slice(&encode_avp_u32(avp::AUTH_APPLICATION_ID, auth_app_id));
-    }
+    encode_application_ids(&mut avps, &config.application_ids);
 
     encode_diameter_message(
         FLAG_REQUEST,
@@ -286,10 +325,7 @@ pub fn build_cea(config: &PeerConfig, result_code: u32, hbh: u32, e2e: u32) -> V
     avps.extend_from_slice(&encode_avp_u32(avp::FIRMWARE_REVISION, config.firmware_revision));
     avps.extend_from_slice(&encode_avp_u32(avp::SUPPORTED_VENDOR_ID, dictionary::VENDOR_3GPP));
 
-    for &(vendor_id, auth_app_id) in &config.application_ids {
-        avps.extend_from_slice(&encode_vendor_specific_app_id(vendor_id, auth_app_id));
-        avps.extend_from_slice(&encode_avp_u32(avp::AUTH_APPLICATION_ID, auth_app_id));
-    }
+    encode_application_ids(&mut avps, &config.application_ids);
 
     encode_diameter_message(
         0, // Answer: no R flag
@@ -384,6 +420,8 @@ where
         pending: pending.clone(),
         hbh_counter: hbh_counter.clone(),
         e2e_counter: e2e_counter.clone(),
+        session_counter: Arc::new(AtomicU32::new(1)),
+        session_high: session_high_seed(),
         state: state.clone(),
         shutdown: shutdown.clone(),
     });
@@ -737,6 +775,63 @@ mod tests {
             decoded.avps.get("Product-Name").and_then(|v| v.as_str()),
             Some("SIPhon")
         );
+    }
+
+    #[test]
+    fn cer_advertises_acct_app_for_rf_and_skips_vendor0_vsai() {
+        // A peer speaking Rf (acct app 3, vendor 0), Ro (auth app 4, vendor 0)
+        // and Cx (auth, vendor 10415). RFC 6733 §2.4/§6.9/§6.11 require: the
+        // accounting app advertised via Acct-Application-Id (259), the base apps
+        // advertised via the bare app-id AVP (never a VSAI with Vendor-Id 0),
+        // and no Auth-Application-Id carrying the accounting app id.
+        let config = PeerConfig {
+            host: "cdf.example.com".to_string(),
+            port: 3868,
+            origin_host: "siphon.example.com".to_string(),
+            origin_realm: "example.com".to_string(),
+            destination_host: None,
+            destination_realm: "example.com".to_string(),
+            local_ip: "10.0.0.1".parse().unwrap(),
+            application_ids: vec![
+                (0, dictionary::RF_APP_ID),
+                (0, dictionary::RO_APP_ID),
+                (dictionary::VENDOR_3GPP, dictionary::CX_APP_ID),
+            ],
+            watchdog_interval: 3600,
+            reconnect_delay: 5,
+            product_name: "SIPhon".to_string(),
+            firmware_revision: 1,
+        };
+
+        let cer = build_cer(&config, 1, 1);
+        let tree = codec::DiameterMsg::from_wire(&cer).expect("decode CER");
+
+        let acct: Vec<u32> = tree
+            .find_all(avp::ACCT_APPLICATION_ID, 0)
+            .filter_map(|a| a.as_u32())
+            .collect();
+        assert!(
+            acct.contains(&dictionary::RF_APP_ID),
+            "Rf must be advertised as Acct-Application-Id, got {acct:?}"
+        );
+
+        let auth: Vec<u32> = tree
+            .find_all(avp::AUTH_APPLICATION_ID, 0)
+            .filter_map(|a| a.as_u32())
+            .collect();
+        assert!(
+            auth.contains(&dictionary::RO_APP_ID),
+            "Ro must be advertised as Auth-Application-Id, got {auth:?}"
+        );
+        assert!(
+            !auth.contains(&dictionary::RF_APP_ID),
+            "the accounting app id must NOT appear as an Auth-Application-Id"
+        );
+
+        // Only the vendor-10415 app produces a Vendor-Specific-Application-Id;
+        // the two base (vendor-0) apps must not be wrapped in one.
+        let vsai_count = tree.find_all(avp::VENDOR_SPECIFIC_APPLICATION_ID, 0).count();
+        assert_eq!(vsai_count, 1, "exactly one VSAI (the vendor-10415 Cx app)");
     }
 
     /// Build a throwaway `PeerConfig` for the loopback leak tests. The watchdog

@@ -231,6 +231,14 @@ struct DispatcherState {
     /// when `rf_charger` is `None` so the auto-emit hot path branches
     /// out cheaply.
     rf_sessions: Arc<DashMap<String, Arc<ProxyRfState>>>,
+    /// Ro online-charging service (RFC 8506 / TS 32.299) — `None` when `ro:`
+    /// is unset/disabled or no Diameter peers are configured.
+    ro_charger: Option<Arc<crate::diameter::ro_service::RoChargingService>>,
+    /// Live per-call Ro credit sessions, keyed `b2bua:<internal-call-id>`, so
+    /// the BYE handler can send CCR-TERMINATION. Empty when `ro_charger` is
+    /// `None`; the mid-call teardown is driven Rust-side by the session's own
+    /// re-auth timer, not from here.
+    ro_sessions: Arc<DashMap<String, crate::diameter::ro_service::CcCreditSession>>,
     /// Per-call CDR tracking for `cdr.auto_emit` (INVITE → answer → BYE).
     ///
     /// Keyed by the SIP dialog (`<Call-ID>\0<tag>`) for proxy calls and by the
@@ -460,6 +468,7 @@ pub async fn run(
     )>,
     rtpengine_events_rx: tokio::sync::mpsc::Receiver<crate::rtpengine::events::RtpEngineEvent>,
     rf_charger: Option<Arc<crate::diameter::rf_service::RfChargingService>>,
+    ro_charger: Option<Arc<crate::diameter::ro_service::RoChargingService>>,
     drain: Arc<DrainState>,
     product_name: &'static str,
     product_version: &'static str,
@@ -627,6 +636,8 @@ pub async fn run(
         is_draining: drain.clone(),
         rf_charger,
         rf_sessions: Arc::new(DashMap::new()),
+        ro_charger,
+        ro_sessions: Arc::new(DashMap::new()),
         cdr_sessions: Arc::new(DashMap::new()),
     });
 
@@ -642,6 +653,26 @@ pub async fn run(
         state: Arc::clone(&state),
         runtime: tokio::runtime::Handle::current(),
     });
+
+    // Install the Ro teardown hook so a session's Rust-side re-auth timer can
+    // disconnect a live call when the OCS refuses further credit. Ro enforcement
+    // is B2BUA-only, so this always tears down a tracked B2BUA call. Pass the
+    // reason as PLAIN TEXT — `b2bua_terminate_call` wraps it into a well-formed
+    // `Reason: Q.850;cause=16;text="…"` header (pre-formatting it here would
+    // nest a Q.850 string inside the text= parameter).
+    if let Some(ro) = state.ro_charger.as_ref() {
+        ro.set_teardown_hook(Arc::new(|sip_call_id, reason| {
+            b2bua_terminate_call(sip_call_id, Some(reason));
+        }));
+        // Publish the Ro authorizer so the `call.ro_authorize()` scripting gate
+        // can reserve credit (CCR-INITIAL) before dialing the B-leg and store the
+        // session where BYE / teardown / failure paths find it.
+        let _ = RO_CONTROL.set(RoControlHandle {
+            charger: Arc::clone(ro),
+            ro_sessions: Arc::clone(&state.ro_sessions),
+            local_domains: Arc::clone(&state.local_domains),
+        });
+    }
 
     // Install the rf_sessions lookup so the CDR Python API can
     // auto-stamp `rf_session_id` / `rf_result_code` on every CDR
@@ -7530,6 +7561,161 @@ fn spawn_rf_proxy_stop_if_tracked(state: &DispatcherState, bye: &SipMessage) {
 /// answered.  No-op when `rf_charger` is unset or auto-emit disabled.
 /// Stores the resulting [`ProxyRfState`] in `state.rf_sessions` keyed
 /// by `b2bua:<internal_call_id>` so the BYE handler can find it.
+/// Format the B2BUA Ro-session key from the internal call UUID.
+fn ro_b2bua_key(internal_call_id: &str) -> String {
+    format!("ro-b2bua:{internal_call_id}")
+}
+
+/// Outcome of a script `call.ro_authorize()` gate — returned to Python as a
+/// dict `{authorized, result_code, granted_time, session_id}`.
+pub struct RoAuthorizeOutcome {
+    pub authorized: bool,
+    pub result_code: Option<u32>,
+    pub granted_time: Option<u32>,
+    pub session_id: Option<String>,
+}
+
+/// Global handle the `call.ro_authorize()` scripting gate reaches to reserve
+/// credit before dialing the B-leg. Bundles the charger + the dispatcher's
+/// session store so the reserved `CcCreditSession` lands where BYE / teardown /
+/// failure paths find it (`ro_b2bua_key(internal_call_id)`).
+struct RoControlHandle {
+    charger: Arc<crate::diameter::ro_service::RoChargingService>,
+    ro_sessions: Arc<DashMap<String, crate::diameter::ro_service::CcCreditSession>>,
+    local_domains: Arc<Vec<String>>,
+}
+
+static RO_CONTROL: std::sync::OnceLock<RoControlHandle> = std::sync::OnceLock::new();
+
+/// Reserve credit (CCR-INITIAL) for a B2BUA call from a `@b2bua.on_invite`
+/// script gate, BEFORE the B-leg is dialed. On grant the session is stored
+/// keyed by the call so its re-auth loop runs and BYE/teardown sends
+/// CCR-TERMINATION. Returns the grant/deny outcome for the script to branch on
+/// (grant → `call.dial()`, deny → `call.reject()`).
+///
+/// `subscription_id` overrides the charged identity; when `None`, the party is
+/// derived from `ro.charge` (orig = calling, term = called) off the INVITE.
+pub async fn ro_authorize_b2bua(
+    internal_call_id: String,
+    invite: SipMessage,
+    subscription_id: Option<String>,
+    subscription_id_type: Option<String>,
+) -> RoAuthorizeOutcome {
+    use crate::diameter::ro_service::ChargeDecision;
+    let deny = |code: Option<u32>| RoAuthorizeOutcome {
+        authorized: false,
+        result_code: code,
+        granted_time: None,
+        session_id: None,
+    };
+    let Some(control) = RO_CONTROL.get() else {
+        // Ro not configured — the gate is a no-op that authorizes (uncharged).
+        return RoAuthorizeOutcome {
+            authorized: true,
+            result_code: None,
+            granted_time: None,
+            session_id: None,
+        };
+    };
+    let charger = Arc::clone(&control.charger);
+
+    let local_predicate = rf_local_uri_predicate(&control.local_domains);
+    let mut ims_data = crate::diameter::rf_service::ims_data_from_request(
+        &invite,
+        charger.node_functionality(),
+        local_predicate,
+    );
+    ims_data.role_of_node = Some(crate::diameter::ro::NodeRole::B2buaRole);
+
+    let subscriber = match subscription_id {
+        Some(id) => build_ro_subscriber(&id, subscription_id_type.as_deref()),
+        None => {
+            let party = match charger.config().charge.as_str() {
+                "term" => ims_data.called_party.clone(),
+                _ => ims_data.calling_party.clone(),
+            };
+            let Some(party_uri) = party else {
+                warn!(call_id = %internal_call_id,
+                    "ro: ro_authorize skipped — no chargeable party on the INVITE");
+                return deny(None);
+            };
+            crate::diameter::ro::SubscriberId::sip_uri(&party_uri)
+        }
+    };
+
+    let sip_call_id = rf_extract_dialog_parts(&invite)
+        .map(|(call_id, _)| call_id)
+        .unwrap_or_else(|| internal_call_id.clone());
+
+    let decision = charger
+        .authorize_call(subscriber, ims_data, sip_call_id)
+        .await;
+    match decision {
+        ChargeDecision::Granted(Some(session)) => {
+            let outcome = RoAuthorizeOutcome {
+                authorized: true,
+                result_code: session.last_result_code(),
+                granted_time: Some(session.granted_time()),
+                session_id: Some(session.session_id().to_string()),
+            };
+            control
+                .ro_sessions
+                .insert(ro_b2bua_key(&internal_call_id), session);
+            outcome
+        }
+        // 4011 CREDIT_CONTROL_NOT_APPLICABLE / Ro disabled / fail-open: the call
+        // proceeds, unmonitored — no session to store.
+        ChargeDecision::Granted(None) | ChargeDecision::AllowUncharged => RoAuthorizeOutcome {
+            authorized: true,
+            result_code: None,
+            granted_time: None,
+            session_id: None,
+        },
+        ChargeDecision::Denied(code) => deny(Some(code)),
+    }
+}
+
+/// Build a `SubscriberId` from a script `(id, type)` pair, inferring a `sip:`/
+/// `tel:` URI when the type is omitted (never mislabels a SIP URI as E.164).
+fn build_ro_subscriber(
+    id: &str,
+    id_type: Option<&str>,
+) -> crate::diameter::ro::SubscriberId {
+    use crate::diameter::ro::SubscriberId;
+    match id_type.map(|s| s.to_ascii_lowercase()).as_deref() {
+        Some("e164") | Some("msisdn") => SubscriberId::msisdn(id),
+        Some("imsi") => SubscriberId::imsi(id),
+        Some("sip") | Some("sipuri") | Some("sip_uri") => SubscriberId::sip_uri(id),
+        _ => {
+            let lower = id.to_ascii_lowercase();
+            if lower.starts_with("sip:") || lower.starts_with("sips:") || lower.starts_with("tel:")
+            {
+                SubscriberId::sip_uri(id)
+            } else {
+                SubscriberId::msisdn(id)
+            }
+        }
+    }
+}
+
+/// Send CCR-TERMINATION for a B2BUA call's Ro session on BYE / teardown.
+fn spawn_ro_b2bua_stop(state: &DispatcherState, internal_call_id: &str) {
+    if state.ro_charger.is_none() {
+        return;
+    }
+    let charger = match state.ro_charger.as_ref() {
+        Some(c) => Arc::clone(c),
+        None => return,
+    };
+    let key = ro_b2bua_key(internal_call_id);
+    let Some((_, session)) = state.ro_sessions.remove(&key) else {
+        return;
+    };
+    tokio::spawn(async move {
+        charger.terminate_call(&session).await;
+    });
+}
+
 fn spawn_rf_b2bua_start(
     state: &DispatcherState,
     internal_call_id: &str,
@@ -8504,6 +8690,11 @@ fn handle_b2bua_cancel(
 
     // CDR: the caller CANCELled before answer (cdr.auto_emit) → 487.
     cdr_finalize_b2bua_fail(state, &call_id, 487);
+
+    // Release any Ro reservation made by `call.ro_authorize()` — a
+    // cancelled-before-answer call held a reservation with no BYE to close it
+    // (CCR-TERMINATION reports ~0 usage).
+    spawn_ro_b2bua_stop(state, &call_id);
 
     state.call_actors.set_state(&call_id, CallState::Terminated);
     // remove_call_after_cancel sends Shutdown to remaining actors, cleans the
@@ -11217,6 +11408,10 @@ fn handle_b2bua_response(
         if let Some(invite_arc) = &a_leg_invite {
             spawn_rf_b2bua_start(state, call_id, invite_arc);
         }
+        // Ro is NOT started here: prepaid reserve-before-connect means the
+        // CCR-INITIAL already fired in `@b2bua.on_invite` via `call.ro_authorize()`
+        // (before the B-leg was dialed). The re-auth loop it armed keeps running;
+        // there is nothing to do on answer.
 
         // Wrap the 200 OK in Arc<Mutex<>> so Python handlers can modify SDP in-place
         let response_arc = Arc::new(std::sync::Mutex::new(message.clone()));
@@ -12412,6 +12607,14 @@ fn handle_b2bua_response(
             }
         }
 
+        // Release any Ro reservation made by `call.ro_authorize()` before the
+        // B-leg failed (reserve-before-connect leaves a live session pre-answer):
+        // CCR-TERMINATION reports ~0 usage. Skipped for a relayed auth challenge —
+        // the call has not failed and the reservation must survive the re-INVITE.
+        if !relay_challenge {
+            spawn_ro_b2bua_stop(state, call_id);
+        }
+
         state.call_actors.remove_call(call_id);
         state.call_event_receivers.remove(call_id);
     }
@@ -12684,6 +12887,7 @@ fn handle_b2bua_bye(
     // proxy committed to tearing the call down; the SIP path is
     // unaffected (spawn is fire-and-forget per §6.5).
     spawn_rf_b2bua_stop(state, &call_id, parse_reason_cause(&message));
+    spawn_ro_b2bua_stop(state, &call_id);
 
     // CDR: write the call record on BYE (cdr.auto_emit). `from_a_leg` gives the
     // disconnecting side (caller vs callee).
@@ -13178,6 +13382,7 @@ fn b2bua_terminate_call_inner(
     // Diameter "normal" cause (None → 0); the RFC 3326 Reason on the BYE is
     // informational only here (its Q.850 cause is not a SIP status).
     spawn_rf_b2bua_stop(state, internal_call_id, None);
+    spawn_ro_b2bua_stop(state, internal_call_id);
 
     // CDR (cdr.auto_emit): write the record with the framework as the
     // disconnecting side and the Reason header as sip_reason.

@@ -92,6 +92,10 @@ class Call:
         self._refer_replaces = refer_replaces
         self._contact_user_override: Optional[str] = None
         self._contact_override: Optional[str] = None
+        # Ro reserve-before-connect gate: the result ``ro_authorize`` returns
+        # (default a grant), and a record of each call for test assertions.
+        self._ro_authorize_result: Optional[dict] = None
+        self._ro_authorizations: list[dict] = []
 
     # -- Properties ------------------------------------------------------------
 
@@ -259,6 +263,71 @@ class Call:
         return self._refer_replaces
 
     # -- Call control ----------------------------------------------------------
+
+    async def ro_authorize(
+        self,
+        *,
+        subscription_id: Optional[str] = None,
+        subscription_id_type: Optional[str] = None,
+    ) -> dict:
+        """Reserve prepaid credit (Ro CCR-INITIAL) BEFORE dialing the B-leg — the
+        reserve-before-connect gate. Await it in ``@b2bua.on_invite`` and branch:
+
+        Example::
+
+            @b2bua.on_invite
+            async def on_invite(call):
+                decision = await call.ro_authorize()
+                if not decision["authorized"]:
+                    call.reject(402, "Payment Required")   # no B-leg dialed
+                    return
+                call.dial("sip:bob@carrier")               # credit reserved
+
+        On a grant siphon opens the credit-control session, re-authorizes on the
+        OCS cadence, disconnects mid-call on exhaustion, and sends
+        CCR-TERMINATION on BYE. ``subscription_id`` overrides the charged
+        identity (a ``sip:`` URI is typed as a SIP URI, never as an E.164
+        number); when omitted it comes from the ``ro.charge`` config. Returns
+        ``{"authorized": bool, "result_code": int|None, "granted_time": int|None,
+        "session_id": str|None}``.
+
+        Tests can force the outcome with :meth:`set_ro_authorize_result` and
+        assert on :attr:`ro_authorizations`.
+        """
+        self._ro_authorizations.append({
+            "subscription_id": subscription_id,
+            "subscription_id_type": subscription_id_type,
+        })
+        if self._ro_authorize_result is not None:
+            return dict(self._ro_authorize_result)
+        return {
+            "authorized": True,
+            "result_code": 2001,
+            "granted_time": 30,
+            "session_id": f"mock-ro;{self._id}",
+        }
+
+    def set_ro_authorize_result(
+        self,
+        authorized: bool,
+        *,
+        result_code: Optional[int] = None,
+        granted_time: Optional[int] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Test hook — pin what the next :meth:`ro_authorize` returns (e.g. a
+        4012 denial so a script's ``call.reject(402)`` branch is exercised)."""
+        self._ro_authorize_result = {
+            "authorized": authorized,
+            "result_code": result_code,
+            "granted_time": granted_time,
+            "session_id": session_id,
+        }
+
+    @property
+    def ro_authorizations(self) -> list[dict]:
+        """Every ``ro_authorize`` call made on this call (for test assertions)."""
+        return self._ro_authorizations
 
     def reject(self, code: int, reason: str) -> None:
         """Reject the call with an error response.
