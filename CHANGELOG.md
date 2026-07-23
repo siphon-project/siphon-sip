@@ -138,6 +138,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   pseudo-legs, so a plain call that re-INVITEd no longer reports two B-legs.
 
 ### Fixed
+- **B2BUA auto-PRACK now carries the early-dialog To-tag** (RFC 3262 §4 / RFC 3261
+  §12.1.2). When the B-leg sent a reliable provisional (`18x` with `Require:
+  100rel`), siphon built the PRACK's `To` from the dialog's remote tag — but that
+  field is only populated from the `200 OK`, which hasn't arrived yet at PRACK
+  time, so the PRACK went out tag-less and a strict UAS (e.g. an IMS S-CSCF)
+  rejected it with `481 Call/Transaction Does Not Exist`, breaking VoLTE calls
+  that use reliable provisionals / preconditions. The reliable provisional
+  establishes the early dialog, so its To-tag (and route set, already handled) is
+  now captured onto the B-leg before the PRACK is built. The SIPp reliable-prov
+  scenario now asserts the PRACK's To-tag, which is why this slipped through.
 - **B2BUA no longer mis-handles a cancelled B-leg during failover** (surfaced by
   LCR ring-timeout reroute; also affects any CANCEL-then-answer-a-different-leg
   flow). Three fixes: (1) a `2xx` to a B-leg CANCEL shares the INVITE's top Via
