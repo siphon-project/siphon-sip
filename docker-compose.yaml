@@ -1,0 +1,63 @@
+# docker-compose.yaml — the quickest way to run SIPhon.
+#
+#   docker compose up -d          # start (pulls the published image)
+#   docker compose logs -f        # follow logs
+#   docker compose down           # stop
+#
+# It bind-mounts your config and scripts from this directory, so you edit
+# siphon.yaml / scripts/*.py on the host and SIPhon hot-reloads them — no
+# rebuild, no restart. The repo ships a working siphon.yaml and
+# scripts/proxy_default.py, so a fresh clone runs a working proxy out of the box.
+#
+# See docs/getting-started.md and docs/deployment.md for the full story.
+
+services:
+  siphon:
+    image: ghcr.io/siphon-project/siphon-sip:latest
+    # To run your own build instead of the published image, comment out the
+    # `image:` line above and uncomment this:
+    # build:
+    #   context: .
+    restart: unless-stopped
+
+    # SIP is sensitive to NAT rewriting of Via/Contact addresses, so on Linux
+    # run in the host network namespace — the ports below bind directly on the
+    # host and Via/Contact carry the real addresses.
+    network_mode: host
+    # Docker Desktop (macOS / Windows) has no host networking. There, delete the
+    # `network_mode: host` line above and publish the ports instead:
+    # ports:
+    #   - "5060:5060/udp"
+    #   - "5060:5060/tcp"
+    #   - "5061:5061/tcp"     # SIP over TLS
+
+    volumes:
+      # Your config and routing scripts — edited on the host, hot-reloaded in
+      # the container. Read-only in the container; SIPhon only reads them.
+      - ./siphon.yaml:/etc/siphon/siphon.yaml:ro
+      - ./scripts:/etc/siphon/scripts:ro
+      # Optional: mount TLS certs / persisted state as needed, e.g.
+      # - ./certs:/etc/siphon/certs:ro
+
+    # Answer a SIP OPTIONS ping to prove the datapath is actually up, not just
+    # that the process started.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >
+          python3 -c "import socket;
+          s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2);
+          s.sendto(b'OPTIONS sip:healthcheck SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\r\nFrom: <sip:hc@localhost>;tag=hc\r\nTo: <sip:localhost>\r\nCall-ID: hc@check\r\nCSeq: 1 OPTIONS\r\nMax-Forwards: 1\r\nContent-Length: 0\r\n\r\n', ('127.0.0.1',5060));
+          s.recv(1024); s.close()"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  # ── Optional: media anchoring with rtpengine ────────────────────────────────
+  # Uncomment to anchor RTP (SBC / topology hiding). Point `media.rtpengine`
+  # in siphon.yaml at 127.0.0.1:22222. See docs/cookbook/media-rtp.md.
+  # rtpengine:
+  #   image: drachtio/rtpengine:latest
+  #   restart: unless-stopped
+  #   network_mode: host

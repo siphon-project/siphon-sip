@@ -7,6 +7,13 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **Docker Compose quickstart + Getting started guide.** A root
+  `docker-compose.yaml` runs the published image with your `siphon.yaml` and
+  `scripts/` bind-mounted (host networking, hot-reload, a SIP `OPTIONS`
+  healthcheck), so `git clone && docker compose up -d` starts a working proxy
+  with nothing to build. A new `Getting started` docs page leads with that path
+  and folds in the native/`.deb`/`.rpm` options plus the common Ubuntu build
+  gotchas (old `apt` rustc, missing `python3-dev`).
 - **SDK: `Request.remove_headers_matching(prefix)`** in the `siphon-sip` mock,
   mirroring the production request method (it was only on the `call` mock), so
   script unit tests can exercise header-prefix stripping on a proxy request.

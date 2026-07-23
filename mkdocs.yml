@@ -40,6 +40,7 @@ theme:
 
 nav:
   - Home: README.md
+  - Getting started: getting-started.md
   - Cookbook:
       - Overview: cookbook/index.md
       - Registrar: cookbook/registrar.md
