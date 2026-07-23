@@ -13,6 +13,7 @@ from typing import Optional, Union
 
 from siphon_sdk.types import Action, Contact, Flow, MediaHandle, SipUri
 from siphon_sdk.request import _parse_uri, _validate_send_socket
+from siphon_sdk.lcr import Route
 
 
 def _validate_replaces(replaces: Optional[dict]) -> None:
@@ -68,6 +69,7 @@ class Call:
         refer_to: Optional[str] = None,
         refer_replaces: Optional[dict] = None,
         transport: str = "udp",
+        active_route: Optional[Route] = None,
     ) -> None:
         self._id = call_id or str(uuid.uuid4())
         self._from_uri = _parse_uri(from_uri)
@@ -92,12 +94,23 @@ class Call:
         self._refer_replaces = refer_replaces
         self._contact_user_override: Optional[str] = None
         self._contact_override: Optional[str] = None
+        # LCR: the carrier that won the sequential failover. In the engine the
+        # dispatcher sets this on the on_answer/on_bye Call; in tests pass
+        # ``active_route=`` (or set ``call._active_route``) to simulate the winner.
+        self._active_route = active_route
         # Ro reserve-before-connect gate: the result ``ro_authorize`` returns
         # (default a grant), and a record of each call for test assertions.
         self._ro_authorize_result: Optional[dict] = None
         self._ro_authorizations: list[dict] = []
 
     # -- Properties ------------------------------------------------------------
+
+    @property
+    def active_route(self) -> Optional[Route]:
+        """The carrier :class:`~siphon_sdk.lcr.Route` that won an LCR sequence
+        (``call.route(...)``), or ``None`` for a non-LCR call. Read in
+        ``@b2bua.on_answer`` / ``on_bye`` to stamp the carrier onto a CDR."""
+        return self._active_route
 
     @property
     def id(self) -> str:
@@ -613,6 +626,44 @@ class Call:
                 "send_socket": send_socket,
                 "auth_passthrough": auth_passthrough,
             },
+        ))
+
+    def route(
+        self,
+        routes: list["Route"],
+        timeout: int = 30,
+        send_socket: Optional[str] = None,
+    ) -> None:
+        """Route the call across an ordered list of carrier :class:`~siphon_sdk.lcr.Route`
+        objects with **sequential failover** — B2BUA-only LCR execution.
+
+        The carriers (from ``await lcr.route(call)``, optionally filtered /
+        reordered) are tried cheapest-first: dial the first routable carrier
+        (a ``gateway_group`` resolved to a healthy member, else ``next_hop`` /
+        ``ruri``, with any ``tech_prefix`` prepended and ``headers`` injected),
+        and on a reroute cause advance to the next — each attempt a fresh B-leg
+        dialog. On answer, :attr:`active_route` is the carrier that won.
+
+        Args:
+            routes: Ordered carriers (cheapest first).
+            timeout: Default ring timeout (seconds) for a route without its own
+                ``timeout_secs``.
+            send_socket: Optional egress socket pin applied to every attempt.
+
+        Example::
+
+            @b2bua.on_invite
+            async def route(call):
+                decision = await lcr.route(call)
+                if decision and decision.routes:
+                    call.route(decision.routes)
+        """
+        _validate_send_socket(send_socket)
+        self._actions.append(Action(
+            kind="route",
+            targets=[route.carrier_id for route in routes],
+            timeout=timeout,
+            extras={"routes": list(routes), "send_socket": send_socket},
         ))
 
     def terminate(self) -> None:

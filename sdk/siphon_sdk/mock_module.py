@@ -20,6 +20,7 @@ from typing import Any, Callable, Optional, Union
 
 from siphon_sdk.types import Contact, SipUri
 from siphon_sdk.request import _parse_uri
+from siphon_sdk.lcr import Route
 from siphon_sdk.smpp import MockSmpp
 from siphon_sdk.http import MockHttp
 
@@ -5185,6 +5186,82 @@ class MockTimerHandle:
 # Module installation
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# LCR namespace — B2BUA-only Least-Cost Routing (await lcr.route(call))
+# ---------------------------------------------------------------------------
+
+class MockLcrDecision:
+    """Mock of the decision returned by ``await lcr.route(call)``.
+
+    Mirrors the Rust ``LcrDecision``: ``.routes`` is a ``list[Route]`` and
+    ``.reject`` is a ``{"code": int, "reason": str}`` dict or ``None``.
+    """
+
+    def __init__(self, routes=None, reject=None) -> None:
+        self.routes = list(routes) if routes else []
+        self.reject = reject
+
+    def __repr__(self) -> str:
+        return f"LcrDecision(routes={len(self.routes)}, reject={self.reject is not None})"
+
+
+class MockLcr:
+    """Mock ``lcr`` namespace — B2BUA-only Least-Cost Routing.
+
+    Configure the canned decision the next ``await lcr.route(call)`` returns::
+
+        lcr = mock_module.get_lcr()
+        lcr.set_routes([Route(carrier_id="a", gateway_group="pool-a", rate=0.004)])
+        # or: lcr.set_reject(503, "No Route")   # API-side block
+        # or: lcr.set_unavailable()             # route() returns None
+
+    Assert on what the script asked via ``lcr.queries``.
+    """
+
+    def __init__(self) -> None:
+        self._routes: list = []
+        self._reject: Optional[dict] = None
+        self._unavailable = False
+        self.queries: list = []
+
+    def set_routes(self, routes) -> None:
+        """Canned ordered carrier routes for subsequent ``route()`` calls."""
+        self._routes = list(routes)
+        self._reject = None
+        self._unavailable = False
+
+    def set_reject(self, code: int, reason: str) -> None:
+        """Make ``route()`` return a decision carrying an API-side reject."""
+        self._reject = {"code": int(code), "reason": reason}
+        self._routes = []
+        self._unavailable = False
+
+    def set_unavailable(self) -> None:
+        """Make ``route()`` return ``None`` (API unreachable, no fallback)."""
+        self._unavailable = True
+
+    def clear(self) -> None:
+        self._routes = []
+        self._reject = None
+        self._unavailable = False
+        self.queries = []
+
+    async def route(self, call, trunk_group=None, attributes=None):
+        """Return the configured decision (or ``None``), recording the query."""
+        try:
+            dialed = call.ruri.user
+        except AttributeError:
+            dialed = None
+        self.queries.append({
+            "dialed_number": dialed,
+            "trunk_group": trunk_group,
+            "attributes": dict(attributes or {}),
+        })
+        if self._unavailable:
+            return None
+        return MockLcrDecision(self._routes, self._reject)
+
+
 # Singleton instances
 _proxy = MockProxy()
 _b2bua = MockB2bua()
@@ -5201,6 +5278,7 @@ _diameter = MockDiameter()
 _presence = MockPresence()
 _srs = MockSrs()
 _timer = MockTimer()
+_lcr = MockLcr()
 
 
 # ---------------------------------------------------------------------------
@@ -6606,6 +6684,11 @@ def install() -> ModuleType:
     mod.sdp = _sdp  # type: ignore[attr-defined]
     mod.numbers = _numbers  # type: ignore[attr-defined]
     mod.qos = _qos  # type: ignore[attr-defined]
+    # LCR namespace (B2BUA-only) + the Route / LcrDecision types (mirrors the
+    # Rust module.add_class::<Route>() / <LcrDecision>() top-level registration).
+    mod.lcr = _lcr  # type: ignore[attr-defined]
+    mod.Route = Route  # type: ignore[attr-defined]
+    mod.LcrDecision = MockLcrDecision  # type: ignore[attr-defined]
     # smpp namespace — provided by the siphon-smpp extension at runtime;
     # mocked here so `from siphon import smpp` works under pytest.
     mod.smpp = _smpp  # type: ignore[attr-defined]
@@ -6658,6 +6741,7 @@ def reset() -> None:
     _numbers.clear()
     _smpp.clear()
     _http.clear()
+    _lcr.clear()
     _auth._allow = False
     _auth._credentials.clear()
     _proxy._utils._rate_limit_allow = True
@@ -6687,6 +6771,16 @@ def get_numbers() -> MockNumbersNamespace:
 def get_smpp() -> MockSmpp:
     """Access the mock smpp namespace singleton (test helper)."""
     return _smpp
+
+
+def get_lcr() -> MockLcr:
+    """Access the mock lcr namespace singleton (test helper).
+
+    Configure the decision a script's ``await lcr.route(call)`` returns::
+
+        mock_module.get_lcr().set_routes([Route(carrier_id="a", gateway_group="pool-a")])
+    """
+    return _lcr
 
 
 def get_http() -> MockHttp:

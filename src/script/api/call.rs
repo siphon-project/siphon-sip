@@ -19,7 +19,10 @@ pub struct SessionTimerOverride {
 }
 
 /// The action the script chose for this call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not `Eq`: [`CallAction::RouteSequence`] carries `lcr::Route`s whose `rate`
+/// is an `f64`. `PartialEq` is retained for tests.
+#[derive(Debug, Clone, PartialEq)]
 pub enum CallAction {
     /// No action taken yet.
     None,
@@ -90,6 +93,21 @@ pub enum CallAction {
     /// This marker only tells the dispatcher the call was answered so it keeps
     /// the actor alive instead of removing it as a silent (no-action) drop.
     Answered,
+    /// Sequential failover across an ordered list of carrier routes — LCR
+    /// (`call.route(...)`) or `call.fork(strategy="sequential")`. The dispatcher
+    /// dials the first routable carrier, stores the rest as the call's failover
+    /// queue, and advances to the next on B-leg reject/timeout, forwarding the
+    /// best error to the A-leg only once the list is exhausted. Each attempt is
+    /// a fresh B-leg dialog (no reused Call-ID — the serial-fork footgun a proxy
+    /// can't avoid).
+    RouteSequence {
+        /// Ordered carriers, cheapest/most-preferred first.
+        routes: Vec<crate::lcr::Route>,
+        /// Call-level send-socket egress pin applied to every attempt.
+        send_socket: Option<String>,
+        /// Default ring timeout (seconds) for a route without `timeout_secs`.
+        default_timeout: u32,
+    },
 }
 
 /// REFER transfer mode selected by `call.accept_refer(mode=...)` (and the
@@ -268,6 +286,11 @@ pub struct PyCall {
     /// forward the challenge without firing `@b2bua.on_failure`, deleting media,
     /// or tearing the call down — so the caller can authenticate and re-INVITE.
     auth_passthrough_flag: bool,
+    /// The carrier route that won (LCR) — injected by the dispatcher when it
+    /// builds the `@b2bua.on_answer` / `on_bye` `Call` from the call actor's
+    /// `route_sequence.active`. Read by scripts via `call.active_route` to stamp
+    /// the winning carrier onto a CDR / charging record.
+    active_route: Option<crate::lcr::Route>,
 }
 
 /// Per-call header policy input from `call.dial(header_policy=…, copy=…, strip=…, translate=…)`.
@@ -322,6 +345,15 @@ fn replace_header_uri(
     Ok(host)
 }
 
+/// Extract the bare URI string from a From/To-style header (drops the display
+/// name and header params/tag). `None` if the header is absent or unparseable.
+fn header_uri(message: &SipMessage, name: &str) -> Option<String> {
+    let raw = message.headers.get(name)?;
+    crate::sip::headers::nameaddr::NameAddr::parse(raw)
+        .ok()
+        .map(|nameaddr| nameaddr.uri.to_string())
+}
+
 impl PyCall {
     pub fn new(
         id: String,
@@ -349,7 +381,63 @@ impl PyCall {
             contact_override: None,
             header_policy_input: None,
             auth_passthrough_flag: false,
+            active_route: None,
         }
+    }
+
+    /// Attach the winning carrier route (from the call actor's
+    /// `route_sequence.active`) so the script can read `call.active_route` in
+    /// `@b2bua.on_answer` / `on_bye`. Called by the dispatcher when it builds
+    /// the handler `Call`.
+    pub fn set_active_route(&mut self, route: crate::lcr::Route) {
+        self.active_route = Some(route);
+    }
+
+    /// Build an [`LcrRequest`](crate::lcr::LcrRequest) from this call for
+    /// `lcr.route(...)`. `dialed_number` is the R-URI userpart (the script is
+    /// expected to have normalized it, e.g. via `rewrite_identities`), falling
+    /// back to the To userpart. `from`/`to` are the bare URIs.
+    pub fn lcr_request(
+        &self,
+        trunk_group: Option<String>,
+        attributes: std::collections::HashMap<String, String>,
+    ) -> PyResult<crate::lcr::LcrRequest> {
+        let message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        let call_id = message
+            .headers
+            .get("Call-ID")
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let from_uri = header_uri(&message, "From").unwrap_or_default();
+        let to_uri = header_uri(&message, "To").unwrap_or_default();
+        let ruri_user = match &message.start_line {
+            crate::sip::message::StartLine::Request(request_line) => {
+                request_line.request_uri.user.clone()
+            }
+            _ => None,
+        };
+        let dialed_number = ruri_user
+            .or_else(|| {
+                crate::sip::parser::parse_uri_standalone(&to_uri)
+                    .ok()
+                    .and_then(|uri| uri.user)
+            })
+            .unwrap_or_default();
+        Ok(crate::lcr::LcrRequest {
+            version: crate::lcr::LCR_CONTRACT_VERSION.to_string(),
+            call_id,
+            from: from_uri,
+            to: to_uri,
+            dialed_number,
+            source: crate::lcr::LcrSource {
+                ip: self.source_ip.clone(),
+                trunk_group,
+                transport: self.transport_name.clone(),
+            },
+            attributes,
+        })
     }
 
     /// Per-call header policy input (preset name + deltas) — read by the
@@ -1273,18 +1361,83 @@ impl PyCall {
             })?;
             super::numbers::apply_for_fork(&mut message, &policy, &mut target_uris);
         }
-        self.action = CallAction::Fork {
-            targets: target_uris,
-            flows,
-            strategy: strategy.to_string(),
-            send_socket,
-            timeout,
-        };
+        if strategy.eq_ignore_ascii_case("sequential") {
+            // Sequential fork = LCR-style serial failover: reuse the
+            // RouteSequence engine so the strategy is actually honored (it was
+            // silently ignored before). Each target becomes a routable-by-R-URI
+            // carrier; captured inbound flows are not carried on the sequential
+            // path (use parallel for WebSocket connection reuse).
+            let routes = target_uris
+                .into_iter()
+                .map(|uri| crate::lcr::Route {
+                    ruri: Some(uri),
+                    ..Default::default()
+                })
+                .collect();
+            self.action = CallAction::RouteSequence {
+                routes,
+                send_socket,
+                default_timeout: timeout,
+            };
+        } else {
+            self.action = CallAction::Fork {
+                targets: target_uris,
+                flows,
+                strategy: strategy.to_string(),
+                send_socket,
+                timeout,
+            };
+        }
         if auth_passthrough {
             self.auth_passthrough_flag = true;
             Self::add_auth_passthrough_copies(&mut copy);
         }
         self.update_header_policy_input(header_policy, copy, strip, translate);
+        Ok(())
+    }
+
+    /// Route this call across an ordered list of carrier `Route`s with
+    /// **sequential failover** — B2BUA-only LCR execution.
+    ///
+    /// The carriers (from `await lcr.route(call)`, optionally filtered/reordered
+    /// by the script — routing policy stays in Python) are tried cheapest-first:
+    /// siphon dials the first routable carrier (resolving a `gateway_group` to a
+    /// healthy member, skipping a carrier whose group is entirely down) and, on a
+    /// reject / ring-timeout, advances to the next — each attempt a **fresh
+    /// B-leg dialog** (new Call-ID / From-tag / CSeq), so no carrier ever sees a
+    /// reused Call-ID. The A-leg receives the best error only once every carrier
+    /// is exhausted. On answer, `call.active_route` is the carrier that won (read
+    /// it in `@b2bua.on_answer` to stamp the carrier onto a CDR).
+    ///
+    /// Call from `@b2bua.on_invite`. Per-carrier shaping (tech-prefix, injected
+    /// headers, R-URI override) and reroute causes are honored per route.
+    #[pyo3(signature = (routes, timeout=30, send_socket=None))]
+    fn route(
+        &mut self,
+        routes: Vec<Bound<'_, PyAny>>,
+        timeout: u32,
+        send_socket: Option<String>,
+    ) -> PyResult<()> {
+        super::request::validate_send_socket(send_socket.as_deref())?;
+        let mut collected: Vec<crate::lcr::Route> = Vec::with_capacity(routes.len());
+        for item in routes {
+            let route: PyRef<super::lcr::PyRoute> = item.extract().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err(
+                    "call.route() expects a list of Route objects from lcr.route(...)",
+                )
+            })?;
+            collected.push(route.inner().clone());
+        }
+        if collected.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "call.route() requires at least one route",
+            ));
+        }
+        self.action = CallAction::RouteSequence {
+            routes: collected,
+            send_socket,
+            default_timeout: timeout,
+        };
         Ok(())
     }
 
@@ -1304,6 +1457,25 @@ impl PyCall {
             min_se,
             refresher: refresher.to_string(),
         });
+    }
+
+    /// The carrier route that won an LCR sequence (`call.route(...)`), or `None`
+    /// for a non-LCR call. Available in `@b2bua.on_answer` / `on_bye` to stamp
+    /// the winning carrier onto a CDR / charging record.
+    ///
+    /// ```python
+    /// @b2bua.on_answer
+    /// def answered(call, reply):
+    ///     route = call.active_route
+    ///     if route:
+    ///         cdr.write(call, extra={"carrier_id": route.carrier_id,
+    ///                                "rate": f"{route.rate:.5f}"})
+    /// ```
+    #[getter]
+    fn active_route(&self) -> Option<super::lcr::PyRoute> {
+        self.active_route
+            .as_ref()
+            .map(|route| super::lcr::PyRoute::from_route(route.clone()))
     }
 
     /// The Refer-To URI (only set during @b2bua.on_refer handler).

@@ -1,0 +1,87 @@
+# SIPhon B2BUA Least-Cost Routing (LCR) — see examples/lcr_b2bua.py
+#
+# The external LCR API owns the cost decision; siphon caches it and executes the
+# ordered route set against these gateway carrier pools (health-probed). A
+# reference API is in examples/lcr_api_server.py.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+  tcp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "sbc.example.com"
+
+advertised_address: "sbc.example.com"
+
+script:
+  path: "examples/lcr_b2bua.py"
+
+# Home numbering plan — drives call.rewrite_identities("ims-e164@2026").
+numbering:
+  country_code: "1"
+  trunk_prefix: "0"
+  international_prefix: "011"
+  assume: national
+
+number_policies:
+  "ims-e164@2026":
+    default: e164
+
+# The external Least-Cost-Routing API (JSON contract v1).
+lcr:
+  api_url: "${LCR_API_URL:-http://127.0.0.1:8080/route}"
+  timeout_ms: 2000
+  cache: "lcr"                 # cache decisions in the named cache below
+  cache_ttl_secs: 300         # default TTL when the API omits cache_ttl_secs
+  auth_header: "Bearer ${LCR_TOKEN:-}"
+  fallback_gateway_group: "carrier-a"   # used if the API is unreachable
+  reroute_causes: [408, 500, 502, 503, 504]   # generic failover codes (default)
+
+cache:
+  - name: "lcr"
+    url: "${REDIS_URL:-redis://127.0.0.1:6379}"
+    local_ttl_secs: 60
+    local_max_entries: 10000
+
+# Carrier pools the API's routes reference by `gateway_group`. siphon picks a
+# healthy member per pool at dial time and skips a pool that is entirely down.
+gateway:
+  groups:
+    - name: "carrier-a"
+      algorithm: weighted
+      probe:
+        enabled: true
+        interval_secs: 15
+        failure_threshold: 3
+      destinations:
+        - uri: "sip:gw1.carrier-a.example:5060"
+          address: "198.51.100.11:5060"
+          weight: 2
+        - uri: "sip:gw2.carrier-a.example:5060"
+          address: "198.51.100.12:5060"
+    - name: "carrier-b"
+      algorithm: weighted
+      # carrier-b doesn't play nice — it answers 404 when it means "no circuits",
+      # so treat 404 (and the usual server codes) as failover causes for it.
+      reroute_causes: [404, 408, 500, 502, 503, 504]
+      probe:
+        enabled: true
+        interval_secs: 15
+        failure_threshold: 3
+      destinations:
+        - uri: "sip:gw1.carrier-b.example:5060"
+          address: "203.0.113.21:5060"
+    # The ingress trunk the calls arrive on — used by call.from_gateway() to tag
+    # the LCR query's trunk_group (source-IP membership), not as a route target.
+    - name: "cust-trunks"
+      probe:
+        enabled: false
+      destinations:
+        - uri: "sip:pbx.customer.example:5060"
+          address: "192.0.2.50:5060"
+
+log:
+  level: info

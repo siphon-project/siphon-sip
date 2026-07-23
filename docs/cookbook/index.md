@@ -15,6 +15,7 @@ page); none of the APIs here are invented.
 | [Registrar](registrar.md) | A SIP registrar with digest auth | `auth.require_digest`, `registrar.save`/`lookup`, NAT fixups |
 | [Stateful proxy](proxy.md) | A residential/edge proxy | `request.fork`, `loose_route`, `record_route`, sanity checks |
 | [Load balancer](load-balancer.md) | A front LB over a backend pool | `gateway.select`, health probing, subscriber affinity |
+| [Least-Cost Routing](least-cost-routing.md) | Carrier LCR driven by an external API | `lcr.route`, `call.route` sequential failover, gateway pools, CDR |
 | [SBC (B2BUA)](sbc.md) | A topology-hiding SBC with media | `@b2bua.*`, `call.dial`/`fork`, **header policies**, RTPEngine |
 | [Number normalization](number-normalization.md) | E.164 identity rewriting at a trunk↔IMS edge | `numbers.parse`, `rewrite_identities`, **number policies**, diversion family |
 | [Media & RTP profiles](media-rtp.md) | SRTP↔RTP, WebRTC, transcoding, hold | `rtpengine.offer`/`answer`, profiles, the `sdp` namespace |

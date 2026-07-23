@@ -290,6 +290,9 @@ pub struct CdrSession {
     response_code: u16,
     /// When this session was created — the orphan-sweep backstop keys off it.
     created_at: Instant,
+    /// Extra fields auto-stamped onto the finalized CDR (e.g. LCR route
+    /// `cdr_fields` from the winning carrier). Merged into `Cdr.extra`.
+    extra: std::collections::HashMap<String, String>,
 }
 
 impl CdrSession {
@@ -319,6 +322,15 @@ impl CdrSession {
             answer_instant: None,
             response_code: 0,
             created_at: Instant::now(),
+            extra: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Merge extra fields to auto-stamp onto the finalized CDR (later keys win).
+    /// Used for LCR route `cdr_fields` when a carrier wins.
+    pub fn merge_extra(&mut self, fields: &std::collections::HashMap<String, String>) {
+        for (key, value) in fields {
+            self.extra.insert(key.clone(), value.clone());
         }
     }
 
@@ -376,6 +388,7 @@ impl CdrSession {
         cdr.auth_user = self.auth_user;
         cdr.disconnect_initiator = Some(disconnect_initiator.to_string());
         cdr.sip_reason = sip_reason;
+        cdr.extra = self.extra;
         cdr
     }
 }

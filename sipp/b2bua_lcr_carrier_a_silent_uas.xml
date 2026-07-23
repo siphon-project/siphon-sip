@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  LCR TIMEOUT-failover test — carrier A (silent: rings but never answers).
+
+  Receive INVITE → 100 → (stay silent) → CANCEL (from siphon after the
+  per-carrier ring timeout) → 200 (for CANCEL) + 487 (for INVITE) → ACK.
+
+  This exercises "try carrier X for N seconds, then re-route": siphon arms the
+  route's timeout_secs as the ring deadline; when carrier A never produces a
+  final response, siphon CANCELs it and fails over to carrier B — a fresh B-leg
+  dialog. CANCEL copies the INVITE's Via/From/To/Call-ID (RFC 3261 §9.1), so
+  [last_*] echoes them; only the 487 pins CSeq to the INVITE (1 INVITE).
+-->
+<scenario name="LCR carrier A (silent → ring-timeout reroute)">
+
+  <recv request="INVITE" crlf="true" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 100 Trying
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Silent: no 180/200. siphon rings for timeout_secs then CANCELs. -->
+  <recv request="CANCEL" />
+
+  <!-- 200 OK for the CANCEL (echoes the CANCEL's CSeq via [last_CSeq:]). -->
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- 487 Request Terminated for the INVITE (CSeq pinned to the INVITE). -->
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 487 Request Terminated
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTagA[call_number]
+[last_Call-ID:]
+CSeq: 1 INVITE
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv request="ACK" timeout="5000" />
+
+</scenario>

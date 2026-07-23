@@ -7,6 +7,33 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **Least-Cost Routing (LCR) — B2BUA-only.** A new `lcr` scripting namespace
+  (`await lcr.route(call)`) queries an external HTTP JSON API for an ordered
+  carrier decision (the API owns cost/order; siphon is not a rating engine),
+  caches it in a named cache, and `call.route(decision.routes)` executes it with
+  **sequential failover**: try cheapest-first, resolve each carrier's
+  `gateway_group` to a healthy member (skip a pool that is down), and advance to
+  the next carrier on reject/ring-timeout — each attempt a fresh B-leg dialog
+  (new Call-ID), so no carrier ever sees a reused Call-ID. On answer,
+  `call.active_route` is the carrier that won (stamp it onto a CDR). New `lcr:`
+  config (`api_url`, `timeout_ms`, `cache`, `cache_ttl_secs`, `auth_header`,
+  `fallback_gateway_group`, `reroute_causes`). Per-carrier shaping: a
+  **`tech_prefix`** (dial-prefix prepended to the R-URI userpart), a full `ruri`
+  override, a **`number_policy`** (per-carrier From/To/PAI reshaping via a named
+  `number_policies:` preset), injected `headers`, and **`cdr_fields`** the API
+  auto-stamps onto the CDR when a carrier wins (no per-field script). An unknown
+  `gateway_group` is warned, not silently dropped, and `gateway.add_group`/
+  `remove_group` let routes reference groups added at runtime (no restart).
+  **Reroute causes** — which SIP codes fail over vs. forward to the caller — are
+  selectable per-route (API) > per-gateway (`gateway.groups[].reroute_causes`) >
+  global (`lcr.reroute_causes`, default `[408, 500, 502, 503, 504]`). B2BUA-only
+  by design (dialog hygiene, per-carrier media, charging). Example:
+  `examples/lcr_b2bua.py` + a FastAPI reference API `examples/lcr_api_server.py`;
+  SDK contract models in `siphon_sdk.lcr`.
+- **`call.fork(strategy="sequential")` now actually fails over.** The strategy
+  was previously ignored (every target was rung in parallel); it now tries the
+  targets one at a time, advancing on failure, via the same engine as
+  `call.route(...)`.
 - **Diameter Ro online charging (prepaid), reserve-before-connect.** A B2BUA
   reserves credit with a Credit-Control CCR-INITIAL in `@b2bua.on_invite` via
   `await call.ro_authorize()` BEFORE the B-leg is dialed: a grant dials, a denial
@@ -84,6 +111,11 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `checks_missed` and each group gains `failure_threshold`.
 
 ### Changed
+- **B2BUA answer-timeout is now honored within ~0.5s of the deadline** (was up to
+  30s late). The `call.fork`/`call.dial`/`call.route` `timeout=` check moved off
+  the 30s orphan sweep onto a dedicated 500ms interval, so a short per-carrier LCR
+  ring timeout ("try carrier X for N seconds, then re-route") re-routes promptly
+  instead of stalling the call.
 - **Calls view shows both the caller and the dialed callee.** Previously it showed
   the A-leg From (which is actually the dialed identity, not the caller) and the
   B-leg target, so a bridged call looked like it only had one side. `GET /admin/calls`
@@ -92,6 +124,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   pseudo-legs, so a plain call that re-INVITEd no longer reports two B-legs.
 
 ### Fixed
+- **B2BUA no longer mis-handles a cancelled B-leg during failover** (surfaced by
+  LCR ring-timeout reroute; also affects any CANCEL-then-answer-a-different-leg
+  flow). Three fixes: (1) a `2xx` to a B-leg CANCEL shares the INVITE's top Via
+  branch (RFC 3261 §9.1), so it was branch-matched and misclassified as the
+  cancelled carrier *answering* — marking the wrong leg the winner and sending the
+  late ACK / BYE to the cancelled carrier; non-INVITE-CSeq responses are now
+  absorbed. (2) A provisional (e.g. a `180` reordered behind its `200` under the
+  multi-worker UDP receive) that arrives after the call is answered is dropped
+  instead of forwarded (and no longer downgrades the confirmed dialog to Ringing).
+  (3) A straggler non-2xx from a cancelled/losing carrier after answer is ACKed
+  and absorbed rather than torn down toward the caller.
 - **Diameter Session-Id uniqueness under concurrency** — `new_session_id` read
   the Hop-by-Hop/End-to-End counters without reserving them, so two requests
   built concurrently could mint the *same* Session-Id, collapsing two accounting

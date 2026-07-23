@@ -167,6 +167,12 @@ pub struct Config {
     /// 5G SBI client configuration (Npcf, Nchf).
     pub sbi: Option<SbiYamlConfig>,
 
+    /// Least-Cost Routing (LCR) external HTTP API. Drives the `lcr` Python
+    /// namespace (`await lcr.route(call)`) — B2BUA-only. The API owns the
+    /// cost-order decision; siphon caches it and executes the ordered route
+    /// set against the `gateway` health/failover machinery.
+    pub lcr: Option<LcrConfig>,
+
     /// Session Recording Server (SRS) — receive SIPREC INVITEs and record calls.
     pub srs: Option<SrsConfig>,
 
@@ -2100,6 +2106,13 @@ pub struct GatewayGroupConfig {
     /// `"2001:db8::1"` → `/128`).
     #[serde(default)]
     pub source_networks: Vec<String>,
+    /// SIP response codes from a carrier in this group that trigger LCR failover
+    /// to the next carrier, overriding the global `lcr.reroute_causes` for routes
+    /// dialed through this group. For a carrier that doesn't play nice with the
+    /// standard codes (e.g. sends `404`/`403` for "no circuits"). Empty = use the
+    /// global set. A per-route `reroute_causes` from the API wins over this.
+    #[serde(default)]
+    pub reroute_causes: Vec<u16>,
 }
 
 /// Per-group health probe settings.
@@ -3252,6 +3265,59 @@ impl SbiYamlConfig {
             oauth2_client_secret: self.oauth2_client_secret.clone(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Least-Cost Routing (LCR)
+// ---------------------------------------------------------------------------
+
+/// Top-level `lcr:` configuration — the external Least-Cost-Routing API.
+///
+/// ```yaml
+/// lcr:
+///   api_url: "${LCR_API_URL:-https://lcr.internal/route}"
+///   timeout_ms: 2000
+///   cache: "lcr"                     # optional: a name from the cache: list
+///   cache_ttl_secs: 300              # default TTL when the API omits one
+///   auth_header: "Bearer ${LCR_TOKEN}"
+///   fallback_gateway_group: "emergency-pstn"   # used when the API is down
+/// ```
+#[derive(Debug, Deserialize, Clone)]
+pub struct LcrConfig {
+    /// URL siphon `POST`s each LCR query to (JSON contract v1). Required.
+    pub api_url: String,
+    /// Per-query timeout in milliseconds.
+    #[serde(default = "default_lcr_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Name of a `cache:` entry to cache decisions in (L1 LRU + optional Redis
+    /// so a decision cached on one node is reused fleet-wide). When unset,
+    /// decisions are not cached.
+    pub cache: Option<String>,
+    /// Default cache TTL (seconds) used only when a decision omits
+    /// `cache_ttl_secs`. A decision's own `cache_ttl_secs` always wins;
+    /// `0` disables caching for that decision.
+    #[serde(default = "default_lcr_cache_ttl_secs")]
+    pub cache_ttl_secs: u64,
+    /// Full `Authorization` header value sent with each query (e.g.
+    /// `"Bearer …"`). Supports `${VAR}` expansion.
+    pub auth_header: Option<String>,
+    /// Configured `gateway:` group to fall back to when the API is unreachable
+    /// or times out — degrades routing instead of failing the call. When unset,
+    /// an API failure surfaces to the script as "unavailable" (no decision).
+    pub fallback_gateway_group: Option<String>,
+    /// SIP response codes that trigger failover to the next carrier (the generic
+    /// level). When unset, the built-in default `[408, 500, 502, 503, 504]` is
+    /// used. A per-gateway `reroute_causes` or a per-route one (from the API)
+    /// overrides this for that carrier.
+    pub reroute_causes: Option<Vec<u16>>,
+}
+
+fn default_lcr_timeout_ms() -> u64 {
+    2000
+}
+
+fn default_lcr_cache_ttl_secs() -> u64 {
+    300
 }
 
 // ---------------------------------------------------------------------------

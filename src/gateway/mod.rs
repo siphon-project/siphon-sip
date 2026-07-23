@@ -278,6 +278,10 @@ pub struct DispatcherGroup {
     /// rather than only the IPs its FQDNs resolve to, so membership is stable
     /// regardless of DNS. Configured once at startup — not refreshed.
     source_networks: Vec<IpNet>,
+    /// SIP response codes from a carrier in this group that trigger LCR failover
+    /// to the next carrier (`gateway.groups[].reroute_causes`). Empty = the LCR
+    /// path uses the global `lcr.reroute_causes` for this group's carriers.
+    reroute_causes: Vec<u16>,
 }
 
 impl DispatcherGroup {
@@ -292,6 +296,7 @@ impl DispatcherGroup {
             counters: DashMap::new(),
             member_ips: ArcSwap::from_pointee(HashSet::new()),
             source_networks: Vec::new(),
+            reroute_causes: Vec::new(),
         };
         // Startup resolution — sync context, `to_socket_addrs` is fine here.
         group.refresh_member_ips();
@@ -301,6 +306,17 @@ impl DispatcherGroup {
     pub fn with_probe_config(mut self, config: ProbeConfig) -> Self {
         self.probe_config = config;
         self
+    }
+
+    /// Set the per-group LCR reroute-cause overrides.
+    pub fn with_reroute_causes(mut self, causes: Vec<u16>) -> Self {
+        self.reroute_causes = causes;
+        self
+    }
+
+    /// The per-group LCR reroute-cause overrides (empty = use the global set).
+    pub fn reroute_causes(&self) -> &[u16] {
+        &self.reroute_causes
     }
 
     /// Set the static source CIDR ranges that also count as group members for
@@ -583,6 +599,15 @@ impl DispatcherManager {
     ) -> Option<Arc<Destination>> {
         self.get_group(group_name)
             .and_then(|group| group.select(key, attr_filter))
+    }
+
+    /// The per-group LCR reroute-cause overrides for a named group (empty when
+    /// the group is unknown or has no override — the caller then uses the global
+    /// `lcr.reroute_causes`).
+    pub fn group_reroute_causes(&self, group_name: &str) -> Vec<u16> {
+        self.get_group(group_name)
+            .map(|group| group.reroute_causes().to_vec())
+            .unwrap_or_default()
     }
 
     /// True when `ip` is a resolved member of the named group.

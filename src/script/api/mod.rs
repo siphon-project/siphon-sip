@@ -16,6 +16,7 @@ pub mod diameter_server;
 pub mod gateway;
 pub mod ipsec;
 pub mod isc;
+pub mod lcr;
 pub mod li;
 pub mod log;
 pub mod metrics;
@@ -71,6 +72,7 @@ pub const BUILT_IN_NAMESPACE_NAMES: &[&str] = &[
     "ipsec",
     "qos",
     "stir",
+    "lcr",
 ];
 
 /// Host-registered Python namespaces. Populated by `SiphonServer` at
@@ -89,6 +91,10 @@ static RTPENGINE_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// Optional gateway singleton — set only when `gateway` is configured.
 static GATEWAY_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
+
+/// Optional LCR singleton — set only when `lcr` is configured. Backs the
+/// B2BUA-only `lcr.route(...)` namespace.
+static LCR_SINGLETON: OnceLock<Py<PyAny>> = OnceLock::new();
 
 /// The gateway `DispatcherManager` Arc — stored so `request.from_gateway` /
 /// `call.from_gateway` can test a source IP against a group's resolved-address
@@ -494,6 +500,18 @@ pub fn set_stir_singleton(python: Python<'_>, py_stir: stir::PyStir) -> Result<(
     Ok(())
 }
 
+/// Store the LCR singleton for injection into the siphon module.
+///
+/// Called at startup only when `lcr` is configured. Wires the shared
+/// [`crate::lcr::LcrClient`] into the B2BUA-only Python `lcr` namespace.
+pub fn set_lcr_singleton(python: Python<'_>, py_lcr: lcr::PyLcr) -> Result<()> {
+    let lcr_py: Py<PyAny> = Py::new(python, py_lcr)
+        .map_err(|error| SiphonError::Script(format!("Py::new(lcr): {error}")))?
+        .into_any();
+    let _ = LCR_SINGLETON.set(lcr_py);
+    Ok(())
+}
+
 /// Store the ISC singleton for injection into the siphon module.
 ///
 /// Always called at startup — the iFC store is always available (even if
@@ -633,6 +651,15 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
     module
         .add_class::<registrar::PyFlow>()
         .map_err(|error| SiphonError::Script(format!("add_class Flow: {error}")))?;
+    // LCR: `Route` / `LcrDecision` are returned by `await lcr.route(call)` and
+    // consumed by `call.route(...)`. Registered so scripts can type-check /
+    // repr them (`from siphon import Route` also resolves).
+    module
+        .add_class::<lcr::PyRoute>()
+        .map_err(|error| SiphonError::Script(format!("add_class Route: {error}")))?;
+    module
+        .add_class::<lcr::PyLcrDecision>()
+        .map_err(|error| SiphonError::Script(format!("add_class LcrDecision: {error}")))?;
 
     // If Rust singletons are available, inject them now — before any user
     // script does `from siphon import auth`.
@@ -700,6 +727,13 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
         module
             .setattr("gateway", gateway_py.bind(python))
             .map_err(|error| SiphonError::Script(format!("setattr gateway: {error}")))?;
+    }
+
+    // Inject optional LCR singleton (only when `lcr` is configured).
+    if let Some(lcr_py) = LCR_SINGLETON.get() {
+        module
+            .setattr("lcr", lcr_py.bind(python))
+            .map_err(|error| SiphonError::Script(format!("setattr lcr: {error}")))?;
     }
 
     // Inject optional CDR singleton.

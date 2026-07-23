@@ -696,6 +696,32 @@ pub struct ReferSubscription {
 /// Call actors can be created without an inbound INVITE, enabling
 /// API-driven call origination. Create a `CallActor`, add legs, and
 /// the system sends INVITEs on your behalf.
+/// Sequential-failover state for a call driven by `call.route(...)` (LCR) or
+/// `call.fork(strategy="sequential")`.
+///
+/// Carriers are tried one at a time in order: [`active`](Self::active) is the
+/// attempt currently in flight (or the winner after a 2xx), [`pending`](Self::pending)
+/// holds the not-yet-tried carriers (front = next), and [`best_error`](Self::best_error)
+/// accumulates the highest-priority failure so a fully-exhausted sequence
+/// surfaces the right code to the A-leg. When `None` on a [`CallActor`], the call
+/// is a plain single dial or a parallel fork (no failover). Each attempt is a
+/// fresh B-leg dialog (`b2bua_send_b_leg_invite` mints a new Call-ID/From-tag/
+/// CSeq per call), so no carrier ever sees a reused Call-ID.
+#[derive(Debug, Default)]
+pub struct RouteSequenceState {
+    /// Carriers still to try, front = next attempt.
+    pub pending: std::collections::VecDeque<crate::lcr::Route>,
+    /// The carrier currently in flight — becomes the winner on a 2xx answer.
+    /// Surfaced to scripts as `call.active_route` for CDR/charging.
+    pub active: Option<crate::lcr::Route>,
+    /// Highest-priority error across failed attempts (6xx > 5xx > 4xx).
+    pub best_error: Option<u16>,
+    /// Call-level send-socket egress pin applied to every attempt.
+    pub send_socket: Option<String>,
+    /// Ring timeout (seconds) for a route that omits its own `timeout_secs`.
+    pub default_timeout: u32,
+}
+
 #[derive(Debug)]
 pub struct CallActor {
     /// Internal call identifier (UUID).
@@ -805,6 +831,9 @@ pub struct CallActor {
     /// firing `@b2bua.on_failure`, deleting media, and removing the call — so the
     /// caller can authenticate end-to-end and re-INVITE (RFC 3261 §22.3).
     pub auth_passthrough: bool,
+    /// Sequential-failover (LCR / `fork(strategy="sequential")`) state. `None`
+    /// for a plain single dial or a parallel fork. See [`RouteSequenceState`].
+    pub route_sequence: Option<RouteSequenceState>,
 }
 
 impl CallActor {
@@ -840,7 +869,81 @@ impl CallActor {
             auth_retry_count: 0,
             answer_deadline: None,
             auth_passthrough: false,
+            route_sequence: None,
         }
+    }
+
+    /// Pop the next carrier from the failover queue, mark it active, and return
+    /// a clone. `None` when this is not a sequential call or the queue is empty
+    /// (all carriers exhausted).
+    pub fn take_next_route(&mut self) -> Option<crate::lcr::Route> {
+        let sequence = self.route_sequence.as_mut()?;
+        let route = sequence.pending.pop_front()?;
+        sequence.active = Some(route.clone());
+        Some(route)
+    }
+
+    /// Record a failed attempt's status code, keeping the highest-priority one
+    /// (6xx > 5xx > 4xx). No-op for a non-sequential call.
+    pub fn record_route_failure(&mut self, status_code: u16) {
+        if let Some(sequence) = self.route_sequence.as_mut() {
+            let keep = match sequence.best_error {
+                Some(existing) if error_priority(existing) >= error_priority(status_code) => {
+                    existing
+                }
+                _ => status_code,
+            };
+            sequence.best_error = Some(keep);
+        }
+    }
+
+    /// Whether more carriers remain to try in the failover queue.
+    pub fn has_pending_routes(&self) -> bool {
+        self.route_sequence
+            .as_ref()
+            .is_some_and(|sequence| !sequence.pending.is_empty())
+    }
+
+    /// Whether this call is running a sequential route/failover sequence.
+    pub fn is_route_sequence(&self) -> bool {
+        self.route_sequence.is_some()
+    }
+
+    /// The best (highest-priority) error seen across exhausted attempts.
+    pub fn best_route_error(&self) -> Option<u16> {
+        self.route_sequence.as_ref().and_then(|s| s.best_error)
+    }
+
+    /// The carrier currently in flight / that won (for `call.active_route`).
+    pub fn active_route(&self) -> Option<&crate::lcr::Route> {
+        self.route_sequence.as_ref().and_then(|s| s.active.as_ref())
+    }
+
+    /// Call-level send-socket pin applied to every sequential attempt.
+    pub fn route_send_socket(&self) -> Option<&str> {
+        self.route_sequence
+            .as_ref()
+            .and_then(|s| s.send_socket.as_deref())
+    }
+
+    /// Ring timeout for a route: its own `timeout_secs`, else the sequence
+    /// default, else 30s.
+    pub fn route_timeout(&self, route: &crate::lcr::Route) -> u32 {
+        route.timeout_secs.unwrap_or_else(|| {
+            self.route_sequence
+                .as_ref()
+                .map(|s| s.default_timeout)
+                .unwrap_or(30)
+        })
+    }
+
+    /// Number of not-yet-tried carriers (leak-test accessor).
+    #[cfg(test)]
+    pub fn pending_route_len(&self) -> usize {
+        self.route_sequence
+            .as_ref()
+            .map(|s| s.pending.len())
+            .unwrap_or(0)
     }
 
     /// Which leg an in-dialog request (re-INVITE / UPDATE / BYE) arrived on,
@@ -1454,6 +1557,72 @@ impl CallActorStore {
         }
     }
 
+    /// Begin a sequential route/failover sequence for a call.
+    pub fn start_route_sequence(&self, call_id: &str, sequence: RouteSequenceState) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.route_sequence = Some(sequence);
+        }
+    }
+
+    /// Pop the next carrier for a call's failover queue (marks it active).
+    pub fn take_next_route(&self, call_id: &str) -> Option<crate::lcr::Route> {
+        self.calls.get_mut(call_id)?.take_next_route()
+    }
+
+    /// Record a failed attempt's status code for a call's failover sequence.
+    pub fn record_route_failure(&self, call_id: &str, status_code: u16) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.record_route_failure(status_code);
+        }
+    }
+
+    /// Whether a call has more carriers to try in its failover queue.
+    pub fn has_pending_routes(&self, call_id: &str) -> bool {
+        self.calls
+            .get(call_id)
+            .is_some_and(|call| call.has_pending_routes())
+    }
+
+    /// Mark every not-yet-settled B-leg (Trying/Ringing) as Cancelled — used
+    /// when a failover-advance CANCELs the in-flight carrier, so that carrier's
+    /// stray `487 Request Terminated` is absorbed rather than mistaken for a
+    /// fresh carrier failure (which would trigger another advance).
+    pub fn mark_active_b_legs_cancelled(&self, call_id: &str) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            for status in call.b_leg_status.iter_mut() {
+                if matches!(status, BLegStatus::Trying | BLegStatus::Ringing) {
+                    *status = BLegStatus::Cancelled;
+                }
+            }
+        }
+    }
+
+    /// Whether a call is running a sequential route/failover sequence.
+    pub fn is_route_sequence(&self, call_id: &str) -> bool {
+        self.calls
+            .get(call_id)
+            .is_some_and(|call| call.is_route_sequence())
+    }
+
+    /// The best (highest-priority) error across a call's exhausted attempts.
+    pub fn best_route_error(&self, call_id: &str) -> Option<u16> {
+        self.calls.get(call_id).and_then(|call| call.best_route_error())
+    }
+
+    /// The carrier route currently in flight / that won, cloned.
+    pub fn active_route(&self, call_id: &str) -> Option<crate::lcr::Route> {
+        self.calls
+            .get(call_id)
+            .and_then(|call| call.active_route().cloned())
+    }
+
+    /// The call-level send-socket pin for a call's sequential attempts, cloned.
+    pub fn route_send_socket(&self, call_id: &str) -> Option<String> {
+        self.calls
+            .get(call_id)
+            .and_then(|call| call.route_send_socket().map(String::from))
+    }
+
     /// Store the original A-leg INVITE.
     pub fn set_a_leg_invite(&self, call_id: &str, message: Arc<Mutex<SipMessage>>) {
         if let Some(mut call) = self.calls.get_mut(call_id) {
@@ -2061,6 +2230,77 @@ mod tests {
                 local_addr: None,
             },
         )
+    }
+
+    fn lcr_route(carrier: &str) -> crate::lcr::Route {
+        crate::lcr::Route {
+            carrier_id: carrier.to_string(),
+            next_hop: Some(format!("sip:{carrier}.example:5060")),
+            ..Default::default()
+        }
+    }
+
+    // --- LCR sequential-failover state tests ---
+
+    #[test]
+    fn route_sequence_pops_in_order_and_drains() {
+        let mut actor = CallActor::new(make_a_leg());
+        actor.route_sequence = Some(RouteSequenceState {
+            pending: [lcr_route("a"), lcr_route("b"), lcr_route("c")]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+        assert_eq!(actor.pending_route_len(), 3);
+        assert!(actor.has_pending_routes());
+        assert!(actor.is_route_sequence());
+
+        let first = actor.take_next_route().expect("first carrier");
+        assert_eq!(first.carrier_id, "a");
+        // The popped carrier becomes the active (in-flight) route.
+        assert_eq!(
+            actor.active_route().map(|route| route.carrier_id.as_str()),
+            Some("a")
+        );
+        assert_eq!(actor.pending_route_len(), 2);
+
+        assert_eq!(actor.take_next_route().unwrap().carrier_id, "b");
+        assert_eq!(actor.take_next_route().unwrap().carrier_id, "c");
+        assert!(!actor.has_pending_routes());
+        assert!(actor.take_next_route().is_none());
+        // Active stays at the last carrier tried (the winner after a 2xx).
+        assert_eq!(
+            actor.active_route().map(|route| route.carrier_id.as_str()),
+            Some("c")
+        );
+    }
+
+    #[test]
+    fn record_route_failure_keeps_highest_priority() {
+        let mut actor = CallActor::new(make_a_leg());
+        actor.route_sequence = Some(RouteSequenceState::default());
+        actor.record_route_failure(486);
+        assert_eq!(actor.best_route_error(), Some(486));
+        // 5xx outranks 4xx.
+        actor.record_route_failure(503);
+        assert_eq!(actor.best_route_error(), Some(503));
+        // A later lower-priority 404 does not displace the 503.
+        actor.record_route_failure(404);
+        assert_eq!(actor.best_route_error(), Some(503));
+        // 6xx outranks everything.
+        actor.record_route_failure(603);
+        assert_eq!(actor.best_route_error(), Some(603));
+    }
+
+    #[test]
+    fn non_sequential_call_has_no_route_state() {
+        let mut actor = CallActor::new(make_a_leg());
+        assert!(!actor.is_route_sequence());
+        assert!(!actor.has_pending_routes());
+        assert!(actor.take_next_route().is_none());
+        assert_eq!(actor.best_route_error(), None);
+        assert!(actor.active_route().is_none());
+        assert_eq!(actor.pending_route_len(), 0);
     }
 
     // --- Leg tests ---

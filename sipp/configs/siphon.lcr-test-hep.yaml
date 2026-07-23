@@ -1,0 +1,32 @@
+# siphon config for the LCR failover SIPp test WITH HEP tracing — used by
+# scripts/lcr_sipp_test.sh in PCAP mode (scripts/hep_to_pcap.py turns the HEP
+# feed into a real pcap). Same as siphon.lcr-test.yaml plus tracing.hep.
+
+listen:
+  udp:
+    - "127.0.0.1:5060"
+
+domain:
+  local:
+    - "127.0.0.1"
+
+advertised_address: "127.0.0.1"
+
+script:
+  path: "scripts/lcr_test.py"
+
+lcr:
+  api_url: "http://127.0.0.1:8088/route"
+  timeout_ms: 2000
+  reroute_causes: [408, 500, 502, 503, 504]
+
+# HEP (Homer) SIP-message trace → the local hep_to_pcap.py bridge on 9060.
+tracing:
+  hep:
+    endpoint: "127.0.0.1:9060"
+    version: 3
+    transport: udp
+    agent_id: "siphon-lcr"
+
+log:
+  level: info

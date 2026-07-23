@@ -917,6 +917,63 @@ impl SiphonServer {
                 manager
             });
 
+        // Least-Cost Routing (LCR) HTTP client — backs the B2BUA-only
+        // `lcr.route(...)` namespace. Registered BEFORE the script engine so a
+        // script's top-level `from siphon import lcr` resolves to the real
+        // namespace (not the import stub). The API owns the cost decision;
+        // siphon caches it and executes the ordered route set against the
+        // gateway health/failover machinery.
+        if let Some(ref lcr_config) = config.lcr {
+            // The LCR client keeps its own CacheManager over the same `cache:`
+            // config. Its L2 (Redis) is shared by key with every replica, so a
+            // decision cached on one node is reused fleet-wide; only the L1 LRU
+            // is process-local (fine — the `lcr` cache isn't touched via the
+            // `cache` namespace).
+            let (cache_handle, cache_name) = match lcr_config.cache.as_ref() {
+                Some(name) => {
+                    let manager = Arc::new(crate::cache::CacheManager::new(
+                        config.cache.as_deref().unwrap_or(&[]),
+                    ));
+                    if manager.has_cache(name) {
+                        (Some(manager), Some(name.clone()))
+                    } else {
+                        tracing::warn!(
+                            cache = %name,
+                            "lcr.cache names an unconfigured cache — LCR decisions won't be cached",
+                        );
+                        (None, None)
+                    }
+                }
+                None => (None, None),
+            };
+            let lcr_client = Arc::new(crate::lcr::LcrClient::new(
+                lcr_config.api_url.clone(),
+                lcr_config.timeout_ms,
+                lcr_config.auth_header.clone(),
+                cache_handle,
+                cache_name,
+                lcr_config.cache_ttl_secs,
+                lcr_config.fallback_gateway_group.clone(),
+            ));
+            // Install the process-wide reroute-cause set (the generic level).
+            let reroute_causes = lcr_config
+                .reroute_causes
+                .clone()
+                .map(|codes| codes.into_iter().collect())
+                .unwrap_or_else(crate::lcr::default_reroute_causes);
+            crate::lcr::set_global_reroute_causes(reroute_causes);
+            pyo3::Python::attach(|python| {
+                let py_lcr = crate::script::api::lcr::PyLcr::new(lcr_client);
+                if let Err(error) = crate::script::api::set_lcr_singleton(python, py_lcr) {
+                    error!("failed to store LCR singleton: {error}");
+                }
+            });
+            info!(
+                api_url = %lcr_config.api_url,
+                "LCR client initialized and exposed to Python (B2BUA-only)",
+            );
+        }
+
         // --- Script engine ---
         let engine = if let Some(bytecode) = self.embedded_bytecode {
             Arc::new(ScriptEngine::new_from_bytecode(bytecode).unwrap_or_else(|error| {
@@ -2361,7 +2418,8 @@ fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {
         manager.add_group(
             DispatcherGroup::new(group_config.name.clone(), algorithm, destinations)
                 .with_probe_config(probe)
-                .with_source_networks(source_networks),
+                .with_source_networks(source_networks)
+                .with_reroute_causes(group_config.reroute_causes.clone()),
         );
     }
 

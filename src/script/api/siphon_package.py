@@ -630,6 +630,25 @@ class _SubscribeStateStub:
         raise NotImplementedError(self._ERROR.format(name="local_count"))
 
 
+class _LcrNamespace:
+    """Stub for the ``lcr`` namespace — B2BUA-only Least-Cost Routing.
+
+    The real, Rust-backed namespace is installed by ``install_siphon_module()``
+    when the top-level ``lcr:`` block is configured. Reaching this stub means
+    either ``lcr:`` is not configured or the singleton wasn't registered before
+    the script loaded; the method below raises a self-describing error.
+    """
+
+    _ERROR = (
+        "lcr.{name}() not available — configure the top-level `lcr:` block in "
+        "siphon.yaml (api_url, …). LCR is B2BUA-only; call it from "
+        "@b2bua.on_invite."
+    )
+
+    async def route(self, call, trunk_group=None, attributes=None):
+        raise NotImplementedError(self._ERROR.format(name="route"))
+
+
 # ---------------------------------------------------------------------------
 # Module-level singletons
 # ---------------------------------------------------------------------------
@@ -644,6 +663,7 @@ rtpengine = _RtpEngineNamespace()
 gateway = _GatewayNamespace()
 registration = _RegistrationNamespace()
 li = _LiNamespace()
+lcr = _LcrNamespace()
 
 
 # ---------------------------------------------------------------------------
