@@ -8,12 +8,31 @@ whole thing and adapt it.
 Every recipe is grounded in a real script in the repo (linked at the bottom of each
 page); none of the APIs here are invented.
 
+## What SIPhon does, and what's yours
+
+SIPhon is open source (MIT) and free to run in production. It gives you the
+protocol side: the transports, the RFC 3261 transaction and dialog state
+machines, the registrar, media control. The parts that take years to get right
+and tend to break at 3am.
+
+What it deliberately doesn't do is your business logic. The LCR cost decision,
+the LNP dip, which carrier wins tonight, how your customers map onto trunks. That
+stays yours. That's the whole promise: the hard protocol parts are handled so you
+spend your time on the logic that's actually specific to you. Wherever a recipe
+needs your data, it leaves you a small function to fill in.
+
+If you'd rather not build or run that integration alone, commercial support is
+available from [Real Time Telecom](../support.md).
+
 ## The recipes
 
 | Recipe | What you build | Key ideas |
 |---|---|---|
 | [Registrar](registrar.md) | A SIP registrar with digest auth | `auth.require_digest`, `registrar.save`/`lookup`, NAT fixups |
 | [Stateful proxy](proxy.md) | A residential/edge proxy | `request.fork`, `loose_route`, `record_route`, sanity checks |
+| [SIP & SDP manipulation](manipulation.md) | Header/SDP rewrite at a boundary (HMR) | `set_header`/`remove_headers_matching`, `re`, the `sdp` namespace |
+| [Number routing](number-routing.md) | LNP correction + a redirect (3xx) server | `set_ruri` (`rn`/`npdi`), `add_reply_header`, `reply(3xx)` |
+| [Quick recipes](snippets.md) | Common one-off building blocks | scanner drop, `from_gateway`, `rate_limit`, prefix routing |
 | [Load balancer](load-balancer.md) | A front LB over a backend pool | `gateway.select`, health probing, subscriber affinity |
 | [Least-Cost Routing](least-cost-routing.md) | Carrier LCR driven by an external API | `lcr.route`, `call.route` sequential failover, gateway pools, CDR |
 | [SBC (B2BUA)](sbc.md) | A topology-hiding SBC with media | `@b2bua.*`, `call.dial`/`fork`, **header policies**, RTPEngine |

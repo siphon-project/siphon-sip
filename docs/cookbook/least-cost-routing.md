@@ -214,11 +214,20 @@ The JSON contract is in [the LCR API reference](../reference/lcr-api.md); the
 typed models operators build against ship in the `siphon-sip` SDK
 (`from siphon_sdk.lcr import LcrRequest, LcrResponse, Route`).
 
-## Charging (coming with Ro)
+## Charging
 
-Today the winning carrier flows into the **CDR** via `cdr.write(call,
-extra={...})` (shown above) — `carrier_id`, `rate`, `currency`. Auto-stamping
-the carrier onto the **Rf** offline record (`outgoing-trunk-group-id`) and
-**Ro** online credit teardown (drop the call when the OCS refuses further
-credit) build on the B2BUA teardown hook and land once online charging merges.
-Because LCR is B2BUA-only, that teardown path is available to it when it ships.
+The carrier that won is on `call.active_route` (a `Route`: `carrier_id`,
+`gateway_group`, `rate`, `currency`), so it flows into all three charging paths:
+
+- **CDR.** Stamp it into the record, as in the `@b2bua.on_answer` handler above:
+  `cdr.write(call, extra={"carrier_id": route.carrier_id, "rate": ...})`.
+- **Rf offline.** Stamp the carrier's trunk group onto the offline record with
+  `call.set_charging_param("outgoing-trunk-group-id", route.gateway_group)`. The
+  Rf ACR auto-emit carries it as `Outgoing-Trunk-Group-Id` (TS 32.260).
+- **Ro online.** With the [`ro:` block](online-charging-ocs.md) enabled, SIPhon
+  reserves credit before connect, re-authorises mid-call, and drops the call when
+  the OCS refuses further credit (`4012 CREDIT_LIMIT_REACHED`). Because LCR is
+  B2BUA-only, that mid-call teardown applies to every LCR call.
+
+See the [Online charging (OCS)](online-charging-ocs.md) recipe for the full Ro
+setup (reserve-before-connect gate, re-auth timer, CGRateS).

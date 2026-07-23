@@ -933,6 +933,21 @@ class Request:
         if not self.has_header(name):
             self.set_header(name, value)
 
+    def remove_headers_matching(self, prefix: str) -> None:
+        """Remove all headers whose name starts with a prefix (case-insensitive).
+
+        Mirrors the production ``request.remove_headers_matching`` — e.g.
+        ``request.remove_headers_matching("X-")`` strips every custom header.
+
+        Args:
+            prefix: Header-name prefix (e.g. ``"X-"``).
+        """
+        prefix_lower = prefix.lower()
+        self._headers = {
+            k: v for k, v in self._headers.items()
+            if not k.lower().startswith(prefix_lower)
+        }
+
     def remove_from_header_list(self, name: str, value: str) -> None:
         """Remove one value from a comma-separated multi-value header.
 

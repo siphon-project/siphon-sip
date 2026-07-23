@@ -44,10 +44,14 @@ nav:
       - Overview: cookbook/index.md
       - Registrar: cookbook/registrar.md
       - Stateful proxy: cookbook/proxy.md
+      - SIP & SDP manipulation: cookbook/manipulation.md
+      - Quick recipes: cookbook/snippets.md
       - Load balancer: cookbook/load-balancer.md
+      - Least-Cost Routing: cookbook/least-cost-routing.md
       - SBC (B2BUA): cookbook/sbc.md
       - Call transfer (REFER): cookbook/call-transfer.md
       - Number normalization: cookbook/number-normalization.md
+      - Number routing (LNP / redirect): cookbook/number-routing.md
       - Media & RTP profiles: cookbook/media-rtp.md
       - Online charging (OCS): cookbook/online-charging-ocs.md
       - Hardening & security: cookbook/security.md
