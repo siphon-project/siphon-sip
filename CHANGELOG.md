@@ -7,6 +7,13 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **SDK: `Request.remove_headers_matching(prefix)`** in the `siphon-sip` mock,
+  mirroring the production request method (it was only on the `call` mock), so
+  script unit tests can exercise header-prefix stripping on a proxy request.
+- **Cookbook recipes: SIP & SDP manipulation (HMR), Number routing (LNP +
+  redirect server), and Quick recipes** (common-case snippets), plus a runnable
+  `examples/number_routing.py`. The existing Least-Cost Routing recipe is now
+  wired into the docs-site navigation.
 - **Least-Cost Routing (LCR) — B2BUA-only.** A new `lcr` scripting namespace
   (`await lcr.route(call)`) queries an external HTTP JSON API for an ordered
   carrier decision (the API owns cost/order; siphon is not a rating engine),
