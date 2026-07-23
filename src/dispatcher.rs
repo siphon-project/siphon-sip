@@ -10721,21 +10721,35 @@ fn handle_b2bua_response(
                 // the 1xx still reaches the A-leg.
             } else {
             // RFC 3262 §4 + RFC 3261 §12.1.2: a reliable provisional response
-            // establishes the early dialog, whose route set is THIS response's
-            // Record-Route reversed (UAC side). The confirmed-dialog route set
-            // isn't captured until the 200 OK, so without this the PRACK is built
-            // with no Route header and sent to the cached INVITE next-hop (e.g. an
-            // IMS I-CSCF that doesn't Record-Route and rejects the in-dialog PRACK
-            // with 406). Establish it once (§12.1.2 — not updated by later
-            // responses), so build_b2bua_prack and resolve_in_dialog_destination
-            // both pick the route-set first hop (the S-CSCF).
+            // establishes the early dialog. Two things must be captured from it
+            // before the PRACK is built, because both are otherwise only filled
+            // from the 200 OK (which hasn't arrived yet at PRACK time):
+            //
+            //   * the early-dialog remote (To) tag — without it the PRACK's To
+            //     header carries no tag, so a strict UAS (e.g. an IMS S-CSCF)
+            //     rejects it with 481 Call/Transaction Does Not Exist;
+            //   * the early-dialog route set (THIS response's Record-Route
+            //     reversed, UAC side) — without it the PRACK is sent to the
+            //     cached INVITE next-hop and an I-CSCF that doesn't Record-Route
+            //     rejects it with 406.
+            //
+            // Establish both once (§12.1.2 — not updated by later responses), so
+            // build_b2bua_prack and resolve_in_dialog_destination see the tagged
+            // To and the route-set first hop (the S-CSCF). The 200 OK re-sets
+            // remote_tag to the same value later (confirmed dialog).
+            let early_to_tag = crate::b2bua::actor::extract_to_tag(message);
             let early_routes = uac_route_set_from_record_routes(
                 &message.headers.get_all("Record-Route").cloned().unwrap_or_default(),
             );
-            if !early_routes.is_empty() {
+            if early_to_tag.is_some() || !early_routes.is_empty() {
                 if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
                     if let Some(leg) = call.b_legs.get_mut(idx) {
-                        if leg.dialog.route_set.is_empty() {
+                        if leg.dialog.remote_tag.is_none() {
+                            if let Some(tag) = early_to_tag {
+                                leg.dialog.remote_tag = Some(tag);
+                            }
+                        }
+                        if leg.dialog.route_set.is_empty() && !early_routes.is_empty() {
                             leg.dialog.route_set = early_routes;
                         }
                     }

@@ -69,8 +69,19 @@ a=fmtp:101 0-15
 ]]>
   </send>
 
-  <!-- siphon (B2BUA, B-leg side) auto-PRACKs the reliable 183 -->
-  <recv request="PRACK" crlf="true" />
+  <!-- siphon (B2BUA, B-leg side) auto-PRACKs the reliable 183.  The PRACK MUST
+       carry the early-dialog To-tag from the 183 (RFC 3262 §4 — PRACK is
+       in-dialog); a strict IMS UAS 481s a tag-less PRACK.  check_it fails the
+       call if the To header has no matching tag. -->
+  <recv request="PRACK" crlf="true">
+    <action>
+      <ereg regexp="tag=[0-9]+SIPpTag01[0-9]+" search_in="hdr" header="To:"
+            check_it="true" assign_to="prack_to_tag" />
+      <!-- SIPp requires an assigned variable to be referenced; the log both
+           satisfies that and records the matched early-dialog To-tag. -->
+      <log message="PRACK carries early-dialog To-tag [$prack_to_tag]" />
+    </action>
+  </recv>
 
   <send>
     <![CDATA[
