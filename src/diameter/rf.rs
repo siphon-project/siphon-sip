@@ -234,17 +234,14 @@ pub fn encode_acr_payload(
     }
 
     // Service-Information → IMS-Information (shared with Ro) and/or
-    // SMS-Information (TS 32.299 §7.2.79).  When both are set, two
-    // separate Service-Information envelopes are emitted; CDR collectors
-    // accept this and surface the SMS-Information on the SMS tab while
-    // IMS-Information still drives the call tab.  Most call sites pass
-    // exactly one of the two.
-    if let Some(ims) = params.ims_data {
-        payload.extend_from_slice(&ims.encode_service_information());
-    }
-    if let Some(sms) = params.sms_data {
-        payload.extend_from_slice(&sms.encode_service_information());
-    }
+    // SMS-Information (TS 32.299 §7.2.79).  TS 32.299 §7.2.87 allows at most
+    // ONE Service-Information per ACR, so when both are set they nest under a
+    // single envelope (IMS-Information on the call tab, SMS-Information on the
+    // SMS tab of a CDR collector).
+    payload.extend_from_slice(&crate::diameter::ro::encode_service_information(
+        params.ims_data,
+        params.sms_data,
+    ));
 
     payload
 }
@@ -300,7 +297,15 @@ pub async fn send_acr(
     );
     let answer = peer.send_request(wire).await?;
 
-    Ok(parse_aca(&answer.avps))
+    let mut parsed = parse_aca(&answer.avps);
+    // Session-Id continuity (RFC 6733 §9.8): the request Session-Id is
+    // authoritative for the whole START→INTERIM→STOP accounting session. If the
+    // CDF's ACA omits it, fall back to the request's so the caller can key
+    // INTERIM/STOP correctly instead of orphaning the session.
+    if parsed.session_id.is_none() {
+        parsed.session_id = Some(session_id.to_string());
+    }
+    Ok(parsed)
 }
 
 /// Send ACR-START (begin accounting session).  Record-Number is fixed at 0
@@ -1111,9 +1116,10 @@ mod tests {
 
     #[test]
     fn acr_can_carry_both_ims_and_sms() {
-        // Belt-and-braces hybrid record — when both ims_data and sms_data
-        // are set the encoder emits each under its own Service-Information
-        // envelope, so CDR collectors can surface either tab.
+        // Hybrid record — when both ims_data and sms_data are set the encoder
+        // nests IMS-Information and SMS-Information under a SINGLE
+        // Service-Information envelope (TS 32.299 §7.2.87 permits at most one),
+        // so a CDR collector surfaces both tabs from one record.
         let ims = ImsChargingData {
             sip_method: Some("MESSAGE".into()),
             node_functionality: Some(NodeFunctionality::ApplicationServer),
@@ -1148,16 +1154,23 @@ mod tests {
         );
         let decoded = decode_diameter(&wire).unwrap();
 
-        // Multiple Service-Information AVPs decode to an array
+        // Exactly one Service-Information, carrying BOTH IMS-Information and
+        // SMS-Information as sub-groups (not two separate envelopes).
         let svc = decoded
             .avps
             .get("Service-Information")
-            .expect("Service-Information array");
-        let entries = svc.as_array().expect("two Service-Information AVPs");
-        assert_eq!(entries.len(), 2);
-        let has_ims = entries.iter().any(|e| e.get("IMS-Information").is_some());
-        let has_sms = entries.iter().any(|e| e.get("SMS-Information").is_some());
-        assert!(has_ims, "IMS-Information envelope must be present");
-        assert!(has_sms, "SMS-Information envelope must be present");
+            .expect("Service-Information present");
+        assert!(
+            !svc.is_array(),
+            "must be a single Service-Information, not an array of envelopes"
+        );
+        assert!(
+            svc.get("IMS-Information").is_some(),
+            "IMS-Information must nest under the single Service-Information"
+        );
+        assert!(
+            svc.get("SMS-Information").is_some(),
+            "SMS-Information must nest under the single Service-Information"
+        );
     }
 }

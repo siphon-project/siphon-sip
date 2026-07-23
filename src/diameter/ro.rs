@@ -8,6 +8,7 @@
 //! | CCR/CCA | 272 | CTF → OCS | Credit control (INITIAL/UPDATE/TERMINATION/EVENT) |
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use tracing::info;
 
@@ -417,12 +418,43 @@ impl ImsChargingData {
         ims_inner
     }
 
-    /// Encode the full Service-Information → IMS-Information grouped AVP chain.
-    pub fn encode_service_information(&self) -> Vec<u8> {
-        let ims_info = self.encode_ims_information();
-        let ims_grouped = encode_avp_grouped_3gpp(avp::IMS_INFORMATION, &ims_info);
-        encode_avp_grouped_3gpp(avp::SERVICE_INFORMATION, &ims_grouped)
+    /// Encode just the `IMS-Information` (876) grouped AVP, ready to nest
+    /// inside a `Service-Information` envelope. `User-Session-Id` lives here,
+    /// as a child of IMS-Information (TS 32.299 §7.2.101) — not under
+    /// Service-Information directly.
+    pub fn encode_ims_information_avp(&self) -> Vec<u8> {
+        encode_avp_grouped_3gpp(avp::IMS_INFORMATION, &self.encode_ims_information())
     }
+
+    /// Encode the full `Service-Information → IMS-Information` grouped AVP
+    /// chain (IMS-only). For records that also carry SMS-Information, use the
+    /// free [`encode_service_information`] so both nest under one envelope.
+    pub fn encode_service_information(&self) -> Vec<u8> {
+        encode_avp_grouped_3gpp(avp::SERVICE_INFORMATION, &self.encode_ims_information_avp())
+    }
+}
+
+/// Encode a single `Service-Information` (873) grouped AVP carrying the
+/// `IMS-Information` and/or `SMS-Information` sub-groups. TS 32.299 §7.2.87
+/// permits at most **one** Service-Information per ACR/CCR, so a record with
+/// both IMS and SMS data must nest both under one envelope (the prior code
+/// emitted two separate Service-Information AVPs). Returns an empty vector when
+/// neither is supplied.
+pub fn encode_service_information(
+    ims: Option<&ImsChargingData>,
+    sms: Option<&SmsChargingData>,
+) -> Vec<u8> {
+    let mut inner = Vec::new();
+    if let Some(ims) = ims {
+        inner.extend_from_slice(&ims.encode_ims_information_avp());
+    }
+    if let Some(sms) = sms {
+        inner.extend_from_slice(&sms.encode_sms_information_avp());
+    }
+    if inner.is_empty() {
+        return Vec::new();
+    }
+    encode_avp_grouped_3gpp(avp::SERVICE_INFORMATION, &inner)
 }
 
 // ── SMS charging information ────────────────────────────────────────────
@@ -662,23 +694,20 @@ impl SmsChargingData {
         sms_inner
     }
 
-    /// Encode the full `Service-Information → SMS-Information` grouped
-    /// AVP chain.  `User-Session-Id` (when set) lives directly under
-    /// Service-Information alongside the SMS-Information envelope, the
-    /// same place IMS-Information puts it.
+    /// Encode just the `SMS-Information` (2000) grouped AVP, ready to nest
+    /// inside a `Service-Information` envelope.
+    pub fn encode_sms_information_avp(&self) -> Vec<u8> {
+        encode_avp_grouped_3gpp(avp::SMS_INFORMATION, &self.encode_sms_information())
+    }
+
+    /// Encode the full `Service-Information → SMS-Information` grouped AVP
+    /// chain (SMS-only). `User-Session-Id` is NOT emitted directly under
+    /// Service-Information — that placement is non-conformant (TS 32.299
+    /// §7.2.87 lists no such child) and a strict CDF rejects it; the top-level
+    /// `Session-Id` carries the correlation, and IMS-Information carries
+    /// `User-Session-Id` for hybrid records via [`encode_service_information`].
     pub fn encode_service_information(&self) -> Vec<u8> {
-        let sms_info = self.encode_sms_information();
-        let mut service_info = encode_avp_grouped_3gpp(avp::SMS_INFORMATION, &sms_info);
-        if let Some(ref session_id) = self.user_session_id {
-            service_info
-                .extend_from_slice(&encode_avp_utf8_3gpp(avp::USER_SESSION_ID, session_id));
-        }
-        let mut wrapped = Vec::with_capacity(service_info.len() + 16);
-        wrapped.extend_from_slice(&encode_avp_grouped_3gpp(
-            avp::SERVICE_INFORMATION,
-            &service_info,
-        ));
-        wrapped
+        encode_avp_grouped_3gpp(avp::SERVICE_INFORMATION, &self.encode_sms_information_avp())
     }
 }
 
@@ -687,12 +716,25 @@ impl SmsChargingData {
 /// Parsed Credit-Control-Answer from the OCS.
 #[derive(Debug, Clone)]
 pub struct CreditControlAnswer {
+    /// Effective Result-Code — command level, overridden by a non-success
+    /// per-service Result-Code inside Multiple-Services-Credit-Control
+    /// (RFC 8506 §5.1.2).
     pub result_code: u32,
     pub request_type: Option<u32>,
     pub request_number: Option<u32>,
+    /// Granted CC-Time (seconds) from Granted-Service-Unit — the quota to
+    /// consume before the next CCR-UPDATE.
     pub granted_time: Option<u32>,
     pub granted_total_octets: Option<u64>,
+    /// Validity-Time (seconds) — an absolute re-authorization deadline that
+    /// runs from CCA receipt regardless of usage (RFC 8506 §5.1.2).
     pub validity_time: Option<u32>,
+    /// Final-Unit-Action inside Final-Unit-Indication (0 = TERMINATE,
+    /// 1 = REDIRECT, 2 = RESTRICT_ACCESS) — present on the last grant.
+    pub final_unit_action: Option<u32>,
+    /// Session-Id echoed by the OCS (falls back to the request's for
+    /// continuity so UPDATE/TERMINATE key the same session).
+    pub session_id: Option<String>,
 }
 
 impl CreditControlAnswer {
@@ -701,13 +743,43 @@ impl CreditControlAnswer {
     }
 }
 
+/// Parse a CCA, reading grants from **both** the command level and inside
+/// Multiple-Services-Credit-Control (a 3GPP OCS returns Granted-Service-Unit,
+/// Validity-Time and Final-Unit-Indication inside MSCC — the prior parser saw
+/// only the command level and silently missed every MSCC grant).
 fn parse_cca(avps: &serde_json::Value) -> CreditControlAnswer {
-    let granted = avps.get("Granted-Service-Unit");
+    let command_result = avps
+        .get("Result-Code")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+
+    // MSCC may decode as an object or, with multiple instances, an array —
+    // take the first.
+    let mscc = avps.get("Multiple-Services-Credit-Control").map(|m| {
+        m.as_array().and_then(|a| a.first()).unwrap_or(m)
+    });
+
+    // Prefer the MSCC-level value, fall back to the command level.
+    let at_either = |name: &str| -> Option<&serde_json::Value> {
+        mscc.and_then(|m| m.get(name)).or_else(|| avps.get(name))
+    };
+    let granted = at_either("Granted-Service-Unit");
+    let fui = at_either("Final-Unit-Indication");
+
+    // A non-success per-service Result-Code inside MSCC overrides a
+    // command-level success (RFC 8506 §5.1.2) — e.g. command 2001 but MSCC
+    // 4012 credit-limit-reached.
+    let result_code = match mscc
+        .and_then(|m| m.get("Result-Code"))
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+    {
+        Some(rc) if command_result == dictionary::DIAMETER_SUCCESS && rc != dictionary::DIAMETER_SUCCESS => rc,
+        _ => command_result,
+    };
+
     CreditControlAnswer {
-        result_code: avps
-            .get("Result-Code")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32,
+        result_code,
         request_type: avps
             .get("CC-Request-Type")
             .and_then(|v| v.as_u64())
@@ -723,32 +795,62 @@ fn parse_cca(avps: &serde_json::Value) -> CreditControlAnswer {
         granted_total_octets: granted
             .and_then(|g| g.get("CC-Total-Octets"))
             .and_then(|v| v.as_u64()),
-        validity_time: avps
-            .get("Validity-Time")
+        validity_time: at_either("Validity-Time")
             .and_then(|v| v.as_u64())
             .map(|n| n as u32),
+        final_unit_action: fui
+            .and_then(|f| f.get("Final-Unit-Action"))
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32),
+        session_id: avps
+            .get("Session-Id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
     }
 }
 
 // ── CCR sender ──────────────────────────────────────────────────────────
+
+/// Default Service-Context-Id for IMS voice online charging (TS 32.260).
+pub const SERVICE_CONTEXT_ID_IMS: &str = "32260@3gpp.org";
+/// Service-Context-Id for SMS online charging (TS 32.274).
+pub const SERVICE_CONTEXT_ID_SMS: &str = "32274@3gpp.org";
+
+/// Multiple-Services-Indicator = MULTIPLE_SERVICES_SUPPORTED (RFC 8506 §8.40).
+const MSI_SUPPORTED: u32 = 1;
+/// Requested-Action = DIRECT_DEBITING (RFC 8506 §8.41) — IEC event charging.
+pub const REQUESTED_ACTION_DIRECT_DEBITING: u32 = 0;
 
 /// Full set of parameters for a Credit-Control-Request.
 pub struct CreditControlParams<'a> {
     pub request_type: CcRequestType,
     pub request_number: u32,
     pub subscriber: &'a SubscriberId,
+    /// Mandatory Service-Context-Id (RFC 8506 §8.42) — voice `32260@3gpp.org`,
+    /// SMS `32274@3gpp.org`, etc.
+    pub service_context_id: &'a str,
+    /// Session-Id for continuity. `Some` for UPDATE/TERMINATION (reuse the
+    /// INITIAL's); `None` mints a fresh one (INITIAL / EVENT).
+    pub session_id: Option<&'a str>,
     pub ims_data: Option<&'a ImsChargingData>,
+    /// SMS-Information for IEC SMS/RCS event charging.
+    pub sms_data: Option<&'a SmsChargingData>,
     pub requested_units: Option<&'a ServiceUnit>,
     pub used_units: Option<&'a ServiceUnit>,
     pub rating_group: Option<u32>,
     pub service_identifier: Option<u32>,
+    /// Requested-Action for one-time IEC events (e.g. DIRECT_DEBITING).
+    pub requested_action: Option<u32>,
+    /// Emit Multiple-Services-Indicator = SUPPORTED (set on CCR-INITIAL).
+    pub multiple_services_indicator: bool,
 }
 
 /// Send a Credit-Control-Request to the OCS.
 ///
 /// Per TS 32.299 §6.4.2, the CTF sends CCR at session start (INITIAL),
 /// during the session (UPDATE), at session end (TERMINATION), or for
-/// one-time events (EVENT).
+/// one-time events (EVENT). The returned answer carries the Session-Id used
+/// so the caller can thread UPDATE/TERMINATION onto the same session.
 pub async fn send_ccr(
     peer: &Arc<DiameterPeer>,
     params: &CreditControlParams<'_>,
@@ -756,10 +858,18 @@ pub async fn send_ccr(
     let config = peer.config();
     let hbh = peer.next_hbh();
     let e2e = peer.next_e2e();
-    let session_id = peer.new_session_id();
+    // Session-Id continuity: reuse the caller's (UPDATE/TERMINATION) or mint one.
+    let owned_session;
+    let session_id: &str = match params.session_id {
+        Some(id) => id,
+        None => {
+            owned_session = peer.new_session_id();
+            &owned_session
+        }
+    };
 
     let mut payload = Vec::with_capacity(512);
-    payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, &session_id));
+    payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, session_id));
     payload.extend_from_slice(&encode_avp_u32(avp::AUTH_APPLICATION_ID, dictionary::RO_APP_ID));
     payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, &config.origin_host));
     payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, &config.origin_realm));
@@ -767,6 +877,9 @@ pub async fn send_ccr(
     if let Some(ref host) = config.destination_host {
         payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, host));
     }
+
+    // Service-Context-Id (mandatory, RFC 8506 §8.42).
+    payload.extend_from_slice(&encode_avp_utf8(avp::SERVICE_CONTEXT_ID, params.service_context_id));
 
     payload.extend_from_slice(&encode_avp_u32(
         avp::CC_REQUEST_TYPE,
@@ -777,17 +890,23 @@ pub async fn send_ccr(
     // Subscription-Id
     payload.extend_from_slice(&params.subscriber.encode());
 
-    // Requested-Service-Unit
-    if let Some(rsu) = params.requested_units {
-        payload.extend_from_slice(&rsu.encode_as(avp::REQUESTED_SERVICE_UNIT));
+    // Event-Timestamp (RFC 6733 §8.21) — many OCS templates key on it.
+    payload.extend_from_slice(&encode_avp_time(avp::EVENT_TIMESTAMP, SystemTime::now()));
+
+    if params.multiple_services_indicator {
+        payload.extend_from_slice(&encode_avp_u32(
+            avp::MULTIPLE_SERVICES_INDICATOR,
+            MSI_SUPPORTED,
+        ));
+    }
+    if let Some(action) = params.requested_action {
+        payload.extend_from_slice(&encode_avp_u32(avp::REQUESTED_ACTION, action));
     }
 
-    // Used-Service-Unit
-    if let Some(usu) = params.used_units {
-        payload.extend_from_slice(&usu.encode_as(avp::USED_SERVICE_UNIT));
-    }
-
-    // Multiple-Services-Credit-Control wrapper for Rating-Group/Service-Identifier
+    // Service units go EITHER inside one Multiple-Services-Credit-Control (when
+    // Rating-Group / Service-Identifier make this multi-service, i.e. SCUR) OR
+    // at command level (single-service, e.g. an IEC event) — never both
+    // (RFC 8506 §5.1.2).
     if params.rating_group.is_some() || params.service_identifier.is_some() {
         let mut mscc = Vec::new();
         if let Some(rg) = params.rating_group {
@@ -799,16 +918,26 @@ pub async fn send_ccr(
         if let Some(rsu) = params.requested_units {
             mscc.extend_from_slice(&rsu.encode_as(avp::REQUESTED_SERVICE_UNIT));
         }
-        payload.extend_from_slice(&encode_avp_grouped_3gpp(
+        if let Some(usu) = params.used_units {
+            mscc.extend_from_slice(&usu.encode_as(avp::USED_SERVICE_UNIT));
+        }
+        // MSCC is base RFC 8506 code 456 (vendor 0) — no vendor flag.
+        payload.extend_from_slice(&encode_avp_grouped(
             avp::MULTIPLE_SERVICES_CREDIT_CONTROL,
             &mscc,
         ));
+    } else {
+        if let Some(rsu) = params.requested_units {
+            payload.extend_from_slice(&rsu.encode_as(avp::REQUESTED_SERVICE_UNIT));
+        }
+        if let Some(usu) = params.used_units {
+            payload.extend_from_slice(&usu.encode_as(avp::USED_SERVICE_UNIT));
+        }
     }
 
-    // Service-Information → IMS-Information
-    if let Some(ims) = params.ims_data {
-        payload.extend_from_slice(&ims.encode_service_information());
-    }
+    // A single Service-Information carrying IMS-Information and/or
+    // SMS-Information (IEC SMS/RCS).
+    payload.extend_from_slice(&encode_service_information(params.ims_data, params.sms_data));
 
     let wire = encode_diameter_message(
         FLAG_REQUEST | FLAG_PROXIABLE,
@@ -822,14 +951,22 @@ pub async fn send_ccr(
     info!(
         session = %session_id,
         request_type = %params.request_type.label(),
+        request_number = params.request_number,
         "Ro: sending CCR"
     );
     let answer = peer.send_request(wire).await?;
 
-    Ok(parse_cca(&answer.avps))
+    let mut parsed = parse_cca(&answer.avps);
+    // Session-Id continuity: fall back to the request's if the OCS omitted it.
+    if parsed.session_id.is_none() {
+        parsed.session_id = Some(session_id.to_string());
+    }
+    Ok(parsed)
 }
 
-/// Send CCR-Initial (start of charging session).
+/// Send CCR-Initial (start of charging session) with the IMS voice service
+/// context and a freshly minted Session-Id. For full control (Session-Id
+/// continuity, Rating-Group, SMS context) call [`send_ccr`] directly.
 pub async fn send_ccr_initial(
     peer: &Arc<DiameterPeer>,
     subscriber: &SubscriberId,
@@ -842,21 +979,28 @@ pub async fn send_ccr_initial(
             request_type: CcRequestType::Initial,
             request_number: 0,
             subscriber,
+            service_context_id: SERVICE_CONTEXT_ID_IMS,
+            session_id: None,
             ims_data,
+            sms_data: None,
             requested_units,
             used_units: None,
             rating_group: None,
             service_identifier: None,
+            requested_action: None,
+            multiple_services_indicator: true,
         },
     )
     .await
 }
 
-/// Send CCR-Termination (end of charging session).
+/// Send CCR-Termination (end of charging session). Pass the INITIAL's
+/// `session_id` for continuity.
 pub async fn send_ccr_termination(
     peer: &Arc<DiameterPeer>,
     subscriber: &SubscriberId,
     request_number: u32,
+    session_id: Option<&str>,
     ims_data: Option<&ImsChargingData>,
     used_units: Option<&ServiceUnit>,
 ) -> Result<CreditControlAnswer, String> {
@@ -866,21 +1010,29 @@ pub async fn send_ccr_termination(
             request_type: CcRequestType::Termination,
             request_number,
             subscriber,
+            service_context_id: SERVICE_CONTEXT_ID_IMS,
+            session_id,
             ims_data,
+            sms_data: None,
             requested_units: None,
             used_units,
             rating_group: None,
             service_identifier: None,
+            requested_action: None,
+            multiple_services_indicator: false,
         },
     )
     .await
 }
 
-/// Send CCR-Event (one-shot event charging, e.g., registration or MESSAGE).
+/// Send CCR-Event (one-shot IEC event charging, e.g. SMS/RCS DIRECT_DEBITING).
 pub async fn send_ccr_event(
     peer: &Arc<DiameterPeer>,
     subscriber: &SubscriberId,
+    service_context_id: &str,
     ims_data: Option<&ImsChargingData>,
+    sms_data: Option<&SmsChargingData>,
+    requested_action: Option<u32>,
 ) -> Result<CreditControlAnswer, String> {
     send_ccr(
         peer,
@@ -888,11 +1040,16 @@ pub async fn send_ccr_event(
             request_type: CcRequestType::Event,
             request_number: 0,
             subscriber,
+            service_context_id,
+            session_id: None,
             ims_data,
+            sms_data,
             requested_units: None,
             used_units: None,
             rating_group: None,
             service_identifier: None,
+            requested_action,
+            multiple_services_indicator: false,
         },
     )
     .await
@@ -1351,6 +1508,125 @@ mod tests {
         assert!(answer.validity_time.is_none());
     }
 
+    #[test]
+    fn cca_grant_inside_mscc() {
+        // A 3GPP OCS (and CGRateS in 3GPP-template mode) returns the grant
+        // inside Multiple-Services-Credit-Control — the prior parser read only
+        // the command level and missed it entirely.
+        let json = serde_json::json!({
+            "Result-Code": 2001,
+            "CC-Request-Type": 1,
+            "Multiple-Services-Credit-Control": {
+                "Granted-Service-Unit": { "CC-Time": 30 },
+                "Validity-Time": 60
+            }
+        });
+        let answer = parse_cca(&json);
+        assert!(answer.is_success());
+        assert_eq!(answer.granted_time, Some(30), "grant must be read from inside MSCC");
+        assert_eq!(answer.validity_time, Some(60));
+    }
+
+    #[test]
+    fn cca_mscc_result_overrides_command_success() {
+        // Command-level 2001 but a per-service 4012 inside MSCC means the
+        // service was denied (RFC 8506 §5.1.2).
+        let json = serde_json::json!({
+            "Result-Code": 2001,
+            "Multiple-Services-Credit-Control": { "Result-Code": 4012 }
+        });
+        let answer = parse_cca(&json);
+        assert!(!answer.is_success());
+        assert_eq!(answer.result_code, 4012);
+    }
+
+    #[test]
+    fn cca_final_unit_action_terminate_inside_mscc() {
+        let json = serde_json::json!({
+            "Result-Code": 2001,
+            "Multiple-Services-Credit-Control": {
+                "Granted-Service-Unit": { "CC-Time": 10 },
+                "Final-Unit-Indication": { "Final-Unit-Action": 0 }
+            }
+        });
+        let answer = parse_cca(&json);
+        assert_eq!(answer.granted_time, Some(10), "final grant still consumed");
+        assert_eq!(answer.final_unit_action, Some(0), "TERMINATE (0)");
+    }
+
+    #[test]
+    fn credit_control_avps_use_rfc8506_codes_on_the_wire() {
+        // Raw known-answer (independent of the dictionary name mapping): the
+        // first 4 octets of each encoded AVP are its RFC 8506 code. This is the
+        // byte-level gate that a real OCS parses.
+        let code_of = |bytes: &[u8]| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        assert_eq!(code_of(&encode_avp_u32(avp::CC_TIME, 30)), 420, "CC-Time");
+        assert_eq!(
+            code_of(&encode_avp_grouped(avp::GRANTED_SERVICE_UNIT, &[])),
+            431,
+            "Granted-Service-Unit"
+        );
+        assert_eq!(
+            code_of(&encode_avp_grouped(avp::MULTIPLE_SERVICES_CREDIT_CONTROL, &[])),
+            456,
+            "Multiple-Services-Credit-Control (base, vendor 0)"
+        );
+        assert_eq!(code_of(&encode_avp_u32(avp::RATING_GROUP, 1)), 432, "Rating-Group");
+        assert_eq!(
+            code_of(&encode_avp_u32(avp::FINAL_UNIT_ACTION, 0)),
+            449,
+            "Final-Unit-Action"
+        );
+        assert_eq!(
+            code_of(&encode_avp_utf8(avp::SERVICE_CONTEXT_ID, SERVICE_CONTEXT_ID_IMS)),
+            461,
+            "Service-Context-Id"
+        );
+    }
+
+    #[test]
+    fn scur_ccr_nests_units_in_a_single_mscc() {
+        // When Rating-Group is present the units go inside one MSCC (SCUR),
+        // never at command level (RFC 8506 §5.1.2). Build the payload the way
+        // send_ccr does and decode it back.
+        let mut mscc = Vec::new();
+        mscc.extend_from_slice(&encode_avp_u32(avp::RATING_GROUP, 100));
+        let rsu = ServiceUnit { time_seconds: Some(30), ..Default::default() };
+        mscc.extend_from_slice(&rsu.encode_as(avp::REQUESTED_SERVICE_UNIT));
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "ro;kat;1"));
+        payload.extend_from_slice(&encode_avp_utf8(avp::SERVICE_CONTEXT_ID, SERVICE_CONTEXT_ID_IMS));
+        payload.extend_from_slice(&encode_avp_u32(avp::CC_REQUEST_TYPE, 1));
+        payload.extend_from_slice(&encode_avp_grouped(avp::MULTIPLE_SERVICES_CREDIT_CONTROL, &mscc));
+        let wire = encode_diameter_message(
+            FLAG_REQUEST | FLAG_PROXIABLE,
+            dictionary::CMD_CREDIT_CONTROL,
+            dictionary::RO_APP_ID,
+            1,
+            2,
+            &payload,
+        );
+        let decoded = decode_diameter(&wire).unwrap();
+        assert_eq!(
+            decoded.avps.get("Service-Context-Id").and_then(|v| v.as_str()),
+            Some(SERVICE_CONTEXT_ID_IMS)
+        );
+        // Units are inside the MSCC, not at command level.
+        assert!(decoded.avps.get("Requested-Service-Unit").is_none());
+        let mscc_decoded = decoded
+            .avps
+            .get("Multiple-Services-Credit-Control")
+            .expect("MSCC present");
+        assert_eq!(mscc_decoded.get("Rating-Group").and_then(|v| v.as_u64()), Some(100));
+        assert_eq!(
+            mscc_decoded
+                .get("Requested-Service-Unit")
+                .and_then(|r| r.get("CC-Time"))
+                .and_then(|v| v.as_u64()),
+            Some(30)
+        );
+    }
+
     // ── CCR wire-format roundtrip ───────────────────────────────────────
 
     /// Helper: build a CCR on the wire for testing (bypasses peer).
@@ -1631,10 +1907,13 @@ mod tests {
             Some("term.example.com")
         );
 
-        // User-Session-Id sits at Service-Information level (not inside SMS-Information)
-        assert_eq!(
-            svc_info.get("User-Session-Id").and_then(|v| v.as_str()),
-            Some("call-id-abc-123")
+        // User-Session-Id must NOT sit directly under Service-Information —
+        // that placement is non-conformant (TS 32.299 §7.2.87 lists no such
+        // child) and a strict CDF rejects it. Correlation is via the top-level
+        // Session-Id; IMS-Information carries User-Session-Id for hybrid records.
+        assert!(
+            svc_info.get("User-Session-Id").is_none(),
+            "User-Session-Id must not be a direct child of Service-Information"
         );
     }
 

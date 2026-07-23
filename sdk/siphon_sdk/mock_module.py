@@ -3495,6 +3495,13 @@ class MockDiameter:
         self._default_rf_interim_interval: Optional[int] = None
         self._rf_session_counter: int = 0
         self._rf_acrs: list[dict] = []  # captured ACRs for assertions
+        # Ro (CTF → OCS) — RFC 8506 / TS 32.299 online charging
+        self._default_ro_result_code: int = 2001
+        self._default_ro_granted_time: Optional[int] = 30
+        self._default_ro_validity_time: Optional[int] = None
+        self._default_ro_final_unit_action: Optional[int] = None
+        self._ro_session_counter: int = 0
+        self._ro_ccrs: list[dict] = []  # captured CCRs for assertions
 
     def is_connected(self, peer_name: str) -> bool:
         """Check if a Diameter peer is connected.
@@ -4033,6 +4040,222 @@ class MockDiameter:
         """Reset the captured-ACR list between tests."""
         self._rf_acrs.clear()
 
+    # -- Ro online charging (Credit-Control, RFC 8506 / TS 32.299) --
+
+    async def ro_ccr_initial(
+        self,
+        subscription_id: str,
+        *,
+        subscription_id_type: Optional[str] = None,
+        service_context_id: Optional[str] = None,
+        requested_seconds: Optional[int] = None,
+        rating_group: Optional[int] = None,
+        service_identifier: Optional[int] = None,
+        calling_party: Optional[str] = None,
+        called_party: Optional[str] = None,
+        sip_method: Optional[str] = None,
+        role_of_node: Optional[str] = None,
+        node_functionality: Optional[str] = None,
+        ims_charging_identifier: Optional[str] = None,
+        user_session_id: Optional[str] = None,
+        originating_ioi: Optional[str] = None,
+        terminating_ioi: Optional[str] = None,
+        application_server: Optional[str] = None,
+        application_provided_called_party_address: Optional[str] = None,
+        incoming_trunk_group_id: Optional[str] = None,
+        outgoing_trunk_group_id: Optional[str] = None,
+        visited_network_id: Optional[str] = None,
+        cause_code: Optional[int] = None,
+        peer: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Send a Ro CCR-INITIAL and return the CCA dict.
+
+        Returns ``{result_code, session_id, request_number, granted_time,
+        validity_time, final_unit_action}``. For SCUR, thread the returned
+        ``session_id`` through :meth:`ro_ccr_update` / :meth:`ro_ccr_terminate`.
+
+        Example:
+            answer = await diameter.ro_ccr_initial(
+                "+310000000001", requested_seconds=30, rating_group=100,
+                calling_party="sip:alice@ims", called_party="sip:bob@ims")
+            if answer["result_code"] != 2001:
+                call.reject(402, "Payment Required")
+        """
+        return self._record_ccr(
+            "INITIAL",
+            request_number=0,
+            subscription_id=subscription_id,
+            subscription_id_type=subscription_id_type,
+            service_context_id=service_context_id,
+            requested_seconds=requested_seconds,
+            rating_group=rating_group,
+            service_identifier=service_identifier,
+            calling_party=calling_party,
+            called_party=called_party,
+            sip_method=sip_method,
+            role_of_node=role_of_node,
+            node_functionality=node_functionality,
+            ims_charging_identifier=ims_charging_identifier,
+            user_session_id=user_session_id,
+            originating_ioi=originating_ioi,
+            terminating_ioi=terminating_ioi,
+            application_server=application_server,
+            application_provided_called_party_address=application_provided_called_party_address,
+            incoming_trunk_group_id=incoming_trunk_group_id,
+            outgoing_trunk_group_id=outgoing_trunk_group_id,
+            visited_network_id=visited_network_id,
+            cause_code=cause_code,
+            peer=peer,
+        )
+
+    async def ro_ccr_update(
+        self,
+        subscription_id: str,
+        session_id: str,
+        request_number: int,
+        *,
+        subscription_id_type: Optional[str] = None,
+        service_context_id: Optional[str] = None,
+        used_seconds: Optional[int] = None,
+        requested_seconds: Optional[int] = None,
+        rating_group: Optional[int] = None,
+        service_identifier: Optional[int] = None,
+        peer: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Send a Ro CCR-UPDATE reporting usage and requesting the next quota."""
+        return self._record_ccr(
+            "UPDATE",
+            session_id=session_id,
+            request_number=request_number,
+            subscription_id=subscription_id,
+            subscription_id_type=subscription_id_type,
+            service_context_id=service_context_id,
+            used_seconds=used_seconds,
+            requested_seconds=requested_seconds,
+            rating_group=rating_group,
+            service_identifier=service_identifier,
+            peer=peer,
+        )
+
+    async def ro_ccr_terminate(
+        self,
+        subscription_id: str,
+        session_id: str,
+        request_number: int,
+        *,
+        subscription_id_type: Optional[str] = None,
+        service_context_id: Optional[str] = None,
+        used_seconds: Optional[int] = None,
+        rating_group: Optional[int] = None,
+        service_identifier: Optional[int] = None,
+        peer: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Send a Ro CCR-TERMINATION closing the session with final usage."""
+        return self._record_ccr(
+            "TERMINATION",
+            session_id=session_id,
+            request_number=request_number,
+            subscription_id=subscription_id,
+            subscription_id_type=subscription_id_type,
+            service_context_id=service_context_id,
+            used_seconds=used_seconds,
+            rating_group=rating_group,
+            service_identifier=service_identifier,
+            peer=peer,
+        )
+
+    async def ro_ccr_event(
+        self,
+        subscription_id: str,
+        *,
+        subscription_id_type: Optional[str] = None,
+        service_context_id: Optional[str] = None,
+        requested_action: Optional[int] = None,
+        calling_party: Optional[str] = None,
+        called_party: Optional[str] = None,
+        node_functionality: Optional[str] = None,
+        user_session_id: Optional[str] = None,
+        originator_address: Optional[str] = None,
+        recipient_address: Optional[str] = None,
+        sm_message_type: Optional[int] = None,
+        sm_service_type: Optional[int] = None,
+        sms_node: Optional[int] = None,
+        data_coding_scheme: Optional[int] = None,
+        peer: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Send a one-shot Ro CCR-EVENT (IEC — SMS/RCS DIRECT_DEBITING).
+
+        Example:
+            answer = await diameter.ro_ccr_event(
+                "+310000000001", service_context_id="32274@3gpp.org",
+                originator_address="+310000000001",
+                recipient_address="+310000000002", sm_message_type=0)
+            if answer["result_code"] != 2001:
+                request.reply(402, "Payment Required")  # no balance
+        """
+        return self._record_ccr(
+            "EVENT",
+            request_number=0,
+            subscription_id=subscription_id,
+            subscription_id_type=subscription_id_type,
+            service_context_id=service_context_id,
+            requested_action=(
+                requested_action if requested_action is not None else 0
+            ),
+            calling_party=calling_party,
+            called_party=called_party,
+            node_functionality=node_functionality,
+            user_session_id=user_session_id,
+            originator_address=originator_address,
+            recipient_address=recipient_address,
+            sm_message_type=sm_message_type,
+            sm_service_type=sm_service_type,
+            sms_node=sms_node,
+            data_coding_scheme=data_coding_scheme,
+            peer=peer,
+        )
+
+    def _record_ccr(self, request_type: str, **kwargs) -> dict:
+        """Capture a CCR for assertions and synthesize a CCA dict."""
+        if request_type in ("INITIAL", "EVENT"):
+            self._ro_session_counter += 1
+            session_id = f"mock-ocs;ro;sess;{self._ro_session_counter}"
+        else:
+            session_id = kwargs.get("session_id") or "mock-ocs;ro;sess;1"
+        captured = {"request_type": request_type, "session_id": session_id, **kwargs}
+        self._ro_ccrs.append(captured)
+        success = self._default_ro_result_code == 2001
+        return {
+            "result_code": self._default_ro_result_code,
+            "session_id": session_id,
+            "request_number": kwargs.get("request_number") or 0,
+            "granted_time": self._default_ro_granted_time if success else None,
+            "validity_time": self._default_ro_validity_time if success else None,
+            "final_unit_action": self._default_ro_final_unit_action if success else None,
+        }
+
+    # Ro test helpers
+
+    def set_ro_result_code(self, code: int) -> None:
+        """Override the Result-Code returned by every Ro CCA (default 2001)."""
+        self._default_ro_result_code = code
+
+    def set_ro_granted_time(self, seconds: Optional[int]) -> None:
+        """Configure the granted CC-Time (seconds) returned in a successful CCA."""
+        self._default_ro_granted_time = seconds
+
+    def set_ro_final_unit_action(self, action: Optional[int]) -> None:
+        """Configure the Final-Unit-Action (0=TERMINATE) returned in the CCA."""
+        self._default_ro_final_unit_action = action
+
+    def captured_ccrs(self) -> list[dict]:
+        """Return all CCRs the script has emitted via ``ro_ccr_*`` (fresh copy)."""
+        return [dict(entry) for entry in self._ro_ccrs]
+
+    def clear_captured_ccrs(self) -> None:
+        """Reset the captured-CCR list between tests."""
+        self._ro_ccrs.clear()
+
 
     # -- Server-mode (accept inbound + dispatch to Python) --
 
@@ -4360,6 +4583,12 @@ class MockDiameter:
         self._default_rf_interim_interval = None
         self._rf_session_counter = 0
         self._rf_acrs.clear()
+        self._default_ro_result_code = 2001
+        self._default_ro_granted_time = 30
+        self._default_ro_validity_time = None
+        self._default_ro_final_unit_action = None
+        self._ro_session_counter = 0
+        self._ro_ccrs.clear()
 
 
 # ---------------------------------------------------------------------------

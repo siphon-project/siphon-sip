@@ -69,7 +69,11 @@ use crate::diameter::dictionary::{self, avp, AvpDef, AvpType};
 use crate::diameter::rf::{
     self, AccountingAnswer, AccountingParams, AccountingRecordType,
 };
-use crate::diameter::ro::{ImsChargingData, NodeFunctionality, NodeRole, SmsChargingData};
+use crate::diameter::ro::{
+    self, CcRequestType, CreditControlAnswer, CreditControlParams, ImsChargingData,
+    NodeFunctionality, NodeRole, ServiceUnit, SmsChargingData, SubscriberId,
+    REQUESTED_ACTION_DIRECT_DEBITING, SERVICE_CONTEXT_ID_IMS,
+};
 use crate::diameter::rx::extract_result_code;
 use crate::diameter::{DiameterClient, DiameterManager};
 
@@ -720,6 +724,53 @@ fn accounting_answer_to_dict<'py>(
     dict.set_item("session_id", session_id)?;
     dict.set_item("record_number", answer.record_number)?;
     dict.set_item("interim_interval", answer.interim_interval)?;
+    Ok(dict)
+}
+
+/// Build a `SubscriberId` from a Python `(id, type)` pair. `id_type` accepts
+/// ``"e164"``/``"msisdn"``, ``"imsi"``, or ``"sip"``/``"sipuri"``
+/// (case-insensitive). When omitted, the type is inferred from the data — a
+/// ``sip:``/``sips:``/``tel:`` URI becomes SIP-URI, everything else E.164 — so a
+/// SIP URI is never mislabeled as (and TBCD-mangled into) a phone number.
+fn build_subscriber(id: &str, id_type: Option<&str>) -> PyResult<SubscriberId> {
+    match id_type.map(str::to_ascii_lowercase).as_deref() {
+        Some("e164") | Some("msisdn") => Ok(SubscriberId::msisdn(id)),
+        Some("imsi") => Ok(SubscriberId::imsi(id)),
+        Some("sip") | Some("sipuri") | Some("sip_uri") => Ok(SubscriberId::sip_uri(id)),
+        None => {
+            let lower = id.to_ascii_lowercase();
+            if lower.starts_with("sip:") || lower.starts_with("sips:") || lower.starts_with("tel:") {
+                Ok(SubscriberId::sip_uri(id))
+            } else {
+                Ok(SubscriberId::msisdn(id))
+            }
+        }
+        Some(other) => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown subscription_id_type {other:?}; expected 'e164'/'imsi'/'sip'"
+        ))),
+    }
+}
+
+/// Optional `ServiceUnit` carrying `CC-Time` seconds (`None` when `secs` is
+/// `None` or 0).
+fn time_service_unit(secs: Option<u32>) -> Option<ServiceUnit> {
+    secs.filter(|s| *s > 0).map(|s| ServiceUnit {
+        time_seconds: Some(s),
+        ..Default::default()
+    })
+}
+
+fn credit_control_answer_to_dict<'py>(
+    python: Python<'py>,
+    answer: CreditControlAnswer,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(python);
+    dict.set_item("result_code", answer.result_code)?;
+    dict.set_item("session_id", answer.session_id)?;
+    dict.set_item("request_number", answer.request_number)?;
+    dict.set_item("granted_time", answer.granted_time)?;
+    dict.set_item("validity_time", answer.validity_time)?;
+    dict.set_item("final_unit_action", answer.final_unit_action)?;
     Ok(dict)
 }
 
@@ -2491,6 +2542,311 @@ impl PyDiameter {
                 Ok(None)
             }
         }
+    }
+
+    /// Send a Ro CCR-INITIAL (open a Credit-Control session, RFC 8506 / TS
+    /// 32.299). Returns ``{result_code, session_id, request_number,
+    /// granted_time, validity_time, final_unit_action}`` or ``None`` when no
+    /// OCS peer is connected. For SCUR the script threads the returned
+    /// ``session_id`` through :meth:`ro_ccr_update` / :meth:`ro_ccr_terminate`.
+    #[pyo3(signature = (
+        subscription_id, *, subscription_id_type=None,
+        service_context_id=None, requested_seconds=None,
+        rating_group=None, service_identifier=None,
+        calling_party=None, called_party=None, sip_method=None,
+        role_of_node=None, node_functionality=None,
+        ims_charging_identifier=None, user_session_id=None,
+        originating_ioi=None, terminating_ioi=None,
+        application_server=None, application_provided_called_party_address=None,
+        incoming_trunk_group_id=None, outgoing_trunk_group_id=None,
+        visited_network_id=None, cause_code=None, peer=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn ro_ccr_initial<'py>(
+        &self,
+        python: Python<'py>,
+        subscription_id: &str,
+        subscription_id_type: Option<&str>,
+        service_context_id: Option<&str>,
+        requested_seconds: Option<u32>,
+        rating_group: Option<u32>,
+        service_identifier: Option<u32>,
+        calling_party: Option<&str>,
+        called_party: Option<&str>,
+        sip_method: Option<&str>,
+        role_of_node: Option<&str>,
+        node_functionality: Option<&str>,
+        ims_charging_identifier: Option<&str>,
+        user_session_id: Option<&str>,
+        originating_ioi: Option<&str>,
+        terminating_ioi: Option<&str>,
+        application_server: Option<&str>,
+        application_provided_called_party_address: Option<&str>,
+        incoming_trunk_group_id: Option<&str>,
+        outgoing_trunk_group_id: Option<&str>,
+        visited_network_id: Option<&str>,
+        cause_code: Option<i32>,
+        peer: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // Build owned inputs up front, then `await` the OCS round-trip off the
+        // Python worker thread (a slow OCS must not pin the driver): the script
+        // does `await diameter.ro_ccr_initial(...)`.
+        let subscriber = build_subscriber(subscription_id, subscription_id_type)?;
+        let ims_data = build_ims_data(
+            calling_party, called_party, sip_method, role_of_node, node_functionality,
+            ims_charging_identifier, user_session_id, originating_ioi, terminating_ioi,
+            application_server, application_provided_called_party_address,
+            incoming_trunk_group_id, outgoing_trunk_group_id, visited_network_id, cause_code,
+        )?;
+        let requested = time_service_unit(requested_seconds);
+        let service_context_id = service_context_id.unwrap_or(SERVICE_CONTEXT_ID_IMS).to_string();
+        let peer_handle = self.pick_rf_peer(peer).map(|c| c.peer().clone());
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            let Some(peer_handle) = peer_handle else {
+                warn!("ro_ccr_initial: no Diameter peer connected");
+                return Python::attach(|py| Ok(py.None()));
+            };
+            let params = CreditControlParams {
+                request_type: CcRequestType::Initial,
+                request_number: 0,
+                subscriber: &subscriber,
+                service_context_id: &service_context_id,
+                session_id: None,
+                ims_data: ims_data.as_ref(),
+                sms_data: None,
+                requested_units: requested.as_ref(),
+                used_units: None,
+                rating_group,
+                service_identifier,
+                requested_action: None,
+                multiple_services_indicator: true,
+            };
+            match ro::send_ccr(&peer_handle, &params).await {
+                Ok(answer) => Python::attach(|py| {
+                    Ok(credit_control_answer_to_dict(py, answer)?.into_any().unbind())
+                }),
+                Err(error) => {
+                    warn!(error = %error, "ro_ccr_initial failed");
+                    Python::attach(|py| Ok(py.None()))
+                }
+            }
+        })
+    }
+
+    /// Send a Ro CCR-UPDATE for an existing session. `request_number` MUST be a
+    /// strictly increasing integer scoped to `session_id` (RFC 8506 §8.2).
+    #[pyo3(signature = (
+        subscription_id, session_id, request_number, *,
+        subscription_id_type=None, service_context_id=None,
+        used_seconds=None, requested_seconds=None,
+        rating_group=None, service_identifier=None, peer=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn ro_ccr_update<'py>(
+        &self,
+        python: Python<'py>,
+        subscription_id: &str,
+        session_id: &str,
+        request_number: u32,
+        subscription_id_type: Option<&str>,
+        service_context_id: Option<&str>,
+        used_seconds: Option<u32>,
+        requested_seconds: Option<u32>,
+        rating_group: Option<u32>,
+        service_identifier: Option<u32>,
+        peer: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.ro_ccr_continuation(
+            python,
+            CcRequestType::Update,
+            subscription_id,
+            subscription_id_type,
+            session_id,
+            request_number,
+            service_context_id,
+            used_seconds,
+            requested_seconds,
+            rating_group,
+            service_identifier,
+            peer,
+        )
+    }
+
+    /// Send a Ro CCR-TERMINATION closing a session and reporting final usage.
+    #[pyo3(signature = (
+        subscription_id, session_id, request_number, *,
+        subscription_id_type=None, service_context_id=None,
+        used_seconds=None, rating_group=None, service_identifier=None, peer=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn ro_ccr_terminate<'py>(
+        &self,
+        python: Python<'py>,
+        subscription_id: &str,
+        session_id: &str,
+        request_number: u32,
+        subscription_id_type: Option<&str>,
+        service_context_id: Option<&str>,
+        used_seconds: Option<u32>,
+        rating_group: Option<u32>,
+        service_identifier: Option<u32>,
+        peer: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        self.ro_ccr_continuation(
+            python,
+            CcRequestType::Termination,
+            subscription_id,
+            subscription_id_type,
+            session_id,
+            request_number,
+            service_context_id,
+            used_seconds,
+            None,
+            rating_group,
+            service_identifier,
+            peer,
+        )
+    }
+
+    /// Send a one-shot Ro CCR-EVENT (IEC — SMS/RCS DIRECT_DEBITING). No session
+    /// is opened; the answer's ``result_code`` is 2001 when debited.
+    #[pyo3(signature = (
+        subscription_id, *, subscription_id_type=None,
+        service_context_id=None, requested_action=None,
+        calling_party=None, called_party=None, node_functionality=None,
+        user_session_id=None,
+        originator_address=None, recipient_address=None,
+        sm_message_type=None, sm_service_type=None,
+        sms_node=None, data_coding_scheme=None, peer=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn ro_ccr_event<'py>(
+        &self,
+        python: Python<'py>,
+        subscription_id: &str,
+        subscription_id_type: Option<&str>,
+        service_context_id: Option<&str>,
+        requested_action: Option<u32>,
+        calling_party: Option<&str>,
+        called_party: Option<&str>,
+        node_functionality: Option<&str>,
+        user_session_id: Option<&str>,
+        originator_address: Option<&str>,
+        recipient_address: Option<&str>,
+        sm_message_type: Option<u32>,
+        sm_service_type: Option<u32>,
+        sms_node: Option<u32>,
+        data_coding_scheme: Option<i32>,
+        peer: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // Build owned inputs up front, then `await` the OCS round-trip
+        // (`await diameter.ro_ccr_event(...)`).
+        let subscriber = build_subscriber(subscription_id, subscription_id_type)?;
+        let ims_data = build_ims_data(
+            calling_party, called_party, None, None, node_functionality,
+            None, user_session_id, None, None, None, None, None, None, None, None,
+        )?;
+        let sms_data = build_sms_data(
+            originator_address, recipient_address, None, None,
+            sm_message_type, None, None, sm_service_type,
+            sms_node, None, None, None,
+            data_coding_scheme, None, None, None,
+            None, None, None, None,
+            None, None, user_session_id,
+        )?;
+        let service_context_id = service_context_id.unwrap_or(SERVICE_CONTEXT_ID_IMS).to_string();
+        let requested_action = requested_action.unwrap_or(REQUESTED_ACTION_DIRECT_DEBITING);
+        let peer_handle = self.pick_rf_peer(peer).map(|c| c.peer().clone());
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            let Some(peer_handle) = peer_handle else {
+                warn!("ro_ccr_event: no Diameter peer connected");
+                return Python::attach(|py| Ok(py.None()));
+            };
+            let params = CreditControlParams {
+                request_type: CcRequestType::Event,
+                request_number: 0,
+                subscriber: &subscriber,
+                service_context_id: &service_context_id,
+                session_id: None,
+                ims_data: ims_data.as_ref(),
+                sms_data: sms_data.as_ref(),
+                requested_units: None,
+                used_units: None,
+                rating_group: None,
+                service_identifier: None,
+                requested_action: Some(requested_action),
+                multiple_services_indicator: false,
+            };
+            match ro::send_ccr(&peer_handle, &params).await {
+                Ok(answer) => Python::attach(|py| {
+                    Ok(credit_control_answer_to_dict(py, answer)?.into_any().unbind())
+                }),
+                Err(error) => {
+                    warn!(error = %error, "ro_ccr_event failed");
+                    Python::attach(|py| Ok(py.None()))
+                }
+            }
+        })
+    }
+}
+
+impl PyDiameter {
+    /// Shared body for CCR-UPDATE / CCR-TERMINATION (both continue an existing
+    /// session with the same Session-Id and an increasing request number).
+    #[allow(clippy::too_many_arguments)]
+    fn ro_ccr_continuation<'py>(
+        &self,
+        python: Python<'py>,
+        request_type: CcRequestType,
+        subscription_id: &str,
+        subscription_id_type: Option<&str>,
+        session_id: &str,
+        request_number: u32,
+        service_context_id: Option<&str>,
+        used_seconds: Option<u32>,
+        requested_seconds: Option<u32>,
+        rating_group: Option<u32>,
+        service_identifier: Option<u32>,
+        peer: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // Build owned inputs up front, then `await` the OCS round-trip off the
+        // Python worker thread (`await diameter.ro_ccr_update(...)`).
+        let subscriber = build_subscriber(subscription_id, subscription_id_type)?;
+        let session_id = session_id.to_string();
+        let service_context_id = service_context_id.unwrap_or(SERVICE_CONTEXT_ID_IMS).to_string();
+        let used = time_service_unit(used_seconds);
+        let requested = time_service_unit(requested_seconds);
+        let peer_handle = self.pick_rf_peer(peer).map(|c| c.peer().clone());
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            let Some(peer_handle) = peer_handle else {
+                warn!("ro_ccr: no Diameter peer connected");
+                return Python::attach(|py| Ok(py.None()));
+            };
+            let params = CreditControlParams {
+                request_type,
+                request_number,
+                subscriber: &subscriber,
+                service_context_id: &service_context_id,
+                session_id: Some(&session_id),
+                ims_data: None,
+                sms_data: None,
+                requested_units: requested.as_ref(),
+                used_units: used.as_ref(),
+                rating_group,
+                service_identifier,
+                requested_action: None,
+                multiple_services_indicator: false,
+            };
+            match ro::send_ccr(&peer_handle, &params).await {
+                Ok(answer) => Python::attach(|py| {
+                    Ok(credit_control_answer_to_dict(py, answer)?.into_any().unbind())
+                }),
+                Err(error) => {
+                    warn!(error = %error, "ro_ccr continuation failed");
+                    Python::attach(|py| Ok(py.None()))
+                }
+            }
+        })
     }
 }
 

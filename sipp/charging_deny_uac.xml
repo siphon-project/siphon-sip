@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Ro online-charging UAC (enforcement, prepaid balance = 0):
+  INVITE -> 180 -> 200 -> ACK -> [siphon sends BYE] -> 200
+
+  With the balance drained to 0, the OCS answers CCR-INITIAL (or the first
+  CCR-UPDATE) with 4012 CREDIT_LIMIT_REACHED, and siphon must DISCONNECT the
+  call by sending a BYE to the caller. This scenario asserts exactly that: after
+  ACK it waits to RECEIVE a BYE and answers 200. If siphon never sends the BYE
+  (enforcement broken), sipp times out and the test fails.
+
+  Requires b2bua_uas.xml registered as bob on the B-leg.
+-->
+<scenario name="Ro charging UAC (credit-denied teardown)">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@ims.example.org>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/ro-charging-test
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <label id="1" />
+  <recv response="180" optional="true" next="1" />
+  <recv response="200" rtd="true" crlf="true" />
+
+  <send>
+    <![CDATA[
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@ims.example.org>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- The credit is gone: siphon must tear the call down. Wait for its BYE. -->
+  <recv request="BYE" crlf="true" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>

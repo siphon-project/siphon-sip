@@ -63,6 +63,7 @@ static AVP_TABLE: &[AvpDef] = &[
     // ── Base Diameter (RFC 6733), vendor_id = 0 ─────────────────────────────
     AvpDef { code: 1,   vendor_id: 0, name: "User-Name",                    data_type: AvpType::UTF8String },
     AvpDef { code: 8,   vendor_id: 0, name: "Framed-IP-Address",            data_type: AvpType::OctetString },
+    AvpDef { code: 11,  vendor_id: 0, name: "Filter-Id",                    data_type: AvpType::UTF8String },
     AvpDef { code: 25,  vendor_id: 0, name: "Class",                        data_type: AvpType::OctetString },
     AvpDef { code: 27,  vendor_id: 0, name: "Session-Timeout",              data_type: AvpType::Unsigned32 },
     AvpDef { code: 33,  vendor_id: 0, name: "Proxy-State",                  data_type: AvpType::OctetString },
@@ -100,28 +101,48 @@ static AVP_TABLE: &[AvpDef] = &[
     AvpDef { code: 298, vendor_id: 0, name: "Experimental-Result-Code",     data_type: AvpType::Unsigned32 },
     AvpDef { code: 299, vendor_id: 0, name: "Inband-Security-Id",           data_type: AvpType::Unsigned32 },
 
-    // ── RFC 4006 Credit-Control (Gy), vendor_id = 0 ────────────────────────
+    // ── RFC 8506 (obsoletes RFC 4006) Credit-Control / Gy, vendor_id = 0 ───
+    // Codes per the IANA aaa-parameters registry (RFC 8506 §12). The prior
+    // table used a self-consistent but non-standard numbering that a real OCS
+    // (CGRateS, go-diameter) rejects — every code below is the on-the-wire
+    // value.
+    AvpDef { code: 412, vendor_id: 0, name: "CC-Input-Octets",              data_type: AvpType::Unsigned64 },
+    AvpDef { code: 413, vendor_id: 0, name: "CC-Money",                     data_type: AvpType::Grouped },
+    AvpDef { code: 414, vendor_id: 0, name: "CC-Output-Octets",             data_type: AvpType::Unsigned64 },
     AvpDef { code: 415, vendor_id: 0, name: "CC-Request-Number",            data_type: AvpType::Unsigned32 },
     AvpDef { code: 416, vendor_id: 0, name: "CC-Request-Type",              data_type: AvpType::Enumerated },
-    AvpDef { code: 421, vendor_id: 0, name: "CC-Sub-Session-Id",            data_type: AvpType::Unsigned64 },
-    AvpDef { code: 426, vendor_id: 0, name: "Granted-Service-Unit",         data_type: AvpType::Grouped },
-    AvpDef { code: 427, vendor_id: 0, name: "Rating-Group",                 data_type: AvpType::Unsigned32 },
-    AvpDef { code: 431, vendor_id: 0, name: "Final-Unit-Indication",        data_type: AvpType::Grouped },
-    AvpDef { code: 432, vendor_id: 0, name: "Final-Unit-Action",            data_type: AvpType::Enumerated },
+    AvpDef { code: 417, vendor_id: 0, name: "CC-Service-Specific-Units",    data_type: AvpType::Unsigned64 },
+    AvpDef { code: 418, vendor_id: 0, name: "CC-Session-Failover",          data_type: AvpType::Enumerated },
+    AvpDef { code: 419, vendor_id: 0, name: "CC-Sub-Session-Id",            data_type: AvpType::Unsigned64 },
+    AvpDef { code: 420, vendor_id: 0, name: "CC-Time",                      data_type: AvpType::Unsigned32 },
+    AvpDef { code: 421, vendor_id: 0, name: "CC-Total-Octets",              data_type: AvpType::Unsigned64 },
+    AvpDef { code: 426, vendor_id: 0, name: "Credit-Control",               data_type: AvpType::Enumerated },
+    AvpDef { code: 427, vendor_id: 0, name: "Credit-Control-Failure-Handling", data_type: AvpType::Enumerated },
+    AvpDef { code: 428, vendor_id: 0, name: "Direct-Debiting-Failure-Handling", data_type: AvpType::Enumerated },
+    AvpDef { code: 430, vendor_id: 0, name: "Final-Unit-Indication",        data_type: AvpType::Grouped },
+    AvpDef { code: 431, vendor_id: 0, name: "Granted-Service-Unit",         data_type: AvpType::Grouped },
+    AvpDef { code: 432, vendor_id: 0, name: "Rating-Group",                 data_type: AvpType::Unsigned32 },
+    AvpDef { code: 433, vendor_id: 0, name: "Redirect-Address-Type",        data_type: AvpType::Enumerated },
+    AvpDef { code: 434, vendor_id: 0, name: "Redirect-Server",              data_type: AvpType::Grouped },
+    AvpDef { code: 435, vendor_id: 0, name: "Redirect-Server-Address",      data_type: AvpType::UTF8String },
+    AvpDef { code: 436, vendor_id: 0, name: "Requested-Action",             data_type: AvpType::Enumerated },
     AvpDef { code: 437, vendor_id: 0, name: "Requested-Service-Unit",       data_type: AvpType::Grouped },
+    AvpDef { code: 438, vendor_id: 0, name: "Restriction-Filter-Rule",      data_type: AvpType::OctetString },
     AvpDef { code: 439, vendor_id: 0, name: "Service-Identifier",           data_type: AvpType::Unsigned32 },
     AvpDef { code: 443, vendor_id: 0, name: "Subscription-Id",              data_type: AvpType::Grouped },
     AvpDef { code: 444, vendor_id: 0, name: "Subscription-Id-Data",         data_type: AvpType::UTF8String },
     AvpDef { code: 446, vendor_id: 0, name: "Used-Service-Unit",            data_type: AvpType::Grouped },
     AvpDef { code: 448, vendor_id: 0, name: "Validity-Time",                data_type: AvpType::Unsigned32 },
+    AvpDef { code: 449, vendor_id: 0, name: "Final-Unit-Action",            data_type: AvpType::Enumerated },
     AvpDef { code: 450, vendor_id: 0, name: "Subscription-Id-Type",         data_type: AvpType::Enumerated },
     AvpDef { code: 452, vendor_id: 0, name: "Tariff-Change-Usage",          data_type: AvpType::Enumerated },
-    AvpDef { code: 454, vendor_id: 0, name: "CC-Time",                      data_type: AvpType::Unsigned32 },
-    AvpDef { code: 455, vendor_id: 0, name: "CC-Money",                     data_type: AvpType::Grouped },
-    AvpDef { code: 456, vendor_id: 0, name: "CC-Total-Octets",              data_type: AvpType::Unsigned64 },
-    AvpDef { code: 457, vendor_id: 0, name: "CC-Input-Octets",              data_type: AvpType::Unsigned64 },
-    AvpDef { code: 458, vendor_id: 0, name: "CC-Output-Octets",             data_type: AvpType::Unsigned64 },
-    AvpDef { code: 459, vendor_id: 0, name: "CC-Service-Specific-Units",    data_type: AvpType::Unsigned64 },
+    AvpDef { code: 453, vendor_id: 0, name: "G-S-U-Pool-Identifier",        data_type: AvpType::Unsigned32 },
+    AvpDef { code: 455, vendor_id: 0, name: "Multiple-Services-Indicator",  data_type: AvpType::Enumerated },
+    AvpDef { code: 456, vendor_id: 0, name: "Multiple-Services-Credit-Control", data_type: AvpType::Grouped },
+    AvpDef { code: 457, vendor_id: 0, name: "G-S-U-Pool-Reference",         data_type: AvpType::Grouped },
+    AvpDef { code: 458, vendor_id: 0, name: "User-Equipment-Info",          data_type: AvpType::Grouped },
+    AvpDef { code: 459, vendor_id: 0, name: "User-Equipment-Info-Type",     data_type: AvpType::Enumerated },
+    AvpDef { code: 460, vendor_id: 0, name: "User-Equipment-Info-Value",    data_type: AvpType::OctetString },
     AvpDef { code: 461, vendor_id: 0, name: "Service-Context-Id",           data_type: AvpType::UTF8String },
     AvpDef { code: 480, vendor_id: 0, name: "Accounting-Record-Type",       data_type: AvpType::Enumerated },
     AvpDef { code: 485, vendor_id: 0, name: "Accounting-Record-Number",     data_type: AvpType::Unsigned32 },
@@ -294,8 +315,9 @@ static AVP_TABLE: &[AvpDef] = &[
     // SMS-Information block (TS 32.299 §7.2.79 / §7.2.158 / §7.2.171)
     AvpDef { code: 2000, vendor_id: TGPP, name: "SMS-Information",                    data_type: AvpType::Grouped },
     AvpDef { code: 2001, vendor_id: TGPP, name: "Data-Coding-Scheme",                 data_type: AvpType::Integer32 },
-    // Gy (TS 32.299)
-    AvpDef { code: 2006, vendor_id: TGPP, name: "Multiple-Services-Credit-Control",   data_type: AvpType::Grouped },
+    // Note: Multiple-Services-Credit-Control is base RFC 8506 code 456
+    // (vendor 0), listed above — NOT a 3GPP vendor AVP. The prior (2006,10415)
+    // entry collided with the real 3GPP Interface-Type and has been removed.
     AvpDef { code: 2007, vendor_id: TGPP, name: "SM-Message-Type",                    data_type: AvpType::Enumerated },
     AvpDef { code: 2008, vendor_id: TGPP, name: "Originator-SCCP-Address",            data_type: AvpType::Address },
     AvpDef { code: 2009, vendor_id: TGPP, name: "Originator-Interface",               data_type: AvpType::Grouped },
@@ -306,11 +328,13 @@ static AVP_TABLE: &[AvpDef] = &[
     AvpDef { code: 2014, vendor_id: TGPP, name: "SM-Status",                          data_type: AvpType::OctetString },
     AvpDef { code: 2015, vendor_id: TGPP, name: "SM-User-Data-Header",                data_type: AvpType::OctetString },
     AvpDef { code: 2016, vendor_id: TGPP, name: "SMS-Node",                           data_type: AvpType::Enumerated },
-    AvpDef { code: 2017, vendor_id: TGPP, name: "Interface-Id",                       data_type: AvpType::UTF8String },
+    // TS 32.299 §7.2.171: code 2017 is SMSC-Address (the prior "Interface-Id"
+    // label was wrong — Interface-Id is 2003 — and was never emitted). The old
+    // (2024 Interface-Text / 2025 Interface-Type) rows were likewise mislabeled
+    // and unused, so removed rather than left to poison the generic decoder.
+    AvpDef { code: 2017, vendor_id: TGPP, name: "SMSC-Address",                       data_type: AvpType::Address },
     AvpDef { code: 2018, vendor_id: TGPP, name: "Client-Address",                     data_type: AvpType::Address },
     AvpDef { code: 2019, vendor_id: TGPP, name: "Number-of-Messages-Sent",            data_type: AvpType::Unsigned32 },
-    AvpDef { code: 2024, vendor_id: TGPP, name: "Interface-Text",                     data_type: AvpType::UTF8String },
-    AvpDef { code: 2025, vendor_id: TGPP, name: "Interface-Type",                     data_type: AvpType::Enumerated },
     AvpDef { code: 2026, vendor_id: TGPP, name: "Recipient-Info",                     data_type: AvpType::Grouped },
     AvpDef { code: 2027, vendor_id: TGPP, name: "Originator-Received-Address",        data_type: AvpType::Grouped },
     AvpDef { code: 2028, vendor_id: TGPP, name: "Recipient-Received-Address",         data_type: AvpType::Grouped },
@@ -327,11 +351,15 @@ static AVP_TABLE: &[AvpDef] = &[
     AvpDef { code: 3316, vendor_id: TGPP, name: "SM-Delivery-Outcome",                data_type: AvpType::Grouped },
     AvpDef { code: 3324, vendor_id: TGPP, name: "SMSMI-Correlation-ID",               data_type: AvpType::Grouped },
     AvpDef { code: 3332, vendor_id: TGPP, name: "SMS-GMSC-Address",                   data_type: AvpType::Address },
-    // SMS-Information device-trigger / result extras (TS 32.299 §7.2.79)
+    // SMS-Information device-trigger / result extras (TS 32.299 §7.2.79).
+    // MTC-IWF-Address is 3406 and SMS-Result is 3409 (verified against the
+    // go-diameter tgpp_ro_rf dictionary). The prior 3413/3408 codes were wrong
+    // — 3408 is SM-Sequence-Number and 3413 is Teleservice — and were emitted
+    // on the Rf wire, so a CDF would misparse the SMS record.
     AvpDef { code: 3405, vendor_id: TGPP, name: "SM-Device-Trigger-Information",      data_type: AvpType::Grouped },
+    AvpDef { code: 3406, vendor_id: TGPP, name: "MTC-IWF-Address",                    data_type: AvpType::Address },
     AvpDef { code: 3407, vendor_id: TGPP, name: "SM-Device-Trigger-Indicator",        data_type: AvpType::Enumerated },
-    AvpDef { code: 3408, vendor_id: TGPP, name: "SMS-Result",                         data_type: AvpType::Unsigned32 },
-    AvpDef { code: 3413, vendor_id: TGPP, name: "MTC-IWF-Address",                    data_type: AvpType::Address },
+    AvpDef { code: 3409, vendor_id: TGPP, name: "SMS-Result",                         data_type: AvpType::Unsigned32 },
 ];
 
 /// Look up an AVP definition by (code, vendor_id).
@@ -420,6 +448,17 @@ pub fn app_id_by_name(name: &str) -> Option<(u32, u32)> {
         "s6a" => Some((VENDOR_3GPP, S6A_APP_ID)),
         _ => None,
     }
+}
+
+/// Whether an application-id is a Diameter *accounting* application, which is
+/// advertised in the CER/CEA via `Acct-Application-Id (259)` rather than
+/// `Auth-Application-Id (258)` (RFC 6733 §2.4 / §6.9). Today only base
+/// accounting — Rf (id 3) — is an accounting application; every other app
+/// SIPhon speaks (Cx/Sh/Rx/Ro/S6a/S6c/SGd) is an auth application. Advertising
+/// an accounting app as an auth app makes strict peers (freeDiameter,
+/// go-diameter/CGRateS) answer `DIAMETER_NO_COMMON_APPLICATION`.
+pub fn is_accounting_application(app_id: u32) -> bool {
+    app_id == RF_APP_ID
 }
 
 /// Reverse of [`app_id_by_name`] — returns the canonical short name
@@ -684,27 +723,44 @@ pub mod avp {
     pub const ACCOUNTING_RECORD_TYPE: u32 = 480;
     pub const ACCOUNTING_RECORD_NUMBER: u32 = 485;
 
-    // RFC 4006 Credit-Control (Gy)
+    // RFC 8506 (obsoletes RFC 4006) Credit-Control / Gy — vendor 0.
+    // Codes per the IANA aaa-parameters registry; see the AVP_TABLE note.
+    pub const FILTER_ID: u32 = 11;
+    pub const CC_INPUT_OCTETS: u32 = 412;
+    pub const CC_MONEY: u32 = 413;
+    pub const CC_OUTPUT_OCTETS: u32 = 414;
     pub const CC_REQUEST_NUMBER: u32 = 415;
     pub const CC_REQUEST_TYPE: u32 = 416;
-    pub const GRANTED_SERVICE_UNIT: u32 = 426;
-    pub const RATING_GROUP: u32 = 427;
-    pub const FINAL_UNIT_INDICATION: u32 = 431;
-    pub const FINAL_UNIT_ACTION: u32 = 432;
+    pub const CC_SERVICE_SPECIFIC_UNITS: u32 = 417;
+    pub const CC_SESSION_FAILOVER: u32 = 418;
+    pub const CC_SUB_SESSION_ID: u32 = 419;
+    pub const CC_TIME: u32 = 420;
+    pub const CC_TOTAL_OCTETS: u32 = 421;
+    pub const CREDIT_CONTROL_FAILURE_HANDLING: u32 = 427;
+    pub const FINAL_UNIT_INDICATION: u32 = 430;
+    pub const GRANTED_SERVICE_UNIT: u32 = 431;
+    pub const RATING_GROUP: u32 = 432;
+    pub const REDIRECT_ADDRESS_TYPE: u32 = 433;
+    pub const REDIRECT_SERVER: u32 = 434;
+    pub const REDIRECT_SERVER_ADDRESS: u32 = 435;
+    pub const REQUESTED_ACTION: u32 = 436;
     pub const REQUESTED_SERVICE_UNIT: u32 = 437;
+    pub const RESTRICTION_FILTER_RULE: u32 = 438;
+    pub const SERVICE_IDENTIFIER: u32 = 439;
     pub const SUBSCRIPTION_ID: u32 = 443;
     pub const SUBSCRIPTION_ID_DATA: u32 = 444;
-    pub const SUBSCRIPTION_ID_TYPE: u32 = 450;
-    pub const CC_TIME: u32 = 454;
-    pub const CC_TOTAL_OCTETS: u32 = 456;
-    pub const CC_INPUT_OCTETS: u32 = 457;
-    pub const CC_OUTPUT_OCTETS: u32 = 458;
-    // RFC 4006 §8.28 Service-Identifier (439) — was incorrectly assigned 461 before;
-    // 461 is Service-Context-Id (RFC 4006 §8.42).
-    pub const SERVICE_IDENTIFIER: u32 = 439;
-    pub const SERVICE_CONTEXT_ID: u32 = 461;
     pub const USED_SERVICE_UNIT: u32 = 446;
     pub const VALIDITY_TIME: u32 = 448;
+    pub const FINAL_UNIT_ACTION: u32 = 449;
+    pub const SUBSCRIPTION_ID_TYPE: u32 = 450;
+    pub const G_S_U_POOL_IDENTIFIER: u32 = 453;
+    pub const MULTIPLE_SERVICES_INDICATOR: u32 = 455;
+    pub const MULTIPLE_SERVICES_CREDIT_CONTROL: u32 = 456;
+    pub const G_S_U_POOL_REFERENCE: u32 = 457;
+    pub const USER_EQUIPMENT_INFO: u32 = 458;
+    pub const USER_EQUIPMENT_INFO_TYPE: u32 = 459;
+    pub const USER_EQUIPMENT_INFO_VALUE: u32 = 460;
+    pub const SERVICE_CONTEXT_ID: u32 = 461;
 
     // 3GPP Cx (TS 29.228)
     pub const VISITED_NETWORK_IDENTIFIER: u32 = 600;
@@ -813,8 +869,6 @@ pub mod avp {
     pub const IMS_INFORMATION: u32 = 876;
     pub const IMS_VISITED_NETWORK_IDENTIFIER: u32 = 2713;
 
-    // 3GPP Gy (TS 32.299)
-    pub const MULTIPLE_SERVICES_CREDIT_CONTROL: u32 = 2006;
 
     // 3GPP S6c served-node identifiers
     pub const SGSN_NUMBER: u32 = 1489;
@@ -845,11 +899,9 @@ pub mod avp {
     pub const SM_STATUS: u32 = 2014;
     pub const SM_USER_DATA_HEADER: u32 = 2015;
     pub const SMS_NODE: u32 = 2016;
-    pub const INTERFACE_ID: u32 = 2017;
+    pub const SMSC_ADDRESS: u32 = 2017;
     pub const CLIENT_ADDRESS: u32 = 2018;
     pub const NUMBER_OF_MESSAGES_SENT: u32 = 2019;
-    pub const INTERFACE_TEXT: u32 = 2024;
-    pub const INTERFACE_TYPE: u32 = 2025;
     pub const RECIPIENT_INFO: u32 = 2026;
     pub const ORIGINATOR_RECEIVED_ADDRESS: u32 = 2027;
     pub const RECIPIENT_RECEIVED_ADDRESS: u32 = 2028;
@@ -857,9 +909,9 @@ pub mod avp {
     pub const APPLICATION_PORT_IDENTIFIER: u32 = 3010;
     pub const EXTERNAL_IDENTIFIER: u32 = 3111;
     pub const SM_DEVICE_TRIGGER_INFORMATION: u32 = 3405;
+    pub const MTC_IWF_ADDRESS: u32 = 3406;
     pub const SM_DEVICE_TRIGGER_INDICATOR: u32 = 3407;
-    pub const SMS_RESULT: u32 = 3408;
-    pub const MTC_IWF_ADDRESS: u32 = 3413;
+    pub const SMS_RESULT: u32 = 3409;
 
     // ── S6a / S6d (TS 29.272) ────────────────────────────────────────────
     pub const RAT_TYPE: u32 = 1032;
@@ -954,6 +1006,87 @@ mod tests {
     #[test]
     fn avp_count_is_substantial() {
         assert!(avp_count() > 100, "dictionary should have > 100 AVP entries");
+    }
+
+    #[test]
+    fn credit_control_avp_codes_match_rfc8506() {
+        // Spec oracle (NOT a round-trip): AVP name -> (code, vendor). Base
+        // Credit-Control codes are from the IANA aaa-parameters registry
+        // (RFC 8506 §12); the vendor-10415 charging AVPs are from 3GPP
+        // TS 32.299. This fails if the dictionary drifts from the on-the-wire
+        // values a real OCS/CDF (CGRateS, go-diameter) expects — the class of
+        // bug that made the prior self-consistent-but-wrong table pass its own
+        // encode/decode round-trips while being rejected on the wire.
+        let reference: &[(&str, u32, u32)] = &[
+            // RFC 8506 Credit-Control (vendor 0)
+            ("CC-Input-Octets", 412, 0),
+            ("CC-Money", 413, 0),
+            ("CC-Output-Octets", 414, 0),
+            ("CC-Request-Number", 415, 0),
+            ("CC-Request-Type", 416, 0),
+            ("CC-Service-Specific-Units", 417, 0),
+            ("CC-Session-Failover", 418, 0),
+            ("CC-Sub-Session-Id", 419, 0),
+            ("CC-Time", 420, 0),
+            ("CC-Total-Octets", 421, 0),
+            ("Credit-Control-Failure-Handling", 427, 0),
+            ("Final-Unit-Indication", 430, 0),
+            ("Granted-Service-Unit", 431, 0),
+            ("Rating-Group", 432, 0),
+            ("Redirect-Address-Type", 433, 0),
+            ("Redirect-Server", 434, 0),
+            ("Redirect-Server-Address", 435, 0),
+            ("Requested-Action", 436, 0),
+            ("Requested-Service-Unit", 437, 0),
+            ("Service-Identifier", 439, 0),
+            ("Subscription-Id", 443, 0),
+            ("Subscription-Id-Data", 444, 0),
+            ("Used-Service-Unit", 446, 0),
+            ("Validity-Time", 448, 0),
+            ("Final-Unit-Action", 449, 0),
+            ("Subscription-Id-Type", 450, 0),
+            ("G-S-U-Pool-Identifier", 453, 0),
+            ("Multiple-Services-Indicator", 455, 0),
+            ("Multiple-Services-Credit-Control", 456, 0),
+            ("G-S-U-Pool-Reference", 457, 0),
+            ("User-Equipment-Info", 458, 0),
+            ("User-Equipment-Info-Type", 459, 0),
+            ("User-Equipment-Info-Value", 460, 0),
+            ("Service-Context-Id", 461, 0),
+            // 3GPP charging AVPs emitted on the Rf/Ro wire (vendor 10415)
+            ("Service-Information", 873, TGPP),
+            ("IMS-Information", 876, TGPP),
+            ("SMS-Information", 2000, TGPP),
+            ("Node-Functionality", 862, TGPP),
+            ("Role-of-Node", 829, TGPP),
+            ("SMSC-Address", 2017, TGPP),
+            ("MTC-IWF-Address", 3406, TGPP),
+            ("SMS-Result", 3409, TGPP),
+        ];
+        for &(name, code, vendor) in reference {
+            let entry = lookup_by_name(name)
+                .unwrap_or_else(|| panic!("dictionary missing AVP {name}"));
+            assert_eq!(entry.code, code, "{name} code");
+            assert_eq!(entry.vendor_id, vendor, "{name} vendor");
+            // Reverse lookup by (code, vendor) must round-trip to the same name.
+            let by_code = lookup_avp(code, vendor)
+                .unwrap_or_else(|| panic!("no AVP at ({code}, {vendor}) for {name}"));
+            assert_eq!(by_code.name, name, "reverse lookup for ({code},{vendor})");
+        }
+    }
+
+    #[test]
+    fn old_miscoded_credit_control_codes_are_gone() {
+        // Regression guard for the pre-fix numbering: these codes previously
+        // named the wrong AVP. After the fix 426 is Credit-Control (was
+        // Granted-Service-Unit), 456 is MSCC (was CC-Total-Octets), and the
+        // bogus 3GPP-vendor MSCC at (2006, 10415) is removed entirely.
+        assert_ne!(lookup_by_name("Granted-Service-Unit").unwrap().code, 426);
+        assert_ne!(lookup_by_name("CC-Time").unwrap().code, 454);
+        assert_ne!(lookup_by_name("Final-Unit-Indication").unwrap().code, 431);
+        assert!(lookup_avp(2006, TGPP).is_none(), "stale 3GPP MSCC still present");
+        assert_eq!(lookup_avp(426, 0).unwrap().name, "Credit-Control");
+        assert_eq!(lookup_avp(456, 0).unwrap().name, "Multiple-Services-Credit-Control");
     }
 
     #[test]

@@ -1,0 +1,147 @@
+{
+  // CGRateS DiameterAgent for the SIPhon `charging` functional-test profile.
+  // Self-contained: internal data/stor DBs, no MySQL/Redis/Mongo needed.
+  // Bundled go-diameter base + 3GPP dictionaries handle the AVP shapes.
+
+  "general": {
+    "log_level": 7,
+    "node_id": "cgrates-charging-test"
+  },
+
+  "data_db": { "db_type": "*internal" },
+  "stor_db": { "db_type": "*internal" },
+
+  "listen": {
+    "rpc_json": ":2012",
+    "http": ":2080"
+  },
+
+  "rals":       { "enabled": true },
+  "schedulers": { "enabled": true },
+  "chargers":   { "enabled": true },
+  "cdrs":       { "enabled": true, "chargers_conns": ["*internal"], "rals_conns": ["*internal"] },
+  "sessions": {
+    "enabled": true,
+    "chargers_conns": ["*internal"],
+    "rals_conns": ["*internal"],
+    "cdrs_conns": ["*internal"]
+  },
+  "apiers": { "enabled": true, "scheduler_conns": ["*internal"] },
+
+  "diameter_agent": {
+    "enabled": true,
+    "listen": ":3868",
+    "listen_net": "tcp",
+    "origin_host": "cgrates.org",
+    "origin_realm": "cgrates.org",
+    "sessions_conns": ["*birpc_internal"],
+    "request_processors": [
+
+      {
+        "id": "ro_initial",
+        "filters": ["*string:~*vars.*cmd:CCR", "*string:~*req.CC-Request-Type:1"],
+        "flags": ["*initiate", "*accounts"],
+        "request_fields": [
+          {"tag": "ToR", "path": "*cgreq.ToR", "type": "*constant", "value": "*voice"},
+          {"tag": "OriginID", "path": "*cgreq.OriginID", "type": "*variable", "value": "~*req.Session-Id"},
+          {"tag": "RequestType", "path": "*cgreq.RequestType", "type": "*constant", "value": "*prepaid"},
+          {"tag": "Account", "path": "*cgreq.Account", "type": "*variable",
+           "value": "~*req.Subscription-Id.Subscription-Id-Data"},
+          {"tag": "Destination", "path": "*cgreq.Destination", "type": "*variable",
+           "value": "~*req.Service-Information.IMS-Information.Called-Party-Address"},
+          {"tag": "SetupTime", "path": "*cgreq.SetupTime", "type": "*variable", "value": "~*req.Event-Timestamp"},
+          {"tag": "AnswerTime", "path": "*cgreq.AnswerTime", "type": "*variable", "value": "~*req.Event-Timestamp"},
+          {"tag": "Usage", "path": "*cgreq.Usage", "type": "*variable",
+           "value": "~*req.Multiple-Services-Credit-Control.Requested-Service-Unit.CC-Time"}
+        ],
+        "reply_fields": [
+          {"tag": "CCA", "path": "*rep", "type": "*template", "value": "*cca"},
+          {"tag": "GrantedUnits",
+           "path": "*rep.Multiple-Services-Credit-Control.Granted-Service-Unit.CC-Time",
+           "type": "*variable", "value": "~*cgrep.MaxUsage{*duration_seconds}"},
+          {"tag": "ResultCode", "filters": ["*eq:~*cgrep.MaxUsage:0"],
+           "path": "*rep.Result-Code", "type": "*constant", "value": "4012", "blocker": true}
+        ]
+      },
+
+      {
+        "id": "ro_update",
+        "filters": ["*string:~*vars.*cmd:CCR", "*string:~*req.CC-Request-Type:2"],
+        "flags": ["*update", "*accounts"],
+        "request_fields": [
+          {"tag": "ToR", "path": "*cgreq.ToR", "type": "*constant", "value": "*voice"},
+          {"tag": "OriginID", "path": "*cgreq.OriginID", "type": "*variable", "value": "~*req.Session-Id"},
+          {"tag": "RequestType", "path": "*cgreq.RequestType", "type": "*constant", "value": "*prepaid"},
+          {"tag": "Account", "path": "*cgreq.Account", "type": "*variable",
+           "value": "~*req.Subscription-Id.Subscription-Id-Data"},
+          {"tag": "Usage", "path": "*cgreq.Usage", "type": "*variable",
+           "value": "~*req.Multiple-Services-Credit-Control.Requested-Service-Unit.CC-Time"}
+        ],
+        "reply_fields": [
+          {"tag": "CCA", "path": "*rep", "type": "*template", "value": "*cca"},
+          {"tag": "GrantedUnits",
+           "path": "*rep.Multiple-Services-Credit-Control.Granted-Service-Unit.CC-Time",
+           "type": "*variable", "value": "~*cgrep.MaxUsage{*duration_seconds}"},
+          {"tag": "ResultCode", "filters": ["*eq:~*cgrep.MaxUsage:0"],
+           "path": "*rep.Result-Code", "type": "*constant", "value": "4012", "blocker": true}
+        ]
+      },
+
+      {
+        "id": "ro_terminate",
+        "filters": ["*string:~*vars.*cmd:CCR", "*string:~*req.CC-Request-Type:3"],
+        "flags": ["*terminate", "*accounts", "*cdrs"],
+        "request_fields": [
+          {"tag": "OriginID", "path": "*cgreq.OriginID", "type": "*variable", "value": "~*req.Session-Id"},
+          {"tag": "Account", "path": "*cgreq.Account", "type": "*variable",
+           "value": "~*req.Subscription-Id.Subscription-Id-Data"},
+          {"tag": "Usage", "path": "*cgreq.Usage", "type": "*variable",
+           "value": "~*req.Multiple-Services-Credit-Control.Used-Service-Unit.CC-Time"}
+        ],
+        "reply_fields": [
+          {"tag": "CCA", "path": "*rep", "type": "*template", "value": "*cca"}
+        ]
+      },
+
+      {
+        "id": "ro_event_sms",
+        "filters": ["*string:~*vars.*cmd:CCR", "*string:~*req.CC-Request-Type:4"],
+        "flags": ["*event", "*accounts", "*cdrs"],
+        "request_fields": [
+          {"tag": "ToR", "path": "*cgreq.ToR", "type": "*constant", "value": "*sms"},
+          {"tag": "OriginID", "path": "*cgreq.OriginID", "type": "*variable", "value": "~*req.Session-Id"},
+          {"tag": "RequestType", "path": "*cgreq.RequestType", "type": "*constant", "value": "*prepaid"},
+          {"tag": "Account", "path": "*cgreq.Account", "type": "*variable",
+           "value": "~*req.Subscription-Id.Subscription-Id-Data"},
+          {"tag": "Usage", "path": "*cgreq.Usage", "type": "*constant", "value": "1"}
+        ],
+        "reply_fields": [
+          {"tag": "CCA", "path": "*rep", "type": "*template", "value": "*cca"}
+        ]
+      },
+
+      {
+        "id": "rf_acr",
+        "filters": ["*string:~*vars.*cmd:ACR"],
+        "flags": ["*cdrs"],
+        "request_fields": [
+          {"tag": "OriginID", "path": "*cgreq.OriginID", "type": "*variable", "value": "~*req.Session-Id"},
+          {"tag": "ToR", "path": "*cgreq.ToR", "type": "*constant", "value": "*voice"},
+          {"tag": "RequestType", "path": "*cgreq.RequestType", "type": "*constant", "value": "*rated"},
+          {"tag": "Account", "path": "*cgreq.Account", "type": "*variable", "value": "~*req.User-Name"}
+        ],
+        "reply_fields": [
+          {"tag": "SessionId", "path": "*rep.Session-Id", "type": "*variable", "value": "~*req.Session-Id"},
+          {"tag": "RecordType", "path": "*rep.Accounting-Record-Type", "type": "*variable",
+           "value": "~*req.Accounting-Record-Type"},
+          {"tag": "RecordNumber", "path": "*rep.Accounting-Record-Number", "type": "*variable",
+           "value": "~*req.Accounting-Record-Number"},
+          {"tag": "OriginHost", "path": "*rep.Origin-Host", "type": "*constant", "value": "cgrates.org"},
+          {"tag": "OriginRealm", "path": "*rep.Origin-Realm", "type": "*constant", "value": "cgrates.org"},
+          {"tag": "ResultCode", "path": "*rep.Result-Code", "type": "*constant", "value": "2001"}
+        ]
+      }
+
+    ]
+  }
+}
