@@ -349,11 +349,9 @@ pub async fn listen(
         if let Err(error) = socket.set_reuseport(true) {
             error!("failed to set SO_REUSEPORT on TLS socket: {error}"); return;
         }
+        // DSCP / DiffServ marking (RFC 4594) — family-aware, best-effort.
         if let Some(tos) = tos {
-            let sock_ref = socket2::SockRef::from(&socket);
-            if let Err(error) = sock_ref.set_tos_v4(tos) {
-                error!("failed to set IP_TOS on TLS socket: {error}"); return;
-            }
+            super::apply_tos(&socket2::SockRef::from(&socket), tos);
         }
         if let Err(error) = socket.bind(local_addr) {
             error!("failed to bind TLS listener on {local_addr}: {error}"); return;

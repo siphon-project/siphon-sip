@@ -2589,6 +2589,16 @@ mod tests {
         assert_eq!(request.via_target_override(), Some("10.0.0.2:5060"));
     }
 
+    #[test]
+    fn force_send_via_preserves_bracketed_ipv6_target() {
+        // A bare bracketed v6 literal (no port) must round-trip verbatim so the
+        // dispatcher's bracket-aware split renders a valid sent-by rather than
+        // the truncated "[2001:db8:" a naive rsplit_once(':') would produce.
+        let mut request = make_request();
+        request.force_send_via("udp", "[2001:db8::1]");
+        assert_eq!(request.via_target_override(), Some("[2001:db8::1]"));
+    }
+
     // --- Utility tests ---
 
     #[test]

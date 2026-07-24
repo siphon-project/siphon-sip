@@ -17,6 +17,44 @@ pub fn strip_ipv6_brackets(host: &str) -> &str {
         .unwrap_or(host)
 }
 
+/// Split a SIP `host[:port]` authority into its host and optional port,
+/// IPv6-bracket aware.  The returned host keeps its brackets for a v6 literal.
+///
+/// Handles `[2001:db8::1]:5060`, `[2001:db8::1]`, `host:5060`, `host`, and a
+/// bare (unbracketed) IPv6 literal such as `2001:db8::1` — the last is returned
+/// whole with no port, because a trailing `:port` cannot be disambiguated from
+/// the address without brackets (RFC 3261 §19.1.2 / §25.1).
+///
+/// Lenient by contract: a malformed port yields `None` rather than an error.
+/// This is the best-effort splitter for send-side overrides (e.g.
+/// `force_send_via`); the strict, error-returning parse lives in
+/// [`crate::sip::headers::via::Via::parse`].
+pub fn split_host_port(authority: &str) -> (&str, Option<u16>) {
+    let authority = authority.trim();
+    if authority.starts_with('[') {
+        // Bracketed IPv6 literal, with an optional `:port` after the `]`.
+        if let Some(bracket_end) = authority.find(']') {
+            let host = &authority[..=bracket_end];
+            let port = authority[bracket_end + 1..]
+                .strip_prefix(':')
+                .and_then(|port_str| port_str.parse::<u16>().ok());
+            return (host, port);
+        }
+        // Unterminated bracket — hand it back untouched rather than mangle it.
+        return (authority, None);
+    }
+    match authority.rsplit_once(':') {
+        // A colon still in the host portion means this is a bare, unbracketed
+        // IPv6 literal (not host:port) — keep it whole.
+        Some((host, _)) if host.contains(':') => (authority, None),
+        Some((host, port_str)) => match port_str.parse::<u16>() {
+            Ok(port) => (host, Some(port)),
+            Err(_) => (authority, None),
+        },
+        None => (authority, None),
+    }
+}
+
 /// SIP URI as defined in RFC 3261
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SipUri {
@@ -167,6 +205,45 @@ mod tests {
     fn strip_ipv6_brackets_partial() {
         assert_eq!(strip_ipv6_brackets("[::1"), "[::1");
         assert_eq!(strip_ipv6_brackets("::1]"), "::1]");
+    }
+
+    #[test]
+    fn split_host_port_ipv4() {
+        assert_eq!(split_host_port("10.0.0.1:5060"), ("10.0.0.1", Some(5060)));
+        assert_eq!(split_host_port("10.0.0.1"), ("10.0.0.1", None));
+    }
+
+    #[test]
+    fn split_host_port_hostname() {
+        assert_eq!(split_host_port("proxy.example.com:5061"), ("proxy.example.com", Some(5061)));
+        assert_eq!(split_host_port("proxy.example.com"), ("proxy.example.com", None));
+    }
+
+    #[test]
+    fn split_host_port_ipv6_bracketed_with_port() {
+        assert_eq!(
+            split_host_port("[2001:db8::1]:5060"),
+            ("[2001:db8::1]", Some(5060))
+        );
+    }
+
+    #[test]
+    fn split_host_port_ipv6_bracketed_no_port() {
+        // Regression: the old rsplit_once(':') truncated this to "[2001:db8:".
+        assert_eq!(split_host_port("[2001:db8::1]"), ("[2001:db8::1]", None));
+        assert_eq!(split_host_port("[::1]"), ("[::1]", None));
+    }
+
+    #[test]
+    fn split_host_port_ipv6_bare_unbracketed() {
+        // No brackets → can't disambiguate a port; whole thing is the host.
+        assert_eq!(split_host_port("2001:db8::1"), ("2001:db8::1", None));
+        assert_eq!(split_host_port("::1"), ("::1", None));
+    }
+
+    #[test]
+    fn split_host_port_bad_port_is_all_host() {
+        assert_eq!(split_host_port("host:notaport"), ("host:notaport", None));
     }
 
     #[test]

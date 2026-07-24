@@ -446,8 +446,9 @@ impl ConnectionPool {
         socket.set_reuseaddr(true)?;
         socket.set_reuseport(true)?;
         if let Some(tos) = self.tos {
-            let sock_ref = socket2::SockRef::from(&socket);
-            sock_ref.set_tos_v4(tos)?;
+            // Family-aware, best-effort — a DSCP marking failure must not fail
+            // the outbound connection.
+            super::apply_tos(&socket2::SockRef::from(&socket), tos);
         }
         socket.bind(bind_addr).map_err(|e| {
             warn!(
@@ -707,7 +708,8 @@ impl ConnectionPool {
                     socket.set_reuseaddr(true)?;
                     socket.set_reuseport(true)?;
                     if let Some(tos) = self.tos {
-                        socket2::SockRef::from(&socket).set_tos_v4(tos)?;
+                        // Family-aware, best-effort (see connect_tcp).
+                        super::apply_tos(&socket2::SockRef::from(&socket), tos);
                     }
                     socket.bind(source).map_err(|error| {
                         warn!(bind_addr = %source, destination = %destination, "pool: TLS bind to requested source failed: {error}");

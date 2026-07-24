@@ -20,6 +20,20 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   side is unchanged. Default is off (no behaviour change on a bump); IMS
   deployments set `1280` (the IPv6 minimum MTU). Family-agnostic — works for v4
   and v6 next hops. Kamailio analog: `udp_mtu` + `udp_mtu_try_proto=TCP`.
+- **Dual-stack (IPv4 + IPv6) P-CSCF — per-family Gm identity.** A P-CSCF can bind
+  a v4 and a v6 Gm listener set at once and now stamps the family-matching local
+  identity on each UE's signalling instead of collapsing to the first configured
+  listener. Responses, Contact and Record-Route toward the UE carry a v6 host for
+  a v6 UE (v4 for v4); the IPsec sec-agree SA's P-CSCF side is selected to match
+  the UE's family (a mismatch now errors loudly rather than installing a dead
+  mixed-family XFRM selector); the SDP `o=` rewrite emits an unbracketed address
+  with the correct `IN IP4`/`IN IP6` addrtype; the IPsec/flow-relay Via paths and
+  the `force_send_via` target split are IPv6-bracket correct; and DSCP marking now
+  sets `IPV6_TCLASS` on v6 sockets (was IPv4-only, so v6 egress went unmarked).
+  Loop detection checks every configured listener across both families. Configure
+  explicit per-family listeners, each with an optional per-listener `advertise`
+  (see `examples/ims_pcscf.yaml`). Core-side (Mw / outbound) dual-stack is a
+  separate follow-up.
 - **Docker Compose quickstart + Getting started guide.** A root
   `docker-compose.yaml` runs the published image with your `siphon.yaml` and
   `scripts/` bind-mounted (host networking, hot-reload, a SIP `OPTIONS`
