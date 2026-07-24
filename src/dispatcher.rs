@@ -6645,6 +6645,49 @@ fn build_b2bua_bye(
     }
 }
 
+/// The remote target of an early dialog, derived from the reliable provisional
+/// response that established it (RFC 3262 §4 / RFC 3261 §12.1.2). Used to build
+/// in-dialog requests generated before answer (the auto-PRACK) from THAT
+/// response rather than from the single per-Leg `Dialog`, so a downstream fork
+/// producing several early dialogs on one INVITE branch routes each request to
+/// its own remote target instead of collapsing them onto the first.
+struct EarlyDialogTarget {
+    /// The response `Contact` (RFC 3261 §12.1.2 remote target) → the in-dialog
+    /// Request-URI. `None` when the provisional carried no Contact.
+    remote_contact: Option<String>,
+    /// The response `To` value — already carries this early dialog's remote tag
+    /// → the in-dialog `To` header.
+    to_header: Option<String>,
+    /// The response `Record-Route`, reversed for the UAC side (RFC 3261
+    /// §12.1.2) → the in-dialog route set.
+    route_set: Vec<String>,
+}
+
+/// Extract the early-dialog remote target (Contact, To, route set) from a
+/// reliable provisional response. Reuses `extract_contact_uri` and
+/// `uac_route_set_from_record_routes` so the PRACK routes exactly as the
+/// eventual 2xx-confirmed dialog would.
+fn early_dialog_target_from_response(response: &SipMessage) -> EarlyDialogTarget {
+    let remote_contact = response
+        .headers
+        .get("Contact")
+        .or_else(|| response.headers.get("m"))
+        .map(|value| crate::b2bua::actor::extract_contact_uri(value));
+    let to_header = response.headers.to().cloned();
+    let route_set = uac_route_set_from_record_routes(
+        &response
+            .headers
+            .get_all("Record-Route")
+            .cloned()
+            .unwrap_or_default(),
+    );
+    EarlyDialogTarget {
+        remote_contact,
+        to_header,
+        route_set,
+    }
+}
+
 /// Build an in-dialog PRACK request toward a leg, acknowledging the
 /// reliable provisional response identified by `rseq`/`response_cseq_num`.
 /// Used by the B2BUA's "auto-PRACK" mode (RFC 3262 §4): when the B-leg
@@ -6652,19 +6695,67 @@ fn build_b2bua_bye(
 /// locally rather than relying on the A-leg (which lives in a different
 /// dialog) to do it.
 ///
+/// The remote target (Request-URI, To, route set) comes from `target` — the
+/// reliable provisional that established this early dialog (RFC 3261 §12.1.2) —
+/// NOT from `leg.dialog`, so forked early dialogs each PRACK their own Contact.
+/// `leg` still supplies OUR side (From/local-tag/Contact) and the CSeq counter,
+/// which are identical across every early dialog of the leg.
+///
 /// `local_cseq` MUST already have been incremented for the dialog before
 /// calling this — the value passed in is used as-is.
 fn build_b2bua_prack(
     leg: &crate::b2bua::actor::Leg,
     state: &DispatcherState,
+    target: &EarlyDialogTarget,
     rseq: u32,
     response_cseq_num: u32,
     response_cseq_method: &str,
     local_cseq: u32,
 ) -> Option<SipMessage> {
-    let dialog = &leg.dialog;
+    // Via sent-by host:port is the listener this leg is anchored on (the A-leg's
+    // arrival socket on a multi-homed host) so the response comes back to the
+    // socket the request left from. Falls back to via_port for the B-leg
+    // (local_addr None) and single-listener hosts — no change there.
+    let via_host = state.via_host(&leg.transport.transport);
+    let via_port = a_leg_advertised_port(
+        leg.transport.local_addr,
+        state.via_port(&leg.transport.transport),
+    );
+    build_b2bua_prack_message(
+        &leg.dialog,
+        leg.transport.transport,
+        &via_host,
+        via_port,
+        target,
+        rseq,
+        response_cseq_num,
+        response_cseq_method,
+        local_cseq,
+    )
+}
 
-    let ruri = dialog.remote_contact.as_deref()
+/// Pure PRACK message construction (no `DispatcherState`): the Via sent-by
+/// host:port are resolved by the caller. Split out so the RFC 3261 §12.1.2
+/// remote-target / To-tag / route-set logic — the part the reliable-provisional
+/// bug lives in — is unit-testable against known-answer response bytes.
+#[allow(clippy::too_many_arguments)]
+fn build_b2bua_prack_message(
+    dialog: &crate::b2bua::actor::Dialog,
+    transport: Transport,
+    via_host: &str,
+    via_port: u16,
+    target: &EarlyDialogTarget,
+    rseq: u32,
+    response_cseq_num: u32,
+    response_cseq_method: &str,
+    local_cseq: u32,
+) -> Option<SipMessage> {
+    // R-URI: the early-dialog remote target — the Contact of the reliable
+    // provisional that established this early dialog (RFC 3261 §12.1.2), NOT the
+    // To AoR. Falls back to the leg's stored remote_contact, then target_uri,
+    // only when the provisional carried no Contact.
+    let ruri = target.remote_contact.as_deref()
+        .or(dialog.remote_contact.as_deref())
         .and_then(|uri_str| parse_uri_standalone(uri_str).ok())
         .unwrap_or_else(|| {
             dialog.target_uri.as_deref()
@@ -6672,18 +6763,11 @@ fn build_b2bua_prack(
                 .unwrap_or_else(|| SipUri::new("invalid".to_string()))
         });
 
-    let transport_str = format!("{}", leg.transport.transport).to_uppercase();
+    let transport_str = format!("{}", transport).to_uppercase();
     let branch = TransactionKey::generate_branch();
-    // Via sent-by port is the listener this leg is anchored on (the A-leg's arrival
-    // socket on a multi-homed host) so the response comes back to the socket the
-    // request left from. Falls back to via_port for the B-leg (local_addr None) and
-    // single-listener hosts — no change there.
     let via = format!(
         "SIP/2.0/{} {}:{};branch={}",
-        transport_str,
-        state.via_host(&leg.transport.transport),
-        a_leg_advertised_port(leg.transport.local_addr, state.via_port(&leg.transport.transport)),
-        branch,
+        transport_str, via_host, via_port, branch,
     );
 
     let from_header = match &dialog.local_from_uri {
@@ -6694,16 +6778,22 @@ fn build_b2bua_prack(
             dialog.local_tag,
         ),
     };
-    let to_header = match &dialog.remote_to_uri {
-        Some(uri) => crate::b2bua::actor::ensure_tag(uri, dialog.remote_tag.as_deref()),
-        None => {
-            let to_uri = dialog.remote_contact.as_deref()
-                .unwrap_or(dialog.target_uri.as_deref().unwrap_or("sip:invalid"));
-            match &dialog.remote_tag {
-                Some(tag) => format!("<{}>;tag={}", to_uri, tag),
-                None => format!("<{}>", to_uri),
+    // To: the reliable provisional's To — it already carries THIS early
+    // dialog's remote tag (RFC 3261 §12.2.1.1). Falls back to the leg's stored
+    // remote_to_uri + remote_tag only when the response had no To (defensive).
+    let to_header = match &target.to_header {
+        Some(to) => to.clone(),
+        None => match &dialog.remote_to_uri {
+            Some(uri) => crate::b2bua::actor::ensure_tag(uri, dialog.remote_tag.as_deref()),
+            None => {
+                let to_uri = dialog.remote_contact.as_deref()
+                    .unwrap_or(dialog.target_uri.as_deref().unwrap_or("sip:invalid"));
+                match &dialog.remote_tag {
+                    Some(tag) => format!("<{}>;tag={}", to_uri, tag),
+                    None => format!("<{}>", to_uri),
+                }
             }
-        }
+        },
     };
 
     let mut builder = SipMessageBuilder::new()
@@ -6720,7 +6810,10 @@ fn build_b2bua_prack(
     if let Some(ref contact) = dialog.local_contact {
         builder = builder.header("Contact", contact.clone());
     }
-    for route in &dialog.route_set {
+    // Route set: THIS early dialog's route set (the reliable provisional's
+    // Record-Route reversed for the UAC side, RFC 3261 §12.1.2), so a forked
+    // early dialog routes over its own proxies rather than the first dialog's.
+    for route in &target.route_set {
         builder = builder.header("Route", route.clone());
     }
 
@@ -10705,110 +10798,110 @@ fn handle_b2bua_response(
             crate::sip::headers::rseq::parse_rseq(&message.headers),
             b_leg_index,
         ) {
-            // Skip if we've already PRACKed this RSeq — the B-leg is just
-            // retransmitting the reliable 1xx because our PRACK is in
-            // flight or got delayed; one PRACK per RSeq is correct.
-            if !state.call_actors.try_mark_prack_acked(call_id, idx, rseq.response_number) {
+            // RFC 3262 §4 + RFC 3261 §12.1.2: this reliable provisional
+            // establishes (or refreshes) an early dialog. Build the auto-PRACK
+            // from THIS response's remote target — Contact (→ Request-URI), To
+            // (carries the early-dialog remote tag), and Record-Route (reversed
+            // → route set) — rather than from the single per-Leg Dialog, so a
+            // downstream fork producing several early dialogs on this one INVITE
+            // branch PRACKs each to its OWN remote target instead of collapsing
+            // them onto the first dialog's Contact. Without the Contact the
+            // Request-URI falls back to the To AoR, which an IMS I-CSCF treats
+            // as an initial terminating request and rejects 482 Loop Detected.
+            let target = early_dialog_target_from_response(message);
+            // The early dialog is keyed by its remote To-tag; dedup PRACK per
+            // tag (forked dialogs have independent RSeq spaces, RFC 3262 §3). A
+            // missing tag (malformed reliable 1xx) degrades to one shared key.
+            let early_to_tag = crate::b2bua::actor::extract_to_tag(message);
+            let dedup_key = early_to_tag.as_deref().unwrap_or("");
+
+            // Skip if we've already PRACKed this RSeq for this early dialog —
+            // the B-leg is just retransmitting the reliable 1xx because our
+            // PRACK is in flight or got delayed; one PRACK per (dialog, RSeq)
+            // is correct. Fall through either way so the 1xx still reaches the
+            // A-leg (Require/RSeq stripped in sanitize_b2bua_response below).
+            if state.call_actors.try_mark_prack_acked(
+                call_id,
+                idx,
+                dedup_key,
+                rseq.response_number,
+            ) {
+                // Establish the FIRST early dialog's remote target on the
+                // canonical Dialog (§12.1.2 — set once, not updated by later
+                // provisionals) so the eventual 2xx / BYE / re-INVITE have a
+                // target before answer. The confirming 2xx refreshes remote_tag
+                // / remote_contact to the winning dialog (2xx block below).
+                if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
+                    if let Some(leg) = call.b_legs.get_mut(idx) {
+                        if leg.dialog.remote_tag.is_none() {
+                            if let Some(ref tag) = early_to_tag {
+                                leg.dialog.remote_tag = Some(tag.clone());
+                            }
+                        }
+                        if leg.dialog.remote_contact.is_none() {
+                            if let Some(ref contact) = target.remote_contact {
+                                leg.dialog.remote_contact = Some(contact.clone());
+                            }
+                        }
+                        if leg.dialog.route_set.is_empty() && !target.route_set.is_empty() {
+                            leg.dialog.route_set = target.route_set.clone();
+                        }
+                    }
+                }
+
+                // Pull CSeq num + method from the 1xx (it echoes the INVITE's).
+                let response_cseq_num: u32 = message.headers.cseq()
+                    .and_then(|c| c.split_whitespace().next())
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(1);
+                let response_cseq_method = message.headers.cseq()
+                    .and_then(|c| c.split_whitespace().nth(1))
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "INVITE".to_string());
+
+                if let Some(prack_cseq) = state.call_actors.next_b_leg_local_cseq(call_id, idx) {
+                    let prack = state.call_actors.get_call(call_id).and_then(|call| {
+                        let leg = call.b_legs.get(idx)?;
+                        build_b2bua_prack(
+                            leg,
+                            state,
+                            &target,
+                            rseq.response_number,
+                            response_cseq_num,
+                            &response_cseq_method,
+                            prack_cseq,
+                        )
+                    });
+                    if let Some(prack) = prack {
+                        if let Some((dest, transport)) = b_leg_dest {
+                            // PRACK follows THIS early dialog's route set (RFC
+                            // 3262 §4 + RFC 3261 §12.2.1.1), from the reliable
+                            // 1xx's Record-Route. Empty (direct B-leg, no
+                            // proxies) → resolve_in_dialog_destination falls back
+                            // to the cached destination, correct there.
+                            let (destination, prack_transport) = resolve_in_dialog_destination(
+                                &target.route_set,
+                                state,
+                                dest,
+                                transport,
+                            );
+                            debug!(
+                                call_id = %call_id,
+                                rseq = rseq.response_number,
+                                %destination,
+                                "B2BUA: sending auto-PRACK for reliable 1xx from B-leg"
+                            );
+                            send_b2bua_to_bleg(prack, prack_transport, destination, state);
+                        }
+                    }
+                }
+            } else {
                 debug!(
                     call_id = %call_id,
                     rseq = rseq.response_number,
                     "B2BUA: already PRACKed this RSeq, skipping"
                 );
-                // Still need to strip Require/RSeq from forwarded 1xx (done
-                // in sanitize_b2bua_response below); fall through.
-                let _ = ();
-                // We DO want to fall through to the rest of the function so
-                // the 1xx still reaches the A-leg.
-            } else {
-            // RFC 3262 §4 + RFC 3261 §12.1.2: a reliable provisional response
-            // establishes the early dialog. Two things must be captured from it
-            // before the PRACK is built, because both are otherwise only filled
-            // from the 200 OK (which hasn't arrived yet at PRACK time):
-            //
-            //   * the early-dialog remote (To) tag — without it the PRACK's To
-            //     header carries no tag, so a strict UAS (e.g. an IMS S-CSCF)
-            //     rejects it with 481 Call/Transaction Does Not Exist;
-            //   * the early-dialog route set (THIS response's Record-Route
-            //     reversed, UAC side) — without it the PRACK is sent to the
-            //     cached INVITE next-hop and an I-CSCF that doesn't Record-Route
-            //     rejects it with 406.
-            //
-            // Establish both once (§12.1.2 — not updated by later responses), so
-            // build_b2bua_prack and resolve_in_dialog_destination see the tagged
-            // To and the route-set first hop (the S-CSCF). The 200 OK re-sets
-            // remote_tag to the same value later (confirmed dialog).
-            let early_to_tag = crate::b2bua::actor::extract_to_tag(message);
-            let early_routes = uac_route_set_from_record_routes(
-                &message.headers.get_all("Record-Route").cloned().unwrap_or_default(),
-            );
-            if early_to_tag.is_some() || !early_routes.is_empty() {
-                if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
-                    if let Some(leg) = call.b_legs.get_mut(idx) {
-                        if leg.dialog.remote_tag.is_none() {
-                            if let Some(tag) = early_to_tag {
-                                leg.dialog.remote_tag = Some(tag);
-                            }
-                        }
-                        if leg.dialog.route_set.is_empty() && !early_routes.is_empty() {
-                            leg.dialog.route_set = early_routes;
-                        }
-                    }
-                }
             }
-
-            // Pull CSeq num + method from the 1xx (it echoes the INVITE's).
-            let response_cseq_num: u32 = message.headers.cseq()
-                .and_then(|c| c.split_whitespace().next())
-                .and_then(|n| n.parse().ok())
-                .unwrap_or(1);
-            let response_cseq_method = message.headers.cseq()
-                .and_then(|c| c.split_whitespace().nth(1))
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "INVITE".to_string());
-
-            if let Some(prack_cseq) = state.call_actors.next_b_leg_local_cseq(call_id, idx) {
-                // Re-snapshot the leg now that we may have mutated it.
-                let prack = state.call_actors.get_call(call_id).and_then(|call| {
-                    let leg = call.b_legs.get(idx)?;
-                    build_b2bua_prack(
-                        leg,
-                        state,
-                        rseq.response_number,
-                        response_cseq_num,
-                        &response_cseq_method,
-                        prack_cseq,
-                    )
-                });
-                if let Some(prack) = prack {
-                    if let Some((dest, transport)) = b_leg_dest {
-                        // PRACK follows the early-dialog route set (RFC 3262 §4
-                        // + RFC 3261 §12.2.1.1), captured from this reliable
-                        // 1xx's Record-Route just above. When the 1xx carried no
-                        // Record-Route (direct B-leg, no proxies) the set is
-                        // empty and resolve_in_dialog_destination falls back to
-                        // the cached destination, which is correct there.
-                        let leg_route_set = state.call_actors.get_call(call_id)
-                            .and_then(|call| {
-                                call.b_legs.get(idx).map(|leg| leg.dialog.route_set.clone())
-                            })
-                            .unwrap_or_default();
-                        let (destination, prack_transport) = resolve_in_dialog_destination(
-                            &leg_route_set,
-                            state,
-                            dest,
-                            transport,
-                        );
-                        debug!(
-                            call_id = %call_id,
-                            rseq = rseq.response_number,
-                            %destination,
-                            "B2BUA: sending auto-PRACK for reliable 1xx from B-leg"
-                        );
-                        send_b2bua_to_bleg(prack, prack_transport, destination, state);
-                    }
-                }
-            }
-            } // close `else` (first-time-this-RSeq branch)
         }
     }
 
@@ -17783,6 +17876,197 @@ mod tests {
             Some("sip:scscf.ims.example.com:6060;lr;transport=udp"),
             "PRACK must follow the early-dialog route set to the S-CSCF",
         );
+    }
+
+    /// The reliable 183 as an IMS UE sends it: a `Contact` on a host
+    /// (`203.0.113.14`) DISTINCT from the To AoR host (the home domain). The
+    /// early-dialog target must capture the Contact (RFC 3261 §12.1.2 remote
+    /// target), the tagged To, and the reversed Record-Route — a round-trip
+    /// against siphon's own loopback UAS would hide this because AoR and Contact
+    /// resolve to the same place.
+    #[test]
+    fn early_dialog_target_from_response_uses_contact_not_aor() {
+        let response = parse_sip_message(concat!(
+            "SIP/2.0 183 Session Progress\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-bleg-1\r\n",
+            "From: <sip:+15550100@192.0.2.1>;tag=sb-fromtag\r\n",
+            "To: <sip:1001@ims.example.com>;tag=uas-early-1\r\n",
+            "Call-ID: b2b-callid@192.0.2.1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "RSeq: 1\r\n",
+            "Require: 100rel\r\n",
+            "Record-Route: <sip:198.51.100.101:5060;transport=tcp;lr>, <sip:198.51.100.101:5060;transport=udp;lr>, <sip:198.51.100.121:6060;transport=udp;lr>\r\n",
+            "Contact: <sip:ue@203.0.113.14:42685>\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ))
+        .expect("183 fixture parses")
+        .1;
+
+        let target = early_dialog_target_from_response(&response);
+        // Remote target = the UE Contact, NOT the To AoR.
+        assert_eq!(
+            target.remote_contact.as_deref(),
+            Some("sip:ue@203.0.113.14:42685"),
+        );
+        // To carries the early-dialog remote tag.
+        assert_eq!(
+            target.to_header.as_deref(),
+            Some("<sip:1001@ims.example.com>;tag=uas-early-1"),
+        );
+        // Route set = Record-Route reversed for the UAC side (first hop = the
+        // last Record-Route entry, the S-CSCF).
+        assert_eq!(
+            first_route_uri(&target.route_set).as_deref(),
+            Some("sip:198.51.100.121:6060;transport=udp;lr"),
+        );
+    }
+
+    /// The core fix: the auto-PRACK's Request-URI must be the reliable 183's
+    /// Contact (the UE), NOT the dialog To AoR. Pre-fix, `remote_contact` was
+    /// only captured on the 2xx, so the R-URI fell back to `target_uri` (the
+    /// AoR) and an IMS I-CSCF returned 482 Loop Detected.
+    #[test]
+    fn build_b2bua_prack_ruri_is_remote_contact_not_aor() {
+        let response = parse_sip_message(concat!(
+            "SIP/2.0 183 Session Progress\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-bleg-1\r\n",
+            "From: <sip:+15550100@192.0.2.1>;tag=sb-fromtag\r\n",
+            "To: <sip:1001@ims.example.com>;tag=uas-early-1\r\n",
+            "Call-ID: b2b-callid@192.0.2.1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "RSeq: 1\r\n",
+            "Require: 100rel\r\n",
+            "Record-Route: <sip:198.51.100.101:5060;transport=tcp;lr>, <sip:198.51.100.101:5060;transport=udp;lr>, <sip:198.51.100.121:6060;transport=udp;lr>\r\n",
+            "Contact: <sip:ue@203.0.113.14:42685>\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ))
+        .expect("183 fixture parses")
+        .1;
+        let target = early_dialog_target_from_response(&response);
+
+        // B-leg dialog as siphon holds it before answer: target_uri is the AoR,
+        // remote_contact is still None (only the 2xx would set it pre-fix).
+        let mut dialog = crate::b2bua::actor::Dialog::new_outbound(
+            "b2b-callid@192.0.2.1".to_string(),
+            "sb-fromtag".to_string(),
+            "sip:1001@ims.example.com".to_string(),
+        );
+        dialog.local_from_uri = Some("<sip:+15550100@192.0.2.1>".to_string());
+        dialog.local_contact = Some("<sip:192.0.2.1:5060;transport=udp>".to_string());
+
+        let prack = build_b2bua_prack_message(
+            &dialog,
+            crate::transport::Transport::Udp,
+            "192.0.2.1",
+            5060,
+            &target,
+            1,        // RSeq
+            1,        // INVITE CSeq number (echoed by the 183)
+            "INVITE", // RAck method
+            3,        // local CSeq for the PRACK
+        )
+        .expect("PRACK builds");
+
+        // Request-URI is the UE Contact, not the home-domain AoR.
+        match &prack.start_line {
+            StartLine::Request(request_line) => {
+                assert_eq!(request_line.method, Method::Prack);
+                assert_eq!(request_line.request_uri.host, "203.0.113.14");
+                assert_eq!(request_line.request_uri.port, Some(42685));
+                assert_eq!(
+                    request_line.request_uri.user.as_deref(),
+                    Some("ue"),
+                );
+                assert_ne!(
+                    request_line.request_uri.host, "ims.example.com",
+                    "R-URI must be the remote target Contact, never the To AoR",
+                );
+            }
+            _ => panic!("expected a PRACK request line"),
+        }
+        // To carries the remote tag from the 183 (early-dialog identity).
+        assert!(prack.headers.to().unwrap().contains("tag=uas-early-1"));
+        // RAck = "<RSeq> <CSeq-num> <method>" (RFC 3262 §7.2).
+        assert_eq!(prack.headers.get("RAck").map(String::as_str), Some("1 1 INVITE"));
+        // Route set follows the reversed Record-Route to the S-CSCF first hop.
+        let routes = prack.headers.get_all("Route").cloned().unwrap_or_default();
+        assert_eq!(
+            first_route_uri(&routes).as_deref(),
+            Some("sip:198.51.100.121:6060;transport=udp;lr"),
+        );
+    }
+
+    /// Forked early dialogs: one INVITE branch, two reliable 183s with DISTINCT
+    /// To-tags and Contacts (and both RSeq 1). Each PRACK must target its OWN
+    /// dialog's Contact and carry its OWN To-tag — a single per-Leg remote-target
+    /// slot would send both PRACKs to the first dialog's Contact.
+    #[test]
+    fn forked_early_dialogs_prack_targets_matching_contact() {
+        let make_183 = |to_tag: &str, contact_host: &str| {
+            parse_sip_message(&format!(
+                concat!(
+                    "SIP/2.0 183 Session Progress\r\n",
+                    "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-bleg-1\r\n",
+                    "From: <sip:+15550100@192.0.2.1>;tag=sb-fromtag\r\n",
+                    "To: <sip:1001@ims.example.com>;tag={to_tag}\r\n",
+                    "Call-ID: b2b-callid@192.0.2.1\r\n",
+                    "CSeq: 1 INVITE\r\n",
+                    "RSeq: 1\r\n",
+                    "Require: 100rel\r\n",
+                    "Contact: <sip:ue@{contact_host}:42685>\r\n",
+                    "Content-Length: 0\r\n",
+                    "\r\n",
+                ),
+                to_tag = to_tag,
+                contact_host = contact_host,
+            ))
+            .expect("183 fixture parses")
+            .1
+        };
+
+        let dialog = || {
+            let mut dialog = crate::b2bua::actor::Dialog::new_outbound(
+                "b2b-callid@192.0.2.1".to_string(),
+                "sb-fromtag".to_string(),
+                "sip:1001@ims.example.com".to_string(),
+            );
+            dialog.local_from_uri = Some("<sip:+15550100@192.0.2.1>".to_string());
+            dialog.local_contact = Some("<sip:192.0.2.1:5060;transport=udp>".to_string());
+            dialog
+        };
+
+        for (to_tag, host) in [("tag-alpha", "203.0.113.14"), ("tag-beta", "203.0.113.99")] {
+            let response = make_183(to_tag, host);
+            let target = early_dialog_target_from_response(&response);
+            let prack = build_b2bua_prack_message(
+                &dialog(),
+                crate::transport::Transport::Udp,
+                "172.16.0.153",
+                5060,
+                &target,
+                1,
+                1,
+                "INVITE",
+                3,
+            )
+            .expect("PRACK builds");
+
+            match &prack.start_line {
+                StartLine::Request(request_line) => {
+                    assert_eq!(
+                        request_line.request_uri.host, host,
+                        "each fork branch PRACKs its own Contact host",
+                    );
+                }
+                _ => panic!("expected a PRACK request line"),
+            }
+            assert!(
+                prack.headers.to().unwrap().contains(&format!("tag={to_tag}")),
+                "each fork branch PRACK carries its own To-tag",
+            );
+        }
     }
 
     #[test]
