@@ -67,19 +67,59 @@ pub fn detect_routable_local_ip(ipv6: bool) -> Option<IpAddr> {
 /// zombie connections from accumulating (especially behind NAT).
 pub const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Apply IP_TOS / IPV6_TCLASS on a socket2 reference.
+/// Apply the DSCP mark to a socket, selecting the knob by address family.
 ///
 /// `tos` is the full 8-bit TOS byte (DSCP << 2).  Use [`crate::config::dscp_to_tos`]
 /// to convert from a 6-bit DSCP value.
 ///
-/// socket2 0.6 only exposes `set_tos_v4` (IP_TOS).  For IPv6 sockets we
-/// fall back to a raw `setsockopt(IPV6_TCLASS)` via `set_tos_v4` which on
-/// Linux works on dual-stack sockets.  If the v4 call fails we log and
-/// continue — TOS is best-effort (the kernel may ignore it without
-/// `CAP_NET_ADMIN` depending on DSCP value).
+/// v4 socket → `IP_TOS` (IPPROTO_IP).  v6 socket → `IPV6_TCLASS` (IPPROTO_IPV6)
+/// for native IPv6 packets **and** `IP_TOS` too: a dual-stack `[::]` socket also
+/// emits v4-mapped IPv4 packets whose DSCP rides `IP_TOS`, so setting only
+/// `IPV6_TCLASS` would leave those unmarked.  `IP_TOS` alone (the pre-dual-stack
+/// behaviour) is silently ineffective for native IPv6, which is the gap this
+/// closes.  socket2 0.6 gates `set_tclass_v6` behind its `all` feature (not
+/// enabled), so the v6 path goes straight to `libc::setsockopt` — the same
+/// raw-setsockopt pattern used in [`crate::firewall`].
+///
+/// Best-effort: a marking failure logs and is ignored, never taking the
+/// listener/connection down (DSCP is advisory; the kernel may reject some values
+/// without `CAP_NET_ADMIN`).
 pub fn apply_tos(sock_ref: &SockRef<'_>, tos: u32) {
-    if let Err(error) = sock_ref.set_tos_v4(tos) {
-        warn!(tos, "failed to set IP_TOS/IPV6_TCLASS: {error}");
+    let is_ipv6 = sock_ref
+        .local_addr()
+        .map(|addr| addr.is_ipv6())
+        .unwrap_or(false);
+    if is_ipv6 {
+        set_tclass_v6(sock_ref, tos);
+        // Also mark v4-mapped egress on a dual-stack socket.  Best-effort: on a
+        // pure-v6 socket this may be a no-op / ENOPROTOOPT, which is harmless.
+        let _ = sock_ref.set_tos_v4(tos);
+    } else if let Err(error) = sock_ref.set_tos_v4(tos) {
+        warn!(tos, "failed to set IP_TOS (DSCP): {error}");
+    }
+}
+
+/// Set `IPV6_TCLASS` on a v6 socket via a raw `setsockopt`.  Best-effort.
+fn set_tclass_v6(sock_ref: &SockRef<'_>, tos: u32) {
+    use std::os::fd::AsRawFd;
+    let tclass = tos as libc::c_int;
+    // SAFETY: `sock_ref` owns a valid open socket fd for the duration of the
+    // call, and we pass a correctly-sized `c_int` option value + length.
+    let ret = unsafe {
+        libc::setsockopt(
+            sock_ref.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_TCLASS,
+            &tclass as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        warn!(
+            tos,
+            "failed to set IPV6_TCLASS (DSCP): {}",
+            std::io::Error::last_os_error()
+        );
     }
 }
 
@@ -269,6 +309,38 @@ impl ListenerRegistry {
         self.entries
             .get(&(transport, addr))
             .map(|advertise| SendSocket { transport, addr, advertise: advertise.clone() })
+    }
+
+    /// Resolve the listener of `transport` matching the given address family
+    /// (`ipv6 == true` selects an IPv6 listener), for family-aware local
+    /// identity on a dual-stack host.  When several listeners of that
+    /// transport+family exist (e.g. a P-CSCF's 5060/5064/5066), the lowest
+    /// bound address wins deterministically — the backing HashMap's iteration
+    /// order is otherwise unstable.  Returns `None` when no listener of that
+    /// family is configured for the transport.
+    pub fn resolve_family(&self, transport: Transport, ipv6: bool) -> Option<SendSocket> {
+        self.entries
+            .iter()
+            .filter(|((t, addr), _)| *t == transport && addr.is_ipv6() == ipv6)
+            .min_by_key(|((_, addr), _)| *addr)
+            .map(|((transport, addr), advertise)| SendSocket {
+                transport: *transport,
+                addr: *addr,
+                advertise: advertise.clone(),
+            })
+    }
+
+    /// Whether `destination` points back at one of our own listeners, for loop
+    /// detection across every listener on a multi-homed / dual-stack host (not
+    /// just the first-per-transport `listen_addrs` view).  A destination on a
+    /// listener's port matches when its IP equals that listener's IP or is a
+    /// loopback address (a peer may address us by loopback).
+    pub fn matches_local(&self, destination: &SocketAddr) -> bool {
+        let ip = destination.ip();
+        let port = destination.port();
+        self.entries
+            .keys()
+            .any(|(_, addr)| port == addr.port() && (ip == addr.ip() || ip.is_loopback()))
     }
 
     /// Number of registered listeners (diagnostics / tests).
@@ -540,6 +612,35 @@ mod tests {
         apply_tos(&sock_ref, 184); // EF
         let tos = sock_ref.tos_v4().unwrap();
         assert_eq!(tos, 184, "TOS should be 184 (EF = DSCP 46 << 2)");
+    }
+
+    #[test]
+    fn apply_tos_sets_tclass_on_ipv6_socket() {
+        // A v6 socket must get IPV6_TCLASS (IP_TOS is a no-op for native v6),
+        // otherwise its egress carries no DSCP mark.
+        use std::os::fd::AsRawFd;
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        let sock_ref = SockRef::from(&socket);
+        apply_tos(&sock_ref, 96); // CS3
+        let mut tclass: libc::c_int = -1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: valid open v6 socket fd; correctly-sized c_int out-param.
+        let ret = unsafe {
+            libc::getsockopt(
+                sock_ref.as_raw_fd(),
+                libc::IPPROTO_IPV6,
+                libc::IPV6_TCLASS,
+                &mut tclass as *mut libc::c_int as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(ret, 0, "getsockopt(IPV6_TCLASS) should succeed");
+        assert_eq!(tclass, 96, "IPV6_TCLASS should be 96 (CS3)");
     }
 
     #[tokio::test]
@@ -887,5 +988,39 @@ mod tests {
 
         // An address siphon isn't listening on does not resolve.
         assert!(registry.resolve(Transport::Udp, addr("172.16.0.1:5060")).is_none());
+    }
+
+    #[test]
+    fn listener_registry_resolve_family_picks_matching_family() {
+        let registry = ListenerRegistry::from_entries([
+            (Transport::Udp, addr("192.0.2.10:5066"), Some("v4.example".to_string())),
+            (Transport::Udp, addr("192.0.2.10:5060"), None),
+            (Transport::Udp, addr("[2001:db8::10]:5060"), Some("v6.example".to_string())),
+        ]);
+        // v6 selector → the v6 listener, carrying its advertise.
+        let v6 = registry.resolve_family(Transport::Udp, true).unwrap();
+        assert!(v6.addr.is_ipv6());
+        assert_eq!(v6.advertise.as_deref(), Some("v6.example"));
+        // v4 selector → deterministically the lowest v4 addr (:5060 < :5066).
+        let v4 = registry.resolve_family(Transport::Udp, false).unwrap();
+        assert_eq!(v4.addr, addr("192.0.2.10:5060"));
+        // No listener of that transport+family.
+        assert!(registry.resolve_family(Transport::Tcp, true).is_none());
+    }
+
+    #[test]
+    fn listener_registry_matches_local_covers_all_families_and_loopback() {
+        let registry = ListenerRegistry::from_entries([
+            (Transport::Udp, addr("192.0.2.10:5060"), None),
+            (Transport::Udp, addr("[2001:db8::10]:5060"), None),
+        ]);
+        // Both families' listeners match (dual-stack loop detection).
+        assert!(registry.matches_local(&addr("192.0.2.10:5060")));
+        assert!(registry.matches_local(&addr("[2001:db8::10]:5060")));
+        // Loopback on a listener port is treated as our own.
+        assert!(registry.matches_local(&addr("127.0.0.1:5060")));
+        // A different port is not ours; a foreign IP on a listener port isn't either.
+        assert!(!registry.matches_local(&addr("192.0.2.10:5999")));
+        assert!(!registry.matches_local(&addr("198.51.100.1:5060")));
     }
 }

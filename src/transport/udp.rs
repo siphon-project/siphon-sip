@@ -134,9 +134,10 @@ fn create_reusable_udp_socket(local_addr: SocketAddr, tos: Option<u32>) -> std::
     socket.set_reuse_port(true)?;
     socket.set_nonblocking(true)?;
 
-    // DSCP / DiffServ marking (RFC 4594).
+    // DSCP / DiffServ marking (RFC 4594) — family-aware, best-effort (a marking
+    // failure must not stop the listener coming up).
     if let Some(tos) = tos {
-        socket.set_tos_v4(tos)?;
+        super::apply_tos(&socket2::SockRef::from(&socket), tos);
     }
 
     socket.bind(&SockAddr::from(local_addr))?;

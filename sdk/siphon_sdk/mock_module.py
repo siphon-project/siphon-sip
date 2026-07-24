@@ -6079,6 +6079,12 @@ class MockIpsec:
     def __init__(self) -> None:
         self.pcscf_port_c = 5064
         self.pcscf_port_s = 5066
+        # Per-family P-CSCF local address (dual-stack).  Both present by default
+        # so a correctly-configured P-CSCF allocates for either family; set one
+        # to ``None`` to model a single-stack P-CSCF and exercise the
+        # family-mismatch error (see ``set_pcscf_families``).
+        self.pcscf_addr_v4: Optional[str] = "10.0.0.10"
+        self.pcscf_addr_v6: Optional[str] = "2001:db8::10"
         self._stash: dict[str, MockPendingSA] = {}
         self._allocate_should_fail: Optional[type[BaseException]] = None
         self._allocate_failure_message = "mock allocate failure"
@@ -6126,6 +6132,19 @@ class MockIpsec:
             sa_protocol = proto_lower
             wire_protocol = "udp" if proto_lower == "any" else proto_lower
         av._take()  # raises ValueError if already consumed
+        # Family-matched P-CSCF address (mirrors the Rust binding, which
+        # consumes ``av`` before this check): the SA's P-CSCF side must be the
+        # same family as the UE, so a UE whose family has no configured P-CSCF
+        # listener raises rather than installing a dead mixed-family selector
+        # (3GPP TS 33.203 §7.2).
+        ue_is_v6 = ":" in offer.ue_addr
+        if (self.pcscf_addr_v6 if ue_is_v6 else self.pcscf_addr_v4) is None:
+            family = "IPv6" if ue_is_v6 else "IPv4"
+            raise ValueError(
+                f"no {family} P-CSCF listener configured for {family} UE "
+                f"{offer.ue_addr}; cannot build a same-family IPsec SA selector "
+                f"(3GPP TS 33.203 §7.2)"
+            )
         if self._allocate_should_fail is not None:
             raise self._allocate_should_fail(self._allocate_failure_message)
         pending = MockPendingSA(
@@ -6155,9 +6174,21 @@ class MockIpsec:
         self._allocate_should_fail = exc_type
         self._allocate_failure_message = message
 
+    def set_pcscf_families(self, v4: bool = True, v6: bool = True) -> None:
+        """Model which address families this P-CSCF has a listener for.
+
+        Both default to available.  Set one to ``False`` to model a
+        single-stack P-CSCF so ``allocate()`` raises for a UE of the missing
+        family, exactly as the Rust binding does.
+        """
+        self.pcscf_addr_v4 = "10.0.0.10" if v4 else None
+        self.pcscf_addr_v6 = "2001:db8::10" if v6 else None
+
     def clear(self) -> None:
         self._stash.clear()
         self._allocate_should_fail = None
+        self.pcscf_addr_v4 = "10.0.0.10"
+        self.pcscf_addr_v6 = "2001:db8::10"
         MockPendingSA._next_spi = 10000
 
 

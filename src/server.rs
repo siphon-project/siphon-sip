@@ -753,16 +753,31 @@ impl SiphonServer {
                 "IPsec SA manager initialized (script-driven via siphon.ipsec)"
             );
 
-            // Derive pcscf_addr from the first UDP listen entry without
-            // binding the listener.  Used at SA creation time as the
-            // P-CSCF side of the kernel's xfrm selectors.
-            let pcscf_addr = config
-                .listen
-                .udp
-                .first()
-                .and_then(|entry| entry.address().parse::<std::net::SocketAddr>().ok())
-                .map(|addr| addr.ip())
-                .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            // Derive the P-CSCF local address per family from the first UDP
+            // listen entry of each family, without binding the listener.  Used
+            // at SA creation time as the P-CSCF side of the kernel's xfrm
+            // selectors — which must match the UE's family (3GPP TS 33.203
+            // §7.2), so a dual-stack P-CSCF needs both.
+            let mut pcscf_addr_v4: Option<std::net::IpAddr> = None;
+            let mut pcscf_addr_v6: Option<std::net::IpAddr> = None;
+            // Prefer a concrete bind address over a wildcard (0.0.0.0 / [::]):
+            // an unspecified address yields a dead XFRM selector, so take the
+            // first concrete listener of each family when one exists, only
+            // falling back to a wildcard entry if that's all that's configured
+            // (preserves the historical single-wildcard-listener behaviour).
+            for entry in &config.listen.udp {
+                if let Ok(addr) = entry.address().parse::<std::net::SocketAddr>() {
+                    let ip = addr.ip();
+                    let slot = if ip.is_ipv6() { &mut pcscf_addr_v6 } else { &mut pcscf_addr_v4 };
+                    match slot {
+                        None => *slot = Some(ip),
+                        Some(existing) if existing.is_unspecified() && !ip.is_unspecified() => {
+                            *slot = Some(ip);
+                        }
+                        _ => {}
+                    }
+                }
+            }
 
             let ipsec_manager_for_singleton = Arc::clone(&manager);
             let ipsec_config_arc = Arc::new(ipsec_config.clone());
@@ -770,14 +785,19 @@ impl SiphonServer {
                 let py_ipsec = crate::script::api::ipsec::PyIpsec::new(
                     ipsec_manager_for_singleton,
                     ipsec_config_arc,
-                    pcscf_addr,
+                    pcscf_addr_v4,
+                    pcscf_addr_v6,
                 );
                 if let Err(error) =
                     crate::script::api::set_ipsec_singleton(python, py_ipsec)
                 {
                     error!("failed to store IPsec singleton: {error}");
                 } else {
-                    info!(pcscf_addr = %pcscf_addr, "ipsec namespace registered for injection");
+                    info!(
+                        pcscf_addr_v4 = ?pcscf_addr_v4,
+                        pcscf_addr_v6 = ?pcscf_addr_v6,
+                        "ipsec namespace registered for injection"
+                    );
                 }
             });
 

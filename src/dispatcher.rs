@@ -4,7 +4,7 @@
 //! Python script handlers, and sends responses back through the transport.
 //! Implements stateless proxy relay with Via-based response routing.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, RwLock};
 
 use bytes::Bytes;
@@ -31,7 +31,7 @@ use crate::sip::message::{Method, RequestLine, SipMessage, StartLine, StatusLine
 use crate::sip::headers::SipHeaders;
 use crate::sip::uri::SipUri;
 use crate::sip::parser::{parse_sip_message_bytes, parse_uri_standalone};
-use crate::sip::uri::format_sip_host;
+use crate::sip::uri::{format_sip_host, split_host_port, strip_ipv6_brackets};
 use crate::transaction::key::TransactionKey;
 use crate::transaction::state::{
     Action, TimerName,
@@ -350,6 +350,30 @@ impl DispatcherState {
             .unwrap_or(self.local_addr.port())
     }
 
+    /// Family-matched host to advertise to the A-leg (Contact / Via /
+    /// Record-Route), selected from the socket the request arrived on.
+    ///
+    /// Host-side analogue of [`a_leg_advertised_port`].  `via_host` keys only on
+    /// transport and so collapses to the first configured listener's family — on
+    /// a dual-stack P-CSCF a UE that registered over IPv6 would get the IPv4
+    /// advertised host stamped on its responses.  Passing the arrival socket
+    /// (`inbound.local_addr` / `leg.transport.local_addr`) selects the
+    /// family-correct identity.  `None` (arrival socket unknown — e.g. a
+    /// core-facing outbound leg) reproduces the legacy per-transport `via_host`.
+    fn a_leg_advertised_host(
+        &self,
+        a_leg_local_addr: Option<SocketAddr>,
+        transport: &Transport,
+    ) -> String {
+        resolve_advertised_host(
+            &self.listener_registry,
+            &self.advertised_addrs,
+            self.local_addr.ip(),
+            a_leg_local_addr,
+            transport,
+        )
+    }
+
     /// Resolve siphon's own endpoint to report in a HEP capture for `transport`.
     ///
     /// When siphon binds to the wildcard address (`0.0.0.0` / `[::]`, the usual
@@ -415,28 +439,23 @@ impl DispatcherState {
     }
 
     /// Check whether a resolved destination points back to one of our own
-    /// listen addresses (loop detection).  Checks the primary `local_addr`
-    /// AND every per-transport listen address in `listen_addrs`.
+    /// listen addresses (loop detection).  Checks the primary `local_addr` and
+    /// **every** configured listener via `listener_registry` — on a multi-homed
+    /// / dual-stack host `listen_addrs` keeps only the first listener per
+    /// transport, so a destination on the second-family (or second-port)
+    /// listener would otherwise slip through.
     fn is_own_address(&self, destination: &std::net::SocketAddr) -> bool {
         let ip = destination.ip();
         let port = destination.port();
-        let ip_matches = |listen_ip: std::net::IpAddr| {
-            ip == listen_ip || ip.is_loopback()
-        };
 
-        // Check primary listen address
-        if port == self.local_addr.port() && ip_matches(self.local_addr.ip()) {
+        // Check primary listen address (the resolved via_addr, which may not be
+        // an exact registry entry when bound to a wildcard).
+        if port == self.local_addr.port() && (ip == self.local_addr.ip() || ip.is_loopback()) {
             return true;
         }
 
-        // Check all per-transport listen addresses (e.g. TLS on :5061)
-        for addr in self.listen_addrs.values() {
-            if port == addr.port() && ip_matches(addr.ip()) {
-                return true;
-            }
-        }
-
-        false
+        // Check every configured listener (both families, all transports).
+        self.listener_registry.matches_local(destination)
     }
 }
 
@@ -2867,8 +2886,10 @@ fn handle_request(
             if method == "OPTIONS" && (200..300).contains(code) {
                 augment_options_response(
                     &mut response,
-                    &state.via_host(&inbound.transport),
-                    state.via_port(&inbound.transport),
+                    // Family-matched to the socket the OPTIONS arrived on, so a v6
+                    // probe gets a v6 Contact/Via and the exact arrival port.
+                    &state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
+                    inbound.local_addr.port(),
                     inbound.transport,
                 );
             }
@@ -3317,14 +3338,16 @@ fn relay_request(
         // server port (e.g. 5066) is non-default — using the per-
         // transport via_host would emit a Via with the wrong port and
         // the UE's response would land on the wrong listener
-        // (3GPP TS 33.203 §7.4).
-        (local.ip().to_string(), Some(local.port()))
+        // (3GPP TS 33.203 §7.4).  Bracket a v6 literal — a raw
+        // `local.ip().to_string()` would emit a malformed unbracketed
+        // `SIP/2.0/UDP 2001:db8::10:5066` sent-by.
+        (format_sip_host(&local.ip().to_string()), Some(local.port()))
     } else if let Some(local) = ipsec_source {
         // IPsec auto-source: same correctness invariant as the flow
         // path — the UE's response on SA #4 (UE → port_pc) must land
         // on the Via we advertise, otherwise the kernel selector
         // doesn't match and the response is silently dropped.
-        (local.ip().to_string(), Some(local.port()))
+        (format_sip_host(&local.ip().to_string()), Some(local.port()))
     } else if let Some(pin) = send_socket {
         // Script send_socket= egress pin: advertise the selected listener's
         // sent-by (its configured advertise host, else the bound IP) with the
@@ -3332,12 +3355,12 @@ fn relay_request(
         let (host, port) = pin.via_sent_by();
         (format_sip_host(&host), Some(port))
     } else if let Some(target_str) = send_via_target {
-        // Parse "host:port" or just "host"
-        if let Some((host, port_str)) = target_str.rsplit_once(':') {
-            (host.to_string(), port_str.parse::<u16>().ok())
-        } else {
-            (target_str.to_string(), None)
-        }
+        // Script force_send_via override — bracket-aware split so a bare
+        // bracketed v6 literal (`[2001:db8::1]`, no port) isn't truncated by a
+        // naive rsplit_once(':').  Re-bracket the host so an unbracketed v6
+        // still renders a valid sent-by.
+        let (host, port) = split_host_port(target_str);
+        (format_sip_host(host), port)
     } else {
         (state.via_host(&outbound_transport), Some(state.via_port(&outbound_transport)))
     };
@@ -4070,7 +4093,7 @@ fn handle_response(
                             .via(format!(
                                 "SIP/2.0/{} {}:{};branch={}",
                                 transport_str,
-                                format_sip_host(&state.local_addr.ip().to_string()),
+                                state.a_leg_advertised_host(zombie.local_addr, &zombie.transport),
                                 outbound_port,
                                 TransactionKey::generate_branch(),
                             ))
@@ -6257,6 +6280,93 @@ fn a_leg_advertised_port(a_leg_local_addr: Option<SocketAddr>, default_via_port:
         .unwrap_or(default_via_port)
 }
 
+/// Resolve the family-matched host to advertise to the A-leg, given the socket
+/// the request arrived on.  Backing logic for
+/// [`DispatcherState::a_leg_advertised_host`], factored out as a free function
+/// so it is unit-testable without a `DispatcherState` fixture.
+///
+/// With `a_leg_local_addr = Some(addr)` the resolution, most-specific first:
+///
+/// 1. the per-listener `advertise` configured for that exact socket;
+/// 2. a transport-level advertised host of the **same family** (preserves the
+///    global `advertised_address` / NAT case, but never hands a v4 literal to a
+///    v6 UE or vice-versa; an FQDN is family-agnostic and always accepted);
+/// 3. the exact bound IP, when concrete (explicit per-family listener);
+/// 4. a wildcard bind → a family-matched listener's advertise/bound IP, else a
+///    routable local IP of that family, else that family's loopback.
+///
+/// `None` reproduces the legacy per-transport `via_host` (first advertised host,
+/// else the resolved `default_local_ip`).
+fn resolve_advertised_host(
+    registry: &crate::transport::ListenerRegistry,
+    advertised_addrs: &std::collections::HashMap<Transport, String>,
+    default_local_ip: IpAddr,
+    a_leg_local_addr: Option<SocketAddr>,
+    transport: &Transport,
+) -> String {
+    let Some(addr) = a_leg_local_addr else {
+        return advertised_addrs
+            .get(transport)
+            .map(|host| format_sip_host(host))
+            .unwrap_or_else(|| format_sip_host(&default_local_ip.to_string()));
+    };
+    let ipv6 = addr.is_ipv6();
+
+    // 1. Per-listener advertise for this exact socket.
+    if let Some(advertise) = registry.resolve(*transport, addr).and_then(|s| s.advertise) {
+        return format_sip_host(&advertise);
+    }
+
+    // 2. A transport-level advertised host of the same family (or an FQDN).
+    //    Strip any v6 brackets before parsing so a bracketed literal
+    //    (`[2001:db8::1]`) is still classified as an IP, not an FQDN.
+    if let Some(host) = advertised_addrs.get(transport) {
+        let family_ok = match strip_ipv6_brackets(host).parse::<IpAddr>() {
+            Ok(ip) => ip.is_ipv6() == ipv6,
+            Err(_) => true, // FQDN — resolves to whichever family the UE needs.
+        };
+        if family_ok {
+            return format_sip_host(host);
+        }
+    }
+
+    // 3. The exact bound IP, when concrete.
+    if !addr.ip().is_unspecified() {
+        return format_sip_host(&addr.ip().to_string());
+    }
+
+    // 4. Wildcard bind → family-matched fallback.
+    if let Some(send) = registry.resolve_family(*transport, ipv6) {
+        if let Some(advertise) = send.advertise {
+            return format_sip_host(&advertise);
+        }
+        if !send.addr.ip().is_unspecified() {
+            return format_sip_host(&send.addr.ip().to_string());
+        }
+    }
+    if let Some(ip) = cached_routable_local_ip(ipv6) {
+        return format_sip_host(&ip.to_string());
+    }
+    let loopback = if ipv6 {
+        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+    } else {
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    };
+    format_sip_host(&loopback.to_string())
+}
+
+/// Process-lifetime cache of [`crate::transport::detect_routable_local_ip`] per
+/// family.  Only the wildcard-bind, no-advertise fallback of
+/// [`resolve_advertised_host`] reaches the probe, but that path can be
+/// per-message, and the probe does a socket create + `connect` + `getsockname`.
+/// The routable local IP doesn't change at runtime, so memoise it.
+fn cached_routable_local_ip(ipv6: bool) -> Option<IpAddr> {
+    static V4: std::sync::OnceLock<Option<IpAddr>> = std::sync::OnceLock::new();
+    static V6: std::sync::OnceLock<Option<IpAddr>> = std::sync::OnceLock::new();
+    let cache = if ipv6 { &V6 } else { &V4 };
+    *cache.get_or_init(|| crate::transport::detect_routable_local_ip(ipv6))
+}
+
 /// Sanitize a B2BUA response before forwarding it to the A-leg.
 ///
 /// A proper B2BUA terminates and regenerates the dialog, so B-leg-specific
@@ -6284,7 +6394,7 @@ fn sanitize_b2bua_response(
     // Contact advertising the wrong port sends every in-dialog request (ACK, BYE,
     // re-INVITE) to a port the dialog isn't anchored on. Falls back to via_port()
     // when the arrival socket is unknown (single-listener hosts, where they match).
-    let a_leg_host = state.via_host(&a_leg_transport);
+    let a_leg_host = state.a_leg_advertised_host(a_leg_local_addr, &a_leg_transport);
     let a_leg_port =
         a_leg_advertised_port(a_leg_local_addr, state.via_port(&a_leg_transport));
     let contact_value = format!(
@@ -6381,6 +6491,27 @@ fn sanitize_o_username(name: &str) -> String {
     }
 }
 
+/// Resolve a substituted SDP origin address to its `(unicast-address, addrtype)`
+/// pair for the `o=` line.  `via_host()` produces a **bracket-formatted** host
+/// for IPv6, but brackets are illegal in SDP (RFC 4566 §5.2) and the address
+/// family must match the `<addrtype>` token — so strip the brackets and derive
+/// `IP4`/`IP6` from the address family.  Returns `addrtype = None` for a
+/// non-literal host (an FQDN advertise address), signalling the caller to leave
+/// the existing `<addrtype>` untouched.
+fn sdp_origin_address(addr: &str) -> (String, Option<&'static str>) {
+    let bare = strip_ipv6_brackets(addr);
+    if bare.parse::<std::net::Ipv6Addr>().is_ok() {
+        (bare.to_string(), Some("IP6"))
+    } else if bare.parse::<std::net::Ipv4Addr>().is_ok() {
+        (bare.to_string(), Some("IP4"))
+    } else {
+        // FQDN / unparseable (e.g. a zoned link-local) — emit unbracketed and
+        // leave <addrtype> as-is.  For an FQDN `bare == addr`; for a bracketed
+        // non-literal this strips the brackets rather than leak them into SDP.
+        (bare.to_string(), None)
+    }
+}
+
 fn sanitize_sdp_identity(body: &mut Vec<u8>, name: &str, addr: Option<&str>) {
     if body.is_empty() {
         return;
@@ -6399,31 +6530,63 @@ fn sanitize_sdp_identity(body: &mut Vec<u8>, name: &str, addr: Option<&str>) {
     for line in text.split_inclusive('\n') {
         if line.starts_with("o=") {
             // o=<username> <sess-id> <sess-version> <nettype> <addrtype> <addr>[\r\n]
-            // Replace username, and optionally the trailing address.
+            // Replace <username>, and (when addr is Some) the <addrtype>+<addr>.
             if let Some(rest) = line.strip_prefix("o=") {
-                if let Some(space_pos) = rest.find(' ') {
-                    let after_username = &rest[space_pos..];
-                    // Optionally rewrite the address (last field)
-                    if let Some(sdp_addr) = addr {
-                        // Find the last space before the trailing \r\n
-                        let trimmed = after_username.trim_end_matches(['\r', '\n']);
-                        if let Some(last_space) = trimmed.rfind(' ') {
-                            let line_ending = &after_username[trimmed.len()..];
-                            result.push_str("o=");
-                            result.push_str(&o_line_name);
-                            result.push_str(&trimmed[..last_space + 1]);
-                            result.push_str(sdp_addr);
-                            result.push_str(line_ending);
-                        } else {
-                            result.push_str("o=");
-                            result.push_str(&o_line_name);
-                            result.push_str(after_username);
-                        }
-                    } else {
+                if let Some(sdp_addr) = addr {
+                    let value = rest.trim_end_matches(['\r', '\n']);
+                    let line_ending = &rest[value.len()..];
+                    let fields: Vec<&str> = value.split(' ').collect();
+                    if fields.len() == 6 {
+                        // Well-formed origin: rewrite username + address, and
+                        // flip <addrtype> to match the substituted address
+                        // family.  The address is emitted UNbracketed (brackets
+                        // are illegal in SDP) — a v6 via_host() carries them.
+                        let (bare_addr, addrtype) = sdp_origin_address(sdp_addr);
                         result.push_str("o=");
                         result.push_str(&o_line_name);
-                        result.push_str(after_username);
+                        result.push(' ');
+                        result.push_str(fields[1]);
+                        result.push(' ');
+                        result.push_str(fields[2]);
+                        result.push(' ');
+                        result.push_str(fields[3]);
+                        result.push(' ');
+                        result.push_str(addrtype.unwrap_or(fields[4]));
+                        result.push(' ');
+                        result.push_str(&bare_addr);
+                        result.push_str(line_ending);
+                        changed = true;
+                        continue;
                     }
+                    // Malformed o= (not the six RFC fields — doubled spaces, a
+                    // vendor-extended origin): still substitute the trailing
+                    // address for topology hiding, bracket-stripped.  Skipping it
+                    // would leak the peer's real address.  <addrtype> is left
+                    // alone since it can't be reliably located on a malformed
+                    // line.
+                    if let Some(space_pos) = rest.find(' ') {
+                        let (bare_addr, _addrtype) = sdp_origin_address(sdp_addr);
+                        let after_username = &rest[space_pos..];
+                        let trimmed = after_username.trim_end_matches(['\r', '\n']);
+                        result.push_str("o=");
+                        result.push_str(&o_line_name);
+                        if let Some(last_space) = trimmed.rfind(' ') {
+                            result.push_str(&trimmed[..last_space + 1]);
+                            result.push_str(&bare_addr);
+                            result.push_str(&after_username[trimmed.len()..]);
+                        } else {
+                            // Only a username + one token: nothing address-shaped
+                            // to replace — keep the remainder as-is.
+                            result.push_str(after_username);
+                        }
+                        changed = true;
+                        continue;
+                    }
+                } else if let Some(space_pos) = rest.find(' ') {
+                    // No address substitution — replace the username only.
+                    result.push_str("o=");
+                    result.push_str(&o_line_name);
+                    result.push_str(&rest[space_pos..]);
                     changed = true;
                     continue;
                 }
@@ -6456,7 +6619,10 @@ fn sanitize_sdp_identity(body: &mut Vec<u8>, name: &str, addr: Option<&str>) {
 /// Stamp siphon's owned `o=` identity onto an SDP body: rewrite the origin
 /// line's username to `name`, its `<sess-id>` to `sess_id`, its `<sess-version>`
 /// to `version`, and (when `addr` is `Some`) its unicast-address to `addr`. The
-/// `<nettype>`/`<addrtype>` tokens are preserved.
+/// `<nettype>` token is preserved; `<addrtype>` is flipped to `IP4`/`IP6` to
+/// match the substituted address family (and left untouched for an FQDN), and
+/// the substituted address is emitted unbracketed (brackets are illegal in SDP,
+/// RFC 4566 §5.2).
 ///
 /// This is the piece [`sanitize_sdp_identity`] deliberately leaves alone: it
 /// lets siphon own a stable per-leg session identity with a monotonic version
@@ -6483,7 +6649,16 @@ fn stamp_sdp_origin(body: &mut Vec<u8>, name: &str, sess_id: u64, version: u64, 
             let line_ending = &rest[value.len()..];
             let fields: Vec<&str> = value.split(' ').collect();
             if fields.len() == 6 {
-                let unicast_addr = addr.unwrap_or(fields[5]);
+                // When substituting the address, strip any v6 brackets and flip
+                // <addrtype> to the substituted family; otherwise keep the
+                // origin's own address + addrtype verbatim.
+                let (unicast_addr, addrtype) = match addr {
+                    Some(a) => {
+                        let (bare, at) = sdp_origin_address(a);
+                        (bare, at.unwrap_or(fields[4]))
+                    }
+                    None => (fields[5].to_string(), fields[4]),
+                };
                 result.push_str("o=");
                 result.push_str(&o_line_name);
                 result.push(' ');
@@ -6493,9 +6668,9 @@ fn stamp_sdp_origin(body: &mut Vec<u8>, name: &str, sess_id: u64, version: u64, 
                 result.push(' ');
                 result.push_str(fields[3]);
                 result.push(' ');
-                result.push_str(fields[4]);
+                result.push_str(addrtype);
                 result.push(' ');
-                result.push_str(unicast_addr);
+                result.push_str(&unicast_addr);
                 result.push_str(line_ending);
                 changed = true;
                 continue;
@@ -6738,7 +6913,7 @@ fn build_b2bua_bye(
     let via = format!(
         "SIP/2.0/{} {}:{};branch={}",
         transport_str,
-        state.via_host(&leg.transport.transport),
+        state.a_leg_advertised_host(leg.transport.local_addr, &leg.transport.transport),
         a_leg_advertised_port(leg.transport.local_addr, state.via_port(&leg.transport.transport)),
         branch,
     );
@@ -6871,9 +7046,11 @@ fn build_b2bua_prack(
 ) -> Option<SipMessage> {
     // Via sent-by host:port is the listener this leg is anchored on (the A-leg's
     // arrival socket on a multi-homed host) so the response comes back to the
-    // socket the request left from. Falls back to via_port for the B-leg
-    // (local_addr None) and single-listener hosts — no change there.
-    let via_host = state.via_host(&leg.transport.transport);
+    // socket the request left from. The host is resolved per address family
+    // (dual-stack Gm) so a v6 UE's PRACK carries the v6 identity, not the first
+    // configured listener. Falls back to via_port for the B-leg (local_addr
+    // None) and single-listener hosts — no change there.
+    let via_host = state.a_leg_advertised_host(leg.transport.local_addr, &leg.transport.transport);
     let via_port = a_leg_advertised_port(
         leg.transport.local_addr,
         state.via_port(&leg.transport.transport),
@@ -9559,7 +9736,7 @@ fn handle_b2bua_invite(
     // socket the call actually landed on — matches sanitize_b2bua_response's Contact.
     a_leg.dialog.local_contact = Some(format!(
         "<sip:{}:{};transport={}>",
-        state.via_host(&inbound.transport),
+        state.a_leg_advertised_host(Some(inbound.local_addr), &inbound.transport),
         inbound.local_addr.port(),
         inbound.transport.to_string().to_lowercase(),
     ));
@@ -11143,7 +11320,10 @@ fn handle_b2bua_response(
                         .via(format!(
                             "SIP/2.0/{} {}:{};branch={}",
                             transport_str,
-                            format_sip_host(&state.local_addr.ip().to_string()),
+                            state.a_leg_advertised_host(
+                                if is_a2b { None } else { a_leg.transport.local_addr },
+                                &responder_transport,
+                            ),
                             outbound_port,
                             TransactionKey::generate_branch(),
                         ))
@@ -11377,7 +11557,10 @@ fn handle_b2bua_response(
                         .via(format!(
                             "SIP/2.0/{} {}:{};branch={}",
                             transport_str,
-                            format_sip_host(&state.local_addr.ip().to_string()),
+                            state.a_leg_advertised_host(
+                                if is_a2b { None } else { a_leg.transport.local_addr },
+                                &responder_transport,
+                            ),
                             outbound_port,
                             ack_branch,
                         ))
@@ -14814,9 +14997,10 @@ fn handle_b2bua_reinvite(
         let via_value = format!(
             "SIP/2.0/{} {}:{};branch={}",
             transport_str,
-            state.via_host(&transport),
-            // Via port = the target leg's anchored listener (A-leg's arrival socket
-            // when forwarding B→A on a multi-homed host); via_port for the B-leg.
+            // Via host + port = the target leg's anchored listener (A-leg's arrival
+            // socket, family-correct, on a multi-homed / dual-stack host); the
+            // per-transport via_host/via_port for the B-leg (local_addr None).
+            state.a_leg_advertised_host(target_local_addr, &transport),
             a_leg_advertised_port(target_local_addr, state.via_port(&transport)),
             branch,
         );
@@ -14901,8 +15085,10 @@ fn handle_b2bua_reinvite(
         let _ = crate::proxy::core::decrement_max_forwards(&mut forwarded.headers);
 
         // Sanitize SDP: mask other leg's identity in o= and s= lines, and
-        // rewrite the o= address for topology hiding.
-        let sdp_addr = state.via_host(&transport);
+        // rewrite the o= address for topology hiding — family-matched to the
+        // target leg (same arrival socket as the Via above), so a v6 A-leg gets
+        // a v6 o= address to go with its v6 Via.
+        let sdp_addr = state.a_leg_advertised_host(target_local_addr, &transport);
         sanitize_sdp_identity(&mut forwarded.body, &state.sdp_name, Some(&sdp_addr));
 
         // RTPEngine: rewrite re-INVITE SDP through offer to maintain media anchoring.
@@ -15231,9 +15417,10 @@ fn handle_b2bua_update(
         let via_value = format!(
             "SIP/2.0/{} {}:{};branch={}",
             transport_str,
-            state.via_host(&transport),
-            // Via port = the target leg's anchored listener (A-leg's arrival socket
-            // when forwarding B→A on a multi-homed host); via_port for the B-leg.
+            // Via host + port = the target leg's anchored listener (A-leg's arrival
+            // socket, family-correct, on a multi-homed / dual-stack host); the
+            // per-transport via_host/via_port for the B-leg (local_addr None).
+            state.a_leg_advertised_host(target_local_addr, &transport),
             a_leg_advertised_port(target_local_addr, state.via_port(&transport)),
             branch,
         );
@@ -15319,7 +15506,8 @@ fn handle_b2bua_update(
         // Body-aware media handling: empty-body UPDATE (session-timer
         // refresh) bypasses SDP rewrite and rtpengine entirely.
         if !forwarded.body.is_empty() {
-            let sdp_addr = state.via_host(&transport);
+            // Family-matched to the target leg (same arrival socket as the Via).
+            let sdp_addr = state.a_leg_advertised_host(target_local_addr, &transport);
             sanitize_sdp_identity(&mut forwarded.body, &state.sdp_name, Some(&sdp_addr));
 
             if let (Some(ref rtpengine_set), Some(ref media_sessions), Some(ref profiles)) =
@@ -15495,7 +15683,7 @@ fn build_b2bua_in_dialog_request(
     let via = format!(
         "SIP/2.0/{} {}:{};branch={}",
         transport_str,
-        state.via_host(&leg.transport.transport),
+        state.a_leg_advertised_host(leg.transport.local_addr, &leg.transport.transport),
         a_leg_advertised_port(leg.transport.local_addr, state.via_port(&leg.transport.transport)),
         branch,
     );
@@ -16212,7 +16400,10 @@ fn b2bua_complete_terminated_transfer(
             .via(format!(
                 "SIP/2.0/{} {}:{};branch={}",
                 transport_str,
-                state.via_host(&target_leg.transport.transport),
+                state.a_leg_advertised_host(
+                    target_leg.transport.local_addr,
+                    &target_leg.transport.transport,
+                ),
                 a_leg_advertised_port(
                     target_leg.transport.local_addr,
                     state.via_port(&target_leg.transport.transport)
@@ -16585,7 +16776,7 @@ fn b2bua_forward_indialog_request(
     let via_value = format!(
         "SIP/2.0/{} {}:{};branch={}",
         transport_str,
-        state.via_host(&transport),
+        state.a_leg_advertised_host(target_local_addr, &transport),
         a_leg_advertised_port(target_local_addr, state.via_port(&transport)),
         branch,
     );
@@ -17445,6 +17636,110 @@ mod tests {
         // And when the arrival socket happens to equal the default, still correct.
         let same: SocketAddr = "10.0.0.1:5060".parse().unwrap();
         assert_eq!(a_leg_advertised_port(Some(same), 5060), 5060);
+    }
+
+    // -----------------------------------------------------------------------
+    // A-leg advertised host (per-family / dual-stack identity)
+    // -----------------------------------------------------------------------
+
+    fn dualstack_registry() -> crate::transport::ListenerRegistry {
+        crate::transport::ListenerRegistry::from_entries(vec![
+            (Transport::Udp, "192.0.2.10:5060".parse().unwrap(), None::<String>),
+            (Transport::Udp, "[2001:db8::10]:5060".parse().unwrap(), None::<String>),
+        ])
+    }
+
+    #[test]
+    fn resolve_advertised_host_uses_exact_listener_advertise() {
+        // Per-listener advertise is the most specific source, per family.
+        let registry = crate::transport::ListenerRegistry::from_entries(vec![
+            (Transport::Udp, "192.0.2.10:5060".parse().unwrap(), Some("pcscf-v4.example".to_string())),
+            (Transport::Udp, "[2001:db8::10]:5060".parse().unwrap(), Some("pcscf-v6.example".to_string())),
+        ]);
+        let advertised = std::collections::HashMap::new();
+        let v4: SocketAddr = "192.0.2.10:5060".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::10]:5060".parse().unwrap();
+        assert_eq!(
+            resolve_advertised_host(&registry, &advertised, v4.ip(), Some(v4), &Transport::Udp),
+            "pcscf-v4.example"
+        );
+        assert_eq!(
+            resolve_advertised_host(&registry, &advertised, v4.ip(), Some(v6), &Transport::Udp),
+            "pcscf-v6.example"
+        );
+    }
+
+    #[test]
+    fn resolve_advertised_host_uses_concrete_bind_ip_per_family() {
+        // No advertise anywhere: the exact bound IP, bracketed for v6.
+        let registry = dualstack_registry();
+        let advertised = std::collections::HashMap::new();
+        let default_ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::10]:5060".parse().unwrap();
+        assert_eq!(
+            resolve_advertised_host(&registry, &advertised, default_ip, Some(v6), &Transport::Udp),
+            "[2001:db8::10]"
+        );
+        let v4: SocketAddr = "192.0.2.10:5060".parse().unwrap();
+        assert_eq!(
+            resolve_advertised_host(&registry, &advertised, default_ip, Some(v4), &Transport::Udp),
+            "192.0.2.10"
+        );
+    }
+
+    #[test]
+    fn resolve_advertised_host_filters_transport_advertised_by_family() {
+        // The gap this closes: a transport-level advertised v4 literal must NOT be
+        // stamped on a v6 UE's identity — it falls through to the v6 bind IP; a
+        // same-family literal IS used.
+        let registry = dualstack_registry();
+        let mut advertised = std::collections::HashMap::new();
+        advertised.insert(Transport::Udp, "198.51.100.1".to_string()); // public v4
+        let default_ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::10]:5060".parse().unwrap();
+        assert_eq!(
+            resolve_advertised_host(&registry, &advertised, default_ip, Some(v6), &Transport::Udp),
+            "[2001:db8::10]"
+        );
+        let v4: SocketAddr = "192.0.2.10:5060".parse().unwrap();
+        assert_eq!(
+            resolve_advertised_host(&registry, &advertised, default_ip, Some(v4), &Transport::Udp),
+            "198.51.100.1"
+        );
+    }
+
+    #[test]
+    fn resolve_advertised_host_fqdn_advertised_used_for_any_family() {
+        // An FQDN advertised host resolves to both A and AAAA, so it's accepted
+        // regardless of the UE's family.
+        let registry = dualstack_registry();
+        let mut advertised = std::collections::HashMap::new();
+        advertised.insert(Transport::Udp, "pcscf.ims.example".to_string());
+        let default_ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::10]:5060".parse().unwrap();
+        assert_eq!(
+            resolve_advertised_host(&registry, &advertised, default_ip, Some(v6), &Transport::Udp),
+            "pcscf.ims.example"
+        );
+    }
+
+    #[test]
+    fn resolve_advertised_host_none_is_legacy_behavior() {
+        // No arrival socket (outbound leg): first per-transport advertised host,
+        // else the resolved default local IP — the pre-dual-stack via_host.
+        let registry = dualstack_registry();
+        let default_ip: IpAddr = "192.0.2.10".parse().unwrap();
+        let mut advertised = std::collections::HashMap::new();
+        advertised.insert(Transport::Udp, "203.0.113.5".to_string());
+        assert_eq!(
+            resolve_advertised_host(&registry, &advertised, default_ip, None, &Transport::Udp),
+            "203.0.113.5"
+        );
+        let empty = std::collections::HashMap::new();
+        assert_eq!(
+            resolve_advertised_host(&registry, &empty, default_ip, None, &Transport::Udp),
+            "192.0.2.10"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -20068,6 +20363,48 @@ a=rtpmap:8 PCMA/8000\r\n";
     }
 
     #[test]
+    fn sanitize_sdp_identity_rewrites_o_line_ipv6_address_and_addrtype() {
+        // A v6 substitute host (bracketed, as via_host() produces) must land on
+        // the o= line unbracketed with the addrtype flipped IP4 -> IP6.
+        let sdp = "v=0\r\no=FreeSWITCH 123 456 IN IP4 10.0.0.1\r\ns=FreeSWITCH\r\nt=0 0\r\nm=audio 8000 RTP/AVP 0\r\n";
+        let mut body = sdp.as_bytes().to_vec();
+        sanitize_sdp_identity(&mut body, "SIPhon", Some("[2001:db8::1]"));
+        let result = std::str::from_utf8(&body).unwrap();
+        assert!(
+            result.contains("o=SIPhon 123 456 IN IP6 2001:db8::1\r\n"),
+            "o= line should carry IN IP6 + an unbracketed v6 address, got: {result}"
+        );
+        assert!(!result.contains("IN IP4 2001"), "addrtype must not stay IP4: {result}");
+        assert!(!result.contains('['), "SDP address must not be bracketed: {result}");
+    }
+
+    #[test]
+    fn sanitize_sdp_identity_masks_address_on_malformed_o_line() {
+        // A non-canonical o= line (doubled space → 7 tokens) must STILL have its
+        // trailing address substituted — a missing rewrite would leak the peer's
+        // real address (topology-hiding regression).
+        let sdp = "v=0\r\no=carol 1 2 IN IP4  198.51.100.9\r\ns=-\r\nt=0 0\r\n";
+        let mut body = sdp.as_bytes().to_vec();
+        sanitize_sdp_identity(&mut body, "SIPhon", Some("203.0.113.7"));
+        let result = std::str::from_utf8(&body).unwrap();
+        assert!(!result.contains("198.51.100.9"), "peer address must be masked: {result}");
+        assert!(result.contains("203.0.113.7"), "substitute address must be present: {result}");
+        assert!(!result.contains("carol"), "username must be replaced: {result}");
+    }
+
+    #[test]
+    fn sdp_origin_address_classifies_and_strips() {
+        assert_eq!(sdp_origin_address("10.0.0.1"), ("10.0.0.1".to_string(), Some("IP4")));
+        assert_eq!(sdp_origin_address("[2001:db8::1]"), ("2001:db8::1".to_string(), Some("IP6")));
+        assert_eq!(sdp_origin_address("2001:db8::1"), ("2001:db8::1".to_string(), Some("IP6")));
+        // FQDN — emitted verbatim, addrtype left to the caller.
+        assert_eq!(sdp_origin_address("pcscf.example"), ("pcscf.example".to_string(), None));
+        // Bracketed but unparseable (zoned link-local): brackets stripped, never
+        // leaked into SDP.
+        assert_eq!(sdp_origin_address("[fe80::1%eth0]"), ("fe80::1%eth0".to_string(), None));
+    }
+
+    #[test]
     fn sanitize_sdp_identity_no_op_on_empty_body() {
         let mut body = Vec::new();
         sanitize_sdp_identity(&mut body, "SIPhon", None);
@@ -20141,6 +20478,21 @@ a=rtpmap:8 PCMA/8000\r\n";
             "got: {result}",
         );
         assert!(!result.contains("198.51.100.9"));
+    }
+
+    #[test]
+    fn stamp_sdp_origin_rewrites_ipv6_address_and_addrtype() {
+        // v6 substitute (bracketed via_host()) -> unbracketed address + IP6.
+        let sdp = "v=0\r\no=carol 5 6 IN IP4 198.51.100.9\r\ns=-\r\nt=0 0\r\n";
+        let mut body = sdp.as_bytes().to_vec();
+        stamp_sdp_origin(&mut body, "SIPhon", 42, 1, Some("[2001:db8::7]"));
+        let result = std::str::from_utf8(&body).unwrap();
+        assert!(
+            result.contains("o=SIPhon 42 1 IN IP6 2001:db8::7\r\n"),
+            "got: {result}",
+        );
+        assert!(!result.contains("IN IP4 2001"), "addrtype must flip to IP6: {result}");
+        assert!(!result.contains('['), "SDP address must be unbracketed: {result}");
     }
 
     /// The whole point of siphon-owned o=: a re-emit toward the same peer keeps

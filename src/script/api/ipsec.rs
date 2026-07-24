@@ -1044,9 +1044,13 @@ struct StashEntry {
 pub struct PyIpsec {
     manager: Arc<IpsecManager>,
     config: Arc<IpsecConfig>,
-    /// Local P-CSCF address.  Captured at startup from the listener
-    /// configuration.
-    pcscf_addr: IpAddr,
+    /// Local P-CSCF address per family, captured at startup from the listener
+    /// configuration.  The SA's P-CSCF side MUST match the UE's address family
+    /// — the kernel rejects a mixed-family XFRM selector (3GPP TS 33.203 §7.2),
+    /// so a dual-stack P-CSCF keeps a v4 and a v6 local address and picks the
+    /// one matching the UE that is registering.
+    pcscf_addr_v4: Option<IpAddr>,
+    pcscf_addr_v6: Option<IpAddr>,
     /// Stash for PendingSAs awaiting the auth REGISTER round-trip.
     stash: Arc<DashMap<String, StashEntry>>,
     /// TTL for stashed entries.
@@ -1054,7 +1058,12 @@ pub struct PyIpsec {
 }
 
 impl PyIpsec {
-    pub fn new(manager: Arc<IpsecManager>, config: Arc<IpsecConfig>, pcscf_addr: IpAddr) -> Self {
+    pub fn new(
+        manager: Arc<IpsecManager>,
+        config: Arc<IpsecConfig>,
+        pcscf_addr_v4: Option<IpAddr>,
+        pcscf_addr_v6: Option<IpAddr>,
+    ) -> Self {
         // Wire up the direct Rust-side accessors so `PyRequest`'s
         // `is_ipsec_protected` and `matched_sa` getters can resolve
         // without going through the Python type system.  Idempotent —
@@ -1064,9 +1073,22 @@ impl PyIpsec {
         Self {
             manager,
             config,
-            pcscf_addr,
+            pcscf_addr_v4,
+            pcscf_addr_v6,
             stash: Arc::new(DashMap::new()),
             stash_ttl: DEFAULT_STASH_TTL,
+        }
+    }
+
+    /// The P-CSCF local address matching the UE's address family, or `None`
+    /// when no listener of that family is configured.  The SA's P-CSCF side
+    /// must be the same family as the UE — a mixed-family selector never
+    /// matches in the kernel (3GPP TS 33.203 §7.2).
+    fn pcscf_addr_for(&self, ue_ipv6: bool) -> Option<IpAddr> {
+        if ue_ipv6 {
+            self.pcscf_addr_v6
+        } else {
+            self.pcscf_addr_v4
         }
     }
 }
@@ -1160,7 +1182,18 @@ impl PyIpsec {
             ))
         })?;
         let manager = Arc::clone(&self.manager);
-        let pcscf_addr = self.pcscf_addr;
+        // Pick the P-CSCF local address matching the UE's family.  The four SAs
+        // and policies are keyed on (source, destination) of the same family;
+        // a v4 P-CSCF address against a v6 UE (or vice-versa) programs a
+        // mixed-family selector the kernel silently never matches — so fail
+        // loudly rather than install a dead SA (3GPP TS 33.203 §7.2).
+        let pcscf_addr = self.pcscf_addr_for(ue_addr.is_ipv6()).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "no {family} P-CSCF listener configured for {family} UE {ue_addr}; \
+                 cannot build a same-family IPsec SA selector (3GPP TS 33.203 §7.2)",
+                family = if ue_addr.is_ipv6() { "IPv6" } else { "IPv4" },
+            ))
+        })?;
         let pcscf_port_c = self.config.pcscf_port_c;
         let pcscf_port_s = self.config.pcscf_port_s;
 
@@ -1263,9 +1296,11 @@ impl PyIpsec {
     }
 
     fn __repr__(&self) -> String {
+        let fmt = |addr: Option<IpAddr>| addr.map(|a| a.to_string()).unwrap_or_else(|| "-".to_string());
         format!(
-            "Ipsec(pcscf_addr={}, pcscf_port_c={}, pcscf_port_s={}, active={}, stashed={})",
-            self.pcscf_addr,
+            "Ipsec(pcscf_addr_v4={}, pcscf_addr_v6={}, pcscf_port_c={}, pcscf_port_s={}, active={}, stashed={})",
+            fmt(self.pcscf_addr_v4),
+            fmt(self.pcscf_addr_v6),
             self.config.pcscf_port_c,
             self.config.pcscf_port_s,
             self.manager.active_count(),
@@ -1488,6 +1523,36 @@ mod tests {
     fn parse_hex_param_rejects_wrong_length() {
         assert!(parse_hex_param("abc").is_none());
         assert!(parse_hex_param("\"00\"").is_none());
+    }
+
+    #[test]
+    fn pcscf_addr_for_selects_by_ue_family() {
+        let manager = Arc::new(IpsecManager::with_partition(
+            crate::ipsec::XfrmBackend::Netlink,
+            10000,
+            8192,
+        ));
+        let config = Arc::new(IpsecConfig {
+            pcscf_port_c: 5064,
+            pcscf_port_s: 5066,
+            backend: crate::config::IpsecBackend::Netlink,
+            spi_range_start: None,
+            spi_range_count: 8192,
+            path_host: None,
+        });
+        let v4: IpAddr = "192.0.2.10".parse().unwrap();
+        let v6: IpAddr = "2001:db8::10".parse().unwrap();
+
+        // Dual-stack: each UE family selects its own P-CSCF local address.
+        let dual = PyIpsec::new(Arc::clone(&manager), Arc::clone(&config), Some(v4), Some(v6));
+        assert_eq!(dual.pcscf_addr_for(false), Some(v4));
+        assert_eq!(dual.pcscf_addr_for(true), Some(v6));
+
+        // v4-only P-CSCF: a v6 UE has no same-family local address, so allocate
+        // must fail loudly rather than program a mixed-family selector.
+        let v4_only = PyIpsec::new(Arc::clone(&manager), Arc::clone(&config), Some(v4), None);
+        assert_eq!(v4_only.pcscf_addr_for(false), Some(v4));
+        assert_eq!(v4_only.pcscf_addr_for(true), None);
     }
 
     #[test]

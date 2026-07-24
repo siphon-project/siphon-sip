@@ -208,7 +208,7 @@ fn spawn_outbound_dispatcher(
 fn bind_tcp_listener(
     local_addr: SocketAddr,
     tos: Option<u32>,
-    label: &str,
+    _label: &str,
 ) -> std::io::Result<tokio::net::TcpListener> {
     let socket = if local_addr.is_ipv6() {
         tokio::net::TcpSocket::new_v6()?
@@ -218,11 +218,9 @@ fn bind_tcp_listener(
     socket.set_reuseaddr(true)?;
     #[cfg(unix)]
     socket.set_reuseport(true)?;
+    // DSCP / DiffServ marking (RFC 4594) — family-aware, best-effort.
     if let Some(tos) = tos {
-        let sock_ref = socket2::SockRef::from(&socket);
-        if let Err(error) = sock_ref.set_tos_v4(tos) {
-            tracing::error!("failed to set IP_TOS on {label} socket: {error}");
-        }
+        super::apply_tos(&socket2::SockRef::from(&socket), tos);
     }
     socket.bind(local_addr)?;
     socket.listen(1024)

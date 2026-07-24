@@ -24,7 +24,31 @@ listen:
     - "0.0.0.0:5064"        # IPsec protected client port (ESP-over-TCP, TS 33.203 §7.2)
     - "0.0.0.0:5066"        # IPsec protected server port (ESP-over-TCP)
 
-# Public IP — set to the P-CSCF's routable address
+  # --- Dual-stack Gm (IPv4 + IPv6) ---------------------------------------
+  # A P-CSCF serving VoLTE UEs on both IPv4 and IPv6 bearers binds an
+  # explicit v4 AND v6 Gm listener set (per GSMA IR.92 a UE registers over
+  # one family at a time; this is dual-stack per process, not per UE).
+  # Prefer EXPLICIT per-family binds over a single `[::]` — siphon does not
+  # normalise v4-mapped (`::ffff:`) peers, so an explicit v4 listener keeps
+  # addresses canonical.  siphon then stamps the family-matching local
+  # identity (Via / Record-Route host, IPsec SA local address, SDP o=) for
+  # each UE.  Give each family its own routable identity with a per-listener
+  # `advertise` (an FQDN with both A + AAAA works for either family):
+  #
+  # udp:
+  #   - { address: "192.0.2.10:5060",          advertise: "pcscf.ims.example" }
+  #   - { address: "192.0.2.10:5064",          advertise: "pcscf.ims.example" }
+  #   - { address: "192.0.2.10:5066",          advertise: "pcscf.ims.example" }
+  #   - { address: "[2001:db8:ac10::10]:5060", advertise: "pcscf.ims.example" }
+  #   - { address: "[2001:db8:ac10::10]:5064", advertise: "pcscf.ims.example" }
+  #   - { address: "[2001:db8:ac10::10]:5066", advertise: "pcscf.ims.example" }
+  # tcp:  # ESP-over-TCP mirror (TS 33.203 §7.2), same six entries
+  #   - { address: "192.0.2.10:5060" }
+  #   - { address: "[2001:db8:ac10::10]:5060" }
+  #   # ...
+
+# Public IP — set to the P-CSCF's routable address (per-listener `advertise`
+# above overrides this for dual-stack, so each family gets its own identity)
 advertised_address: "10.0.0.10"
 
 domain:

@@ -83,3 +83,45 @@ def test_activate_after_cleanup_rejects_lifetime_kwarg():
 
     with pytest.raises(ValueError, match="cleaned up"):
         pending.activate(hard_lifetime_secs=3632)
+
+
+# -- Dual-stack: the P-CSCF SA side must match the UE's family ---------------
+
+def _allocate_for(ipsec, ue_addr):
+    av = MockAuthVectorHandle(ck=bytes(16), ik=bytes(16))
+    offer = MockSecurityOffer(
+        mechanism="ipsec-3gpp",
+        alg="hmac-sha-1-96",
+        ealg="null",
+        spi_c=11111, spi_s=22222,
+        port_c=50000, port_s=50001,
+        ue_addr=ue_addr,
+    )
+    return asyncio.run(
+        ipsec.allocate(
+            av, offer, _TransformEnum.HmacSha1_96Null,
+            expires_secs=600_000, protocol=None,
+        )
+    )
+
+
+def test_allocate_dual_stack_serves_both_families():
+    ipsec = _fresh_ipsec()  # default mock is dual-stack
+    assert _allocate_for(ipsec, "10.0.0.1") is not None
+    assert _allocate_for(ipsec, "2001:db8::1") is not None
+
+
+def test_allocate_v6_ue_without_v6_listener_raises():
+    ipsec = _fresh_ipsec()
+    ipsec.set_pcscf_families(v4=True, v6=False)  # single-stack (v4-only) P-CSCF
+    assert _allocate_for(ipsec, "10.0.0.1") is not None
+    with pytest.raises(ValueError, match="no IPv6 P-CSCF listener"):
+        _allocate_for(ipsec, "2001:db8::1")
+
+
+def test_allocate_v4_ue_without_v4_listener_raises():
+    ipsec = _fresh_ipsec()
+    ipsec.set_pcscf_families(v4=False, v6=True)  # v6-only P-CSCF
+    assert _allocate_for(ipsec, "2001:db8::1") is not None
+    with pytest.raises(ValueError, match="no IPv4 P-CSCF listener"):
+        _allocate_for(ipsec, "10.0.0.1")
