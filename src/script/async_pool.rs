@@ -416,7 +416,18 @@ pub(crate) fn run_coroutine_via_pool(
     // free-threaded Python this is technically unnecessary (no GIL), but
     // it keeps the contract clear: the calling thread is idle while the
     // coroutine runs.
-    let outcome = python.detach(|| runtime.block_on(receiver));
+    //
+    // Wrap the blocking wait in `block_in_place`: this function is also called
+    // synchronously from a tokio runtime WORKER thread (the dispatcher's
+    // answer-timeout sweep fires a sync `@b2bua.on_failure` on the B-leg
+    // timeout path), and a bare `Handle::block_on` panics "Cannot start a
+    // runtime from within a runtime" on a worker.  `block_in_place` hands the
+    // worker's tasks off to a sibling so blocking here is safe; on the
+    // py_executor pool / `spawn_blocking` threads that already reach this path
+    // it is the same passthrough those callers use elsewhere (blocking.rs,
+    // engine.rs, diameter.rs).
+    let outcome =
+        python.detach(|| tokio::task::block_in_place(|| runtime.block_on(receiver)));
 
     match outcome {
         Ok(Ok(value)) => Ok(Some(value)),
@@ -561,6 +572,38 @@ mod tests {
             let extracted: i64 =
                 Python::attach(|python| value.bind(python).extract().unwrap());
             assert_eq!(extracted, 3);
+        });
+    }
+
+    /// Regression: `run_coroutine_via_pool` must be safe to call synchronously
+    /// from a tokio runtime WORKER thread. The dispatcher's B-leg answer-timeout
+    /// sweep runs in the `select!` loop (a worker) and fires a sync
+    /// `@b2bua.on_failure` through this path; before the `block_in_place` wrap
+    /// the bare `Handle::block_on` panicked "Cannot start a runtime from within a
+    /// runtime" on every B-leg timeout, and the spawned task resolved to a
+    /// JoinError. `tokio::spawn` (NOT `spawn_blocking`) reproduces the worker
+    /// context exactly.
+    #[test]
+    fn pool_dispatch_from_worker_thread_does_not_panic() {
+        let _serial = pool_test_guard();
+        test_runtime().block_on(async move {
+            ensure_pool();
+            let factory = Python::attach(|python| {
+                Arc::new(build_factory(python, "async def factory():\n    return 5\n"))
+            });
+            let value = tokio::spawn(async move {
+                Python::attach(|python| {
+                    let coro = factory.bind(python).call0().unwrap();
+                    run_coroutine_via_pool(python, &coro)
+                        .unwrap()
+                        .expect("pool must be installed in tests")
+                })
+            })
+            .await
+            .expect("worker-thread dispatch must not panic");
+            let extracted: i64 =
+                Python::attach(|python| value.bind(python).extract().unwrap());
+            assert_eq!(extracted, 5);
         });
     }
 

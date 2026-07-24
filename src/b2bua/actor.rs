@@ -27,6 +27,7 @@
 //! - `LegRegistry` provides SIP-level routing (Call-ID, branch → internal ID).
 //! - Foundation for API-driven calls: create a `Leg` without an inbound INVITE.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
@@ -414,11 +415,16 @@ pub struct Leg {
     /// already pending toward the same leg we respond 491 Request
     /// Pending rather than forward a second concurrent offer/answer.
     pub pending_reinvite: bool,
-    /// Highest RSeq we've already PRACKed on this leg (RFC 3262
-    /// auto-PRACK). Reliable 1xx responses retransmit until PRACKed
-    /// — without this guard we would emit a fresh PRACK for every
-    /// retransmit, racking up CSeq numbers and confusing the peer.
-    pub prack_acked_rseq: Option<u32>,
+    /// Highest RSeq we've already PRACKed for each early dialog on this leg
+    /// (RFC 3262 auto-PRACK), keyed by the early dialog's remote To-tag.
+    /// Reliable 1xx responses retransmit until PRACKed — without this guard we
+    /// would emit a fresh PRACK for every retransmit, racking up CSeq numbers
+    /// and confusing the peer. Keyed per To-tag (not a single value) because a
+    /// downstream fork produces several early dialogs on this one INVITE
+    /// branch, each with an INDEPENDENT RSeq space (RFC 3262 §3) that commonly
+    /// restarts at 1 — a single monotonic slot would swallow the second
+    /// dialog's low RSeqs.
+    pub prack_acked_rseq: HashMap<String, u32>,
     /// Last-sent outbound INVITE for this leg (B-leg only).
     /// Persisted at the end of [`b2bua_send_b_leg_invite`] so that the
     /// 401/407 auto-retry path can rebuild the retry from the fully
@@ -465,7 +471,7 @@ impl Leg {
             last_sdp: None,
             initial_acked: false,
             pending_reinvite: false,
-            prack_acked_rseq: None,
+            prack_acked_rseq: HashMap::new(),
             b_leg_invite: None,
             pending_cancel: false,
             auth_challenged: false,
@@ -493,7 +499,7 @@ impl Leg {
             last_sdp: None,
             initial_acked: false,
             pending_reinvite: false,
-            prack_acked_rseq: None,
+            prack_acked_rseq: HashMap::new(),
             b_leg_invite: None,
             pending_cancel: false,
             auth_challenged: false,
@@ -1445,14 +1451,19 @@ impl CallActorStore {
         Some(leg.dialog.local_cseq)
     }
 
-    /// RFC 3262 auto-PRACK dedup: returns `true` exactly once for each
-    /// new RSeq value seen on the given B-leg, and `false` for retransmits
-    /// of an already-PRACKed reliable provisional. Used so the B2BUA emits
-    /// a single PRACK per RSeq instead of one per 1xx retransmit.
+    /// RFC 3262 auto-PRACK dedup: returns `true` exactly once for each new RSeq
+    /// value seen on the given B-leg's early dialog (identified by its remote
+    /// To-tag), and `false` for retransmits of an already-PRACKed reliable
+    /// provisional. Used so the B2BUA emits a single PRACK per RSeq instead of
+    /// one per 1xx retransmit. Keyed per To-tag so a forked pair of early
+    /// dialogs — whose RSeq spaces are independent (RFC 3262 §3) and commonly
+    /// both start at 1 — each get their own PRACK rather than the second being
+    /// swallowed as a "retransmit" of the first.
     pub fn try_mark_prack_acked(
         &self,
         call_id: &str,
         b_leg_index: usize,
+        to_tag: &str,
         rseq: u32,
     ) -> bool {
         let Some(mut call) = self.calls.get_mut(call_id) else {
@@ -1461,10 +1472,10 @@ impl CallActorStore {
         let Some(leg) = call.b_legs.get_mut(b_leg_index) else {
             return false;
         };
-        if leg.prack_acked_rseq.is_some_and(|v| v >= rseq) {
+        if leg.prack_acked_rseq.get(to_tag).is_some_and(|&v| v >= rseq) {
             return false;
         }
-        leg.prack_acked_rseq = Some(rseq);
+        leg.prack_acked_rseq.insert(to_tag.to_string(), rseq);
         true
     }
 
@@ -2913,13 +2924,35 @@ mod tests {
         let call_id = store.create_call(make_a_leg());
         store.add_b_leg(&call_id, make_b_leg(0));
 
-        assert!(store.try_mark_prack_acked(&call_id, 0, 42));
+        let tag = "uas-early-tag";
+        assert!(store.try_mark_prack_acked(&call_id, 0, tag, 42));
         // Same RSeq again — already PRACKed, returns false.
-        assert!(!store.try_mark_prack_acked(&call_id, 0, 42));
+        assert!(!store.try_mark_prack_acked(&call_id, 0, tag, 42));
         // Earlier RSeq (out-of-order retransmit) — also no PRACK.
-        assert!(!store.try_mark_prack_acked(&call_id, 0, 1));
+        assert!(!store.try_mark_prack_acked(&call_id, 0, tag, 1));
         // Higher RSeq (next reliable 1xx, e.g. 180 after 183) — PRACK it.
-        assert!(store.try_mark_prack_acked(&call_id, 0, 43));
+        assert!(store.try_mark_prack_acked(&call_id, 0, tag, 43));
+    }
+
+    /// Forked early dialogs on ONE INVITE branch have independent RSeq spaces
+    /// (RFC 3262 §3) that commonly both start at 1. The dedup is keyed per
+    /// remote To-tag, so each dialog's RSeq 1 gets its own PRACK — the second
+    /// is NOT swallowed as a retransmit of the first.
+    #[test]
+    fn try_mark_prack_acked_per_early_dialog() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        store.add_b_leg(&call_id, make_b_leg(0));
+
+        // Two distinct early dialogs (two To-tags), each RSeq 1 → both PRACKed.
+        assert!(store.try_mark_prack_acked(&call_id, 0, "tag-alpha", 1));
+        assert!(store.try_mark_prack_acked(&call_id, 0, "tag-beta", 1));
+        // Retransmit of each is still deduped independently.
+        assert!(!store.try_mark_prack_acked(&call_id, 0, "tag-alpha", 1));
+        assert!(!store.try_mark_prack_acked(&call_id, 0, "tag-beta", 1));
+        // Each dialog advances its own RSeq independently.
+        assert!(store.try_mark_prack_acked(&call_id, 0, "tag-alpha", 2));
+        assert!(!store.try_mark_prack_acked(&call_id, 0, "tag-beta", 1));
     }
 
     /// 401/407 auth-retry dedup: the first challenge on a B-leg returns true

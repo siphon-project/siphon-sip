@@ -155,6 +155,24 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   an untagged `From` gains a generated tag (display name and existing params
   kept), and a request with no `From` at all is given one built from the
   advertised identity. The compact `f` form is handled identically.
+- **B2BUA auto-PRACK for a reliable provisional now routes to the early-dialog
+  remote target (the UE `Contact`), not the To AoR.** When the B-leg answered
+  preconditions with a reliable `183` (`Require: 100rel`), the auto-PRACK's
+  Request-URI fell back to the dialog AoR because the remote `Contact` was only
+  captured on the final `2xx` (which hasn't arrived at PRACK time). Against an
+  IMS core the home-domain R-URI is treated as a fresh terminating request and
+  rejected `482 Loop Detected`, so the UE never gets its PRACK, never rings, and
+  the caller CANCELs. The Contact, To-tag and route set are now captured from the
+  reliable provisional that establishes the early dialog (RFC 3262 §4 / RFC 3261
+  §12.1.2). Forked early dialogs (several `18x` with distinct To-tags/Contacts on
+  one INVITE branch) are each PRACKed to their own Contact, with per-dialog PRACK
+  de-duplication keyed on the remote To-tag (their RSeq spaces are independent).
+- **B2BUA B-leg answer-timeout no longer panics a worker thread.** The
+  answer-timeout sweep runs in the dispatcher's async loop (a tokio worker) and
+  fires an async `@b2bua.on_failure`; the synchronous dispatch used a bare
+  `block_on`, which panics "Cannot start a runtime from within a runtime" on a
+  worker thread. It now yields the worker (`block_in_place`) before blocking, so
+  the timeout handler runs instead of the worker panicking.
 - **B2BUA answer / provisional handling is now race-free under concurrent
   dispatch.** Two check-then-set decisions read a `call_state` snapshot taken
   early in response handling but committed the new state only ~1600 lines later,
