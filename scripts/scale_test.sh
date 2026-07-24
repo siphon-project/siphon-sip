@@ -110,6 +110,8 @@ echo "[+] build ok"
 # --- Pick config: MODE=proxy (default) or MODE=b2bua ---
 # B2BUA mode rewrites the Python script path in a temp config copy so the
 # proxy_default.py routing logic is replaced by b2bua_default.py.
+# (siphon.yaml pins advertised_address: 127.0.0.1 for loopback testing — the
+# reason the loopback SIPp peers can reach siphon's Via/Contact.)
 MODE="${MODE:-proxy}"
 case "$MODE" in
     proxy)

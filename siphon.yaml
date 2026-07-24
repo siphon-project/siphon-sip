@@ -68,9 +68,14 @@ domain:
     - "127.0.0.1"       # Local IP for loop detection
 
 # Public IP advertised in Via / Contact / SDP when binding 0.0.0.0 or [::].
-# Needed on cloud instances (EC2, GCE) where the bound IP is private.
-# advertised_address: "1.2.3.4"
-# advertised_address: "2001:db8::1"  # IPv6 public address
+# Defaults to 127.0.0.1 so this example config works out of the box for LOCAL
+# use — a softphone on the same host, loopback SIPp, the scale-test harness.
+# >>> CHANGE THIS to your public / LAN address for any real deployment. <<<
+# (Without it, a wildcard-bound siphon auto-detects a routable interface, which
+# on a multi-homed host — LAN + docker + VPN — can be the wrong one.)
+advertised_address: "127.0.0.1"
+# advertised_address: "1.2.3.4"        # <- your public IPv4 for real traffic
+# advertised_address: "2001:db8::1"    # <- your public IPv6
 
 # ---------------------------------------------------------------------------
 # TLS certificate (required when listen.tls or listen.wss is set)

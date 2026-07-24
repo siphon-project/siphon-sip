@@ -125,6 +125,12 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `checks_missed` and each group gains `failure_threshold`.
 
 ### Changed
+- **The example `siphon.yaml` now defaults `advertised_address` to `127.0.0.1`**
+  so it works out of the box for local use (a softphone on the same host,
+  loopback SIPp, the scale-test harness). **Set it to your public / LAN address
+  for any real deployment** — a wildcard-bound siphon with no `advertised_address`
+  auto-detects a routable interface, which on a multi-homed host (LAN + docker +
+  VPN) can be the wrong one.
 - **B2BUA answer-timeout is now honored within ~0.5s of the deadline** (was up to
   30s late). The `call.fork`/`call.dial`/`call.route` `timeout=` check moved off
   the 30s orphan sweep onto a dedicated 500ms interval, so a short per-carrier LCR
@@ -138,6 +144,19 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   pseudo-legs, so a plain call that re-INVITEd no longer reports two B-legs.
 
 ### Fixed
+- **B2BUA answer / provisional handling is now race-free under concurrent
+  dispatch.** Two check-then-set decisions read a `call_state` snapshot taken
+  early in response handling but committed the new state only ~1600 lines later,
+  so under multi-worker dispatch two responses for the same call — a `200` and
+  its retransmit, or a `180` and its `200` (received in order over one flow but
+  processed on different workers) — could both act on a stale "not answered"
+  view: (1) two B-leg `200`s both forwarded to the A-leg, delivering a duplicate
+  `200` to a caller that already ACKed; (2) a `180` processed behind its `200`
+  forwarded to the A-leg after the final response, downgrading the confirmed
+  dialog back to Ringing. Both are now claimed atomically under the per-call
+  lock (`try_win` / `try_mark_ringing`). Loopback is too fast to expose these,
+  but a real TCP trunk with network latency at high call rates widens exactly
+  that window.
 - **B2BUA auto-PRACK now carries the early-dialog To-tag** (RFC 3262 §4 / RFC 3261
   §12.1.2). When the B-leg sent a reliable provisional (`18x` with `Require:
   100rel`), siphon built the PRACK's `To` from the dialog's remote tag — but that

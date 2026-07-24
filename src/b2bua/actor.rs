@@ -1249,6 +1249,19 @@ pub struct ZombieCancelledLeg {
     pub byed: bool,
 }
 
+/// Outcome of an atomic answer claim ([`CallActorStore::try_win`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WinOutcome {
+    /// This 2xx is the first to answer the call: the winner and `Answered`
+    /// state were set under the per-call lock.
+    FirstWin,
+    /// The call was already answered — this 2xx is a retransmit of the winning
+    /// B-leg's answer (or a losing fork branch). `b_leg_acked` reports whether
+    /// the winning B-leg's ACK has already gone out, so the caller can re-ACK
+    /// to stop the retransmit vs. absorb silently while awaiting the A-leg ACK.
+    AlreadyAnswered { b_leg_acked: bool },
+}
+
 /// Manages all active B2BUA calls.
 ///
 /// Stores `CallActor` instances in a concurrent map, indexed by internal
@@ -1555,6 +1568,62 @@ impl CallActorStore {
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.set_winner(index);
         }
+    }
+
+    /// Atomically claim the answer for the B-leg at `index`.
+    ///
+    /// If the call is not yet `Answered`, sets the winner (which also flips the
+    /// state to `Answered`) and returns [`WinOutcome::FirstWin`]. Otherwise the
+    /// call was already answered — this 2xx is a retransmit of the winning
+    /// B-leg's answer (or a losing fork branch) — and it returns
+    /// [`WinOutcome::AlreadyAnswered`] with the winning B-leg's `initial_acked`.
+    ///
+    /// The check-and-set runs under the DashMap per-key lock, closing the race
+    /// where two concurrent B-leg 200s both observe a stale "not answered"
+    /// snapshot and both forward to the A-leg, delivering a duplicate 200 to a
+    /// call the caller already ACKed.
+    pub fn try_win(&self, call_id: &str, index: usize) -> WinOutcome {
+        let Some(mut call) = self.calls.get_mut(call_id) else {
+            return WinOutcome::AlreadyAnswered { b_leg_acked: false };
+        };
+        if call.state == CallState::Answered {
+            let b_leg_acked = call
+                .winner
+                .and_then(|w| call.b_legs.get(w))
+                .map(|leg| leg.initial_acked)
+                .unwrap_or(false);
+            WinOutcome::AlreadyAnswered { b_leg_acked }
+        } else {
+            call.set_winner(index);
+            WinOutcome::FirstWin
+        }
+    }
+
+    /// Atomically decide whether a 1xx provisional should be forwarded to the
+    /// A-leg, moving the call `Calling -> Ringing` when it is.
+    ///
+    /// Returns `false` (drop the provisional) when the call is already
+    /// `Answered`: a 1xx that arrives after the final response must not be
+    /// forwarded, nor may it downgrade the confirmed dialog back to `Ringing`
+    /// (RFC 3261 §12.1). Under multi-worker dispatch a B-leg's 180 and 200 —
+    /// received in order but processed on different workers — can be handled
+    /// concurrently; checking the call state under the per-call lock here (not
+    /// a stale snapshot read ~1600 lines earlier) is what stops a late 180 from
+    /// being forwarded behind its 200 and aborting the A-leg UAC.
+    ///
+    /// Returns `false` too when the call is gone (a provisional for a call that
+    /// no longer exists is dropped).
+    pub fn try_mark_ringing(&self, call_id: &str) -> bool {
+        let Some(mut call) = self.calls.get_mut(call_id) else {
+            return false;
+        };
+        if call.state == CallState::Answered {
+            return false;
+        }
+        if call.state == CallState::Calling {
+            call.state = CallState::Ringing;
+        }
+        true
     }
 
     /// Begin a sequential route/failover sequence for a call.
@@ -2722,6 +2791,79 @@ mod tests {
         assert!(store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, false));
         // Now a new re-INVITE can start.
         assert!(!store.set_pending_reinvite(&call_id, /*on_a_leg=*/ false, true));
+    }
+
+    /// The 2xx answer must be claimed atomically: the first `try_win` wins
+    /// (sets the winner + `Answered`), and every subsequent 2xx (retransmit or
+    /// losing fork branch) reports `AlreadyAnswered`. This is what stops two
+    /// concurrent B-leg 200s from both forwarding to the A-leg and delivering a
+    /// duplicate 200 to a caller that already ACKed.
+    #[test]
+    fn try_win_claims_the_answer_exactly_once() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        store.add_b_leg(&call_id, make_b_leg(0));
+        store.add_b_leg(&call_id, make_b_leg(1));
+
+        // First 200 (B-leg 0) wins, setting winner + state atomically.
+        assert_eq!(store.try_win(&call_id, 0), WinOutcome::FirstWin);
+        {
+            let call = store.get_call(&call_id).unwrap();
+            assert_eq!(call.winner, Some(0));
+            assert_eq!(call.state, CallState::Answered);
+        }
+
+        // A retransmit of the winner's 200 before the B-leg ACK went out:
+        // already answered, absorb silently.
+        assert_eq!(
+            store.try_win(&call_id, 0),
+            WinOutcome::AlreadyAnswered { b_leg_acked: false }
+        );
+        // A losing fork branch's 200 (B-leg 1): also already answered, not a win.
+        assert_eq!(
+            store.try_win(&call_id, 1),
+            WinOutcome::AlreadyAnswered { b_leg_acked: false }
+        );
+        // The winner is unchanged (still B-leg 0).
+        assert_eq!(store.get_call(&call_id).unwrap().winner, Some(0));
+
+        // Once the winner's ACK has gone out, a further retransmit reports
+        // acked=true so the caller re-ACKs to stop the UAS retransmitting.
+        store.get_call_mut(&call_id).unwrap().b_legs[0].initial_acked = true;
+        assert_eq!(
+            store.try_win(&call_id, 0),
+            WinOutcome::AlreadyAnswered { b_leg_acked: true }
+        );
+    }
+
+    /// A 1xx provisional is forwarded (and moves Calling -> Ringing) until the
+    /// call is answered; a late provisional reordered behind its 200 is then
+    /// dropped and must NOT downgrade the confirmed dialog back to Ringing.
+    /// This is the atomic guard that stops a late 180 processed on another
+    /// worker from being forwarded to the A-leg after the final response.
+    #[test]
+    fn try_mark_ringing_drops_provisional_after_answer() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        store.add_b_leg(&call_id, make_b_leg(0));
+
+        // First 180: Calling -> Ringing, forward it.
+        assert!(store.try_mark_ringing(&call_id));
+        assert_eq!(store.get_call(&call_id).unwrap().state, CallState::Ringing);
+        // A second 180 while Ringing: still forwarded, stays Ringing.
+        assert!(store.try_mark_ringing(&call_id));
+        assert_eq!(store.get_call(&call_id).unwrap().state, CallState::Ringing);
+
+        // Answer the call.
+        store.set_winner(&call_id, 0);
+        assert_eq!(store.get_call(&call_id).unwrap().state, CallState::Answered);
+
+        // A late 180 reordered behind the 200: dropped, dialog NOT downgraded.
+        assert!(!store.try_mark_ringing(&call_id));
+        assert_eq!(store.get_call(&call_id).unwrap().state, CallState::Answered);
+
+        // A provisional for a call that no longer exists is dropped.
+        assert!(!store.try_mark_ringing("nonexistent"));
     }
 
     /// RFC 3891 §3 dialog lookup: find a call where one of its legs has
