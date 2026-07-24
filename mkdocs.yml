@@ -50,6 +50,7 @@ nav:
       - Load balancer: cookbook/load-balancer.md
       - Least-Cost Routing: cookbook/least-cost-routing.md
       - SBC (B2BUA): cookbook/sbc.md
+      - WhatsApp calling: cookbook/whatsapp-calling.md
       - Call transfer (REFER): cookbook/call-transfer.md
       - Number normalization: cookbook/number-normalization.md
       - Number routing (LNP / redirect): cookbook/number-routing.md

@@ -3843,6 +3843,52 @@ registrant:
         assert!(ims.features.iter().any(|f| f == "mmtel"));
     }
 
+    /// The shipped WhatsApp Business Calling gateway example must parse, and its
+    /// WhatsApp-specific invariants must hold: no mutual-TLS client cert (Meta is
+    /// server-auth only), no session timer (a re-INVITE would fail the WhatsApp
+    /// leg), the whatsapp + internal gateway groups (WhatsApp probe disabled —
+    /// Meta does not answer OPTIONS), and the DTLS-SRTP media profiles. Guards
+    /// against the example silently rotting.
+    #[test]
+    fn example_whatsapp_calling_yaml_parses() {
+        let yaml = include_str!("../examples/whatsapp_calling.yaml");
+        let config = Config::from_str(yaml).expect("example yaml must parse");
+
+        // Server-auth TLS only — no outbound client certificate toward Meta.
+        let tls = config.tls.expect("tls block");
+        assert!(tls.client_certificate.is_none());
+        assert!(tls.client_private_key.is_none());
+
+        // SIPhon must never originate a re-INVITE toward the WhatsApp leg.
+        assert!(config.session_timer.is_none());
+
+        let gateway = config.gateway.expect("gateway block");
+        let whatsapp = gateway
+            .groups
+            .iter()
+            .find(|g| g.name == "whatsapp")
+            .expect("whatsapp gateway group");
+        assert!(!whatsapp.probe.enabled);
+        // Meta's source ranges drive call.from_gateway("whatsapp") direction
+        // detection — the group must carry source_networks.
+        assert!(!whatsapp.source_networks.is_empty());
+        assert!(gateway.groups.iter().any(|g| g.name == "internal"));
+
+        // DTLS-SRTP profiles for the Meta leg (the SDES default reuses built-ins).
+        let media = config.media.expect("media block");
+        let dtls_in = media
+            .profiles
+            .get("whatsapp_dtls_in")
+            .expect("whatsapp_dtls_in profile");
+        assert_eq!(dtls_in.answer.transport_protocol.as_deref(), Some("RTP/SAVPF"));
+        assert_eq!(dtls_in.answer.dtls.as_deref(), Some("passive"));
+        let dtls_out = media
+            .profiles
+            .get("whatsapp_dtls_out")
+            .expect("whatsapp_dtls_out profile");
+        assert_eq!(dtls_out.offer.dtls.as_deref(), Some("passive"));
+    }
+
     #[test]
     fn parses_security_config() {
         let yaml = r#"

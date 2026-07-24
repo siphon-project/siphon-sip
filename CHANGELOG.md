@@ -34,6 +34,20 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   explicit per-family listeners, each with an optional per-listener `advertise`
   (see `examples/ims_pcscf.yaml`). Core-side (Mw / outbound) dual-stack is a
   separate follow-up.
+- **WhatsApp Business Calling gateway example.** WhatsApp's Business Calling API
+  is SIP-over-TLS to `wa.meta.vc`, so SIPhon bridges WhatsApp voice to an internal
+  SIP/IMS network as a B2BUA in both directions with no new protocol code — a TLS
+  trunk plus a routing script. New `examples/whatsapp_calling.{py,yaml}` (server-
+  auth TLS with no client cert, outbound digest via `call.set_credentials()`,
+  direction detection via `call.from_gateway()` on Meta's source ranges
+  (`gateway.groups[].source_networks`, handshake-verified on TLS), OPUS passthrough,
+  SDES via the built-in `srtp_to_rtp`/`rtp_to_srtp` profiles and DTLS-SRTP via new
+  `whatsapp_dtls_in`/`whatsapp_dtls_out` profiles, and no session timer since Meta
+  rejects re-INVITEs) plus a `docs/cookbook/whatsapp-calling.md` recipe. The
+  messaging side (Cloud API) is a separate HTTP example in the siphon-http addon.
+  SDK fix along the way: the `Call` mock's `set_from_user()` / `set_ruri_user()`
+  now mutate the parsed URI (they previously did string ops on a `SipUri` and
+  raised), matching `set_to_user()`.
 - **Docker Compose quickstart + Getting started guide.** A root
   `docker-compose.yaml` runs the published image with your `siphon.yaml` and
   `scripts/` bind-mounted (host networking, hot-reload, a SIP `OPTIONS`
