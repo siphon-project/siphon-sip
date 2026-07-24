@@ -11623,16 +11623,35 @@ fn handle_b2bua_response(
     match class { ResponseClass::Answered => {
     // --- 2xx answer handling ---
     if (200..300).contains(&status_code) {
-        // Absorb 200 OK retransmissions: if the call is already answered,
-        // this is a retransmit from the B-leg (it hasn't received our ACK yet).
-        // Only re-ACK if the B-leg has been ACKed (late ACK complete).
-        // If still waiting for A-leg ACK, absorb silently.
-        if call_state == CallState::Answered {
-            // Check if B-leg has been ACKed yet (late ACK pattern)
-            let b_leg_acked = b_leg_index
-                .and_then(|idx| state.call_actors.get_call(call_id)
-                    .and_then(|call| call.b_legs.get(idx).map(|b| b.initial_acked)))
-                .unwrap_or(false);
+        // Atomically claim the answer. Under load, two B-leg 200s for the same
+        // call (the answer plus a retransmit, or a fork glare) can be processed
+        // concurrently; `call_state` is snapshotted at the top of this function
+        // and only flipped to Answered below, so both could pass a stale
+        // "not answered" check and both forward to the A-leg — delivering a
+        // duplicate 200 to a caller that already ACKed (the "Dead call
+        // (successful)" the UAC logs, and an occasional failed call when a
+        // forward lands after the A-leg freed its state). Claim under the
+        // per-call lock so exactly one 2xx wins and forwards; the rest are
+        // absorbed here. A FirstWin also sets the winner + Answered (replacing
+        // the set_winner below). `None` = no matched B-leg (defensive) — fall
+        // back to the pre-atomic snapshot check.
+        let already_answered: Option<bool> =
+            match b_leg_index.map(|idx| state.call_actors.try_win(call_id, idx)) {
+                Some(crate::b2bua::actor::WinOutcome::FirstWin) => None,
+                Some(crate::b2bua::actor::WinOutcome::AlreadyAnswered { b_leg_acked }) => {
+                    Some(b_leg_acked)
+                }
+                None if call_state == CallState::Answered => Some(true),
+                None => {
+                    state.call_actors.set_state(call_id, CallState::Answered);
+                    None
+                }
+            };
+        if let Some(b_leg_acked) = already_answered {
+            // Retransmit of the winning B-leg's 200 (it hasn't received our ACK
+            // yet), or a losing fork branch. Re-ACK only once the B-leg ACK has
+            // gone out (late-ACK complete); while still awaiting the A-leg ACK,
+            // absorb silently.
             if !b_leg_acked {
                 debug!(
                     call_id = %call_id,
@@ -11700,11 +11719,8 @@ fn handle_b2bua_response(
         // (siphon-terminated transfer-target responses are intercepted earlier,
         // before the class match, so they never reach this normal-answer path.)
 
-        // 2xx — call answered; record the winning B-leg
-        state.call_actors.set_state(call_id, CallState::Answered);
-        if let Some(idx) = b_leg_index {
-            state.call_actors.set_winner(call_id, idx);
-        }
+        // 2xx — this is the winning answer; the winner + Answered state were
+        // claimed atomically above (try_win), so there is nothing to set here.
 
         // Record the winning B-leg's own raw endpoint SDP (its 200 answer,
         // captured before the @b2bua.on_answer script / rtpengine rewrite below)
@@ -12236,20 +12252,21 @@ fn handle_b2bua_response(
     // --- 1xx provisional handling ---
     {
         // Drop a stray provisional that arrives after the call is already
-        // answered — e.g. a carrier's 180 reordered behind its 200 under the
-        // multi-worker UDP receive (seen on an LCR reroute where the winning
-        // carrier's 180/200 land in a tight window), or a losing fork branch's
-        // late 18x. A B2BUA must not forward a provisional after the final
-        // response, nor downgrade the confirmed dialog back to Ringing
-        // (RFC 3261 §12.1). Absorb it.
-        if call_state == CallState::Answered {
+        // answered — e.g. a carrier's 180 reordered behind its 200, or a losing
+        // fork branch's late 18x. A B2BUA must not forward a provisional after
+        // the final response, nor downgrade the confirmed dialog back to Ringing
+        // (RFC 3261 §12.1). This MUST be an atomic check-and-set, not the
+        // `call_state` snapshot taken ~1600 lines earlier: under multi-worker
+        // dispatch a B-leg's 180 and 200 (received in order over one TCP/UDP
+        // flow) are processed on different workers concurrently, so a late 180
+        // that reads a stale "not answered" snapshot would be forwarded behind
+        // its 200 and abort the A-leg UAC (which already ACKed/BYE'd). Deciding
+        // under the per-call lock drops the provisional that lost the race.
+        if !state.call_actors.try_mark_ringing(call_id) {
             debug!(call_id = %call_id, status = status_code,
                 "B2BUA: dropping provisional received after answer");
             return;
         }
-
-        // 1xx provisional — forward to A-leg
-        state.call_actors.set_state(call_id, CallState::Ringing);
 
         // Invoke @b2bua.on_early_media handlers when provisional has SDP body.
         // This lets scripts process early media through RTPEngine before forwarding.
