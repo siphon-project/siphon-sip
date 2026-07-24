@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  RFC 3261 §18.1.1 over-MTU test — SMALL MESSAGE.
+
+  A tiny body keeps the request well under listen.mtu - 200, so siphon must
+  keep it on UDP.  The R-URI userpart `udprecv` routes the relay at the
+  UDP-ONLY receiver, so a 200 OK comes back only if siphon left it on UDP
+  (a wrongful TCP switch would never reach a UDP-only peer).
+
+  Run: sipp -sf mtu_message_small.xml -s udprecv <proxy>:5060
+-->
+<scenario name="MTU small MESSAGE (expect UDP relay)">
+
+  <send retrans="500">
+    <![CDATA[
+MESSAGE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:sender@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 MESSAGE
+Contact: <sip:sender@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/siphon-mtu-test
+Content-Type: text/plain
+Content-Length: [len]
+
+ping
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+</scenario>

@@ -7,6 +7,19 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **`listen.mtu` — RFC 3261 §18.1.1 UDP→TCP fallback for oversized requests.**
+  When `listen.mtu` is set, an outbound SIP *request* built for UDP whose
+  serialised length exceeds `mtu − 200` bytes is relayed over TCP instead — but
+  only when the next hop has a **reachable** TCP listener (confirmed by a short
+  connect probe on the over-MTU path); otherwise it stays on UDP (delivered,
+  fragmented) with a `warn`, so an over-MTU request is never dropped against a
+  UDP-only peer. This stops an oversized IMS-core NOTIFY (large
+  `reginfo+xml` / iFC fan-out) from IP-fragmenting and being silently dropped by
+  UEs / IPX peers with strict ICMP filtering. Applies to the proxy relay, fork,
+  and B2BUA dial paths; responses follow the request's transport and the inbound
+  side is unchanged. Default is off (no behaviour change on a bump); IMS
+  deployments set `1280` (the IPv6 minimum MTU). Family-agnostic — works for v4
+  and v6 next hops. Kamailio analog: `udp_mtu` + `udp_mtu_try_proto=TCP`.
 - **Docker Compose quickstart + Getting started guide.** A root
   `docker-compose.yaml` runs the published image with your `siphon.yaml` and
   `scripts/` bind-mounted (host networking, hot-reload, a SIP `OPTIONS`

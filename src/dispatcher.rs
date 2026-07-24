@@ -95,6 +95,9 @@ struct DispatcherState {
     /// socket siphon is actually listening on, and the advertised host for the
     /// outgoing Via comes from the matched listener.
     listener_registry: crate::transport::ListenerRegistry,
+    /// Path MTU (bytes) for the outbound UDP request path (RFC 3261 §18.1.1).
+    /// `Some(mtu)` biases an over-`(mtu - 200)` UDP request to TCP; `None` = off.
+    mtu: Option<u16>,
     /// Server header value injected into locally-generated responses.
     server_header: Option<String>,
     /// User-Agent header value for outbound requests (UAC, registrant).
@@ -504,6 +507,19 @@ pub async fn run(
         }
     }
 
+    // RFC 3261 §18.1.1 MTU floor sanity check.  Below the 576-byte IPv4 minimum
+    // (mtu-200 ≈ 376), almost every request crosses the threshold and switches
+    // to TCP — very likely a typo (e.g. `mtu: 128`).
+    if let Some(mtu) = config.listen.mtu {
+        if mtu < 576 {
+            warn!(
+                mtu,
+                "listen.mtu is below the 576-byte IPv4 minimum — nearly every request will \
+                 exceed mtu-200 and be relayed over TCP; is this intended?"
+            );
+        }
+    }
+
     let default_server = format!("{product_name}/{product_version}");
     let server_header = Some(
         config
@@ -605,6 +621,7 @@ pub async fn run(
         rtpengine_sessions,
         rtpengine_profiles,
         session_timer_config: config.session_timer.clone(),
+        mtu: config.listen.mtu,
         header_policy_registry,
         default_header_policy,
         default_refer_mode: config.b2bua.resolved_default_refer_mode(),
@@ -3078,7 +3095,7 @@ fn relay_request(
     //   a) flow=Some — use the captured inbound flow directly,
     //      bypassing DNS resolution of any URI.
     //   b) flow=None — resolve the next_hop / top Route / R-URI as usual.
-    let (target_uri_string, destination, mut outbound_transport, flow_local_addr) =
+    let (target_uri_string, mut destination, mut outbound_transport, flow_local_addr) =
         if let Some(flow) = flow {
             let transport = match flow.transport.as_str() {
                 "udp" => Transport::Udp,
@@ -3242,6 +3259,32 @@ fn relay_request(
         }
         _ => None,
     };
+
+    // RFC 3261 §18.1.1 — bias an over-MTU UDP request to TCP.  The length is
+    // measured before our Via is added (`mtu - 200` leaves headroom for it plus
+    // downstream Via additions).  Skipped for flow-/IPsec-pinned egress: a
+    // captured flow and an IPsec SA both pin the transport authoritatively (the
+    // kernel XFRM selector would drop a switched-transport frame).  The
+    // `state.mtu.is_some()` guard keeps the serialise off the default hot path.
+    if state.mtu.is_some() && flow.is_none() && ipsec_source.is_none() {
+        if let Some((tcp_transport, tcp_addr)) = mtu_tcp_upgrade(
+            state.mtu,
+            outbound_transport,
+            relayed.to_bytes().len(),
+            &target_uri_string,
+            destination,
+            &state.dns_resolver,
+        ) {
+            // A hostname's _sip._tcp path could point back at us — don't switch
+            // into a loop (the UDP destination already passed is_own_address).
+            if state.is_own_address(&tcp_addr) {
+                warn!(%tcp_addr, "§18.1.1: TCP path loops back to us — keeping UDP");
+            } else {
+                outbound_transport = tcp_transport;
+                destination = tcp_addr;
+            }
+        }
+    }
 
     // Resolve the script `send_socket=` egress pin against the *final*
     // outbound transport (the IPsec block above may have re-pinned it).  It
@@ -3587,7 +3630,7 @@ fn relay_fork_branch(
     // Resolve the branch destination + transport: over the captured inbound flow
     // (RFC 5626 §5.3 connection reuse — the only way back to a WebSocket UE,
     // RFC 7118 §5) when one is attached, else by DNS-resolving the target URI.
-    let (destination, outbound_transport) = if let Some(flow) = flow {
+    let (mut destination, mut outbound_transport) = if let Some(flow) = flow {
         let transport = match flow.transport.as_str() {
             "udp" => Transport::Udp,
             "tcp" => Transport::Tcp,
@@ -3622,6 +3665,26 @@ fn relay_fork_branch(
 
     if core::decrement_max_forwards(&mut relayed.headers).is_err() {
         return; // caller handles the error for the whole fork
+    }
+
+    // RFC 3261 §18.1.1 — bias an over-MTU UDP fork branch to TCP.  Skipped for a
+    // flow-pinned branch (its transport is fixed by connection reuse).
+    if state.mtu.is_some() && flow.is_none() {
+        if let Some((tcp_transport, tcp_addr)) = mtu_tcp_upgrade(
+            state.mtu,
+            outbound_transport,
+            relayed.to_bytes().len(),
+            target,
+            destination,
+            &state.dns_resolver,
+        ) {
+            if state.is_own_address(&tcp_addr) {
+                warn!(%tcp_addr, "fork §18.1.1: TCP path loops back to us — keeping UDP");
+            } else {
+                outbound_transport = tcp_transport;
+                destination = tcp_addr;
+            }
+        }
     }
 
     // A script send_socket= egress pin applies to this branch only when it has
@@ -5020,6 +5083,100 @@ fn resolve_candidates_inner(
 /// weighted-random / shuffled pick on every call.
 fn resolve_target(uri_string: &str, resolver: &SipResolver) -> Option<RelayTarget> {
     resolve_candidates(uri_string, resolver).into_iter().next()
+}
+
+/// RFC 3261 §18.1.1: a UDP request whose serialised length exceeds `mtu - 200`
+/// bytes must be sent over a congestion-controlled transport (TCP).  The 200
+/// bytes is headroom for the Via siphon adds plus additions by downstream hops.
+fn over_mtu(len: usize, mtu: u16) -> bool {
+    len > mtu.saturating_sub(200) as usize
+}
+
+/// Time budget for the §18.1.1 TCP-reachability probe (below).  Kept short so a
+/// blackholed TCP port on the (rare) over-MTU path adds only bounded latency; a
+/// peer with no TCP listener refuses immediately (ECONNREFUSED), well under it.
+const TCP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Probe a **reachable** TCP path to the next hop for the §18.1.1 over-MTU
+/// switch.  Returns the TCP `SocketAddr` to send to, or `None` when no TCP
+/// listener answers — in which case the caller keeps UDP and delivers the
+/// request (fragmented) rather than dropping it, honouring RFC 3261 §18.1.1's
+/// "retry using UDP" on a TCP connection failure.
+///
+/// The candidate address is the same `SocketAddr` for a numeric next hop (SIP
+/// peers co-locate UDP+TCP; there is no SRV to consult, matching Kamailio's
+/// `udp_mtu_try_proto=TCP`), or the `_sip._tcp` SRV / A/AAAA result for a
+/// hostname.  A short blocking connect then confirms a TCP listener is actually
+/// there before we commit the Via/transaction to TCP: the resolver's A/AAAA
+/// fallback means a hostname almost always "resolves" for TCP even with no TCP
+/// service, so the connect — not the resolution — is the real reachability test.
+fn resolve_tcp_path(
+    uri_string: &str,
+    udp_destination: SocketAddr,
+    resolver: &SipResolver,
+) -> Option<SocketAddr> {
+    let candidate = if uri_string.parse::<SocketAddr>().is_ok() {
+        udp_destination
+    } else {
+        let uri = parse_uri_standalone(uri_string).ok()?;
+        if crate::sip::uri::strip_ipv6_brackets(&uri.host)
+            .parse::<std::net::IpAddr>()
+            .is_ok()
+        {
+            // Numeric host (v4 or bracketed v6) — same address, TCP.
+            udp_destination
+        } else {
+            let results = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(resolver.resolve(
+                    &uri.host,
+                    uri.port,
+                    &uri.scheme,
+                    Some("tcp"),
+                ))
+            });
+            results.into_iter().next()?.address
+        }
+    };
+    // The real reachability test: only switch if a TCP listener answers.
+    let reachable = tokio::task::block_in_place(|| {
+        std::net::TcpStream::connect_timeout(&candidate, TCP_PROBE_TIMEOUT).is_ok()
+    });
+    reachable.then_some(candidate)
+}
+
+/// Apply the RFC 3261 §18.1.1 over-MTU UDP→TCP decision for one outbound
+/// request.  Given the current transport, the serialised (pre-Via) request
+/// length and its next hop, returns `Some((Tcp, tcp_addr))` when the request is
+/// too big for UDP and a TCP path resolves, else `None` (keep UDP — logging the
+/// forced over-MTU send when a switch was wanted but no TCP path exists).
+fn mtu_tcp_upgrade(
+    mtu: Option<u16>,
+    outbound_transport: Transport,
+    serialized_len: usize,
+    target_uri_string: &str,
+    destination: SocketAddr,
+    resolver: &SipResolver,
+) -> Option<(Transport, SocketAddr)> {
+    let mtu = mtu?;
+    if outbound_transport != Transport::Udp || !over_mtu(serialized_len, mtu) {
+        return None;
+    }
+    match resolve_tcp_path(target_uri_string, destination, resolver) {
+        Some(tcp_addr) => {
+            debug!(
+                serialized_len, mtu, %destination,
+                "RFC 3261 §18.1.1: over-MTU UDP request → TCP"
+            );
+            Some((Transport::Tcp, tcp_addr))
+        }
+        None => {
+            warn!(
+                serialized_len, mtu, %destination,
+                "transport: forced UDP over-MTU send (no reachable TCP path)"
+            );
+            None
+        }
+    }
 }
 
 /// For a B→A in-dialog forward over **TLS**, decide whether to dial the remote
@@ -9827,7 +9984,7 @@ fn b2bua_send_b_leg_invite(
     // 7118 §5) when one is attached, else from next_hop when set, else from
     // target.  R-URI construction below still uses target_uri unconditionally —
     // that split is the whole point of next_hop.
-    let (destination, outbound_transport) = if let Some(flow) = flow {
+    let (mut destination, mut outbound_transport) = if let Some(flow) = flow {
         let transport = match flow.transport.as_str() {
             "udp" => Transport::Udp,
             "tcp" => Transport::Tcp,
@@ -9856,6 +10013,28 @@ fn b2bua_send_b_leg_invite(
         };
         (relay_target.address, relay_target.transport.unwrap_or(Transport::Udp))
     };
+
+    // RFC 3261 §18.1.1 — bias an over-MTU UDP B-leg INVITE to TCP.  Skipped for a
+    // flow-pinned B-leg.  The length is measured on the A-leg request as an
+    // approximation of the derived B-leg INVITE (header-policy strips/adds mean
+    // it is not exact); the decision must precede the Via build below so the
+    // Via/txn reflect the chosen transport.  An over-estimate cannot drop the
+    // call — the reachability probe in resolve_tcp_path keeps UDP when the peer
+    // has no TCP listener; an under-estimate simply leaves a borderline B-leg on
+    // UDP (fragmenting, as it would pre-feature).
+    if state.mtu.is_some() && flow.is_none() {
+        if let Some((tcp_transport, tcp_addr)) = mtu_tcp_upgrade(
+            state.mtu,
+            outbound_transport,
+            original_request.to_bytes().len(),
+            next_hop.unwrap_or(target_uri),
+            destination,
+            &state.dns_resolver,
+        ) {
+            outbound_transport = tcp_transport;
+            destination = tcp_addr;
+        }
+    }
 
     // A script send_socket= egress pin applies to the B-leg only when it has no
     // captured flow (a flow already pins egress) and its transport matches the
@@ -18887,6 +19066,65 @@ a=rtpmap:8 PCMA/8000\r\n";
     async fn resolve_target_unresolvable_domain() {
         let resolver = test_resolver();
         assert!(resolve_target("sip:alice@this-domain-should-not-exist-xyzzy.invalid", &resolver).is_none());
+    }
+
+    // -- RFC 3261 §18.1.1 over-MTU UDP → TCP fallback ------------------------
+
+    #[test]
+    fn over_mtu_threshold() {
+        // Must EXCEED mtu-200 to trigger (the headroom for our Via + downstream).
+        assert!(!over_mtu(1080, 1280), "exactly at the boundary is not over");
+        assert!(over_mtu(1081, 1280));
+        assert!(!over_mtu(500, 1280));
+        // A tiny mtu saturates to 0 rather than underflowing.
+        assert!(over_mtu(1, 100));
+        assert!(!over_mtu(0, 100));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mtu_tcp_upgrade_switches_when_tcp_reachable() {
+        let resolver = test_resolver();
+        // A live TCP listener so the reachability probe succeeds.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dest = listener.local_addr().unwrap();
+        let uri = dest.to_string(); // numeric "127.0.0.1:PORT" next hop
+        // Over threshold + reachable TCP → switch to TCP at the same address.
+        assert_eq!(
+            mtu_tcp_upgrade(Some(1280), Transport::Udp, 1300, &uri, dest, &resolver),
+            Some((Transport::Tcp, dest)),
+        );
+        // Under threshold → keep UDP (no probe).
+        assert_eq!(mtu_tcp_upgrade(Some(1280), Transport::Udp, 900, &uri, dest, &resolver), None);
+        // MTU off → never switch.
+        assert_eq!(mtu_tcp_upgrade(None, Transport::Udp, 1300, &uri, dest, &resolver), None);
+        // Already non-UDP → never switch.
+        assert_eq!(mtu_tcp_upgrade(Some(1280), Transport::Tcp, 1300, &uri, dest, &resolver), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mtu_tcp_upgrade_keeps_udp_when_no_tcp_listener() {
+        // Bind then drop → a closed port; the reachability probe refuses, so an
+        // over-MTU request must STAY on UDP (delivered fragmented, not dropped).
+        let dest: SocketAddr = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let resolver = test_resolver();
+        assert_eq!(
+            mtu_tcp_upgrade(Some(1280), Transport::Udp, 1300, &dest.to_string(), dest, &resolver),
+            None,
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_tcp_path_numeric_probes_reachability() {
+        let resolver = test_resolver();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dest = listener.local_addr().unwrap();
+        // Bare IP:port and a sip: URI with a numeric host both resolve to the
+        // same address, and the live listener makes the probe succeed.
+        assert_eq!(resolve_tcp_path(&dest.to_string(), dest, &resolver), Some(dest));
+        assert_eq!(resolve_tcp_path(&format!("sip:{dest}"), dest, &resolver), Some(dest));
     }
 
     #[tokio::test(flavor = "multi_thread")]

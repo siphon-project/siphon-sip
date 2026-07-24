@@ -247,6 +247,46 @@ jobs:
             siphon.log
             *.log
 
+  # ── RFC 3261 §18.1.1 over-MTU UDP->TCP fallback (IPv4) ─────────────────────
+  # Deterministic signal: an over-MTU MESSAGE is relayed at a TCP-only receiver
+  # (200 only if siphon switched to TCP); a small MESSAGE at a UDP-only receiver
+  # (200 only if it stayed UDP).  Needs no special capability.  The runner builds
+  # the image, runs both cases, dumps siphon+receiver logs on failure, and tears
+  # the stack down on exit.
+  sipp-mtu:
+    runs-on: ubuntu-latest
+    needs: rust-tests
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: MTU §18.1.1 fallback tests (IPv4)
+        run: scripts/mtu_test.sh v4
+
+  # IPv6 leg — manual dispatch only.  A user-defined compose network with
+  # enable_ipv6 + a private ULA subnet keeps all traffic inside the bridge (no
+  # host IPv6 egress needed), but docker's IPv6 bridge is not reliable on
+  # GitHub-hosted runners, so this is opt-in (also runnable locally with
+  # `scripts/mtu_test.sh v6`) rather than a required check.
+  sipp-mtu-ipv6:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    needs: rust-tests
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Enable docker IPv6 (merge into the runner's daemon.json)
+        run: |
+          sudo apt-get install -y jq
+          tmp=$(mktemp)
+          jq '. + {experimental: true, ip6tables: true}' \
+            /etc/docker/daemon.json 2>/dev/null > "$tmp" || \
+            echo '{"experimental": true, "ip6tables": true}' > "$tmp"
+          sudo mv "$tmp" /etc/docker/daemon.json
+          sudo systemctl restart docker
+
+      - name: MTU §18.1.1 fallback tests (IPv6)
+        run: scripts/mtu_test.sh v6
+
   # ── B2BUA functional tests ─────────────────────────────────────────────
   sipp-b2bua:
     runs-on: ubuntu-latest

@@ -1,0 +1,28 @@
+# siphon.mtu.yaml — RFC 3261 §18.1.1 over-MTU UDP->TCP fallback test config.
+#
+# Used with: sipp/docker-compose.mtu.yaml (IPv4 + IPv6 stacks).
+# Script:    scripts/mtu_relay.py
+#
+# The bind address is parameterised so the same file serves the v4 stack
+# (MTU_BIND=0.0.0.0) and the v6 stack (MTU_BIND=[fd18:5109::10]).  listen.mtu
+# is small (1280, the IPv6 minimum MTU) so a padded MESSAGE crosses the
+# mtu-200 = 1080-byte threshold and is relayed over TCP.
+
+listen:
+  mtu: ${MTU_LISTEN_MTU:-1280}
+  udp:
+    - "${MTU_BIND:-0.0.0.0}:5060"
+  tcp:
+    - "${MTU_BIND:-0.0.0.0}:5060"
+
+domain:
+  local:
+    - "mtu.test"
+
+script:
+  path: "/etc/siphon/scripts/mtu_relay.py"
+  reload: auto
+
+log:
+  level: debug
+  format: pretty

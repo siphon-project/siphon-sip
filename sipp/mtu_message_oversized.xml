@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  RFC 3261 §18.1.1 over-MTU test — OVERSIZED MESSAGE.
+
+  The text/plain body is padded so the serialised request comfortably exceeds
+  listen.mtu - 200 (= 1080 bytes at mtu 1280), so siphon must relay it over a
+  congestion-controlled transport (TCP).  The R-URI userpart `tcprecv` routes
+  the relay at the TCP-ONLY receiver, so a 200 OK comes back only if siphon
+  actually switched the over-MTU request to TCP.
+
+  Run: sipp -sf mtu_message_oversized.xml -s tcprecv <proxy>:5060
+-->
+<scenario name="MTU oversized MESSAGE (expect TCP relay)">
+
+  <send retrans="500">
+    <![CDATA[
+MESSAGE sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:sender@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 MESSAGE
+Contact: <sip:sender@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/siphon-mtu-test
+Content-Type: text/plain
+Content-Length: [len]
+
+MTU-OVERSIZE-PADDING mtu-oversize-padding MTU-OVERSIZE-PADDING mtu-oversize-padding
+MTU-OVERSIZE-PADDING mtu-oversize-padding MTU-OVERSIZE-PADDING mtu-oversize-padding
+MTU-OVERSIZE-PADDING mtu-oversize-padding MTU-OVERSIZE-PADDING mtu-oversize-padding
+MTU-OVERSIZE-PADDING mtu-oversize-padding MTU-OVERSIZE-PADDING mtu-oversize-padding
+MTU-OVERSIZE-PADDING mtu-oversize-padding MTU-OVERSIZE-PADDING mtu-oversize-padding
+MTU-OVERSIZE-PADDING mtu-oversize-padding MTU-OVERSIZE-PADDING mtu-oversize-padding
+MTU-OVERSIZE-PADDING mtu-oversize-padding MTU-OVERSIZE-PADDING mtu-oversize-padding
+MTU-OVERSIZE-PADDING mtu-oversize-padding MTU-OVERSIZE-PADDING mtu-oversize-padding
+MTU-OVERSIZE-PADDING mtu-oversize-padding MTU-OVERSIZE-PADDING mtu-oversize-padding
+MTU-OVERSIZE-PADDING mtu-oversize-padding MTU-OVERSIZE-PADDING mtu-oversize-padding
+MTU-OVERSIZE-PADDING mtu-oversize-padding MTU-OVERSIZE-PADDING mtu-oversize-padding
+MTU-OVERSIZE-PADDING mtu-oversize-padding MTU-OVERSIZE-PADDING mtu-oversize-padding
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+</scenario>
