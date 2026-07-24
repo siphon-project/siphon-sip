@@ -144,6 +144,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   pseudo-legs, so a plain call that re-INVITEd no longer reports two B-legs.
 
 ### Fixed
+- **`proxy.send_request()` now always emits a From tag (RFC 3261 §8.1.1.3).**
+  Script-originated out-of-dialog requests (e.g. an IP-SM-GW delivering an
+  RP-ACK or an MT SIP MESSAGE) went on the wire with a tagless `From` when the
+  script supplied a `From` header without one, so a strict UAS — a real VoLTE
+  handset — answered `400 Bad Request` and every such delivery was rejected. The
+  UAC path already auto-managed the other mandatory single-value headers
+  (Call-ID, CSeq, Via, Max-Forwards) but treated `From` as opaque pass-through.
+  It now guarantees a tag: a script-pinned `From;tag=…` is preserved verbatim,
+  an untagged `From` gains a generated tag (display name and existing params
+  kept), and a request with no `From` at all is given one built from the
+  advertised identity. The compact `f` form is handled identically.
 - **B2BUA answer / provisional handling is now race-free under concurrent
   dispatch.** Two check-then-set decisions read a `call_state` snapshot taken
   early in response handling but committed the new state only ~1600 lines later,

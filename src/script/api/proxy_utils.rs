@@ -14,6 +14,7 @@ use pyo3::types::{PyDict, PyModule};
 use crate::dns::SipResolver;
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::headers::cseq::CSeq;
+use crate::sip::headers::nameaddr::NameAddr;
 use crate::sip::headers::route::RouteEntry;
 use crate::sip::message::{Method, StartLine};
 use crate::sip::parser::parse_uri_standalone;
@@ -522,6 +523,46 @@ fn parse_first_route_uri(raw: &str) -> Option<SipUri> {
     parse_uri_standalone(first).ok()
 }
 
+/// Guarantee a `tag` parameter on a script-supplied `From` header value.
+///
+/// RFC 3261 §8.1.1.3 makes the From tag mandatory on every request.  A script
+/// that hands `proxy.send_request()` a `From: <sip:a@b>` (bare user-part on
+/// purpose, e.g. so an S-CSCF impu-alias lookup hits) should not have to
+/// hand-roll the tag — `send_request` already owns the other mandatory
+/// single-value headers (Call-ID, CSeq, Via, Max-Forwards), so it owns this
+/// too.
+///
+/// - Already tagged → returned verbatim (some flows pin the tag for
+///   correlation; RFC 3261 §8.1.1.3 wants it stable across a dialog's
+///   requests, so never rewrite one the script chose).
+/// - Untagged → append `;tag=<uuid>` to the raw value (header params are
+///   unordered per §7.3.1, so appending is byte-preserving for everything the
+///   script wrote).
+/// - Unparseable → lenient scan for an existing `tag=` header param before
+///   appending, so a malformed-but-tagged value is not double-tagged.
+fn ensure_from_tag(raw: &str) -> String {
+    let has_tag = match NameAddr::parse(raw) {
+        Ok(name_addr) => name_addr.tag.is_some(),
+        // Parse failed (e.g. a malformed URI) — fall back to scanning the
+        // header-parameter portion (after the closing '>' of the addr-spec,
+        // if any) so a `tag=` *inside* the angle brackets can't false-match.
+        Err(_) => {
+            let params = match raw.rfind('>') {
+                Some(pos) => &raw[pos + 1..],
+                None => raw,
+            };
+            params
+                .split(';')
+                .any(|param| param.trim().to_ascii_lowercase().starts_with("tag="))
+        }
+    };
+    if has_tag {
+        raw.to_string()
+    } else {
+        format!("{raw};tag={}", uuid::Uuid::new_v4())
+    }
+}
+
 /// Build the SIP message originated by `proxy.send_request()`.
 ///
 /// Returns the built message paired with its top-Via branch — the caller
@@ -552,6 +593,7 @@ fn build_send_request_message(
     let mut user_cseq: Option<String> = None;
     let mut user_max_forwards: Option<String> = None;
     let mut user_via: Option<String> = None;
+    let mut user_from: Option<String> = None;
     let mut other_headers: Vec<(String, String)> = Vec::new();
 
     if let Some(header_dict) = headers {
@@ -576,6 +618,13 @@ fn build_send_request_message(
                 user_max_forwards = Some(val);
             } else if name.eq_ignore_ascii_case("Via") || name.eq_ignore_ascii_case("v") {
                 user_via = Some(val);
+            } else if name.eq_ignore_ascii_case("From") || name.eq_ignore_ascii_case("f") {
+                // From is single-value (RFC 3261 §7.3.1) and its `tag` is
+                // mandatory on every request (§8.1.1.3).  Pull it out here
+                // so we can guarantee the tag below — leaving it in
+                // other_headers would both risk a duplicate From and skip
+                // the tag fixup entirely.
+                user_from = Some(val);
             } else {
                 other_headers.push((name, val));
             }
@@ -603,9 +652,23 @@ fn build_send_request_message(
     let call_id = user_call_id.unwrap_or_else(|| format!("py-{}", uuid::Uuid::new_v4()));
     let cseq_str = user_cseq.unwrap_or_else(|| format!("1 {}", sip_method.as_str()));
 
+    // From tag is mandatory on *every* request (RFC 3261 §8.1.1.3) — it is
+    // half of the transaction/dialog identity, not a dialog-only nicety, and
+    // even a dialog-less MESSAGE (RFC 3428) must carry it.  A strict UAS is
+    // entitled to answer 400 Bad Request on a tagless From, and real VoLTE
+    // handsets do.  Guarantee one here the same way Call-ID/CSeq/Via are
+    // auto-provided: keep a script-pinned tag untouched, append a generated
+    // one when it is missing, and synthesize a whole From (from our advertised
+    // identity) when the script supplied none at all.
+    let from_value = match user_from {
+        Some(raw) => ensure_from_tag(&raw),
+        None => format!("<sip:{local_sent_by}>;tag={}", uuid::Uuid::new_v4()),
+    };
+
     let mut builder = SipMessageBuilder::new()
         .request(sip_method, uri)
         .via(via_value)
+        .from(from_value)
         .call_id(call_id)
         .cseq(cseq_str);
 
@@ -1195,6 +1258,167 @@ mod tests {
                 branch.starts_with("z9hG4bK-uac-py-"),
                 "auto branch must use the UAC-py prefix, got {branch}"
             );
+        });
+    }
+
+    /// RFC 3261 §8.1.1.3: the From tag is mandatory on every request.  A
+    /// script that supplies a `From` with no tag (e.g. IP-SM-GW delivery.py
+    /// building `<sip:{aor}>` on purpose so an S-CSCF impu-alias lookup hits)
+    /// must still go on the wire with a tag — a strict UAS (real VoLTE
+    /// handset) answers 400 Bad Request otherwise.
+    #[test]
+    fn send_request_untagged_from_gets_generated_tag() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let headers = PyDict::new(py);
+            headers.set_item("From", "<sip:a@b>").unwrap();
+
+            let (message, _branch) = build_send_request_message(
+                "MESSAGE",
+                target_uri(),
+                Transport::Udp,
+                local_sent_by(),
+                Some(&headers),
+                None,
+            )
+            .expect("build_send_request_message");
+
+            let froms = message.headers.get_all("From").expect("From must be present");
+            assert_eq!(froms.len(), 1, "From must be a single value, got {froms:?}");
+            // Matches ^<sip:a@b>;tag=.+$
+            assert!(
+                froms[0].starts_with("<sip:a@b>;tag="),
+                "untagged From must gain a tag, got {froms:?}"
+            );
+            assert!(
+                froms[0].len() > "<sip:a@b>;tag=".len(),
+                "generated tag must be non-empty, got {froms:?}"
+            );
+        });
+    }
+
+    /// A script that pins its own From tag (some flows do, for correlation)
+    /// must get it back byte-for-byte — never rewritten.
+    #[test]
+    fn send_request_pinned_from_tag_is_preserved() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let headers = PyDict::new(py);
+            headers.set_item("From", "<sip:a@b>;tag=fixed").unwrap();
+
+            let (message, _branch) = build_send_request_message(
+                "MESSAGE",
+                target_uri(),
+                Transport::Udp,
+                local_sent_by(),
+                Some(&headers),
+                None,
+            )
+            .expect("build_send_request_message");
+
+            let froms = message.headers.get_all("From").expect("From must be present");
+            assert_eq!(froms.len(), 1, "From must be a single value, got {froms:?}");
+            assert_eq!(
+                froms[0], "<sip:a@b>;tag=fixed",
+                "pinned From tag must be preserved verbatim"
+            );
+        });
+    }
+
+    /// A display name and existing header params must survive the tag
+    /// append (header params are unordered per RFC 3261 §7.3.1).
+    #[test]
+    fn send_request_untagged_from_preserves_display_name() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let headers = PyDict::new(py);
+            headers
+                .set_item("From", "\"Alice\" <sip:alice@atlanta.com>")
+                .unwrap();
+
+            let (message, _branch) = build_send_request_message(
+                "MESSAGE",
+                target_uri(),
+                Transport::Udp,
+                local_sent_by(),
+                Some(&headers),
+                None,
+            )
+            .expect("build_send_request_message");
+
+            let froms = message.headers.get_all("From").expect("From must be present");
+            assert_eq!(froms.len(), 1, "From must be a single value, got {froms:?}");
+            assert!(
+                froms[0].starts_with("\"Alice\" <sip:alice@atlanta.com>;tag="),
+                "display name must be preserved and a tag appended, got {froms:?}"
+            );
+        });
+    }
+
+    /// The From compact form `f` (RFC 3261 §20) is the same single-value
+    /// header — it must be pulled out, tagged, and emitted as one canonical
+    /// From with no leftover `f` header alongside.
+    #[test]
+    fn send_request_from_compact_form_gets_tag() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let headers = PyDict::new(py);
+            headers.set_item("f", "<sip:a@b>").unwrap();
+
+            let (message, _branch) = build_send_request_message(
+                "MESSAGE",
+                target_uri(),
+                Transport::Udp,
+                local_sent_by(),
+                Some(&headers),
+                None,
+            )
+            .expect("build_send_request_message");
+
+            // The store expands compact forms (§7.3.3), so both names resolve
+            // to the one canonical From — a single value proves there is no
+            // duplicate From/`f` pair on the wire.
+            let froms = message.headers.get_all("From").expect("From must be present");
+            assert_eq!(froms.len(), 1, "From must be a single value, got {froms:?}");
+            assert!(
+                froms[0].starts_with("<sip:a@b>;tag="),
+                "compact-form From must gain a tag, got {froms:?}"
+            );
+        });
+    }
+
+    /// When the script supplies no From at all, `send_request` must still
+    /// emit a valid, tagged From built from our advertised identity — a
+    /// request with no From line is malformed (RFC 3261 §8.1.1).
+    #[test]
+    fn send_request_without_from_synthesizes_tagged_from() {
+        pyo3::Python::initialize();
+        Python::attach(|py| {
+            let _ = py;
+            let (message, _branch) = build_send_request_message(
+                "MESSAGE",
+                target_uri(),
+                Transport::Udp,
+                local_sent_by(),
+                None,
+                None,
+            )
+            .expect("build_send_request_message");
+
+            let froms = message.headers.get_all("From").expect("From must be present");
+            assert_eq!(froms.len(), 1, "one From expected, got {froms:?}");
+            // Built from our advertised identity, and tagged.
+            assert!(
+                froms[0].contains(&format!("<sip:{}>", local_sent_by())),
+                "synthesized From must use our advertised identity, got {froms:?}"
+            );
+            assert!(
+                froms[0].contains(";tag="),
+                "synthesized From must carry a tag, got {froms:?}"
+            );
+            // Parses back to a NameAddr with a tag (RFC-valid).
+            let parsed = NameAddr::parse(&froms[0]).expect("From must parse");
+            assert!(parsed.tag.is_some(), "parsed From must have a tag");
         });
     }
 
