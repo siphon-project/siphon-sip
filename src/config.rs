@@ -433,6 +433,16 @@ pub struct ListenConfig {
     /// Set to `0` or `"BE"` to disable marking.
     #[serde(default = "default_dscp", deserialize_with = "deserialize_dscp")]
     pub dscp: Option<u8>,
+    /// Path MTU in bytes for the outbound UDP request path (RFC 3261 §18.1.1).
+    /// When set, an outbound SIP *request* built for UDP whose serialised length
+    /// exceeds `mtu - 200` is sent over TCP instead (if a TCP path to the
+    /// destination is reachable), else it falls back to UDP with a warning.
+    /// Default `None` (off) — existing UDP-at-any-size deployments are unchanged.
+    /// `1280` (the IPv6 minimum MTU) is a safe dual-stack lower bound for IMS
+    /// core legs. Responses follow the transport of the request they answer;
+    /// the inbound side is unaffected.
+    #[serde(default)]
+    pub mtu: Option<u16>,
     #[serde(default)]
     pub udp: Vec<ListenEntry>,
     #[serde(default)]
@@ -454,6 +464,7 @@ impl Default for ListenConfig {
     fn default() -> Self {
         Self {
             dscp: default_dscp(),
+            mtu: None,
             udp: Vec::new(),
             tcp: Vec::new(),
             tls: Vec::new(),
@@ -5158,6 +5169,39 @@ script:
 "#;
         let config = Config::from_str(yaml).unwrap();
         assert_eq!(config.listen.dscp, Some(46));
+    }
+
+    #[test]
+    fn listen_config_mtu_from_yaml() {
+        let yaml = r#"
+listen:
+  mtu: 1280
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert_eq!(config.listen.mtu, Some(1280));
+    }
+
+    #[test]
+    fn listen_config_mtu_defaults_off() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert_eq!(config.listen.mtu, None, "mtu must default to off (no behaviour change on a bump)");
     }
 
     #[test]

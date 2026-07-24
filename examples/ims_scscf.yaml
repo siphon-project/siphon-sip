@@ -19,6 +19,13 @@
 #   P-CSCF: 5060    I-CSCF: 4060    S-CSCF: 6060
 
 listen:
+  # RFC 3261 §18.1.1: relay an oversized UDP *request* (a large proxied /
+  # forwarded INVITE, SUBSCRIBE, etc.) over TCP instead of letting it
+  # IP-fragment on the IMS-core UDP legs, when the next hop has a reachable TCP
+  # listener.  Applies to the proxy relay / fork / B2BUA-dial paths — not to
+  # requests this node originates itself.  1280 = the IPv6 minimum MTU.  Wrap in
+  # an env for the cluster operator to tune: mtu: ${IMS_LISTEN_MTU:-1280}
+  mtu: 1280
   udp:
     - "0.0.0.0:6060"
   tcp:

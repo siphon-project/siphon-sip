@@ -1,0 +1,186 @@
+# docker-compose.mtu.yaml — RFC 3261 §18.1.1 over-MTU UDP->TCP fallback,
+# exercised over BOTH address families.
+#
+# Each family has its own isolated network and a five-service stack:
+#   siphon-mtu{4,6}   — proxy with listen.mtu=1280, relays MESSAGE by R-URI user
+#   recv-tcp{4,6}     — SIPp UAS, TCP-only  (-t t1): only reached if siphon
+#                       switched an over-MTU request to TCP
+#   recv-udp{4,6}     — SIPp UAS, UDP-only: only reached if siphon kept an
+#                       under-MTU request on UDP
+#   uac-oversized{4,6}— sends an oversized MESSAGE to `tcprecv@` -> expect 200
+#   uac-small{4,6}    — sends a small MESSAGE to `udprecv@` -> expect 200
+#
+# All traffic stays inside the compose network, so the v6 stack needs no host
+# IPv6 egress.  Driven by scripts/mtu_test.sh (and the CI `sipp-mtu` job).
+
+x-siphon-health: &siphon-health
+  # UDP OPTIONS probe against the container's own address; family auto-detected
+  # by the presence of a ':' in MTU_HEALTH_TARGET (the mtu_relay.py script
+  # answers OPTIONS with 200).
+  test:
+    - CMD-SHELL
+    - >-
+      python3 -c "import socket,os;h=os.environ['MTU_HEALTH_TARGET'];
+      fam=socket.AF_INET6 if ':' in h else socket.AF_INET;
+      s=socket.socket(fam,socket.SOCK_DGRAM);s.settimeout(2);
+      s.sendto(b'OPTIONS sip:mtu.test SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\r\nFrom: <sip:hc@mtu.test>;tag=hc\r\nTo: <sip:mtu.test>\r\nCall-ID: hc@check\r\nCSeq: 1 OPTIONS\r\nMax-Forwards: 1\r\nContent-Length: 0\r\n\r\n',(h,5060));s.recv(1024);s.close()"
+  interval: 3s
+  timeout: 3s
+  retries: 20
+  start_period: 10s
+
+services:
+  # ─── IPv4 stack ────────────────────────────────────────────────────────────
+  siphon-mtu4:
+    image: sipp-siphon
+    build:
+      context: ..
+    volumes:
+      - ./configs/siphon.mtu.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+    environment:
+      MTU_BIND: "0.0.0.0"
+      MTU_HEALTH_TARGET: "172.30.0.10"
+      MTU_RECV_TCP: "sip:172.30.0.20:5060"
+      MTU_RECV_UDP: "sip:172.30.0.21:5060"
+    networks:
+      mtu4:
+        ipv4_address: 172.30.0.10
+    healthcheck: *siphon-health
+    profiles: [mtu4]
+
+  recv-tcp4:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-mtu4:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      mtu4:
+        ipv4_address: 172.30.0.20
+    entrypoint: [sipp, -sf, /sipp/scenarios/message_uas.xml, -t, t1, -p, "5060", -i, "172.30.0.20", -timeout, "60"]
+    profiles: [mtu4]
+
+  recv-udp4:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-mtu4:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      mtu4:
+        ipv4_address: 172.30.0.21
+    entrypoint: [sipp, -sf, /sipp/scenarios/message_uas.xml, -p, "5060", -i, "172.30.0.21", -timeout, "60"]
+    profiles: [mtu4]
+
+  uac-oversized4:
+    image: ctaloi/sipp:latest
+    depends_on:
+      recv-tcp4:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      mtu4:
+        ipv4_address: 172.30.0.30
+    entrypoint: [sipp, "172.30.0.10:5060", -sf, /sipp/scenarios/mtu_message_oversized.xml, -s, tcprecv, -i, "172.30.0.30", -m, "1", -l, "1", -timeout, "20", -trace_err]
+    profiles: [mtu4]
+
+  uac-small4:
+    image: ctaloi/sipp:latest
+    depends_on:
+      recv-udp4:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      mtu4:
+        ipv4_address: 172.30.0.31
+    entrypoint: [sipp, "172.30.0.10:5060", -sf, /sipp/scenarios/mtu_message_small.xml, -s, udprecv, -i, "172.30.0.31", -m, "1", -l, "1", -timeout, "20", -trace_err]
+    profiles: [mtu4]
+
+  # ─── IPv6 stack ────────────────────────────────────────────────────────────
+  siphon-mtu6:
+    image: sipp-siphon
+    build:
+      context: ..
+    volumes:
+      - ./configs/siphon.mtu.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+    environment:
+      MTU_BIND: "[fd18:5109::10]"
+      MTU_HEALTH_TARGET: "fd18:5109::10"
+      MTU_RECV_TCP: "sip:[fd18:5109::20]:5060"
+      MTU_RECV_UDP: "sip:[fd18:5109::21]:5060"
+    networks:
+      mtu6:
+        ipv6_address: fd18:5109::10
+    healthcheck: *siphon-health
+    profiles: [mtu6]
+
+  recv-tcp6:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-mtu6:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      mtu6:
+        ipv6_address: fd18:5109::20
+    entrypoint: [sipp, -sf, /sipp/scenarios/message_uas.xml, -t, t1, -p, "5060", -i, "fd18:5109::20", -timeout, "60"]
+    profiles: [mtu6]
+
+  recv-udp6:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-mtu6:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      mtu6:
+        ipv6_address: fd18:5109::21
+    entrypoint: [sipp, -sf, /sipp/scenarios/message_uas.xml, -p, "5060", -i, "fd18:5109::21", -timeout, "60"]
+    profiles: [mtu6]
+
+  uac-oversized6:
+    image: ctaloi/sipp:latest
+    depends_on:
+      recv-tcp6:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      mtu6:
+        ipv6_address: fd18:5109::30
+    entrypoint: [sipp, "[fd18:5109::10]:5060", -sf, /sipp/scenarios/mtu_message_oversized.xml, -s, tcprecv, -i, "fd18:5109::30", -m, "1", -l, "1", -timeout, "20", -trace_err]
+    profiles: [mtu6]
+
+  uac-small6:
+    image: ctaloi/sipp:latest
+    depends_on:
+      recv-udp6:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      mtu6:
+        ipv6_address: fd18:5109::31
+    entrypoint: [sipp, "[fd18:5109::10]:5060", -sf, /sipp/scenarios/mtu_message_small.xml, -s, udprecv, -i, "fd18:5109::31", -m, "1", -l, "1", -timeout, "20", -trace_err]
+    profiles: [mtu6]
+
+networks:
+  mtu4:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  mtu6:
+    enable_ipv6: true
+    driver: bridge
+    ipam:
+      config:
+        - subnet: fd18:5109::/64

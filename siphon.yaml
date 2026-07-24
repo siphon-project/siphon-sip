@@ -26,6 +26,15 @@ listen:
   # Set to 0 or "BE" (Best Effort) to disable marking.
   # Per-listener overrides are possible in the extended form (see below).
   dscp: CS3
+  # Path MTU (bytes) for the outbound UDP request path (RFC 3261 §18.1.1).
+  # When set, an outbound SIP request built for UDP whose serialised length
+  # exceeds mtu-200 is relayed over TCP instead (if the next hop has a reachable
+  # TCP path), else it stays on UDP with a warning.  This prevents oversized
+  # requests (e.g. a large reg-event NOTIFY) from IP-fragmenting and being
+  # silently dropped by peers with strict ICMP filtering.  Default: off (unset),
+  # so UDP-at-any-size behaviour is unchanged.  1280 = the IPv6 minimum MTU, a
+  # safe lower bound for dual-stack IMS core legs.
+  # mtu: 1280
   udp:
     - "0.0.0.0:5060"    # Standard SIP (PSTN gateways, legacy UEs)
     # - "[::]:5060"      # Dual-stack IPv6 (accepts both IPv4 and IPv6)
