@@ -882,7 +882,8 @@ class Call:
                 call.set_ruri_user("+33123456789")
                 call.dial("sip:gw@carrier.example.com")
         """
-        self._ruri = f"sip:{value}@{self._ruri.split('@', 1)[-1]}" if '@' in self._ruri else self._ruri
+        if self._ruri is not None:
+            self._ruri.user = value
 
     def set_from_user(self, value: str) -> None:
         """Set the user part of the From header URI.
@@ -899,10 +900,8 @@ class Call:
                 call.set_from_user("+33123456789")
                 call.dial("sip:gw@carrier.example.com")
         """
-        # In the mock, just update the from_uri string
-        old = self._from_uri
-        if '@' in old:
-            self._from_uri = f"{value}@{old.split('@', 1)[-1]}"
+        if self._from_uri is not None:
+            self._from_uri.user = value
 
     def set_to_user(self, value: str) -> None:
         """Set the user part of the To header URI.

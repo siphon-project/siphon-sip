@@ -1,0 +1,183 @@
+# ---------------------------------------------------------------------------
+# SIPhon gateway for the WhatsApp Business Calling API (voice)
+#
+# Bridges WhatsApp voice calls (SIP over TLS to Meta) to an internal SIP
+# network (PBX / carrier trunk) as a B2BUA, both directions:
+#
+#     WhatsApp  <-- SIP/TLS + SRTP -->  SIPhon  <-- SIP + RTP -->  internal
+#
+# See examples/whatsapp_calling.py for the routing logic.
+#
+# Meta side (provisioned in WhatsApp Business, not here):
+#   * Configure a SIP server for your business phone number pointing at this
+#     gateway's public FQDN:5061 over TLS (Meta connects to `advertised_address`
+#     below). Meta's own SIP domain is `wa.meta.vc`.
+#   * Fetch the per-number SIP digest password (GET the phone-number settings
+#     with `include_sip_credentials=true`) and pass it to this script via
+#     $WHATSAPP_SIP_PASSWORD (see examples/whatsapp_calling.py).
+#   * Pick an SRTP keying mode for the number: SDES (simplest, the default this
+#     example ships) or DTLS-SRTP (Meta's default; the `whatsapp_dtls_*`
+#     profiles below — validate against your number before production).
+#
+# Constraints baked into this config (Meta requirements):
+#   * TLS is mandatory; Meta presents a server cert for `wa.meta.vc` and does
+#     NOT do mutual TLS, so there is NO client_certificate here (unlike Teams).
+#   * OPUS is the only WhatsApp audio codec — the internal leg must also speak
+#     OPUS (this gateway anchors/relays, it does not transcode). telephone-event
+#     (RFC 4733 DTMF) rides through.
+#   * No re-INVITE may be sent toward Meta — so there is deliberately NO
+#     `session_timer:` block (a UAC session-timer refresh would re-INVITE Meta
+#     and fail the call). Do not enable it for the WhatsApp leg.
+#   * Meta forbids bridging WhatsApp calls to the PSTN — the "internal" leg must
+#     stay on-net VoIP/SIP, not a PSTN breakout.
+# ---------------------------------------------------------------------------
+
+listen:
+  udp:
+    - "0.0.0.0:5060"          # internal-facing
+  tcp:
+    - "0.0.0.0:5060"          # internal-facing
+  tls:
+    - "0.0.0.0:5061"          # WhatsApp-facing (Meta -> SIPhon, TLS)
+
+# Contact / Via / Record-Route host. This MUST be the public FQDN you gave Meta
+# as the SIP server for the number (Meta connects here), and the SAN on the TLS
+# cert below.
+advertised_address: "whatsapp-gw.example.com"
+
+domain:
+  local:
+    - "whatsapp-gw.example.com"
+
+tls:
+  # Server identity presented to Meta (Meta -> SIPhon). Any publicly-trusted CA
+  # (the SAN must be the FQDN above). There is intentionally no client
+  # certificate: the WhatsApp Business Calling API is server-auth TLS only —
+  # Meta neither sends nor requests a client cert.
+  certificate: "/etc/siphon/tls/whatsapp-gw.example.com/fullchain.pem"
+  private_key: "/etc/siphon/tls/whatsapp-gw.example.com/privkey.pem"
+  method: "TLSv1_2"
+
+script:
+  path: "examples/whatsapp_calling.py"
+  reload: auto
+
+# ---------------------------------------------------------------------------
+# Security. This gateway is internet-facing (Meta connects over the internet)
+# and will be scanned within minutes of going live.
+#
+# NOTE: Meta sources calls from 1000+ IP ranges, so a `trusted_cidrs` allowlist
+# for the WhatsApp side is impractical — trust is established by TLS plus the
+# per-call SIP digest (this script can challenge inbound INVITEs, and
+# authenticates outbound ones with call.set_credentials()). Rate-limit and
+# scanner-block still protect the listeners from generic abuse.
+# ---------------------------------------------------------------------------
+security:
+  rate_limit:
+    window_secs: 10
+    max_requests: 30           # per source IP per window
+    ban_duration_secs: 3600
+
+  scanner_block:
+    user_agents:
+      - "sipvicious"
+      - "friendly-scanner"
+      - "VaxSip"
+      - "sipcli"
+
+  failed_auth_ban:
+    threshold: 10
+    window_secs: 600
+    ban_duration_secs: 3600
+    strong_signal_weight: 3
+
+b2bua:
+  # Strip P-*/X-* (including the x-wa-meta-* / X-FB-External-Domain identifiers
+  # Meta adds) between the WhatsApp side and the internal network — the script
+  # reads them off the A-leg before they are stripped from the B-leg.
+  default_header_policy: "sip-trunk-edge@2026"
+
+gateway:
+  groups:
+    # WhatsApp / Meta side. One static next-hop over TLS; the request URI user
+    # part (the E.164 to reach) is set per-call in the script. Health-probe is
+    # DISABLED: Meta's edge does not answer SIP OPTIONS keepalives, so probing
+    # would flap the destination down.
+    #
+    # source_networks lists Meta's published WhatsApp Calling source ranges so
+    # call.from_gateway("whatsapp") recognises inbound calls by source IP
+    # (handshake-verified on TLS) regardless of what wa.meta.vc resolves to. Meta
+    # publishes a large set that changes over time — populate this from their
+    # current list and automate updates. The placeholder below matches nothing.
+    - name: "whatsapp"
+      algorithm: weighted
+      probe:
+        enabled: false
+      source_networks:
+        - "192.0.2.0/24"          # PLACEHOLDER — replace with Meta's published ranges
+      destinations:
+        - uri: "sip:wa.meta.vc:5061;transport=tls"
+
+    # Internal SIP network (PBX / on-net trunk). Plain SIP over UDP here; must be
+    # OPUS-capable (no transcoding) and on-net (no PSTN breakout, per Meta ToS).
+    - name: "internal"
+      algorithm: weighted
+      probe:
+        enabled: true
+        interval_secs: 30
+        failure_threshold: 3
+        from_domain: "whatsapp-gw.example.com"
+      destinations:
+        - uri: "sip:pbx.internal.example.net:5060"
+
+media:
+  rtpengine:
+    address: "127.0.0.1:22222"
+    timeout_ms: 1000
+    sdp_name: "SIPhon WhatsApp GW"
+  health_check_interval_secs: 30
+
+  # SDES mode (the default this example uses) needs NO custom profiles: WhatsApp
+  # with SDES keying is a standard SRTP trunk, so the built-in `srtp_to_rtp`
+  # (WhatsApp -> internal) and `rtp_to_srtp` (internal -> WhatsApp) profiles
+  # already do the right thing. The script selects them by default.
+  #
+  # The profiles below are the DTLS-SRTP alternative (Meta's default keying),
+  # modelled on the built-in `wss_to_rtp` WebRTC profile. rtpengine terminates
+  # DTLS on the WhatsApp side and bridges to the internal RTP leg (there is no
+  # opaque DTLS pass-through when anchoring). Switch the script's MODE to "dtls"
+  # to use them, and VALIDATE the DTLS role / ICE against your own WhatsApp
+  # number before production — the correct role can depend on Meta's offer.
+  profiles:
+    # WhatsApp -> internal (Meta is the offering A-leg: DTLS-SRTP + ICE + OPUS).
+    whatsapp_dtls_in:
+      offer:
+        transport_protocol: "RTP/AVP"    # present plain RTP to the internal leg
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin"]
+        direction: ["external", "internal"]
+      answer:
+        transport_protocol: "RTP/SAVPF"  # DTLS-SRTP back to WhatsApp
+        ice: "force"
+        dtls: "passive"
+        replace: ["origin"]
+        direction: ["internal", "external"]
+    # internal -> WhatsApp (internal is the offering A-leg: plain RTP).
+    whatsapp_dtls_out:
+      offer:
+        transport_protocol: "RTP/SAVPF"  # DTLS-SRTP toward WhatsApp
+        ice: "force"
+        dtls: "passive"
+        replace: ["origin"]
+        direction: ["internal", "external"]
+      answer:
+        transport_protocol: "RTP/AVP"    # plain RTP back to the internal leg
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin"]
+        direction: ["external", "internal"]
+
+log:
+  level: info
+  format: pretty

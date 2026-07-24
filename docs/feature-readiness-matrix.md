@@ -165,6 +165,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Dynamic group management | Implemented | Python `gateway.add_group()` / `gateway.remove_group()` | |
 | Destination up/down marking | Implemented | Python `gateway.mark_up()` / `gateway.mark_down()` | |
 | Source-membership predicate | Implemented | Python `request.from_gateway()` / `call.from_gateway()` | `ds_is_from_list()` / `ds_is_in_list()` equivalent; IP-only match against all resolved group addresses, cached + refreshed on probe cycle. Trust signal on TCP/TLS/WS/WSS, direction hint on UDP |
+| WhatsApp Business Calling (voice) | Implemented | `examples/whatsapp_calling.{py,yaml}` | SIP-over-TLS trunk to `wa.meta.vc` (server-auth TLS, no mTLS), B2BUA both directions, outbound digest via `call.set_credentials()`, OPUS passthrough, SDES (built-in profiles) / DTLS-SRTP (`whatsapp_dtls_*`). Composed from existing features; live WABA validation pending |
 
 ## Call Detail Records
 
