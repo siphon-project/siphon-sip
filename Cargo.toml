@@ -110,7 +110,7 @@ aes = "0.9"
 # sign path.
 p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }  # ES256 sign/verify + key load
 x509-cert = { version = "0.3", features = ["pem"] }               # cert parse, SPKI, extensions, validity
-base64 = "0.22"                                                    # base64url (URL_SAFE_NO_PAD) for JWS
+base64 = "0.23"                                                    # base64url (URL_SAFE_NO_PAD) for JWS
 
 # Utilities
 md5 = "0.8"
