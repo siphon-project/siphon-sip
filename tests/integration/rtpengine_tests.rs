@@ -310,6 +310,77 @@ async fn profile_flags_produce_valid_bencode() {
     }
 }
 
+/// End-to-end proof that a profile's `address_family` reaches the engine as the
+/// dedicated `"address family"` NG key — rtpengine reads the family from that key
+/// only, so a value stuck in the free-form `flags` list would be silently ignored
+/// and the relay would come back in the offerer's family.
+#[tokio::test]
+async fn offer_carries_address_family_on_the_wire() {
+    let (command_sender, mut command_receiver) = tokio::sync::mpsc::channel(4);
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = socket.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        let mut buffer = BytesMut::zeroed(65535);
+        while let Ok((size, source)) = socket.recv_from(&mut buffer).await {
+            let data = &buffer[..size];
+            let space = data.iter().position(|&byte| byte == b' ').unwrap();
+            let cookie = data[..space].to_vec();
+            let command = bencode::decode_full_dict(&data[space + 1..]).unwrap();
+            let family = command
+                .dict_get_str("address family")
+                .map(|value| value.to_string());
+            let flags_has_family = match command.dict_get("flags") {
+                Some(BencodeValue::List(items)) => items.iter().any(|item| match item {
+                    BencodeValue::String(bytes) => {
+                        let text = String::from_utf8_lossy(bytes).to_ascii_uppercase();
+                        text.contains("IP4") || text.contains("IP6")
+                    }
+                    _ => false,
+                }),
+                _ => false,
+            };
+            let _ = command_sender.send((family, flags_has_family)).await;
+
+            let response = BencodeValue::dict(vec![
+                ("result", BencodeValue::string("ok")),
+                (
+                    "sdp",
+                    BencodeValue::string(concat!(
+                        "v=0\r\n",
+                        "o=- 0 0 IN IP4 203.0.113.1\r\n",
+                        "s=-\r\n",
+                        "c=IN IP4 203.0.113.1\r\n",
+                        "t=0 0\r\n",
+                        "m=audio 30000 RTP/AVP 0\r\n",
+                    )),
+                ),
+            ]);
+            let mut reply = cookie;
+            reply.push(b' ');
+            reply.extend_from_slice(&bencode::encode(&response));
+            let _ = socket.send_to(&reply, source).await;
+        }
+    });
+
+    let client = RtpEngineClient::new(address, 1000).await.unwrap();
+    let flags = NgFlags {
+        address_family: Some("IP4".into()),
+        ..NgFlags::default()
+    };
+    client
+        .offer("call-af", "tag-a", b"v=0\r\n", &flags)
+        .await
+        .unwrap();
+
+    let (family, flags_has_family) = command_receiver.recv().await.unwrap();
+    assert_eq!(family.as_deref(), Some("IP4"));
+    assert!(
+        !flags_has_family,
+        "the family must ride its own key, never the flags list"
+    );
+}
+
 #[tokio::test]
 async fn config_media_section_backward_compatible() {
     use siphon::config::Config;

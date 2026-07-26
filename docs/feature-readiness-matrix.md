@@ -147,6 +147,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Built-in profile: WSS↔RTP | Implemented | `wss_to_rtp` | DTLS-SRTP/AVPF + ICE ↔ RTP |
 | Built-in profile: RTP passthrough | Implemented | `rtp_passthrough` | IMS-internal |
 | Custom media profiles | Implemented | `media.profiles` | User-defined NG flags |
+| Media-plane IPv4↔IPv6 interworking | Implemented | `media.profiles.<name>.{offer,answer}.address_family` | Pins the family (`IP4`/`IP6`) the engine allocates its relay endpoints in per direction, so a v6-only access leg can bridge to a v4 core; unset (default) = follow the offered SDP, unchanged single-family behaviour. rtpengine (dedicated `address family` NG key, not a `flags` token) + siphon-rtp (`address_family` control field); the classic rtpproxy backend cannot express it and is warned about at boot. Unknown values fail the config load. Wire-level tests on both backends (`offer_carries_address_family_on_the_wire`). Not yet validated against a live dual-stack engine. |
 | SDP manipulation (`sdp` namespace) | Implemented | None | Parse/modify/apply SDP from Python scripts |
 | SDP attribute get/set/remove | Implemented | None | Session and media-level `a=` attributes |
 | SDP codec filtering | Implemented | None | `filter_codecs()` / `remove_codecs()` |
@@ -350,7 +351,7 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Authentication | 6 (HTTP/HA1, digest 401/407, anti-spoof, Diameter Cx, IMS AKA) | 3 (static, local Milenage AKA, SHA-256) | 9 |
 | Security | 5 (rate limit, scanner, trusted CIDR, fail ban, APIBan) | 1 (IP ACLs) | 6 |
 | NAT | 5 (rport, fix contact, fix register, script fixup, stale eviction) | 3 (keepalive, CRLF keepalive, flow tokens) | 8 |
-| Media | 1 (RTPEngine NG) | 6 (LB, 4 profiles, custom profiles) | 7 |
+| Media | 1 (RTPEngine NG) | 7 (LB, 4 profiles, custom profiles, v4↔v6 interworking) | 8 |
 | Gateway routing | 3 (groups, round-robin, probes) | 4 (weighted, hash, failover, dynamic) | 7 |
 | CDR | 0 | 5 (file, syslog, HTTP, register events, extra fields) | 5 |
 | Tracing | 3 (HEP v3 UDP, agent ID, error suppression) | 2 (TCP, TLS) | 5 |
@@ -358,4 +359,4 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Scripting | 14 (proxy, B2BUA, registrar, auth, gateway, cache, presence, logging, metrics, async, ...) | 3 (LI, timer, SDK) | 17 |
 | 3GPP/IMS | 10 (Cx, Sh, Rx, peer mgmt, IMS AKA HSS-backed, IPsec, iFC, P/I/S-CSCF, Npcf) | 4 (Ro, Rf, local Milenage AKA, Nchf) | 14 |
 | LI/Recording | 0 | 5 (X1, X2, X3, SIPREC, audit) | 5 |
-| **Totals** | **~66** | **~42** | **~109** |
+| **Totals** | **~66** | **~43** | **~110** |

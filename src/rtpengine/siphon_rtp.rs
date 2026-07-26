@@ -63,12 +63,13 @@ pub(crate) fn profile_flags_from_ng(flags: &NgFlags) -> ProfileFlags {
         ice: flags.ice.clone(),
         dtls: flags.dtls.clone(),
         replace: flags.replace.clone(),
+        address_family: flags.address_family.clone(),
         flags: flags.flags.clone(),
         direction: flags.direction.clone(),
         record_call: flags.record_call,
         record_path: flags.record_path.clone(),
-        // Proto fields siphon's NgFlags has no source for (address_family,
-        // ws_uri, received_from, rtcp_mux). Default them: each carries
+        // Proto fields siphon's NgFlags has no source for (ws_uri,
+        // received_from, rtcp_mux). Default them: each carries
         // skip_serializing_if, so the emitted wire form is unchanged.
         ..ProfileFlags::default()
     }
@@ -1502,6 +1503,7 @@ mod tests {
             ice: Some("force".into()),
             dtls: Some("passive".into()),
             replace: vec!["origin".into()],
+            address_family: Some("IP4".into()),
             flags: vec!["trust-address".into(), "symmetric".into()],
             direction: vec!["external".into(), "internal".into()],
             record_call: true,
@@ -1512,6 +1514,7 @@ mod tests {
         assert_eq!(proto.ice.as_deref(), Some("force"));
         assert_eq!(proto.dtls.as_deref(), Some("passive"));
         assert_eq!(proto.replace, vec!["origin".to_string()]);
+        assert_eq!(proto.address_family.as_deref(), Some("IP4"));
         assert_eq!(proto.flags, vec!["trust-address".to_string(), "symmetric".to_string()]);
         assert_eq!(proto.direction, vec!["external".to_string(), "internal".to_string()]);
         assert!(proto.record_call);
@@ -1685,6 +1688,96 @@ mod tests {
         assert_eq!(client.active_sessions(), 1);
         assert_eq!(client.instance_count(), 1);
         assert_eq!(client.instance_addresses(), vec![address]);
+    }
+
+    /// The engine-facing twin of the rtpengine `"address family"` NG key: on this
+    /// backend the family rides the offer's `profile.address_family` JSON field.
+    /// Asserted on the raw frame so a rename or a drop in the mapping shows up as
+    /// a wire change, not just a struct-field change.
+    #[tokio::test]
+    async fn offer_carries_address_family_on_the_wire() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (frame_tx, frame_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            // Decode as raw JSON rather than `Request` so the assertion is on the
+            // wire shape the engine actually parses.
+            let raw: serde_json::Value = read_frame(&mut stream, &mut buffer).await;
+            let _ = frame_tx.send(raw);
+            write_frame(
+                &mut stream,
+                &Response {
+                    id: 1,
+                    result: CmdResult::Ok {
+                        sdp: Some("v=0\r\nc=IN IP4 203.0.113.1\r\n".into()),
+                        duration_ms: None,
+                        to_tag: None,
+                        stats: None,
+                        play_id: None,
+                    },
+                },
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let (event_tx, _event_rx) = channel();
+        let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
+        let flags = NgFlags {
+            address_family: Some("IP6".into()),
+            ..NgFlags::default()
+        };
+        client
+            .offer("call-af", "tag-a", b"v=0\r\n", &flags)
+            .await
+            .unwrap();
+
+        let raw = frame_rx.await.unwrap();
+        assert_eq!(raw["command"], "offer");
+        assert_eq!(raw["profile"]["address_family"], "IP6");
+    }
+
+    /// Absent by default — anchoring a plain call must not pin a relay family.
+    #[tokio::test]
+    async fn offer_omits_address_family_when_unset() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (frame_tx, frame_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            let raw: serde_json::Value = read_frame(&mut stream, &mut buffer).await;
+            let _ = frame_tx.send(raw);
+            write_frame(
+                &mut stream,
+                &Response {
+                    id: 1,
+                    result: CmdResult::Ok {
+                        sdp: Some("v=0\r\n".into()),
+                        duration_ms: None,
+                        to_tag: None,
+                        stats: None,
+                        play_id: None,
+                    },
+                },
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        let (event_tx, _event_rx) = channel();
+        let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
+        client
+            .offer("call-af", "tag-a", b"v=0\r\n", &NgFlags::default())
+            .await
+            .unwrap();
+
+        let raw = frame_rx.await.unwrap();
+        assert!(raw["profile"]["address_family"].is_null());
     }
 
     /// Fake engine that accepts one `PlayMedia` with `play_id`, then optionally

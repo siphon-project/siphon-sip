@@ -555,6 +555,8 @@ auth:
 #   # `profiles:` and `health_check_interval_secs:` apply here too. A profile's
 #   # NAT `direction` (["internal","external"]) and `asymmetric` flag map to
 #   # rtpproxy bridge/symmetry modifiers; IPv6 is auto-detected per stream.
+#   # A profile's `address_family:` is NOT supported here (rtpengine/siphon-rtp
+#   # only) — siphon warns at boot if one sets it on this backend.
 #   # The `media.events:` listener is unused — rtpproxy pushes no async events.
 #
 # Custom media profiles (extend or override built-ins):
@@ -581,6 +583,34 @@ auth:
 #         ice: "remove"
 #         replace: ["origin"]
 #         direction: ["internal", "external"]
+#
+# Per-profile keys:
+#   transport_protocol  RTP/AVP, RTP/SAVP, RTP/AVPF, RTP/SAVPF
+#   ice                 remove | force | force-relay
+#   dtls                passive | active | off
+#   replace             SDP fields the engine rewrites, e.g. ["origin"]
+#   address_family      IP4 | IP6 — the family the engine allocates its relay
+#                       endpoints in for this side of the call. Unset (default)
+#                       means "follow the offered SDP", i.e. a single-family
+#                       relay. Set it to bridge families: a v6 VoLTE access side
+#                       reaching a v4 core sets IP4 on the profile used toward
+#                       the core. rtpengine + siphon-rtp only; the rtpproxy
+#                       backend cannot honour it (warned at boot).
+#   flags               trust-address, symmetric, asymmetric, port latching, …
+#   direction           NAT leg pair, e.g. ["external", "internal"]
+#   record_call         true to have the engine record this leg
+#   record_path         recording output directory
+#
+# IPv4/IPv6 interworking — v6 access leg, v4 core:
+# media:
+#   profiles:
+#     v6_access_to_v4_core:
+#       offer:                          # toward the core: allocate v4
+#         replace: ["origin"]
+#         address_family: "IP4"
+#       answer:                         # back toward the v6 access side
+#         replace: ["origin"]
+#         address_family: "IP6"
 #
 # Python usage:
 #   rtpengine.offer(request, profile="srtp_to_srtp")

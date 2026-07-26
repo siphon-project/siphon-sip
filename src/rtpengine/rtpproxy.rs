@@ -599,6 +599,13 @@ fn unsupported(operation: &str) -> RtpEngineError {
 ///   get the `ie`/`ei` pairing rtpproxy bridging expects).
 /// - a `flags` entry of `"asymmetric"` → `a` (rtpproxy defaults to symmetric).
 /// - an IPv6 stream → `6`.
+///
+/// A profile's `address_family` is deliberately **not** mapped here: rtpproxy's
+/// `6` states the family of the address this very command carries (taken from the
+/// offered `c=` line), so it is an observation, not a policy knob — forcing it
+/// against the address would just make rtpproxy reject the command.  Selecting a
+/// relay family per leg (IPv4↔IPv6 interworking) is an rtpengine / siphon-rtp
+/// capability; `init_rtpengine` warns at boot if a profile asks for it here.
 fn command_modifiers(flags: &NgFlags, is_ipv6: bool) -> String {
     let mut modifiers = String::new();
     for direction in &flags.direction {

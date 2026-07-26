@@ -5529,6 +5529,33 @@ pub fn init_rtpengine(
         &media_config.profiles,
     ));
 
+    // `address_family` has no equivalent in the classic rtpproxy control
+    // protocol: its `6` modifier states the family of the address the command
+    // carries (derived from the offered c= line), it does not select a family for
+    // the relay.  Say so at boot rather than let the knob look wired.
+    if matches!(
+        media_config.backend,
+        crate::config::MediaBackendKind::Rtpproxy
+    ) {
+        let mut with_family: Vec<&str> = media_config
+            .profiles
+            .iter()
+            .filter(|(_, profile)| {
+                profile.offer.address_family.is_some() || profile.answer.address_family.is_some()
+            })
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !with_family.is_empty() {
+            with_family.sort_unstable();
+            warn!(
+                profiles = %with_family.join(", "),
+                "media profile sets address_family, which the rtpproxy backend \
+                 cannot honour (rtpengine / siphon-rtp only) — IPv4/IPv6 \
+                 interworking will not happen on these profiles"
+            );
+        }
+    }
+
     // Create the Python-side singleton (shares the same Arcs).
     let py_rtpengine = crate::script::api::rtpengine::PyRtpEngine::new(
         Arc::clone(&backend),
