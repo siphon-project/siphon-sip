@@ -1969,6 +1969,36 @@ fn default_siphon_rtp_play_timeout_ms() -> u64 {
     300_000
 }
 
+/// Serde deserializer for a media profile's `address_family`, canonicalising to
+/// the `IP4`/`IP6` spelling every media engine expects (it is the SDP `addrtype`
+/// token — rtpengine's `"address family"` NG key, siphon-rtp's `address_family`
+/// JSON field).
+///
+/// Case-insensitive, and `ipv4`/`ipv6` are accepted as aliases.  Any other value
+/// is a config error: the engines ignore an unknown family silently, so a typo
+/// would otherwise land as a relay quietly allocated in the wrong family.
+fn deserialize_address_family<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de;
+
+    let value: Option<String> = Option::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "ip4" | "ipv4" => Ok(Some("IP4".to_string())),
+        "ip6" | "ipv6" => Ok(Some("IP6".to_string())),
+        other => Err(de::Error::custom(format!(
+            "media profile address_family must be \"IP4\" or \"IP6\" (aliases \
+             \"ipv4\"/\"ipv6\"), got {other:?}"
+        ))),
+    }
+}
+
 /// A user-defined RTPEngine media profile with separate offer/answer NG flags.
 #[derive(Debug, Deserialize, Clone)]
 pub struct MediaProfileConfig {
@@ -1988,6 +2018,17 @@ pub struct NgFlagsConfig {
     /// SDP fields to replace: "origin".
     #[serde(default)]
     pub replace: Vec<String>,
+    /// Address family the engine should allocate its relay endpoints in for this
+    /// side of the call: `"IP4"` or `"IP6"`.  Unset (the default) leaves the
+    /// engine following the offered SDP's own family — a single-family relay.
+    ///
+    /// Setting it is how an IPv4↔IPv6 interworking leg is expressed: a v6 VoLTE
+    /// access side bridged to a v4 core sets `address_family: "IP4"` on the
+    /// profile used toward the core.  Accepted case-insensitively, and `ipv4`/
+    /// `ipv6` are taken as aliases; anything else is a hard config error rather
+    /// than a value the media engine would silently ignore.
+    #[serde(default, deserialize_with = "deserialize_address_family")]
+    pub address_family: Option<String>,
     /// Additional flags: "trust-address", "symmetric", "asymmetric".
     #[serde(default)]
     pub flags: Vec<String>,
@@ -4450,6 +4491,72 @@ media:
         assert!(profile.offer.dtls.is_none());
         assert_eq!(profile.offer.direction, vec!["external", "internal"]);
         assert_eq!(profile.answer.direction, vec!["internal", "external"]);
+        // Unset unless the profile asks for a family.
+        assert!(profile.offer.address_family.is_none());
+        assert!(profile.answer.address_family.is_none());
+    }
+
+    /// A v6 VoLTE access side bridged to a v4 core: the profile used toward the
+    /// core pins `IP4`.  Accepted case-insensitively with `ipv4`/`ipv6` aliases,
+    /// always canonicalised to the SDP `addrtype` spelling the engines want.
+    #[test]
+    fn parses_media_profile_address_family() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+media:
+  rtpengine:
+    address: "127.0.0.1:22222"
+  profiles:
+    v6_access_to_v4_core:
+      offer:
+        replace: ["origin"]
+        address_family: "IP4"
+      answer:
+        replace: ["origin"]
+        address_family: "ipv6"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let media = config.media.unwrap();
+        let profile = media.profiles.get("v6_access_to_v4_core").unwrap();
+        assert_eq!(profile.offer.address_family.as_deref(), Some("IP4"));
+        assert_eq!(profile.answer.address_family.as_deref(), Some("IP6"));
+    }
+
+    /// The engines drop an unknown family silently, so a typo has to fail the
+    /// config load — otherwise it lands as a relay in the wrong family.
+    #[test]
+    fn rejects_media_profile_bad_address_family() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+media:
+  rtpengine:
+    address: "127.0.0.1:22222"
+  profiles:
+    broken:
+      offer:
+        address_family: "IP5"
+      answer: {}
+"#;
+        let error = Config::from_str(yaml).expect_err("IP5 must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("address_family"),
+            "error should name the field: {message}"
+        );
     }
 
     #[test]

@@ -86,8 +86,12 @@ still apply, but only the flags rtpproxy understands: a profile's
 `direction: ["internal","external"]` becomes bridge mode (`ie`/`ei`) and an
 `asymmetric` flag maps through; IPv6 is detected per stream. SRTP/DTLS/ICE flags are
 ignored — rtpproxy is a plain RTP relay (use `rtpengine` or `siphon-rtp` for SRTP↔RTP,
-WebRTC, or transcoding). It has the same weighted round-robin + per-call-id affinity
-and per-instance `V` health probes as the other backends.
+WebRTC, or transcoding). A profile's
+[`address_family`](#ipv4-and-ipv6-interworking) is unsupported here too — rtpproxy's
+`6` modifier reports the family of the address the command carries, it cannot select
+one for the relay — and siphon warns at boot naming any profile that sets it. It has
+the same weighted round-robin + per-call-id affinity and per-instance `V` health
+probes as the other backends.
 
 !!! note "rtpproxy is anchor-only"
     The extra `rtpengine` verbs — announcements / tones (`play_media`, `play_dtmf`),
@@ -176,6 +180,37 @@ media:
 ```python
 await rtpengine.offer(request, profile="srtp_to_srtp")
 ```
+
+### IPv4 and IPv6 interworking
+
+`address_family` pins the family the engine allocates its **own** relay endpoints
+in for that side of the call. Leave it unset (the default) and the engine follows
+the offered SDP, which gives you a single-family relay — fine until one side is
+v6-only. Set it per direction to bridge, e.g. a v6 VoLTE access leg reaching a v4
+core:
+
+```yaml
+media:
+  profiles:
+    v6_access_to_v4_core:
+      offer:                     # toward the core: hand it a v4 endpoint
+        replace: ["origin"]
+        address_family: "IP4"
+      answer:                    # back toward the v6 UE
+        replace: ["origin"]
+        address_family: "IP6"
+```
+
+The value is the SDP `addrtype` spelling, `IP4` or `IP6` (`ipv4` / `ipv6` are
+accepted and normalised; anything else fails the config load, because a media
+engine ignores an unknown family silently and you would get a relay in the wrong
+family with no error). The engine needs an interface configured in the target
+family — rtpengine's `interface=` must list both, otherwise it has nothing to
+allocate from.
+
+Works on **rtpengine** (sent as the dedicated `address family` NG key) and
+**siphon-rtp** (the `address_family` control field). The classic **rtpproxy**
+backend has no equivalent and logs a warning at boot if a profile sets it.
 
 ## Shape the SDP yourself
 

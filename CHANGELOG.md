@@ -7,6 +7,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **`address_family` on a media profile — IPv4/IPv6 interworking on the media
+  plane.** A `media.profiles.<name>.offer` / `.answer` block can now pin the
+  address family the media engine allocates its relay endpoints in for that side
+  of the call (`IP4` / `IP6`, the SDP `addrtype` spelling; `ipv4` / `ipv6` are
+  accepted and normalised). Unset — the default — keeps today's behaviour: the
+  engine follows the offered SDP, so the relay is single-family. Setting it is
+  what lets a v6-only access leg (VoNR / IPv6 VoLTE) bridge to a v4 core: the
+  profile used toward the core sets `IP4`, the one back toward the UE `IP6`.
+  Wired on both modern backends — **rtpengine** receives it as the dedicated
+  `"address family"` NG dict key (it is a first-class key there, *not* a token in
+  the `flags` list, where the engine would ignore it), **siphon-rtp** as the
+  `address_family` control field. The classic `rtpproxy` backend has no
+  equivalent — its `6` modifier states the family of the address the command
+  carries, it does not select one — so siphon logs a warning at boot naming any
+  profile that asks for it there. An unrecognised value fails the config load
+  rather than being passed to an engine that would drop it silently.
 - **`listen.mtu` — RFC 3261 §18.1.1 UDP→TCP fallback for oversized requests.**
   When `listen.mtu` is set, an outbound SIP *request* built for UDP whose
   serialised length exceeds `mtu − 200` bytes is relayed over TCP instead — but

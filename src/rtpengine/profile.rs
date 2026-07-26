@@ -82,6 +82,7 @@ impl ProfileRegistry {
                 ice: Some("remove".into()),
                 dtls: None,
                 replace: vec!["origin".into()],
+                address_family: None,
                 flags: vec![],
                 direction: vec!["external".into(), "internal".into()],
                 record_call: false,
@@ -92,6 +93,7 @@ impl ProfileRegistry {
                 ice: Some("remove".into()),
                 dtls: None,
                 replace: vec!["origin".into()],
+                address_family: None,
                 flags: vec![],
                 direction: vec!["internal".into(), "external".into()],
                 record_call: false,
@@ -107,6 +109,7 @@ impl ProfileRegistry {
                 ice: Some("remove".into()),
                 dtls: None,
                 replace: vec!["origin".into()],
+                address_family: None,
                 flags: vec![],
                 direction: vec!["internal".into(), "external".into()],
                 record_call: false,
@@ -117,6 +120,7 @@ impl ProfileRegistry {
                 ice: Some("remove".into()),
                 dtls: None,
                 replace: vec!["origin".into()],
+                address_family: None,
                 flags: vec![],
                 direction: vec!["external".into(), "internal".into()],
                 record_call: false,
@@ -132,6 +136,7 @@ impl ProfileRegistry {
                 ice: Some("force".into()),
                 dtls: None,
                 replace: vec!["origin".into()],
+                address_family: None,
                 flags: vec![],
                 direction: vec!["external".into(), "internal".into()],
                 record_call: false,
@@ -142,6 +147,7 @@ impl ProfileRegistry {
                 ice: Some("remove".into()),
                 dtls: None,
                 replace: vec!["origin".into()],
+                address_family: None,
                 flags: vec![],
                 direction: vec!["internal".into(), "external".into()],
                 record_call: false,
@@ -157,6 +163,7 @@ impl ProfileRegistry {
                 ice: Some("force".into()),
                 dtls: Some("passive".into()),
                 replace: vec!["origin".into()],
+                address_family: None,
                 flags: vec![],
                 direction: vec!["external".into(), "internal".into()],
                 record_call: false,
@@ -167,6 +174,7 @@ impl ProfileRegistry {
                 ice: Some("remove".into()),
                 dtls: Some("off".into()),
                 replace: vec!["origin".into()],
+                address_family: None,
                 flags: vec![],
                 direction: vec!["internal".into(), "external".into()],
                 record_call: false,
@@ -186,6 +194,7 @@ impl ProfileRegistry {
                 ice: Some("remove".into()),
                 dtls: Some("off".into()),
                 replace: vec!["origin".into()],
+                address_family: None,
                 flags: vec![
                     "media handover".into(),
                     "port latching".into(),
@@ -199,6 +208,7 @@ impl ProfileRegistry {
                 ice: Some("remove".into()),
                 dtls: Some("off".into()),
                 replace: vec!["origin".into()],
+                address_family: None,
                 flags: vec![
                     "media handover".into(),
                     "port latching".into(),
@@ -223,6 +233,7 @@ impl ProfileRegistry {
                 ice: Some("remove".into()),
                 dtls: Some("off".into()),
                 replace: vec!["origin".into()],
+                address_family: None,
                 flags: vec![],
                 direction: vec![],
                 record_call: false,
@@ -239,6 +250,7 @@ impl ProfileRegistry {
                 ice: None,
                 dtls: None,
                 replace: vec!["origin".into()],
+                address_family: None,
                 flags: vec!["trust-address".into()],
                 direction: vec![],
                 record_call: false,
@@ -249,6 +261,7 @@ impl ProfileRegistry {
                 ice: None,
                 dtls: None,
                 replace: vec!["origin".into()],
+                address_family: None,
                 flags: vec!["trust-address".into()],
                 direction: vec![],
                 record_call: false,
@@ -275,6 +288,15 @@ pub struct NgFlags {
     pub dtls: Option<String>,
     /// SDP fields to replace: "origin".
     pub replace: Vec<String>,
+    /// Address family for the engine's relay endpoints on this side of the call:
+    /// `"IP4"` or `"IP6"` (the SDP `addrtype` spelling).  `None` leaves the
+    /// engine following the offered SDP's own family — a single-family relay.
+    ///
+    /// Carried on the wire as rtpengine's dedicated `"address family"` NG dict
+    /// key (**not** a `flags` token — rtpengine would ignore it there) and as
+    /// siphon-rtp's `address_family` JSON field.  The classic `rtpproxy` backend
+    /// has no equivalent and cannot honour it.
+    pub address_family: Option<String>,
     /// Additional flags: "trust-address", "symmetric", "asymmetric".
     pub flags: Vec<String>,
     /// Direction pair for NAT traversal: ["external", "internal"].
@@ -293,6 +315,7 @@ impl NgFlags {
             ice: config.ice.clone(),
             dtls: config.dtls.clone(),
             replace: config.replace.clone(),
+            address_family: config.address_family.clone(),
             flags: config.flags.clone(),
             direction: config.direction.clone(),
             record_call: config.record_call,
@@ -321,6 +344,12 @@ impl NgFlags {
         if !self.replace.is_empty() {
             let items: Vec<&str> = self.replace.iter().map(|s| s.as_str()).collect();
             pairs.push(("replace", BencodeValue::string_list(&items)));
+        }
+        // rtpengine reads the address family from a dedicated dict key
+        // (`"address family": "IP4"`), NOT as a token in the `flags` list — a
+        // family smuggled into `flags` is silently dropped by the engine.
+        if let Some(address_family) = &self.address_family {
+            pairs.push(("address family", BencodeValue::string(address_family)));
         }
         if !self.flags.is_empty() {
             let items: Vec<&str> = self.flags.iter().map(|s| s.as_str()).collect();
@@ -392,6 +421,7 @@ mod tests {
                     ice: Some("force".into()),
                     dtls: Some("passive".into()),
                     replace: vec!["origin".into()],
+                    address_family: None,
                     flags: vec![],
                     direction: vec!["external".into(), "internal".into()],
                     record_call: false,
@@ -402,6 +432,7 @@ mod tests {
                     ice: Some("remove".into()),
                     dtls: Some("off".into()),
                     replace: vec!["origin".into()],
+                    address_family: None,
                     flags: vec![],
                     direction: vec!["internal".into(), "external".into()],
                     record_call: false,
@@ -430,6 +461,7 @@ mod tests {
                     ice: None,
                     dtls: None,
                     replace: vec![],
+                    address_family: None,
                     flags: vec![],
                     direction: vec![],
                     record_call: false,
@@ -440,6 +472,7 @@ mod tests {
                     ice: None,
                     dtls: None,
                     replace: vec![],
+                    address_family: None,
                     flags: vec![],
                     direction: vec![],
                     record_call: false,
@@ -566,6 +599,99 @@ mod tests {
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
         assert!(keys.contains(&"record call"), "missing 'record call' key");
         assert!(keys.contains(&"recording-dir"), "missing 'recording-dir' key");
+    }
+
+    /// `address family` must ride its own NG dict key with the SDP `addrtype`
+    /// spelling.  rtpengine reads the family from that key only — a family put in
+    /// the free-form `flags` list is silently ignored by the engine, which is the
+    /// exact bug this key exists to avoid.
+    #[test]
+    fn ng_flags_emits_address_family_as_its_own_key() {
+        let flags = NgFlags {
+            address_family: Some("IP4".into()),
+            ..NgFlags::default()
+        };
+        let pairs = flags.to_bencode_pairs();
+        let (key, value) = pairs
+            .iter()
+            .find(|(key, _)| *key == "address family")
+            .expect("missing 'address family' key");
+        assert_eq!(*key, "address family");
+        assert_eq!(*value, super::super::bencode::BencodeValue::string("IP4"));
+        // Never smuggled into the flags list.
+        assert!(!pairs.iter().any(|(key, _)| *key == "flags"));
+    }
+
+    #[test]
+    fn ng_flags_omits_address_family_when_unset() {
+        let flags = NgFlags::default();
+        assert!(!flags
+            .to_bencode_pairs()
+            .iter()
+            .any(|(key, _)| *key == "address family"));
+    }
+
+    /// A profile's `address_family` must survive the YAML → `NgFlags` hop; it
+    /// previously had no `NgFlagsConfig` source at all.
+    #[test]
+    fn address_family_flows_from_config_to_flags() {
+        let mut custom = HashMap::new();
+        custom.insert(
+            "v6_access_to_v4_core".to_string(),
+            MediaProfileConfig {
+                offer: NgFlagsConfig {
+                    transport_protocol: None,
+                    ice: None,
+                    dtls: None,
+                    replace: vec!["origin".into()],
+                    address_family: Some("IP4".into()),
+                    flags: vec![],
+                    direction: vec![],
+                    record_call: false,
+                    record_path: None,
+                },
+                answer: NgFlagsConfig {
+                    transport_protocol: None,
+                    ice: None,
+                    dtls: None,
+                    replace: vec!["origin".into()],
+                    address_family: Some("IP6".into()),
+                    flags: vec![],
+                    direction: vec![],
+                    record_call: false,
+                    record_path: None,
+                },
+            },
+        );
+        let registry = ProfileRegistry::from_config(&custom);
+        let entry = registry.get("v6_access_to_v4_core").unwrap();
+        assert_eq!(entry.offer.address_family.as_deref(), Some("IP4"));
+        assert_eq!(entry.answer.address_family.as_deref(), Some("IP6"));
+        let keys: Vec<&str> = entry
+            .offer
+            .to_bencode_pairs()
+            .iter()
+            .map(|(key, _)| *key)
+            .collect();
+        assert!(keys.contains(&"address family"));
+    }
+
+    /// Built-ins must stay family-agnostic — anchoring a plain call must not
+    /// suddenly pin a relay family (that would be a silent wire change).
+    #[test]
+    fn builtin_profiles_leave_address_family_unset() {
+        let registry = ProfileRegistry::new();
+        for name in registry.profile_names() {
+            let entry = registry.get(name).unwrap();
+            assert!(
+                entry.offer.address_family.is_none(),
+                "{name} offer pins an address family"
+            );
+            assert!(
+                entry.answer.address_family.is_none(),
+                "{name} answer pins an address family"
+            );
+        }
     }
 
     #[test]
