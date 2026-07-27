@@ -6,6 +6,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-07-27
+
 ### Added
 - **`address_family` on a media profile — IPv4/IPv6 interworking on the media
   plane.** A `media.profiles.<name>.offer` / `.answer` block can now pin the

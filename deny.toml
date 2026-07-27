@@ -35,6 +35,9 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "BSL-1.0",       # Boost Software License — permissive, OSI + FSF-Free (xxhash-rust via redis)
+    "CC0-1.0",       # public-domain dedication, FSF-Free (notify — hot-reload file watcher)
+    "CDLA-Permissive-2.0",  # Linux Foundation permissive data license (webpki-roots — Mozilla CA bundle)
     "ISC",
     "Unicode-3.0",
     "Unicode-DFS-2016",
