@@ -295,11 +295,14 @@ async def _handle_200_register(request, reply):
 def handle_presence(request):
     """Forward presence requests (reg event, presence) toward the S-CSCF."""
     if request.in_dialog:
-        if request.loose_route():
-            request.record_route()
-            request.relay()
-        else:
-            request.reply(404, "Not Here")
+        # loose_route() consumes only Route entries that identify us
+        # (RFC 3261 §16.4).  A False return means the top Route belongs to
+        # another proxy, and relay() follows it (§16.6) — so forward either
+        # way.  Rejecting here would 404 a perfectly routable in-dialog
+        # request whose route set simply points somewhere else next.
+        request.loose_route()
+        request.record_route()
+        request.relay()
         return
 
     request.record_route()
@@ -321,9 +324,12 @@ async def handle_request(request):
 
     # In-dialog requests (re-INVITE, BYE, UPDATE, PRACK, etc.)
     if request.in_dialog:
-        if not request.loose_route():
-            request.reply(404, "Not Here")
-            return
+        # loose_route() consumes only Route entries that identify us
+        # (RFC 3261 §16.4).  A False return means the top Route belongs to
+        # another proxy, and relay() follows it (§16.6) — so continue either
+        # way.  Rejecting here would 404 a perfectly routable in-dialog
+        # request whose route set simply points somewhere else next.
+        request.loose_route()
 
         request.record_route()
 

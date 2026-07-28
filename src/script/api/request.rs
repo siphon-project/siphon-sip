@@ -154,6 +154,13 @@ pub struct PyRequest {
     auth_user: Option<String>,
     /// Local domains from config (for `ruri.is_local`).
     local_domains: Option<LocalDomains>,
+    /// Host/port pairs that identify this proxy for Route recognition
+    /// (RFC 3261 §16.4).  `loose_route()` matches against this rather than
+    /// `local_domains`, which answers the narrower "which SIP domains do we
+    /// serve" question and for an IP-addressed proxy legitimately contains no
+    /// IP at all.  `None` makes `loose_route()` fail closed — it cannot prove a
+    /// Route is ours, so it must not consume it.
+    self_identity: Option<Arc<crate::proxy::core::SelfIdentity>>,
     /// Transport override for Via header (set by `force_send_via`).
     via_transport_override: Option<String>,
     /// Target override for Via header (set by `force_send_via`).
@@ -210,6 +217,7 @@ impl PyRequest {
             action: RequestAction::None,
             auth_user: None,
             local_domains: None,
+            self_identity: None,
             via_transport_override: None,
             via_target_override: None,
             on_reply_callback: None,
@@ -223,7 +231,27 @@ impl PyRequest {
         }
     }
 
+    /// Attach the Route self-identity used by `loose_route()`.
+    ///
+    /// Separate from `with_local_domains` because the two answer different
+    /// questions: `local_domains` is which SIP domains we serve,
+    /// `self_identity` is which host/port pairs identify us on the wire
+    /// (RFC 3261 §16.4).  Without it `loose_route()` fails closed.
+    pub fn with_self_identity(
+        mut self,
+        self_identity: Arc<crate::proxy::core::SelfIdentity>,
+    ) -> Self {
+        self.self_identity = Some(self_identity);
+        self
+    }
+
     /// Create with local domain awareness for `ruri.is_local`.
+    ///
+    /// The served domains double as a baseline Route self-identity: for a proxy
+    /// addressed by name, a Route at one of its own domains does identify it
+    /// (RFC 3261 §16.4).  The dispatcher then overrides this with the full
+    /// identity via [`Self::with_self_identity`], which also covers the
+    /// addresses and ports a name-based list cannot express.
     pub fn with_local_domains(
         message: Arc<Mutex<SipMessage>>,
         transport_name: String,
@@ -231,6 +259,10 @@ impl PyRequest {
         source_port: u16,
         local_domains: LocalDomains,
     ) -> Self {
+        let mut identity = crate::proxy::core::SelfIdentity::new();
+        for domain in local_domains.iter() {
+            identity.add_alias(domain);
+        }
         Self {
             message,
             transport_name,
@@ -240,6 +272,7 @@ impl PyRequest {
             action: RequestAction::None,
             auth_user: None,
             local_domains: Some(local_domains),
+            self_identity: Some(Arc::new(identity)),
             via_transport_override: None,
             via_target_override: None,
             on_reply_callback: None,
@@ -950,30 +983,34 @@ impl PyRequest {
             }
 
             // Per RFC 3261 §16.4: only consume Route entries that identify
-            // *this* server.  If the top Route host doesn't match our local
-            // domains, leave it intact — relay() will forward to it.
-            if let Some(ref domains) = self.local_domains {
-                let top_is_local = crate::proxy::core::top_route_is_local(
-                    &message.headers, domains,
-                );
-                if !top_is_local {
-                    return Ok(false);
-                }
+            // *this* server.  If the top Route isn't ours, leave it intact —
+            // relay() will forward to it.
+            //
+            // Matched against `self_identity` (every listener, advertised host
+            // and stamping fallback, with the ports we serve), NOT the
+            // served-domain list: we Record-Route ourselves with the advertised
+            // host, which an IP-addressed deployment has no reason to also list
+            // under `domain.local`.
+            //
+            // No identity at all means we cannot prove the Route is ours, so we
+            // must not consume it.  Failing closed here leaves the Route for
+            // relay() (a routing decision the script can still see and act on)
+            // instead of silently stripping a hop, which is what popping
+            // unconditionally used to do.
+            let Some(identity) = self.self_identity.as_ref() else {
+                return Ok(false);
+            };
+            if !crate::proxy::core::top_route_is_local(&message.headers, identity) {
+                return Ok(false);
             }
 
-            // Pop the first (topmost) Route — it was addressed to us.
-            if let Some(entry) = crate::proxy::core::pop_top_route(&mut message.headers) {
-                popped.push(entry.uri.to_string());
-            }
-
-            // Pop any additional Routes that also point to us (double
-            // Record-Route from transport bridging).
-            if let Some(ref domains) = self.local_domains {
-                let extra = crate::proxy::core::pop_local_routes(
-                    &mut message.headers, domains,
-                );
-                popped.extend(extra.into_iter().map(|entry| entry.uri.to_string()));
-            }
+            // Pop the first (topmost) Route — it was addressed to us — plus any
+            // that follow it and also point to us (double Record-Route from
+            // transport bridging).  Same function the 2xx ACK path uses, so the
+            // two in-dialog paths cannot disagree about one dialog's route set.
+            let consumed =
+                crate::proxy::core::consume_self_routes(&mut message.headers, identity);
+            popped.extend(consumed.into_iter().map(|entry| entry.uri.to_string()));
         }
         self.consumed_routes.extend(popped);
         Ok(true)
@@ -2117,6 +2154,168 @@ mod tests {
             assert!(msg.headers.get("Route").is_some());
         }
         assert!(request.consumed_routes().unwrap().is_empty());
+    }
+
+    /// Build an in-dialog BYE carrying `route` as its only Route header.
+    fn bye_with_route(route: &str) -> SipMessage {
+        SipMessage {
+            start_line: StartLine::Request(RequestLine {
+                method: Method::Bye,
+                request_uri: crate::sip::uri::SipUri::new("192.0.2.5".to_string()),
+                version: Version::sip_2_0(),
+            }),
+            headers: {
+                let mut headers = SipHeaders::new();
+                headers.add("Via", "SIP/2.0/UDP 192.0.2.4:5060;branch=z9hG4bK-1".into());
+                headers.add("Route", route.into());
+                headers
+            },
+            body: vec![],
+        }
+    }
+
+    /// A `PyRequest` over an in-dialog BYE carrying `route`, for a proxy
+    /// reachable at `hosts` (each with the given ports) serving example.com.
+    fn bye_request(route: &str, hosts: &[(&str, &[u16])]) -> PyRequest {
+        let mut identity = crate::proxy::core::SelfIdentity::new();
+        identity.add_alias("example.com");
+        for (host, ports) in hosts {
+            identity.add_host(host, ports);
+        }
+        PyRequest::with_local_domains(
+            Arc::new(Mutex::new(bye_with_route(route))),
+            "udp".to_string(),
+            "192.0.2.4".to_string(),
+            5060,
+            Arc::new(vec!["example.com".to_string()]),
+        )
+        .with_self_identity(Arc::new(identity))
+    }
+
+    fn route_header(request: &PyRequest) -> Option<String> {
+        let msg_arc = request.message();
+        let msg = msg_arc.lock().unwrap();
+        msg.headers.get("Route").cloned()
+    }
+
+    #[test]
+    fn loose_route_consumes_own_record_route_when_domain_local_has_no_ip() {
+        // Regression: a proxy addressed by IP Record-Routes itself with its
+        // advertised/bind address, and the UA echoes that exact URI back on the
+        // in-dialog BYE. `domain.local` holds served SIP domains and has no
+        // reason to list the IP, so matching against it alone made the proxy
+        // refuse its own Record-Route — the shipped scripts then answer 404.
+        let mut request = bye_request(
+            "<sip:192.0.2.40:5060;transport=udp;lr>",
+            &[("192.0.2.40", &[5060])],
+        );
+        assert!(
+            request.loose_route().unwrap(),
+            "must recognise the Record-Route it inserted itself"
+        );
+        assert!(route_header(&request).is_none(), "self-Route must be consumed");
+        assert_eq!(request.consumed_routes().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn loose_route_consumes_ipv6_record_route_of_a_second_listener() {
+        // The dual-stack Gm shape: the v6 listener is not the first UDP entry,
+        // so an identity built from the first-per-transport maps misses the host
+        // stamped toward every v6 UE. Route hosts arrive bracketed.
+        let mut request = bye_request(
+            "<sip:[2001:db8:ac10::10]:5064;transport=udp;lr>",
+            &[("192.0.2.40", &[5060]), ("2001:db8:ac10::10", &[5064, 5066])],
+        );
+        assert!(
+            request.loose_route().unwrap(),
+            "the v6 listener's Record-Route must be recognised"
+        );
+        assert!(route_header(&request).is_none());
+    }
+
+    #[test]
+    fn loose_route_still_rejects_foreign_route() {
+        // Widening the match must not make us consume someone else's Route
+        // (RFC 3261 §16.4) — relay() has to be able to follow it.
+        let mut request =
+            bye_request("<sip:scscf.example.net;lr>", &[("192.0.2.40", &[5060])]);
+        assert!(!request.loose_route().unwrap());
+        assert!(route_header(&request).is_some());
+        assert!(request.consumed_routes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn loose_route_rejects_co_located_proxy_on_our_address() {
+        // Same IP, a port we do not serve — a different proxy.
+        let mut request =
+            bye_request("<sip:192.0.2.40:6060;lr>", &[("192.0.2.40", &[5060])]);
+        assert!(!request.loose_route().unwrap());
+        assert!(route_header(&request).is_some());
+    }
+
+    #[test]
+    fn loose_route_fails_closed_without_an_identity() {
+        // A PyRequest built without self-identity cannot prove the Route is
+        // ours, so it must not consume it. Popping unconditionally here was the
+        // §16.4 violation reachable from the on_reply/on_failure handler paths.
+        let mut request = PyRequest::new(
+            Arc::new(Mutex::new(bye_with_route("<sip:192.0.2.40:5060;lr>"))),
+            "udp".to_string(),
+            "192.0.2.4".to_string(),
+            5060,
+        );
+        assert!(!request.loose_route().unwrap());
+        assert!(
+            route_header(&request).is_some(),
+            "must not strip a hop it cannot attribute to itself"
+        );
+        assert!(request.consumed_routes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn loose_route_consumes_both_self_routes_of_a_bridged_dialog() {
+        // Transport bridging Record-Routes twice (TLS listener + UDP listener).
+        // Both must go, or our own second Route becomes the apparent next hop.
+        let mut request = bye_request(
+            "<sip:sip.example.com:5061;transport=tls;lr>, \
+             <sip:192.0.2.40:5060;transport=udp;lr>",
+            &[("sip.example.com", &[5060, 5061]), ("192.0.2.40", &[5060, 5061])],
+        );
+        assert!(request.loose_route().unwrap());
+        assert!(route_header(&request).is_none());
+        assert_eq!(request.consumed_routes().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn loose_route_stops_at_a_co_located_proxy_after_consuming_ours() {
+        // Ours first, then a co-located proxy's own Route: consume exactly one.
+        let mut request = bye_request(
+            "<sip:192.0.2.40:5060;lr>, <sip:192.0.2.40:6060;lr>",
+            &[("192.0.2.40", &[5060])],
+        );
+        assert!(request.loose_route().unwrap());
+        assert_eq!(
+            route_header(&request).as_deref(),
+            Some("<sip:192.0.2.40:6060;lr>"),
+            "the co-located proxy must remain the next hop",
+        );
+        assert_eq!(request.consumed_routes().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn loose_route_preserves_consumed_route_user_for_path_token_routing() {
+        // Path-token MT routing (RFC 3327 §5): the token rides in the userpart
+        // of the Route we stamped via add_pcscf_path, and the script reads it
+        // back off consumed_route_user after loose_route().
+        let mut request = bye_request(
+            "<sip:tok-abc123@pcscf.example.com;lr>",
+            &[("pcscf.example.com", &[5060])],
+        );
+        assert!(request.loose_route().unwrap());
+        assert_eq!(
+            request.consumed_route_user().unwrap().as_deref(),
+            Some("tok-abc123"),
+        );
     }
 
     #[test]

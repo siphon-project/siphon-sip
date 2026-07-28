@@ -82,6 +82,12 @@ struct DispatcherState {
     engine: Arc<ScriptEngine>,
     outbound: Arc<OutboundRouter>,
     local_domains: LocalDomains,
+    /// Host/port pairs that identify *this* proxy for Route recognition
+    /// (RFC 3261 §16.4 "indicates this proxy") — every listener, advertised
+    /// host, and stamping fallback, i.e. exactly what we put into Record-Route.
+    /// Distinct from `local_domains`, which answers the different question of
+    /// which SIP domains we *serve* (`ruri.is_local`, Rf/Ro charging role).
+    self_identity: Arc<core::SelfIdentity>,
     local_addr: SocketAddr,
     /// Per-transport advertised host (hostname or IP) for Record-Route/Via.
     /// Configured via `listen: { tls: [{ address: ..., advertise: "..." }] }`.
@@ -618,10 +624,28 @@ pub async fn run(
     let call_actors = Arc::new(CallActorStore::new());
     crate::b2bua::actor::set_global_call_store(Arc::clone(&call_actors));
 
+    let self_identity = Arc::new(build_self_identity(
+        &config.domain.local,
+        config
+            .ipsec
+            .as_ref()
+            .map(|ipsec| (ipsec.pcscf_port_c, ipsec.pcscf_port_s)),
+        config
+            .ipsec
+            .as_ref()
+            .and_then(|ipsec| ipsec.path_host.as_deref()),
+        &listener_registry,
+        &merged_advertised,
+        &listen_addrs,
+        via_addr,
+    ));
+    debug!(entries = ?self_identity.entries(), "route self-identity");
+
     let state = Arc::new(DispatcherState {
         engine,
         outbound,
         local_domains: Arc::new(config.domain.local.clone()),
+        self_identity,
         local_addr: via_addr,
         advertised_addrs: merged_advertised,
         listen_addrs,
@@ -2761,7 +2785,8 @@ fn handle_request(
         inbound.remote_addr.ip().to_string(),
         inbound.remote_addr.port(),
         Arc::clone(&state.local_domains),
-    );
+    )
+    .with_self_identity(Arc::clone(&state.self_identity));
     // Tag the request with its arrival local port so `is_ipsec_protected`
     // / `matched_sa` can resolve when running as P-CSCF (3GPP TS 33.203).
     request.set_local_port(inbound.local_addr.port());
@@ -4389,12 +4414,14 @@ fn handle_response(
                         }
                     };
                     let py_req = {
-                        let mut req = PyRequest::new(
+                        let mut req = PyRequest::with_local_domains(
                             Arc::clone(&req_arc),
                             transport.to_string(),
                             source_addr.ip().to_string(),
                             source_addr.port(),
-                        );
+                            Arc::clone(&state.local_domains),
+                        )
+                        .with_self_identity(Arc::clone(&state.self_identity));
                         // Replay the inbound flow capture so
                         // registrar.save(flow_token=…) /
                         // request.relay(flow=…) called from the
@@ -4561,12 +4588,14 @@ fn handle_response(
                             let response_arc = Arc::new(std::sync::Mutex::new(best_response));
                             let reply = PyReply::new(Arc::clone(&response_arc));
                             let request_arc = Arc::new(std::sync::Mutex::new(original_request));
-                            let mut py_request = PyRequest::new(
+                            let mut py_request = PyRequest::with_local_domains(
                                 request_arc,
                                 transport.to_string(),
                                 source_addr.ip().to_string(),
                                 source_addr.port(),
-                            );
+                                Arc::clone(&state.local_domains),
+                            )
+                            .with_self_identity(Arc::clone(&state.self_identity));
                             // Replay the inbound flow capture so the
                             // failure handler can do Path-token MT
                             // routing (`registrar.lookup_by_token` +
@@ -4795,12 +4824,14 @@ fn run_reply_handlers(
 
     // Build a PyRequest from the original request so scripts get (request, reply)
     let request_arc = Arc::new(std::sync::Mutex::new(original_request));
-    let mut py_request_obj = PyRequest::new(
+    let mut py_request_obj = PyRequest::with_local_domains(
         request_arc,
         transport.to_string(),
         source_addr.ip().to_string(),
         source_addr.port(),
-    );
+        Arc::clone(&state.local_domains),
+    )
+    .with_self_identity(Arc::clone(&state.self_identity));
     // Replay the inbound flow capture so `@proxy.on_reply` handlers
     // that call `registrar.save(flow_token=…)` /
     // `registrar.save_proxy(flow_token=…)` see the same listener
@@ -4915,12 +4946,14 @@ fn run_proxy_cancel_handlers(
     }
 
     let request_arc = Arc::new(std::sync::Mutex::new(original_request));
-    let mut py_request_obj = PyRequest::new(
+    let mut py_request_obj = PyRequest::with_local_domains(
         request_arc,
         transport.to_string(),
         source_addr.ip().to_string(),
         source_addr.port(),
-    );
+        Arc::clone(&state.local_domains),
+    )
+    .with_self_identity(Arc::clone(&state.self_identity));
     py_request_obj.set_local_port(inbound_local_addr.port());
     py_request_obj.set_inbound_flow(inbound_local_addr, inbound_connection_id.0);
 
@@ -6310,6 +6343,116 @@ fn a_leg_advertised_port(a_leg_local_addr: Option<SocketAddr>, default_via_port:
     a_leg_local_addr
         .map(|addr| addr.port())
         .unwrap_or(default_via_port)
+}
+
+/// Build the Route self-identity (RFC 3261 §16.4) from every source that can
+/// end up stamped into a Record-Route or Path.
+///
+/// This deliberately walks `listener_registry` rather than `listen_addrs` /
+/// `advertised_addrs`: those two are `entry().or_insert()` maps and so keep only
+/// the **first listener per transport** (see `is_own_address`, which already
+/// consults the registry for exactly this reason).  A dual-stack P-CSCF's IPv6
+/// listener is not the first UDP entry, so a set built from the collapsed maps
+/// misses the host it stamps toward every v6 UE — the in-dialog request then
+/// fails to match and the 404 this whole mechanism exists to prevent comes back.
+///
+/// Every case in [`resolve_advertised_host`] has to be represented here, since
+/// that function is what produces `via_host`:
+///   1. per-listener `advertise`             → registry entries
+///   2. transport-level advertised host      → `advertised_addrs`
+///   3. the concrete bound IP                → registry entries
+///   4. wildcard fallbacks                   → routable local IP, then loopback
+///
+/// Ports come from the listeners we actually bind, plus the IPsec protected
+/// ports (`pcscf_port_c`/`pcscf_port_s`), which a P-CSCF stamps in place of the
+/// listen port.  Anything host-only (`domain.local`, `ipsec.path_host`) is added
+/// as an any-port alias.
+fn build_self_identity(
+    domain_local: &[String],
+    ipsec_ports: Option<(u16, u16)>,
+    path_host: Option<&str>,
+    listener_registry: &crate::transport::ListenerRegistry,
+    advertised_addrs: &std::collections::HashMap<Transport, String>,
+    listen_addrs: &std::collections::HashMap<Transport, SocketAddr>,
+    via_addr: SocketAddr,
+) -> core::SelfIdentity {
+    let mut identity = core::SelfIdentity::new();
+
+    // The ports we answer on. A Route at one of our hosts but on a port outside
+    // this set belongs to a different proxy co-located on the same address.
+    let mut ports: Vec<u16> = Vec::new();
+    let add_port = |ports: &mut Vec<u16>, port: u16| {
+        if port != 0 && !ports.contains(&port) {
+            ports.push(port);
+        }
+    };
+    for (_, addr, _) in listener_registry.entries() {
+        add_port(&mut ports, addr.port());
+    }
+    for addr in listen_addrs.values() {
+        add_port(&mut ports, addr.port());
+    }
+    add_port(&mut ports, via_addr.port());
+    if let Some((port_c, port_s)) = ipsec_ports {
+        // TS 33.203 §7.1: the protected ports a P-CSCF Record-Routes with.
+        add_port(&mut ports, port_c);
+        add_port(&mut ports, port_s);
+    }
+
+    // 1 + 3: every configured listener — its advertise name and its bound IP.
+    for (_, addr, advertise) in listener_registry.entries() {
+        if let Some(ref advertise) = advertise {
+            identity.add_host(advertise, &ports);
+        }
+        if !addr.ip().is_unspecified() {
+            identity.add_host(&addr.ip().to_string(), &ports);
+        }
+    }
+
+    // 2: transport-level advertised hosts (global `advertised_address` and any
+    //    per-transport `advertise`), which step 2 hands to same-family sockets.
+    for host in advertised_addrs.values() {
+        identity.add_host(host, &ports);
+    }
+
+    // The resolved via address, and the raw bind IP the double-Record-Route
+    // branch falls back to as `internal_host`.
+    if !via_addr.ip().is_unspecified() {
+        identity.add_host(&via_addr.ip().to_string(), &ports);
+    }
+
+    // 4: the wildcard-bind fallbacks. Reached only when a listener is bound to
+    //    0.0.0.0 / [::] with no advertise, but then it is what we stamp.
+    let wildcard_bound = listener_registry
+        .entries()
+        .iter()
+        .any(|(_, addr, _)| addr.ip().is_unspecified())
+        || via_addr.ip().is_unspecified();
+    if wildcard_bound {
+        for ipv6 in [false, true] {
+            if let Some(ip) = cached_routable_local_ip(ipv6) {
+                identity.add_host(&ip.to_string(), &ports);
+            }
+        }
+        identity.add_host(&std::net::Ipv4Addr::LOCALHOST.to_string(), &ports);
+        identity.add_host(&std::net::Ipv6Addr::LOCALHOST.to_string(), &ports);
+    }
+
+    // Operator-declared aliases — no port information, so any port matches.
+    // `domain.local` stays purely a served-domain list; including it here only
+    // preserves the deployments that worked around the old behaviour by adding
+    // their own address to it.
+    for domain in domain_local {
+        identity.add_alias(domain);
+    }
+    // `add_pcscf_path` stamps `ipsec.path_host` into Path; it returns as the top
+    // Route on MT requests, where the documented flow is loose_route() +
+    // consumed_route_user (RFC 3327 §5 / TS 24.229 §5.2.7.2).
+    if let Some(path_host) = path_host {
+        identity.add_alias(path_host);
+    }
+
+    identity
 }
 
 /// Resolve the family-matched host to advertise to the A-leg, given the socket
@@ -8752,20 +8895,24 @@ fn handle_ack_via_session(
 
             // Consume our own Route entries (loose routing — RFC 3261 §16.4 /
             // §16.12), mirroring the script-side loose_route() that the
-            // in-dialog BYE/UPDATE path uses. Pop the top Route, then any
-            // additional Routes that also point to us — a doubly-Record-Routed
-            // dialog (transport bridging, e.g. an IMS P-CSCF/S-CSCF spanning
-            // UDP and TCP) leaves two consecutive self-Routes, and consuming
-            // only the top would leave our own second Route as the apparent
-            // next hop (a routing loop). `pop_local_routes` matches the same
-            // `local_domains` loose_route() does, so the ACK consumes exactly
-            // the self-Routes the BYE on this dialog already consumes.
-            if core::check_loose_route(&ack_downstream.headers) {
-                core::pop_top_route(&mut ack_downstream.headers);
-                if !state.local_domains.is_empty() {
-                    core::pop_local_routes(&mut ack_downstream.headers, &state.local_domains);
-                }
-            }
+            // in-dialog BYE/UPDATE path uses. A doubly-Record-Routed dialog
+            // (transport bridging, e.g. an IMS P-CSCF/S-CSCF spanning UDP and
+            // TCP) leaves two consecutive self-Routes, and consuming only the
+            // top would leave our own second Route as the apparent next hop (a
+            // routing loop) — so pop every leading self-Route in one pass.
+            //
+            // Matching on `self_identity` is what keeps this identical to the
+            // BYE: both paths ask the same "does this Route indicate me"
+            // question about the same dialog. It also stops the ACK stripping a
+            // Route that belongs to a *downstream* proxy, which the previous
+            // unconditional `pop_top_route` did in violation of §16.4.
+            //
+            // The identity must cover every listener, not just the first per
+            // transport: an unrecognised self-Route stays on, becomes the
+            // computed next hop, and is then silently dropped by the
+            // `is_own_address` loop guard below — which *does* consult the full
+            // listener registry. That asymmetry turns a 404 into a lost ACK.
+            core::consume_self_routes(&mut ack_downstream.headers, &state.self_identity);
 
             // The 2xx ACK is end-to-end (RFC 3261 §13.2.2.4 / §17.1.1.3): it is
             // a new request routed by the *dialog route set*, NOT retraced along
@@ -18708,6 +18855,15 @@ mod tests {
         assert_eq!(next_hop, Some(ruri.to_string()));
     }
 
+    /// Identity for the ACK route-set tests: hosts with the ports we serve.
+    fn ack_identity(hosts: &[(&str, &[u16])]) -> core::SelfIdentity {
+        let mut identity = core::SelfIdentity::new();
+        for (host, ports) in hosts {
+            identity.add_host(host, ports);
+        }
+        identity
+    }
+
     #[test]
     fn ack_2xx_follows_route_set_after_popping_self() {
         // Field regression (siphon as S-CSCF): the 2xx ACK arrives with a route
@@ -18720,9 +18876,9 @@ mod tests {
             "<sip:172.16.0.121:6060;lr>, <sip:172.16.0.101:5060;transport=udp;lr>",
         ));
 
-        // Mirror handle_ack_via_session: pop our own (top) Route entry.
-        assert!(core::check_loose_route(&ack.headers));
-        core::pop_top_route(&mut ack.headers);
+        // Mirror handle_ack_via_session: consume our own leading Route entries.
+        let identity = ack_identity(&[("172.16.0.121", &[6060])]);
+        core::consume_self_routes(&mut ack.headers, &identity);
 
         let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("next hop");
         let parsed = parse_uri_standalone(&next_hop).unwrap();
@@ -18745,7 +18901,7 @@ mod tests {
         // the apparent next hop — a routing loop. The ACK must consume both
         // self-Routes (via pop_local_routes) and forward to the P-CSCF, exactly
         // as loose_route() does for the in-dialog BYE on this dialog.
-        let local_domains = vec!["172.16.0.121".to_string()];
+        let identity = ack_identity(&[("172.16.0.121", &[6060])]);
         let mut ack = ack_request_with_route(Some(
             "<sip:172.16.0.121:6060;transport=tcp;lr>, \
              <sip:172.16.0.121:6060;transport=udp;lr>, \
@@ -18753,9 +18909,7 @@ mod tests {
         ));
 
         // Mirror handle_ack_via_session's route consumption.
-        assert!(core::check_loose_route(&ack.headers));
-        core::pop_top_route(&mut ack.headers);
-        core::pop_local_routes(&mut ack.headers, &local_domains);
+        core::consume_self_routes(&mut ack.headers, &identity);
 
         let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("next hop");
         let parsed = parse_uri_standalone(&next_hop).unwrap();
@@ -18764,6 +18918,218 @@ mod tests {
             "ACK must skip our own double Record-Route and follow the route set",
         );
         assert_eq!(parsed.port, Some(5060));
+    }
+
+    #[test]
+    fn ack_2xx_does_not_consume_a_route_addressed_to_another_proxy() {
+        // RFC 3261 §16.4: only Routes that indicate *this* proxy may be
+        // removed. The ACK path used to pop the top Route unconditionally
+        // whenever it carried `;lr`, stripping a downstream proxy's own Route
+        // and sending the ACK a hop too far. It now applies the same
+        // self-identity test the in-dialog BYE does.
+        let identity = ack_identity(&[("172.16.0.121", &[6060])]);
+        let mut ack = ack_request_with_route(Some(
+            "<sip:172.16.0.101:5060;transport=udp;lr>, \
+             <sip:172.16.0.199:5060;transport=udp;lr>",
+        ));
+
+        let popped = core::consume_self_routes(&mut ack.headers, &identity);
+        assert!(popped.is_empty(), "no leading Route identifies this proxy");
+
+        let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("next hop");
+        let parsed = parse_uri_standalone(&next_hop).unwrap();
+        assert_eq!(
+            parsed.host, "172.16.0.101",
+            "ACK must still go to the first Route, not past it",
+        );
+    }
+
+    #[test]
+    fn ack_2xx_consumes_self_route_stamped_from_advertised_host() {
+        // Same regression the in-dialog BYE hit: the Record-Route we stamp
+        // carries our advertised/bind address, which `domain.local` need not
+        // list. The ACK resolves self-identity from the same widened set, so
+        // both in-dialog paths agree about the same dialog's route set.
+        let identity = ack_identity(&[("172.16.0.121", &[6060])]);
+        let mut ack = ack_request_with_route(Some(
+            "<sip:172.16.0.121:6060;transport=udp;lr>, \
+             <sip:172.16.0.101:5060;transport=udp;lr>",
+        ));
+
+        let popped = core::consume_self_routes(&mut ack.headers, &identity);
+        assert_eq!(popped.len(), 1);
+
+        let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("next hop");
+        let parsed = parse_uri_standalone(&next_hop).unwrap();
+        assert_eq!(parsed.host, "172.16.0.101");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_self_identity — the wiring that F1 got wrong.
+    //
+    // The ACK/BYE tests above hand-build their identity, so they prove the
+    // *matching* is right while saying nothing about whether the dispatcher
+    // assembles the identity correctly. These drive the real builder.
+    // -----------------------------------------------------------------------
+
+    /// Build an identity the way the dispatcher does, from a listener list.
+    ///
+    /// Deliberately reproduces server.rs's first-per-transport `or_insert`
+    /// collapse into `listen_addrs` / `advertised_addrs`, so these tests run
+    /// against the same asymmetry the real wiring has — that collapse is what
+    /// F1 was.
+    fn identity_from(
+        listeners: &[(Transport, &str, Option<&str>)],
+        domain_local: &[&str],
+        ipsec_ports: Option<(u16, u16)>,
+        path_host: Option<&str>,
+    ) -> core::SelfIdentity {
+        let entries: Vec<(Transport, SocketAddr, Option<String>)> = listeners
+            .iter()
+            .map(|(transport, addr, advertise)| {
+                (
+                    *transport,
+                    addr.parse().expect("test listener address"),
+                    advertise.map(str::to_string),
+                )
+            })
+            .collect();
+        let registry = crate::transport::ListenerRegistry::from_entries(entries.clone());
+
+        let mut listen_addrs: std::collections::HashMap<Transport, SocketAddr> =
+            std::collections::HashMap::new();
+        let mut advertised: std::collections::HashMap<Transport, String> =
+            std::collections::HashMap::new();
+        for (transport, addr, advertise) in &entries {
+            listen_addrs.entry(*transport).or_insert(*addr);
+            if let Some(advertise) = advertise {
+                advertised.entry(*transport).or_insert_with(|| advertise.clone());
+            }
+        }
+
+        let via_addr = entries
+            .first()
+            .map(|(_, addr, _)| *addr)
+            .unwrap_or_else(|| "127.0.0.1:5060".parse().expect("loopback"));
+        let domains: Vec<String> = domain_local.iter().map(|d| d.to_string()).collect();
+
+        build_self_identity(
+            &domains,
+            ipsec_ports,
+            path_host,
+            &registry,
+            &advertised,
+            &listen_addrs,
+            via_addr,
+        )
+    }
+
+    fn identity_for(
+        listeners: &[(Transport, &str, Option<&str>)],
+        domain_local: &[&str],
+    ) -> core::SelfIdentity {
+        identity_from(listeners, domain_local, None, None)
+    }
+
+    #[test]
+    fn build_self_identity_covers_a_second_listener_of_the_same_transport() {
+        // F1 regression. `listen_addrs`/`advertised_addrs` keep only the first
+        // listener per transport, so a dual-stack Gm P-CSCF's IPv6 listener is
+        // invisible to them. Building from those maps meant the v6 UE's
+        // in-dialog request did not match the Record-Route we stamped at it.
+        let identity = identity_for(
+            &[
+                (Transport::Udp, "192.0.2.40:5060", None),
+                (Transport::Udp, "[2001:db8:ac10::10]:5064", None),
+            ],
+            &["ims.example.com"],
+        );
+        assert!(
+            identity.matches("2001:db8:ac10::10", Some(5064)),
+            "second (v6) UDP listener must identify us: {:?}",
+            identity.entries(),
+        );
+        // And bracketed, which is how it comes back on the wire.
+        assert!(identity.matches("[2001:db8:ac10::10]", Some(5064)));
+    }
+
+    #[test]
+    fn build_self_identity_covers_a_second_listeners_advertise_name() {
+        // A per-listener `advertise` on anything but the first listener of a
+        // transport never reaches `advertised_addrs` either.
+        let identity = identity_for(
+            &[
+                (Transport::Tls, "192.0.2.40:5061", Some("sip.example.com")),
+                (Transport::Tls, "192.0.2.41:5081", Some("alt.example.com")),
+            ],
+            &[],
+        );
+        assert!(identity.matches("alt.example.com", Some(5081)));
+        assert!(identity.matches("192.0.2.41", Some(5081)));
+    }
+
+    #[test]
+    fn build_self_identity_rejects_a_foreign_port_on_our_own_address() {
+        // F3: a co-located proxy sharing our IP on its own port is not us.
+        let identity = identity_for(&[(Transport::Udp, "192.0.2.40:5060", None)], &[]);
+        assert!(identity.matches("192.0.2.40", Some(5060)));
+        assert!(!identity.matches("192.0.2.40", Some(6060)));
+    }
+
+    #[test]
+    fn build_self_identity_includes_ipsec_protected_ports() {
+        // A P-CSCF Record-Routes with pcscf_port_c/pcscf_port_s, which need not
+        // be listener ports (TS 33.203 §7.1).
+        let identity = identity_from(
+            &[(Transport::Udp, "192.0.2.40:5060", None)],
+            &[],
+            Some((5064, 5066)),
+            None,
+        );
+        assert!(identity.matches("192.0.2.40", Some(5064)));
+        assert!(identity.matches("192.0.2.40", Some(5066)));
+        // Still not a free-for-all on our address.
+        assert!(!identity.matches("192.0.2.40", Some(6060)));
+    }
+
+    #[test]
+    fn build_self_identity_adds_path_host_as_an_any_port_alias() {
+        // add_pcscf_path stamps ipsec.path_host into Path with no port; it comes
+        // back as the top Route on MT requests (RFC 3327 §5).
+        let identity = identity_from(
+            &[(Transport::Udp, "192.0.2.40:5060", None)],
+            &[],
+            Some((5064, 5066)),
+            Some("pcscf.example.com"),
+        );
+        assert!(identity.matches("pcscf.example.com", None));
+        assert!(identity.matches("pcscf.example.com", Some(5060)));
+    }
+
+    #[test]
+    fn build_self_identity_keeps_domain_local_as_an_any_port_alias() {
+        // Deployments that worked around the old behaviour by listing their own
+        // address under `domain.local` must keep working, on any port.
+        let identity = identity_for(
+            &[(Transport::Udp, "192.0.2.40:5060", None)],
+            &["example.com", "192.0.2.99"],
+        );
+        assert!(identity.matches("example.com", Some(12345)));
+        assert!(identity.matches("192.0.2.99", Some(12345)));
+    }
+
+    #[test]
+    fn build_self_identity_skips_wildcard_binds_but_keeps_the_fallbacks() {
+        // A wildcard bind identifies no host, so 0.0.0.0 itself is never a
+        // match — but `resolve_advertised_host` then stamps a routable local IP
+        // or loopback, and those must be recognised.
+        let identity = identity_for(&[(Transport::Udp, "0.0.0.0:5060", None)], &[]);
+        assert!(!identity.matches("0.0.0.0", Some(5060)));
+        assert!(
+            identity.matches("127.0.0.1", Some(5060)),
+            "loopback fallback must identify us: {:?}",
+            identity.entries(),
+        );
     }
 
     #[test]

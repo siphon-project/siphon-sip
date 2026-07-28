@@ -63,6 +63,67 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   unchanged. This was also the cause of the intermittent
   `sipp-b2bua-refer` CI failure (`while expecting '202' … received 'NOTIFY'`).
   Regression-guarded by a multi-worker UDP ordering test.
+- **A proxy addressed by IP no longer 404s every in-dialog request.** Route
+  recognition (RFC 3261 §16.4 — remove the top Route only when it "indicates
+  this proxy") matched the Route host against `domain.local` alone, but
+  Record-Route is stamped with the *advertised* host, or the bind address when a
+  transport configures none. `domain.local` is the list of SIP domains served,
+  which for a proxy reached by IP legitimately contains no IP at all, so siphon
+  would insert a Record-Route and then refuse to consume the Route the UA
+  faithfully echoed back: `request.loose_route()` returned `False` and the
+  shipped proxy scripts answered `404` to the BYE (and to every other sequential
+  request) of an otherwise healthy dialog. Self-identity is now built from every
+  listener in the transport registry plus each one's advertised host, the
+  wildcard-bind fallbacks, and the IPsec protected ports — that is, every host
+  siphon can actually stamp. `domain.local` remains purely the served-domain
+  list, still used for `ruri.is_local` and the Rf/Ro charging role, and still
+  honoured as an any-port alias so deployments that worked around this by adding
+  their own address to it need no change.
+- **Dual-stack and multi-listener deployments are covered.** The dispatcher's
+  per-transport listen/advertise maps keep only the *first* listener of each
+  transport, so a dual-stack Gm P-CSCF's IPv6 listener — and any second listener
+  with its own `advertise` — was absent from the identity. Route recognition now
+  reads the full listener registry, the same source loop detection already used.
+- **The 2xx ACK no longer strips a Route belonging to a downstream proxy, or
+  drops itself.** The ACK path popped the top Route whenever it carried `;lr`
+  without checking the Route identified siphon, sending the ACK one hop too far
+  past an intervening loose router (RFC 3261 §16.4). Both in-dialog paths now
+  share one route-consumption routine, so they cannot disagree about the same
+  dialog's route set. This also closes a way for the ACK to be lost outright: an
+  unrecognised self-Route became the computed next hop, which the loop guard
+  then correctly identified as siphon and silently discarded.
+- **A Route at one of siphon's own addresses on a port it does not serve is no
+  longer consumed.** Matching ignored ports, so a proxy co-located on the same
+  address (an S-CSCF on `:6060` beside a P-CSCF on `:5060`) had its Route
+  stripped too, bypassing it entirely. Matching is now port-aware against the
+  ports siphon binds, including the IPsec protected ports.
+- **The shipped scripts no longer reject an in-dialog request routed via another
+  proxy.** `scripts/proxy_default.py` and ten example scripts answered
+  `404 Not Here` whenever `request.loose_route()` returned `False`, but a `False`
+  return means the top Route belongs to somebody else and `relay()` should follow
+  it (RFC 3261 §16.6) — the documented contract, and what the method's own
+  docstring says. So a siphon sitting in front of another loose router (a
+  P-CSCF ahead of an S-CSCF, an edge proxy ahead of an AS) rejected mid-dialog
+  requests it should have forwarded. All twelve sites now loose-route and
+  forward unconditionally; the only remaining `404` is `registrar_proxy.py`'s
+  genuine "no contacts registered" case.
+- **`request.loose_route()` fails closed.** On the `@proxy.on_reply` /
+  `on_failure` / `on_cancel` handler paths the request carried no self-identity
+  at all, and `loose_route()` popped any `;lr` Route unconditionally — the same
+  §16.4 violation, reachable from the documented failure-retry pattern. Those
+  requests now carry the full identity, and a request without one declines to
+  consume rather than stripping a hop it cannot attribute to itself.
+
+### Changed
+- **Bump the `siphon-bin` SMPP extension to siphon-smpp v1.3.1**, which picks up
+  `smpp34` 1.2.1's lost-response fix: both writer tasks registered a request's
+  pending-response entry only *after* the socket write returned, and the read
+  loop drops any response it has no entry for, so a response landing in that gap
+  was discarded and the caller blocked until its 30s response timer expired —
+  the PDU was lost, not merely slow. It hit the SMSC→ESME direction too, i.e.
+  the delivery-receipt path. Also surfaces smpp34's `error!` diagnostics in the
+  load harness. Only affects builds with `--features smpp`; the plain `siphon`
+  binary is unaffected.
 
 ## [1.5.0] — 2026-07-27
 
