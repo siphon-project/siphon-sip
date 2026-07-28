@@ -183,12 +183,119 @@ pub fn pop_top_route(headers: &mut SipHeaders) -> Option<RouteEntry> {
     Some(removed)
 }
 
-/// Check if the top Route header's host matches one of the local domains.
+/// The host/port pairs that identify *this* proxy on the wire.
+///
+/// RFC 3261 §16.4 says a proxy removes the top Route only when it "indicates
+/// this proxy", and §16.6 item 4 requires the URI it puts into Record-Route to
+/// be one it "would be willing to receive requests on".  So the recogniser has
+/// to cover exactly what we *stamp* — and nothing more, or we consume a Route
+/// belonging to somebody else.
+///
+/// Two kinds of entry, because we know the port for some identities and not
+/// others:
+///
+/// * **Aliases** ([`Self::add_alias`]) — operator-declared names with no port
+///   attached (`domain.local`, `ipsec.path_host`).  Match on any port.
+/// * **Transport identities** ([`Self::add_host`]) — every listener address and
+///   advertised host, paired with the ports we actually answer on.  A Route at
+///   our host but on a port we do not serve belongs to a *different* proxy
+///   co-located on the same address, and must not be consumed.
+///
+/// Hosts are normalised (IPv6 brackets stripped, lowercased) on the way in and
+/// on the way out, so a bracketed Route host — which is what
+/// [`crate::sip::uri::format_sip_host`] stamps for v6 — matches a bare
+/// configured address and vice versa.
+#[derive(Debug, Clone, Default)]
+pub struct SelfIdentity {
+    /// `(host, ports)`.  An empty `ports` means "any port" (an alias).
+    entries: Vec<(String, Vec<u16>)>,
+}
+
+impl SelfIdentity {
+    pub fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    fn normalise(host: &str) -> String {
+        crate::sip::uri::strip_ipv6_brackets(host.trim()).to_ascii_lowercase()
+    }
+
+    /// Record a host we answer for on **any** port.
+    pub fn add_alias(&mut self, host: &str) {
+        let host = Self::normalise(host);
+        if host.is_empty() {
+            return;
+        }
+        match self.entries.iter_mut().find(|(known, _)| *known == host) {
+            // Any-port subsumes any port-scoped entry for the same host.
+            Some((_, ports)) => ports.clear(),
+            None => self.entries.push((host, Vec::new())),
+        }
+    }
+
+    /// Record a host we answer for on `ports` only.
+    pub fn add_host(&mut self, host: &str, ports: &[u16]) {
+        let host = Self::normalise(host);
+        if host.is_empty() || ports.is_empty() {
+            return;
+        }
+        match self.entries.iter_mut().find(|(known, _)| *known == host) {
+            Some((_, known_ports)) => {
+                // Already any-port — leave it alone, it is strictly wider.
+                if known_ports.is_empty() {
+                    return;
+                }
+                for port in ports {
+                    if !known_ports.contains(port) {
+                        known_ports.push(*port);
+                    }
+                }
+            }
+            None => self.entries.push((host, ports.to_vec())),
+        }
+    }
+
+    /// Whether `host`/`port` identifies this proxy.
+    ///
+    /// A Route with no explicit port matches on the host alone: RFC 3261 §19.1.2
+    /// makes the port optional, and refusing there would reintroduce the very
+    /// 404 this type exists to prevent.
+    pub fn matches(&self, host: &str, port: Option<u16>) -> bool {
+        let candidate = Self::normalise(host);
+        // Keep scanning on a host hit with a port miss — the same host can be
+        // registered more than once (a listener entry plus an alias).
+        for (known_host, ports) in &self.entries {
+            if *known_host != candidate {
+                continue;
+            }
+            if ports.is_empty() {
+                return true;
+            }
+            match port {
+                None => return true,
+                Some(port) if ports.contains(&port) => return true,
+                Some(_) => continue,
+            }
+        }
+        false
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Normalised `(host, ports)` entries, for assertions and diagnostics.
+    pub fn entries(&self) -> &[(String, Vec<u16>)] {
+        &self.entries
+    }
+}
+
+/// Check if the top Route header identifies this proxy.
 ///
 /// Per RFC 3261 §16.4, a proxy must only consume Route entries that identify
-/// itself.  Returns `false` if there's no Route, no local domains, or the
-/// top Route host doesn't match.
-pub fn top_route_is_local(headers: &SipHeaders, local_domains: &[String]) -> bool {
+/// itself.  Returns `false` if there's no Route, the identity is empty, or the
+/// top Route doesn't match.
+pub fn top_route_is_local(headers: &SipHeaders, identity: &SelfIdentity) -> bool {
     let route_raw = match headers.get("Route") {
         Some(raw) => raw,
         None => return false,
@@ -197,10 +304,7 @@ pub fn top_route_is_local(headers: &SipHeaders, local_domains: &[String]) -> boo
         Ok(entries) if !entries.is_empty() => entries,
         _ => return false,
     };
-    let host = &entries[0].uri.host;
-    local_domains
-        .iter()
-        .any(|domain| domain.eq_ignore_ascii_case(host))
+    identity.matches(&entries[0].uri.host, entries[0].uri.port)
 }
 
 /// Pop all leading Route entries whose URI host matches one of the local domains.
@@ -216,7 +320,7 @@ pub fn top_route_is_local(headers: &SipHeaders, local_domains: &[String]) -> boo
 /// P-CSCF preloaded on the IMS service-route) to scripts.
 pub fn pop_local_routes(
     headers: &mut SipHeaders,
-    local_domains: &[String],
+    identity: &SelfIdentity,
 ) -> Vec<RouteEntry> {
     let mut popped = Vec::new();
     while let Some(route_raw) = headers.get("Route").cloned() {
@@ -224,11 +328,7 @@ pub fn pop_local_routes(
             Ok(entries) if !entries.is_empty() => entries,
             _ => break,
         };
-        let host = &entries[0].uri.host;
-        let is_local = local_domains
-            .iter()
-            .any(|domain| domain.eq_ignore_ascii_case(host));
-        if is_local {
+        if identity.matches(&entries[0].uri.host, entries[0].uri.port) {
             if let Some(entry) = pop_top_route(headers) {
                 popped.push(entry);
             } else {
@@ -239,6 +339,20 @@ pub fn pop_local_routes(
         }
     }
     popped
+}
+
+/// Consume every leading Route entry that identifies this proxy (RFC 3261
+/// §16.4 / §16.12), leaving the first foreign Route as the apparent next hop.
+///
+/// The single implementation of "shed our own hops from an in-dialog request",
+/// shared by the script-side `loose_route()` and the 2xx ACK path so the two can
+/// never disagree about the same dialog's route set.  A `;lr`-less top Route is
+/// strict-routed and left alone.
+pub fn consume_self_routes(headers: &mut SipHeaders, identity: &SelfIdentity) -> Vec<RouteEntry> {
+    if !check_loose_route(headers) {
+        return Vec::new();
+    }
+    pop_local_routes(headers, identity)
 }
 
 /// Return the URI of the topmost Route header, if any.
@@ -267,6 +381,256 @@ mod tests {
         headers.add("Via", "SIP/2.0/UDP client.example.com:5060;branch=z9hG4bK-c1".to_string());
         headers.add("Max-Forwards", "70".to_string());
         headers
+    }
+
+    fn route_headers(value: &str) -> SipHeaders {
+        let mut headers = SipHeaders::new();
+        headers.add("Route", value.to_string());
+        headers
+    }
+
+    // -----------------------------------------------------------------------
+    // Route self-identity (RFC 3261 §16.4 "indicates this proxy")
+    // -----------------------------------------------------------------------
+
+    /// Host-only identity (any port), matching what a bare list of local
+    /// domains used to mean.
+    fn aliases(hosts: &[&str]) -> SelfIdentity {
+        let mut identity = SelfIdentity::new();
+        for host in hosts {
+            identity.add_alias(host);
+        }
+        identity
+    }
+
+    /// An identity for a proxy reachable at 192.0.2.40 on 5060/5061, serving
+    /// the SIP domain example.com (which, as is normal, does not list the IP).
+    fn identity() -> SelfIdentity {
+        let mut identity = SelfIdentity::new();
+        identity.add_host("192.0.2.40", &[5060, 5061]);
+        identity.add_alias("example.com");
+        identity
+    }
+
+    #[test]
+    fn identity_matches_host_on_a_served_port() {
+        assert!(identity().matches("192.0.2.40", Some(5060)));
+        assert!(identity().matches("192.0.2.40", Some(5061)));
+    }
+
+    #[test]
+    fn identity_rejects_host_on_a_port_we_do_not_serve() {
+        // A co-located proxy on the same address — not us (RFC 3261 §16.4).
+        assert!(!identity().matches("192.0.2.40", Some(6060)));
+    }
+
+    #[test]
+    fn identity_matches_portless_route_on_host_alone() {
+        // RFC 3261 §19.1.2 makes the port optional; refusing here would
+        // reintroduce the 404 this type exists to prevent.
+        assert!(identity().matches("192.0.2.40", None));
+    }
+
+    #[test]
+    fn identity_alias_matches_any_port() {
+        assert!(identity().matches("example.com", Some(9999)));
+        assert!(identity().matches("example.com", None));
+    }
+
+    #[test]
+    fn identity_rejects_unknown_host() {
+        assert!(!identity().matches("scscf.example.net", Some(5060)));
+        assert!(!identity().matches("scscf.example.net", None));
+    }
+
+    #[test]
+    fn identity_normalises_case() {
+        let mut identity = SelfIdentity::new();
+        identity.add_host("SIP.Example.COM", &[5060]);
+        assert!(identity.matches("sip.example.com", Some(5060)));
+        assert!(identity.matches("SIP.EXAMPLE.COM", Some(5060)));
+    }
+
+    #[test]
+    fn identity_matches_bracketed_ipv6_against_bare() {
+        // format_sip_host() stamps IPv6 bracketed, so that is what comes back
+        // on the Route — it must match the bare configured address either way.
+        let mut identity = SelfIdentity::new();
+        identity.add_host("2001:db8::1", &[5060]);
+        assert!(identity.matches("[2001:db8::1]", Some(5060)));
+        assert!(identity.matches("2001:db8::1", Some(5060)));
+
+        let mut bracketed = SelfIdentity::new();
+        bracketed.add_host("[2001:db8::1]", &[5060]);
+        assert!(bracketed.matches("2001:db8::1", Some(5060)));
+        assert!(bracketed.matches("[2001:db8::1]", Some(5060)));
+    }
+
+    #[test]
+    fn identity_unions_ports_for_a_repeated_host() {
+        let mut identity = SelfIdentity::new();
+        identity.add_host("192.0.2.40", &[5060]);
+        identity.add_host("192.0.2.40", &[5064, 5066]);
+        assert_eq!(identity.entries().len(), 1);
+        for port in [5060, 5064, 5066] {
+            assert!(identity.matches("192.0.2.40", Some(port)), "port {port}");
+        }
+        assert!(!identity.matches("192.0.2.40", Some(6060)));
+    }
+
+    #[test]
+    fn identity_alias_widens_a_port_scoped_host() {
+        // An operator who lists their own IP under domain.local gets any-port
+        // matching — the pre-existing workaround must keep working.
+        let mut identity = SelfIdentity::new();
+        identity.add_host("192.0.2.40", &[5060]);
+        identity.add_alias("192.0.2.40");
+        assert!(identity.matches("192.0.2.40", Some(6060)));
+    }
+
+    #[test]
+    fn identity_port_scoped_host_never_narrows_an_alias() {
+        // Reverse insertion order of the case above — any-port must win.
+        let mut identity = SelfIdentity::new();
+        identity.add_alias("192.0.2.40");
+        identity.add_host("192.0.2.40", &[5060]);
+        assert!(identity.matches("192.0.2.40", Some(6060)));
+    }
+
+    #[test]
+    fn identity_keeps_scanning_past_a_port_miss_on_a_duplicate_host() {
+        // Same host registered twice; the match must not stop at the first
+        // entry whose port set misses.
+        let mut identity = SelfIdentity::new();
+        identity.entries.push(("192.0.2.40".to_string(), vec![5060]));
+        identity.entries.push(("192.0.2.40".to_string(), vec![6060]));
+        assert!(identity.matches("192.0.2.40", Some(6060)));
+    }
+
+    #[test]
+    fn identity_ignores_empty_and_whitespace_hosts() {
+        let mut identity = SelfIdentity::new();
+        identity.add_alias("");
+        identity.add_alias("   ");
+        identity.add_host("", &[5060]);
+        assert!(identity.is_empty());
+    }
+
+    #[test]
+    fn identity_add_host_with_no_ports_is_a_noop() {
+        // Guards against silently creating an any-port entry from an empty port
+        // list, which would defeat the co-location check.
+        let mut identity = SelfIdentity::new();
+        identity.add_host("192.0.2.40", &[]);
+        assert!(identity.is_empty());
+        assert!(!identity.matches("192.0.2.40", Some(5060)));
+    }
+
+    #[test]
+    fn empty_identity_matches_nothing() {
+        let identity = SelfIdentity::new();
+        assert!(!identity.matches("192.0.2.40", Some(5060)));
+        assert!(!identity.matches("192.0.2.40", None));
+    }
+
+    #[test]
+    fn top_route_is_local_matches_advertised_host_absent_from_domain_local() {
+        // Regression: an IP-addressed proxy Record-Routes itself with its
+        // advertised address, which the operator has no reason to also list
+        // under `domain.local`. Matching only `domain.local` meant refusing to
+        // consume our own Record-Route, 404-ing every in-dialog request.
+        let headers = route_headers("<sip:192.0.2.40:5060;transport=udp;lr>");
+        assert!(top_route_is_local(&headers, &identity()));
+    }
+
+    #[test]
+    fn top_route_is_local_rejects_downstream_proxy_route() {
+        // The other half of §16.4 — a Route addressed to someone else must be
+        // left intact for the relay path to follow.
+        let headers = route_headers("<sip:scscf.example.net:5060;lr>");
+        assert!(!top_route_is_local(&headers, &identity()));
+    }
+
+    #[test]
+    fn top_route_is_local_rejects_same_host_foreign_port() {
+        // Co-located S-CSCF on our address, its own port.
+        let headers = route_headers("<sip:192.0.2.40:6060;lr>");
+        assert!(!top_route_is_local(&headers, &identity()));
+    }
+
+    #[test]
+    fn pop_local_routes_consumes_our_route_and_keeps_the_next_hop() {
+        let mut headers = route_headers(
+            "<sip:192.0.2.40:5060;transport=udp;lr>, <sip:scscf.example.net;lr>",
+        );
+        let popped = pop_local_routes(&mut headers, &identity());
+        assert_eq!(popped.len(), 1);
+        assert_eq!(popped[0].uri.host, "192.0.2.40");
+        assert_eq!(
+            next_hop_from_route(&headers).as_deref(),
+            Some("sip:scscf.example.net;lr")
+        );
+    }
+
+    #[test]
+    fn pop_local_routes_consumes_double_record_route_across_transports() {
+        // Transport bridging leaves two consecutive self-Routes (one per
+        // listener). Consuming only the top would leave our own second Route
+        // looking like the next hop — a loop.
+        let mut identity = SelfIdentity::new();
+        identity.add_host("sip.example.com", &[5060, 5061]);
+        identity.add_host("192.0.2.40", &[5060, 5061]);
+        let mut headers = route_headers(
+            "<sip:sip.example.com:5061;transport=tls;lr>, \
+             <sip:192.0.2.40:5060;transport=udp;lr>, \
+             <sip:scscf.example.net;lr>",
+        );
+        let popped = pop_local_routes(&mut headers, &identity);
+        assert_eq!(popped.len(), 2);
+        assert_eq!(
+            next_hop_from_route(&headers).as_deref(),
+            Some("sip:scscf.example.net;lr")
+        );
+    }
+
+    #[test]
+    fn pop_local_routes_leaves_foreign_route_untouched() {
+        let mut headers = route_headers("<sip:scscf.example.net;lr>");
+        let popped = pop_local_routes(&mut headers, &identity());
+        assert!(popped.is_empty());
+        assert_eq!(
+            next_hop_from_route(&headers).as_deref(),
+            Some("sip:scscf.example.net;lr")
+        );
+    }
+
+    #[test]
+    fn pop_local_routes_stops_at_a_co_located_proxy_on_our_own_address() {
+        // The F3 shape: P-CSCF :5060 and S-CSCF :6060 on one IP. Popping both
+        // would bypass the S-CSCF entirely (losing its Rf STOP).
+        let mut headers = route_headers(
+            "<sip:192.0.2.40:5060;lr>, <sip:192.0.2.40:6060;lr>, <sip:ue.example.net;lr>",
+        );
+        let popped = pop_local_routes(&mut headers, &identity());
+        assert_eq!(popped.len(), 1, "only our own Route may be consumed");
+        assert_eq!(
+            next_hop_from_route(&headers).as_deref(),
+            Some("sip:192.0.2.40:6060;lr"),
+            "the co-located proxy must remain the next hop",
+        );
+    }
+
+    #[test]
+    fn pop_local_routes_consumes_ipsec_protected_port_route() {
+        // A P-CSCF Record-Routes with its protected port (TS 33.203 §7.1),
+        // not its plain listen port.
+        let mut identity = SelfIdentity::new();
+        identity.add_host("192.0.2.40", &[5060, 5064, 5066]);
+        let mut headers =
+            route_headers("<sip:192.0.2.40:5066;transport=udp;lr>, <sip:scscf.example.net;lr>");
+        let popped = pop_local_routes(&mut headers, &identity);
+        assert_eq!(popped.len(), 1);
+        assert_eq!(popped[0].uri.port, Some(5066));
     }
 
     #[test]
@@ -525,10 +889,7 @@ mod tests {
             "<sip:proxy.example.com:5060;transport=tcp;lr>, <sip:external.example.com;lr>".to_string(),
         );
 
-        let domains = vec![
-            "proxy.example.com".to_string(),
-            "10.0.0.1".to_string(),
-        ];
+        let domains = aliases(&["proxy.example.com", "10.0.0.1"]);
         pop_local_routes(&mut headers, &domains);
 
         // The local Route should be popped, leaving only the external one
@@ -547,10 +908,7 @@ mod tests {
             "<sip:10.0.0.1:5060;transport=tcp;lr>, <sip:proxy.example.com:5061;transport=tls;lr>".to_string(),
         );
 
-        let domains = vec![
-            "proxy.example.com".to_string(),
-            "10.0.0.1".to_string(),
-        ];
+        let domains = aliases(&["proxy.example.com", "10.0.0.1"]);
         pop_local_routes(&mut headers, &domains);
 
         // Both should be popped — no Route header left
@@ -564,7 +922,7 @@ mod tests {
         headers.add("Route", "<sip:10.0.0.1:5060;transport=tcp;lr>".to_string());
         headers.add("Route", "<sip:far-end.example.com:5060;lr>".to_string());
 
-        let domains = vec!["10.0.0.1".to_string()];
+        let domains = aliases(&["10.0.0.1"]);
         pop_local_routes(&mut headers, &domains);
 
         let remaining = headers.get("Route").unwrap();
@@ -574,7 +932,7 @@ mod tests {
     #[test]
     fn pop_local_routes_no_routes() {
         let mut headers = SipHeaders::new();
-        let domains = vec!["proxy.example.com".to_string()];
+        let domains = aliases(&["proxy.example.com"]);
         // Should not panic
         pop_local_routes(&mut headers, &domains);
         assert!(!headers.has("Route"));
@@ -585,7 +943,7 @@ mod tests {
         let mut headers = SipHeaders::new();
         headers.add("Route", "<sip:PROXY.Example.COM:5060;lr>".to_string());
 
-        let domains = vec!["proxy.example.com".to_string()];
+        let domains = aliases(&["proxy.example.com"]);
         pop_local_routes(&mut headers, &domains);
         assert!(!headers.has("Route"));
     }
@@ -595,7 +953,7 @@ mod tests {
         let mut headers = SipHeaders::new();
         headers.add("Route", "<sip:external.example.com;lr>".to_string());
 
-        let domains = vec!["proxy.example.com".to_string()];
+        let domains = aliases(&["proxy.example.com"]);
         pop_local_routes(&mut headers, &domains);
 
         // Should still be there

@@ -343,6 +343,19 @@ impl ListenerRegistry {
             .any(|(_, addr)| port == addr.port() && (ip == addr.ip() || ip.is_loopback()))
     }
 
+    /// Every registered listener as `(transport, bound_addr, advertise)`.
+    ///
+    /// The authoritative view of what siphon is reachable at — unlike the
+    /// first-per-transport `listen_addrs` / `advertised_addrs` maps the
+    /// dispatcher also keeps.  Used to build the Route self-identity
+    /// (RFC 3261 §16.4), which has to cover every host we can stamp.
+    pub fn entries(&self) -> Vec<(Transport, SocketAddr, Option<String>)> {
+        self.entries
+            .iter()
+            .map(|((transport, addr), advertise)| (*transport, *addr, advertise.clone()))
+            .collect()
+    }
+
     /// Number of registered listeners (diagnostics / tests).
     pub fn len(&self) -> usize {
         self.entries.len()

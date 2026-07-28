@@ -97,21 +97,25 @@ def route(request):
     # In-dialog (sequential) requests
     # -------------------------------------------------------------------
     if request.in_dialog:
-        if request.loose_route():
-            # After loose_route(), double Record-Route entries pointing to
-            # us are already consumed.  If the R-URI still resolves to a
-            # local domain (e.g. AS put our address as Contact), do a
-            # registrar lookup rather than blindly relaying into a loop.
-            if request.ruri.is_local:
-                contacts = registrar.lookup(request.ruri)
-                if not contacts:
-                    request.reply(404, "Not Found")
-                    return
-                request.fork([c.received or c.uri for c in contacts])
-            else:
-                request.relay()
+        # loose_route() consumes only Route entries that identify us
+        # (RFC 3261 §16.4).  A False return means the top Route belongs to
+        # another proxy, and relay() follows it (§16.6) — so route either way.
+        # Rejecting here would 404 a perfectly routable in-dialog request
+        # whose route set simply points somewhere else next.
+        request.loose_route()
+
+        # Any double Record-Route entries pointing to us are now consumed.
+        # If the R-URI still resolves to a local domain (e.g. an AS put our
+        # address in Contact), do a registrar lookup rather than blindly
+        # relaying into a loop.
+        if request.ruri.is_local:
+            contacts = registrar.lookup(request.ruri)
+            if not contacts:
+                request.reply(404, "Not Found")
+                return
+            request.fork([c.received or c.uri for c in contacts])
         else:
-            request.reply(404, "Not Here")
+            request.relay()
         return
 
     # CANCEL — matched to transaction by core

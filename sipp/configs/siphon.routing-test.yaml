@@ -1,0 +1,69 @@
+# siphon.routing-test.yaml — Route self-identity test (RFC 3261 §16.4)
+#
+# Used with: sipp/docker-compose.yaml (--profile routing)
+# Script:    scripts/proxy_default.py
+#
+# Two deliberate differences from siphon.test.yaml, each reproducing a real
+# deployment shape that the standard test config accidentally papers over:
+#
+#   1. `domain.local` lists ONLY the served SIP domain — no IP address.
+#      That is what an operator actually writes: `domain.local` is the set of
+#      domains this instance serves, and a proxy reached by IP has no reason to
+#      put its own address there.  siphon.test.yaml lists 172.20.0.10 and
+#      127.0.0.1, which makes a Record-Route recognisable even when Route
+#      recognition is keyed on served domains alone — so it cannot detect a
+#      proxy that fails to identify its own Record-Route.
+#
+#   2. A SECOND udp listener, and the call is driven at it (:5070).  This
+#      exercises a non-first listener end to end — the healthcheck probes :5070,
+#      so both listeners are proven bound, and the whole dialog runs through it.
+#
+#      It does NOT, however, reach the "identity misses a second listener" case.
+#      On the plain proxy relay path siphon stamps Record-Route from the
+#      per-transport advertised host/port unless a flow pin, an IPsec source or
+#      a `send_socket=` pin is in play (see the via_host selection in
+#      dispatcher.rs), so a request arriving on :5070 is still Record-Routed
+#      with the first listener's port.  Reaching the second-listener case needs
+#      one of those paths — a dual-stack Gm P-CSCF, flow-token MT routing, or a
+#      script pinning egress — none of which this stack sets up.  Those are
+#      covered by the `build_self_identity` unit tests instead.
+#
+# What this config DOES prove, deterministically and without inspecting a single
+# header: with `domain.local` holding only the served domain, siphon still
+# recognises the Record-Route it stamped itself.  If it does not, the shipped
+# script cannot loose-route the in-dialog BYE and the UAC fails on the missing
+# 200 — which is exactly what happens when the identity is built from
+# `domain.local` alone.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+    - "0.0.0.0:5070"
+  tcp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+
+advertised_address: "172.20.0.10"
+
+script:
+  path: "scripts/proxy_default.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+log:
+  level: debug
+  format: pretty

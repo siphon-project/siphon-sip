@@ -262,6 +262,25 @@ jobs:
       - name: MTU §18.1.1 fallback tests (IPv4)
         run: scripts/mtu_test.sh v4
 
+  # ── RFC 3261 §16.4 Route self-identity ─────────────────────────────────────
+  # A proxy must consume the Record-Route it inserted itself, or every in-dialog
+  # request of a healthy dialog is refused.  The standard functional stack
+  # cannot show this: siphon.test.yaml lists the container IP and 127.0.0.1
+  # under `domain.local`, which makes a Record-Route recognisable even when
+  # Route recognition is keyed on served domains alone.  This job runs a config
+  # listing ONLY the served domain — what an operator actually writes for a
+  # proxy addressed by IP.  Deterministic and needs no capability: the UAC waits
+  # for a 200 to its in-dialog BYE, which only arrives if the self-Route was
+  # consumed and the request relayed.
+  sipp-route-selfid:
+    runs-on: ubuntu-latest
+    needs: rust-tests
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Route self-identity (in-dialog BYE must be relayed, not 404'd)
+        run: scripts/route_selfid_test.sh
+
   # IPv6 leg — manual dispatch only.  A user-defined compose network with
   # enable_ipv6 + a private ULA subnet keeps all traffic inside the bridge (no
   # host IPv6 egress needed), but docker's IPv6 bridge is not reliable on
