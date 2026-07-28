@@ -1058,6 +1058,107 @@ mod tests {
         assert!(default.1.try_recv().is_ok());
     }
 
+    /// Soft-UE shape (3GPP TS 33.203 IMS-AKA over IPsec): three UDP listeners on
+    /// one address — plain SIP toward the local peer, plus the two protected
+    /// sec-agree ports — and an MO request pinned to the protected client port.
+    ///
+    /// The pinned datagram MUST leave the protected client socket. The kernel
+    /// XFRM selector for the UE→P-CSCF SA matches only `(ue_addr, port_uc) →
+    /// (pcscf_addr, port_ps)`, so a send that falls back to the plain listener
+    /// (the first-configured one, which doubles as the default channel) goes out
+    /// unprotected and the P-CSCF never sees a valid request. The response
+    /// direction is the mirror case: it comes back on the protected client port,
+    /// which is why the Via sent-by has to name it too (see
+    /// `dispatcher::pinned_sent_by`).
+    #[test]
+    fn outbound_router_pins_a_protected_ipsec_socket_over_the_plain_default() {
+        let ue = "192.0.2.10";
+        let plain = flume::unbounded::<OutboundMessage>(); // :5060, also the default
+        let protected_client = flume::unbounded::<OutboundMessage>(); // port_uc
+        let protected_server = flume::unbounded::<OutboundMessage>(); // port_us
+        let plain_addr = addr(&format!("{ue}:5060"));
+        let port_uc = addr(&format!("{ue}:6100"));
+        let port_us = addr(&format!("{ue}:6101"));
+
+        let mut udp_by_local = std::collections::HashMap::new();
+        udp_by_local.insert(plain_addr, plain.0.clone());
+        udp_by_local.insert(port_uc, protected_client.0.clone());
+        udp_by_local.insert(port_us, protected_server.0.clone());
+
+        let (dummy, _) = flume::unbounded();
+        let router = OutboundRouter {
+            // The first configured listener's channel doubles as the default —
+            // exactly the socket a lost pin would silently fall back to.
+            udp: plain.0.clone(),
+            udp_by_local,
+            tcp: dummy.clone(),
+            tls: dummy.clone(),
+            ws: dummy.clone(),
+            wss: dummy.clone(),
+            sctp: dummy,
+        };
+
+        // MO INVITE over the SA: sourced from port_uc, addressed to the P-CSCF's
+        // protected server port.
+        let pcscf = addr("192.0.2.20:5066");
+        router
+            .send(OutboundMessage {
+                connection_id: ConnectionId(0),
+                transport: Transport::Udp,
+                destination: pcscf,
+                data: Bytes::from_static(b"INVITE"),
+                source_local_addr: Some(port_uc),
+                server_name: None,
+                followups: None,
+            })
+            .unwrap();
+
+        let sent = protected_client
+            .1
+            .try_recv()
+            .expect("MO request must egress the protected client socket");
+        assert_eq!(sent.source_local_addr, Some(port_uc));
+        assert_eq!(sent.destination, pcscf);
+        assert!(
+            plain.1.try_recv().is_err(),
+            "MO request must never fall back to the plain listener — it would leave outside the SA"
+        );
+        assert!(protected_server.1.try_recv().is_err());
+    }
+
+    /// The mirror guard: on a single-listener host there are no per-listener
+    /// channels, so a pinned message still takes the default egress. This is the
+    /// unchanged path for every non-IPsec deployment (and the branch the README
+    /// throughput baseline runs on).
+    #[test]
+    fn outbound_router_single_listener_ignores_a_pin() {
+        let default = flume::unbounded::<OutboundMessage>();
+        let (dummy, _) = flume::unbounded();
+        let router = OutboundRouter {
+            udp: default.0.clone(),
+            udp_by_local: std::collections::HashMap::new(),
+            tcp: dummy.clone(),
+            tls: dummy.clone(),
+            ws: dummy.clone(),
+            wss: dummy.clone(),
+            sctp: dummy,
+        };
+
+        router
+            .send(OutboundMessage {
+                connection_id: ConnectionId(0),
+                transport: Transport::Udp,
+                destination: addr("192.0.2.20:5060"),
+                data: Bytes::from_static(b"INVITE"),
+                source_local_addr: Some(addr("192.0.2.10:6100")),
+                server_name: None,
+                followups: None,
+            })
+            .unwrap();
+
+        assert!(default.1.try_recv().is_ok());
+    }
+
     #[test]
     fn listener_registry_resolves_only_configured_sockets() {
         let registry = ListenerRegistry::from_entries([

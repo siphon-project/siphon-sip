@@ -48,6 +48,26 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   certificate — it is not an identity signal.
 
 ### Fixed
+- **A B2BUA B-leg dialled over a captured flow advertised the wrong socket, so
+  its responses came back nowhere.** `call.dial(flow=…)` writes the B-leg INVITE
+  to the flow's own local socket, but the `Via` sent-by and `Contact` were built
+  from the default per-transport listener. The far end answers to the sent-by,
+  so the response was directed at a socket the flow does not cover — and on an
+  IPsec sec-agree leg (3GPP TS 33.203 §7.4) that means a port outside the
+  security association, where the answer is simply lost. The visible symptom was
+  an originating call that drew no response at all — not a 4xx, silence — and
+  failed with a synthetic `408` at the answer timeout. Worst on a soft-UE
+  registering into an IMS core (`registration.flow()` + `call.dial(flow=…)`,
+  `examples/ims_ue_b2bua.*`), where the INVITE leaves the protected client port
+  while the `Via` named the plain SIP listener. The proxy `relay(flow=…)` path
+  has always pinned its `Via` to the flow; the B2BUA path never did.
+
+  A flow-dialled B-leg is now anchored on the flow's socket for its whole life:
+  the INVITE's `Via` and `Contact` name it, the leg records it, and every later
+  siphon-originated request on that leg — ACK, BYE, CANCEL, auto-PRACK,
+  session-timer refresh, bridged re-INVITE/UPDATE — both leaves from it and
+  advertises it. B-legs without a flow, and every single-listener deployment, are
+  byte-for-byte unchanged.
 - **An initial NOTIFY could overtake the 2xx that accepted its subscription.**
   A script that replies to a SUBSCRIBE and then calls `subscribe_state.notify()`
   / `presence.notify()` had the reply and the NOTIFY enqueued as two independent
