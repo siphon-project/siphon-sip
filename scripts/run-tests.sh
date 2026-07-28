@@ -41,27 +41,40 @@ RUN_SECURITY=false
 RUN_WEBRTC=false
 SKIP_RUST=false
 
+# Scenario modes selected on this invocation.  Exactly one is allowed — see the
+# guard below.
+SELECTED_MODES=()
+
 for arg in "$@"; do
   case "$arg" in
-    --ipsec)      RUN_IPSEC=true ;;
-    --charging)   RUN_CHARGING=true ;;
-    --call)       RUN_CALL=true ;;
-    --presence)   RUN_PRESENCE=true ;;
-    --rtpengine)  RUN_RTPENGINE=true ;;
-    --rtpproxy)   RUN_RTPPROXY=true ;;
-    --reinvite)   RUN_REINVITE=true ;;
-    --b2bua)      RUN_B2BUA=true ;;
-    --b2bua-auth) RUN_B2BUA_AUTH=true ;;
-    --gateway)    RUN_GATEWAY=true ;;
-    --auto100)    RUN_AUTO100=true ;;
-    --http-auth)  RUN_HTTP_AUTH=true ;;
-    --wedge)      RUN_WEDGE=true ;;
-    --banscan)    RUN_BANSCAN=true ;;
-    --security)   RUN_SECURITY=true ;;
-    --webrtc)     RUN_WEBRTC=true ;;
+    --ipsec)      RUN_IPSEC=true;      SELECTED_MODES+=("$arg") ;;
+    --charging)   RUN_CHARGING=true;   SELECTED_MODES+=("$arg") ;;
+    --call)       RUN_CALL=true;       SELECTED_MODES+=("$arg") ;;
+    --presence)   RUN_PRESENCE=true;   SELECTED_MODES+=("$arg") ;;
+    --rtpengine)  RUN_RTPENGINE=true;  SELECTED_MODES+=("$arg") ;;
+    --rtpproxy)   RUN_RTPPROXY=true;   SELECTED_MODES+=("$arg") ;;
+    --reinvite)   RUN_REINVITE=true;   SELECTED_MODES+=("$arg") ;;
+    --b2bua)      RUN_B2BUA=true;      SELECTED_MODES+=("$arg") ;;
+    --b2bua-auth) RUN_B2BUA_AUTH=true; SELECTED_MODES+=("$arg") ;;
+    --gateway)    RUN_GATEWAY=true;    SELECTED_MODES+=("$arg") ;;
+    --auto100)    RUN_AUTO100=true;    SELECTED_MODES+=("$arg") ;;
+    --http-auth)  RUN_HTTP_AUTH=true;  SELECTED_MODES+=("$arg") ;;
+    --wedge)      RUN_WEDGE=true;      SELECTED_MODES+=("$arg") ;;
+    --banscan)    RUN_BANSCAN=true;    SELECTED_MODES+=("$arg") ;;
+    --security)   RUN_SECURITY=true;   SELECTED_MODES+=("$arg") ;;
+    --webrtc)     RUN_WEBRTC=true;     SELECTED_MODES+=("$arg") ;;
     --skip-rust)  SKIP_RUST=true ;;
     --help|-h)
-      echo "Usage: $0 [--ipsec] [--charging] [--call] [--presence] [--rtpengine] [--rtpproxy] [--reinvite] [--b2bua] [--b2bua-auth] [--gateway] [--auto100] [--http-auth] [--wedge] [--banscan] [--security] [--webrtc] [--skip-rust]"
+      echo "Usage: $0 [<one scenario mode>] [--skip-rust]"
+      echo
+      echo "Scenario modes (pick at most ONE per run):"
+      echo "  --ipsec --charging --call --presence --rtpengine --rtpproxy --reinvite"
+      echo "  --b2bua --b2bua-auth --gateway --auto100 --http-auth --wedge --banscan"
+      echo "  --security --webrtc"
+      echo
+      echo "  --skip-rust   skip the Rust test step (combines with any mode)"
+      echo
+      echo "With no mode, only the Rust tests run."
       exit 0
       ;;
     *)
@@ -70,6 +83,30 @@ for arg in "$@"; do
       ;;
   esac
 done
+
+# ── One scenario mode per run ───────────────────────────────────────────────
+# Each mode brings up its own long-lived service containers (siphon-*, and the
+# rtpengine/rtpproxy mocks) on FIXED host ports, and those are only torn down by
+# the EXIT trap at the end of the whole script — a mode's own teardown only
+# `rm -sf`s its sipp peers.  So a second mode in the same invocation starts while
+# the first mode's containers still hold the ports and docker fails the run with
+# "failed to set up container networking: Address already in use", partway
+# through, after the earlier mode already reported green.
+#
+# CI runs each mode as its own job for exactly this reason.  Fail fast with an
+# explanation instead of letting the collision surface as a confusing mid-run
+# docker error.
+if (( ${#SELECTED_MODES[@]} > 1 )); then
+  echo "error: pick ONE scenario mode per run (got: ${SELECTED_MODES[*]})" >&2
+  echo >&2
+  echo "Each mode binds fixed host ports and its service containers live until the" >&2
+  echo "script exits, so a second mode collides with the first (docker: 'Address" >&2
+  echo "already in use').  CI runs each mode as a separate job." >&2
+  echo >&2
+  echo "Run them in sequence instead:" >&2
+  echo "    for mode in ${SELECTED_MODES[*]}; do $0 --skip-rust \"\$mode\" || break; done" >&2
+  exit 2
+fi
 
 cleanup() {
   echo "--- Cleaning up ---"
