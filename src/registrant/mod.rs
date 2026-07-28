@@ -1332,6 +1332,7 @@ pub async fn registration_loop(
                             None
                         };
                         let outbound_message = OutboundMessage {
+                            followups: None,
                             connection_id: ConnectionId::default(),
                             transport,
                             destination,
@@ -1366,6 +1367,7 @@ pub async fn registration_loop(
                             None
                         };
                         let outbound_message = OutboundMessage {
+                            followups: None,
                             connection_id: ConnectionId::default(),
                             transport,
                             destination,

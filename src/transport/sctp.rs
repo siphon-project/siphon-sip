@@ -38,13 +38,20 @@ pub async fn listen(
                 // the `connection_map` shard guard — stalling all outbound and
                 // blocking accept's `insert` on the same shard. `try_send` sheds
                 // for a backed-up (stuck) peer instead.
-                match sender.try_send(outbound.data) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        warn!("SCTP outbound dropped: connection {:?} send buffer full (slow/stuck peer)", outbound.connection_id);
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        warn!("SCTP outbound dropped: connection {:?} closed", outbound.connection_id);
+                let connection_id = outbound.connection_id;
+                // Frames of one message keep their relative order — same
+                // per-connection channel, single distributor task.
+                for frame in outbound.into_frames() {
+                    match sender.try_send(frame) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            warn!("SCTP outbound dropped: connection {:?} send buffer full (slow/stuck peer)", connection_id);
+                            break;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            warn!("SCTP outbound dropped: connection {:?} closed", connection_id);
+                            break;
+                        }
                     }
                 }
             } else {

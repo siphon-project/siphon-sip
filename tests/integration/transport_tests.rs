@@ -94,6 +94,7 @@ async fn udp_roundtrip() {
     // Send response back through outbound channel
     outbound_tx
         .send_async(OutboundMessage {
+            followups: None,
             connection_id: inbound.connection_id,
             transport: inbound.transport,
             destination: inbound.remote_addr,
@@ -150,6 +151,7 @@ async fn tcp_roundtrip() {
     // Send response back through outbound channel (routed via connection_map)
     outbound_tx
         .send_async(OutboundMessage {
+            followups: None,
             connection_id: inbound.connection_id,
             transport: inbound.transport,
             destination: inbound.remote_addr,
@@ -300,6 +302,7 @@ async fn tcp_outbound_fallback_to_pool_when_no_connection() {
         \r\n");
     outbound_tx
         .send_async(OutboundMessage {
+            followups: None,
             connection_id: ConnectionId::default(),
             transport: Transport::Tcp,
             destination: target_addr,
@@ -448,6 +451,7 @@ async fn tls_roundtrip() {
     // Send response back
     outbound_tx
         .send_async(OutboundMessage {
+            followups: None,
             connection_id: inbound.connection_id,
             transport: inbound.transport,
             destination: inbound.remote_addr,
@@ -508,6 +512,7 @@ async fn ws_roundtrip() {
     // Send response back through outbound channel
     outbound_tx
         .send_async(OutboundMessage {
+            followups: None,
             connection_id: inbound.connection_id,
             transport: inbound.transport,
             destination: inbound.remote_addr,
@@ -581,6 +586,7 @@ async fn wss_roundtrip() {
     // Send response back
     outbound_tx
         .send_async(OutboundMessage {
+            followups: None,
             connection_id: inbound.connection_id,
             transport: inbound.transport,
             destination: inbound.remote_addr,

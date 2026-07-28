@@ -47,6 +47,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   The server name is client-supplied plaintext and is used only to pick a
   certificate — it is not an identity signal.
 
+### Fixed
+- **REFER `202 Accepted` could be overtaken by its own first NOTIFY on UDP.**
+  On a siphon-terminated transfer the B2BUA answers `202` and immediately sends
+  the `message/sipfrag` `NOTIFY (100 Trying)` that opens the implicit
+  subscription. Both were enqueued in the right order, but the UDP transport
+  does not preserve it: every UDP worker clones the same outbound receiver
+  (flume is MPMC) and owns its own `SO_REUSEPORT` socket, so the two messages
+  are routinely picked up by two workers and race to `send_to`. When the NOTIFY
+  won, a referrer saw a NOTIFY for a subscription it had not been told existed
+  yet — RFC 3515 §2.4.4 has the 202 establish it — and a strict UA is entitled
+  to reject it. The pair is now enqueued as one ordered unit that a single
+  worker writes in sequence, so nothing can interleave between them. Stream
+  transports were never affected (one distributor task per listener) and are
+  unchanged. This was also the cause of the intermittent
+  `sipp-b2bua-refer` CI failure (`while expecting '202' … received 'NOTIFY'`).
+  Regression-guarded by a multi-worker UDP ordering test.
+
 ## [1.5.0] — 2026-07-27
 
 ### Added
