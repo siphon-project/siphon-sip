@@ -7096,7 +7096,18 @@ fn send_message_from(
 
 /// Drain deferred messages queued by presence.notify() etc. during the handler
 /// and send each one via the UacSender.  Called after the reply/relay has been
-/// dispatched so ordering is preserved (RFC 3265 §3.1.6.2).
+/// dispatched, so the reply is *enqueued* first (RFC 6665 §4.1.2.3 — the
+/// notifier sends the initial NOTIFY after the 200 to the SUBSCRIBE).
+///
+/// Enqueueing first is not the same as leaving first: on UDP the workers share
+/// the outbound channel and each owns its own socket, so the deferred NOTIFY can
+/// still overtake the reply (see `OutboundMessage::followups` for the ordered-unit
+/// mechanism that does guarantee it). That is tolerable here and NOT tolerable for
+/// a REFER's 202 — RFC 6665 §4.4.1 requires a subscriber to accept a NOTIFY that
+/// arrives before the SUBSCRIBE's 200 and to treat it as creating the dialog,
+/// whereas RFC 3515 gives no such allowance for the 202. Making this ordered too
+/// means threading the reply into the flush, which is a wider change than the
+/// hazard warrants.
 fn flush_deferred_sends(_state: &DispatcherState) {
     let deferred = crate::script::api::proxy_utils::drain_deferred_sends();
     if deferred.is_empty() {
@@ -16676,7 +16687,19 @@ fn b2bua_complete_terminated_transfer(
         }
     }
 
-    // Terminating NOTIFY (sipfrag 200 OK) to the referrer on its subscription.
+    // Terminating NOTIFY (sipfrag 200 OK) and then BYE, both to the referrer.
+    //
+    // The order is load-bearing: the BYE ends the very dialog the NOTIFY is
+    // sent on. A referrer that sees the BYE first tears the dialog down and
+    // answers the late NOTIFY with 481, never learning the transfer succeeded
+    // (RFC 3515 §2.4.4; RFC 5589 §6 shows the result NOTIFY ahead of the BYE).
+    // Two separate sends do NOT order on UDP — the workers share the outbound
+    // channel and each owns its own socket — so when both target the same flow
+    // they travel as one unit (see `OutboundMessage::followups`).
+    let mut referrer_messages: Vec<SipMessage> = Vec::new();
+    let mut referrer_route: Option<(Transport, SocketAddr, ConnectionId, Option<SocketAddr>)> =
+        None;
+
     if let Some(cseq) = state.call_actors.reserve_leg_cseq(call_id, referrer_on_a_leg) {
         if let Some(referrer_leg) = state.call_actors.clone_leg(call_id, referrer_on_a_leg) {
             let extra_headers = [
@@ -16706,14 +16729,13 @@ fn b2bua_complete_terminated_transfer(
                     referrer_leg.transport.remote_addr,
                     referrer_leg.transport.transport,
                 );
-                send_message_from(
-                    notify,
+                referrer_route = Some((
                     transport,
                     dest,
                     referrer_leg.transport.connection_id,
                     referrer_leg.transport.local_addr,
-                    state,
-                );
+                ));
+                referrer_messages.push(notify);
             }
         }
     }
@@ -16731,15 +16753,43 @@ fn b2bua_complete_terminated_transfer(
                 referrer_leg.transport.remote_addr,
                 referrer_leg.transport.transport,
             );
-            send_message_from(
-                bye,
+            let route = (
                 transport,
                 dest,
                 referrer_leg.transport.connection_id,
                 referrer_leg.transport.local_addr,
-                state,
             );
+            if referrer_route == Some(route) {
+                referrer_messages.push(bye);
+            } else {
+                // Different flow than the NOTIFY took (or no NOTIFY was built):
+                // nothing to order against, so flush the NOTIFY on its own route
+                // first and send the BYE on this one.
+                if let Some((transport, dest, connection_id, local_addr)) = referrer_route.take() {
+                    send_messages_in_order_from(
+                        std::mem::take(&mut referrer_messages),
+                        transport,
+                        dest,
+                        connection_id,
+                        local_addr,
+                        state,
+                    );
+                }
+                referrer_route = Some(route);
+                referrer_messages.push(bye);
+            }
         }
+    }
+
+    if let Some((transport, dest, connection_id, local_addr)) = referrer_route {
+        send_messages_in_order_from(
+            referrer_messages,
+            transport,
+            dest,
+            connection_id,
+            local_addr,
+            state,
+        );
     }
 
     state

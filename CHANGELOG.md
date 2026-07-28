@@ -48,6 +48,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   certificate — it is not an identity signal.
 
 ### Fixed
+- **A completed transfer could BYE the referrer before telling it the transfer
+  succeeded.** At the end of a siphon-terminated REFER the B2BUA sends the
+  referrer a terminating `NOTIFY` (sipfrag `200 OK`,
+  `Subscription-State: terminated`) and then BYEs that leg. Both went out as
+  separate enqueues to the same peer, which does not order them on UDP (same
+  cause as the 202/NOTIFY inversion below). Arriving inverted, the referrer
+  tears the dialog down on the BYE and answers the late NOTIFY with `481`,
+  never learning the outcome of the transfer it requested — RFC 3515 §2.4.4
+  makes that NOTIFY the result report, and RFC 5589 §6 shows it ahead of the
+  BYE. The pair now travels as one ordered unit when both target the same flow.
 - **REFER `202 Accepted` could be overtaken by its own first NOTIFY on UDP.**
   On a siphon-terminated transfer the B2BUA answers `202` and immediately sends
   the `message/sipfrag` `NOTIFY (100 Trying)` that opens the implicit
