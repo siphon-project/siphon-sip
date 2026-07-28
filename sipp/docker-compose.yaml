@@ -3114,6 +3114,128 @@ services:
     profiles:
       - charging
 
+  # ── Route self-identity (RFC 3261 §16.4) ─────────────────────────────────
+  # A proxy must consume the Route that "indicates this proxy" — the one it put
+  # into Record-Route itself — and only that one.  siphon.routing-test.yaml
+  # removes the IP from `domain.local` (leaving only the served domain, as a
+  # real deployment does) and adds a SECOND udp listener on :5070, which the
+  # dispatcher's first-per-transport maps cannot see.  The call runs against
+  # :5070, so the Record-Route siphon stamps carries a host/port an incomplete
+  # self-identity fails to match — and the in-dialog BYE is then refused.
+  #
+  # No header inspection needed: the UAC scenario waits for a 200 to its BYE,
+  # so a refused self-Route fails the scenario and the container exits non-zero.
+  siphon-routing:
+    image: sipp-siphon
+    build:
+      context: ..
+    container_name: siphon-routing-test
+    volumes:
+      - ./configs/siphon.routing-test.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.70
+    healthcheck:
+      # Probe the SECOND listener — proves both are actually bound.
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5070)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - routing
+
+  # Register bob with a Contact pointing at the routing UAS (172.20.0.72).
+  sipp-routing-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-routing:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.72
+    entrypoint:
+      - sipp
+      - "172.20.0.70:5070"
+      - -sf
+      - /sipp/scenarios/register.xml
+      - -s
+      - bob
+      - -au
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - routing
+
+  # invite_uas.xml (not _fast): it echoes [last_Record-Route:] into its 180/200
+  # per RFC 3261 §12.1.1, so the UAC learns a real route set and the in-dialog
+  # ACK and BYE come back Route-headed. That round trip is the whole point.
+  sipp-routing-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-routing:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.72
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/invite_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - routing
+
+  # The verdict. invite_uac.xml uses rrs="true" + [routes], so its ACK and BYE
+  # carry the route set siphon advertised. It waits for a 200 to the BYE — which
+  # only arrives if siphon consumed its own Record-Route and relayed onward.
+  sipp-routing-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-routing:
+        condition: service_healthy
+      sipp-routing-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.73
+    entrypoint:
+      - sipp
+      - "172.20.0.70:5070"
+      - -sf
+      - /sipp/scenarios/routing_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - routing
+
 # ── Network ────────────────────────────────────────────────────────────────
 networks:
   sipnet:

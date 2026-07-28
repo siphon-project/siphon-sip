@@ -107,6 +107,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   requests it should have forwarded. All twelve sites now loose-route and
   forward unconditionally; the only remaining `404` is `registrar_proxy.py`'s
   genuine "no contacts registered" case.
+- **CI now covers Route self-identity on the wire.** A new `sipp-route-selfid`
+  job runs `scripts/route_selfid_test.sh` against a config whose `domain.local`
+  holds only the served domain — the shape of a proxy addressed by IP. The
+  existing functional stack could not catch this class of defect because its
+  test config lists the container address under `domain.local`, which makes a
+  Record-Route recognisable even when Route recognition is keyed on served
+  domains alone. The check is deterministic and needs no capability: the UAC
+  waits for a 200 to its in-dialog BYE, which only arrives if the self-Route was
+  consumed and the request relayed.
 - **`request.loose_route()` fails closed.** On the `@proxy.on_reply` /
   `on_failure` / `on_cancel` handler paths the request carried no self-identity
   at all, and `loose_route()` popped any `;lr` Route unconditionally — the same
