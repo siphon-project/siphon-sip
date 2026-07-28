@@ -551,6 +551,32 @@ impl UacSender {
         }
     }
 
+    /// Fire-and-forget an already-serialized message.
+    ///
+    /// Used for a deferred message that was serialized to ride along with a
+    /// reply (RFC 6665 §4.1.2.3 ordering) but whose reply path never fired —
+    /// it must still reach the peer rather than be dropped on the floor.
+    pub fn send_bytes(&self, data: Bytes, destination: SocketAddr, transport: Transport) {
+        if let Some(ref hep) = self.hep_sender {
+            let addr = self.addr_for(&transport);
+            hep.capture_outbound(addr, destination, transport, &data);
+        }
+
+        let outbound_message = OutboundMessage {
+            followups: None,
+            connection_id: ConnectionId::default(),
+            transport,
+            destination,
+            data,
+            source_local_addr: None,
+            server_name: None,
+        };
+
+        if let Err(error) = self.outbound.send(outbound_message) {
+            warn!("UAC send_bytes failed: {error}");
+        }
+    }
+
     /// Number of in-flight UAC requests awaiting a response.
     ///
     /// Surfaced as the `siphon_uac_pending_requests` gauge. A steadily rising

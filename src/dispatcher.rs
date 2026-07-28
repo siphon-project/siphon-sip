@@ -1369,12 +1369,55 @@ fn process_timer_actions(
     source_local_addr: Option<SocketAddr>,
     state: &DispatcherState,
 ) {
+    process_timer_actions_with_followups(
+        actions,
+        key,
+        destination,
+        transport,
+        connection_id,
+        source_local_addr,
+        Vec::new(),
+        state,
+    )
+}
+
+/// As [`process_timer_actions`], but `followups` are appended to the FIRST
+/// `Action::SendMessage` so they leave immediately after it, in order, with
+/// nothing interleaved (see [`OutboundMessage::followups`]).
+///
+/// Only the first-send path of a script reply passes a non-empty list. Every
+/// other caller — timer-driven retransmits above all — goes through
+/// [`process_timer_actions`] with an empty one, so a cached response being
+/// re-emitted never drags a stale NOTIFY along with it.
+#[allow(clippy::too_many_arguments)]
+fn process_timer_actions_with_followups(
+    actions: &[Action],
+    key: &TransactionKey,
+    destination: Option<SocketAddr>,
+    transport: Option<Transport>,
+    connection_id: Option<ConnectionId>,
+    source_local_addr: Option<SocketAddr>,
+    mut followups: Vec<Bytes>,
+    state: &DispatcherState,
+) {
     for action in actions {
         match action {
             Action::SendMessage(message) => {
                 if let (Some(dest), Some(trans)) = (destination, transport) {
                     let conn_id = connection_id.unwrap_or_default();
-                    send_message_from(message.clone(), trans, dest, conn_id, source_local_addr, state);
+                    if followups.is_empty() {
+                        send_message_from(message.clone(), trans, dest, conn_id, source_local_addr, state);
+                    } else {
+                        send_frames_in_order_from(
+                            Bytes::from(message.to_bytes()),
+                            std::mem::take(&mut followups),
+                            trans,
+                            dest,
+                            conn_id,
+                            source_local_addr,
+                            state,
+                        );
+                    }
                 }
             }
             Action::StartTimer(name, duration) => {
@@ -2987,6 +3030,26 @@ fn handle_request(
                 }
             }
 
+            // Messages the handler deferred (subscribe_state.notify(),
+            // presence.notify()) that are addressed to the peer this reply goes
+            // to must leave AFTER it: RFC 6665 §4.1.2.3 has the notifier send
+            // the initial NOTIFY once the subscription is accepted, i.e. after
+            // the 2xx to the SUBSCRIBE. §4.4.1 obliges a subscriber to cope with
+            // the reverse arrival order, but that allowance exists for a network
+            // that reorders — it is not licence for the notifier to emit out of
+            // order, which is what queueing them as two independent messages did
+            // (the UDP workers share the outbound channel and each owns a
+            // socket, so the NOTIFY could overtake the reply).
+            //
+            // They ride along as followups of the reply instead. Deferred
+            // messages for any OTHER peer are untouched and still go out via
+            // `flush_deferred_sends` at the end of the request.
+            let mut reply_followups: Vec<Bytes> = crate::script::api::proxy_utils::
+                drain_deferred_sends_for(inbound.remote_addr, inbound.transport)
+                .into_iter()
+                .map(|deferred| Bytes::from(deferred.message.to_bytes()))
+                .collect();
+
             // Feed response into server transaction so it can cache it for
             // retransmit handling and manage Timer J/G/H.
             // The state machine emits SendMessage which process_timer_actions
@@ -3011,16 +3074,21 @@ fn handle_request(
                 if let Some(event) = server_event {
                     match state.transaction_manager.process_server_event(key, event) {
                         Ok(actions) => {
-                            process_timer_actions(
+                            sent_by_transaction = actions.iter().any(|a| matches!(a, Action::SendMessage(_)));
+                            process_timer_actions_with_followups(
                                 &actions,
                                 key,
                                 Some(inbound.remote_addr),
                                 Some(inbound.transport),
                                 Some(inbound.connection_id),
                                 Some(inbound.local_addr),
+                                if sent_by_transaction {
+                                    std::mem::take(&mut reply_followups)
+                                } else {
+                                    Vec::new()
+                                },
                                 state,
                             );
-                            sent_by_transaction = actions.iter().any(|a| matches!(a, Action::SendMessage(_)));
                         }
                         Err(error) => {
                             debug!(key = %key, "failed to feed reply to server transaction: {error}");
@@ -3029,7 +3097,27 @@ fn handle_request(
                 }
             }
             if !sent_by_transaction {
-                send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+                send_frames_in_order_from(
+                    Bytes::from(response.to_bytes()),
+                    std::mem::take(&mut reply_followups),
+                    inbound.transport,
+                    inbound.remote_addr,
+                    inbound.connection_id,
+                    Some(inbound.local_addr),
+                    state,
+                );
+            }
+            // Anything still held (no reply path fired at all) must not be lost.
+            if !reply_followups.is_empty() {
+                if let Some(uac_sender) = crate::script::api::proxy_utils::uac_sender() {
+                    for frame in std::mem::take(&mut reply_followups) {
+                        uac_sender.send_bytes(
+                            frame,
+                            inbound.remote_addr,
+                            inbound.transport,
+                        );
+                    }
+                }
             }
 
         }
@@ -7031,8 +7119,29 @@ fn send_messages_in_order_from(
     let Some(first) = frames.next() else {
         return;
     };
-    let followups: Vec<Bytes> = frames.collect();
+    send_frames_in_order_from(
+        first,
+        frames.collect(),
+        transport,
+        destination,
+        connection_id,
+        source_local_addr,
+        state,
+    )
+}
 
+/// [`send_messages_in_order_from`] for callers that already hold serialized
+/// frames — `first` leaves before every entry of `followups`, in order.
+#[allow(clippy::too_many_arguments)]
+fn send_frames_in_order_from(
+    first: Bytes,
+    followups: Vec<Bytes>,
+    transport: Transport,
+    destination: SocketAddr,
+    connection_id: ConnectionId,
+    source_local_addr: Option<SocketAddr>,
+    state: &DispatcherState,
+) {
     // HEP sees each frame individually — they are distinct SIP messages on the
     // wire, and a capture that merged them would not decode.
     if let Some(ref hep) = state.hep_sender {
@@ -7099,15 +7208,12 @@ fn send_message_from(
 /// dispatched, so the reply is *enqueued* first (RFC 6665 §4.1.2.3 — the
 /// notifier sends the initial NOTIFY after the 200 to the SUBSCRIBE).
 ///
-/// Enqueueing first is not the same as leaving first: on UDP the workers share
-/// the outbound channel and each owns its own socket, so the deferred NOTIFY can
-/// still overtake the reply (see `OutboundMessage::followups` for the ordered-unit
-/// mechanism that does guarantee it). That is tolerable here and NOT tolerable for
-/// a REFER's 202 — RFC 6665 §4.4.1 requires a subscriber to accept a NOTIFY that
-/// arrives before the SUBSCRIBE's 200 and to treat it as creating the dialog,
-/// whereas RFC 3515 gives no such allowance for the 202. Making this ordered too
-/// means threading the reply into the flush, which is a wider change than the
-/// hazard warrants.
+/// By this point the reply path has already claimed any deferred message going
+/// to the *same* peer as the reply and sent it as an ordered followup, so what
+/// reaches here is addressed elsewhere and has nothing to be ordered against.
+/// Enqueueing is not the same as leaving — on UDP the workers share the outbound
+/// channel and each owns its own socket — which is why that ordering is done by
+/// pairing the frames rather than by send order (see `OutboundMessage::followups`).
 fn flush_deferred_sends(_state: &DispatcherState) {
     let deferred = crate::script::api::proxy_utils::drain_deferred_sends();
     if deferred.is_empty() {

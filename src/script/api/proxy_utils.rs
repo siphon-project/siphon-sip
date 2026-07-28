@@ -64,6 +64,38 @@ pub fn drain_deferred_sends() -> Vec<DeferredMessage> {
     })
 }
 
+/// Drain only the deferred messages addressed to `(destination, transport)`,
+/// preserving their relative order and leaving every other queued message in
+/// place for [`drain_deferred_sends`].
+///
+/// The caller sends these itself, ordered behind the reply going to that same
+/// peer (RFC 6665 §4.1.2.3 — the initial NOTIFY follows the 2xx that accepted
+/// the subscription).  Unlike [`drain_deferred_sends`] this does NOT disable
+/// deferred mode: messages for other peers must still reach the flush at the
+/// end of the request rather than being dropped.
+pub fn drain_deferred_sends_for(
+    destination: std::net::SocketAddr,
+    transport: Transport,
+) -> Vec<DeferredMessage> {
+    DEFERRED_SENDS.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let Some(ref mut queue) = *guard else {
+            return Vec::new();
+        };
+        let mut matched = Vec::new();
+        let mut remaining = Vec::with_capacity(queue.len());
+        for deferred in queue.drain(..) {
+            if deferred.destination == destination && deferred.transport == transport {
+                matched.push(deferred);
+            } else {
+                remaining.push(deferred);
+            }
+        }
+        *queue = remaining;
+        matched
+    })
+}
+
 /// Try to queue a message for deferred sending.  Returns `true` if deferred
 /// mode is active and the message was queued; `false` if no request handler
 /// is active (caller should send immediately).
@@ -813,6 +845,81 @@ fn memory_pct_linux() -> u32 {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod deferred_send_tests {
+    use super::*;
+    use crate::sip::builder::SipMessageBuilder;
+    use crate::sip::message::Method;
+    use crate::sip::uri::SipUri;
+
+    fn notify_to(user: &str) -> SipMessage {
+        SipMessageBuilder::new()
+            .request(
+                Method::Notify,
+                SipUri::new("example.com".to_string()).with_user(user.to_string()),
+            )
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-test".to_string())
+            .to(format!("<sip:{user}@example.com>"))
+            .from("<sip:notifier@example.com>;tag=1".to_string())
+            .call_id(format!("call-{user}"))
+            .cseq("1 NOTIFY".to_string())
+            .content_length(0)
+            .build()
+            .expect("NOTIFY must build")
+    }
+
+    fn addr(spec: &str) -> std::net::SocketAddr {
+        spec.parse().expect("addr")
+    }
+
+    #[test]
+    fn drain_for_takes_only_the_matching_peer() {
+        let subscriber = addr("10.0.0.1:5060");
+        let other = addr("10.0.0.2:5060");
+
+        enable_deferred_sends();
+        assert!(try_defer_send(notify_to("alice"), subscriber, Transport::Udp));
+        assert!(try_defer_send(notify_to("bob"), other, Transport::Udp));
+        assert!(try_defer_send(notify_to("carol"), subscriber, Transport::Udp));
+
+        let matched = drain_deferred_sends_for(subscriber, Transport::Udp);
+        assert_eq!(matched.len(), 2, "both messages for the reply's peer");
+        // Relative order preserved — they are sent as ordered followups.
+        assert_eq!(matched[0].destination, subscriber);
+        assert_eq!(matched[1].destination, subscriber);
+        assert!(matched[0].message.to_bytes().windows(5).any(|w| w == b"alice"));
+        assert!(matched[1].message.to_bytes().windows(5).any(|w| w == b"carol"));
+
+        // The other peer's message MUST survive for the end-of-request flush.
+        // Draining used to disable deferred mode outright, which silently
+        // dropped it.
+        let remaining = drain_deferred_sends();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].destination, other);
+    }
+
+    #[test]
+    fn drain_for_distinguishes_transport() {
+        let peer = addr("10.0.0.1:5060");
+        enable_deferred_sends();
+        assert!(try_defer_send(notify_to("alice"), peer, Transport::Udp));
+        assert!(try_defer_send(notify_to("bob"), peer, Transport::Tcp));
+
+        assert_eq!(drain_deferred_sends_for(peer, Transport::Udp).len(), 1);
+        let remaining = drain_deferred_sends();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].transport, Transport::Tcp);
+    }
+
+    #[test]
+    fn drain_for_is_empty_when_deferred_mode_is_off() {
+        // Reply paths run this unconditionally; with no handler active it must
+        // be a no-op rather than a panic.
+        drain_deferred_sends();
+        assert!(drain_deferred_sends_for(addr("10.0.0.1:5060"), Transport::Udp).is_empty());
+    }
+}
 
 #[cfg(test)]
 mod tests {
