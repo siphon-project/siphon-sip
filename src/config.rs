@@ -1248,6 +1248,11 @@ fn default_http_connect_timeout_ms() -> u64 {
 pub struct TlsServerConfig {
     pub certificate: String,
     pub private_key: String,
+    /// Additional certificate pairs selected by the TLS SNI extension
+    /// (RFC 6066) on `listen.tls` and `listen.wss`. Empty (the default) serves
+    /// `certificate`/`private_key` to every client, exactly as before.
+    #[serde(default)]
+    pub certificates: Vec<SniCertificate>,
     #[serde(default = "default_tls_method")]
     pub method: String,
     /// If true, client certificates are required and verified against
@@ -1268,6 +1273,34 @@ pub struct TlsServerConfig {
     /// `client_certificate` is set; a one-sided setting is a startup error.
     #[serde(default)]
     pub client_private_key: Option<String>,
+}
+
+/// One additional certificate/key pair, selected by the server name the client
+/// sends in the TLS SNI extension (RFC 6066).
+///
+/// Serving several domains from a single TLS/WSS listener otherwise needs one
+/// SAN certificate covering all of them, which couples every domain to a single
+/// renewal — one failed ACME validation blocks the cert for all of them, and
+/// every peer sees the full list. Each entry here is an independent pair.
+///
+/// The top-level `certificate`/`private_key` remains the default: it is served
+/// to a client that sends no SNI (including any IP-literal peer, which RFC 6066
+/// forbids from sending one) or whose server name matches no entry. Selection
+/// never aborts a handshake.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SniCertificate {
+    /// Server names this pair serves, matched case-insensitively.
+    ///
+    /// A leading-label wildcard (`*.example.com`) matches exactly one label per
+    /// RFC 6125 §6.4.3 — `ue.example.com` matches, `example.com` and
+    /// `a.b.example.com` do not. A name may appear only once across all
+    /// entries; a duplicate is a startup error rather than a silent
+    /// last-one-wins.
+    pub server_names: Vec<String>,
+    /// PEM certificate chain served for `server_names`.
+    pub certificate: String,
+    /// PEM private key matching `certificate`.
+    pub private_key: String,
 }
 
 fn default_tls_method() -> String {
@@ -3398,6 +3431,52 @@ log:
   level: info
   format: pretty
 "#
+    }
+
+    #[test]
+    fn parses_sni_certificates() {
+        let yaml = format!(
+            "{}{}",
+            minimal_yaml(),
+            r#"
+tls:
+  certificate: "/etc/siphon/tls/default.crt"
+  private_key: "/etc/siphon/tls/default.key"
+  certificates:
+    - server_names: ["sip.tenant-a.example", "sip.tenant-a.net"]
+      certificate: "/etc/siphon/tls/tenant-a.crt"
+      private_key: "/etc/siphon/tls/tenant-a.key"
+    - server_names: ["*.tenant-b.example"]
+      certificate: "/etc/siphon/tls/tenant-b.crt"
+      private_key: "/etc/siphon/tls/tenant-b.key"
+"#
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        let tls = config.tls.expect("tls block");
+        assert_eq!(tls.certificate, "/etc/siphon/tls/default.crt");
+        assert_eq!(tls.certificates.len(), 2);
+        assert_eq!(
+            tls.certificates[0].server_names,
+            vec!["sip.tenant-a.example", "sip.tenant-a.net"]
+        );
+        assert_eq!(tls.certificates[0].certificate, "/etc/siphon/tls/tenant-a.crt");
+        assert_eq!(tls.certificates[1].server_names, vec!["*.tenant-b.example"]);
+    }
+
+    #[test]
+    fn tls_certificates_defaults_to_empty() {
+        // A pre-SNI config must keep parsing, with the single-cert behaviour.
+        let yaml = format!(
+            "{}{}",
+            minimal_yaml(),
+            r#"
+tls:
+  certificate: "/etc/siphon/tls/default.crt"
+  private_key: "/etc/siphon/tls/default.key"
+"#
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        assert!(config.tls.expect("tls block").certificates.is_empty());
     }
 
     #[test]

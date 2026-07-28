@@ -5,6 +5,7 @@
 //! Failed handshakes are logged and the connection is dropped without
 //! affecting other connections or the accept loop.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -15,6 +16,8 @@ use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert};
+use tokio_rustls::rustls::sign::CertifiedKey;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
@@ -34,19 +37,35 @@ pub type SharedTlsAcceptor = Arc<ArcSwap<TlsAcceptor>>;
 /// enough for slow mobile clients, short enough to bound half-open handshakes.
 const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Build a `TlsAcceptor` from the certificate and key paths in config.
-pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAcceptor> {
+/// The crypto provider used to parse private keys outside a `ServerConfig`
+/// builder. `server.rs` installs ring as the process default before any
+/// listener starts; the fallback keeps unit tests and library embedders that
+/// never installed one working instead of failing to load a valid key.
+fn crypto_provider() -> Arc<tokio_rustls::rustls::crypto::CryptoProvider> {
+    tokio_rustls::rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(tokio_rustls::rustls::crypto::ring::default_provider()))
+}
+
+/// Load one PEM certificate chain + private key into a rustls `CertifiedKey`.
+///
+/// Shared by the default `tls.certificate`/`tls.private_key` pair and by every
+/// `tls.certificates[]` SNI entry, so a broken pair reports the same
+/// path-tagged error wherever it is configured.
+fn load_certified_key(
+    certificate_path: &str,
+    private_key_path: &str,
+) -> io::Result<Arc<CertifiedKey>> {
     use rustls_pki_types::pem::PemObject;
     use rustls_pki_types::{CertificateDer, PrivateKeyDer};
     use std::fs::File;
     use std::io::BufReader;
-    use tokio_rustls::rustls;
 
     // Load certificate chain
-    let cert_file = File::open(&tls_config.certificate).map_err(|error| {
+    let cert_file = File::open(certificate_path).map_err(|error| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            format!("failed to open certificate file '{}': {}", tls_config.certificate, error),
+            format!("failed to open certificate file '{certificate_path}': {error}"),
         )
     })?;
     let certificates: Vec<_> =
@@ -55,22 +74,22 @@ pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAccepto
             .map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("failed to parse certificate PEM: {}", error),
+                    format!("failed to parse certificate PEM '{certificate_path}': {error}"),
                 )
             })?;
 
     if certificates.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "certificate file contains no certificates",
+            format!("certificate file '{certificate_path}' contains no certificates"),
         ));
     }
 
     // Load private key
-    let key_file = File::open(&tls_config.private_key).map_err(|error| {
+    let key_file = File::open(private_key_path).map_err(|error| {
         io::Error::new(
             io::ErrorKind::NotFound,
-            format!("failed to open private key file '{}': {}", tls_config.private_key, error),
+            format!("failed to open private key file '{private_key_path}': {error}"),
         )
     })?;
     let key = PrivateKeyDer::from_pem_reader(&mut BufReader::new(key_file)).map_err(|error| {
@@ -81,14 +100,176 @@ pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAccepto
         match error {
             rustls_pki_types::pem::Error::NoItemsFound => io::Error::new(
                 io::ErrorKind::InvalidData,
-                "private key file contains no private key",
+                format!("private key file '{private_key_path}' contains no private key"),
             ),
             other => io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("failed to parse private key PEM: {}", other),
+                format!("failed to parse private key PEM '{private_key_path}': {other}"),
             ),
         }
     })?;
+
+    // Parses the key with the active provider AND checks it against the
+    // certificate's public key. `with_single_cert` did both before the resolver
+    // replaced it, so a cert/key mismatch still fails at boot rather than at the
+    // first handshake.
+    CertifiedKey::from_der(certificates, key, &crypto_provider())
+        .map(Arc::new)
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "certificate '{certificate_path}' and private key \
+                     '{private_key_path}' are not a usable pair: {error}"
+                ),
+            )
+        })
+}
+
+/// Picks the server certificate from the SNI server name in the ClientHello
+/// (RFC 6066), the server-side counterpart to the SNI siphon already *sends* on
+/// outbound TLS.
+///
+/// Never returns `None`: an unknown or absent server name falls back to the
+/// default pair, so a peer that addresses siphon by IP — or any deployment that
+/// configures no `tls.certificates` at all — behaves exactly as it did before
+/// SNI selection existed.
+#[derive(Debug)]
+struct SniCertResolver {
+    /// Exact server name (lowercased) → pair.
+    exact: HashMap<String, Arc<CertifiedKey>>,
+    /// Wildcard parent domain (lowercased, `*.` stripped) → pair. Matches
+    /// exactly one leading label, per RFC 6125 §6.4.3.
+    wildcard: HashMap<String, Arc<CertifiedKey>>,
+    /// `tls.certificate`/`tls.private_key` — served when nothing matches.
+    default: Arc<CertifiedKey>,
+}
+
+impl SniCertResolver {
+    /// Resolve a server name against the configured pairs. Split out from the
+    /// `ResolvesServerCert` impl so the matching rules are unit-testable
+    /// without synthesising a `ClientHello`.
+    fn lookup(&self, server_name: Option<&str>) -> Arc<CertifiedKey> {
+        let Some(server_name) = server_name else {
+            return Arc::clone(&self.default);
+        };
+        // rustls already rejects a non-ASCII/invalid DnsName during parsing, but
+        // it does not case-normalise; DNS names are case-insensitive (RFC 4343).
+        let server_name = server_name.to_ascii_lowercase();
+
+        if let Some(certified_key) = self.exact.get(&server_name) {
+            return Arc::clone(certified_key);
+        }
+        // One label off the front only: `ue.example.com` matches
+        // `*.example.com`, `a.b.example.com` does not.
+        if let Some((_label, parent)) = server_name.split_once('.') {
+            if let Some(certified_key) = self.wildcard.get(parent) {
+                return Arc::clone(certified_key);
+            }
+        }
+        Arc::clone(&self.default)
+    }
+}
+
+impl ResolvesServerCert for SniCertResolver {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(self.lookup(client_hello.server_name()))
+    }
+}
+
+/// Build the SNI resolver from config, loading every configured pair.
+///
+/// Fails closed at startup on the same server name claimed by two entries (in
+/// either the exact or the wildcard form), an entry with no server names, or a
+/// malformed wildcard — all of which would otherwise degrade silently into
+/// "some tenant gets the wrong certificate". `example.com` and `*.example.com`
+/// are different names, so configuring both is fine: the exact one wins for
+/// `example.com`, the wildcard covers its subdomains.
+fn build_cert_resolver(tls_config: &TlsServerConfig) -> io::Result<SniCertResolver> {
+    let default = load_certified_key(&tls_config.certificate, &tls_config.private_key)?;
+
+    let mut exact: HashMap<String, Arc<CertifiedKey>> = HashMap::new();
+    let mut wildcard: HashMap<String, Arc<CertifiedKey>> = HashMap::new();
+
+    for entry in &tls_config.certificates {
+        if entry.server_names.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "tls.certificates entry for '{}' has an empty server_names list — \
+                     it could never be selected",
+                    entry.certificate
+                ),
+            ));
+        }
+        let certified_key = load_certified_key(&entry.certificate, &entry.private_key)?;
+
+        for name in &entry.server_names {
+            let name = name.trim().to_ascii_lowercase();
+            if name.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "tls.certificates entry for '{}' has an empty server name",
+                        entry.certificate
+                    ),
+                ));
+            }
+            let (map, key) = match name.strip_prefix("*.") {
+                Some(parent) => {
+                    if parent.is_empty() || parent.starts_with('.') {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("tls.certificates: malformed wildcard server name '{name}'"),
+                        ));
+                    }
+                    (&mut wildcard, parent.to_string())
+                }
+                None => {
+                    if name.contains('*') {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "tls.certificates: '{name}' — a wildcard is only valid as the \
+                                 whole leading label (`*.example.com`)"
+                            ),
+                        ));
+                    }
+                    (&mut exact, name.clone())
+                }
+            };
+            if map.insert(key, Arc::clone(&certified_key)).is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "tls.certificates: server name '{name}' is configured more than once — \
+                         which certificate wins would be arbitrary"
+                    ),
+                ));
+            }
+        }
+    }
+
+    if !tls_config.certificates.is_empty() {
+        info!(
+            exact = exact.len(),
+            wildcard = wildcard.len(),
+            "TLS SNI certificate selection enabled"
+        );
+    }
+
+    Ok(SniCertResolver { exact, wildcard, default })
+}
+
+/// Build a `TlsAcceptor` from the certificate and key paths in config.
+pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAcceptor> {
+    use rustls_pki_types::pem::PemObject;
+    use rustls_pki_types::CertificateDer;
+    use std::fs::File;
+    use std::io::BufReader;
+    use tokio_rustls::rustls;
+
+    let resolver = Arc::new(build_cert_resolver(tls_config)?);
 
     // Honor `verify_client` (mutual TLS). Previously this was hardcoded to
     // `with_no_client_auth()`, so the config option was silently ignored —
@@ -142,20 +323,16 @@ pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAccepto
                 )
             })?;
         info!(client_ca = %ca_path, "mutual TLS enabled — client certificate required");
+        // Client-certificate verification stays listener-wide: rustls can only
+        // vary it per SNI name via a custom `ServerConfig` per handshake, and a
+        // per-tenant trust anchor is a different feature from a per-tenant
+        // server certificate.
         builder
             .with_client_cert_verifier(verifier)
-            .with_single_cert(certificates, key)
+            .with_cert_resolver(resolver)
     } else {
-        builder
-            .with_no_client_auth()
-            .with_single_cert(certificates, key)
-    }
-    .map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("failed to build TLS server config: {}", error),
-        )
-    })?;
+        builder.with_no_client_auth().with_cert_resolver(resolver)
+    };
 
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
@@ -175,8 +352,17 @@ pub fn build_hot_reload_acceptor(
     let initial = build_tls_acceptor(tls_config)?;
     let shared: SharedTlsAcceptor = Arc::new(ArcSwap::from(Arc::new(initial)));
 
-    let cert_path = PathBuf::from(&tls_config.certificate);
-    let key_path = PathBuf::from(&tls_config.private_key);
+    // Every configured pair is watched, not just the default — an SNI tenant
+    // renews on its own ACME schedule, and a cert that hot-reloads only when
+    // some *other* tenant happens to renew is worse than not reloading at all.
+    let mut watched_paths: Vec<PathBuf> = vec![
+        PathBuf::from(&tls_config.certificate),
+        PathBuf::from(&tls_config.private_key),
+    ];
+    for entry in &tls_config.certificates {
+        watched_paths.push(PathBuf::from(&entry.certificate));
+        watched_paths.push(PathBuf::from(&entry.private_key));
+    }
     let watch_config = tls_config.clone();
     // Weak ref so the watcher exits when the last strong reference (the
     // listener) is dropped. Without this, tests that build an acceptor
@@ -198,22 +384,33 @@ pub fn build_hot_reload_acceptor(
 
         // Watch the parent directories so atomic rename (cert-manager, certbot)
         // is observed — they typically swap the file rather than rewrite it.
-        for path in [&cert_path, &key_path] {
+        // Several pairs commonly share one directory, so de-duplicate: watching
+        // the same directory twice yields duplicate events per change.
+        let mut watched_dirs: Vec<&std::path::Path> = Vec::new();
+        for path in &watched_paths {
             let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            if watched_dirs.contains(&dir) {
+                continue;
+            }
             if let Err(error) = watcher.watch(dir, RecursiveMode::NonRecursive) {
                 warn!(%error, path = %dir.display(),
                     "TLS watcher: failed to watch directory; cert hot-reload disabled");
                 return;
             }
+            watched_dirs.push(dir);
         }
         info!(
-            cert = %cert_path.display(),
-            key = %key_path.display(),
+            pairs = watched_paths.len() / 2,
+            directories = watched_dirs.len(),
             "TLS cert hot-reload watcher started"
         );
 
-        let cert_name = cert_path.file_name().map(|n| n.to_owned());
-        let key_name = key_path.file_name().map(|n| n.to_owned());
+        // Match events by file name — the watch is on the directory, and a
+        // rename-into-place reports the destination name.
+        let watched_names: Vec<_> = watched_paths
+            .iter()
+            .filter_map(|path| path.file_name().map(|name| name.to_owned()))
+            .collect();
 
         loop {
             // Poll with a 1s timeout so we can check Weak::upgrade between
@@ -232,9 +429,9 @@ pub fn build_hot_reload_acceptor(
             };
             match event {
                 Ok(Event { kind: EventKind::Modify(_) | EventKind::Create(_), paths, .. }) => {
-                    let touched = paths.iter().any(|p| {
-                        let name = p.file_name().map(|n| n.to_owned());
-                        name == cert_name || name == key_name
+                    let touched = paths.iter().any(|path| {
+                        path.file_name()
+                            .is_some_and(|name| watched_names.iter().any(|watched| watched == name))
                     });
                     if !touched {
                         continue;
@@ -549,6 +746,7 @@ mod tests {
         TlsServerConfig {
             certificate: cert_path.to_str().unwrap().to_string(),
             private_key: key_path.to_str().unwrap().to_string(),
+            certificates: vec![],
             method: "TLSv1_3".to_string(),
             verify_client: false,
             client_ca: None,
@@ -572,6 +770,7 @@ mod tests {
         let tls_config = TlsServerConfig {
             certificate: "/nonexistent/cert.pem".to_string(),
             private_key: "/nonexistent/key.pem".to_string(),
+            certificates: vec![],
             method: "TLSv1_3".to_string(),
             verify_client: false,
             client_ca: None,
@@ -617,6 +816,7 @@ mod tests {
         let tls_config = TlsServerConfig {
             certificate: cert_path.to_str().unwrap().to_string(),
             private_key: key_path.to_str().unwrap().to_string(),
+            certificates: vec![],
             method: "TLSv1_3".to_string(),
             verify_client: false,
             client_ca: None,
@@ -862,6 +1062,401 @@ mod tests {
             stream_connections.reuse(remote_addr, Transport::Tls),
             None,
             "stream registry should be cleaned up after client drop"
+        );
+    }
+
+    // --- SNI certificate selection (RFC 6066) -----------------------------
+
+    /// Self-signed cert + key PEM for the given SAN DNS names.
+    fn generate_cert_for(names: &[&str]) -> (String, String) {
+        let key_pair = rcgen::KeyPair::generate().expect("keygen");
+        let certificate_params =
+            rcgen::CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
+                .expect("failed to create cert params");
+        let certificate = certificate_params.self_signed(&key_pair).expect("self-sign");
+        (certificate.pem(), key_pair.serialize_pem())
+    }
+
+    /// Write a cert/key pair into `directory` under `stem`, returning the paths.
+    fn write_pair(
+        directory: &tempfile::TempDir,
+        stem: &str,
+        names: &[&str],
+    ) -> (String, String) {
+        let (cert_pem, key_pem) = generate_cert_for(names);
+        let cert_path = directory.path().join(format!("{stem}-cert.pem"));
+        let key_path = directory.path().join(format!("{stem}-key.pem"));
+        std::fs::write(&cert_path, &cert_pem).unwrap();
+        std::fs::write(&key_path, &key_pem).unwrap();
+        (
+            cert_path.to_str().unwrap().to_string(),
+            key_path.to_str().unwrap().to_string(),
+        )
+    }
+
+    fn sni_entry(
+        directory: &tempfile::TempDir,
+        stem: &str,
+        names: &[&str],
+    ) -> crate::config::SniCertificate {
+        let (certificate, private_key) = write_pair(directory, stem, names);
+        crate::config::SniCertificate {
+            server_names: names.iter().map(|n| n.to_string()).collect(),
+            certificate,
+            private_key,
+        }
+    }
+
+    /// DER of the end-entity cert a resolver hands back for `server_name`.
+    fn resolved_der(resolver: &SniCertResolver, server_name: Option<&str>) -> Vec<u8> {
+        resolver.lookup(server_name).cert[0].as_ref().to_vec()
+    }
+
+    /// DER of the end-entity cert in a PEM file on disk.
+    fn der_of(certificate_path: &str) -> Vec<u8> {
+        use rustls_pki_types::pem::PemObject;
+        let pem = std::fs::read(certificate_path).unwrap();
+        let mut cursor = std::io::Cursor::new(pem);
+        let certificates: Vec<_> = rustls_pki_types::CertificateDer::pem_reader_iter(&mut cursor)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        certificates[0].as_ref().to_vec()
+    }
+
+    #[test]
+    fn sni_resolver_picks_exact_match_and_falls_back_to_default() {
+        ensure_crypto_provider();
+        let directory = tempfile::tempdir().unwrap();
+        let mut tls_config = write_test_cert(&directory);
+        let tenant = sni_entry(&directory, "tenant-a", &["sip.tenant-a.test"]);
+        let tenant_der = der_of(&tenant.certificate);
+        let default_der = der_of(&tls_config.certificate);
+        tls_config.certificates = vec![tenant];
+
+        let resolver = build_cert_resolver(&tls_config).expect("resolver");
+
+        assert_eq!(
+            resolved_der(&resolver, Some("sip.tenant-a.test")),
+            tenant_der,
+            "exact SNI match must serve that tenant's certificate"
+        );
+        // A name nobody configured, and a client that sent no SNI at all (every
+        // IP-literal peer — RFC 6066 forbids SNI for an IP), both get the
+        // default pair. Neither may abort the handshake.
+        assert_eq!(
+            resolved_der(&resolver, Some("unconfigured.test")),
+            default_der,
+            "unknown SNI must fall back to the default certificate"
+        );
+        assert_eq!(
+            resolved_der(&resolver, None),
+            default_der,
+            "absent SNI must fall back to the default certificate"
+        );
+    }
+
+    #[test]
+    fn sni_resolver_matches_one_wildcard_label_only() {
+        ensure_crypto_provider();
+        let directory = tempfile::tempdir().unwrap();
+        let mut tls_config = write_test_cert(&directory);
+        let wild = sni_entry(&directory, "wild", &["*.wild.test"]);
+        let wild_der = der_of(&wild.certificate);
+        let default_der = der_of(&tls_config.certificate);
+        tls_config.certificates = vec![wild];
+
+        let resolver = build_cert_resolver(&tls_config).expect("resolver");
+
+        assert_eq!(
+            resolved_der(&resolver, Some("ue.wild.test")),
+            wild_der,
+            "`*.wild.test` must match a single leading label"
+        );
+        // RFC 6125 §6.4.3: a wildcard matches exactly one label — not the bare
+        // domain, and not a deeper subdomain.
+        assert_eq!(
+            resolved_der(&resolver, Some("wild.test")),
+            default_der,
+            "`*.wild.test` must NOT match the bare domain"
+        );
+        assert_eq!(
+            resolved_der(&resolver, Some("a.b.wild.test")),
+            default_der,
+            "`*.wild.test` must NOT match a multi-label subdomain"
+        );
+    }
+
+    #[test]
+    fn sni_resolver_is_case_insensitive() {
+        // DNS names are case-insensitive (RFC 4343); rustls does not normalise
+        // the ClientHello value, so the resolver must.
+        ensure_crypto_provider();
+        let directory = tempfile::tempdir().unwrap();
+        let mut tls_config = write_test_cert(&directory);
+        let mut tenant = sni_entry(&directory, "tenant-b", &["sip.tenant-b.test"]);
+        tenant.server_names = vec!["SIP.Tenant-B.TEST".to_string()];
+        let tenant_der = der_of(&tenant.certificate);
+        tls_config.certificates = vec![tenant];
+
+        let resolver = build_cert_resolver(&tls_config).expect("resolver");
+
+        for probe in ["sip.tenant-b.test", "SIP.TENANT-B.TEST", "Sip.Tenant-b.Test"] {
+            assert_eq!(
+                resolved_der(&resolver, Some(probe)),
+                tenant_der,
+                "SNI matching must be case-insensitive (probe: {probe})"
+            );
+        }
+    }
+
+    #[test]
+    fn sni_exact_match_wins_over_wildcard() {
+        ensure_crypto_provider();
+        let directory = tempfile::tempdir().unwrap();
+        let mut tls_config = write_test_cert(&directory);
+        let wild = sni_entry(&directory, "wild", &["*.shared.test"]);
+        let exact = sni_entry(&directory, "exact", &["vip.shared.test"]);
+        let exact_der = der_of(&exact.certificate);
+        let wild_der = der_of(&wild.certificate);
+        tls_config.certificates = vec![wild, exact];
+
+        let resolver = build_cert_resolver(&tls_config).expect("resolver");
+
+        assert_eq!(
+            resolved_der(&resolver, Some("vip.shared.test")),
+            exact_der,
+            "a specific name must win over a wildcard covering it"
+        );
+        assert_eq!(
+            resolved_der(&resolver, Some("other.shared.test")),
+            wild_der,
+            "names not called out explicitly still take the wildcard"
+        );
+    }
+
+    #[test]
+    fn empty_certificates_list_preserves_single_cert_behaviour() {
+        // The no-SNI-configured path must be indistinguishable from the
+        // pre-SNI build: one cert served to everyone, whatever they ask for.
+        ensure_crypto_provider();
+        let directory = tempfile::tempdir().unwrap();
+        let tls_config = write_test_cert(&directory);
+        let default_der = der_of(&tls_config.certificate);
+
+        let resolver = build_cert_resolver(&tls_config).expect("resolver");
+
+        for probe in [None, Some("anything.test"), Some("localhost")] {
+            assert_eq!(resolved_der(&resolver, probe), default_der);
+        }
+    }
+
+    #[test]
+    fn duplicate_server_name_fails_closed() {
+        // Two pairs claiming one name: whichever won would be arbitrary, and an
+        // operator would only find out by watching which cert peers received.
+        ensure_crypto_provider();
+        let directory = tempfile::tempdir().unwrap();
+        let mut tls_config = write_test_cert(&directory);
+        tls_config.certificates = vec![
+            sni_entry(&directory, "first", &["dup.test"]),
+            sni_entry(&directory, "second", &["dup.test"]),
+        ];
+
+        let error = build_cert_resolver(&tls_config)
+            .expect_err("duplicate server name must fail closed")
+            .to_string();
+        assert!(error.contains("dup.test"), "error should name the duplicate: {error}");
+    }
+
+    #[test]
+    fn duplicate_wildcard_server_name_fails_closed() {
+        ensure_crypto_provider();
+        let directory = tempfile::tempdir().unwrap();
+        let mut tls_config = write_test_cert(&directory);
+        tls_config.certificates = vec![
+            sni_entry(&directory, "first", &["*.dup.test"]),
+            sni_entry(&directory, "second", &["*.dup.test"]),
+        ];
+
+        assert!(
+            build_cert_resolver(&tls_config).is_err(),
+            "duplicate wildcard server name must fail closed"
+        );
+    }
+
+    #[test]
+    fn empty_server_names_fails_closed() {
+        ensure_crypto_provider();
+        let directory = tempfile::tempdir().unwrap();
+        let mut tls_config = write_test_cert(&directory);
+        let mut entry = sni_entry(&directory, "orphan", &["orphan.test"]);
+        entry.server_names = vec![];
+        tls_config.certificates = vec![entry];
+
+        assert!(
+            build_cert_resolver(&tls_config).is_err(),
+            "an entry that can never be selected must fail closed, not load silently"
+        );
+    }
+
+    #[test]
+    fn malformed_wildcard_fails_closed() {
+        ensure_crypto_provider();
+        let directory = tempfile::tempdir().unwrap();
+        let base = write_test_cert(&directory);
+
+        // A wildcard is only meaningful as the entire leading label. `sip*.x`
+        // and a bare `*` would silently never match anything.
+        for bad in ["*", "*.", "sip*.example.test", "a.*.example.test"] {
+            let mut tls_config = base.clone();
+            let mut entry = sni_entry(&directory, "bad", &["placeholder.test"]);
+            entry.server_names = vec![bad.to_string()];
+            tls_config.certificates = vec![entry];
+            assert!(
+                build_cert_resolver(&tls_config).is_err(),
+                "malformed wildcard '{bad}' must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_sni_certificate_file_fails_closed_naming_the_path() {
+        ensure_crypto_provider();
+        let directory = tempfile::tempdir().unwrap();
+        let mut tls_config = write_test_cert(&directory);
+        tls_config.certificates = vec![crate::config::SniCertificate {
+            server_names: vec!["ghost.test".to_string()],
+            certificate: "/nonexistent/tenant-cert.pem".to_string(),
+            private_key: "/nonexistent/tenant-key.pem".to_string(),
+        }];
+
+        let error = build_cert_resolver(&tls_config)
+            .expect_err("missing SNI cert file must fail closed")
+            .to_string();
+        assert!(
+            error.contains("/nonexistent/tenant-cert.pem"),
+            "error must name the offending path, not just 'certificate': {error}"
+        );
+    }
+
+    #[test]
+    fn acceptor_builds_with_sni_certificates() {
+        ensure_crypto_provider();
+        let directory = tempfile::tempdir().unwrap();
+        let mut tls_config = write_test_cert(&directory);
+        tls_config.certificates = vec![
+            sni_entry(&directory, "tenant-a", &["sip.tenant-a.test"]),
+            sni_entry(&directory, "wild", &["*.wild.test"]),
+        ];
+
+        assert!(
+            build_tls_acceptor(&tls_config).is_ok(),
+            "acceptor must build with SNI certificates configured"
+        );
+    }
+
+    #[test]
+    fn sni_certificates_work_with_mutual_tls() {
+        // mTLS is listener-wide and must keep working alongside per-name certs.
+        ensure_crypto_provider();
+        let directory = tempfile::tempdir().unwrap();
+        let mut tls_config = write_test_cert(&directory);
+        let (ca_path, _ca_key) = write_pair(&directory, "ca", &["ca.test"]);
+        tls_config.verify_client = true;
+        tls_config.client_ca = Some(ca_path);
+        tls_config.certificates = vec![sni_entry(&directory, "tenant-a", &["sip.tenant-a.test"])];
+
+        assert!(
+            build_tls_acceptor(&tls_config).is_ok(),
+            "SNI selection must compose with verify_client"
+        );
+    }
+
+    /// Drive one real TLS handshake against `acceptor`, asking for `server_name`,
+    /// and return the DER of the end-entity certificate the server presented.
+    async fn handshake_peer_cert(
+        tls_config: &TlsServerConfig,
+        server_name: &str,
+        trusted: &[&str],
+    ) -> Vec<u8> {
+        use tokio_rustls::rustls;
+        use tokio_rustls::TlsConnector;
+
+        let acceptor = build_tls_acceptor(tls_config).expect("acceptor");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound_addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // The handshake is all this test needs; the client drops right after.
+            let _ = acceptor.accept(stream).await;
+        });
+
+        let mut root_store = rustls::RootCertStore::empty();
+        for certificate_path in trusted {
+            use rustls_pki_types::pem::PemObject;
+            let pem = std::fs::read(certificate_path).unwrap();
+            let mut cursor = std::io::Cursor::new(pem);
+            for certificate in rustls_pki_types::CertificateDer::pem_reader_iter(&mut cursor) {
+                root_store.add(certificate.unwrap()).unwrap();
+            }
+        }
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+
+        let tcp_stream = tokio::net::TcpStream::connect(bound_addr).await.unwrap();
+        let name = rustls::pki_types::ServerName::try_from(server_name.to_string()).unwrap();
+        let tls_stream = connector.connect(name, tcp_stream).await.unwrap_or_else(|error| {
+            panic!("client handshake for '{server_name}' failed: {error}")
+        });
+        let peer = tls_stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .expect("server presented no certificate")[0]
+            .as_ref()
+            .to_vec();
+        drop(tls_stream);
+        let _ = server.await;
+        peer
+    }
+
+    #[tokio::test]
+    async fn handshake_serves_the_certificate_matching_the_client_sni() {
+        // End-to-end proof over a real handshake: the cert a client receives is
+        // chosen by the name it asked for, and it validates against that name.
+        ensure_crypto_provider();
+        let directory = tempfile::tempdir().unwrap();
+        let mut tls_config = write_test_cert(&directory);
+        let tenant = sni_entry(&directory, "tenant-a", &["sip.tenant-a.test"]);
+        let wild = sni_entry(&directory, "wild", &["*.wild.test"]);
+        let tenant_cert_path = tenant.certificate.clone();
+        let wild_cert_path = wild.certificate.clone();
+        let default_cert_path = tls_config.certificate.clone();
+        tls_config.certificates = vec![tenant, wild];
+
+        let trusted = [
+            default_cert_path.as_str(),
+            tenant_cert_path.as_str(),
+            wild_cert_path.as_str(),
+        ];
+
+        assert_eq!(
+            handshake_peer_cert(&tls_config, "sip.tenant-a.test", &trusted).await,
+            der_of(&tenant_cert_path),
+            "SNI 'sip.tenant-a.test' must be served the tenant certificate"
+        );
+        assert_eq!(
+            handshake_peer_cert(&tls_config, "ue.wild.test", &trusted).await,
+            der_of(&wild_cert_path),
+            "SNI 'ue.wild.test' must be served the wildcard certificate"
+        );
+        assert_eq!(
+            handshake_peer_cert(&tls_config, "localhost", &trusted).await,
+            der_of(&default_cert_path),
+            "an unmatched SNI must be served the default certificate"
         );
     }
 }

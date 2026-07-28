@@ -6,6 +6,47 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **`tls.certificates` — per-domain server certificates selected by inbound SNI
+  (RFC 6066).** One `listen.tls` / `listen.wss` socket can now serve a different
+  certificate per server name, the equivalent of OpenSIPS `tls_mgm` per-domain
+  certificates and Kamailio's `tls_domain`. Previously the whole listener was
+  pinned to the single `tls.certificate`/`tls.private_key` pair, so serving
+  several domains meant one SAN certificate covering all of them — which couples
+  every domain to a single renewal (one failed ACME validation blocks the
+  certificate for all of them) and shows every peer the full list. Each entry is
+  an independent pair:
+
+  ```yaml
+  tls:
+    certificate: "/etc/siphon/tls/default.crt"   # served when nothing matches
+    private_key: "/etc/siphon/tls/default.key"
+    certificates:
+      - server_names: ["sip.tenant-a.example", "sip.tenant-a.net"]
+        certificate: "/etc/siphon/tls/tenant-a.crt"
+        private_key: "/etc/siphon/tls/tenant-a.key"
+      - server_names: ["*.tenant-b.example"]
+        certificate: "/etc/siphon/tls/tenant-b.crt"
+        private_key: "/etc/siphon/tls/tenant-b.key"
+  ```
+
+  Names match case-insensitively (RFC 4343); a wildcard matches exactly one
+  leading label (RFC 6125 §6.4.3 — `ue.tenant-b.example` yes,
+  `tenant-b.example` and `a.b.tenant-b.example` no); an exact entry wins over a
+  wildcard covering it. Anything unmatched, including every client that sends no
+  SNI at all (any peer addressing siphon by IP literal, which RFC 6066 forbids
+  from sending one), falls back to the top-level pair — selection never aborts a
+  handshake, and a config without `certificates:` is byte-for-byte the previous
+  behaviour. The block is shared by `listen.tls` and `listen.wss` as before, and
+  every pair is watched for changes independently, so each domain hot-reloads on
+  its own renewal schedule instead of only when some other domain happens to
+  renew. A duplicate server name, an entry with an empty `server_names`, a
+  malformed wildcard, or a certificate that does not match its key are hard
+  startup errors naming the offending path, rather than silently deciding which
+  certificate a peer gets. `verify_client` / `client_ca` remain listener-wide.
+  The server name is client-supplied plaintext and is used only to pick a
+  certificate — it is not an identity signal.
+
 ## [1.5.0] — 2026-07-27
 
 ### Added
