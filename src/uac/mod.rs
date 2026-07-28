@@ -377,6 +377,7 @@ impl UacSender {
         }
 
         let outbound_message = OutboundMessage {
+            followups: None,
             connection_id,
             transport,
             destination,
@@ -480,6 +481,7 @@ impl UacSender {
         }
 
         let outbound_message = OutboundMessage {
+            followups: None,
             connection_id: ConnectionId::default(),
             transport,
             destination,
@@ -529,6 +531,7 @@ impl UacSender {
         }
 
         let outbound_message = OutboundMessage {
+            followups: None,
             connection_id: ConnectionId::default(),
             transport,
             destination,

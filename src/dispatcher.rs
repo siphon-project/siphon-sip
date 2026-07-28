@@ -3481,6 +3481,7 @@ fn relay_request(
     //   - URI-relay: the legacy path through `send_to_target`.
     let connection_id = if let Some(local) = flow_local_addr {
         let outbound_message = OutboundMessage {
+            followups: None,
             connection_id: ConnectionId(flow.map(|f| f.connection_id).unwrap_or(0)),
             transport: outbound_transport,
             destination,
@@ -3832,6 +3833,7 @@ fn relay_fork_branch(
     // normal resolver/pool path.
     let connection_id = if let Some(flow) = flow {
         let outbound_message = OutboundMessage {
+            followups: None,
             connection_id: ConnectionId(flow.connection_id),
             transport: outbound_transport,
             destination,
@@ -5361,6 +5363,7 @@ fn send_to_target(
 
             if let Some(connection_id) = connection_id {
                 let outbound_message = OutboundMessage {
+                    followups: None,
                     connection_id,
                     transport: Transport::Tls,
                     destination,
@@ -5424,6 +5427,7 @@ fn send_to_target(
             match state.stream_connections.reuse(destination, transport) {
                 Some(connection_id) => {
                     let outbound_message = OutboundMessage {
+                        followups: None,
                         connection_id,
                         transport,
                         destination,
@@ -5472,6 +5476,7 @@ fn send_to_target(
             let source_local_addr =
                 crate::script::api::ipsec::outbound_local_addr_for(destination).or(send_source);
             let outbound_message = OutboundMessage {
+                followups: None,
                 connection_id: fallback_connection_id,
                 transport,
                 destination,
@@ -6856,10 +6861,66 @@ fn send_outbound_from(
         data,
         source_local_addr,
         server_name: None,
+        followups: None,
     };
 
     if let Err(error) = state.outbound.send(outbound_message) {
         error!("failed to enqueue outbound message: {error}");
+    }
+}
+
+/// Serialize and enqueue `messages` as ONE outbound unit, so they leave in the
+/// given order with nothing interleaved.
+///
+/// Separate `send_message_from` calls do not order on UDP — the workers share
+/// the outbound channel and each owns its own socket, so two enqueues race (see
+/// [`OutboundMessage::followups`]). Use this wherever the sequence is part of
+/// the protocol rather than an accident of timing.
+fn send_messages_in_order_from(
+    messages: Vec<SipMessage>,
+    transport: Transport,
+    destination: SocketAddr,
+    connection_id: ConnectionId,
+    source_local_addr: Option<SocketAddr>,
+    state: &DispatcherState,
+) {
+    let mut frames = messages.into_iter().map(|message| Bytes::from(message.to_bytes()));
+    let Some(first) = frames.next() else {
+        return;
+    };
+    let followups: Vec<Bytes> = frames.collect();
+
+    // HEP sees each frame individually — they are distinct SIP messages on the
+    // wire, and a capture that merged them would not decode.
+    if let Some(ref hep) = state.hep_sender {
+        let local = source_local_addr
+            .or_else(|| state.listen_addrs.get(&transport).copied())
+            .unwrap_or(state.local_addr);
+        let local = state.hep_local_addr(local, transport);
+        hep.capture_outbound(local, destination, transport, &first);
+        for frame in &followups {
+            hep.capture_outbound(local, destination, transport, frame);
+        }
+    }
+
+    debug!(
+        destination = %destination,
+        frames = 1 + followups.len(),
+        "sending ordered message group"
+    );
+
+    let outbound_message = OutboundMessage {
+        connection_id,
+        transport,
+        destination,
+        data: first,
+        source_local_addr,
+        server_name: None,
+        followups: if followups.is_empty() { None } else { Some(followups) },
+    };
+
+    if let Err(error) = state.outbound.send(outbound_message) {
+        error!("failed to enqueue ordered outbound group: {error}");
     }
 }
 
@@ -10589,6 +10650,7 @@ fn b2bua_send_b_leg_invite(
     // resolver/pool path.
     if let Some(flow) = flow {
         let outbound_message = OutboundMessage {
+            followups: None,
             connection_id: ConnectionId(flow.connection_id),
             transport: outbound_transport,
             destination,
@@ -11030,6 +11092,7 @@ fn handle_registrant_ipsec_challenge(
             return;
         }
         let outbound_message = crate::transport::OutboundMessage {
+            followups: None,
             connection_id: crate::transport::ConnectionId::default(),
             transport,
             destination,
@@ -14692,6 +14755,7 @@ fn arm_reliable_provisional_retransmit(
                         "retransmitting reliable 1xx (RFC 3262)"
                     );
                     let _ = outbound.send(OutboundMessage {
+                        followups: None,
                         connection_id,
                         transport,
                         destination,
@@ -14767,6 +14831,7 @@ fn arm_b2bua_2xx_retransmit(
                         "retransmitting A-leg 2xx (RFC 3261 §13.3.1.4)"
                     );
                     let _ = outbound.send(OutboundMessage {
+                        followups: None,
                         connection_id,
                         transport,
                         destination,
@@ -16151,7 +16216,16 @@ fn b2bua_refer_accept(
                 "B2BUA REFER: accepting (siphon-terminated) — 202 + NOTIFY 100 Trying"
             );
 
-            // 202 Accepted to the referrer, on the flow the REFER arrived on.
+            // 202 Accepted to the referrer, on the flow the REFER arrived on,
+            // followed by the first NOTIFY (sipfrag 100 Trying) opening the
+            // implicit subscription.
+            //
+            // RFC 3515 §2.4.4 orders these: the 202 is what tells the referrer
+            // the subscription exists, so a NOTIFY that overtakes it can be
+            // rejected as being for an unknown subscription. They are enqueued
+            // as one ordered unit because two separate sends do NOT order on
+            // UDP — the workers share the outbound channel and each owns its own
+            // SO_REUSEPORT socket, so the NOTIFY could and did win the race.
             let accepted = build_response(
                 &message,
                 202,
@@ -16159,17 +16233,8 @@ fn b2bua_refer_accept(
                 state.server_header.as_deref(),
                 &[],
             );
-            send_message_from(
-                accepted,
-                inbound.transport,
-                inbound.remote_addr,
-                inbound.connection_id,
-                Some(inbound.local_addr),
-                state,
-            );
+            let mut ordered = vec![accepted];
 
-            // Open the subscription and send the first NOTIFY (sipfrag 100
-            // Trying) toward the referrer on the same flow.
             let notify_cseq = state.call_actors.reserve_leg_cseq(call_id, from_a_leg);
             let origin_leg = state.call_actors.clone_leg(call_id, from_a_leg);
             if let (Some(cseq), Some(leg)) = (notify_cseq, origin_leg) {
@@ -16194,16 +16259,18 @@ fn b2bua_refer_accept(
                         crate::b2bua::transfer::build_sipfrag_body(100, "Trying").into_bytes(),
                     )),
                 ) {
-                    send_message_from(
-                        notify,
-                        inbound.transport,
-                        inbound.remote_addr,
-                        inbound.connection_id,
-                        Some(inbound.local_addr),
-                        state,
-                    );
+                    ordered.push(notify);
                 }
             }
+
+            send_messages_in_order_from(
+                ordered,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
+            );
 
             // Dial the transfer target as a new leg, then record the
             // subscription tagged with that leg's Call-ID. The leg's 2xx is

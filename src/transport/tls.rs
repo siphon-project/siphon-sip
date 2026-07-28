@@ -494,30 +494,42 @@ pub async fn listen(
                 // park here, stalling outbound for every connection and blocking
                 // accept's `insert` on the same shard — the wedge. `try_send`
                 // sheds for a backed-up (stuck) peer instead.
-                match sender.try_send(outbound.data) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        warn!("TLS outbound dropped: connection {:?} send buffer full (slow/stuck peer)", outbound.connection_id);
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        warn!("TLS outbound dropped: connection {:?} closed", outbound.connection_id);
+                let connection_id = outbound.connection_id;
+                // Frames of one message keep their relative order — same
+                // per-connection channel, single distributor task.
+                for frame in outbound.into_frames() {
+                    match sender.try_send(frame) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            warn!("TLS outbound dropped: connection {:?} send buffer full (slow/stuck peer)", connection_id);
+                            break;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            warn!("TLS outbound dropped: connection {:?} closed", connection_id);
+                            break;
+                        }
                     }
                 }
             } else if let Some(ref pool) = pool {
                 // No existing connection — create outbound TLS via pool
-                match pool.send_tls(outbound.destination, outbound.server_name.as_deref(), outbound.data).await {
-                    Ok(connection_id) => {
-                        debug!(
-                            destination = %outbound.destination,
-                            connection_id = ?connection_id,
-                            "TLS outbound: sent via pool"
-                        );
-                    }
-                    Err(error) => {
-                        warn!(
-                            destination = %outbound.destination,
-                            "TLS outbound pool connect failed: {error}"
-                        );
+                let destination = outbound.destination;
+                let server_name = outbound.server_name.clone();
+                for frame in outbound.into_frames() {
+                    match pool.send_tls(destination, server_name.as_deref(), frame).await {
+                        Ok(connection_id) => {
+                            debug!(
+                                destination = %destination,
+                                connection_id = ?connection_id,
+                                "TLS outbound: sent via pool"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(
+                                destination = %destination,
+                                "TLS outbound pool connect failed: {error}"
+                            );
+                            break;
+                        }
                     }
                 }
             } else {

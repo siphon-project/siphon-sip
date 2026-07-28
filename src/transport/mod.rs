@@ -377,6 +377,43 @@ pub struct OutboundMessage {
     /// destination IP literal (no SNI). Ignored for non-TLS transports and for
     /// TLS connection *reuse* (no handshake occurs).
     pub server_name: Option<String>,
+    /// Further messages that MUST leave after `data`, to the same destination,
+    /// without anything interleaving between them.
+    ///
+    /// Enqueueing two `OutboundMessage`s back to back does **not** order them on
+    /// UDP: every UDP worker clones the same outbound receiver (flume is MPMC)
+    /// and owns a separate `SO_REUSEPORT` socket, so two messages are routinely
+    /// picked up by two workers and race to `send_to`. Anything that is only
+    /// correct in a specific order — RFC 3515 §2.4.4's `202 Accepted` before the
+    /// first `message/sipfrag` NOTIFY, where the 202 is what tells the referrer
+    /// the implicit subscription exists — must travel as one unit so a single
+    /// worker writes them in sequence.
+    ///
+    /// `None` on effectively every message, and empty then costs no allocation.
+    /// Stream transports preserve order anyway (one distributor task per
+    /// listener), but honour this for free by writing the frames into the same
+    /// per-connection channel in order.
+    pub followups: Option<Vec<Bytes>>,
+}
+
+impl OutboundMessage {
+    /// The frames to write, in the order they must leave: `data`, then any
+    /// [`followups`](Self::followups).
+    pub fn frames(&self) -> impl Iterator<Item = &Bytes> {
+        std::iter::once(&self.data)
+            .chain(self.followups.iter().flat_map(|extra| extra.iter()))
+    }
+
+    /// Owned form of [`frames`](Self::frames), for senders that move each frame
+    /// into a per-connection channel.
+    pub fn into_frames(self) -> Vec<Bytes> {
+        let mut frames = Vec::with_capacity(1 + self.followups.as_ref().map_or(0, |e| e.len()));
+        frames.push(self.data);
+        if let Some(extra) = self.followups {
+            frames.extend(extra);
+        }
+        frames
+    }
 }
 
 /// Routes outbound messages to the correct transport channel.
@@ -755,10 +792,54 @@ mod tests {
             data: Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"),
             source_local_addr: None,
             server_name: None,
+            followups: None,
         };
         assert_eq!(message.connection_id, ConnectionId(99));
         assert_eq!(message.transport, Transport::Udp);
         assert_eq!(message.destination.port(), 5060);
+    }
+
+    fn message_with_followups(followups: Option<Vec<Bytes>>) -> OutboundMessage {
+        OutboundMessage {
+            connection_id: ConnectionId(1),
+            transport: Transport::Udp,
+            destination: "10.0.0.1:5060".parse().unwrap(),
+            data: Bytes::from_static(b"202"),
+            source_local_addr: None,
+            server_name: None,
+            followups,
+        }
+    }
+
+    #[test]
+    fn frames_is_just_data_without_followups() {
+        let message = message_with_followups(None);
+        let frames: Vec<_> = message.frames().cloned().collect();
+        assert_eq!(frames, vec![Bytes::from_static(b"202")]);
+        assert_eq!(message.into_frames(), vec![Bytes::from_static(b"202")]);
+    }
+
+    #[test]
+    fn frames_yields_data_then_followups_in_order() {
+        // The order here IS the protocol requirement (RFC 3515 §2.4.4): the
+        // REFER's 202 must precede the NOTIFY that reports on the subscription
+        // it opened.
+        let message = message_with_followups(Some(vec![
+            Bytes::from_static(b"NOTIFY-1"),
+            Bytes::from_static(b"NOTIFY-2"),
+        ]));
+        let frames: Vec<_> = message.frames().cloned().collect();
+        assert_eq!(
+            frames,
+            vec![
+                Bytes::from_static(b"202"),
+                Bytes::from_static(b"NOTIFY-1"),
+                Bytes::from_static(b"NOTIFY-2"),
+            ]
+        );
+        // Owned form must agree with the borrowed one — the stream distributors
+        // use `into_frames`, the UDP workers use `frames`.
+        assert_eq!(message.into_frames(), frames);
     }
 
     fn addr(s: &str) -> SocketAddr {
@@ -942,6 +1023,7 @@ mod tests {
             data: Bytes::from_static(b"PING"),
             source_local_addr: source,
             server_name: None,
+            followups: None,
         };
 
         // Pinned to listener A → lands on A's channel.

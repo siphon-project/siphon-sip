@@ -91,8 +91,19 @@ pub async fn listen(
                                     warn!("[udp-worker-{}] invalid destination: {}", worker_index, outbound.destination);
                                     continue;
                                 };
-                                if let Err(e) = socket.send_to(&outbound.data, &dest_addr).await {
-                                    warn!("[udp-worker-{}] send_to {} failed: {}", worker_index, outbound.destination, e);
+                                // Every frame of this message goes out from THIS
+                                // worker's socket, in order, before the worker
+                                // takes another message off the shared channel.
+                                // That is the only ordering guarantee available
+                                // on UDP here: workers share the receiver
+                                // MPMC-style, so two separately-enqueued
+                                // messages can leave from two sockets in either
+                                // order (see `OutboundMessage::followups`).
+                                for frame in outbound.frames() {
+                                    if let Err(e) = socket.send_to(frame, &dest_addr).await {
+                                        warn!("[udp-worker-{}] send_to {} failed: {}", worker_index, outbound.destination, e);
+                                        break;
+                                    }
                                 }
                             }
                             Err(_) => {
@@ -148,6 +159,7 @@ fn create_reusable_udp_socket(local_addr: SocketAddr, tos: Option<u32>) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[test]
     fn udp_connection_id_is_deterministic() {
@@ -172,5 +184,115 @@ mod tests {
         let remote1: SocketAddr = "192.168.1.100:50123".parse().unwrap();
         let remote2: SocketAddr = "192.168.1.100:50124".parse().unwrap();
         assert_ne!(udp_connection_id(local, remote1), udp_connection_id(local, remote2));
+    }
+
+    /// Frames of one `OutboundMessage` must reach the peer in the order they
+    /// were queued, however many workers are draining the shared channel.
+    ///
+    /// This is the regression guard for the REFER `202`/`NOTIFY` inversion:
+    /// every worker clones the same outbound receiver and owns its own
+    /// `SO_REUSEPORT` socket, so two *separately enqueued* messages race and can
+    /// land inverted (RFC 3515 §2.4.4 requires the 202 first). Grouping them
+    /// into one message pins them to a single worker, which sends them in
+    /// sequence.
+    ///
+    /// The guarantee is per-group ordering, NOT adjacency on the wire: another
+    /// worker may be sending a different group concurrently, so groups legitimately
+    /// interleave with each other. Many groups are driven through so a within-group
+    /// inversion has room to show up rather than passing by luck on one attempt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ordered_frames_are_not_reordered_across_workers() {
+        const GROUPS: usize = 100;
+        const FRAMES: usize = 3;
+
+        // Generous receive buffer + a reader running before anything is sent:
+        // the workers can burst faster than one recv loop drains, and a dropped
+        // datagram here would look like a failure without being one.
+        let peer = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        peer.set_recv_buffer_size(4 * 1024 * 1024).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        peer.bind(&SockAddr::from("127.0.0.1:0".parse::<SocketAddr>().unwrap()))
+            .unwrap();
+        let peer = tokio::net::UdpSocket::from_std(peer.into()).unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+
+        let reader = tokio::spawn(async move {
+            let mut received = Vec::with_capacity(GROUPS * FRAMES);
+            let mut buffer = [0u8; 2048];
+            while received.len() < GROUPS * FRAMES {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    peer.recv_from(&mut buffer),
+                )
+                .await
+                {
+                    Ok(Ok((size, _))) => {
+                        received.push(String::from_utf8_lossy(&buffer[..size]).to_string())
+                    }
+                    Ok(Err(error)) => panic!("recv failed: {error}"),
+                    Err(_) => break,
+                }
+            }
+            received
+        });
+
+        let listen_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let (inbound_tx, _inbound_rx) = flume::unbounded::<InboundMessage>();
+        let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+
+        listen(
+            listen_addr,
+            inbound_tx,
+            outbound_rx,
+            Arc::new(TransportAcl::new(vec![], vec![])),
+            None,
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        for group in 0..GROUPS {
+            outbound_tx
+                .send(OutboundMessage {
+                    connection_id: ConnectionId::default(),
+                    transport: Transport::Udp,
+                    destination: peer_addr,
+                    data: Bytes::from(format!("{group}:0")),
+                    source_local_addr: None,
+                    server_name: None,
+                    followups: Some(vec![
+                        Bytes::from(format!("{group}:1")),
+                        Bytes::from(format!("{group}:2")),
+                    ]),
+                })
+                .unwrap();
+        }
+
+        let received = reader.await.unwrap();
+        assert_eq!(
+            received.len(),
+            GROUPS * FRAMES,
+            "expected every frame to arrive; got {}",
+            received.len()
+        );
+
+        // Within each group, frame N must arrive before frame N+1.
+        let mut next_expected = vec![0usize; GROUPS];
+        for (arrival, payload) in received.iter().enumerate() {
+            let (group, frame) = payload.split_once(':').expect("malformed payload");
+            let group: usize = group.parse().expect("group id");
+            let frame: usize = frame.parse().expect("frame id");
+            assert_eq!(
+                frame, next_expected[group],
+                "group {group} frame {frame} arrived at position {arrival} but \
+                 frame {} was still outstanding — frames of one message were reordered",
+                next_expected[group]
+            );
+            next_expected[group] += 1;
+        }
     }
 }

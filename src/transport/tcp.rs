@@ -60,30 +60,45 @@ pub async fn listen(
                 // `try_send` keeps the guard for only the synchronous send and
                 // sheds for a backed-up (stuck) peer — it will retransmit or its
                 // connection will close.
-                match sender.try_send(outbound.data) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        warn!("TCP outbound dropped: connection {:?} send buffer full (slow/stuck peer)", outbound.connection_id);
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        warn!("TCP outbound dropped: connection {:?} closed", outbound.connection_id);
+                let connection_id = outbound.connection_id;
+                // Frames of one message keep their relative order: they enter
+                // the same per-connection channel back to back, and this is the
+                // only distributor task feeding it.
+                for frame in outbound.into_frames() {
+                    match sender.try_send(frame) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            warn!("TCP outbound dropped: connection {:?} send buffer full (slow/stuck peer)", connection_id);
+                            break;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            warn!("TCP outbound dropped: connection {:?} closed", connection_id);
+                            break;
+                        }
                     }
                 }
             } else if let Some(ref pool) = pool {
-                match pool.send_tcp(outbound.destination, outbound.data).await {
-                    Ok(connection_id) => {
-                        debug!(
-                            destination = %outbound.destination,
-                            connection_id = ?connection_id,
-                            "TCP outbound: sent via pool"
-                        );
-                    }
-                    Err(error) => {
-                        warn!(
-                            destination = %outbound.destination,
-                            connection_id = ?outbound.connection_id,
-                            "TCP outbound pool connect failed: {error}"
-                        );
+                let destination = outbound.destination;
+                let requested_connection_id = outbound.connection_id;
+                // Sequential await per frame — the pool coalesces to one
+                // connection per destination, so frames stay in order on it.
+                for frame in outbound.into_frames() {
+                    match pool.send_tcp(destination, frame).await {
+                        Ok(connection_id) => {
+                            debug!(
+                                destination = %destination,
+                                connection_id = ?connection_id,
+                                "TCP outbound: sent via pool"
+                            );
+                        }
+                        Err(error) => {
+                            warn!(
+                                destination = %destination,
+                                connection_id = ?requested_connection_id,
+                                "TCP outbound pool connect failed: {error}"
+                            );
+                            break;
+                        }
                     }
                 }
             } else {

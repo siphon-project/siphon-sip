@@ -187,13 +187,20 @@ fn spawn_outbound_dispatcher(
                 // the `connection_map` shard guard — stalling all outbound and
                 // blocking accept's `insert` on the same shard. `try_send` sheds
                 // for a backed-up (stuck) peer instead.
-                match sender.try_send(outbound.data) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        warn!("{} outbound dropped: connection {:?} send buffer full (slow/stuck peer)", label, outbound.connection_id);
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        warn!("{} outbound dropped: connection {:?} closed", label, outbound.connection_id);
+                let connection_id = outbound.connection_id;
+                // Frames of one message keep their relative order — same
+                // per-connection channel, single distributor task.
+                for frame in outbound.into_frames() {
+                    match sender.try_send(frame) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            warn!("{} outbound dropped: connection {:?} send buffer full (slow/stuck peer)", label, connection_id);
+                            break;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            warn!("{} outbound dropped: connection {:?} closed", label, connection_id);
+                            break;
+                        }
                     }
                 }
             } else {
