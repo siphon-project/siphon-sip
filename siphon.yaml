@@ -106,6 +106,26 @@ advertised_address: "127.0.0.1"
 #     # PEM chain + key. Both must be set together, or neither (startup fails on
 #     # a one-sided setting or an unreadable/unparseable file). Outbound TLS also
 #     # sends the resolved target hostname as SNI (was the destination IP).
+#   # INBOUND SNI (RFC 6066) — serve a different certificate per server name on
+#   # the SAME listener, instead of one SAN cert covering every domain (which
+#   # couples all of them to a single renewal). `certificate`/`private_key`
+#   # above stay the default, served when the client sends no SNI (any peer
+#   # addressing siphon by IP) or a name that matches nothing here.
+#   certificates:
+#     - server_names: ["sip.tenant-a.example", "sip.tenant-a.net"]
+#       certificate: "/etc/siphon/tls/tenant-a.crt"
+#       private_key:  "/etc/siphon/tls/tenant-a.key"
+#     - server_names: ["*.tenant-b.example"]
+#         # A wildcard matches exactly ONE leading label (RFC 6125 §6.4.3):
+#         # ue.tenant-b.example matches, tenant-b.example and a.b.tenant-b.example
+#         # do not. An exact entry always wins over a wildcard covering it.
+#       certificate: "/etc/siphon/tls/tenant-b.crt"
+#       private_key:  "/etc/siphon/tls/tenant-b.key"
+#     # Applies to listen.tls AND listen.wss (they share this block). Every pair
+#     # is hot-reloaded independently, so each tenant renews on its own ACME
+#     # schedule. A server name configured twice is a startup error.
+#     # verify_client/client_ca stay listener-wide — per-name client-cert trust
+#     # anchors are not expressible here.
 
 # ---------------------------------------------------------------------------
 # Python script

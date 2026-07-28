@@ -691,6 +691,7 @@ mod tests {
         TlsServerConfig {
             certificate: cert_path.to_str().unwrap().to_string(),
             private_key: key_path.to_str().unwrap().to_string(),
+            certificates: vec![],
             method: "TLSv1_3".to_string(),
             verify_client: false,
             client_ca: None,

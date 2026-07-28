@@ -64,6 +64,55 @@ sends the resolved target hostname as SNI (RFC 6066) instead of the destination
 IP, so a hostname-vhost front-end can route the handshake; bare-IP next hops
 send no SNI, as before.
 
+### Per-domain certificates (inbound SNI)
+
+One listener can serve a different certificate per server name, selected from
+the SNI extension the client sends in its ClientHello (RFC 6066). Without it,
+several domains on one socket need a single SAN certificate covering all of
+them, which couples every domain to one renewal — a failed validation for one
+blocks the certificate for all of them, and every peer sees the whole list.
+
+```yaml
+tls:
+  certificate: "/etc/siphon/tls/default.crt"   # served when nothing matches
+  private_key: "/etc/siphon/tls/default.key"
+  certificates:
+    - server_names: ["sip.tenant-a.example", "sip.tenant-a.net"]
+      certificate: "/etc/siphon/tls/tenant-a.crt"
+      private_key: "/etc/siphon/tls/tenant-a.key"
+    - server_names: ["*.tenant-b.example"]
+      certificate: "/etc/siphon/tls/tenant-b.crt"
+      private_key: "/etc/siphon/tls/tenant-b.key"
+```
+
+Matching rules:
+
+- Names are matched **case-insensitively** (RFC 4343).
+- A wildcard matches **exactly one leading label** (RFC 6125 §6.4.3):
+  `*.tenant-b.example` matches `ue.tenant-b.example`, but not
+  `tenant-b.example` and not `a.b.tenant-b.example`.
+- An **exact entry wins** over a wildcard that would also cover the name.
+- Anything unmatched — including every client that sends no SNI at all, which
+  is any peer addressing siphon by IP literal — gets the top-level
+  `certificate`/`private_key`. Selection never aborts a handshake, so a config
+  without `certificates:` behaves exactly as it did before.
+
+The block is shared by `listen.tls` **and** `listen.wss`, and every pair is
+watched independently, so each domain hot-reloads on its own ACME schedule
+without touching the others. A server name configured twice, an entry with an
+empty `server_names`, a malformed wildcard, or a certificate that does not match
+its key are all hard startup errors naming the offending path — none of them
+degrade into "some peers silently get the wrong certificate".
+
+`verify_client` / `client_ca` stay listener-wide: rustls can only vary client
+verification per name with a distinct config per handshake, and a per-domain
+trust anchor is a different feature from a per-domain server certificate.
+
+!!! note "SNI is not an authentication signal"
+    The server name is client-supplied plaintext chosen by whoever dialled in.
+    Use it to pick a certificate, never to decide who someone is — the SIP
+    domain in the request, or inbound mTLS, is what identifies a peer.
+
 A listener can be a **plain string** (`"10.0.0.1:5060"`) or the **extended form**
 with a per-socket advertised host and DSCP override (like OpenSIPS
 `socket … as …`):
