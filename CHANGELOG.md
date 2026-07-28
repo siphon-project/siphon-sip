@@ -48,6 +48,27 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   certificate — it is not an identity signal.
 
 ### Fixed
+- **An initial NOTIFY could overtake the 2xx that accepted its subscription.**
+  A script that replies to a SUBSCRIBE and then calls `subscribe_state.notify()`
+  / `presence.notify()` had the reply and the NOTIFY enqueued as two independent
+  messages, which does not order them on UDP. RFC 6665 §4.1.2.3 has the notifier
+  send the initial NOTIFY once the subscription is accepted — that is, after the
+  2xx. §4.4.1 obliges a subscriber to cope with the reverse arrival order, but
+  that allowance exists for a network that reorders in flight; it is not licence
+  for the notifier to emit out of order in the first place. Deferred messages
+  addressed to the same peer as the reply now leave as ordered followups of it.
+  Deferred messages for any other peer are unaffected and still go out at the end
+  of the request.
+- **A completed transfer could BYE the referrer before telling it the transfer
+  succeeded.** At the end of a siphon-terminated REFER the B2BUA sends the
+  referrer a terminating `NOTIFY` (sipfrag `200 OK`,
+  `Subscription-State: terminated`) and then BYEs that leg. Both went out as
+  separate enqueues to the same peer, which does not order them on UDP (same
+  cause as the 202/NOTIFY inversion below). Arriving inverted, the referrer
+  tears the dialog down on the BYE and answers the late NOTIFY with `481`,
+  never learning the outcome of the transfer it requested — RFC 3515 §2.4.4
+  makes that NOTIFY the result report, and RFC 5589 §6 shows it ahead of the
+  BYE. The pair now travels as one ordered unit when both target the same flow.
 - **REFER `202 Accepted` could be overtaken by its own first NOTIFY on UDP.**
   On a siphon-terminated transfer the B2BUA answers `202` and immediately sends
   the `message/sipfrag` `NOTIFY (100 Trying)` that opens the implicit
