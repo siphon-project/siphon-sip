@@ -6,6 +6,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.5.1] — 2026-07-29
+
 ### Added
 - **`tls.certificates` — per-domain server certificates selected by inbound SNI
   (RFC 6066).** One `listen.tls` / `listen.wss` socket can now serve a different
