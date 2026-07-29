@@ -2285,3 +2285,88 @@ fn promote_transfer_target_out_of_range_is_none() {
     store.set_winner(&call_id, 0);
     assert!(store.promote_transfer_target(&call_id, 5, true).is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Flow-pinned B-leg egress socket (captured flow / IPsec sec-agree)
+// ---------------------------------------------------------------------------
+
+/// A B-leg dialled over a captured flow (`call.dial(flow=…)`) is anchored on
+/// that flow's local socket, and the anchor has to survive on the leg — every
+/// later siphon-originated request on that leg (ACK, BYE, CANCEL, PRACK,
+/// re-INVITE) leaves from it and advertises it.
+///
+/// The soft-UE case this exists for (3GPP TS 33.203): the MO INVITE goes out
+/// the UE's protected client port, and the kernel XFRM selector matches only
+/// that source. A leg that forgot its socket sends the ACK and BYE from the
+/// plain listener instead — unprotected, outside the SA.
+#[test]
+fn flow_dialled_b_leg_keeps_its_egress_socket() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("flow-pinned@test"));
+
+    // UE protected client port; the plain listener would be :5060.
+    let port_uc: SocketAddr = "192.0.2.10:6100".parse().unwrap();
+    let pcscf: SocketAddr = "192.0.2.20:5066".parse().unwrap();
+    let b_leg = Leg::new_b_leg(
+        generate_call_id(),
+        generate_tag(),
+        "sip:bob@ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+        TransactionKey::generate_branch(),
+        TransportInfo {
+            remote_addr: pcscf,
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+            local_addr: Some(port_uc),
+        },
+    );
+    store.add_b_leg(&call_id, b_leg);
+    store.set_winner(&call_id, 0);
+
+    let call = store.get_call(&call_id).unwrap();
+    let winner = &call.b_legs[0];
+    assert_eq!(
+        winner.transport.local_addr,
+        Some(port_uc),
+        "the flow socket must stay on the leg — it is what pins every later egress"
+    );
+    assert_eq!(winner.transport.remote_addr, pcscf);
+    assert_eq!(winner.side, LegSide::B);
+}
+
+/// The pin has to outlive the call too: a `reinvite_done:` leg is preserved as a
+/// zombie so a retransmitted 200 OK can still be re-ACKed (RFC 3261 §13.2.2.4),
+/// and that re-ACK must leave from the same socket the leg was anchored on.
+#[test]
+fn zombie_reinvite_entry_preserves_the_flow_egress_socket() {
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("flow-pinned-zombie@test"));
+
+    let port_uc: SocketAddr = "192.0.2.10:6100".parse().unwrap();
+    let pcscf: SocketAddr = "192.0.2.20:5066".parse().unwrap();
+    let reinvite_leg = Leg::new_b_leg(
+        generate_call_id(),
+        generate_tag(),
+        "reinvite_done:a2b".to_string(),
+        TransactionKey::generate_branch(),
+        TransportInfo {
+            remote_addr: pcscf,
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+            local_addr: Some(port_uc),
+        },
+    );
+    let sip_call_id = reinvite_leg.dialog.call_id.clone();
+    store.add_b_leg(&call_id, reinvite_leg);
+
+    store.remove_call(&call_id);
+
+    let zombie = store
+        .get_zombie_reinvite(&sip_call_id)
+        .expect("reinvite_done leg is preserved for the post-teardown re-ACK");
+    assert_eq!(zombie.destination, pcscf);
+    assert_eq!(
+        zombie.local_addr,
+        Some(port_uc),
+        "the post-teardown re-ACK must still leave from the anchored socket"
+    );
+}

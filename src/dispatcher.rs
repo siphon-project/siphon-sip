@@ -2508,20 +2508,25 @@ fn handle_request(
                         if let Some((_, notify)) = state.uas_2xx_retransmits.remove(&internal_id) {
                             notify.notify_one();
                         }
-                        // Take the pending ACK and mark both legs as ACKed
-                        let pending_ack = if let Some(mut call) = state.call_actors.get_call_mut(&internal_id) {
+                        // Take the pending ACK and mark both legs as ACKed.
+                        // Grab the winning B-leg's anchored egress socket in the
+                        // same pass — the ACK has to leave from where its INVITE
+                        // did (flow-dialled legs; see `send_b2bua_to_bleg`).
+                        let (pending_ack, b_leg_local_addr) = if let Some(mut call) = state.call_actors.get_call_mut(&internal_id) {
                             call.a_leg.initial_acked = true;
+                            let mut b_leg_local_addr = None;
                             if let Some(b_leg) = call.winner.and_then(|i| call.b_legs.get_mut(i)) {
                                 b_leg.initial_acked = true;
+                                b_leg_local_addr = b_leg.transport.local_addr;
                             }
-                            call.pending_b_leg_ack.take()
+                            (call.pending_b_leg_ack.take(), b_leg_local_addr)
                         } else {
-                            None
+                            (None, None)
                         };
 
                         // Send the pre-built ACK to B-leg
                         if let Some((ack, b_transport, b_dest)) = pending_ack {
-                            send_b2bua_to_bleg(ack, b_transport, b_dest, state);
+                            send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
                             debug!(
                                 call_id = %internal_id,
                                 "B2BUA: sent deferred ACK to B-leg (A-leg ACKed)"
@@ -6433,6 +6438,97 @@ fn a_leg_advertised_port(a_leg_local_addr: Option<SocketAddr>, default_via_port:
         .unwrap_or(default_via_port)
 }
 
+/// The sent-by (host, port) siphon advertises in the `Via` and `Contact` of
+/// every request it originates toward a B-leg.
+///
+/// `b_leg_local_addr` is [`LegTransport::local_addr`], which is `Some` only for
+/// a leg dialled over a captured flow (`call.dial(flow=…)`).  A flow pins the
+/// leg to exactly one local socket, and the sent-by has to name *that* socket —
+/// not the default per-transport listener — because the far end answers to the
+/// sent-by and the response must come back over the same flow.  On an IPsec
+/// sec-agree leg that is the whole ballgame (3GPP TS 33.203 §7.4): a soft-UE's
+/// MO INVITE leaves the protected client port, so a `Via` naming the plain
+/// listener asks the P-CSCF to answer on a port outside the SA, where nothing
+/// is listening on the SA and the response is lost — the call then gets no
+/// answer at all and times out.  Same invariant the proxy `relay(flow=…)` path
+/// enforces in [`relay_request`].
+///
+/// The socket's own IP is used rather than the advertised host for the same
+/// reason: an advertised NAT address or FQDN does not identify the flow the
+/// response has to return over.  Unpinned legs (`None` — every non-flow B-leg)
+/// fall back to the per-transport advertised identity, byte-for-byte what
+/// siphon has always emitted.
+fn b_leg_sent_by(
+    b_leg_local_addr: Option<SocketAddr>,
+    state: &DispatcherState,
+    transport: &Transport,
+) -> (String, u16) {
+    match b_leg_local_addr {
+        Some(local) => pinned_sent_by(local),
+        None => (state.via_host(transport), state.via_port(transport)),
+    }
+}
+
+/// The sent-by naming a socket a leg is pinned to.
+///
+/// Pure half of [`b_leg_sent_by`], split out so the invariant that actually
+/// matters — *advertise the socket you send from* — is unit-testable without a
+/// `DispatcherState` fixture.
+fn pinned_sent_by(local: SocketAddr) -> (String, u16) {
+    // Bracket a v6 literal — a raw `ip().to_string()` would emit a malformed
+    // unbracketed `SIP/2.0/UDP 2001:db8::10:6100` sent-by.
+    (format_sip_host(&local.ip().to_string()), local.port())
+}
+
+/// Sent-by for a B-leg INVITE, by precedence:
+///
+/// 1. **The captured flow's socket.** A flow pins the egress absolutely — the
+///    INVITE is written to that socket — so nothing may override it. This is
+///    also why a `send_socket=` pin is dropped upstream for a flow-dialled leg.
+/// 2. **The script's `send_socket=` listener**, when it applies.
+/// 3. **The per-transport advertised identity** (`fallback`) — every ordinary
+///    B-leg, byte-for-byte unchanged. Taken lazily so the pinned paths don't pay
+///    for the lookup.
+///
+/// Pure so the precedence — the part the flow-egress bug got wrong, by using
+/// `fallback` even when a flow was attached — is testable without a
+/// `DispatcherState` fixture.
+fn b_leg_invite_sent_by(
+    flow_local_addr: Option<SocketAddr>,
+    send_socket_sent_by: Option<(String, u16)>,
+    fallback: impl FnOnce() -> (String, u16),
+) -> (String, u16) {
+    match (flow_local_addr, send_socket_sent_by) {
+        (Some(local), _) => pinned_sent_by(local),
+        (None, Some((host, port))) => (format_sip_host(&host), port),
+        (None, None) => fallback(),
+    }
+}
+
+/// The sent-by (host, port) for a request siphon originates on `leg` — BYE,
+/// PRACK, refresh re-INVITE.
+///
+/// Picked by side, because the two sides anchor for different reasons:
+///
+/// - **A-leg** — [`LegTransport::local_addr`] is the socket the call *arrived*
+///   on, so the identity is the advertised one for that socket (a NAT/topology
+///   -hiding deployment depends on the peer seeing the advertised host, not the
+///   bind IP), with the arrival port for multi-homed source-port parity.
+/// - **B-leg** — `local_addr` is set only by a captured flow, which pins the leg
+///   to one socket the response has to return over; see [`b_leg_sent_by`].
+fn leg_sent_by(leg: &crate::b2bua::actor::Leg, state: &DispatcherState) -> (String, u16) {
+    let transport = &leg.transport.transport;
+    match leg.side {
+        crate::b2bua::actor::LegSide::B => {
+            b_leg_sent_by(leg.transport.local_addr, state, transport)
+        }
+        crate::b2bua::actor::LegSide::A => (
+            state.a_leg_advertised_host(leg.transport.local_addr, transport),
+            a_leg_advertised_port(leg.transport.local_addr, state.via_port(transport)),
+        ),
+    }
+}
+
 /// Build the Route self-identity (RFC 3261 §16.4) from every source that can
 /// end up stamped into a Record-Route or Path.
 ///
@@ -7254,16 +7350,15 @@ fn build_b2bua_bye(
 
     let transport_str = format!("{}", leg.transport.transport).to_uppercase();
     let branch = TransactionKey::generate_branch();
-    // Via sent-by port is the listener this leg is anchored on (the A-leg's arrival
-    // socket on a multi-homed host) so the response comes back to the socket the
-    // request left from. Falls back to via_port for the B-leg (local_addr None) and
-    // single-listener hosts — no change there.
+    // Via sent-by is the socket this leg is anchored on — the A-leg's arrival
+    // socket on a multi-homed host, the B-leg's flow socket when it was dialled
+    // over one — so the response comes back to where the request left from.
+    // Unanchored legs and single-listener hosts fall back to the per-transport
+    // identity, unchanged.
+    let (via_host, via_port) = leg_sent_by(leg, state);
     let via = format!(
         "SIP/2.0/{} {}:{};branch={}",
-        transport_str,
-        state.a_leg_advertised_host(leg.transport.local_addr, &leg.transport.transport),
-        a_leg_advertised_port(leg.transport.local_addr, state.via_port(&leg.transport.transport)),
-        branch,
+        transport_str, via_host, via_port, branch,
     );
 
     // From/To: use stored URI strings from the dialog-creating INVITE
@@ -7392,17 +7487,14 @@ fn build_b2bua_prack(
     response_cseq_method: &str,
     local_cseq: u32,
 ) -> Option<SipMessage> {
-    // Via sent-by host:port is the listener this leg is anchored on (the A-leg's
-    // arrival socket on a multi-homed host) so the response comes back to the
-    // socket the request left from. The host is resolved per address family
+    // Via sent-by host:port is the socket this leg is anchored on (the A-leg's
+    // arrival socket on a multi-homed host, the B-leg's flow socket when it was
+    // dialled over one) so the response comes back to the socket the request
+    // left from. On the A-leg the host is resolved per address family
     // (dual-stack Gm) so a v6 UE's PRACK carries the v6 identity, not the first
-    // configured listener. Falls back to via_port for the B-leg (local_addr
-    // None) and single-listener hosts — no change there.
-    let via_host = state.a_leg_advertised_host(leg.transport.local_addr, &leg.transport.transport);
-    let via_port = a_leg_advertised_port(
-        leg.transport.local_addr,
-        state.via_port(&leg.transport.transport),
-    );
+    // configured listener. Unanchored legs and single-listener hosts fall back
+    // to the per-transport identity — no change there.
+    let (via_host, via_port) = leg_sent_by(leg, state);
     build_b2bua_prack_message(
         &leg.dialog,
         leg.transport.transport,
@@ -7508,10 +7600,28 @@ fn build_b2bua_prack_message(
     }
 }
 
+/// Send a siphon-originated message to a B-leg.
+///
+/// `source_local_addr` is the leg's anchored egress socket
+/// ([`LegTransport::local_addr`]) — set when the leg was dialled over a
+/// captured flow (`call.dial(flow=…)`), `None` otherwise.  A flow-dialled leg
+/// MUST keep leaving from that socket: on an IPsec sec-agree UE leg it is the
+/// protected client port, and the kernel XFRM selector matches nothing else, so
+/// a default-listener send goes out unprotected (3GPP TS 33.203 §7.4).  `None`
+/// falls back to the default egress, which is what every non-flow leg and every
+/// single-listener host has always done.
+///
+/// The pin is applied to UDP only, where it selects the listener socket to
+/// egress from (`udp_by_local`).  On a stream transport the leg is reached over
+/// a live connection instead — [`send_to_target`] reuses the accepted
+/// TCP/TLS/WS/WSS connection to the destination, and for a client-initiated
+/// WS/WSS flow that is the *only* way to reach the peer (RFC 7118 §5) — so
+/// handing it a source bind there would dial a fresh connection instead.
 fn send_b2bua_to_bleg(
     message: SipMessage,
     transport: Transport,
     destination: SocketAddr,
+    source_local_addr: Option<SocketAddr>,
     state: &DispatcherState,
 ) {
     let data = Bytes::from(message.to_bytes());
@@ -7520,7 +7630,18 @@ fn send_b2bua_to_bleg(
         transport: Some(transport),
         server_name: None,
     };
-    send_to_target(data, &target, transport, ConnectionId::default(), None, state);
+    let send_source = match transport {
+        Transport::Udp => source_local_addr,
+        _ => None,
+    };
+    send_to_target(
+        data,
+        &target,
+        transport,
+        ConnectionId::default(),
+        send_source,
+        state,
+    );
 }
 
 /// Create Rust-backed auth, registrar, log, and proxy utility singletons
@@ -9403,7 +9524,7 @@ fn handle_b2bua_cancel(
     // [b2bua_send_b_leg_invite]).  Legs whose INVITE hasn't been sent
     // yet get marked pending_cancel; the CANCEL drains automatically
     // once the stash lands.
-    let mut bleg_targets: Vec<(SipMessage, Transport, SocketAddr)> = Vec::new();
+    let mut bleg_targets: Vec<(SipMessage, Transport, SocketAddr, Option<SocketAddr>)> = Vec::new();
     for b_leg in call.b_legs.iter_mut() {
         match b_leg.b_leg_invite.as_ref() {
             Some(invite_arc) => {
@@ -9420,6 +9541,7 @@ fn handle_b2bua_cancel(
                             cancel_msg,
                             b_leg.transport.transport,
                             b_leg.transport.remote_addr,
+                            b_leg.transport.local_addr,
                         ));
                     }
                     None => {
@@ -9457,8 +9579,8 @@ fn handle_b2bua_cancel(
 
     // Emit the prepared CANCELs after dropping the call lock so the
     // outbound path doesn't reenter the DashMap.
-    for (cancel_msg, b_transport, b_dest) in bleg_targets {
-        send_b2bua_to_bleg(cancel_msg, b_transport, b_dest, state);
+    for (cancel_msg, b_transport, b_dest, b_local) in bleg_targets {
+        send_b2bua_to_bleg(cancel_msg, b_transport, b_dest, b_local, state);
     }
 
     // The 487 to the A-leg leaves on the socket the CANCEL (== the INVITE) arrived
@@ -9775,7 +9897,7 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
                 if !matches!(call.state, CallState::Calling | CallState::Ringing) {
                     return;
                 }
-                let mut targets: Vec<(SipMessage, Transport, SocketAddr)> = Vec::new();
+                let mut targets: Vec<(SipMessage, Transport, SocketAddr, Option<SocketAddr>)> = Vec::new();
                 for b_leg in &call.b_legs {
                     if let Some(invite_arc) = b_leg.b_leg_invite.as_ref() {
                         if let Ok(invite) = invite_arc.lock() {
@@ -9784,6 +9906,7 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
                                     cancel_msg,
                                     b_leg.transport.transport,
                                     b_leg.transport.remote_addr,
+                                    b_leg.transport.local_addr,
                                 ));
                             }
                         }
@@ -9815,8 +9938,8 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
         state.call_actors.record_route_failure(call_id, 408);
         // CANCEL the timed-out carrier's pending B-leg(s) (RFC 3261 §9.1) and
         // mark them cancelled so their stray 487s are absorbed.
-        for (cancel_msg, transport, dest) in &cancel_targets {
-            send_b2bua_to_bleg(cancel_msg.clone(), *transport, *dest, state);
+        for (cancel_msg, transport, dest, local) in &cancel_targets {
+            send_b2bua_to_bleg(cancel_msg.clone(), *transport, *dest, *local, state);
         }
         for tx in &handle_txs {
             let _ = tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
@@ -9842,8 +9965,8 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
     cdr_finalize_b2bua_fail(state, call_id, 408);
 
     // CANCEL each pending B-leg transaction (RFC 3261 §9.1).
-    for (cancel_msg, transport, dest) in cancel_targets {
-        send_b2bua_to_bleg(cancel_msg, transport, dest, state);
+    for (cancel_msg, transport, dest, local) in cancel_targets {
+        send_b2bua_to_bleg(cancel_msg, transport, dest, local, state);
     }
     for tx in &handle_txs {
         let _ = tx.try_send(crate::b2bua::actor::LegMessage::Cancel);
@@ -10586,15 +10709,22 @@ fn b2bua_send_b_leg_invite(
         None => None,
     };
 
+    // The local socket this B-leg is anchored on — `Some` when the script
+    // dialled over a captured flow, which is what pins the egress.  The leg
+    // keeps it (see `LegTransport::local_addr` below) so every later
+    // siphon-originated request on this leg leaves from the same socket.
+    let flow_local_addr = flow.map(|f| f.local_addr);
+
     // Build a new INVITE for the B-leg
     let branch = TransactionKey::generate_branch();
-    let (via_host, via_port) = match send_socket {
-        Some(pin) => {
-            let (host, port) = pin.via_sent_by();
-            (format_sip_host(&host), port)
-        }
-        None => (state.via_host(&outbound_transport), state.via_port(&outbound_transport)),
-    };
+    // The one identity this B-leg advertises — Via sent-by AND Contact.  Both
+    // have to name the socket the INVITE actually leaves from, or the far end
+    // answers somewhere we are not listening on this flow.
+    let (via_host, via_port) = b_leg_invite_sent_by(
+        flow_local_addr,
+        send_socket.map(|pin| pin.via_sent_by()),
+        || (state.via_host(&outbound_transport), state.via_port(&outbound_transport)),
+    );
     let via_value = format!(
         "SIP/2.0/{} {}:{};branch={}",
         outbound_transport,
@@ -10725,8 +10855,16 @@ fn b2bua_send_b_leg_invite(
     //     for a downstream that keys a tenant/extension off the Contact user);
     //   set_contact_uri()  → replace the whole URI (edge/GRUU deployments that
     //     front siphon — the deployment owns routing the in-dialog target back).
-    let b_contact_host = state.via_host(&outbound_transport);
-    let b_contact_port = state.via_port(&outbound_transport);
+    //
+    // On a flow-pinned B-leg the Contact names the flow's own socket, the same
+    // sent-by as the Via above: an in-dialog request from the far end has to
+    // arrive back on the socket the dialog is anchored on, which for an IPsec SA
+    // means a protected port (anything else is outside the SA).  A `send_socket=`
+    // pin deliberately does NOT move the Contact — that feature pins egress and
+    // the Via so the *response* returns to the chosen listener; the in-dialog
+    // remote target stays the advertised address, as it was before flows.
+    let (b_contact_host, b_contact_port) =
+        b_leg_sent_by(flow_local_addr, state, &outbound_transport);
     let b_contact_value = build_b_leg_contact(
         &b_contact_host,
         b_contact_port,
@@ -10863,7 +11001,11 @@ fn b2bua_send_b_leg_invite(
             remote_addr: destination,
             connection_id: flow.map(|f| ConnectionId(f.connection_id)).unwrap_or_default(),
             transport: outbound_transport,
-            local_addr: None,
+            // Anchor the leg on the flow's socket so every later B-leg egress
+            // leaves from the same place the INVITE did (the Via/Contact above
+            // advertise it, and on an IPsec SA it is the only source address
+            // the kernel selector matches).
+            local_addr: flow_local_addr,
         },
     );
     b_leg.dialog.local_contact = Some(b_contact_value);
@@ -10975,7 +11117,10 @@ fn b2bua_send_b_leg_invite(
 
     if let Some((cancel_msg, b_transport, b_dest)) = deferred_cancel {
         debug!(call_id = %call_id, "B2BUA: draining deferred CANCEL after INVITE stash");
-        send_b2bua_to_bleg(cancel_msg, b_transport, b_dest, state);
+        // Same egress socket as the INVITE it cancels — RFC 3261 §9.1 puts the
+        // CANCEL on the INVITE's own hop, and on a flow-pinned leg that hop is
+        // the flow's socket.
+        send_b2bua_to_bleg(cancel_msg, b_transport, b_dest, flow_local_addr, state);
     }
 }
 
@@ -11429,7 +11574,7 @@ fn handle_b2bua_response(
 
     // Get the A-leg info and stored INVITE for handler reconstruction.
     // Extract everything we need then drop the DashMap ref before entering Python.
-    let (a_leg, a_leg_invite, b_leg_target, b_leg_remote_contact, _b_leg_local_contact, b_leg_dialog, b_leg_dest, b_leg_connection_id, b_leg_index, b_leg_stored_vias, b_leg_stored_cseq, b_leg_stored_from, b_leg_stored_to, call_state, outbound_credentials, li_record, b_leg_handle_tx, b_leg_stored_invite, b_leg_local_cseq, a_leg_supports_100rel, a_leg_local_addr) = match state.call_actors.get_call(call_id) {
+    let (a_leg, a_leg_invite, b_leg_target, b_leg_remote_contact, _b_leg_local_contact, b_leg_dialog, b_leg_dest, b_leg_local_addr, b_leg_connection_id, b_leg_index, b_leg_stored_vias, b_leg_stored_cseq, b_leg_stored_from, b_leg_stored_to, call_state, outbound_credentials, li_record, b_leg_handle_tx, b_leg_stored_invite, b_leg_local_cseq, a_leg_supports_100rel, a_leg_local_addr) = match state.call_actors.get_call(call_id) {
         Some(call) => {
             let matching_b_idx = call.b_legs.iter().position(|b| b.branch == branch);
             let matching_b = matching_b_idx.map(|i| &call.b_legs[i]);
@@ -11438,6 +11583,11 @@ fn handle_b2bua_response(
             let local_contact = matching_b.and_then(|b| b.dialog.local_contact.clone());
             let dialog = matching_b.map(|b| (b.dialog.call_id.clone(), b.dialog.local_tag.clone()));
             let dest = matching_b.map(|b| (b.transport.remote_addr, b.transport.transport));
+            // The socket this B-leg is anchored on — `Some` only when the leg
+            // was dialled over a captured flow (`call.dial(flow=…)`). Every
+            // siphon-originated request we put back on this leg (auto-PRACK,
+            // ACK, BYE, forwarded re-INVITE/UPDATE) has to leave from it.
+            let b_local_addr = matching_b.and_then(|b| b.transport.local_addr);
             // The connection_id the original B-leg INVITE was sent on — reused
             // by the 401/407 retry path so the credentialed re-INVITE stays on
             // the same trunk member that issued the nonce (RFC 5923).
@@ -11452,7 +11602,7 @@ fn handle_b2bua_response(
                 .map(|h| h.tx.clone());
             let stored_invite = matching_b.and_then(|b| b.b_leg_invite.clone());
             let local_cseq = matching_b.map(|b| b.dialog.local_cseq).unwrap_or(2);
-            (call.a_leg.clone(), call.a_leg_invite.clone(), target, remote_contact, local_contact, dialog, dest, connection_id, matching_b_idx, stored_vias, stored_cseq, stored_from, stored_to, call.state.clone(), call.outbound_credentials.clone(), call.li_record, handle_tx, stored_invite, local_cseq, call.a_leg_supports_100rel, call.a_leg_local_addr)
+            (call.a_leg.clone(), call.a_leg_invite.clone(), target, remote_contact, local_contact, dialog, dest, b_local_addr, connection_id, matching_b_idx, stored_vias, stored_cseq, stored_from, stored_to, call.state.clone(), call.outbound_credentials.clone(), call.li_record, handle_tx, stored_invite, local_cseq, call.a_leg_supports_100rel, call.a_leg_local_addr)
         }
         None => {
             warn!(call_id = %call_id, "B2BUA: response for unknown call");
@@ -11601,7 +11751,7 @@ fn handle_b2bua_response(
                                 %destination,
                                 "B2BUA: sending auto-PRACK for reliable 1xx from B-leg"
                             );
-                            send_b2bua_to_bleg(prack, prack_transport, destination, state);
+                            send_b2bua_to_bleg(prack, prack_transport, destination, b_leg_local_addr, state);
                         }
                     }
                 }
@@ -11640,15 +11790,26 @@ fn handle_b2bua_response(
             if let Some((responder_dest, responder_transport)) = b_leg_dest {
                 if let Some((ref responder_cid, ref _responder_ftag)) = b_leg_dialog {
                     let transport_str = format!("{}", responder_transport).to_uppercase();
-                    // ACK Via sent-by port: the responder's anchored listener. When
-                    // the responder is the A-leg (B→A re-INVITE, !is_a2b) that's the
-                    // arrival socket on a multi-homed host; otherwise the default.
-                    let outbound_port = a_leg_advertised_port(
-                        if is_a2b { None } else { a_leg.transport.local_addr },
-                        state.listen_addrs.get(&responder_transport)
-                            .map(|a| a.port())
-                            .unwrap_or(state.local_addr.port()),
-                    );
+                    // ACK Via sent-by: the responder's anchored listener. When the
+                    // responder is the A-leg (B→A re-INVITE, !is_a2b) that's the
+                    // arrival socket on a multi-homed host; when it is the B-leg,
+                    // the flow socket the leg was dialled over (`b_leg_sent_by`).
+                    let (outbound_host, outbound_port) = if is_a2b {
+                        b_leg_sent_by(b_leg_local_addr, state, &responder_transport)
+                    } else {
+                        (
+                            state.a_leg_advertised_host(
+                                a_leg.transport.local_addr,
+                                &responder_transport,
+                            ),
+                            a_leg_advertised_port(
+                                a_leg.transport.local_addr,
+                                state.listen_addrs.get(&responder_transport)
+                                    .map(|a| a.port())
+                                    .unwrap_or(state.local_addr.port()),
+                            ),
+                        )
+                    };
                     let cseq_num = message.headers.cseq()
                         .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
                         .unwrap_or_else(|| "1".to_string());
@@ -11674,10 +11835,7 @@ fn handle_b2bua_response(
                         .via(format!(
                             "SIP/2.0/{} {}:{};branch={}",
                             transport_str,
-                            state.a_leg_advertised_host(
-                                if is_a2b { None } else { a_leg.transport.local_addr },
-                                &responder_transport,
-                            ),
+                            outbound_host,
                             outbound_port,
                             TransactionKey::generate_branch(),
                         ))
@@ -11696,7 +11854,7 @@ fn handle_b2bua_response(
                         }
                     };
                     if is_a2b {
-                        send_b2bua_to_bleg(ack, responder_transport, responder_dest, state);
+                        send_b2bua_to_bleg(ack, responder_transport, responder_dest, b_leg_local_addr, state);
                     } else {
                         // ACK to the A-leg responder — source it from the A-leg's
                         // anchored socket (multi-homed source-port parity; Via above
@@ -11741,15 +11899,19 @@ fn handle_b2bua_response(
         // Determine where to route the response: back to the leg that sent the re-INVITE.
         // A→B re-INVITE: response goes to A-leg, rewrite B-leg→A-leg headers
         // B→A re-INVITE: response goes to B-leg, rewrite A-leg→B-leg headers
-        let (resp_dest, resp_transport, resp_conn_id) = if is_a2b {
-            (a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.transport.connection_id)
+        // The 4th element is the responder leg's anchored egress socket, so the
+        // forwarded response leaves from the same socket that leg is bridged on
+        // (A-leg: its arrival listener; B-leg: its flow socket, when dialled
+        // with `call.dial(flow=…)`).
+        let (resp_dest, resp_transport, resp_conn_id, resp_local_addr) = if is_a2b {
+            (a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.transport.connection_id, a_leg_local_addr)
         } else {
             // B→A: send response to winning B-leg
             match state.call_actors.get_call(call_id) {
                 Some(call) => {
                     let winner = call.winner.and_then(|i| call.b_legs.get(i));
                     if let Some(b) = winner {
-                        (b.transport.remote_addr, b.transport.transport, ConnectionId::default())
+                        (b.transport.remote_addr, b.transport.transport, ConnectionId::default(), b.transport.local_addr)
                     } else {
                         warn!(call_id = %call_id, "B2BUA re-INVITE response: no winning B-leg");
                         return;
@@ -11878,15 +12040,26 @@ fn handle_b2bua_response(
             if let Some((responder_dest, responder_transport)) = b_leg_dest {
                 if let Some((ref responder_cid, ref _responder_ftag)) = b_leg_dialog {
                     let transport_str = format!("{}", responder_transport).to_uppercase();
-                    // ACK Via sent-by port: the responder's anchored listener. When
-                    // the responder is the A-leg (B→A re-INVITE, !is_a2b) that's the
-                    // arrival socket on a multi-homed host; otherwise the default.
-                    let outbound_port = a_leg_advertised_port(
-                        if is_a2b { None } else { a_leg.transport.local_addr },
-                        state.listen_addrs.get(&responder_transport)
-                            .map(|a| a.port())
-                            .unwrap_or(state.local_addr.port()),
-                    );
+                    // ACK Via sent-by: the responder's anchored listener. When the
+                    // responder is the A-leg (B→A re-INVITE, !is_a2b) that's the
+                    // arrival socket on a multi-homed host; when it is the B-leg,
+                    // the flow socket the leg was dialled over (`b_leg_sent_by`).
+                    let (outbound_host, outbound_port) = if is_a2b {
+                        b_leg_sent_by(b_leg_local_addr, state, &responder_transport)
+                    } else {
+                        (
+                            state.a_leg_advertised_host(
+                                a_leg.transport.local_addr,
+                                &responder_transport,
+                            ),
+                            a_leg_advertised_port(
+                                a_leg.transport.local_addr,
+                                state.listen_addrs.get(&responder_transport)
+                                    .map(|a| a.port())
+                                    .unwrap_or(state.local_addr.port()),
+                            ),
+                        )
+                    };
                     // Use the responder's CSeq (captured before originator CSeq restoration).
                     let cseq_num = responder_cseq_num.clone();
                     let from = message.headers.from().cloned().unwrap_or_default();
@@ -11911,10 +12084,7 @@ fn handle_b2bua_response(
                         .via(format!(
                             "SIP/2.0/{} {}:{};branch={}",
                             transport_str,
-                            state.a_leg_advertised_host(
-                                if is_a2b { None } else { a_leg.transport.local_addr },
-                                &responder_transport,
-                            ),
+                            outbound_host,
                             outbound_port,
                             ack_branch,
                         ))
@@ -11933,7 +12103,7 @@ fn handle_b2bua_response(
                         }
                     };
                     if is_a2b {
-                        send_b2bua_to_bleg(ack, responder_transport, responder_dest, state);
+                        send_b2bua_to_bleg(ack, responder_transport, responder_dest, b_leg_local_addr, state);
                     } else {
                         // ACK to the A-leg responder — source it from the A-leg's
                         // anchored socket (multi-homed source-port parity; Via above
@@ -12002,9 +12172,9 @@ fn handle_b2bua_response(
             );
         } else if is_a2b {
             // A→B re-INVITE: the response goes to the A-leg — pin its arrival socket.
-            send_message_from(message.clone(), resp_transport, resp_dest, resp_conn_id, a_leg_local_addr, state);
+            send_message_from(message.clone(), resp_transport, resp_dest, resp_conn_id, resp_local_addr, state);
         } else {
-            send_b2bua_to_bleg(message.clone(), resp_transport, resp_dest, state);
+            send_b2bua_to_bleg(message.clone(), resp_transport, resp_dest, resp_local_addr, state);
         }
 
         debug!(
@@ -12026,14 +12196,16 @@ fn handle_b2bua_response(
     if let Some(direction) = update_direction {
         let is_a2b = direction == "a2b";
 
-        let (resp_dest, resp_transport, resp_conn_id) = if is_a2b {
-            (a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.transport.connection_id)
+        // 4th element: the responder leg's anchored egress socket (see the
+        // re-INVITE response path above).
+        let (resp_dest, resp_transport, resp_conn_id, resp_local_addr) = if is_a2b {
+            (a_leg.transport.remote_addr, a_leg.transport.transport, a_leg.transport.connection_id, a_leg_local_addr)
         } else {
             match state.call_actors.get_call(call_id) {
                 Some(call) => {
                     let winner = call.winner.and_then(|i| call.b_legs.get(i));
                     if let Some(b) = winner {
-                        (b.transport.remote_addr, b.transport.transport, ConnectionId::default())
+                        (b.transport.remote_addr, b.transport.transport, ConnectionId::default(), b.transport.local_addr)
                     } else {
                         warn!(call_id = %call_id, "B2BUA UPDATE response: no winning B-leg");
                         return;
@@ -12142,9 +12314,9 @@ fn handle_b2bua_response(
         // Forward response to the originator.
         if is_a2b {
             // A→B UPDATE: the response goes to the A-leg — pin its arrival socket.
-            send_message_from(message.clone(), resp_transport, resp_dest, resp_conn_id, a_leg_local_addr, state);
+            send_message_from(message.clone(), resp_transport, resp_dest, resp_conn_id, resp_local_addr, state);
         } else {
-            send_b2bua_to_bleg(message.clone(), resp_transport, resp_dest, state);
+            send_b2bua_to_bleg(message.clone(), resp_transport, resp_dest, resp_local_addr, state);
         }
 
         debug!(
@@ -12167,16 +12339,19 @@ fn handle_b2bua_response(
     });
     if let Some((marker, direction)) = transfer_response {
         let is_a2b = direction == "a2b";
-        let (resp_dest, resp_transport, resp_conn_id) = if is_a2b {
+        // 4th element: the responder leg's anchored egress socket (see the
+        // re-INVITE response path above).
+        let (resp_dest, resp_transport, resp_conn_id, resp_local_addr) = if is_a2b {
             (
                 a_leg.transport.remote_addr,
                 a_leg.transport.transport,
                 a_leg.transport.connection_id,
+                a_leg_local_addr,
             )
         } else {
             match state.call_actors.get_call(call_id) {
                 Some(call) => match call.winner.and_then(|i| call.b_legs.get(i)) {
-                    Some(b) => (b.transport.remote_addr, b.transport.transport, ConnectionId::default()),
+                    Some(b) => (b.transport.remote_addr, b.transport.transport, ConnectionId::default(), b.transport.local_addr),
                     None => {
                         warn!(call_id = %call_id, marker, "B2BUA transfer response: no winning B-leg");
                         return;
@@ -12285,9 +12460,9 @@ fn handle_b2bua_response(
         }
 
         if is_a2b {
-            send_message_from(message.clone(), resp_transport, resp_dest, resp_conn_id, a_leg_local_addr, state);
+            send_message_from(message.clone(), resp_transport, resp_dest, resp_conn_id, resp_local_addr, state);
         } else {
-            send_b2bua_to_bleg(message.clone(), resp_transport, resp_dest, state);
+            send_b2bua_to_bleg(message.clone(), resp_transport, resp_dest, resp_local_addr, state);
         }
         debug!(call_id = %call_id, status = status_code, marker, direction, "B2BUA: forwarded transparent transfer response");
         return;
@@ -12488,9 +12663,10 @@ fn handle_b2bua_response(
                             .and_then(|u| parse_uri_standalone(u).ok()))
                         .unwrap_or_else(|| SipUri::new("invalid".to_string()));
                     let transport_str = format!("{}", b_transport).to_uppercase();
-                    let outbound_port = state.listen_addrs.get(&b_transport)
-                        .map(|a| a.port())
-                        .unwrap_or(state.local_addr.port());
+                    // Sent-by of the leg this ACK goes back on — the flow socket
+                    // when the leg was dialled over one.
+                    let (outbound_host, outbound_port) =
+                        b_leg_sent_by(b_leg_local_addr, state, &b_transport);
                     let cseq_num = message.headers.cseq()
                         .and_then(|c| c.split_whitespace().next().map(|s| s.to_string()))
                         .unwrap_or_else(|| "1".to_string());
@@ -12501,7 +12677,7 @@ fn handle_b2bua_response(
                         .via(format!(
                             "SIP/2.0/{} {}:{};branch={}",
                             transport_str,
-                            format_sip_host(&state.local_addr.ip().to_string()),
+                            outbound_host,
                             outbound_port,
                             TransactionKey::generate_branch(),
                         ))
@@ -12519,7 +12695,7 @@ fn handle_b2bua_response(
                             return;
                         }
                     };
-                    send_b2bua_to_bleg(ack, b_transport, b_dest, state);
+                    send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
                 }
             }
             return;
@@ -12866,13 +13042,18 @@ fn handle_b2bua_response(
                 // Flatten BEFORE reversing — see flatten_record_route_headers comment.
                 let b_leg_routes = uac_route_set_from_record_routes(&b_leg_record_routes);
 
+                // Sent-by of the leg this ACK goes back on — the flow socket when
+                // the leg was dialled over one, so the ACK is consistent with the
+                // INVITE that drew this 2xx and leaves the same way (below).
+                let (ack_via_host, ack_via_port) =
+                    b_leg_sent_by(b_leg_local_addr, state, &b_transport);
                 let mut ack_builder = SipMessageBuilder::new()
                     .request(Method::Ack, ack_uri)
                     .via(format!(
                         "SIP/2.0/{} {}:{};branch={}",
                         transport_str,
-                        state.via_host(&b_transport),
-                        state.via_port(&b_transport),
+                        ack_via_host,
+                        ack_via_port,
                         TransactionKey::generate_branch(),
                     ))
                     .from(from.to_string())
@@ -13247,14 +13428,15 @@ fn handle_b2bua_response(
                                 let mut retry = original.clone();
                                 drop(original);
 
-                                // Replace Via with new branch
+                                // Replace Via with new branch. The retry continues
+                                // the same B-leg, so it keeps the leg's sent-by —
+                                // the flow socket when it was dialled over one.
                                 let new_branch = TransactionKey::generate_branch();
+                                let (retry_via_host, retry_via_port) =
+                                    b_leg_sent_by(b_leg_local_addr, state, &transport);
                                 let via_value = format!(
                                     "SIP/2.0/{} {}:{};branch={}",
-                                    transport,
-                                    state.via_host(&transport),
-                                    state.via_port(&transport),
-                                    new_branch,
+                                    transport, retry_via_host, retry_via_port, new_branch,
                                 );
                                 retry.headers.set("Via", via_value);
 
@@ -13300,7 +13482,9 @@ fn handle_b2bua_response(
                                         remote_addr: destination,
                                         connection_id: reuse_connection_id,
                                         transport,
-                                        local_addr: None,
+                                        // The retry IS this B-leg continuing, so
+                                        // it keeps the leg's anchored socket.
+                                        local_addr: b_leg_local_addr,
                                     },
                                 );
                                 // Stash the retry INVITE so a caller CANCEL during
@@ -13328,7 +13512,13 @@ fn handle_b2bua_response(
                                 }
 
                                 let data = Bytes::from(retry.to_bytes());
-                                send_to_target(data, &relay_target, transport, reuse_connection_id, None, state);
+                                // Egress from the leg's anchored socket (UDP only —
+                                // a stream leg is reached over its connection).
+                                let retry_source = match transport {
+                                    Transport::Udp => b_leg_local_addr,
+                                    _ => None,
+                                };
+                                send_to_target(data, &relay_target, transport, reuse_connection_id, retry_source, state);
                             }
                             return; // don't forward 422 to A-leg or fire on_failure
                         }
@@ -13364,15 +13554,20 @@ fn handle_b2bua_response(
                 && state.call_actors.auth_retry_count(call_id) >= MAX_B2BUA_AUTH_RETRIES
             {
                 if let Some((b_dest, b_transport)) = b_leg_dest {
+                    // RFC 3261 §17.1.1.3 — this ACK belongs to the INVITE's own
+                    // client transaction, so its Via sent-by must be the one the
+                    // INVITE used: the leg's flow socket when it has one.
+                    let (ack_via_host, ack_via_port) =
+                        b_leg_sent_by(b_leg_local_addr, state, &b_transport);
                     let ack = build_b2bua_ack_for_non2xx(
                         message,
                         branch,
                         b_leg_target.as_deref(),
                         b_transport,
-                        &state.via_host(&b_transport),
-                        state.via_port(&b_transport),
+                        &ack_via_host,
+                        ack_via_port,
                     );
-                    send_b2bua_to_bleg(ack, b_transport, b_dest, state);
+                    send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
                 }
                 let first = b_leg_index
                     .map(|idx| state.call_actors.try_mark_auth_challenged(call_id, idx))
@@ -13408,15 +13603,20 @@ fn handle_b2bua_response(
                             // retransmitting until Timer B and feeds the re-retry
                             // bug guarded against next.
                             if let Some((b_dest, b_transport)) = b_leg_dest {
+                                // RFC 3261 §17.1.1.3 — same client transaction as
+                                // the INVITE, so the same sent-by (flow socket
+                                // when the leg is pinned).
+                                let (ack_via_host, ack_via_port) =
+                                    b_leg_sent_by(b_leg_local_addr, state, &b_transport);
                                 let ack = build_b2bua_ack_for_non2xx(
                                     message,
                                     branch,
                                     b_leg_target.as_deref(),
                                     b_transport,
-                                    &state.via_host(&b_transport),
-                                    state.via_port(&b_transport),
+                                    &ack_via_host,
+                                    ack_via_port,
                                 );
-                                send_b2bua_to_bleg(ack, b_transport, b_dest, state);
+                                send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
                             }
 
                             // Only the FIRST challenge on this leg drives a retry.
@@ -13516,12 +13716,14 @@ fn handle_b2bua_response(
                                 // P-Asserted-Identity, Record-Route stripping, and the SDP body
                                 // (anchored by rtpengine if applicable) are all already correct.
                                 let new_branch = TransactionKey::generate_branch();
+                                // The credentialed retry continues the same B-leg,
+                                // so it keeps the leg's sent-by (flow socket when
+                                // it was dialled over one).
+                                let (retry_via_host, retry_via_port) =
+                                    b_leg_sent_by(b_leg_local_addr, state, &transport);
                                 let via_value = format!(
                                     "SIP/2.0/{} {}:{};branch={}",
-                                    transport,
-                                    state.via_host(&transport),
-                                    state.via_port(&transport),
-                                    new_branch,
+                                    transport, retry_via_host, retry_via_port, new_branch,
                                 );
                                 let retry = {
                                     let Ok(original) = stored_invite_arc.lock() else {
@@ -13554,7 +13756,9 @@ fn handle_b2bua_response(
                                         remote_addr: destination,
                                         connection_id: reuse_connection_id,
                                         transport,
-                                        local_addr: None,
+                                        // The retry IS this B-leg continuing, so
+                                        // it keeps the leg's anchored socket.
+                                        local_addr: b_leg_local_addr,
                                     },
                                 );
                                 // Preserve dialog state from the failed attempt:
@@ -13599,7 +13803,13 @@ fn handle_b2bua_response(
                                 }
 
                                 let data = Bytes::from(retry.to_bytes());
-                                send_to_target(data, &relay_target, transport, reuse_connection_id, None, state);
+                                // Egress from the leg's anchored socket (UDP only —
+                                // a stream leg is reached over its connection).
+                                let retry_source = match transport {
+                                    Transport::Udp => b_leg_local_addr,
+                                    _ => None,
+                                };
+                                send_to_target(data, &relay_target, transport, reuse_connection_id, retry_source, state);
                             }
                             return; // don't forward 401/407 to A-leg or fire on_failure
                         }
@@ -13657,15 +13867,18 @@ fn handle_b2bua_response(
                 });
             if already_cancelled || status_code == 487 || call_state == CallState::Answered {
                 if let Some((b_dest, b_transport)) = b_leg_dest {
+                    // RFC 3261 §17.1.1.3 — same client transaction as the INVITE.
+                    let (ack_via_host, ack_via_port) =
+                        b_leg_sent_by(b_leg_local_addr, state, &b_transport);
                     let ack = build_b2bua_ack_for_non2xx(
                         message,
                         branch,
                         b_leg_target.as_deref(),
                         b_transport,
-                        &state.via_host(&b_transport),
-                        state.via_port(&b_transport),
+                        &ack_via_host,
+                        ack_via_port,
                     );
-                    send_b2bua_to_bleg(ack, b_transport, b_dest, state);
+                    send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
                 }
                 debug!(call_id = %call_id, status = status_code,
                     "LCR: absorbing straggler carrier response (cancelled / post-answer / 487)");
@@ -13683,15 +13896,18 @@ fn handle_b2bua_response(
                 // A-leg Call-ID and reused by the next carrier's B-leg, so it is
                 // intentionally NOT torn down here.
                 if let Some((b_dest, b_transport)) = b_leg_dest {
+                    // RFC 3261 §17.1.1.3 — same client transaction as the INVITE.
+                    let (ack_via_host, ack_via_port) =
+                        b_leg_sent_by(b_leg_local_addr, state, &b_transport);
                     let ack = build_b2bua_ack_for_non2xx(
                         message,
                         branch,
                         b_leg_target.as_deref(),
                         b_transport,
-                        &state.via_host(&b_transport),
-                        state.via_port(&b_transport),
+                        &ack_via_host,
+                        ack_via_port,
                     );
-                    send_b2bua_to_bleg(ack, b_transport, b_dest, state);
+                    send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
                     b_leg_acked_for_reroute = true;
                 }
                 let advanced = match a_leg_invite.as_ref().map(|arc| arc.lock()) {
@@ -13775,15 +13991,19 @@ fn handle_b2bua_response(
         // trying (and failing to route) the next one — no double ACK.
         if let Some((b_dest, b_transport)) = b_leg_dest {
             if !b_leg_acked_for_reroute {
+                // RFC 3261 §17.1.1.3 — same client transaction as the INVITE, so
+                // the same sent-by (the leg's flow socket when it has one).
+                let (ack_via_host, ack_via_port) =
+                    b_leg_sent_by(b_leg_local_addr, state, &b_transport);
                 let ack = build_b2bua_ack_for_non2xx(
                     message,
                     branch,
                     b_leg_target.as_deref(),
                     b_transport,
-                    &state.via_host(&b_transport),
-                    state.via_port(&b_transport),
+                    &ack_via_host,
+                    ack_via_port,
                 );
-                send_b2bua_to_bleg(ack, b_transport, b_dest, state);
+                send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
             }
         }
 
@@ -13977,15 +14197,14 @@ fn handle_zombie_cancelled_2xx(
 ) {
     let transport = leg.transport.transport;
     let destination = leg.transport.remote_addr;
+    // The socket this leg was dialled from (flow-pinned legs) — the ACK and BYE
+    // below have to leave from it and advertise it, exactly as the INVITE did.
+    let local_addr = leg.transport.local_addr;
+    let (via_host, via_port) = b_leg_sent_by(local_addr, state, &transport);
 
     // ACK the 2xx on every match — a lost ACK leaves the callee retransmitting.
-    if let Some(ack) = build_b2bua_ack_for_2xx(
-        response,
-        transport,
-        &state.via_host(&transport),
-        state.via_port(&transport),
-    ) {
-        send_b2bua_to_bleg(ack, transport, destination, state);
+    if let Some(ack) = build_b2bua_ack_for_2xx(response, transport, &via_host, via_port) {
+        send_b2bua_to_bleg(ack, transport, destination, local_addr, state);
     }
 
     if !first_2xx {
@@ -14007,7 +14226,7 @@ fn handle_zombie_cancelled_2xx(
     leg.dialog.local_cseq = invite_cseq.saturating_add(1);
 
     if let Some(bye) = build_b2bua_bye(&leg, state) {
-        send_b2bua_to_bleg(bye, transport, destination, state);
+        send_b2bua_to_bleg(bye, transport, destination, local_addr, state);
         debug!(
             sip_call_id = %leg.dialog.call_id,
             "B2BUA: ACK+BYE for a 2xx that raced our CANCEL (RFC 3261 §9.1 glare)"
@@ -14177,7 +14396,7 @@ fn handle_b2bua_bye(
                         b_leg.transport.transport,
                     );
                     debug!(call_id = %call_id, %destination, "B2BUA: sending BYE to B-leg");
-                    send_b2bua_to_bleg(bye, transport, destination, state);
+                    send_b2bua_to_bleg(bye, transport, destination, b_leg.transport.local_addr, state);
                 } else {
                     warn!(call_id = %call_id, "B2BUA: failed to build B-leg BYE");
                 }
@@ -14318,15 +14537,14 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
     let mut reinvite = original.clone();
     drop(original);
 
-    // New Via/branch
+    // New Via/branch — sent-by is the socket this leg is anchored on, so the
+    // refresh's response comes back where the request left from.
     let branch = TransactionKey::generate_branch();
     let transport_str = format!("{}", b_leg.transport.transport).to_uppercase();
+    let (via_host, via_port) = leg_sent_by(&b_leg, state);
     let via_value = format!(
         "SIP/2.0/{} {}:{};branch={}",
-        transport_str,
-        state.via_host(&b_leg.transport.transport),
-        state.via_port(&b_leg.transport.transport),
-        branch,
+        transport_str, via_host, via_port, branch,
     );
     reinvite.headers.set("Via", via_value);
 
@@ -14401,7 +14619,10 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
             // re-INVITE/UPDATE forward reuse) rather than a placeholder.
             connection_id: b_leg.transport.connection_id,
             transport: b_leg.transport.transport,
-            local_addr: None,
+            // Inherit the real B-leg's anchored socket so the refresh's response
+            // handling (which resolves the pin off the branch-matched leg) sends
+            // the ACK back out the same socket.
+            local_addr: b_leg.transport.local_addr,
         },
     );
     new_b_leg.stored_vias = vec![];
@@ -14432,7 +14653,13 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
     }
 
     debug!(call_id = %call_id, "B2BUA: sending session timer refresh re-INVITE");
-    send_b2bua_to_bleg(reinvite, b_leg.transport.transport, b_leg.transport.remote_addr, state);
+    send_b2bua_to_bleg(
+        reinvite,
+        b_leg.transport.transport,
+        b_leg.transport.remote_addr,
+        b_leg.transport.local_addr,
+        state,
+    );
 
     // Increment B-leg CSeq after sending
     if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
@@ -14667,7 +14894,8 @@ fn b2bua_terminate_call_inner(
                 b_leg.transport.remote_addr,
                 b_leg.transport.transport,
             );
-            send_b2bua_to_bleg(bye_msg, transport, destination, state);
+            // Source it from the B-leg's anchored socket (Via matches).
+            send_b2bua_to_bleg(bye_msg, transport, destination, b_leg.transport.local_addr, state);
         }
     }
 
@@ -15348,17 +15576,23 @@ fn handle_b2bua_reinvite(
     };
 
     if let Some((destination, transport, target_local_addr, target_connection_id, leg_call_id, leg_from_tag)) = reinvite_target {
-        // Set Via with correct transport for the target leg
+        // Set Via with correct transport for the target leg.
+        // Via host + port = the target leg's anchored socket: the A-leg's arrival
+        // listener (family-correct, advertised identity) on a B→A forward, the
+        // B-leg's flow socket on an A→B forward when it was dialled over one.
+        // Unanchored legs keep the per-transport via_host/via_port.
         let transport_str = format!("{}", transport).to_uppercase();
+        let (via_host, via_port) = if from_a_leg {
+            b_leg_sent_by(target_local_addr, state, &transport)
+        } else {
+            (
+                state.a_leg_advertised_host(target_local_addr, &transport),
+                a_leg_advertised_port(target_local_addr, state.via_port(&transport)),
+            )
+        };
         let via_value = format!(
             "SIP/2.0/{} {}:{};branch={}",
-            transport_str,
-            // Via host + port = the target leg's anchored listener (A-leg's arrival
-            // socket, family-correct, on a multi-homed / dual-stack host); the
-            // per-transport via_host/via_port for the B-leg (local_addr None).
-            state.a_leg_advertised_host(target_local_addr, &transport),
-            a_leg_advertised_port(target_local_addr, state.via_port(&transport)),
-            branch,
+            transport_str, via_host, via_port, branch,
         );
         forwarded.headers.set("Via", via_value);
 
@@ -15568,7 +15802,7 @@ fn handle_b2bua_reinvite(
             target_route_set.is_empty(), target_remote_contact.as_deref(), state,
         );
         if from_a_leg {
-            send_b2bua_to_bleg(forwarded, send_transport, send_dest, state);
+            send_b2bua_to_bleg(forwarded, send_transport, send_dest, target_local_addr, state);
         } else if let Some(target) = contact_fallback {
             warn!(
                 call_id = %call_id, dest = %target.address,
@@ -15769,16 +16003,20 @@ fn handle_b2bua_update(
     };
 
     if let Some((destination, transport, target_local_addr, target_connection_id, leg_call_id, leg_from_tag)) = update_target {
+        // Via host + port = the target leg's anchored socket (see the re-INVITE
+        // forward above for the A/B split).
         let transport_str = format!("{}", transport).to_uppercase();
+        let (via_host, via_port) = if from_a_leg {
+            b_leg_sent_by(target_local_addr, state, &transport)
+        } else {
+            (
+                state.a_leg_advertised_host(target_local_addr, &transport),
+                a_leg_advertised_port(target_local_addr, state.via_port(&transport)),
+            )
+        };
         let via_value = format!(
             "SIP/2.0/{} {}:{};branch={}",
-            transport_str,
-            // Via host + port = the target leg's anchored listener (A-leg's arrival
-            // socket, family-correct, on a multi-homed / dual-stack host); the
-            // per-transport via_host/via_port for the B-leg (local_addr None).
-            state.a_leg_advertised_host(target_local_addr, &transport),
-            a_leg_advertised_port(target_local_addr, state.via_port(&transport)),
-            branch,
+            transport_str, via_host, via_port, branch,
         );
         forwarded.headers.set("Via", via_value);
 
@@ -15970,7 +16208,7 @@ fn handle_b2bua_update(
             target_route_set.is_empty(), target_remote_contact.as_deref(), state,
         );
         if from_a_leg {
-            send_b2bua_to_bleg(forwarded, send_transport, send_dest, state);
+            send_b2bua_to_bleg(forwarded, send_transport, send_dest, target_local_addr, state);
         } else if let Some(target) = contact_fallback {
             warn!(
                 call_id = %call_id, dest = %target.address,
@@ -16036,12 +16274,11 @@ fn build_b2bua_in_dialog_request(
 
     let transport_str = format!("{}", leg.transport.transport).to_uppercase();
     let branch = TransactionKey::generate_branch();
+    // Sent-by is the socket this leg is anchored on (see `leg_sent_by`).
+    let (via_host, via_port) = leg_sent_by(leg, state);
     let via = format!(
         "SIP/2.0/{} {}:{};branch={}",
-        transport_str,
-        state.a_leg_advertised_host(leg.transport.local_addr, &leg.transport.transport),
-        a_leg_advertised_port(leg.transport.local_addr, state.via_port(&leg.transport.transport)),
-        branch,
+        transport_str, via_host, via_port, branch,
     );
 
     let from_header = match &dialog.local_from_uri {
@@ -16748,6 +16985,8 @@ fn b2bua_complete_terminated_transfer(
         });
     if let Some(ruri) = ack_ruri {
         let transport_str = format!("{}", target_leg.transport.transport).to_uppercase();
+        // Sent-by is the socket the target leg is anchored on (see `leg_sent_by`).
+        let (via_host, via_port) = leg_sent_by(&target_leg, state);
         let cseq_num = response
             .headers
             .cseq()
@@ -16758,14 +16997,8 @@ fn b2bua_complete_terminated_transfer(
             .via(format!(
                 "SIP/2.0/{} {}:{};branch={}",
                 transport_str,
-                state.a_leg_advertised_host(
-                    target_leg.transport.local_addr,
-                    &target_leg.transport.transport,
-                ),
-                a_leg_advertised_port(
-                    target_leg.transport.local_addr,
-                    state.via_port(&target_leg.transport.transport)
-                ),
+                via_host,
+                via_port,
                 TransactionKey::generate_branch(),
             ))
             .from(response.headers.from().cloned().unwrap_or_default())
@@ -17169,13 +17402,20 @@ fn b2bua_forward_indialog_request(
         return;
     };
 
+    // Via host + port = the target leg's anchored socket (see the re-INVITE
+    // forward for the A/B split).
     let transport_str = format!("{}", transport).to_uppercase();
+    let (via_host, via_port) = if from_a_leg {
+        b_leg_sent_by(target_local_addr, state, &transport)
+    } else {
+        (
+            state.a_leg_advertised_host(target_local_addr, &transport),
+            a_leg_advertised_port(target_local_addr, state.via_port(&transport)),
+        )
+    };
     let via_value = format!(
         "SIP/2.0/{} {}:{};branch={}",
-        transport_str,
-        state.a_leg_advertised_host(target_local_addr, &transport),
-        a_leg_advertised_port(target_local_addr, state.via_port(&transport)),
-        branch,
+        transport_str, via_host, via_port, branch,
     );
     forwarded.headers.set("Via", via_value);
 
@@ -17312,7 +17552,7 @@ fn b2bua_forward_indialog_request(
         state,
     );
     if from_a_leg {
-        send_b2bua_to_bleg(forwarded, send_transport, send_dest, state);
+        send_b2bua_to_bleg(forwarded, send_transport, send_dest, target_local_addr, state);
     } else if let Some(fallback) = contact_fallback {
         let data = Bytes::from(forwarded.to_bytes());
         send_to_target(
@@ -18033,6 +18273,108 @@ mod tests {
         // And when the arrival socket happens to equal the default, still correct.
         let same: SocketAddr = "10.0.0.1:5060".parse().unwrap();
         assert_eq!(a_leg_advertised_port(Some(same), 5060), 5060);
+    }
+
+    // -----------------------------------------------------------------------
+    // Flow-pinned B-leg sent-by (IPsec sec-agree / captured-flow egress)
+    // -----------------------------------------------------------------------
+
+    /// A B-leg dialled over a captured flow leaves from that flow's socket, so
+    /// the sent-by it advertises must name that socket — NOT the default
+    /// per-transport listener.
+    ///
+    /// This is the soft-UE MO-call invariant (3GPP TS 33.203 §7.4): the UE's
+    /// protected client port sends the INVITE, and the SA only carries a
+    /// response addressed back to that port. Advertising the plain listener
+    /// asks the P-CSCF to answer outside the SA, where the response is lost and
+    /// the call times out with no final response at all.
+    #[test]
+    fn pinned_sent_by_names_the_flow_socket_not_the_default_listener() {
+        // Soft-UE shape: plain SIP on :5060, protected client port :6100.
+        let protected_client: SocketAddr = "192.0.2.10:6100".parse().unwrap();
+        let (host, port) = pinned_sent_by(protected_client);
+        assert_eq!(host, "192.0.2.10");
+        assert_eq!(
+            port, 6100,
+            "a flow-pinned B-leg must advertise the flow's own port, not :5060"
+        );
+    }
+
+    /// The protected *server* port is a distinct pin — a leg anchored there
+    /// must not collapse onto the client port or the default listener.
+    #[test]
+    fn pinned_sent_by_distinguishes_the_two_protected_ports() {
+        let client: SocketAddr = "192.0.2.10:6100".parse().unwrap();
+        let server: SocketAddr = "192.0.2.10:6101".parse().unwrap();
+        assert_ne!(pinned_sent_by(client), pinned_sent_by(server));
+        assert_eq!(pinned_sent_by(server).1, 6101);
+    }
+
+    /// A v6 flow socket has to come out bracketed, or the Via is malformed
+    /// (`SIP/2.0/UDP 2001:db8::10:6100` parses the last colon as the port).
+    #[test]
+    fn pinned_sent_by_brackets_an_ipv6_flow_socket() {
+        let v6: SocketAddr = "[2001:db8::10]:6100".parse().unwrap();
+        let (host, port) = pinned_sent_by(v6);
+        assert_eq!(host, "[2001:db8::10]");
+        assert_eq!(port, 6100);
+    }
+
+    /// The B-leg INVITE's own precedence. The bug this guards: a flow-dialled
+    /// B-leg took the per-transport fallback, so the INVITE went out the flow's
+    /// socket while advertising the default listener — the far end then answered
+    /// to a port outside the flow and the call never got a final response.
+    #[test]
+    fn b_leg_invite_sent_by_prefers_the_flow_over_the_default_listener() {
+        let flow: SocketAddr = "192.0.2.10:6100".parse().unwrap();
+        let sent_by = b_leg_invite_sent_by(Some(flow), None, || {
+            ("192.0.2.10".to_string(), 5060)
+        });
+        assert_eq!(
+            sent_by,
+            ("192.0.2.10".to_string(), 6100),
+            "a flow-dialled B-leg must advertise the flow socket, never the default listener"
+        );
+    }
+
+    /// A flow beats a `send_socket=` pin: the flow already wrote the INVITE to
+    /// its own socket, so advertising the script's listener would be a lie.
+    #[test]
+    fn b_leg_invite_sent_by_flow_beats_a_send_socket_pin() {
+        let flow: SocketAddr = "192.0.2.10:6100".parse().unwrap();
+        let sent_by = b_leg_invite_sent_by(
+            Some(flow),
+            Some(("sip.example.com".to_string(), 5080)),
+            || ("192.0.2.10".to_string(), 5060),
+        );
+        assert_eq!(sent_by, ("192.0.2.10".to_string(), 6100));
+    }
+
+    /// Without a flow the pre-existing behaviour is untouched: a `send_socket=`
+    /// pin wins over the default, and with neither, the default stands.
+    #[test]
+    fn b_leg_invite_sent_by_without_a_flow_is_unchanged() {
+        let pinned = b_leg_invite_sent_by(
+            None,
+            Some(("sip.example.com".to_string(), 5080)),
+            || ("192.0.2.10".to_string(), 5060),
+        );
+        assert_eq!(pinned, ("sip.example.com".to_string(), 5080));
+
+        let plain = b_leg_invite_sent_by(None, None, || ("192.0.2.10".to_string(), 5060));
+        assert_eq!(plain, ("192.0.2.10".to_string(), 5060));
+    }
+
+    /// A v6 `send_socket=` advertise host is bracketed on the way out, same as
+    /// the flow path — the sent-by is a URI host, not a bare address.
+    #[test]
+    fn b_leg_invite_sent_by_brackets_an_ipv6_send_socket_host() {
+        let sent_by = b_leg_invite_sent_by(
+            None,
+            Some(("2001:db8::20".to_string(), 5080)),
+            || ("192.0.2.10".to_string(), 5060),
+        );
+        assert_eq!(sent_by, ("[2001:db8::20]".to_string(), 5080));
     }
 
     // -----------------------------------------------------------------------
