@@ -114,6 +114,15 @@ pub enum CallAction {
         /// (default), the call is parked un-answered (deferred mode) and the
         /// controller decides how to respond.
         answer: bool,
+        /// Answer-first only: the media profile to anchor with (default
+        /// `"voice_ai"`). Ignored when `answer` is `false`.
+        profile: Option<String>,
+        /// Answer-first only: the per-call WebSocket bridge URI the media engine
+        /// dials out for this leg's audio. Supports `{call_id}` / `{from_tag}` /
+        /// `{from_user}` / `{to_user}` templating (RFC-3264-answer side). Falls
+        /// back to the profile's own `ws_uri` when omitted. Ignored when `answer`
+        /// is `false`.
+        ws_uri: Option<String>,
     },
     /// Sequential failover across an ordered list of carrier routes — LCR
     /// (`call.route(...)`) or `call.fork(strategy="sequential")`. The dispatcher
@@ -1188,16 +1197,27 @@ impl PyCall {
     ///         channel — answering commits the call (CDR answer-time starts;
     ///         declining is a BYE, not a 4xx). When ``False`` (default), the call
     ///         is parked un-answered and the controller decides how to respond.
+    ///     profile: Answer-first only — the media profile to anchor with (default
+    ///         ``"voice_ai"``).
+    ///     ws_uri: Answer-first only — the per-call WebSocket bridge URI the media
+    ///         engine dials out for this leg's audio, so the app computes it per
+    ///         session/tenant. Supports ``{call_id}`` / ``{from_tag}`` /
+    ///         ``{from_user}`` / ``{to_user}`` templating; falls back to the
+    ///         profile's own ``ws_uri`` when omitted.
     ///
     /// Example:
     ///     @b2bua.on_invite
     ///     async def route(call):
-    ///         if is_ivr_number(call.to_uri):
+    ///         if is_ai_number(call.to_uri):
+    ///             call.handover("ai-app", answer=True,
+    ///                           ws_uri="wss://ai.example/stream/{call_id}")
+    ///         elif is_ivr_number(call.to_uri):
     ///             call.handover("ivr-app", on_lost="hangup", deadline_ms=3000,
     ///                           vars={"queue": "support"})
     ///         else:
     ///             call.dial(call.ruri)
-    #[pyo3(signature = (app, on_lost=None, deadline_ms=None, vars=None, answer=false))]
+    #[pyo3(signature = (app, on_lost=None, deadline_ms=None, vars=None, answer=false, profile=None, ws_uri=None))]
+    #[allow(clippy::too_many_arguments)]
     fn handover(
         &mut self,
         app: &str,
@@ -1205,6 +1225,8 @@ impl PyCall {
         deadline_ms: Option<u64>,
         vars: Option<std::collections::HashMap<String, String>>,
         answer: bool,
+        profile: Option<&str>,
+        ws_uri: Option<&str>,
     ) -> PyResult<()> {
         if app.is_empty() {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -1218,12 +1240,19 @@ impl PyCall {
                 )));
             }
         }
+        if !answer && (profile.is_some() || ws_uri.is_some()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "call.handover(profile=…/ws_uri=…) requires answer=True (they only apply to answer-first mode)",
+            ));
+        }
         self.action = CallAction::Handover {
             app: app.to_string(),
             on_lost: on_lost.map(String::from),
             deadline_ms,
             vars: vars.unwrap_or_default(),
             answer,
+            profile: profile.map(String::from),
+            ws_uri: ws_uri.map(String::from),
         };
         Ok(())
     }
@@ -2056,7 +2085,7 @@ mod tests {
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
         let mut vars = std::collections::HashMap::new();
         vars.insert("queue".to_string(), "support".to_string());
-        call.handover("ivr-app", Some("hangup"), Some(3000), Some(vars.clone()), false)
+        call.handover("ivr-app", Some("hangup"), Some(3000), Some(vars.clone()), false, None, None)
             .unwrap();
         assert_eq!(
             call.action(),
@@ -2066,30 +2095,47 @@ mod tests {
                 deadline_ms: Some(3000),
                 vars,
                 answer: false,
+                profile: None,
+                ws_uri: None,
             }
         );
     }
 
     #[test]
-    fn call_handover_answer_mode_sets_flag() {
+    fn call_handover_answer_mode_sets_flag_and_media_args() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
-        call.handover("ivr-app", None, None, None, true).unwrap();
+        call.handover("ai-app", None, None, None, true, Some("voice_ai"), Some("wss://ai/{call_id}"))
+            .unwrap();
         assert!(matches!(
             call.action(),
-            CallAction::Handover { answer: true, .. }
+            CallAction::Handover {
+                answer: true,
+                profile: Some(ref p),
+                ws_uri: Some(ref u),
+                ..
+            } if p == "voice_ai" && u == "wss://ai/{call_id}"
         ));
+    }
+
+    #[test]
+    fn call_handover_media_args_require_answer_true() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        // profile/ws_uri without answer=True is a programming error.
+        assert!(call.handover("app", None, None, None, false, Some("voice_ai"), None).is_err());
+        assert!(call.handover("app", None, None, None, false, None, Some("wss://ai")).is_err());
     }
 
     #[test]
     fn call_handover_rejects_empty_app_and_bad_on_lost() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
-        assert!(call.handover("", None, None, None, false).is_err());
-        assert!(call.handover("app", Some("explode"), None, None, false).is_err());
+        assert!(call.handover("", None, None, None, false, None, None).is_err());
+        assert!(call.handover("app", Some("explode"), None, None, false, None, None).is_err());
         // Valid policies are accepted.
-        assert!(call.handover("app", Some("continue"), None, None, false).is_ok());
-        assert!(call.handover("app", Some("fallback"), None, None, false).is_ok());
+        assert!(call.handover("app", Some("continue"), None, None, false, None, None).is_ok());
+        assert!(call.handover("app", Some("fallback"), None, None, false, None, None).is_ok());
     }
 
     #[test]
