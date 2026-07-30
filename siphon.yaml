@@ -576,7 +576,9 @@ auth:
 #   # NAT `direction` (["internal","external"]) and `asymmetric` flag map to
 #   # rtpproxy bridge/symmetry modifiers; IPv6 is auto-detected per stream.
 #   # A profile's `address_family:` is NOT supported here (rtpengine/siphon-rtp
-#   # only) — siphon warns at boot if one sets it on this backend.
+#   # only) — siphon warns at boot if one sets it on this backend. A profile's
+#   # `received_from:` / `rtcp_mux:` are not supported either, and those FAIL the
+#   # config load rather than warning.
 #   # The `media.events:` listener is unused — rtpproxy pushes no async events.
 #
 # Custom media profiles (extend or override built-ins):
@@ -584,8 +586,15 @@ auth:
 # Built-in profiles (always available):
 #   rtp_passthrough — Plain RTP both sides, media anchoring only (default)
 #   srtp_to_rtp     — SRTP UE ↔ RTP core
+#   rtp_to_srtp     — RTP access ↔ SRTP core (the reverse pairing)
 #   ws_to_rtp       — WebSocket UE (RTP/AVPF + ICE) ↔ RTP core
 #   wss_to_rtp      — Secure WebSocket UE (DTLS-SRTP/AVPF + ICE) ↔ RTP core
+#   srs_recording   — Recording sink: plain RTP, media handover + port latching
+#   siprec_src      — SIPREC SRC subscription leg toward the recorder
+#   voice_ai        — Plain RTP toward the caller, audio bridged to a WebSocket
+#                     media server. NS + AEC + VAD + barge-in on; ws_uri is left
+#                     unset (no sensible default endpoint) — set it here or pass
+#                     ws_uri= per call. siphon-rtp backend only.
 #
 # Define custom profiles under media.profiles:
 # media:
@@ -620,6 +629,79 @@ auth:
 #   direction           NAT leg pair, e.g. ["external", "internal"]
 #   record_call         true to have the engine record this leg
 #   record_path         recording output directory
+#   received_from       true to carry the real post-NAT source IP siphon saw the
+#                       request arrive from, gating this leg's media ingress to
+#                       it. For a NATed UA advertising an unroutable private c=
+#                       address this is a TIGHTER RTPBleed source gate than the
+#                       signalled address gives. Only the IP is carried (media
+#                       and signalling ports differ). Off by default — wrong for
+#                       a deployment whose media legitimately arrives from a
+#                       different address than its signalling (separate media
+#                       gateway, carrier that splits the two). rtpengine +
+#                       siphon-rtp only; rtpproxy fails the config load.
+#   rtcp_mux            RFC 5761 directives overriding the mux decision the
+#                       engine derives from the offered SDP: offer | require |
+#                       demux | accept | reject | remove. Empty (default) mirrors
+#                       the offer. rtpengine + siphon-rtp only.
+#
+# siphon-rtp-only keys (siphon REFUSES TO START if a profile sets one of these on
+# the rtpengine or rtpproxy backend — an ignored ws_uri answers the call and
+# bridges it nowhere, i.e. silence for its whole duration with nothing logged):
+#   ws_uri              Bridge this leg's audio to an external WebSocket media
+#                       server: the engine dials the URI and relays the leg's RTP
+#                       to it as L16 (decode → uplink, downlink → encode). The WS
+#                       server IS that leg's far side, so the A↔B relay path is
+#                       not wired in this mode — pair it with
+#                       rtpengine.answer_local() to answer the call with the
+#                       engine as the far side. ws:// and wss:// only (anything
+#                       else fails the config load). Expands {call_id},
+#                       {from_tag}, {from_user}, {to_user} per call; an unknown
+#                       placeholder is an error, not a literal. A script can
+#                       override it per call with rtpengine.offer(...,
+#                       ws_uri=...) / answer(...) / answer_local(...), which also
+#                       records it so a later answer reuses the same bridge.
+#   ws_vad              Run a local energy-VAD on the WebSocket uplink and emit
+#                       speech_started / speech_stopped on the caller's speech
+#                       edges, so the inference server gets turn boundaries (and
+#                       the turn endpoint) without running its own VAD. Inert
+#                       without ws_uri.
+#   ws_barge_in         Flush queued downlink playout in the same tick the caller
+#                       starts speaking, with no server round-trip. Implies
+#                       ws_vad; inert without ws_uri.
+#   ws_vad_threshold    Mean-square energy threshold for the uplink VAD. Unset
+#                       uses the engine's 8/16 kHz L16 default (~1_000_000);
+#                       higher is less sensitive.
+#   ws_vad_hangover_ms  How long speech is held after energy drops before the
+#                       turn endpoint fires. Unset uses the engine's ~200 ms.
+#   noise_suppression   Single-channel noise suppression on this leg's decoded
+#                       ingress audio. Engaged only on a userspace-transcoded leg
+#                       whose ingress codec runs at 8 or 16 kHz, and forces the
+#                       call off the in-kernel fast path (as record_call does).
+#   echo_cancellation   Echo cancellation on this leg's send path, referenced
+#                       against the audio played toward that party. On a
+#                       WebSocket bridge this cancels the phone uplink toward the
+#                       AI using the AI downlink as the reference.
+#
+# Voice-AI bridge — plain RTP toward the caller, audio to a WebSocket backend:
+# media:
+#   backend: siphon-rtp
+#   siphon_rtp:
+#     address: "127.0.0.1:9000"
+#   profiles:
+#     voice_ai:                         # overrides the built-in of the same name
+#       offer: &voice_ai_flags
+#         transport_protocol: "RTP/AVP"
+#         ice: "remove"
+#         dtls: "off"
+#         replace: ["origin"]
+#         ws_uri: "wss://ai.example.com/stream/{call_id}"
+#         ws_vad: true
+#         ws_barge_in: true
+#         ws_vad_threshold: 2000000
+#         ws_vad_hangover_ms: 300
+#         noise_suppression: true
+#         echo_cancellation: true
+#       answer: *voice_ai_flags
 #
 # IPv4/IPv6 interworking — v6 access leg, v4 core:
 # media:

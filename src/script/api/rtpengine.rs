@@ -16,7 +16,7 @@ use pyo3::types::PyDict;
 use tracing::{debug, warn};
 
 use crate::rtpengine::client::PlayMediaSource;
-use crate::rtpengine::profile::ProfileRegistry;
+use crate::rtpengine::profile::{NgFlags, ProfileRegistry};
 use crate::rtpengine::MediaBackend;
 use crate::rtpengine::RtpEngineError;
 use crate::rtpengine::session::{MediaSession, MediaSessionStore};
@@ -108,6 +108,175 @@ fn resolve_play_media_source(
 
 /// Default profile name when none is specified.
 const DEFAULT_PROFILE: &str = "rtp_passthrough";
+
+/// The per-call values a `ws_uri` template can interpolate.
+struct WsUriContext<'a> {
+    call_id: &'a str,
+    from_tag: &'a str,
+    from_user: Option<&'a str>,
+    to_user: Option<&'a str>,
+}
+
+/// The From/To user parts of a message, for `ws_uri` templating.
+///
+/// Reuses [`NameAddr::parse`] rather than re-parsing name-addrs by hand, so a
+/// display-name-with-comma or an angle-bracketed URI is handled the same way the
+/// `request.from_uri` / `request.to_uri` getters handle it.
+fn ws_uri_user_parts(message: &Arc<Mutex<SipMessage>>) -> (Option<String>, Option<String>) {
+    let Ok(message) = message.lock() else {
+        return (None, None);
+    };
+    let user_of = |raw: Option<&String>| -> Option<String> {
+        raw.and_then(|value| crate::sip::headers::nameaddr::NameAddr::parse(value).ok())
+            .and_then(|nameaddr| nameaddr.uri.user)
+    };
+    (
+        user_of(message.headers.from()),
+        user_of(message.headers.to()),
+    )
+}
+
+/// The source IP of the message a media verb was handed, for `received_from`.
+///
+/// `SipMessage` does not carry the peer address — it is held by the Python
+/// wrapper the dispatcher built (`PyRequest` / `PyCall`), so it has to be read
+/// off the object while it is still borrowed, before any async block.
+/// A `PyReply` has no source of its own (the address that matters is the
+/// offerer's), so it yields `None` and the gate is simply not set.
+fn extract_source_ip(object: &Bound<'_, PyAny>) -> Option<String> {
+    if let Ok(request) = object.cast::<PyRequest>() {
+        return Some(request.borrow().source_ip_str().to_string());
+    }
+    if let Ok(call) = object.cast::<PyCall>() {
+        return Some(call.borrow().cdr_source_ip());
+    }
+    None
+}
+
+/// Expand `{call_id}` / `{from_tag}` / `{from_user}` / `{to_user}` in a `ws_uri`.
+///
+/// An unrecognised placeholder is an **error**, not a literal: a typo'd
+/// `{callid}` passed through verbatim would reach the engine as part of the URI
+/// path and the inference server would answer a route nobody meant to call. A
+/// placeholder with no value for this call (no From user part, say) is the same
+/// error — silently emitting an empty path segment is the same class of bug.
+///
+/// A URI with no `{` is returned untouched, so the common non-templated case
+/// costs one scan and no allocation decisions.
+fn expand_ws_uri(template: &str, context: &WsUriContext<'_>) -> PyResult<String> {
+    if !template.contains('{') {
+        return Ok(template.to_string());
+    }
+
+    let mut expanded = String::with_capacity(template.len());
+    let mut rest = template;
+
+    while let Some(open) = rest.find('{') {
+        expanded.push_str(&rest[..open]);
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('}') else {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "ws_uri has an unclosed '{{' placeholder: {template:?}"
+            )));
+        };
+        let name = &after_open[..close];
+        let value = match name {
+            "call_id" => Some(context.call_id),
+            "from_tag" => Some(context.from_tag),
+            "from_user" => context.from_user,
+            "to_user" => context.to_user,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "ws_uri has unknown placeholder {{{other}}}; supported: \
+                     {{call_id}}, {{from_tag}}, {{from_user}}, {{to_user}}"
+                )))
+            }
+        };
+        let Some(value) = value else {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "ws_uri placeholder {{{name}}} has no value on this call"
+            )));
+        };
+        expanded.push_str(value);
+        rest = &after_open[close + 1..];
+    }
+    expanded.push_str(rest);
+
+    Ok(expanded)
+}
+
+/// Resolve which WebSocket bridge URI a call should use, before templating.
+///
+/// Precedence mirrors [`resolve_answer_profile`], for the same reason: an
+/// `answer` following an `offer` should keep the bridge the offer set up without
+/// the script having to repeat itself.
+///   1. Explicit `ws_uri=` argument from the script (override).
+///   2. URI recorded by the matching `offer` (looked up by Call-ID).
+///   3. The resolved profile's `ws_uri`.
+fn resolve_ws_uri(
+    ws_uri: Option<&str>,
+    sessions: &MediaSessionStore,
+    call_id: &str,
+    profile_ws_uri: Option<&str>,
+) -> Option<String> {
+    if let Some(uri) = ws_uri {
+        return Some(uri.to_string());
+    }
+    if let Some(recorded) = sessions.get(call_id).and_then(|session| session.ws_uri) {
+        return Some(recorded);
+    }
+    profile_ws_uri.map(|uri| uri.to_string())
+}
+
+/// Apply the per-call WebSocket URI and `received_from` address to a profile's
+/// resolved flags, and reject flags the configured backend cannot honour.
+///
+/// This is the single place a call's [`NgFlags`] become final, so it is also the
+/// only place the backend-capability check has to live. Built-in profiles are
+/// registered regardless of backend (config validation only covers
+/// operator-declared `media.profiles`), so without this a script naming
+/// `voice_ai` on an rtpengine backend would answer the call and bridge it
+/// nowhere — silence for the call's whole duration, with nothing logged.
+fn finalise_flags(
+    mut flags: NgFlags,
+    backend: &MediaBackend,
+    ws_uri: Option<String>,
+    source_ip: Option<&str>,
+    profile_name: &str,
+) -> PyResult<NgFlags> {
+    if let Some(uri) = ws_uri {
+        flags.ws_uri = Some(uri);
+    }
+    if flags.carry_received_from {
+        match source_ip.and_then(|ip| ip.parse::<std::net::IpAddr>().ok()) {
+            Some(address) => flags.received_from = Some(address),
+            None => {
+                // Opted in but we have no address to carry. Leaving the gate
+                // unset is the safe direction (the engine falls back to the
+                // signalled address), but it is silently weaker than asked for,
+                // so say it.
+                warn!(
+                    profile = %profile_name,
+                    "media profile sets received_from but no usable source \
+                     address is available for this call — media ingress will \
+                     not be gated to it"
+                );
+            }
+        }
+    }
+
+    let unsupported = backend.unsupported_flags(&flags);
+    if !unsupported.is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "media profile '{profile_name}' sets {} which the {} backend cannot \
+             honour — set media.backend to a backend that supports it",
+            unsupported.join(", "),
+            backend.kind().as_str(),
+        )));
+    }
+
+    Ok(flags)
+}
 
 /// Resolve which RTP profile to use on the answer side.
 ///
@@ -259,12 +428,19 @@ impl PyRtpEngine {
     /// Args:
     ///     request: A Request or Call object containing the INVITE with SDP.
     ///     profile: RTP profile name (default: "rtp_passthrough").
-    #[pyo3(signature = (request, profile=None))]
+    ///     ws_uri: Bridge this leg's audio to an external WebSocket media server
+    ///             (``siphon-rtp`` backend only), overriding the profile's own
+    ///             ``ws_uri`` for this call. Supports ``{call_id}``,
+    ///             ``{from_tag}``, ``{from_user}`` and ``{to_user}``
+    ///             placeholders. The resolved URI is recorded on the media
+    ///             session, so a later ``answer`` reuses it automatically.
+    #[pyo3(signature = (request, profile=None, ws_uri=None))]
     fn offer<'py>(
         &self,
         python: Python<'py>,
         request: &Bound<'py, PyAny>,
         profile: Option<&str>,
+        ws_uri: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let profile_name = profile.unwrap_or(DEFAULT_PROFILE);
         let entry = self.registry.get(profile_name).ok_or_else(|| {
@@ -277,6 +453,39 @@ impl PyRtpEngine {
 
         let message = extract_message(request)?;
         let (call_id, from_tag, sdp) = extract_offer_params(&message)?;
+
+        // Resolve + template the bridge URI, then finalise the flags. Both run
+        // before the async block so a bad template or an unhonourable flag
+        // raises to the script instead of failing a call already in flight.
+        let source_ip = extract_source_ip(request);
+        let resolved_ws_uri = resolve_ws_uri(
+            ws_uri,
+            &self.sessions,
+            &call_id,
+            entry.offer.ws_uri.as_deref(),
+        );
+        let resolved_ws_uri = match resolved_ws_uri {
+            Some(template) => {
+                let (from_user, to_user) = ws_uri_user_parts(&message);
+                Some(expand_ws_uri(
+                    &template,
+                    &WsUriContext {
+                        call_id: &call_id,
+                        from_tag: &from_tag,
+                        from_user: from_user.as_deref(),
+                        to_user: to_user.as_deref(),
+                    },
+                )?)
+            }
+            None => None,
+        };
+        let flags = finalise_flags(
+            flags,
+            &self.client,
+            resolved_ws_uri.clone(),
+            source_ip.as_deref(),
+            profile_name,
+        )?;
 
         let client = Arc::clone(&self.client);
         let sessions = Arc::clone(&self.sessions);
@@ -306,6 +515,7 @@ impl PyRtpEngine {
                 from_tag,
                 to_tag: None,
                 profile: profile_str,
+                ws_uri: resolved_ws_uri,
                 created_at: std::time::Instant::now(),
             });
 
@@ -340,13 +550,18 @@ impl PyRtpEngine {
     ///     call: Optional Call object — when provided, Call-ID and From-tag are
     ///           taken from this object (matching the earlier `offer`), while
     ///           To-tag and SDP body still come from `reply`.
-    #[pyo3(signature = (reply, profile=None, call=None))]
+    ///     ws_uri: WebSocket bridge URI override for this call (``siphon-rtp``
+    ///             backend only). When omitted, the URI recorded by the matching
+    ///             ``offer`` is reused, then the resolved profile's own —
+    ///             the same precedence as ``profile``.
+    #[pyo3(signature = (reply, profile=None, call=None, ws_uri=None))]
     fn answer<'py>(
         &self,
         python: Python<'py>,
         reply: &Bound<'py, PyAny>,
         profile: Option<&str>,
         call: Option<&Bound<'py, PyAny>>,
+        ws_uri: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let message = extract_message(reply)?;
 
@@ -378,6 +593,41 @@ impl PyRtpEngine {
             ))
         })?;
         let flags = entry.answer.clone();
+
+        // The bridge belongs to the offerer's leg, so template against the A-leg
+        // identifiers resolved above — not the reply's own tags.
+        let resolved_ws_uri = resolve_ws_uri(
+            ws_uri,
+            &self.sessions,
+            &call_id,
+            entry.answer.ws_uri.as_deref(),
+        );
+        let resolved_ws_uri = match resolved_ws_uri {
+            Some(template) => {
+                let (from_user, to_user) =
+                    ws_uri_user_parts(a_leg_msg.as_ref().unwrap_or(&message));
+                Some(expand_ws_uri(
+                    &template,
+                    &WsUriContext {
+                        call_id: &call_id,
+                        from_tag: &from_tag,
+                        from_user: from_user.as_deref(),
+                        to_user: to_user.as_deref(),
+                    },
+                )?)
+            }
+            None => None,
+        };
+        // A reply carries no source address of its own; when the script passed
+        // `call=`, that object does.
+        let source_ip = call.and_then(|object| extract_source_ip(object));
+        let flags = finalise_flags(
+            flags,
+            &self.client,
+            resolved_ws_uri,
+            source_ip.as_deref(),
+            &profile_name,
+        )?;
 
         let client = Arc::clone(&self.client);
         let sessions = Arc::clone(&self.sessions);
@@ -437,17 +687,23 @@ impl PyRtpEngine {
     ///                  no-encodable-codec engine result sets a deferred
     ///                  ``488 Not Acceptable Here`` on the call and returns
     ///                  ``None``.  When ``False`` it raises ``ValueError``.
+    ///     ws_uri: Bridge this leg's audio to an external WebSocket media server
+    ///             instead of a far SIP leg — the shape a voice-AI answer takes,
+    ///             since the WS server *is* the far side. Overrides the
+    ///             profile's own ``ws_uri``; supports the same placeholders as
+    ///             :meth:`offer`.
     ///
     /// Returns:
     ///     The answer SDP as ``str`` on success, or ``None`` when the offer had
     ///     no encodable codec and it was auto-rejected with a 488.
-    #[pyo3(signature = (call, profile=None, auto_reject=true))]
+    #[pyo3(signature = (call, profile=None, auto_reject=true, ws_uri=None))]
     fn answer_local<'py>(
         &self,
         python: Python<'py>,
         call: &Bound<'py, PyAny>,
         profile: Option<&str>,
         auto_reject: bool,
+        ws_uri: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let message = extract_message(call)?;
         let (call_id, from_tag, offer_sdp_bytes) = extract_offer_params(&message)?;
@@ -463,6 +719,36 @@ impl PyRtpEngine {
             ))
         })?;
         let flags = entry.answer.clone();
+
+        let source_ip = extract_source_ip(call);
+        let resolved_ws_uri = resolve_ws_uri(
+            ws_uri,
+            &self.sessions,
+            &call_id,
+            entry.answer.ws_uri.as_deref(),
+        );
+        let resolved_ws_uri = match resolved_ws_uri {
+            Some(template) => {
+                let (from_user, to_user) = ws_uri_user_parts(&message);
+                Some(expand_ws_uri(
+                    &template,
+                    &WsUriContext {
+                        call_id: &call_id,
+                        from_tag: &from_tag,
+                        from_user: from_user.as_deref(),
+                        to_user: to_user.as_deref(),
+                    },
+                )?)
+            }
+            None => None,
+        };
+        let flags = finalise_flags(
+            flags,
+            &self.client,
+            resolved_ws_uri.clone(),
+            source_ip.as_deref(),
+            &profile_name,
+        )?;
 
         // Capture an owned handle to the Call for the auto-488 path, cloned
         // while the GIL is held (free-threaded `Py::clone` rule).  `None` when
@@ -500,6 +786,7 @@ impl PyRtpEngine {
                         from_tag,
                         to_tag: None,
                         profile: profile_str,
+                        ws_uri: resolved_ws_uri,
                         created_at: std::time::Instant::now(),
                     });
                     Ok(Some(answer_sdp))
@@ -1482,7 +1769,160 @@ mod tests {
             from_tag: "tag-a".to_string(),
             to_tag: None,
             profile: profile.to_string(),
+            ws_uri: None,
             created_at: std::time::Instant::now(),
+        }
+    }
+
+    fn make_session_with_ws(call_id: &str, ws_uri: &str) -> MediaSession {
+        MediaSession {
+            ws_uri: Some(ws_uri.to_string()),
+            ..make_session(call_id, "voice_ai")
+        }
+    }
+
+    // -- ws_uri templating ----------------------------------------------------
+
+    fn ws_context<'a>() -> WsUriContext<'a> {
+        WsUriContext {
+            call_id: "abc123@example.invalid",
+            from_tag: "tag-a",
+            from_user: Some("1001"),
+            to_user: Some("2002"),
+        }
+    }
+
+    #[test]
+    fn expand_ws_uri_without_placeholder_is_untouched() {
+        let expanded = expand_ws_uri("wss://ai.invalid/stream", &ws_context()).unwrap();
+        assert_eq!(expanded, "wss://ai.invalid/stream");
+    }
+
+    #[test]
+    fn expand_ws_uri_substitutes_every_placeholder() {
+        let expanded = expand_ws_uri(
+            "wss://ai.invalid/{call_id}/{from_tag}?from={from_user}&to={to_user}",
+            &ws_context(),
+        )
+        .unwrap();
+        assert_eq!(
+            expanded,
+            "wss://ai.invalid/abc123@example.invalid/tag-a?from=1001&to=2002"
+        );
+    }
+
+    #[test]
+    fn expand_ws_uri_substitutes_repeated_placeholder() {
+        let expanded =
+            expand_ws_uri("wss://ai.invalid/{call_id}/{call_id}", &ws_context()).unwrap();
+        assert_eq!(
+            expanded,
+            "wss://ai.invalid/abc123@example.invalid/abc123@example.invalid"
+        );
+    }
+
+    /// A typo'd placeholder must not reach the engine as a literal path segment.
+    #[test]
+    fn expand_ws_uri_rejects_unknown_placeholder() {
+        pyo3::Python::initialize();
+        let error = expand_ws_uri("wss://ai.invalid/{callid}", &ws_context()).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown placeholder {callid}"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn expand_ws_uri_rejects_unclosed_placeholder() {
+        pyo3::Python::initialize();
+        let error = expand_ws_uri("wss://ai.invalid/{call_id", &ws_context()).unwrap_err();
+        assert!(
+            error.to_string().contains("unclosed"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// A placeholder with nothing to substitute is an error too — an empty path
+    /// segment is as wrong as a literal one, just harder to spot.
+    #[test]
+    fn expand_ws_uri_rejects_placeholder_with_no_value() {
+        pyo3::Python::initialize();
+        let context = WsUriContext {
+            from_user: None,
+            ..ws_context()
+        };
+        let error = expand_ws_uri("wss://ai.invalid/{from_user}", &context).unwrap_err();
+        assert!(
+            error.to_string().contains("has no value"),
+            "unexpected error: {error}"
+        );
+    }
+
+    // -- ws_uri resolution precedence -----------------------------------------
+
+    #[test]
+    fn resolve_ws_uri_explicit_arg_wins() {
+        let store = MediaSessionStore::new();
+        store.insert(make_session_with_ws("call-1", "wss://recorded.invalid"));
+        let resolved = resolve_ws_uri(
+            Some("wss://explicit.invalid"),
+            &store,
+            "call-1",
+            Some("wss://profile.invalid"),
+        );
+        assert_eq!(resolved.as_deref(), Some("wss://explicit.invalid"));
+    }
+
+    /// The reason this precedence exists: an `answer` after an `offer` keeps the
+    /// bridge the offer established, without the script re-passing `ws_uri=`.
+    #[test]
+    fn resolve_ws_uri_recovers_from_offer() {
+        let store = MediaSessionStore::new();
+        store.insert(make_session_with_ws("call-1", "wss://recorded.invalid"));
+        let resolved = resolve_ws_uri(None, &store, "call-1", Some("wss://profile.invalid"));
+        assert_eq!(resolved.as_deref(), Some("wss://recorded.invalid"));
+    }
+
+    #[test]
+    fn resolve_ws_uri_falls_back_to_profile() {
+        let store = MediaSessionStore::new();
+        let resolved = resolve_ws_uri(None, &store, "no-such-call", Some("wss://profile.invalid"));
+        assert_eq!(resolved.as_deref(), Some("wss://profile.invalid"));
+    }
+
+    /// An offer recorded *without* a bridge must not inherit the profile's URI on
+    /// the answer — otherwise a script that passed `ws_uri=None` deliberately
+    /// gets a bridge attached behind its back at answer time.
+    #[test]
+    fn resolve_ws_uri_recorded_session_without_bridge_falls_through() {
+        let store = MediaSessionStore::new();
+        store.insert(make_session("call-1", "voice_ai"));
+        let resolved = resolve_ws_uri(None, &store, "call-1", Some("wss://profile.invalid"));
+        assert_eq!(resolved.as_deref(), Some("wss://profile.invalid"));
+    }
+
+    #[test]
+    fn resolve_ws_uri_none_everywhere_is_none() {
+        let store = MediaSessionStore::new();
+        assert!(resolve_ws_uri(None, &store, "no-such-call", None).is_none());
+    }
+
+    // -- the built-in voice_ai profile ----------------------------------------
+
+    /// The profile has to leave `ws_uri` unset (there is no sensible default
+    /// endpoint) but everything else it sets must be live, or naming it would be
+    /// a no-op that reads as configured.
+    #[test]
+    fn builtin_voice_ai_profile_sets_live_flags_but_no_endpoint() {
+        let registry = ProfileRegistry::new();
+        let entry = registry.get("voice_ai").expect("voice_ai profile missing");
+        for flags in [&entry.offer, &entry.answer] {
+            assert!(flags.ws_uri.is_none());
+            assert!(flags.noise_suppression);
+            assert!(flags.echo_cancellation);
+            assert!(flags.ws_vad);
+            assert!(flags.ws_barge_in);
+            assert_eq!(flags.transport_protocol.as_deref(), Some("RTP/AVP"));
         }
     }
 

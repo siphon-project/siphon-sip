@@ -17,16 +17,33 @@ anchors and transforms RTP. You pick one of two engines with `media.backend`:
 !!! warning "siphon-rtp is experimental — use rtpengine in production"
     The siphon-rtp engine is pre-release. Run it for evaluation and lab work;
     keep `rtpengine` (the default) for production until siphon-rtp stabilises.
-    SIPREC/MPTY subscriptions are not implemented on siphon-rtp yet and surface a
-    clear engine error if a script calls them.
 
 **What is the same either way.** The `rtpengine` scripting namespace
 (`offer` / `answer` / `delete`, `play_media`, `play_dtmf`, `silence_media`,
 `@rtpengine.on_dtmf`, …), the [media profiles](cookbook/media-rtp.md#built-in-profiles),
-and the [`MediaSessionStore`](cookbook/media-rtp.md) are **identical**. Only the
+and the [`MediaSessionStore`](cookbook/media-rtp.md) are the same on both. Only the
 engine you run and the `media:` block that points at it change — a script written
-for one backend runs unmodified on the other. The differences are entirely
+for one backend runs unmodified on the other, unless it uses one of the
+engine-specific profile fields below. The rest of the differences are
 operational, and that is what the rest of this page covers.
+
+**What is not.** A few media-profile fields exist only on the engine that can
+perform them. siphon **refuses to start** if a `media.profiles` entry asks for
+something its `media.backend` cannot honour, naming the profile and the field —
+a `ws_uri` the engine never receives would otherwise answer the call and bridge
+it nowhere, with nothing logged and silence on the line.
+
+| Profile field | `siphon-rtp` | `rtpengine` | `rtpproxy` |
+|---|---|---|---|
+| `ws_uri`, `ws_vad`, `ws_barge_in`, `ws_vad_threshold`, `ws_vad_hangover_ms` | yes | — | — |
+| `noise_suppression`, `echo_cancellation` | yes | — | — |
+| `received_from`, `rtcp_mux` | yes | yes | — |
+| `address_family` | yes | yes | — [^af] |
+
+[^af]:
+    `address_family` on `rtpproxy` warns at boot rather than failing the load:
+    rtpproxy's `6` modifier states the family of the address the command already
+    carries, so the call still works and only IPv4/IPv6 interworking is lost.
 
 ---
 

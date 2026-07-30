@@ -828,6 +828,7 @@ fn media_session_store_lifecycle() {
         from_tag: "alice-tag".to_string(),
         to_tag: None,
         profile: "srtp_to_rtp".to_string(),
+        ws_uri: None,
         created_at: std::time::Instant::now(),
     };
     store.insert(session);

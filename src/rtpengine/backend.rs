@@ -40,6 +40,62 @@ pub enum MediaBackend {
 }
 
 impl MediaBackend {
+    /// Which engine this is, as the `media.backend` config spells it.
+    pub fn kind(&self) -> crate::config::MediaBackendKind {
+        use crate::config::MediaBackendKind;
+        match self {
+            Self::RtpEngine(_) => MediaBackendKind::Rtpengine,
+            Self::SiphonRtp(_) => MediaBackendKind::SiphonRtp,
+            Self::RtpProxy(_) => MediaBackendKind::Rtpproxy,
+        }
+    }
+
+    /// Which of `flags`' set fields this engine has no way to express.
+    ///
+    /// The same capability table [`crate::config::Config`] enforces at load
+    /// time, applied to the *resolved* [`NgFlags`] of a call.  Config validation
+    /// only sees operator-declared `media.profiles`; a built-in profile is
+    /// registered whatever the backend, so a script naming one this engine
+    /// cannot honour has to be caught here instead.
+    pub fn unsupported_flags(&self, flags: &NgFlags) -> Vec<&'static str> {
+        let mut unsupported = Vec::new();
+
+        if !matches!(self, Self::SiphonRtp(_)) {
+            if flags.ws_uri.is_some() {
+                unsupported.push("ws_uri");
+            }
+            if flags.ws_vad {
+                unsupported.push("ws_vad");
+            }
+            if flags.ws_barge_in {
+                unsupported.push("ws_barge_in");
+            }
+            if flags.ws_vad_threshold.is_some() {
+                unsupported.push("ws_vad_threshold");
+            }
+            if flags.ws_vad_hangover_ms.is_some() {
+                unsupported.push("ws_vad_hangover_ms");
+            }
+            if flags.noise_suppression {
+                unsupported.push("noise_suppression");
+            }
+            if flags.echo_cancellation {
+                unsupported.push("echo_cancellation");
+            }
+        }
+
+        if matches!(self, Self::RtpProxy(_)) {
+            if flags.carry_received_from || flags.received_from.is_some() {
+                unsupported.push("received_from");
+            }
+            if !flags.rtcp_mux.is_empty() {
+                unsupported.push("rtcp_mux");
+            }
+        }
+
+        unsupported
+    }
+
     /// Send an `offer`, returning the rewritten SDP.
     pub async fn offer(
         &self,
@@ -477,5 +533,116 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, RtpEngineError::Protocol(_)));
         assert!(error.to_string().contains("siphon-rtp"));
+    }
+
+    // -- backend capability reporting -----------------------------------------
+
+    async fn rtpengine_backend() -> MediaBackend {
+        let set = RtpEngineSet::new(vec![(dead_address(), 200, 1)]).await.unwrap();
+        MediaBackend::RtpEngine(Arc::new(set))
+    }
+
+    async fn rtpproxy_backend() -> MediaBackend {
+        let set = RtpProxyClientSet::new(vec![(dead_address(), 200, 1)], 0).await.unwrap();
+        MediaBackend::RtpProxy(set)
+    }
+
+    fn siphon_rtp_backend() -> MediaBackend {
+        let (event_tx, _event_rx) = mpsc::channel::<RtpEngineEvent>(16);
+        let set =
+            SiphonRtpClientSet::new(vec![(dead_address(), 200, 1)], None, 5_000, event_tx).unwrap();
+        MediaBackend::SiphonRtp(set)
+    }
+
+    fn ws_and_dsp_flags() -> NgFlags {
+        NgFlags {
+            ws_uri: Some("wss://ai.invalid/stream".into()),
+            ws_vad: true,
+            ws_barge_in: true,
+            ws_vad_threshold: Some(2_000_000),
+            ws_vad_hangover_ms: Some(300),
+            noise_suppression: true,
+            echo_cancellation: true,
+            ..NgFlags::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn kind_reports_the_configured_backend() {
+        use crate::config::MediaBackendKind;
+        assert_eq!(rtpengine_backend().await.kind(), MediaBackendKind::Rtpengine);
+        assert_eq!(rtpproxy_backend().await.kind(), MediaBackendKind::Rtpproxy);
+        assert_eq!(siphon_rtp_backend().kind(), MediaBackendKind::SiphonRtp);
+    }
+
+    /// A plain profile must be honourable everywhere, or every existing
+    /// deployment would start failing calls.
+    #[tokio::test]
+    async fn plain_flags_are_supported_on_every_backend() {
+        let plain = NgFlags {
+            replace: vec!["origin".into()],
+            flags: vec!["trust-address".into()],
+            ..NgFlags::default()
+        };
+        assert!(rtpengine_backend().await.unsupported_flags(&plain).is_empty());
+        assert!(rtpproxy_backend().await.unsupported_flags(&plain).is_empty());
+        assert!(siphon_rtp_backend().unsupported_flags(&plain).is_empty());
+    }
+
+    // `SiphonRtpClient::new` spawns its connection manager, so these need a
+    // runtime even though the capability check itself does no I/O.
+    #[tokio::test]
+    async fn siphon_rtp_supports_every_websocket_and_dsp_flag() {
+        assert!(siphon_rtp_backend()
+            .unsupported_flags(&ws_and_dsp_flags())
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn rtpengine_reports_every_websocket_and_dsp_flag_unsupported() {
+        let unsupported = rtpengine_backend().await.unsupported_flags(&ws_and_dsp_flags());
+        assert_eq!(
+            unsupported,
+            vec![
+                "ws_uri",
+                "ws_vad",
+                "ws_barge_in",
+                "ws_vad_threshold",
+                "ws_vad_hangover_ms",
+                "noise_suppression",
+                "echo_cancellation",
+            ]
+        );
+    }
+
+    /// `received_from` / `rtcp_mux` are real NG keys, so rtpengine honours them
+    /// and only rtpproxy does not.
+    #[tokio::test]
+    async fn received_from_and_rtcp_mux_split_rtpengine_from_rtpproxy() {
+        let flags = NgFlags {
+            carry_received_from: true,
+            rtcp_mux: vec!["require".into()],
+            ..NgFlags::default()
+        };
+        assert!(rtpengine_backend().await.unsupported_flags(&flags).is_empty());
+        assert!(siphon_rtp_backend().unsupported_flags(&flags).is_empty());
+        assert_eq!(
+            rtpproxy_backend().await.unsupported_flags(&flags),
+            vec!["received_from", "rtcp_mux"]
+        );
+    }
+
+    /// An injected address counts as asking for the gate even if the policy bit
+    /// was cleared along the way.
+    #[tokio::test]
+    async fn rtpproxy_reports_injected_received_from_unsupported() {
+        let flags = NgFlags {
+            received_from: Some("198.51.100.7".parse().unwrap()),
+            ..NgFlags::default()
+        };
+        assert_eq!(
+            rtpproxy_backend().await.unsupported_flags(&flags),
+            vec!["received_from"]
+        );
     }
 }

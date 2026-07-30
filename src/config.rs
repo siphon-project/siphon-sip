@@ -1793,6 +1793,68 @@ pub enum MediaBackendKind {
     Rtpproxy,
 }
 
+impl MediaBackendKind {
+    /// The engine's name as it appears in `media.backend`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rtpengine => "rtpengine",
+            Self::SiphonRtp => "siphon-rtp",
+            Self::Rtpproxy => "rtpproxy",
+        }
+    }
+
+    /// Which of `flags`' set fields this backend has no way to express.
+    ///
+    /// The WebSocket bridge and the DSP knobs are native `siphon-rtp`
+    /// extensions; `received_from` and `rtcp_mux` are also real rtpengine NG
+    /// keys but have no `rtpproxy` equivalent.
+    ///
+    /// A field the engine cannot honour is not a degraded call, it is a dead
+    /// one — a `ws_uri` the engine never sees means the leg is answered and
+    /// bridged nowhere, and the caller hears silence for its whole duration.
+    /// So this drives a hard config error rather than the boot warning that
+    /// covers `address_family` on `rtpproxy` (which merely loses IPv4/IPv6
+    /// interworking on an otherwise working call).
+    pub fn unsupported_profile_fields(self, flags: &NgFlagsConfig) -> Vec<&'static str> {
+        let mut unsupported = Vec::new();
+
+        if !matches!(self, Self::SiphonRtp) {
+            if flags.ws_uri.is_some() {
+                unsupported.push("ws_uri");
+            }
+            if flags.ws_vad {
+                unsupported.push("ws_vad");
+            }
+            if flags.ws_barge_in {
+                unsupported.push("ws_barge_in");
+            }
+            if flags.ws_vad_threshold.is_some() {
+                unsupported.push("ws_vad_threshold");
+            }
+            if flags.ws_vad_hangover_ms.is_some() {
+                unsupported.push("ws_vad_hangover_ms");
+            }
+            if flags.noise_suppression {
+                unsupported.push("noise_suppression");
+            }
+            if flags.echo_cancellation {
+                unsupported.push("echo_cancellation");
+            }
+        }
+
+        if matches!(self, Self::Rtpproxy) {
+            if flags.received_from {
+                unsupported.push("received_from");
+            }
+            if !flags.rtcp_mux.is_empty() {
+                unsupported.push("rtcp_mux");
+            }
+        }
+
+        unsupported
+    }
+}
+
 /// Media proxy configuration.
 #[derive(Debug, Deserialize, Clone)]
 pub struct MediaConfig {
@@ -2032,6 +2094,62 @@ where
     }
 }
 
+/// Serde deserializer for a media profile's `rtcp_mux` directive list.
+///
+/// The engines accept a fixed vocabulary (RFC 5761 mux handling); an unknown
+/// token is silently ignored, which would land as a call quietly negotiating the
+/// opposite mux decision from the one the operator wrote.  Same reasoning as
+/// [`deserialize_address_family`].
+fn deserialize_rtcp_mux<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de;
+
+    const VALID: [&str; 6] = ["offer", "require", "demux", "accept", "reject", "remove"];
+
+    let values: Vec<String> = Vec::deserialize(deserializer)?;
+    values
+        .into_iter()
+        .map(|value| {
+            let normalised = value.trim().to_ascii_lowercase();
+            if VALID.contains(&normalised.as_str()) {
+                Ok(normalised)
+            } else {
+                Err(de::Error::custom(format!(
+                    "media profile rtcp_mux entries must be one of {}, got {value:?}",
+                    VALID.join(", ")
+                )))
+            }
+        })
+        .collect()
+}
+
+/// Serde deserializer for a media profile's `ws_uri`.
+///
+/// The engine dials this as a WebSocket client, so anything that is not
+/// `ws://` / `wss://` can never connect.  Caught here rather than as a
+/// connect failure per call.
+fn deserialize_ws_uri<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de;
+
+    let value: Option<String> = Option::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    let scheme = trimmed.split("://").next().unwrap_or_default();
+    match scheme.to_ascii_lowercase().as_str() {
+        "ws" | "wss" if trimmed.contains("://") => Ok(Some(trimmed.to_string())),
+        _ => Err(de::Error::custom(format!(
+            "media profile ws_uri must be a ws:// or wss:// URI, got {value:?}"
+        ))),
+    }
+}
+
 /// A user-defined RTPEngine media profile with separate offer/answer NG flags.
 #[derive(Debug, Deserialize, Clone)]
 pub struct MediaProfileConfig {
@@ -2040,7 +2158,7 @@ pub struct MediaProfileConfig {
 }
 
 /// NG protocol flags for one direction (offer or answer).
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Default)]
 pub struct NgFlagsConfig {
     /// Transport protocol override (e.g. "RTP/AVP", "RTP/SAVPF").
     pub transport_protocol: Option<String>,
@@ -2073,6 +2191,55 @@ pub struct NgFlagsConfig {
     pub record_call: bool,
     /// Directory path for RTPEngine to write recording files.
     pub record_path: Option<String>,
+    /// Single-channel noise suppression on this leg's decoded ingress audio.
+    /// `siphon-rtp` backend only.
+    #[serde(default)]
+    pub noise_suppression: bool,
+    /// Acoustic/line echo cancellation on this leg's send path, referenced
+    /// against the audio played toward that party.  `siphon-rtp` backend only.
+    #[serde(default)]
+    pub echo_cancellation: bool,
+    /// Bridge this leg's audio to an external WebSocket media server: the engine
+    /// dials this URI and relays the leg's RTP to it as L16.  `siphon-rtp`
+    /// backend only.
+    ///
+    /// Supports `{call_id}`, `{from_tag}`, `{from_user}` and `{to_user}`
+    /// placeholders, expanded per call.  A script can override the whole URI for
+    /// one call with `rtpengine.offer(..., ws_uri=...)`.
+    #[serde(default, deserialize_with = "deserialize_ws_uri")]
+    pub ws_uri: Option<String>,
+    /// Run a local energy-VAD on the WebSocket uplink and emit
+    /// `speech_started`/`speech_stopped` on the caller's speech edges.  Inert
+    /// without `ws_uri`.  `siphon-rtp` backend only.
+    #[serde(default)]
+    pub ws_vad: bool,
+    /// Flush queued downlink playout locally when the caller starts speaking,
+    /// without a server round-trip.  Implies `ws_vad`; inert without `ws_uri`.
+    /// `siphon-rtp` backend only.
+    #[serde(default)]
+    pub ws_barge_in: bool,
+    /// Mean-square energy threshold for the WebSocket uplink VAD.  Unset uses
+    /// the engine default; higher is less sensitive.
+    #[serde(default)]
+    pub ws_vad_threshold: Option<i64>,
+    /// Trailing hangover for the WebSocket uplink VAD in milliseconds — how long
+    /// speech is held after energy drops before the turn endpoint fires.  Unset
+    /// uses the engine default.
+    #[serde(default)]
+    pub ws_vad_hangover_ms: Option<u32>,
+    /// Carry the real post-NAT source IP the proxy saw the request arrive from
+    /// (rtpengine's `received from`), gating the leg's media ingress to it.
+    ///
+    /// A tighter source gate than a NATed UA's unusable private `c=` address.
+    /// Opt-in, and off by default: a profile that leaves it unset emits exactly
+    /// the command it did before this knob existed.  Not honoured by `rtpproxy`.
+    #[serde(default)]
+    pub received_from: bool,
+    /// `rtcp-mux` directives (`offer`, `require`, `demux`, `accept`, `reject`,
+    /// `remove`), overriding the mux decision derived from the offered SDP
+    /// (RFC 5761).  Empty mirrors the offer.  Not honoured by `rtpproxy`.
+    #[serde(default, deserialize_with = "deserialize_rtcp_mux")]
+    pub rtcp_mux: Vec<String>,
 }
 
 /// One or more RTPEngine instances.
@@ -3079,8 +3246,60 @@ impl Config {
 
     /// Parse YAML without env-var expansion (used after expansion is already done).
     fn from_str_raw(yaml: &str) -> Result<Self> {
-        serde_yaml_ng::from_str(yaml)
-            .map_err(|e| SiphonError::Config(format!("invalid siphon.yaml: {e}")))
+        let config: Self = serde_yaml_ng::from_str(yaml)
+            .map_err(|e| SiphonError::Config(format!("invalid siphon.yaml: {e}")))?;
+        config.validate_media_profiles()?;
+        Ok(config)
+    }
+
+    /// Reject a media profile asking for something `media.backend` cannot do.
+    ///
+    /// Runs on every load path (`from_file` and `from_str` both route through
+    /// `from_str_raw`), so a misconfigured box fails to start instead of coming
+    /// up healthy and answering calls into a media path that was never wired.
+    ///
+    /// Only covers operator-declared `media.profiles` — a built-in profile is
+    /// registered regardless of backend, so a script naming one the backend
+    /// cannot honour is caught at the call instead (see the `rtpengine` script
+    /// API's profile resolution).
+    fn validate_media_profiles(&self) -> Result<()> {
+        let Some(media) = &self.media else {
+            return Ok(());
+        };
+
+        // Sorted so the error text is deterministic across runs (HashMap order).
+        let mut names: Vec<&String> = media.profiles.keys().collect();
+        names.sort_unstable();
+
+        for name in names {
+            let Some(profile) = media.profiles.get(name) else {
+                continue;
+            };
+            for (direction, flags) in [("offer", &profile.offer), ("answer", &profile.answer)] {
+                let unsupported = media.backend.unsupported_profile_fields(flags);
+                if !unsupported.is_empty() {
+                    return Err(SiphonError::Config(format!(
+                        "media profile {name:?} sets {} on its {direction} flags, which the \
+                         {} backend cannot honour — remove {} or set media.backend to a \
+                         backend that supports {}",
+                        unsupported.join(", "),
+                        media.backend.as_str(),
+                        if unsupported.len() == 1 {
+                            "the field"
+                        } else {
+                            "those fields"
+                        },
+                        if unsupported.len() == 1 {
+                            "it"
+                        } else {
+                            "them"
+                        },
+                    )));
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Returns true if the given host/IP is one of our configured local domains.
@@ -4636,6 +4855,240 @@ media:
             message.contains("address_family"),
             "error should name the field: {message}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Media profiles: WebSocket bridge / DSP / received_from / rtcp_mux
+    // -----------------------------------------------------------------------
+
+    /// Base config for the WS-profile cases, parameterised on backend + profile
+    /// body so each test states only what it is about.
+    fn ws_profile_yaml(backend_block: &str, profile_body: &str) -> String {
+        format!(
+            "listen:\n  udp:\n    - \"0.0.0.0:5060\"\ndomain:\n  local:\n    \
+             - \"example.com\"\nscript:\n  path: \"scripts/proxy_default.py\"\n\
+             media:\n{backend_block}  profiles:\n    voice_ai_custom:\n{profile_body}"
+        )
+    }
+
+    const SIPHON_RTP_BACKEND: &str =
+        "  backend: siphon-rtp\n  siphon_rtp:\n    address: \"127.0.0.1:9000\"\n";
+    const RTPENGINE_BACKEND: &str = "  rtpengine:\n    address: \"127.0.0.1:22222\"\n";
+    const RTPPROXY_BACKEND: &str =
+        "  backend: rtpproxy\n  rtpproxy:\n    address: \"127.0.0.1:22222\"\n";
+
+    #[test]
+    fn parses_media_profile_websocket_and_dsp_fields() {
+        let yaml = ws_profile_yaml(
+            SIPHON_RTP_BACKEND,
+            "      offer:\n        replace: [\"origin\"]\n        \
+             ws_uri: \"wss://ai.example.com/stream/{call_id}\"\n        \
+             ws_vad: true\n        ws_barge_in: true\n        \
+             ws_vad_threshold: 2000000\n        ws_vad_hangover_ms: 300\n        \
+             noise_suppression: true\n        echo_cancellation: true\n        \
+             received_from: true\n        rtcp_mux: [\"require\"]\n      answer: {}\n",
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        let media = config.media.unwrap();
+        let offer = &media.profiles.get("voice_ai_custom").unwrap().offer;
+        assert_eq!(
+            offer.ws_uri.as_deref(),
+            Some("wss://ai.example.com/stream/{call_id}")
+        );
+        assert!(offer.ws_vad);
+        assert!(offer.ws_barge_in);
+        assert_eq!(offer.ws_vad_threshold, Some(2_000_000));
+        assert_eq!(offer.ws_vad_hangover_ms, Some(300));
+        assert!(offer.noise_suppression);
+        assert!(offer.echo_cancellation);
+        assert!(offer.received_from);
+        assert_eq!(offer.rtcp_mux, vec!["require"]);
+    }
+
+    /// Defaults must stay off, so an existing profile emits exactly the command
+    /// it did before these knobs existed.
+    #[test]
+    fn media_profile_websocket_fields_default_off() {
+        let yaml = ws_profile_yaml(
+            RTPENGINE_BACKEND,
+            "      offer:\n        replace: [\"origin\"]\n      answer: {}\n",
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        let media = config.media.unwrap();
+        let offer = &media.profiles.get("voice_ai_custom").unwrap().offer;
+        assert!(offer.ws_uri.is_none());
+        assert!(!offer.ws_vad);
+        assert!(!offer.ws_barge_in);
+        assert!(offer.ws_vad_threshold.is_none());
+        assert!(offer.ws_vad_hangover_ms.is_none());
+        assert!(!offer.noise_suppression);
+        assert!(!offer.echo_cancellation);
+        assert!(!offer.received_from);
+        assert!(offer.rtcp_mux.is_empty());
+    }
+
+    #[test]
+    fn rejects_media_profile_non_websocket_ws_uri_scheme() {
+        let yaml = ws_profile_yaml(
+            SIPHON_RTP_BACKEND,
+            "      offer:\n        ws_uri: \"https://ai.example.com/stream\"\n      answer: {}\n",
+        );
+        let error = Config::from_str(&yaml).expect_err("https:// must be rejected");
+        assert!(
+            error.to_string().contains("ws_uri"),
+            "error should name the field: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_media_profile_bad_rtcp_mux_token() {
+        let yaml = ws_profile_yaml(
+            SIPHON_RTP_BACKEND,
+            "      offer:\n        rtcp_mux: [\"mux-please\"]\n      answer: {}\n",
+        );
+        let error = Config::from_str(&yaml).expect_err("unknown token must be rejected");
+        assert!(
+            error.to_string().contains("rtcp_mux"),
+            "error should name the field: {error}"
+        );
+    }
+
+    #[test]
+    fn accepts_media_profile_rtcp_mux_case_insensitively() {
+        let yaml = ws_profile_yaml(
+            SIPHON_RTP_BACKEND,
+            "      offer:\n        rtcp_mux: [\"OFFER\", \" Require \"]\n      answer: {}\n",
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        let media = config.media.unwrap();
+        assert_eq!(
+            media.profiles.get("voice_ai_custom").unwrap().offer.rtcp_mux,
+            vec!["offer", "require"]
+        );
+    }
+
+    /// A `ws_uri` the engine never receives means the leg is answered and bridged
+    /// nowhere — silence for the call's whole duration.  So it fails the load
+    /// rather than warning, unlike `address_family` on rtpproxy (which only
+    /// loses IPv4/IPv6 interworking on an otherwise working call).
+    #[test]
+    fn rejects_websocket_profile_on_rtpengine_backend() {
+        let yaml = ws_profile_yaml(
+            RTPENGINE_BACKEND,
+            "      offer:\n        ws_uri: \"wss://ai.example.com/stream\"\n      answer: {}\n",
+        );
+        let error = Config::from_str(&yaml).expect_err("ws_uri on rtpengine must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("ws_uri") && message.contains("rtpengine"),
+            "error should name the field and the backend: {message}"
+        );
+        assert!(
+            message.contains("voice_ai_custom"),
+            "error should name the profile: {message}"
+        );
+    }
+
+    #[test]
+    fn rejects_dsp_profile_on_rtpproxy_backend() {
+        let yaml = ws_profile_yaml(
+            RTPPROXY_BACKEND,
+            "      offer:\n        noise_suppression: true\n      answer: {}\n",
+        );
+        let error = Config::from_str(&yaml).expect_err("noise_suppression must be rejected");
+        assert!(
+            error.to_string().contains("noise_suppression"),
+            "error should name the field: {error}"
+        );
+    }
+
+    /// The answer direction is checked too — a profile is only half-validated if
+    /// only its offer flags are.
+    #[test]
+    fn rejects_websocket_profile_set_on_answer_direction_only() {
+        let yaml = ws_profile_yaml(
+            RTPENGINE_BACKEND,
+            "      offer: {}\n      answer:\n        ws_barge_in: true\n",
+        );
+        let error = Config::from_str(&yaml).expect_err("answer-side ws_barge_in must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("ws_barge_in") && message.contains("answer"),
+            "error should name the field and direction: {message}"
+        );
+    }
+
+    /// `received_from` and `rtcp_mux` are real rtpengine NG keys, so only
+    /// rtpproxy rejects them.
+    #[test]
+    fn accepts_received_from_and_rtcp_mux_on_rtpengine_backend() {
+        let yaml = ws_profile_yaml(
+            RTPENGINE_BACKEND,
+            "      offer:\n        received_from: true\n        \
+             rtcp_mux: [\"require\"]\n      answer: {}\n",
+        );
+        let config = Config::from_str(&yaml).expect("rtpengine honours both");
+        let media = config.media.unwrap();
+        assert!(media.profiles.get("voice_ai_custom").unwrap().offer.received_from);
+    }
+
+    #[test]
+    fn rejects_received_from_on_rtpproxy_backend() {
+        let yaml = ws_profile_yaml(
+            RTPPROXY_BACKEND,
+            "      offer:\n        received_from: true\n      answer: {}\n",
+        );
+        let error = Config::from_str(&yaml).expect_err("rtpproxy cannot gate on received_from");
+        assert!(
+            error.to_string().contains("received_from"),
+            "error should name the field: {error}"
+        );
+    }
+
+    #[test]
+    fn accepts_websocket_profile_on_siphon_rtp_backend() {
+        let yaml = ws_profile_yaml(
+            SIPHON_RTP_BACKEND,
+            "      offer:\n        ws_uri: \"wss://ai.example.com/stream\"\n        \
+             noise_suppression: true\n      answer: {}\n",
+        );
+        Config::from_str(&yaml).expect("siphon-rtp honours the WS bridge");
+    }
+
+    /// The check must not fire on a config with no `media` block at all.
+    #[test]
+    fn media_profile_validation_skips_config_without_media() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert!(config.media.is_none());
+    }
+
+    #[test]
+    fn unsupported_profile_fields_is_empty_for_plain_profile() {
+        let plain = NgFlagsConfig {
+            replace: vec!["origin".into()],
+            ..NgFlagsConfig::default()
+        };
+        for backend in [
+            MediaBackendKind::Rtpengine,
+            MediaBackendKind::SiphonRtp,
+            MediaBackendKind::Rtpproxy,
+        ] {
+            assert!(
+                backend.unsupported_profile_fields(&plain).is_empty(),
+                "{} rejected a plain profile",
+                backend.as_str()
+            );
+        }
     }
 
     #[test]

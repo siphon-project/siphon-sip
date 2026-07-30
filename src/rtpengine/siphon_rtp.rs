@@ -57,6 +57,12 @@ const READ_CHUNK: usize = 8192;
 /// semantics; only the wire encoding (JSON vs bencode) differs.  A free
 /// function rather than a `From` impl because both `From` and `ProfileFlags`
 /// are foreign to this crate (orphan rule).
+///
+/// Deliberately exhaustive — **no `..ProfileFlags::default()` tail**.  The tail
+/// is what let the WebSocket-bridge fields sit unreachable from signalling while
+/// the engine supported them: a struct-update fallback turns "siphon forgot to
+/// carry this" into a silent default instead of a compile error.  Adding a proto
+/// field must break this function.
 pub(crate) fn profile_flags_from_ng(flags: &NgFlags) -> ProfileFlags {
     ProfileFlags {
         transport_protocol: flags.transport_protocol.clone(),
@@ -68,10 +74,18 @@ pub(crate) fn profile_flags_from_ng(flags: &NgFlags) -> ProfileFlags {
         direction: flags.direction.clone(),
         record_call: flags.record_call,
         record_path: flags.record_path.clone(),
-        // Proto fields siphon's NgFlags has no source for (ws_uri,
-        // received_from, rtcp_mux). Default them: each carries
-        // skip_serializing_if, so the emitted wire form is unchanged.
-        ..ProfileFlags::default()
+        noise_suppression: flags.noise_suppression,
+        echo_cancellation: flags.echo_cancellation,
+        ws_uri: flags.ws_uri.clone(),
+        ws_vad: flags.ws_vad,
+        ws_barge_in: flags.ws_barge_in,
+        ws_vad_threshold: flags.ws_vad_threshold,
+        ws_vad_hangover_ms: flags.ws_vad_hangover_ms,
+        // The per-call address, not the `carry_received_from` policy bit — the
+        // script API injects the former only when the latter is set, so an
+        // opted-out profile leaves this `None` and serialises away.
+        received_from: flags.received_from,
+        rtcp_mux: flags.rtcp_mux.clone(),
     }
 }
 
@@ -1496,6 +1510,178 @@ mod tests {
         mpsc::channel(16)
     }
 
+    /// A fake engine that answers like [`spawn_offer_server`] but also hands back
+    /// the **raw JSON body** of every frame it received.
+    ///
+    /// Decoding to `Request` and asserting on the struct would not catch the bug
+    /// this work fixes: a field siphon never populates round-trips as `None`
+    /// through a `Request` just as happily as one it does populate. Asserting on
+    /// the bytes actually written is what proves the field reached the wire.
+    async fn spawn_capturing_server() -> (SocketAddr, mpsc::UnboundedReceiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (capture_tx, capture_rx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let capture_tx = capture_tx.clone();
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    loop {
+                        // Decode a frame to learn its length, but publish the
+                        // raw body bytes rather than the decoded value.
+                        let decoded = loop {
+                            match frame::decode::<Request>(&buffer) {
+                                Ok(Some((request, consumed))) => break Some((request, consumed)),
+                                Ok(None) => {
+                                    let mut chunk = vec![0u8; READ_CHUNK];
+                                    match stream.read(&mut chunk).await {
+                                        Ok(0) | Err(_) => break None,
+                                        Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                                    }
+                                }
+                                Err(_) => break None,
+                            }
+                        };
+                        let Some((request, consumed)) = decoded else {
+                            return;
+                        };
+                        let body =
+                            String::from_utf8_lossy(&buffer[frame::HEADER_LEN..consumed]).into_owned();
+                        buffer.drain(..consumed);
+                        let _ = capture_tx.send(body);
+
+                        let result = match request.command {
+                            Command::Ping => CmdResult::Pong,
+                            Command::Offer { .. }
+                            | Command::Answer { .. }
+                            | Command::AnswerLocal { .. } => CmdResult::Ok {
+                                sdp: Some("v=0\r\nc=IN IP4 203.0.113.1\r\n".to_string()),
+                                duration_ms: None,
+                                to_tag: None,
+                                stats: None,
+                                play_id: None,
+                            },
+                            _ => CmdResult::Ok {
+                                sdp: None,
+                                duration_ms: None,
+                                to_tag: None,
+                                stats: None,
+                                play_id: None,
+                            },
+                        };
+                        write_frame(&mut stream, &Response { id: request.id, result }).await;
+                    }
+                });
+            }
+        });
+        (address, capture_rx)
+    }
+
+    /// The emitted offer frame for `flags`, as the raw JSON the engine receives.
+    async fn captured_offer_json(flags: &NgFlags) -> String {
+        let (address, mut capture_rx) = spawn_capturing_server().await;
+        let (event_tx, _event_rx) = channel();
+        let client = SiphonRtpClient::new(address, None, 2_000, 5_000, event_tx);
+        client
+            .offer("call-1", "tag-a", b"v=0\r\n", flags)
+            .await
+            .expect("offer");
+        capture_rx.recv().await.expect("captured frame")
+    }
+
+    /// The acceptance criterion for the WebSocket bridge: a profile carrying
+    /// `ws_uri` must put it on the wire.  This is the assertion that would have
+    /// failed for as long as `profile_flags_from_ng` defaulted the field.
+    #[tokio::test]
+    async fn offer_frame_carries_ws_uri_and_dsp_fields() {
+        let json = captured_offer_json(&NgFlags {
+            transport_protocol: Some("RTP/AVP".into()),
+            replace: vec!["origin".into()],
+            ws_uri: Some("wss://ai.example.com/stream/call-1".into()),
+            ws_vad: true,
+            ws_barge_in: true,
+            ws_vad_threshold: Some(2_000_000),
+            ws_vad_hangover_ms: Some(300),
+            noise_suppression: true,
+            echo_cancellation: true,
+            rtcp_mux: vec!["require".into()],
+            received_from: Some("198.51.100.7".parse().unwrap()),
+            ..NgFlags::default()
+        })
+        .await;
+
+        for expected in [
+            r#""ws_uri":"wss://ai.example.com/stream/call-1""#,
+            r#""ws_vad":true"#,
+            r#""ws_barge_in":true"#,
+            r#""ws_vad_threshold":2000000"#,
+            r#""ws_vad_hangover_ms":300"#,
+            r#""noise_suppression":true"#,
+            r#""echo_cancellation":true"#,
+            r#""rtcp_mux":["require"]"#,
+            r#""received_from":"198.51.100.7""#,
+        ] {
+            assert!(
+                json.contains(expected),
+                "offer frame missing {expected}\nframe was: {json}"
+            );
+        }
+    }
+
+    /// The no-wire-drift guard.  A profile that sets none of the new fields must
+    /// serialise to exactly the bytes it did before they existed, so no existing
+    /// deployment sees its offer change.  Asserted as the whole frame, not a
+    /// substring — a spurious `"ws_vad":false` would slip past a `contains`.
+    #[tokio::test]
+    async fn offer_frame_without_new_fields_is_byte_identical() {
+        let json = captured_offer_json(&NgFlags {
+            transport_protocol: Some("RTP/AVP".into()),
+            ice: Some("remove".into()),
+            replace: vec!["origin".into()],
+            flags: vec!["trust-address".into()],
+            direction: vec!["external".into(), "internal".into()],
+            ..NgFlags::default()
+        })
+        .await;
+
+        assert_eq!(
+            json,
+            concat!(
+                r#"{"id":1,"command":"offer","call_id":"call-1","from_tag":"tag-a","#,
+                r#""sdp":"v=0\r\n","profile":{"transport_protocol":"RTP/AVP","ice":"remove","#,
+                r#""replace":["origin"],"flags":["trust-address"],"#,
+                r#""direction":["external","internal"]}}"#,
+            )
+        );
+    }
+
+    /// `carry_received_from` is siphon-side policy.  Setting it without an
+    /// injected address must not add a field to the frame.
+    #[tokio::test]
+    async fn offer_frame_omits_received_from_when_only_policy_is_set() {
+        let json = captured_offer_json(&NgFlags {
+            carry_received_from: true,
+            ..NgFlags::default()
+        })
+        .await;
+        assert!(
+            !json.contains("received_from"),
+            "policy bit leaked onto the wire: {json}"
+        );
+    }
+
+    /// Every field, not just the ones that happened to be wired.
+    ///
+    /// The earlier version of this test asserted only the nine fields
+    /// `profile_flags_from_ng` copied, so it stayed green for as long as the
+    /// WebSocket-bridge fields were dropped by a `..ProfileFlags::default()`
+    /// tail.  Asserting the whole struct is what makes "every field" mean it —
+    /// compare against a fully-populated expected value so a newly-added proto
+    /// field cannot pass by being defaulted on both sides.
     #[test]
     fn profile_flags_from_ng_maps_every_field() {
         let ng = NgFlags {
@@ -1508,17 +1694,62 @@ mod tests {
             direction: vec!["external".into(), "internal".into()],
             record_call: true,
             record_path: Some("/var/spool".into()),
+            noise_suppression: true,
+            echo_cancellation: true,
+            ws_uri: Some("wss://ai.invalid/stream".into()),
+            ws_vad: true,
+            ws_barge_in: true,
+            ws_vad_threshold: Some(2_000_000),
+            ws_vad_hangover_ms: Some(300),
+            carry_received_from: true,
+            received_from: Some("198.51.100.7".parse().unwrap()),
+            rtcp_mux: vec!["require".into()],
         };
-        let proto = profile_flags_from_ng(&ng);
-        assert_eq!(proto.transport_protocol.as_deref(), Some("RTP/SAVPF"));
-        assert_eq!(proto.ice.as_deref(), Some("force"));
-        assert_eq!(proto.dtls.as_deref(), Some("passive"));
-        assert_eq!(proto.replace, vec!["origin".to_string()]);
-        assert_eq!(proto.address_family.as_deref(), Some("IP4"));
-        assert_eq!(proto.flags, vec!["trust-address".to_string(), "symmetric".to_string()]);
-        assert_eq!(proto.direction, vec!["external".to_string(), "internal".to_string()]);
-        assert!(proto.record_call);
-        assert_eq!(proto.record_path.as_deref(), Some("/var/spool"));
+
+        let expected = ProfileFlags {
+            transport_protocol: Some("RTP/SAVPF".into()),
+            ice: Some("force".into()),
+            dtls: Some("passive".into()),
+            replace: vec!["origin".into()],
+            address_family: Some("IP4".into()),
+            flags: vec!["trust-address".into(), "symmetric".into()],
+            direction: vec!["external".into(), "internal".into()],
+            record_call: true,
+            record_path: Some("/var/spool".into()),
+            noise_suppression: true,
+            echo_cancellation: true,
+            ws_uri: Some("wss://ai.invalid/stream".into()),
+            ws_vad: true,
+            ws_barge_in: true,
+            ws_vad_threshold: Some(2_000_000),
+            ws_vad_hangover_ms: Some(300),
+            received_from: Some("198.51.100.7".parse().unwrap()),
+            rtcp_mux: vec!["require".into()],
+        };
+
+        assert_eq!(profile_flags_from_ng(&ng), expected);
+    }
+
+    /// `carry_received_from` is siphon-side policy, not a wire field: on its own
+    /// it must change nothing.  Only the injected address is emitted.
+    #[test]
+    fn profile_flags_from_ng_ignores_received_from_policy_without_address() {
+        let ng = NgFlags {
+            carry_received_from: true,
+            ..NgFlags::default()
+        };
+        assert_eq!(profile_flags_from_ng(&ng), ProfileFlags::default());
+    }
+
+    /// The no-wire-drift guard: a profile setting none of the new fields must
+    /// convert to exactly the default `ProfileFlags`, so every existing
+    /// deployment's emitted JSON is unchanged.
+    #[test]
+    fn profile_flags_from_ng_default_is_wire_identical() {
+        assert_eq!(
+            profile_flags_from_ng(&NgFlags::default()),
+            ProfileFlags::default()
+        );
     }
 
     #[test]
