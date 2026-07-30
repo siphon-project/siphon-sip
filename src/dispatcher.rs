@@ -9887,6 +9887,13 @@ fn handle_b2bua_cancel(
         state,
     );
 
+    // Control plane: a handed-over call CANCELled before the controller acted is
+    // the same teardown the answered/failed paths hook — emit StasisEnd + drop
+    // the ControlBus channel so the owning app learns to abort and no owner
+    // entry leaks (keyed on the A-leg Call-ID == this CANCEL's Call-ID; no-op for
+    // an uncontrolled call).
+    control_notify_terminated(&sip_call_id, "cancelled");
+
     // CDR: the caller CANCELled before answer (cdr.auto_emit) → 487.
     cdr_finalize_b2bua_fail(state, &call_id, 487);
 
