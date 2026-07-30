@@ -151,8 +151,12 @@ A-leg Call-ID that matched the offer (see [the SBC recipe](sbc.md)).
 |---|---|
 | `rtp_passthrough` | Plain RTP both sides — anchoring only (the default) |
 | `srtp_to_rtp` | SRTP UE ↔ RTP core (VoLTE/secure access ↔ trunk) |
+| `rtp_to_srtp` | The reverse pairing — RTP access ↔ SRTP core |
 | `ws_to_rtp` | WebSocket UE (RTP/AVPF + ICE) ↔ RTP core |
 | `wss_to_rtp` | Secure WebSocket (DTLS-SRTP/AVPF + ICE) ↔ RTP core |
+| `srs_recording` | Recording sink — plain RTP, media handover + port latching |
+| `siprec_src` | SIPREC SRC subscription leg toward the recorder |
+| `voice_ai` | Plain RTP toward the caller, audio bridged to a WebSocket AI backend |
 
 `ws_to_rtp` / `wss_to_rtp` are what make a **WebRTC** gateway work — terminate the
 browser's DTLS-SRTP + ICE on one side, plain RTP toward your core on the other.
@@ -211,6 +215,100 @@ allocate from.
 Works on **rtpengine** (sent as the dedicated `address family` NG key) and
 **siphon-rtp** (the `address_family` control field). The classic **rtpproxy**
 backend has no equivalent and logs a warning at boot if a profile sets it.
+
+### Bridge a leg's audio to a WebSocket server
+
+`ws_uri` hands a leg's audio to an external WebSocket media server instead of a
+far SIP leg: the engine dials the URI and relays the leg's RTP to it as L16
+(decode → uplink, downlink → encode). The WS server *is* that leg's far side, so
+this is the shape a call answered by a speech backend takes — pair it with
+[`rtpengine.answer_local`](#the-offer--answer--delete-lifecycle), which
+synthesises the 2xx answer with the engine as the far side.
+
+```yaml
+media:
+  backend: siphon-rtp          # required — see the capability table below
+  siphon_rtp:
+    address: "127.0.0.1:9000"
+  profiles:
+    voice_ai:                  # overrides the built-in of the same name
+      offer: &voice_ai_flags
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin"]
+        ws_uri: "wss://ai.example.com/stream/{call_id}"
+        ws_vad: true           # emit speech_started / speech_stopped edges
+        ws_barge_in: true      # cut playout locally on the caller's speech
+        ws_vad_threshold: 2000000
+        ws_vad_hangover_ms: 300
+        noise_suppression: true
+        echo_cancellation: true
+      answer: *voice_ai_flags
+```
+
+The URI supports `{call_id}`, `{from_tag}`, `{from_user}` and `{to_user}`,
+expanded per call. An unrecognised placeholder fails rather than passing through
+as a literal, so a typo cannot reach the engine as part of the URI path.
+
+When the endpoint depends on something only the script knows — a session token,
+a tenant lookup — pass it per call instead. It wins over the profile's own value,
+and is recorded on the media session so a later `answer` reuses the same bridge
+without repeating it:
+
+```python
+@b2bua.on_invite
+async def on_invite(call):
+    sdp = await rtpengine.answer_local(
+        call,
+        profile="voice_ai",
+        ws_uri=f"wss://ai.example.com/stream?token={await mint_token(call.call_id)}",
+    )
+    if sdp is not None:
+        call.answer(200, "OK", body=sdp, content_type="application/sdp")
+```
+
+The built-in `voice_ai` profile sets the DSP and VAD flags but deliberately
+leaves `ws_uri` unset — there is no sensible default endpoint, so supply it in
+YAML or per call as above.
+
+`ws_uri`, the `ws_*` knobs, `noise_suppression` and `echo_cancellation` are
+**`siphon-rtp` only**. siphon refuses to start if a `media.profiles` entry sets
+one on another backend, and a script naming such a profile gets a `ValueError`
+naming the field — see [media engines](../media-engines.md) for the full
+capability table.
+
+### Gate media ingress to the signalling source
+
+`received_from: true` carries the real post-NAT source IP siphon saw the request
+arrive from, and the engine gates that leg's ingress to it. For a NATed UA whose
+`c=` line advertises an unroutable private address, that is a **tighter**
+RTPBleed source gate than the signalled address could give. Only the IP is
+carried — media and signalling ports differ, so the port is never gated.
+
+```yaml
+media:
+  profiles:
+    nated_access:
+      offer:
+        replace: ["origin"]
+        received_from: true
+      answer:
+        replace: ["origin"]
+        received_from: true
+```
+
+Off by default, because it is wrong for a deployment whose media legitimately
+arrives from a different address than its signalling (a separate media gateway,
+or a carrier that splits the two). Honoured by **rtpengine** (the `received from`
+NG key) and **siphon-rtp**; **rtpproxy** has no equivalent and fails the config
+load.
+
+`rtcp_mux` takes the same RFC 5761 directives rtpengine does — `offer`,
+`require`, `demux`, `accept`, `reject`, `remove` — to override the mux decision
+the engine would derive from the offered SDP. Empty (the default) mirrors the
+offer. An unknown token fails the config load rather than being silently dropped
+by the engine.
 
 ## Shape the SDP yourself
 

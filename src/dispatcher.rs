@@ -17503,6 +17503,13 @@ fn b2bua_complete_terminated_transfer(
                         from_tag: tgt_tag.clone(),
                         to_tag: Some(surv_tag.clone()),
                         profile: old_session.profile.clone(),
+                        // Deliberately not carried over from `old_session`: this
+                        // is a fresh engine call-id for the survivor↔target
+                        // pair, and any WebSocket bridge the pre-transfer anchor
+                        // held died with the old call-id.  Copying the URI here
+                        // would make a later `answer` on this Call-ID resolve a
+                        // bridge that was never established for it.
+                        ws_uri: None,
                         created_at: std::time::Instant::now(),
                     });
                     store.remove(old_key);
@@ -21961,6 +21968,7 @@ a=rtpmap:8 PCMA/8000\r\n";
             from_tag: "a-tag".to_string(),
             to_tag: None,
             profile: "srtp_to_rtp".to_string(),
+            ws_uri: None,
             created_at: std::time::Instant::now(),
         }
     }

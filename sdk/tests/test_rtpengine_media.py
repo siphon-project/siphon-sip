@@ -367,3 +367,109 @@ class TestMediaTargetForms:
         assert call["op"] == "play_dtmf"
         assert call["call_id"] == "call-7"
         assert call["from_tag"] == "ftag-7"
+
+
+class TestWebSocketBridge:
+    """``ws_uri`` on offer / answer / answer_local — the voice-AI media bridge.
+
+    The engine dials the URI and bridges the leg's RTP to it, so the URI is the
+    whole feature: a script that cannot set it answers the call and bridges it
+    nowhere.
+    """
+
+    def test_answer_local_records_ws_uri(self, harness):
+        call = Call()
+        asyncio.run(
+            harness.rtpengine.answer_local(
+                call, profile="voice_ai", ws_uri="wss://ai.example.com/stream"
+            )
+        )
+        assert ("answer_local", "wss://ai.example.com/stream") in harness.rtpengine.ws_uris
+        assert harness.rtpengine.media_calls[-1]["ws_uri"] == "wss://ai.example.com/stream"
+
+    def test_no_bridge_requested_records_none(self, harness):
+        asyncio.run(harness.rtpengine.answer_local(Call(), profile="voice_ai"))
+        assert ("answer_local", None) in harness.rtpengine.ws_uris
+
+    def test_call_id_placeholder_expands(self, harness):
+        call = Call(call_id="abc123@example.invalid")
+        asyncio.run(
+            harness.rtpengine.offer(
+                call, profile="voice_ai", ws_uri="wss://ai.example.com/{call_id}"
+            )
+        )
+        assert harness.rtpengine.ws_uris[-1] == (
+            "offer",
+            "wss://ai.example.com/abc123@example.invalid",
+        )
+
+    def test_user_placeholders_expand_from_uris(self, harness):
+        call = Call(
+            call_id="c1",
+            from_uri="sip:1001@example.com",
+            to_uri="sip:2002@example.com",
+        )
+        asyncio.run(
+            harness.rtpengine.offer(
+                call,
+                profile="voice_ai",
+                ws_uri="wss://ai.example.com/s?from={from_user}&to={to_user}",
+            )
+        )
+        assert harness.rtpengine.ws_uris[-1] == (
+            "offer",
+            "wss://ai.example.com/s?from=1001&to=2002",
+        )
+
+    def test_unknown_placeholder_raises(self, harness):
+        with pytest.raises(ValueError, match="unknown placeholder"):
+            asyncio.run(
+                harness.rtpengine.offer(Call(call_id="c1"), ws_uri="wss://ai/{callid}")
+            )
+
+    def test_uri_without_placeholder_is_untouched(self, harness):
+        asyncio.run(
+            harness.rtpengine.offer(Call(call_id="c1"), ws_uri="wss://ai.example.com/stream")
+        )
+        assert harness.rtpengine.ws_uris[-1] == ("offer", "wss://ai.example.com/stream")
+
+    def test_answer_reuses_the_uri_recorded_at_offer(self, harness):
+        call = Call(call_id="c1")
+        asyncio.run(
+            harness.rtpengine.offer(call, profile="voice_ai", ws_uri="wss://ai/recorded")
+        )
+        asyncio.run(harness.rtpengine.answer_local(call))
+        assert harness.rtpengine.ws_uris[-1] == ("answer_local", "wss://ai/recorded")
+
+    def test_explicit_uri_overrides_the_recorded_one(self, harness):
+        call = Call(call_id="c1")
+        asyncio.run(
+            harness.rtpengine.offer(call, profile="voice_ai", ws_uri="wss://ai/recorded")
+        )
+        asyncio.run(harness.rtpengine.answer_local(call, ws_uri="wss://ai/explicit"))
+        assert harness.rtpengine.ws_uris[-1] == ("answer_local", "wss://ai/explicit")
+
+    def test_driven_from_on_invite_handler(self, harness):
+        harness.load_source(
+            """
+from siphon import b2bua, rtpengine
+
+@b2bua.on_invite
+async def on_invite(call):
+    sdp = await rtpengine.answer_local(
+        call,
+        profile="voice_ai",
+        ws_uri=f"wss://ai.example.com/stream/{call.call_id}",
+    )
+    if sdp is not None:
+        call.answer(200, "OK", body=sdp, content_type="application/sdp")
+"""
+        )
+        result = harness.send_invite(
+            ruri="sip:ai@example.com", from_uri="sip:alice@example.com"
+        )
+        assert result.action == "answer"
+        assert result.call.state == "answered"
+        operation, uri = harness.rtpengine.ws_uris[-1]
+        assert operation == "answer_local"
+        assert uri.startswith("wss://ai.example.com/stream/")

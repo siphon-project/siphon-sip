@@ -23,6 +23,13 @@ pub struct MediaSession {
     pub to_tag: Option<String>,
     /// The media profile name used for this session.
     pub profile: String,
+    /// The fully-expanded WebSocket bridge URI this session's media is attached
+    /// to, when one was requested (`siphon-rtp` voice-AI bridge).
+    ///
+    /// Recorded at `offer` so a later `answer` on the same Call-ID reuses the
+    /// same bridge without the script re-passing `ws_uri=` — the same reason
+    /// [`MediaSession::profile`] is recorded.
+    pub ws_uri: Option<String>,
     /// When this session was created.
     pub created_at: Instant,
 }
@@ -115,6 +122,7 @@ mod tests {
             from_tag: "tag-a".to_string(),
             to_tag: None,
             profile: "srtp_to_rtp".to_string(),
+            ws_uri: None,
             created_at: Instant::now(),
         }
     }

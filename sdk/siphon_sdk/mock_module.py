@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import re
 import sys
 import uuid
 from types import ModuleType
@@ -1913,6 +1914,13 @@ class MockRtpEngine:
         """List of ``(operation, profile_or_detail)`` tuples recorded."""
         self.media_calls: list[dict[str, Any]] = []
         """Full parameter dicts for each media-injection call."""
+        self.ws_uris: list[tuple[str, Optional[str]]] = []
+        """``(operation, resolved_ws_uri)`` per offer/answer/answer_local.
+
+        The URI is post-templating, so a test asserts the value the media engine
+        would actually be handed. ``None`` means no WebSocket bridge was
+        requested for that call.
+        """
         self._healthy = True
         self._play_media_duration_ms: Optional[int] = None
         self._answer_local_sdp: str = "v=0\r\nm=audio 40000 RTP/AVP 8 101\r\n"
@@ -1934,8 +1942,59 @@ class MockRtpEngine:
         """Number of configured RTPEngine instances (mock: always 1)."""
         return 1
 
+    _WS_URI_PLACEHOLDERS = ("call_id", "from_tag", "from_user", "to_user")
+
+    def _expand_ws_uri(self, template: str, target: Any) -> str:
+        """Expand ``{call_id}`` / ``{from_tag}`` / ``{from_user}`` /
+        ``{to_user}`` in a ``ws_uri``, mirroring the real implementation.
+
+        An unknown placeholder raises ``ValueError`` rather than passing through
+        as a literal — a typo'd ``{callid}`` would otherwise reach the media
+        engine as part of the URI path.
+        """
+        if "{" not in template:
+            return template
+
+        values = {
+            "call_id": getattr(target, "call_id", None),
+            "from_tag": getattr(target, "from_tag", None),
+        }
+        for name, attribute in (("from_user", "from_uri"), ("to_user", "to_uri")):
+            uri = getattr(target, attribute, None)
+            values[name] = getattr(uri, "user", None) if uri is not None else None
+
+        expanded = template
+        for name in re.findall(r"\{([^}]*)\}", template):
+            if name not in self._WS_URI_PLACEHOLDERS:
+                raise ValueError(
+                    f"ws_uri has unknown placeholder {{{name}}}; supported: "
+                    + ", ".join(f"{{{p}}}" for p in self._WS_URI_PLACEHOLDERS)
+                )
+            if values.get(name) is None:
+                raise ValueError(
+                    f"ws_uri placeholder {{{name}}} has no value on this call"
+                )
+            expanded = expanded.replace("{" + name + "}", str(values[name]))
+        return expanded
+
+    def _resolve_ws_uri(self, ws_uri: Optional[str], target: Any) -> Optional[str]:
+        """Resolve the bridge URI for a call: explicit argument, else the one
+        recorded by the matching ``offer``.
+
+        The real implementation has a third step — the resolved profile's own
+        ``ws_uri`` from ``media.profiles`` — which this mock cannot see, since it
+        holds no profile registry. Pass ``ws_uri=`` explicitly in tests.
+        """
+        if ws_uri is None:
+            for op, recorded in reversed(self.ws_uris):
+                if op == "offer":
+                    return recorded
+            return None
+        return self._expand_ws_uri(ws_uri, target)
+
     async def offer(self, request: Any,
-                    profile: Optional[str] = None) -> bool:
+                    profile: Optional[str] = None,
+                    ws_uri: Optional[str] = None) -> bool:
         """Send ``offer`` command to RTPEngine.
 
         Extracts SDP from message body, sends to engine, replaces body
@@ -1944,16 +2003,35 @@ class MockRtpEngine:
         Args:
             request: Request or Call object with SDP body.
             profile: RTP profile name. Defaults to ``"rtp_passthrough"``.
+            ws_uri: Bridge this leg's audio to an external WebSocket media
+                    server (``siphon-rtp`` backend only), overriding the
+                    profile's own ``ws_uri`` for this call. Supports
+                    ``{call_id}``, ``{from_tag}``, ``{from_user}`` and
+                    ``{to_user}`` placeholders. The resolved URI is recorded on
+                    the media session, so a later ``answer`` reuses it
+                    automatically.
 
         Returns:
             ``True`` on success.
+
+        Example::
+
+            @b2bua.on_invite
+            async def on_invite(call):
+                sdp = await rtpengine.answer_local(
+                    call,
+                    profile="voice_ai",
+                    ws_uri=f"wss://ai.example.com/stream/{call.call_id}",
+                )
         """
         self.operations.append(("offer", profile or "rtp_passthrough"))
+        self.ws_uris.append(("offer", self._resolve_ws_uri(ws_uri, request)))
         return True
 
     async def answer(self, reply: Any,
                      profile: Optional[str] = None,
-                     call: Any = None) -> bool:
+                     call: Any = None,
+                     ws_uri: Optional[str] = None) -> bool:
         """Send ``answer`` command to RTPEngine.
 
         Profile precedence (matches the real implementation):
@@ -1973,6 +2051,10 @@ class MockRtpEngine:
                   From-tag are taken from this object (matching the earlier
                   ``offer``), while To-tag and SDP body still come from
                   ``reply``.
+            ws_uri: WebSocket bridge URI override for this call (``siphon-rtp``
+                    backend only). When omitted, the URI recorded by the
+                    matching ``offer`` is reused — the same precedence as
+                    ``profile``.
 
         Returns:
             ``True`` on success.
@@ -1986,6 +2068,7 @@ class MockRtpEngine:
             else:
                 profile = "rtp_passthrough"
         self.operations.append(("answer", profile))
+        self.ws_uris.append(("answer", self._resolve_ws_uri(ws_uri, call or reply)))
         return True
 
     async def answer_local(
@@ -1993,6 +2076,7 @@ class MockRtpEngine:
         call: Any,
         profile: Optional[str] = None,
         auto_reject: bool = True,
+        ws_uri: Optional[str] = None,
     ) -> Optional[str]:
         """Single-leg UAS answer — synthesise an RFC 3264 answer for the
         caller's **own** offer, with the media engine as the far side (IVR /
@@ -2027,6 +2111,11 @@ class MockRtpEngine:
                          no-encodable-codec result records a deferred 488 and
                          returns ``None``. When ``False`` it raises
                          ``ValueError``.
+            ws_uri: Bridge this leg's audio to an external WebSocket media
+                    server instead of a far SIP leg — the shape a voice-AI
+                    answer takes, since the WS server *is* the far side.
+                    Overrides the profile's own ``ws_uri``; supports the same
+                    placeholders as :meth:`offer`.
 
         Returns:
             The answer SDP as ``str`` on success, or ``None`` when the offer had
@@ -2050,6 +2139,10 @@ class MockRtpEngine:
             else:
                 profile = "rtp_passthrough"
 
+        # Resolved before the no-codec branch so a bad template raises
+        # regardless of whether the engine could answer, as it does for real.
+        resolved_ws_uri = self._resolve_ws_uri(ws_uri, call)
+
         if self._answer_local_no_codec:
             can_reject = auto_reject and hasattr(call, "reject")
             if can_reject:
@@ -2060,16 +2153,19 @@ class MockRtpEngine:
                     "profile": profile,
                     "auto_reject": auto_reject,
                     "answered": False,
+                    "ws_uri": resolved_ws_uri,
                 })
                 return None
             raise ValueError("no encodable codec in offer")
 
         self.operations.append(("answer_local", profile))
+        self.ws_uris.append(("answer_local", resolved_ws_uri))
         self.media_calls.append({
             "op": "answer_local",
             "profile": profile,
             "auto_reject": auto_reject,
             "answered": True,
+            "ws_uri": resolved_ws_uri,
         })
         return self._answer_local_sdp
 

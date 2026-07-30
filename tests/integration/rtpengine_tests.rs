@@ -212,6 +212,7 @@ async fn session_store_tracks_offer_and_answer() {
         from_tag: "tag-a".to_string(),
         to_tag: None,
         profile: "srtp_to_rtp".to_string(),
+        ws_uri: None,
         created_at: std::time::Instant::now(),
     });
 

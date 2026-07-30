@@ -6,6 +6,57 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **Media profiles can drive the `siphon-rtp` WebSocket audio bridge and its DSP
+  chain.** The engine has supported handing a leg's audio to an external
+  WebSocket media server (decode → L16 uplink, L16 downlink → encode, the WS
+  server acting as that leg's far side) for as long as siphon has pinned
+  `siphon-rtp-proto` 0.1.4, but siphon never populated the control fields: the
+  `NgFlags` → `ProfileFlags` conversion copied the nine fields it knew about and
+  swallowed the rest under a `..ProfileFlags::default()` tail, so the bridge was
+  unreachable from signalling and no configuration could turn it on. `NgFlags`
+  and the `media.profiles` YAML schema now carry `ws_uri`, `ws_vad`,
+  `ws_barge_in`, `ws_vad_threshold`, `ws_vad_hangover_ms`, `noise_suppression`
+  and `echo_cancellation`, and the conversion is exhaustive — a proto field
+  siphon does not carry is now a compile error rather than a silent default.
+- **`ws_uri=` on `rtpengine.offer()` / `answer()` / `answer_local()`,** for an
+  endpoint the script computes per call (session token, tenant lookup). It wins
+  over the profile's own value and is recorded on the media session, so a later
+  `answer` reuses the same bridge without repeating it — the same precedence
+  `profile=` already had. Both forms expand `{call_id}`, `{from_tag}`,
+  `{from_user}` and `{to_user}`; an unrecognised placeholder raises instead of
+  passing through as a literal, so a typo cannot reach the engine as a URI path
+  segment.
+- **Built-in `voice_ai` media profile** — plain RTP toward the caller with noise
+  suppression, echo cancellation, VAD and local barge-in on. `ws_uri` is left
+  unset (there is no sensible default endpoint) and comes from YAML or per call.
+- **`received_from` media-profile flag (opt-in)** — carries the real post-NAT
+  source IP siphon saw the request arrive from, gating that leg's media ingress
+  to it. For a NATed UA advertising an unroutable private `c=` address this is a
+  tighter RTPBleed source gate than the signalled address allows. Off by default,
+  so an existing profile emits a byte-identical command; wrong for deployments
+  whose media legitimately arrives from a different address than its signalling.
+- **`rtcp_mux` media-profile flag** — the RFC 5761 directive list (`offer`,
+  `require`, `demux`, `accept`, `reject`, `remove`) overriding the mux decision
+  the engine derives from the offered SDP.
+
+### Changed
+- **siphon refuses to start when a `media.profiles` entry sets a field its
+  `media.backend` cannot honour,** naming the profile, the direction and the
+  field. The WebSocket and DSP flags are `siphon-rtp` only; `received_from` and
+  `rtcp_mux` are also real rtpengine NG keys but have no `rtpproxy` equivalent.
+  This is a hard failure rather than the boot warning that covers
+  `address_family` on `rtpproxy`, because the failure modes differ in kind: an
+  ignored `address_family` costs IPv4/IPv6 interworking on a call that still
+  works, while an ignored `ws_uri` answers the call and bridges it nowhere —
+  silence for the call's whole duration, with nothing logged. A script naming a
+  built-in profile the backend cannot honour (built-ins are registered whatever
+  the backend, so config validation cannot see them) raises a `ValueError`
+  naming the field.
+- Invalid `ws_uri` schemes and `rtcp_mux` tokens fail the config load, matching
+  the existing `address_family` treatment — the engines ignore an unknown value
+  silently, which otherwise lands as a call quietly negotiated the wrong way.
+
 ### Fixed
 - **B2BUA-originated requests are now retransmitted per RFC 3261 §17.1 on
   unreliable transports.** The proxy datapath relays through the transaction
@@ -55,6 +106,13 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   additionally logs its destination, source socket, transport and size at debug
   level. Nothing on that path logged before, which made an absent send line easy
   to misread as the request never having been handed to the transport.
+
+- **`docs/media-engines.md` claimed SIPREC/MPTY subscriptions were unimplemented
+  on `siphon-rtp` and would surface an engine error.** They have been wired on
+  all three backends since the native backend shipped; the page was steering
+  people away from a working path. The same page's "media profiles are identical
+  across backends" statement is now qualified with the per-engine capability
+  table.
 
 ## [1.5.1] — 2026-07-29
 
