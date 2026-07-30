@@ -2558,6 +2558,55 @@ fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
     }
 }
 
+/// Does this request carry a To-tag, i.e. is it in-dialog (RFC 3261 §12)?
+fn to_has_tag(message: &SipMessage) -> bool {
+    message
+        .headers
+        .get("To")
+        .map(|value| value.split(';').any(|p| p.trim().starts_with("tag=")))
+        .unwrap_or(false)
+}
+
+/// Must this request be answered 481 because its B2BUA dialog is already gone?
+///
+/// RFC 3261 §12.2.2 — a request whose dialog identifier matches no existing
+/// dialog gets 481 Call/Transaction Does Not Exist; §15.1.2 says the same for
+/// BYE specifically. The case that matters in the field is hang-up glare: both
+/// parties send BYE within a few hundred ms, so the second one arrives after the
+/// call was torn down. It then misses every B2BUA intercept (they gate on the
+/// same Call-ID lookup that has just started failing) and falls through to the
+/// proxy path, where a script with no route for it produces a silent drop. The
+/// peer is left retransmitting to its own timer F — 32 s of silence, which a
+/// VoNR UE treats as a dead IMS and answers by releasing its IMS PDU session and
+/// re-registering, costing ~40 s of terminating service.
+///
+/// Conditions are ordered so a live call pays one hash and stops.
+fn terminated_dialog_needs_481(
+    method: &str,
+    message: &SipMessage,
+    calls: &crate::b2bua::actor::CallActorStore,
+) -> bool {
+    // ACK is never answered (RFC 3261 §17.1.1.3). CANCEL for an unknown
+    // transaction is already 481'd by `handle_cancel`'s fall-through.
+    if method == "ACK" || method == "CANCEL" {
+        return false;
+    }
+    let Some(call_id) = message.headers.call_id() else {
+        return false;
+    };
+    if !calls.is_recently_terminated(call_id) {
+        return false;
+    }
+    // In-dialog only. A peer that reuses a Call-ID for a brand-new dialog sends
+    // no To-tag, and must reach the normal INVITE path rather than a 481.
+    if !to_has_tag(message) {
+        return false;
+    }
+    // A live call always beats a tombstone, so Call-ID reuse can't 481 a call
+    // that is up right now.
+    calls.find_by_sip_call_id(call_id).is_none()
+}
+
 /// Handle an inbound SIP request — run through Python handlers.
 fn handle_request(
     inbound: InboundMessage,
@@ -2790,19 +2839,36 @@ fn handle_request(
     // ACK/BYE/PRACK/CANCEL and all responses are unaffected.
     if method == "INVITE"
         && state.is_draining.is_draining.load(std::sync::atomic::Ordering::Relaxed)
+        && !to_has_tag(&message)
     {
-        let to_has_tag = message.headers.get("To")
-            .map(|t| t.split(';').any(|p| p.trim().starts_with("tag=")))
-            .unwrap_or(false);
-        if !to_has_tag {
-            debug!("draining — rejecting new INVITE with 503 Service Unavailable");
-            let response = build_response(
-                &message, 503, "Service Unavailable",
-                state.server_header.as_deref(), &[],
-            );
-            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
-            return;
-        }
+        debug!("draining — rejecting new INVITE with 503 Service Unavailable");
+        let response = build_response(
+            &message, 503, "Service Unavailable",
+            state.server_header.as_deref(), &[],
+        );
+        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+        return;
+    }
+
+    // In-dialog request for a B2BUA call this node already tore down: 481 rather
+    // than a silent drop (see `terminated_dialog_needs_481` for the why). Runs
+    // ahead of the B2BUA intercepts below so a re-INVITE for a dead call is also
+    // caught here — otherwise `handle_b2bua_invite` takes it for a new call.
+    if terminated_dialog_needs_481(&method, &message, &state.call_actors) {
+        debug!(
+            method = %method,
+            call_id = %message.headers.call_id().map(|s| s.as_str()).unwrap_or(""),
+            "in-dialog request for a torn-down B2BUA call — 481",
+        );
+        let response = build_response(
+            &message, 481, "Call/Transaction Does Not Exist",
+            state.server_header.as_deref(), &[],
+        );
+        send_message_from(
+            response, inbound.transport, inbound.remote_addr,
+            inbound.connection_id, Some(inbound.local_addr), state,
+        );
+        return;
     }
 
     // Check if B2BUA mode should handle this INVITE
@@ -14611,7 +14677,18 @@ fn handle_b2bua_bye(
     let call_id = match state.call_actors.find_by_sip_call_id(&sip_call_id) {
         Some(id) => id,
         None => {
-            warn!(sip_call_id = %sip_call_id, "B2BUA BYE: no matching call");
+            // Lost a race with a concurrent teardown — the dispatch gate saw
+            // this call, and it is gone by now. Same answer as the no-dialog-leg
+            // arm below: 481, never a silent drop (RFC 3261 §15.1.2).
+            warn!(sip_call_id = %sip_call_id, "B2BUA BYE: no matching call — 481");
+            let response = build_response(
+                &message, 481, "Call/Transaction Does Not Exist",
+                state.server_header.as_deref(), &[],
+            );
+            send_message_from(
+                response, inbound.transport, inbound.remote_addr,
+                inbound.connection_id, Some(inbound.local_addr), state,
+            );
             return;
         }
     };
@@ -15749,7 +15826,17 @@ fn handle_b2bua_reinvite(
     let call_id = match state.call_actors.find_by_sip_call_id(&sip_call_id) {
         Some(id) => id,
         None => {
-            warn!(sip_call_id = %sip_call_id, "B2BUA re-INVITE: no matching call");
+            // Raced a concurrent teardown (the `is_reinvite` gate had matched).
+            // 481 like the no-dialog-leg arm below, never a silent drop.
+            warn!(sip_call_id = %sip_call_id, "B2BUA re-INVITE: no matching call — 481");
+            let response = build_response(
+                &message, 481, "Call/Transaction Does Not Exist",
+                state.server_header.as_deref(), &[],
+            );
+            send_message_from(
+                response, inbound.transport, inbound.remote_addr,
+                inbound.connection_id, Some(inbound.local_addr), state,
+            );
             return;
         }
     };
@@ -16226,7 +16313,17 @@ fn handle_b2bua_update(
     let call_id = match state.call_actors.find_by_sip_call_id(&sip_call_id) {
         Some(id) => id,
         None => {
-            warn!(sip_call_id = %sip_call_id, "B2BUA UPDATE: no matching call");
+            // Raced a concurrent teardown. 481 like the no-dialog-leg arm below
+            // (RFC 3311 UPDATE, answered per RFC 3261 §12.2.2).
+            warn!(sip_call_id = %sip_call_id, "B2BUA UPDATE: no matching call — 481");
+            let response = build_response(
+                &message, 481, "Call/Transaction Does Not Exist",
+                state.server_header.as_deref(), &[],
+            );
+            send_message_from(
+                response, inbound.transport, inbound.remote_addr,
+                inbound.connection_id, Some(inbound.local_addr), state,
+            );
             return;
         }
     };
@@ -16735,7 +16832,24 @@ fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &Disp
     let call_id = match state.call_actors.find_by_sip_call_id(&sip_call_id) {
         Some(id) => id,
         None => {
-            warn!(sip_call_id = %sip_call_id, "B2BUA REFER: no matching call");
+            // Raced a concurrent teardown. 481 like the no-dialog-leg arm below,
+            // never a silent drop (RFC 3515 §2.4.2 defers to RFC 3261 §12.2.2).
+            warn!(sip_call_id = %sip_call_id, "B2BUA REFER: no matching call — 481");
+            let response = build_response(
+                &message,
+                481,
+                "Call/Transaction Does Not Exist",
+                state.server_header.as_deref(),
+                &[],
+            );
+            send_message_from(
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
+            );
             return;
         }
     };
@@ -17979,7 +18093,25 @@ fn handle_b2bua_notify(inbound: InboundMessage, message: SipMessage, state: &Dis
     let call_id = match state.call_actors.find_by_sip_call_id(&sip_call_id) {
         Some(id) => id,
         None => {
-            warn!(sip_call_id = %sip_call_id, "B2BUA NOTIFY: no matching call");
+            // Raced a concurrent teardown. 481 like the no-dialog-leg arm below
+            // — RFC 6665 §8.2.1 also answers 481 for a NOTIFY whose
+            // subscription is gone.
+            warn!(sip_call_id = %sip_call_id, "B2BUA NOTIFY: no matching call — 481");
+            let response = build_response(
+                &message,
+                481,
+                "Call/Transaction Does Not Exist",
+                state.server_header.as_deref(),
+                &[],
+            );
+            send_message_from(
+                response,
+                inbound.transport,
+                inbound.remote_addr,
+                inbound.connection_id,
+                Some(inbound.local_addr),
+                state,
+            );
             return;
         }
     };
@@ -22049,6 +22181,177 @@ a=rtpmap:8 PCMA/8000\r\n";
     fn clear_media_session_on_timeout_no_store_is_noop() {
         // Media backend not configured (rtpengine_sessions is None) → false.
         assert!(!clear_media_session_on_timeout(None, "1-1354742@host"));
+    }
+
+    // -----------------------------------------------------------------------
+    // In-dialog request against a torn-down B2BUA call → 481 (RFC 3261 §12.2.2)
+    // -----------------------------------------------------------------------
+
+    fn glare_a_leg(sip_call_id: &str) -> Leg {
+        Leg::new_a_leg(
+            sip_call_id.to_string(),
+            "tag-alice".to_string(),
+            "z9hG4bK-aleg".to_string(),
+            LegTransport {
+                remote_addr: "10.0.0.1:5060".parse().unwrap(),
+                connection_id: ConnectionId::default(),
+                transport: Transport::Udp,
+                local_addr: None,
+            },
+        )
+    }
+
+    /// A store whose only call carried `sip_call_id` and has been torn down —
+    /// the state the trunk's BYE leaves behind in the glare.
+    fn store_after_teardown(sip_call_id: &str) -> CallActorStore {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(glare_a_leg(sip_call_id));
+        store.remove_call(&call_id);
+        store
+    }
+
+    fn in_dialog_request(method: Method, sip_call_id: &str, to_tag: Option<&str>) -> SipMessage {
+        let to = match to_tag {
+            Some(tag) => format!("<sip:bob@example.com>;tag={tag}"),
+            None => "<sip:bob@example.com>".to_string(),
+        };
+        let cseq = format!("2 {}", method.as_str());
+        SipMessageBuilder::new()
+            .request(
+                method,
+                SipUri::new("example.com".to_string()).with_user("bob".to_string()),
+            )
+            .via("SIP/2.0/UDP ue.example.com:5060;branch=z9hG4bK-glare".to_string())
+            .to(to)
+            .from("<sip:alice@example.com>;tag=alice-tag".to_string())
+            .call_id(sip_call_id.to_string())
+            .cseq(cseq)
+            .max_forwards(70)
+            .content_length(0)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn bye_after_teardown_needs_481() {
+        // The field case: the trunk's BYE tore the call down, the UE's own BYE
+        // lands ~350ms later. Silently dropping it costs the UE 32s to timer F
+        // and then a full IMS re-registration.
+        let store = store_after_teardown("ue-call-id@10.0.0.1");
+        let bye = in_dialog_request(Method::Bye, "ue-call-id@10.0.0.1", Some("bob-tag"));
+        assert!(terminated_dialog_needs_481("BYE", &bye, &store));
+    }
+
+    #[test]
+    fn bye_for_live_call_needs_no_481() {
+        // A live call always wins: its own in-dialog requests must reach the
+        // B2BUA intercepts, never a 481.
+        let store = CallActorStore::new();
+        store.create_call(glare_a_leg("ue-call-id@10.0.0.1"));
+        let bye = in_dialog_request(Method::Bye, "ue-call-id@10.0.0.1", Some("bob-tag"));
+        assert!(!terminated_dialog_needs_481("BYE", &bye, &store));
+    }
+
+    #[test]
+    fn reinvite_after_teardown_needs_481() {
+        // Also stops handle_b2bua_invite from taking a re-INVITE for a dead call
+        // as a brand-new call and dialling out again.
+        let store = store_after_teardown("ue-call-id@10.0.0.1");
+        let reinvite = in_dialog_request(Method::Invite, "ue-call-id@10.0.0.1", Some("bob-tag"));
+        assert!(terminated_dialog_needs_481("INVITE", &reinvite, &store));
+    }
+
+    #[test]
+    fn update_and_refer_after_teardown_need_481() {
+        let store = store_after_teardown("ue-call-id@10.0.0.1");
+        let update = in_dialog_request(Method::Update, "ue-call-id@10.0.0.1", Some("bob-tag"));
+        let refer = in_dialog_request(Method::Refer, "ue-call-id@10.0.0.1", Some("bob-tag"));
+        assert!(terminated_dialog_needs_481("UPDATE", &update, &store));
+        assert!(terminated_dialog_needs_481("REFER", &refer, &store));
+    }
+
+    #[test]
+    fn ack_after_teardown_is_never_answered() {
+        // RFC 3261 §17.1.1.3 — an ACK has no response, ever.
+        let store = store_after_teardown("ue-call-id@10.0.0.1");
+        let ack = in_dialog_request(Method::Ack, "ue-call-id@10.0.0.1", Some("bob-tag"));
+        assert!(!terminated_dialog_needs_481("ACK", &ack, &store));
+    }
+
+    #[test]
+    fn cancel_after_teardown_is_left_to_handle_cancel() {
+        // handle_cancel's fall-through already 481s an unknown transaction, and
+        // it keys on the Via branch rather than the Call-ID.
+        let store = store_after_teardown("ue-call-id@10.0.0.1");
+        let cancel = in_dialog_request(Method::Cancel, "ue-call-id@10.0.0.1", Some("bob-tag"));
+        assert!(!terminated_dialog_needs_481("CANCEL", &cancel, &store));
+    }
+
+    #[test]
+    fn out_of_dialog_request_reusing_the_call_id_needs_no_481() {
+        // A peer that reuses a Call-ID for a *new* dialog sends no To-tag; it has
+        // to reach the normal INVITE path.
+        let store = store_after_teardown("ue-call-id@10.0.0.1");
+        let invite = in_dialog_request(Method::Invite, "ue-call-id@10.0.0.1", None);
+        assert!(!terminated_dialog_needs_481("INVITE", &invite, &store));
+    }
+
+    #[test]
+    fn unknown_call_id_is_left_to_the_script() {
+        // Load-bearing for proxy mode: a CSCF loose-routes in-dialog requests for
+        // dialogs it never tracked (topmost Route belongs to another proxy), so
+        // "not a call of ours" must NOT become a 481.
+        let store = store_after_teardown("ue-call-id@10.0.0.1");
+        let bye = in_dialog_request(Method::Bye, "someone-elses-dialog@10.0.0.9", Some("bob-tag"));
+        assert!(!terminated_dialog_needs_481("BYE", &bye, &store));
+    }
+
+    #[test]
+    fn b_leg_call_id_after_teardown_needs_481() {
+        // Glare can be lost by either peer, and the B2BUA's two legs carry
+        // different Call-IDs.
+        let store = CallActorStore::new();
+        let call_id = store.create_call(glare_a_leg("ue-call-id@10.0.0.1"));
+        store.add_b_leg(
+            &call_id,
+            Leg::new_b_leg(
+                "trunk-call-id@10.0.0.2".to_string(),
+                "tag-b2bua".to_string(),
+                "sip:bob@10.0.0.2".to_string(),
+                "z9hG4bK-bleg".to_string(),
+                LegTransport {
+                    remote_addr: "10.0.0.2:5060".parse().unwrap(),
+                    connection_id: ConnectionId::default(),
+                    transport: Transport::Udp,
+                    local_addr: None,
+                },
+            ),
+        );
+        store.remove_call(&call_id);
+
+        let bye = in_dialog_request(Method::Bye, "trunk-call-id@10.0.0.2", Some("bob-tag"));
+        assert!(terminated_dialog_needs_481("BYE", &bye, &store));
+    }
+
+    #[test]
+    fn recreated_call_id_beats_the_tombstone() {
+        // Eviction is lazy, so a UE that reuses a Call-ID for its next call can
+        // be live and remembered-as-terminated at the same time. The live lookup
+        // has to win, or the new call's own BYE would be 481'd.
+        let store = store_after_teardown("ue-call-id@10.0.0.1");
+        store.create_call(glare_a_leg("ue-call-id@10.0.0.1"));
+        assert!(store.is_recently_terminated("ue-call-id@10.0.0.1"));
+
+        let bye = in_dialog_request(Method::Bye, "ue-call-id@10.0.0.1", Some("bob-tag"));
+        assert!(!terminated_dialog_needs_481("BYE", &bye, &store));
+    }
+
+    #[test]
+    fn to_has_tag_reads_the_dialog_identifier() {
+        let in_dialog = in_dialog_request(Method::Bye, "cid@host", Some("bob-tag"));
+        let out_of_dialog = in_dialog_request(Method::Invite, "cid@host", None);
+        assert!(to_has_tag(&in_dialog));
+        assert!(!to_has_tag(&out_of_dialog));
     }
 
 }

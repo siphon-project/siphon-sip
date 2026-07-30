@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA BYE-glare UAS scenario (B-leg / trunk side):
+  Receive INVITE → 200 → ACK → send BYE → 200
+
+  This side wins the hang-up race: its BYE tears the B2BUA call down, which is
+  what leaves the A-leg's own BYE (see b2bua_bye_glare_uac.xml) arriving for a
+  call that no longer exists.
+-->
+<scenario name="B2BUA BYE glare UAS">
+
+  <!-- Receive the B-leg INVITE from the B2BUA and capture dialog state -->
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp="(.*)" search_in="hdr" header="Call-ID:" assign_to="dialog_callid" />
+      <ereg regexp="tag=([^;&gt;\r\n ]+)" search_in="hdr" header="From:" assign_to="junk,remote_tag" />
+      <ereg regexp="&lt;([^&gt;]+)>" search_in="hdr" header="From:" assign_to="junk,remote_from_uri" />
+      <ereg regexp="&lt;([^&gt;]+)>" search_in="hdr" header="Contact:" assign_to="junk,remote_contact" />
+    </action>
+  </recv>
+
+  <send retrans="500">
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:bob@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=bob 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=sendrecv
+]]>
+  </send>
+
+  <recv request="ACK" timeout="5000" />
+
+  <!-- Let the call settle before hanging up, so the teardown is unambiguously
+       a mid-call BYE and not a race with the ACK. -->
+  <pause milliseconds="500" />
+
+  <!-- Trunk hangs up first: this BYE removes the B2BUA call. -->
+  <send retrans="500">
+    <![CDATA[
+BYE [$remote_contact] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:bob@[local_ip]>;tag=[pid]SIPpTag01[call_number]
+To: <[$remote_from_uri]>;tag=[$remote_tag]
+Call-ID: [$dialog_callid]
+CSeq: 1 BYE
+Max-Forwards: 70
+User-Agent: SIPp/b2bua-bye-glare-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+  <!-- Outlive the UAC, including its 4 s wait for the 481. This pair runs under
+       --abort-on-container-exit, so if this side exits first the UAC is killed
+       before its assertion resolves and the run reports green without having
+       tested anything. -->
+  <pause milliseconds="10000" />
+
+</scenario>

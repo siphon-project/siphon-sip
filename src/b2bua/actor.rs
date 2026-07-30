@@ -27,12 +27,13 @@
 //! - `LegRegistry` provides SIP-level routing (Call-ID, branch → internal ID).
 //! - Foundation for API-driven calls: create a `Leg` without an inbound INVITE.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::sip::message::SipMessage;
 use crate::transport::{ConnectionId, Transport};
@@ -1268,6 +1269,24 @@ pub enum WinOutcome {
     AlreadyAnswered { b_leg_acked: bool },
 }
 
+/// How long a torn-down call's SIP Call-IDs stay answerable with 481.
+///
+/// 32 s = Timer H / 64·T1 (RFC 3261 §17), the same expiry the zombie re-INVITE
+/// and post-CANCEL absorbers use: once the peer's own client transaction has
+/// timed out it stops retransmitting, so remembering the dialog past that point
+/// buys nothing.
+const TERMINATED_CALL_TTL: Duration = Duration::from_secs(32);
+
+/// Hard ceiling on remembered torn-down Call-IDs.
+///
+/// Unlike the zombie absorbers — which only gain entries on rare paths — this
+/// set gains an entry per leg on *every* teardown, so the TTL alone is not a
+/// bound: at 40k cps it would hold 32 s × 40k ≈ 1.3M Call-IDs. The cap keeps the
+/// footprint flat while still covering ~1.6 s of teardowns at that rate, far
+/// wider than the sub-second glare window this exists for. At realistic per-NF
+/// call rates the TTL evicts long before the cap is in play.
+const TERMINATED_CALL_CAPACITY: usize = 65_536;
+
 /// Manages all active B2BUA calls.
 ///
 /// Stores `CallActor` instances in a concurrent map, indexed by internal
@@ -1283,6 +1302,19 @@ pub struct CallActorStore {
     /// Post-CANCEL glare absorber (RFC 3261 §9.1): a 2xx that raced our CANCEL
     /// is ACKed + BYEd here, keyed by B-leg SIP Call-ID.
     pub zombie_cancelled: DashMap<String, ZombieCancelledLeg>,
+    /// SIP Call-IDs of calls this node has torn down → when they were torn down,
+    /// so a late in-dialog request naming one can be answered 481 instead of
+    /// dropped ([`Self::is_recently_terminated`]). Read on the request path, so
+    /// it is the lock-free half of the pair.
+    terminated: DashMap<String, Instant>,
+    /// Teardown order backing [`Self::terminated`], for eviction by age and by
+    /// capacity. Only touched on teardown, never on the read path.
+    ///
+    /// A Call-ID can appear more than once — a peer may reuse one for its next
+    /// call, and both B2BUA legs may share one. The timestamp doubles as a
+    /// generation stamp so evicting a stale entry can't drop a Call-ID that has
+    /// since been remembered again; see [`Self::evict_terminated`].
+    terminated_order: Mutex<VecDeque<(String, Instant)>>,
 }
 
 impl CallActorStore {
@@ -1292,7 +1324,93 @@ impl CallActorStore {
             registry: LegRegistry::new(),
             zombie_reinvites: DashMap::new(),
             zombie_cancelled: DashMap::new(),
+            terminated: DashMap::new(),
+            terminated_order: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// Remember `sip_call_id` as a dialog this node has torn down.
+    ///
+    /// Evicts from the front on the way in (amortised O(1), no timer task):
+    /// entries older than [`TERMINATED_CALL_TTL`] first, then any overflow past
+    /// [`TERMINATED_CALL_CAPACITY`].
+    fn remember_terminated(&self, sip_call_id: &str) {
+        if sip_call_id.is_empty() {
+            return;
+        }
+        let mut order = match self.terminated_order.lock() {
+            Ok(guard) => guard,
+            Err(error) => {
+                // Never remember without the order half — nothing would ever
+                // evict it. A late in-dialog request for this call falls through
+                // to the script instead of drawing a 481; that is the lesser
+                // failure next to an unbounded map.
+                warn!("terminated-call order mutex poisoned, not remembering {sip_call_id}: {error}");
+                return;
+            }
+        };
+        // Always stamp and enqueue, even for a Call-ID already present: the
+        // stamp is the generation, and the newest one is what must survive.
+        let now = Instant::now();
+        self.terminated.insert(sip_call_id.to_string(), now);
+        order.push_back((sip_call_id.to_string(), now));
+        Self::evict_terminated(
+            &self.terminated,
+            &mut order,
+            now,
+            TERMINATED_CALL_TTL,
+            TERMINATED_CALL_CAPACITY,
+        );
+    }
+
+    /// Drop remembered Call-IDs from the front of `order`: everything older than
+    /// `ttl` as of `now`, then whatever still overflows `capacity`.
+    ///
+    /// An expiring entry only removes the Call-ID if its stamp is still the
+    /// current generation. Without that check, re-terminating a Call-ID seen
+    /// before would un-remember it: the stale entry ages out and takes the
+    /// freshly-remembered Call-ID with it, which is how a peer that reuses
+    /// Call-IDs across calls lost its 481.
+    ///
+    /// Split out (and given `now` / `ttl` / `capacity` explicitly) so both
+    /// eviction rules are testable without a 32-second sleep.
+    fn evict_terminated(
+        terminated: &DashMap<String, Instant>,
+        order: &mut VecDeque<(String, Instant)>,
+        now: Instant,
+        ttl: Duration,
+        capacity: usize,
+    ) {
+        loop {
+            let evict = match order.front() {
+                Some((_, stamped)) => {
+                    now.saturating_duration_since(*stamped) >= ttl || order.len() > capacity
+                }
+                None => false,
+            };
+            if !evict {
+                break;
+            }
+            if let Some((call_id, stamped)) = order.pop_front() {
+                terminated.remove_if(&call_id, |_, current| *current == stamped);
+            }
+        }
+    }
+
+    /// Did this node recently tear down a call carrying `sip_call_id`?
+    ///
+    /// An in-dialog request naming it can no longer be bridged or routed — both
+    /// dialogs are gone here — so it MUST be answered 481 Call/Transaction Does
+    /// Not Exist (RFC 3261 §12.2.2, §15.1.2 for BYE) rather than dropped.
+    /// Dropping it leaves the peer retransmitting to its own timer F; a VoNR UE
+    /// reads that 32 s silence as a dead IMS and recovers by releasing its IMS
+    /// PDU session and re-registering, which costs ~40 s of terminating service.
+    ///
+    /// Eviction is lazy (it happens on insert), so an entry can outlive the TTL
+    /// by a while. That is harmless — the answer is still correct — and it keeps
+    /// this to a single hash on the request path.
+    pub fn is_recently_terminated(&self, sip_call_id: &str) -> bool {
+        !sip_call_id.is_empty() && self.terminated.contains_key(sip_call_id)
     }
 
     /// Number of active calls.
@@ -1904,6 +2022,12 @@ impl CallActorStore {
     /// Sends `Shutdown` to all active B-leg actor handles before removing.
     /// B-leg entries with `reinvite_done:` or `reinvite:` target_uri are moved
     /// to `zombie_reinvites` so retransmitted 200 OKs can still be ACKed.
+    ///
+    /// Every leg's SIP Call-ID is remembered as terminated on the way out, so an
+    /// in-dialog request that arrives after the teardown — the BYE glare where
+    /// both parties hang up at once — is answered 481 rather than dropped. Both
+    /// sides need it: on a B2BUA the A-leg and B-leg Call-IDs differ, and either
+    /// peer can be the one whose BYE loses the race.
     pub fn remove_call(&self, call_id: &str) {
         if let Some((_, call)) = self.calls.remove(call_id) {
             // Shutdown any active B-leg actors
@@ -1911,10 +2035,12 @@ impl CallActorStore {
             // Clean up A-leg registry entries
             self.registry.remove_call_id(&call.a_leg.dialog.call_id);
             self.registry.remove_branch(&call.a_leg.branch);
+            self.remember_terminated(&call.a_leg.dialog.call_id);
             // Clean up B-leg registry entries, preserving re-INVITE state
             for b_leg in &call.b_legs {
                 self.registry.remove_call_id(&b_leg.dialog.call_id);
                 self.registry.remove_branch(&b_leg.branch);
+                self.remember_terminated(&b_leg.dialog.call_id);
                 // Move re-INVITE tracking entries to zombie map
                 if let Some(ref target) = b_leg.dialog.target_uri {
                     if target.starts_with("reinvite_done:") || target.starts_with("reinvite:") {
@@ -3829,5 +3955,154 @@ mod tests {
                 join,
             ).await.expect("actor did not terminate").unwrap();
         }
+    }
+
+    // --- Recently-terminated Call-IDs (post-teardown 481) ---
+
+    #[test]
+    fn teardown_remembers_every_leg_call_id() {
+        // Hang-up glare: whichever peer's BYE loses the race must still be
+        // answerable, and on a B2BUA that peer may be on either side, so both
+        // the A-leg and every B-leg Call-ID has to be remembered.
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        store.add_b_leg(&call_id, make_b_leg(0));
+        store.add_b_leg(&call_id, make_b_leg(1));
+
+        assert!(!store.is_recently_terminated("call-1@10.0.0.1"));
+
+        store.remove_call(&call_id);
+
+        assert!(store.is_recently_terminated("call-1@10.0.0.1"));
+        assert!(store.is_recently_terminated("b2b-bleg0"));
+        assert!(store.is_recently_terminated("b2b-bleg1"));
+        // A Call-ID this node never saw stays unknown — the dispatcher leaves
+        // those to the script (a proxy loose-routes dialogs it doesn't track).
+        assert!(!store.is_recently_terminated("stranger@10.0.0.9"));
+        assert!(!store.is_recently_terminated(""));
+    }
+
+    #[test]
+    fn live_call_is_never_remembered_as_terminated() {
+        // Guards the dispatcher's ordering: a call that is up must not be able
+        // to answer 481 to its own in-dialog requests.
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        store.add_b_leg(&call_id, make_b_leg(0));
+
+        assert!(!store.is_recently_terminated("call-1@10.0.0.1"));
+        assert!(!store.is_recently_terminated("b2b-bleg0"));
+    }
+
+    #[test]
+    fn legs_sharing_a_call_id_are_remembered_once() {
+        // With preserve_call_id — and for the dispatcher's `reinvite:` tracking
+        // pseudo-legs — a B-leg carries the A-leg's Call-ID. One membership entry
+        // covers both.
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        let mut b_leg = make_b_leg(0);
+        b_leg.dialog.call_id = "call-1@10.0.0.1".to_string();
+        store.add_b_leg(&call_id, b_leg);
+
+        store.remove_call(&call_id);
+
+        assert!(store.is_recently_terminated("call-1@10.0.0.1"));
+        assert_eq!(store.terminated.len(), 1);
+    }
+
+    #[test]
+    fn re_terminating_a_reused_call_id_keeps_it_remembered() {
+        // Regression: a peer that reuses one Call-ID across calls used to LOSE its
+        // 481. The second teardown found the Call-ID already present and pushed no
+        // fresh entry, so eviction aged out the first call's entry and removed the
+        // Call-ID that had just been remembered again. The stamp is a generation:
+        // an expiring entry may only remove the Call-ID if it is still current.
+        let terminated = DashMap::new();
+        let mut order = VecDeque::new();
+        let base = Instant::now();
+        let refreshed = base + Duration::from_secs(60);
+        // Remembered at `base`, then again at `refreshed`.
+        terminated.insert("reused@10.0.0.1".to_string(), refreshed);
+        order.push_back(("reused@10.0.0.1".to_string(), base));
+        order.push_back(("reused@10.0.0.1".to_string(), refreshed));
+
+        // The first entry is well past the TTL; the second is not.
+        CallActorStore::evict_terminated(
+            &terminated,
+            &mut order,
+            base + Duration::from_secs(40),
+            TERMINATED_CALL_TTL,
+            TERMINATED_CALL_CAPACITY,
+        );
+
+        assert!(terminated.contains_key("reused@10.0.0.1"));
+        assert_eq!(order.len(), 1);
+    }
+
+    #[test]
+    fn second_teardown_of_the_same_call_id_still_remembered() {
+        // The store-level shape of the regression above: tear down, reuse the
+        // Call-ID for another call, tear that down too. Still answerable.
+        let store = CallActorStore::new();
+        let first = store.create_call(make_a_leg());
+        store.remove_call(&first);
+        let second = store.create_call(make_a_leg());
+        store.remove_call(&second);
+
+        assert!(store.is_recently_terminated("call-1@10.0.0.1"));
+        assert_eq!(store.terminated.len(), 1);
+    }
+
+    #[test]
+    fn terminated_evicts_by_age() {
+        // Past the TTL the peer's own transaction has timed out, so the entry
+        // has nothing left to answer. `now` is moved forward rather than slept.
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        store.remove_call(&call_id);
+        assert!(store.is_recently_terminated("call-1@10.0.0.1"));
+
+        let mut order = store.terminated_order.lock().unwrap();
+        CallActorStore::evict_terminated(
+            &store.terminated,
+            &mut order,
+            Instant::now() + Duration::from_secs(40),
+            TERMINATED_CALL_TTL,
+            TERMINATED_CALL_CAPACITY,
+        );
+        drop(order);
+
+        assert!(!store.is_recently_terminated("call-1@10.0.0.1"));
+        assert_eq!(store.terminated_order.lock().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn terminated_evicts_by_capacity_oldest_first() {
+        // The cap is what keeps a 40k-cps run from holding 32 s of Call-IDs.
+        let terminated = DashMap::new();
+        let mut order = VecDeque::new();
+        let base = Instant::now();
+        for index in 0..5 {
+            let stamp = base + Duration::from_millis(index);
+            terminated.insert(format!("cid-{index}"), stamp);
+            order.push_back((format!("cid-{index}"), stamp));
+        }
+
+        CallActorStore::evict_terminated(
+            &terminated,
+            &mut order,
+            base,
+            TERMINATED_CALL_TTL,
+            2,
+        );
+
+        // Newest two survive, in order.
+        assert_eq!(order.len(), 2);
+        assert!(!terminated.contains_key("cid-0"));
+        assert!(!terminated.contains_key("cid-1"));
+        assert!(!terminated.contains_key("cid-2"));
+        assert!(terminated.contains_key("cid-3"));
+        assert!(terminated.contains_key("cid-4"));
     }
 }

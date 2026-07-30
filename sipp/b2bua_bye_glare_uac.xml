@@ -1,0 +1,126 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA BYE-glare UAC scenario (A-leg / UE side):
+  INVITE → 200 → ACK → receive BYE → 200 → send our own BYE → 481
+
+  Hang-up glare. The trunk (b2bua_bye_glare_uas.xml) hangs up first, so by the
+  time this side's own BYE goes out the B2BUA call is gone. RFC 3261 §12.2.2 /
+  §15.1.2: that BYE MUST be answered 481 Call/Transaction Does Not Exist.
+
+  Waiting for the relayed BYE before sending ours makes the ordering
+  deterministic — ours is unambiguously post-teardown, as in the field trace
+  where the two BYEs were ~350 ms apart.
+
+  Against a build without the fix the BYE is silently dropped: this scenario then
+  sees only the NIST auto-100 (RFC 4320 §4.2 defers it to T2 ≈ 3.5 s) and fails
+  on the unanswered-BYE timeout — which is exactly the 32 s of silence that makes
+  a VoNR UE release its IMS PDU session and re-register.
+-->
+<scenario name="B2BUA BYE glare UAC">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/b2bua-bye-glare-test
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=sendrecv
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <label id="1" />
+  <recv response="180" optional="true" next="1" />
+
+  <!-- Capture the dialog's remote tag + target from the answer, so our own BYE
+       is built from the dialog rather than from whatever arrived last. -->
+  <recv response="200" rtd="true" crlf="true">
+    <action>
+      <ereg regexp="tag=([^;&gt;\r\n ]+)" search_in="hdr" header="To:" assign_to="junk,peer_tag" />
+      <ereg regexp="&lt;([^&gt;]+)>" search_in="hdr" header="Contact:" assign_to="junk,peer_contact" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>;tag=[$peer_tag]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- The trunk's BYE, relayed to us: the call is being torn down. -->
+  <recv request="BYE" timeout="10000" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Our own hang-up, now orphaned. The field gap was ~350 ms. -->
+  <pause milliseconds="300" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE [$peer_contact] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>;tag=[$peer_tag]
+Call-ID: [call_id]
+CSeq: 2 BYE
+Max-Forwards: 70
+User-Agent: SIPp/b2bua-bye-glare-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <!-- The fix: answered immediately instead of dropped.
+
+       A regressed build has to FAIL here, not just stall — sipp exits 0 if it is
+       stopped with a call still in progress, which would let the regression pass
+       as green. The container runs with -max_retrans 2, so an unanswered BYE ends
+       the call as failed after ~1.5 s (exit 1). A per-recv timeout= does not do
+       this: it is ignored by the sipp build used here, verified against a
+       pre-fix binary, which sat in retransmits for the whole run and still
+       reported success. -->
+  <recv response="481" rtd="true" />
+
+</scenario>

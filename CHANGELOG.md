@@ -168,6 +168,32 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
     §8.2.2 requires a 416 Unsupported URI Scheme — which could not be sent,
     because the message failed to parse first.
 
+- **An in-dialog request for a B2BUA call that was just torn down is answered
+  `481 Call/Transaction Does Not Exist` instead of being silently dropped
+  (RFC 3261 §12.2.2, §15.1.2).** Hang-up glare — both parties send BYE within a
+  few hundred milliseconds — left the second BYE arriving after the call was
+  gone. It missed every B2BUA intercept (they gate on the same Call-ID lookup
+  that has just started failing), fell through to the proxy path, and a script
+  with no route for it dropped it. The peer was then left retransmitting to its
+  own timer F: 32 s of silence, answered only by the deferred non-INVITE auto-100
+  (RFC 4320 §4.2). A VoNR UE reads that as a dead IMS and recovers by releasing
+  its IMS PDU session and re-registering, so terminating calls fail for ~40 s.
+
+  `CallActorStore` now remembers the SIP Call-IDs of calls it has torn down —
+  every leg, since the two sides carry different Call-IDs and either peer can
+  lose the race — and the dispatcher answers 481 for any in-dialog request
+  naming one. A live call always wins over a remembered one, so a peer reusing a
+  Call-ID for its next call is unaffected, and a Call-ID this node never tracked
+  is still left to the script (a proxy loose-routes dialogs it does not own).
+  Bounded by both age (32 s, Timer H) and count, so it stays flat under load.
+
+  A re-INVITE for a torn-down call is covered too: it previously reached
+  `on_invite` as if it were a brand-new call.
+
+  Also brought the B2BUA BYE / re-INVITE / UPDATE / REFER / NOTIFY handlers to
+  the same answer when they lose the race with a concurrent teardown — each
+  returned silently where the neighbouring no-dialog-leg path already sent 481.
+
 ## [1.5.1] — 2026-07-29
 
 ### Added

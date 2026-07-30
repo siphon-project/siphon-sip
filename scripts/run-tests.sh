@@ -230,6 +230,10 @@ if [[ "$RUN_B2BUA" == true ]]; then
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-update up --abort-on-container-exit --exit-code-from sipp-b2bua-update-uac sipp-b2bua-update-uac sipp-b2bua-update-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-update rm -sf sipp-b2bua-update-uac sipp-b2bua-update-uas 2>/dev/null || true
 
+  echo "=== B2BUA BYE-glare test (in-dialog BYE after teardown → 481, not a silent drop) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-bye-glare up --abort-on-container-exit --exit-code-from sipp-b2bua-bye-glare-uac sipp-b2bua-bye-glare-uac sipp-b2bua-bye-glare-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-bye-glare rm -sf sipp-b2bua-bye-glare-uac sipp-b2bua-bye-glare-uas 2>/dev/null || true
+
   echo "=== B2BUA REFER test (RFC 3515 transparent blind transfer) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-refer up --abort-on-container-exit --exit-code-from sipp-b2bua-refer-uac sipp-b2bua-refer-uac sipp-b2bua-refer-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-refer rm -sf sipp-b2bua-refer-uac sipp-b2bua-refer-uas 2>/dev/null || true
