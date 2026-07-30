@@ -6,6 +6,56 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Fixed
+- **B2BUA-originated requests are now retransmitted per RFC 3261 §17.1 on
+  unreliable transports.** The proxy datapath relays through the transaction
+  layer and so has always had Timer A (INVITE, §17.1.1.2) and Timer E
+  (non-INVITE, §17.1.2.2). The B2BUA does not — it owns its legs and routes
+  responses by branch, registering no client transaction — so every request it
+  originated left the socket exactly once. A single lost datagram therefore
+  produced total silence: no retry at 500 ms, nothing on the wire, and the call
+  failing on the synthetic `408` when the 30 s answer timeout swept it, with the
+  very next call succeeding. It showed up most sharply on an IPsec-protected
+  originating leg, where the first packet after an idle gap or across an SA
+  re-key is exactly the one at risk — a soft-UE MO call would fail cold and
+  answer warm — but it applied to every UDP B2BUA leg. A lost `BYE` was the
+  quieter half of the same gap: nothing retried it, so the far end kept the call
+  up with its media still anchored.
+
+  Each siphon-originated request (INVITE, CANCEL, BYE, re-INVITE/UPDATE, PRACK,
+  REFER, forwarded in-dialog requests) now carries a retransmit schedule keyed on
+  its own Via branch and method: `T1` then doubling without a ceiling for INVITE,
+  doubling but capped at `T2` for the rest, giving up at `64·T1`. Intervals come
+  from the configured transaction timers, so tuning `T1`/`T2` tunes these too.
+  The schedule is cancelled by the first response on that branch (§17.1.1.2 — a
+  provisional moves Calling → Proceeding), by a `CANCEL` for the INVITE it
+  abandons (§9.1), and by the answer-timeout teardown. `ACK` is excluded
+  (§17.1.1.3 — it is re-emitted in answer to a retransmitted final, never on a
+  timer of its own), as are relayed responses, which belong to the server
+  transaction. Reliable transports never arm a schedule and are byte-identical.
+
+  A retransmission leaves the **same local socket** as the original, which is
+  what makes it work on a flow-dialled leg: the kernel XFRM selector matches only
+  the protected client port, so a retry that fell back to the default listener
+  would go out unprotected and be dropped (3GPP TS 33.203 §7.4).
+
+- **A `relay(flow=…)` INVITE's Timer A retransmits no longer leave the wrong
+  socket.** The proxy relay and fork paths pinned `source_local_addr: None` on
+  their client-transaction timer entries, so while the first send went out the
+  flow's socket, every retransmit fell back to the default UDP channel — the
+  first-configured listener, typically the plain one — putting the retry outside
+  the IPsec SA on a multi-listener host. Retransmits now resolve the same egress
+  socket the original send did (captured flow, then IPsec auto-source, then a
+  script `send_socket=` pin).
+
+- **Flow-pinned sends are now visible.** A request sent over a captured flow
+  (`call.dial(flow=…)` / `relay(flow=…)`) bypasses the normal egress helper, and
+  with it that helper's HEP capture — so a flow-pinned B-leg INVITE was the one
+  request that never reached Homer. It is captured now, and the B-leg INVITE
+  additionally logs its destination, source socket, transport and size at debug
+  level. Nothing on that path logged before, which made an absent send line easy
+  to misread as the request never having been handed to the transport.
+
 ## [1.5.1] — 2026-07-29
 
 ### Added

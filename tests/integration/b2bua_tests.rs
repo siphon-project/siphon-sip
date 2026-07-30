@@ -2370,3 +2370,248 @@ fn zombie_reinvite_entry_preserves_the_flow_egress_socket() {
         "the post-teardown re-ACK must still leave from the anchored socket"
     );
 }
+
+// ---------------------------------------------------------------------------
+// RFC 3261 §17.1 retransmission of siphon-originated B2BUA requests
+// ---------------------------------------------------------------------------
+
+/// The soft-UE listener set (3GPP TS 33.203): plain SIP toward the local peer
+/// plus the two protected sec-agree ports, with the plain one doubling as the
+/// default UDP channel because it is configured first.
+///
+/// Returns the router and the three receiving ends in `(plain, port_uc,
+/// port_us)` order.
+#[allow(clippy::type_complexity)]
+fn soft_ue_router() -> (
+    siphon::transport::OutboundRouter,
+    flume::Receiver<siphon::transport::OutboundMessage>,
+    flume::Receiver<siphon::transport::OutboundMessage>,
+    flume::Receiver<siphon::transport::OutboundMessage>,
+) {
+    let plain = flume::unbounded();
+    let protected_client = flume::unbounded();
+    let protected_server = flume::unbounded();
+
+    let mut udp_by_local = std::collections::HashMap::new();
+    udp_by_local.insert(ue_plain(), plain.0.clone());
+    udp_by_local.insert(ue_port_uc(), protected_client.0.clone());
+    udp_by_local.insert(ue_port_us(), protected_server.0.clone());
+
+    let (dummy, _dummy_rx) = flume::unbounded();
+    let router = siphon::transport::OutboundRouter {
+        // The default channel is the first-configured listener — the plain one.
+        udp: plain.0.clone(),
+        udp_by_local,
+        tcp: dummy.clone(),
+        tls: dummy.clone(),
+        ws: dummy.clone(),
+        wss: dummy.clone(),
+        sctp: dummy,
+    };
+    (router, plain.1, protected_client.1, protected_server.1)
+}
+
+fn ue_plain() -> SocketAddr {
+    "192.0.2.10:5060".parse().expect("plain listener")
+}
+fn ue_port_uc() -> SocketAddr {
+    "192.0.2.10:6100".parse().expect("protected client port")
+}
+fn ue_port_us() -> SocketAddr {
+    "192.0.2.10:6101".parse().expect("protected server port")
+}
+fn pcscf_port_ps() -> SocketAddr {
+    "192.0.2.20:5066".parse().expect("P-CSCF protected server port")
+}
+
+/// Build the retransmit target a flow-dialled B-leg produces: written to the
+/// P-CSCF protected server port, sourced from the UE protected client port.
+fn flow_pinned_target() -> siphon::b2bua::retransmit::RetransmitTarget {
+    siphon::b2bua::retransmit::RetransmitTarget {
+        destination: pcscf_port_ps(),
+        transport: Transport::Udp,
+        connection_id: ConnectionId::default(),
+        source_local_addr: Some(ue_port_uc()),
+    }
+}
+
+/// Push one due retransmit through the router exactly as the dispatcher's
+/// `send_outbound_from` does, so the assertion is about where the datagram
+/// actually lands rather than about the store's bookkeeping.
+fn route(
+    router: &siphon::transport::OutboundRouter,
+    event: &siphon::b2bua::retransmit::Due,
+) {
+    if let siphon::b2bua::retransmit::Due::Send { data, target, .. } = event {
+        router
+            .send(siphon::transport::OutboundMessage {
+                followups: None,
+                connection_id: target.connection_id,
+                transport: target.transport,
+                destination: target.destination,
+                data: data.clone(),
+                source_local_addr: target.source_local_addr,
+                server_name: None,
+            })
+            .expect("router send");
+    }
+}
+
+/// The regression this whole path exists for: a B-leg INVITE dialled over a
+/// captured flow is retransmitted when it draws no response, and the retransmit
+/// leaves the *same protected socket* the first attempt did.
+///
+/// Before this, the B2BUA registered no client transaction, so the INVITE left
+/// the socket exactly once. One lost datagram — the first packet after an idle
+/// gap, or one dropped across an IPsec re-key — meant no retry at 500 ms and
+/// total silence until the 30 s answer timeout synthesised a 408, with the next
+/// call seconds later answering 200.
+///
+/// The socket half matters just as much: the kernel XFRM selector matches only
+/// `(ue_addr, port_uc) → (pcscf_addr, port_ps)`, so a retransmit that fell back
+/// to the default channel (the plain listener, configured first) would go out
+/// unprotected and be dropped — a retry that cannot possibly work.
+#[test]
+fn flow_pinned_b_leg_invite_retransmits_from_the_protected_socket() {
+    use siphon::b2bua::retransmit::{B2buaRetransmits, RetransmitKey};
+
+    let timers = siphon::transaction::timer::TimerConfig::default();
+    let store = B2buaRetransmits::new(timers);
+    let (router, plain, protected_client, protected_server) = soft_ue_router();
+
+    let invite = bytes::Bytes::from_static(
+        b"INVITE sip:bob@ims.mnc001.mcc001.3gppnetwork.org SIP/2.0\r\n\r\n",
+    );
+    let key = RetransmitKey::new("z9hG4bK-mo-invite", Method::Invite);
+    let sent_at = std::time::Instant::now();
+    assert!(
+        store.arm(key.clone(), invite.clone(), flow_pinned_target(), sent_at),
+        "a UDP flow-pinned B-leg INVITE must arm a Timer A schedule"
+    );
+
+    // Nothing is due before T1 — a retransmit any earlier would be a duplicate,
+    // not a recovery.
+    assert!(store.due(sent_at + timers.t1 / 2).is_empty());
+
+    for event in store.due(sent_at + timers.t1) {
+        route(&router, &event);
+    }
+
+    let retransmitted = protected_client
+        .try_recv()
+        .expect("the INVITE must be retransmitted at T1 when no response arrives");
+    assert_eq!(
+        retransmitted.data, invite,
+        "a retransmit replays the original bytes verbatim"
+    );
+    assert_eq!(retransmitted.source_local_addr, Some(ue_port_uc()));
+    assert_eq!(retransmitted.destination, pcscf_port_ps());
+    assert!(
+        plain.try_recv().is_err(),
+        "a flow-pinned retransmit must never fall back to the plain default listener"
+    );
+    assert!(protected_server.try_recv().is_err());
+}
+
+/// A response stops the retransmissions (RFC 3261 §17.1.1.2 — the first
+/// provisional moves Calling -> Proceeding and cancels Timer A). Nothing may go
+/// on the wire behind a peer that already holds the request; a spurious
+/// duplicate can trip the far end's merged-request detection (§8.2.2.2).
+#[test]
+fn a_response_stops_the_flow_pinned_b_leg_retransmissions() {
+    use siphon::b2bua::retransmit::{B2buaRetransmits, RetransmitKey};
+
+    let timers = siphon::transaction::timer::TimerConfig::default();
+    let store = B2buaRetransmits::new(timers);
+    let (router, plain, protected_client, _protected_server) = soft_ue_router();
+
+    let key = RetransmitKey::new("z9hG4bK-mo-invite", Method::Invite);
+    let sent_at = std::time::Instant::now();
+    store.arm(
+        key.clone(),
+        bytes::Bytes::from_static(b"INVITE sip:bob@example.com SIP/2.0\r\n\r\n"),
+        flow_pinned_target(),
+        sent_at,
+    );
+
+    // The 100 Trying lands well inside T1.
+    assert!(store.disarm(&key));
+
+    for event in store.due(sent_at + timers.timer_b()) {
+        route(&router, &event);
+    }
+    assert!(
+        protected_client.try_recv().is_err(),
+        "an answered INVITE must not be retransmitted"
+    );
+    assert!(plain.try_recv().is_err());
+    assert_eq!(store.len(), 0, "the schedule must not outlive the request");
+}
+
+/// An ordinary single-listener B2BUA is byte-identical to before: the retransmit
+/// carries no source pin and lands on the default channel, exactly where the
+/// original send went.
+#[test]
+fn unpinned_b_leg_retransmit_uses_the_default_egress() {
+    use siphon::b2bua::retransmit::{B2buaRetransmits, Due, RetransmitKey};
+
+    let timers = siphon::transaction::timer::TimerConfig::default();
+    let store = B2buaRetransmits::new(timers);
+    let (router, plain, protected_client, _protected_server) = soft_ue_router();
+
+    let sent_at = std::time::Instant::now();
+    store.arm(
+        RetransmitKey::new("z9hG4bK-trunk", Method::Invite),
+        bytes::Bytes::from_static(b"INVITE sip:bob@trunk.example SIP/2.0\r\n\r\n"),
+        siphon::b2bua::retransmit::RetransmitTarget {
+            destination: "203.0.113.5:5060".parse().expect("trunk"),
+            transport: Transport::Udp,
+            connection_id: ConnectionId::default(),
+            source_local_addr: None,
+        },
+        sent_at,
+    );
+
+    let due = store.due(sent_at + timers.t1);
+    assert!(matches!(due.as_slice(), [Due::Send { .. }]));
+    for event in &due {
+        route(&router, event);
+    }
+
+    let sent = plain.try_recv().expect("unpinned retransmit uses the default channel");
+    assert_eq!(sent.source_local_addr, None);
+    assert!(protected_client.try_recv().is_err());
+}
+
+/// A siphon-originated BYE is retransmitted too, on the non-INVITE schedule
+/// (§17.1.2.2 Timer E). This is the leak the INVITE-only view misses: a lost BYE
+/// leaves a call up on the far end with its media still anchored, and nothing
+/// ever retried it.
+#[test]
+fn flow_pinned_bye_retransmits_on_the_non_invite_schedule() {
+    use siphon::b2bua::retransmit::{B2buaRetransmits, RetransmitKey};
+
+    let timers = siphon::transaction::timer::TimerConfig::default();
+    let store = B2buaRetransmits::new(timers);
+    let (router, plain, protected_client, _protected_server) = soft_ue_router();
+
+    let bye = bytes::Bytes::from_static(b"BYE sip:bob@example.com SIP/2.0\r\n\r\n");
+    let sent_at = std::time::Instant::now();
+    store.arm(
+        RetransmitKey::new("z9hG4bK-bye", Method::Bye),
+        bye.clone(),
+        flow_pinned_target(),
+        sent_at,
+    );
+
+    for event in store.due(sent_at + timers.t1) {
+        route(&router, &event);
+    }
+
+    let retransmitted = protected_client
+        .try_recv()
+        .expect("an unanswered BYE must be retransmitted at T1");
+    assert_eq!(retransmitted.data, bye);
+    assert_eq!(retransmitted.source_local_addr, Some(ue_port_uc()));
+    assert!(plain.try_recv().is_err());
+}
