@@ -29,6 +29,10 @@ type UserNamespaceFactory = Box<dyn FnOnce(Python<'_>) -> PyResult<Py<PyAny>> + 
 /// install long-running background work.
 type ExtensionTask = Box<dyn FnOnce(ScriptHandle) + Send>;
 
+/// A per-protocol control adapter registered by a host binary (the built-in SIP
+/// adapter is always registered; extensions add their own — e.g. SMPP).
+type ControlAdapterHandle = Arc<dyn crate::control::ControlAdapter>;
+
 /// Builder for running a siphon server instance.
 ///
 /// # Examples
@@ -51,6 +55,7 @@ pub struct SiphonServer {
     product_version: Option<&'static str>,
     user_namespaces: Vec<(String, UserNamespaceFactory)>,
     extension_tasks: Vec<ExtensionTask>,
+    control_adapters: Vec<ControlAdapterHandle>,
 }
 
 impl SiphonServer {
@@ -66,6 +71,7 @@ impl SiphonServer {
             product_version: None,
             user_namespaces: Vec::new(),
             extension_tasks: Vec::new(),
+            control_adapters: Vec::new(),
         }
     }
 
@@ -223,6 +229,39 @@ impl SiphonServer {
     /// log how many tasks they've wired up before `.run()`.
     pub fn extension_task_count(&self) -> usize {
         self.extension_tasks.len()
+    }
+
+    /// Register a per-protocol control adapter for the external remote-control
+    /// plane (sibling of [`register_namespace`](Self::register_namespace) /
+    /// [`register_task`](Self::register_task)).
+    ///
+    /// The built-in SIP adapter is always registered. A protocol extension
+    /// (e.g. `siphon-smpp`) registers its own adapter here so its resource model
+    /// and verbs are reachable over the same control WebSocket. Command routing
+    /// is by `module()`; the substrate never parses the adapter's args/payload.
+    ///
+    /// No-op unless a `control:` block is configured.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use siphon::SiphonServer;
+    ///
+    /// SiphonServer::builder()
+    ///     .config_path("siphon.yaml")
+    ///     .register_control_adapter(Arc::new(MySmppAdapter::new()))
+    ///     .run();
+    /// ```
+    pub fn register_control_adapter(mut self, adapter: ControlAdapterHandle) -> Self {
+        self.control_adapters.push(adapter);
+        self
+    }
+
+    /// Number of host-registered control adapters (excludes the always-on SIP
+    /// adapter). Exposed for tests + host logging.
+    pub fn control_adapter_count(&self) -> usize {
+        self.control_adapters.len()
     }
 
     /// Run the siphon server. This blocks until shutdown (SIGINT/SIGTERM).
@@ -2015,6 +2054,20 @@ impl SiphonServer {
                     error!(listen = %admin_config.listen, "invalid admin.listen address: {error}");
                 }
             }
+        }
+
+        // --- External remote-control plane (ARI/ESL-class) ---
+        // Installs the ControlBus, spawns the command consumer + inbound WS
+        // listener, and registers the built-in SIP adapter plus any host adapters
+        // (e.g. SMPP). Per-call-connect apps are dialed lazily at handover.
+        if let Some(ref control_config) = config.control {
+            let control_adapters = std::mem::take(&mut self.control_adapters);
+            crate::control::spawn_control_plane(control_config, control_adapters);
+        } else if !self.control_adapters.is_empty() {
+            warn!(
+                adapters = self.control_adapters.len(),
+                "control adapters registered but no `control:` config block — control plane not started"
+            );
         }
 
         let dispatcher_handle = tokio::spawn(dispatcher::run(

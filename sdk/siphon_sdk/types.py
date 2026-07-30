@@ -199,7 +199,8 @@ class Action:
 
     kind: str
     """Action type: ``"reply"``, ``"relay"``, ``"fork"``, ``"reject"``,
-    ``"dial"``, ``"terminate"``, ``"record_route"``, ``"silent_drop"``."""
+    ``"dial"``, ``"terminate"``, ``"handover"``, ``"record_route"``,
+    ``"silent_drop"``."""
 
     status_code: Optional[int] = None
     """For ``reply`` / ``reject`` — the SIP status code (e.g. 200, 404)."""

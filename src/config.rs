@@ -101,6 +101,9 @@ pub struct Config {
     /// `None` = disabled.
     pub admin: Option<AdminConfig>,
 
+    /// External remote-control plane (ARI/ESL-class). `None` = disabled.
+    pub control: Option<ControlConfig>,
+
     /// Server and User-Agent header values injected into responses.
     pub server: Option<ServerIdentityConfig>,
 
@@ -1658,6 +1661,113 @@ pub struct AdminUiConfig {
     /// warning is logged and no UI is served.
     #[serde(default)]
     pub enabled: bool,
+}
+
+// ---------------------------------------------------------------------------
+// External remote-control plane (ARI/ESL-class)
+// ---------------------------------------------------------------------------
+
+/// External remote-control plane listener + per-app registry.
+///
+/// An out-of-process application drives B2BUA calls that a Python
+/// `@b2bua.on_invite` handler explicitly hands over with `call.handover("app")`
+/// (the ARI *Stasis* model). Two connection modes, same wire protocol:
+/// a persistent inbound WebSocket per app (`listen`), and outbound
+/// per-call-connect where siphon dials the app's `connect_url` at handover.
+///
+/// A management plane — treat it like the admin API. Off by default; enable it
+/// deliberately and set per-app bearer tokens.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ControlConfig {
+    /// Address for the inbound persistent-WebSocket listener
+    /// (e.g. "127.0.0.1:9092"). `None` = only outbound per-call-connect apps
+    /// are usable.
+    #[serde(default)]
+    pub listen: Option<String>,
+    /// Registered control applications. An app not listed here can neither
+    /// connect (unknown token) nor receive a handover (unknown app name).
+    #[serde(default)]
+    pub apps: Vec<ControlAppConfig>,
+    /// Global resource caps + backpressure policy.
+    #[serde(default)]
+    pub limits: ControlLimits,
+}
+
+/// A single registered control application.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ControlAppConfig {
+    /// The application name. `call.handover("<name>")` routes to this app, and
+    /// the connection's `hello.args.app` must equal it.
+    pub name: String,
+    /// The bearer token this app presents (`Authorization: Bearer <token>` on
+    /// the inbound upgrade, or the token siphon presents when dialing
+    /// `connect_url`). Supports `${VAR}` expansion — keep the literal out of the
+    /// YAML.
+    #[serde(default)]
+    pub token: String,
+    /// When true, siphon dials `connect_url` per handed-over call and the
+    /// accepting socket owns that call (the FreeSWITCH-outbound model — the
+    /// documented default for multi-pod controllers). When false (default), the
+    /// app connects in over `listen` and owns per round-robin assignment.
+    #[serde(default)]
+    pub per_call_connect: bool,
+    /// The controller's WebSocket URL for `per_call_connect` mode
+    /// (e.g. "ws://controller.internal:8443/siphon").
+    #[serde(default)]
+    pub connect_url: Option<String>,
+    /// What to do if the owning connection is lost mid-call (owner disconnects):
+    /// "hangup" (default), "continue", or "fallback".
+    #[serde(default)]
+    pub on_lost: Option<String>,
+}
+
+/// Global control-plane resource caps + backpressure policy.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ControlLimits {
+    /// Bounded per-connection outbound event-queue depth. On overflow the
+    /// `slow_consumer` policy applies (events only — replies are never dropped).
+    #[serde(default = "ControlLimits::default_event_queue_depth")]
+    pub event_queue_depth: usize,
+    /// Overflow policy for a slow/stuck consumer: "drop_oldest" (default) or
+    /// "disconnect".
+    #[serde(default = "ControlLimits::default_slow_consumer")]
+    pub slow_consumer: String,
+    /// Grace window (seconds) after an owner disconnects during which a
+    /// reconnecting controller of the same app may `resync` and re-claim its
+    /// calls before `on_lost` fires. Default 10.
+    #[serde(default = "ControlLimits::default_reattach_grace_secs")]
+    pub reattach_grace_secs: u64,
+    /// Default handoff deadline (milliseconds) applied when `call.handover()`
+    /// does not pass an explicit `deadline_ms`. If no controller accepts and
+    /// acts within it, the call degrades (503 / fallback). Default 3000.
+    #[serde(default = "ControlLimits::default_handoff_deadline_ms")]
+    pub handoff_deadline_ms: u64,
+}
+
+impl Default for ControlLimits {
+    fn default() -> Self {
+        Self {
+            event_queue_depth: Self::default_event_queue_depth(),
+            slow_consumer: Self::default_slow_consumer(),
+            reattach_grace_secs: Self::default_reattach_grace_secs(),
+            handoff_deadline_ms: Self::default_handoff_deadline_ms(),
+        }
+    }
+}
+
+impl ControlLimits {
+    fn default_event_queue_depth() -> usize {
+        1024
+    }
+    fn default_slow_consumer() -> String {
+        "drop_oldest".to_string()
+    }
+    fn default_reattach_grace_secs() -> u64 {
+        10
+    }
+    fn default_handoff_deadline_ms() -> u64 {
+        3000
+    }
 }
 
 // ---------------------------------------------------------------------------
