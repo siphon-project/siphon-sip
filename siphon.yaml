@@ -1205,3 +1205,28 @@ log:
   level: info      # debug | info | warn | error
   format: pretty   # pretty (human-readable) | json (structured, for log aggregators)
   # file: /var/log/siphon.log   # optional: also write logs to file (for logrotate)
+
+# External remote-control plane (ARI/ESL-class). A management plane — OFF by
+# default. An out-of-process app drives calls a Python @b2bua.on_invite handler
+# hands over with call.handover("<app>"). Two connection modes (both speak the
+# same JSON-over-WebSocket protocol, subprotocol "siphon-control.v1"):
+#   - persistent inbound WS  (the app connects in to `listen`)
+#   - outbound per-call-connect (siphon dials the app's connect_url per call —
+#     the documented default for multi-pod controllers).
+# control:
+#   listen: "127.0.0.1:9092"        # inbound WebSocket listener (GET /control/ws)
+#   # A parked call is held by the transaction layer's automatic 100 Trying;
+#   # siphon sends no synthesized provisional. The controller sends its own
+#   # ringback/early-media via the `progress` verb if it wants one.
+#   apps:
+#     - name: "ivr-app"
+#       token: "${IVR_APP_TOKEN}"   # bearer token (constant-time compared)
+#       # production default — siphon dials the controller once per call:
+#       per_call_connect: true
+#       connect_url: "wss://controller.internal:8443/siphon"
+#       on_lost: "hangup"           # owner-disconnect policy: hangup|continue|fallback
+#   limits:
+#     event_queue_depth: 1024       # bounded per-connection outbound queue
+#     slow_consumer: drop_oldest    # drop_oldest | disconnect
+#     reattach_grace_secs: 10       # window for a reconnecting app to `resync`
+#     handoff_deadline_ms: 3000     # default deadline before the parked call degrades

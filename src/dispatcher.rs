@@ -11164,6 +11164,21 @@ fn b2bua_advance_route(
 /// [`CallActorStore::remove_call_after_cancel`] (so a 2xx that raced our CANCEL
 /// is still ACK+BYEd). Driven from [`sweep_stale_entries`].
 fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
+    // Control-plane handoff deadline: a call parked under external control whose
+    // controller never accepted + acted in time. Apply the parked default action
+    // (503) instead of the 408 answer-timeout path.
+    let handoff = state
+        .call_actors
+        .get_call(call_id)
+        .map(|call| (call.is_handoff_pending(), call.control_app.clone().unwrap_or_default()));
+    if let Some((true, app)) = handoff {
+        warn!(call_id = %call_id, %app, "control plane: handoff deadline — no controller acted, applying default (503)");
+        crate::metrics::try_metrics()
+            .inspect(|m| m.control_handoff_timeouts_total.with_label_values(&[&app]).inc());
+        b2bua_reject_call(call_id, 503, "No Controller Response");
+        return;
+    }
+
     // Snapshot everything needed, then drop the DashMap ref before the CANCEL
     // sends, Python, and the A-leg response.
     let (a_leg, a_leg_invite, a_leg_local_addr, cancel_targets, handle_txs) =
@@ -11320,6 +11335,9 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
 
     // RTPEngine safety-net cleanup (mirrors the B-leg failure path).
     let a_sip_call_id = a_leg.dialog.call_id.clone();
+    // Control plane: emit StasisEnd for a controlled call that failed (no-op
+    // otherwise).
+    control_notify_terminated(&a_sip_call_id, "failed");
     if let (Some(rtpengine_set), Some(media_sessions)) =
         (&state.rtpengine_set, &state.rtpengine_sessions)
     {
@@ -11849,7 +11867,163 @@ fn handle_b2bua_invite(
             // confirmed and @b2bua.on_bye takes over when the UAC BYEs.
             debug!(call_id = %call_id, "B2BUA: UAS-mode answer already sent (imperative)");
         }
+        CallAction::Handover { app, on_lost, deadline_ms, vars, answer } => {
+            control_handover(
+                &call_id,
+                &message_guard,
+                &inbound,
+                &app,
+                on_lost.as_deref(),
+                deadline_ms,
+                vars,
+                answer,
+                state,
+            );
+        }
     }
+}
+
+/// Park a call under external control (`call.handover("app")`): hold the INVITE
+/// transaction un-dialed, send a keep-alive `180`, register the call with the
+/// control plane, emit `StasisStart` with the full SIP context, and arm the
+/// handoff deadline. If no controller is available (or the control plane is not
+/// configured), the handoff default action fires immediately — never a silent
+/// black-hole.
+#[allow(clippy::too_many_arguments)]
+fn control_handover(
+    call_id: &str,
+    invite: &SipMessage,
+    inbound: &InboundMessage,
+    app: &str,
+    on_lost: Option<&str>,
+    deadline_ms: Option<u64>,
+    vars: std::collections::HashMap<String, String>,
+    answer: bool,
+    state: &DispatcherState,
+) {
+    let Some(bus) = crate::control::ControlBus::global() else {
+        warn!(call_id = %call_id, %app, "handover requested but control plane is not configured — rejecting 503");
+        let response = build_response(invite, 503, "Service Unavailable", state.server_header.as_deref(), &[]);
+        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+        state.call_actors.remove_call(call_id);
+        state.call_event_receivers.remove(call_id);
+        return;
+    };
+    if !bus.app_configured(app) {
+        warn!(call_id = %call_id, %app, "handover to an unknown control app — rejecting 503");
+        let response = build_response(invite, 503, "Service Unavailable", state.server_header.as_deref(), &[]);
+        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+        state.call_actors.remove_call(call_id);
+        state.call_event_receivers.remove(call_id);
+        return;
+    }
+
+    // Answer-first (AI-park) mode binds to answer_local(profile="voice_ai",
+    // ws_uri=…) + a 200 OK — the media-anchor round-trip that lands with the
+    // demo WP's media plumbing. It is NOT wired in this build. Rather than fake
+    // a 200 (which would commit the call + start CDR answer-time without media),
+    // degrade honestly to deferred parking with a loud warning: the controller
+    // still receives the call and can answer it with the `answer` verb.
+    // TODO(control): wire answer-first — MediaBackend::answer_local → 200 OK with
+    // the synthesized SDP, gated to the siphon-rtp backend, before offer_channel.
+    if answer {
+        warn!(
+            call_id = %call_id,
+            %app,
+            "handover(answer=True): answer-first (AI-park) mode is not yet wired \
+             (needs the answer_local voice_ai media round-trip) — parking the call \
+             un-answered instead; the controller must answer it via the `answer` verb"
+        );
+    }
+
+    let sip_call_id = invite.headers.call_id().cloned().unwrap_or_default();
+    let channel_id = format!("ch-{call_id}");
+    let stasis_payload = build_stasis_payload(invite, inbound, &vars);
+
+    // Park the call: record the control owner + mark it awaiting the controller's
+    // first action. Send NO synthesized provisional — the caller's INVITE
+    // transaction is already kept alive by the automatic 100 Trying the
+    // transaction layer sent (client txn in Proceeding — Timer A stopped, Timer B
+    // cancelled). A 180 here would falsely tell the caller a phone is ringing when
+    // nothing has been dialed yet; the real 18x/early-media relay end-to-end from
+    // the downstream carrier once the app routes (Phase 2), and the app may
+    // explicitly send a provisional via the `progress` verb — never automatic.
+    state.call_actors.set_control_owner(call_id, app, on_lost);
+    state.call_actors.set_state(call_id, CallState::Ringing);
+
+    let outcome = bus.offer_channel(
+        app,
+        &channel_id,
+        call_id,
+        &sip_call_id,
+        on_lost.unwrap_or("hangup"),
+        vars,
+        stasis_payload,
+    );
+
+    match outcome {
+        crate::control::OfferOutcome::Assigned | crate::control::OfferOutcome::Dialing => {
+            let deadline_ms = deadline_ms.unwrap_or_else(|| bus.handoff_deadline_ms());
+            if deadline_ms > 0 {
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_millis(deadline_ms);
+                state.call_actors.set_answer_deadline(call_id, deadline);
+            }
+            info!(call_id = %call_id, %app, channel = %channel_id, "B2BUA: call handed over to control plane");
+        }
+        crate::control::OfferOutcome::NoController => {
+            warn!(call_id = %call_id, %app, "handover: no controller available — applying default (503)");
+            crate::metrics::try_metrics()
+                .inspect(|m| m.control_handoff_timeouts_total.with_label_values(&[app]).inc());
+            // Send the final response ourselves (a 180 already went out).
+            b2bua_reject_call(call_id, 503, "No Controller Available");
+        }
+    }
+}
+
+/// Build the `StasisStart` payload: the full SIP context (all headers, source,
+/// R-URI shape, body) + the handover vars. Requirement #5 — the controller sees
+/// the real headers, not a normalized summary.
+fn build_stasis_payload(
+    invite: &SipMessage,
+    inbound: &InboundMessage,
+    vars: &std::collections::HashMap<String, String>,
+) -> serde_json::Value {
+    let (method, ruri) = match &invite.start_line {
+        StartLine::Request(request_line) => (
+            request_line.method.as_str().to_string(),
+            request_line.request_uri.to_string(),
+        ),
+        _ => (String::new(), String::new()),
+    };
+    let mut headers: Vec<[String; 2]> = Vec::new();
+    for (name, values) in invite.headers.iter_original() {
+        for value in values {
+            headers.push([name.clone(), value.clone()]);
+        }
+    }
+    let body = if invite.body.is_empty() {
+        None
+    } else {
+        // SDP is text; surface it directly when valid UTF-8 (avoids a base64 dep
+        // on the control rail). Non-text bodies report their length only.
+        match std::str::from_utf8(&invite.body) {
+            Ok(text) => Some(serde_json::json!({ "content_type": invite.headers.get("Content-Type").cloned(), "text": text })),
+            Err(_) => Some(serde_json::json!({ "content_type": invite.headers.get("Content-Type").cloned(), "bytes": invite.body.len() })),
+        }
+    };
+    serde_json::json!({
+        "invite": {
+            "method": method,
+            "ruri": ruri,
+            "headers": headers,
+            "body": body,
+        },
+        "source_ip": inbound.remote_addr.ip().to_string(),
+        "source_port": inbound.remote_addr.port(),
+        "transport": format!("{}", inbound.transport).to_lowercase(),
+        "vars": vars,
+    })
 }
 
 /// Build the B-leg Contact header value.
@@ -15612,15 +15786,21 @@ fn handle_b2bua_bye(
     };
 
     // Extract the rest from the DashMap ref and drop it before entering Python
-    let (a_leg_invite, a_leg_source_ip, a_leg_transport) =
+    let (a_leg_invite, a_leg_source_ip, a_leg_transport, a_leg_call_id) =
         match state.call_actors.get_call(&call_id) {
             Some(call) => (
                 call.a_leg_invite.clone(),
                 call.a_leg.transport.remote_addr.ip().to_string(),
                 format!("{}", call.a_leg.transport.transport).to_lowercase(),
+                call.a_leg.dialog.call_id.clone(),
             ),
             None => return,
         };
+
+    // Control plane: emit StasisEnd if this call was controlled (keyed on the
+    // A-leg Call-ID, so a BYE from either leg reaches the owning app). No-op
+    // otherwise.
+    control_notify_terminated(&a_leg_call_id, "bye");
 
     // Invoke @b2bua.on_bye handlers with (PyCall, PyByeInitiator)
     let engine_state = state.engine.state();
@@ -16251,12 +16431,84 @@ fn b2bua_terminate_call_inner(
     // SIPREC: stop any active recording sessions for this call.
     b2bua_stop_siprec(internal_call_id, state);
 
+    // Control plane: emit StasisEnd + drop the channel if this call was
+    // controlled (no-op otherwise).
+    control_notify_terminated(&sip_call_id, reason_header.unwrap_or("terminated"));
+
     state.call_actors.set_state(internal_call_id, CallState::Terminated);
     // remove_call sends Shutdown to any remaining actors, cleans up registry,
     // and moves re-INVITE tracking entries to the zombie map.
     state.call_actors.remove_call(internal_call_id);
     state.call_event_receivers.remove(internal_call_id);
     schedule_zombie_reinvite_cleanup(&state.call_actors);
+    true
+}
+
+/// Emit a control-plane `StasisEnd` for a controlled call at teardown (no-op
+/// when the control plane isn't configured or the call isn't controlled).
+fn control_notify_terminated(sip_call_id: &str, reason: &str) {
+    if let Some(bus) = crate::control::ControlBus::global() {
+        bus.on_call_terminated(sip_call_id, reason);
+    }
+}
+
+/// Imperatively reject / tear down a *controlled* B2BUA call that has not been
+/// answered (a parked call the app declined, the handoff deadline elapsing, or a
+/// hangup of an unanswered call). Sends a final non-2xx to the A-leg (tagged to
+/// the A-leg dialog), finalizes the CDR as failed, emits `StasisEnd`, and removes
+/// the call. Returns `false` (never panics) when the call is gone / dispatcher
+/// down. Distinct from [`b2bua_terminate_call`] (which BYEs an *answered* call).
+pub fn b2bua_reject_call(internal_call_id: &str, code: u16, reason: &str) -> bool {
+    let Some(control) = B2BUA_CONTROL.get() else {
+        return false;
+    };
+    let state = &control.state;
+    let (invite_arc, transport, remote_addr, connection_id, local_addr, local_tag, sip_call_id) =
+        match state.call_actors.get_call(internal_call_id) {
+            Some(call) => (
+                call.a_leg_invite.clone(),
+                call.a_leg.transport.transport,
+                call.a_leg.transport.remote_addr,
+                call.a_leg.transport.connection_id,
+                call.a_leg_local_addr,
+                call.a_leg.dialog.local_tag.clone(),
+                call.a_leg.dialog.call_id.clone(),
+            ),
+            None => return false,
+        };
+    let Some(invite_arc) = invite_arc else {
+        return false;
+    };
+    let _enter = control.runtime.enter();
+    let Ok(invite) = invite_arc.lock() else {
+        error!(call_id = %internal_call_id, "b2bua_reject_call: invite lock poisoned");
+        return false;
+    };
+
+    // RFC 3261 §12.1.1: tag the To header with the A-leg dialog local_tag so the
+    // final response terminates the same dialog the 180 opened.
+    let mut reply_headers: Vec<(crate::script::api::request::ReplyHeaderOp, String, String)> =
+        Vec::new();
+    if let Some(to_value) = invite.headers.to() {
+        if !to_value.contains(";tag=") {
+            reply_headers.push((
+                crate::script::api::request::ReplyHeaderOp::Replace,
+                "To".to_string(),
+                crate::b2bua::actor::ensure_tag(to_value, Some(&local_tag)),
+            ));
+        }
+    }
+    let response =
+        build_response(&invite, code, reason, state.server_header.as_deref(), &reply_headers);
+    drop(invite);
+    send_message_from(response, transport, remote_addr, connection_id, local_addr, state);
+
+    if crate::cdr::auto_emit_enabled() {
+        cdr_finalize_b2bua_fail(state, internal_call_id, code);
+    }
+    control_notify_terminated(&sip_call_id, reason);
+    state.call_actors.remove_call(internal_call_id);
+    state.call_event_receivers.remove(internal_call_id);
     true
 }
 
