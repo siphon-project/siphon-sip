@@ -859,6 +859,7 @@ services:
       - b2bua-reinvite-reject
       - b2bua-reinvite-breject
       - b2bua-update
+      - b2bua-bye-glare
       - b2bua-cancel
       - b2bua-early-media
       - b2bua-topology
@@ -904,6 +905,7 @@ services:
       - b2bua-reinvite-reject
       - b2bua-reinvite-breject
       - b2bua-update
+      - b2bua-bye-glare
       - b2bua-cancel
       - b2bua-early-media
       - b2bua-topology
@@ -1314,6 +1316,65 @@ services:
       - -trace_err
     profiles:
       - b2bua-update
+
+  # --- B2BUA BYE-glare test (in-dialog BYE after teardown → 481) ---
+
+  sipp-b2bua-bye-glare-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_bye_glare_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-bye-glare
+
+  sipp-b2bua-bye-glare-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-bye-glare-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_bye_glare_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      # An unanswered BYE must end the call as FAILED (exit 1) instead of sitting
+      # in retransmits until the run is torn down, which sipp reports as success.
+      # Two retries ≈ 1.5 s; the fixed build answers 481 immediately and never
+      # retransmits at all, so this does not weaken the healthy path.
+      - -max_retrans
+      - "2"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-bye-glare
 
   # --- B2BUA REFER test (RFC 3515 transparent blind transfer) ---
 
