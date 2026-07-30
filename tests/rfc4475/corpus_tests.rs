@@ -13,17 +13,21 @@
 //! any filename convention:
 //!
 //! * **§3.1.1 Valid Messages** — `Expect::Parse`. RFC 4475 §3.1 is titled
-//!   "Parser Tests (syntax)"; these are syntactically well-formed and the
-//!   parser must accept them. They must additionally reach a serialisation
-//!   fixed point.
-//! * **§3.1.2 Invalid Messages** — `Expect::Reject`. Syntactically invalid;
-//!   the parser must reject them with a defined error rather than accept or
-//!   panic.
+//!   "Parser Tests (syntax)"; these are syntactically well-formed and must be
+//!   accepted. They must additionally reach a serialisation fixed point.
+//! * **§3.1.2 Invalid Messages** — `Expect::Reject`. The element must refuse
+//!   them, at whichever layer is right for the defect: the parser rejects what
+//!   it cannot represent (an unframeable Content-Length, a malformed
+//!   Request-Line), and `sip::validate` rejects what parses but is invalid,
+//!   naming the status the peer is owed — 505 for an unsupported version, 400
+//!   for the rest. Pushing the latter into the parser would be wrong: a message
+//!   that never parsed cannot be answered, only dropped, and RFC 4475 asks for
+//!   a specific response to most of these.
 //! * **§3.2 / §3.3 / §3.4** — `Expect::Parse`. §3.3 is explicitly
-//!   "Application-Layer Semantics": these messages parse, and the torture is
-//!   above the parser (missing required header fields, unknown schemes,
-//!   multiple Content-Length, RFC 2543 syntax, ...). Rejecting them in the
-//!   parser would be wrong — the application layer decides the response.
+//!   "Application-Layer Semantics": these messages parse and validate, and the
+//!   torture is above both (missing required header fields, unknown schemes,
+//!   multiple Content-Length, RFC 2543 syntax, ...). Refusing them here would
+//!   be wrong — the application layer decides the response.
 //!
 //! Note that this classification is *not* the same as the `_V` / `_I` suffix
 //! carried by the upstream filenames. That suffix records whether the source
@@ -37,6 +41,7 @@
 // `dispatcher` uses for received datagrams. It is not re-exported at
 // `siphon::sip`, so reach it through the public `parser` module.
 use siphon::sip::parser::parse_sip_message_bytes;
+use siphon::sip::validate::validate_message;
 
 /// What the parser is required to do with a fixture.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -70,11 +75,26 @@ enum Outcome {
     Panicked,
 }
 
-/// Run the parser over `bytes`, converting a panic into an [`Outcome`] rather
-/// than unwinding — one panicking fixture must not mask the other 49.
+/// Run a fixture through the inbound path — parse, then RFC 3261 validation —
+/// converting a panic into an [`Outcome`] rather than unwinding, so one
+/// panicking fixture cannot mask the other 49.
+///
+/// Both layers count as a rejection, because both are how the element refuses a
+/// message. The parser rejects what it cannot represent (an unframeable
+/// Content-Length, a malformed Request-Line); the validator rejects what parses
+/// but is still invalid, and names the status the peer is owed. Splitting them
+/// this way is what lets siphon answer 400 or 505 instead of dropping the
+/// message, which is the whole point of the §3.1.2 cases.
 fn probe(bytes: &'static [u8]) -> Outcome {
-    match std::panic::catch_unwind(|| parse_sip_message_bytes(bytes)) {
-        Ok(Ok(_)) => Outcome::Parsed,
+    let outcome = std::panic::catch_unwind(|| {
+        parse_sip_message_bytes(bytes).and_then(|message| {
+            validate_message(&message)
+                .map_err(|rejection| format!("{} {}", rejection.status, rejection.detail))
+        })
+    });
+
+    match outcome {
+        Ok(Ok(())) => Outcome::Parsed,
         Ok(Err(error)) => Outcome::Rejected(error),
         Err(_) => Outcome::Panicked,
     }
@@ -451,107 +471,15 @@ struct Deviation {
     note: &'static str,
 }
 
-/// The parser's current deviations from RFC 4475, enumerated.
+/// Fixtures whose behaviour deviates from RFC 4475, enumerated.
 ///
-/// This list is not a way to excuse the failures — it is how they are kept
-/// visible and machine-checked. [`messages_parse_or_are_rejected_per_rfc4475`]
-/// fails if a fixture deviates *without* an entry here (a regression), and
-/// equally fails if an entry here no longer deviates (a fix landed and the list
-/// is now stale). So the gap can only shrink deliberately, and it can never
-/// rot silently.
-///
-/// Six fixtures fail to parse, from three distinct grammar defects:
-///
-/// * `HCOLON-WS` — RFC 3261 §25.1 defines
-///   `HCOLON = *( SP / HTAB ) ":" SWS`, so whitespace between a header name
-///   and its colon is legal. The header parser rejects it.
-/// * `METHOD-TOKEN` — `Method = INVITEm / ... / extension-method`, and
-///   `extension-method = token`, where `token` admits
-///   `alphanum / "-" / "." / "!" / "%" / "*" / "_" / "+" / "`" / "'" / "~"`.
-///   The start-line parser does not accept the full set.
-/// * `RURI-ABSOLUTEURI` — `Request-URI = SIP-URI / SIPS-URI / absoluteURI`.
-///   A Request-URI in an unknown or atypical scheme is syntactically valid;
-///   RFC 3261 §8.2.2 makes it a 416 Unsupported URI Scheme at the application
-///   layer, not a parse failure.
-///
-/// The remaining fourteen parse when RFC 4475 §3.1.2 classifies them invalid.
-/// Some of those are defensible in a permissive parser that leaves the 400 to
-/// the application layer; the scalar and framing ones (`CL-FRAMING`,
-/// `SCALAR-RANGE`) are not, because nothing above the parser can recover a
-/// length or a scalar that was already accepted out of range.
-const KNOWN_DEVIATIONS: &[Deviation] = &[
-    // --- parse but RFC 4475 §3.1.2 classifies invalid --------------------
-    Deviation {
-        file: "TC_CLERR_I.dat",
-        defect: "CL-FRAMING",
-        note: "accepts Content-Length larger than the message body",
-    },
-    Deviation {
-        file: "TC_NCL_I.dat",
-        defect: "CL-FRAMING",
-        note: "accepts a negative Content-Length",
-    },
-    Deviation {
-        file: "TC_SCALAR02_V.dat",
-        defect: "SCALAR-RANGE",
-        note: "accepts overlarge request scalars (Max-Forwards, CSeq, Expires)",
-    },
-    Deviation {
-        file: "TC_SCALARLG_V.dat",
-        defect: "SCALAR-RANGE",
-        note: "accepts overlarge response scalars",
-    },
-    Deviation {
-        file: "TC_QUOTBAL_I.dat",
-        defect: "PERMISSIVE-SYNTAX",
-        note: "accepts an unterminated quoted string in a display name",
-    },
-    Deviation {
-        file: "TC_BADINV01_I.dat",
-        defect: "PERMISSIVE-SYNTAX",
-        note: "accepts extraneous header field separators",
-    },
-    Deviation {
-        file: "TC_LWSSTART_V.dat",
-        defect: "PERMISSIVE-SYNTAX",
-        note: "accepts multiple SP separating request-line elements",
-    },
-    Deviation {
-        file: "TC_ESCRURI_V.dat",
-        defect: "PERMISSIVE-SYNTAX",
-        note: "accepts escaped headers in the Request-URI",
-    },
-    Deviation {
-        file: "TC_BADDATE_V.dat",
-        defect: "PERMISSIVE-SYNTAX",
-        note: "accepts an invalid time zone in Date",
-    },
-    Deviation {
-        file: "TC_REGBADCT_I.dat",
-        defect: "PERMISSIVE-SYNTAX",
-        note: "accepts a name-addr URI not enclosed in <>",
-    },
-    Deviation {
-        file: "TC_BADASPEC_I.dat",
-        defect: "PERMISSIVE-SYNTAX",
-        note: "accepts spaces within addr-spec",
-    },
-    Deviation {
-        file: "TC_BADVERS_V.dat",
-        defect: "PERMISSIVE-SEMANTIC",
-        note: "accepts SIP/7.0; RFC 4475 expects 505 from the element",
-    },
-    Deviation {
-        file: "TC_MISMATCH01_V.dat",
-        defect: "PERMISSIVE-SEMANTIC",
-        note: "accepts start-line/CSeq method mismatch (cross-field check)",
-    },
-    Deviation {
-        file: "TC_MISMATCH02_V.dat",
-        defect: "PERMISSIVE-SEMANTIC",
-        note: "accepts unknown method with CSeq method mismatch",
-    },
-];
+/// Empty, and meant to stay that way: every one of the 50 fixtures is currently
+/// handled as the RFC requires. The mechanism is kept because it is what makes
+/// that claim checkable. [`messages_parse_or_are_rejected_per_rfc4475`] fails if
+/// a fixture deviates *without* an entry here (a regression), and equally fails
+/// if an entry here no longer deviates (a fix landed and the list is stale). So
+/// a deliberate, documented exception is possible, and silent rot is not.
+const KNOWN_DEVIATIONS: &[Deviation] = &[];
 
 /// Guards against a fixture being added to `corpus/` without a matching
 /// classification, or a `CORPUS` entry losing its file.

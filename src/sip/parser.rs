@@ -63,6 +63,29 @@ pub fn parse_sip_message_bytes(input: &[u8]) -> Result<SipMessage, String> {
 
     // Body is raw bytes after the \r\n\r\n boundary
     let body_start = boundary + 4;
+
+    // RFC 3261 §20.14: `Content-Length = 1*DIGIT`, counting body octets. A value
+    // that is not a non-negative integer, or that claims more octets than were
+    // actually received, leaves the message unframeable — there is no body to
+    // hand upstream and no way to tell where the next message starts. Both are
+    // rejected here rather than papered over with a short read (RFC 4475
+    // §3.1.2.2 "Content Length Larger Than Message" and §3.1.2.3 "Negative
+    // Content-Length"). Stream transports never trip the overrun check: the TCP
+    // framer already waits for `headers + Content-Length` octets before handing
+    // a message over, so a short buffer never reaches the parser.
+    if let Some(declared) = headers.get("Content-Length") {
+        let declared = declared.trim();
+        let declared: usize = declared
+            .parse()
+            .map_err(|_| format!("invalid Content-Length {declared:?} (RFC 3261 §20.14)"))?;
+        let available = input.len().saturating_sub(body_start);
+        if declared > available {
+            return Err(format!(
+                "Content-Length {declared} exceeds the {available} body octet(s) received"
+            ));
+        }
+    }
+
     let content_length = headers.content_length().unwrap_or(0);
     let body = if content_length > 0 && input.len() >= body_start + content_length {
         input[body_start..body_start + content_length].to_vec()
@@ -108,9 +131,13 @@ fn parse_request_line(input: &str) -> IResult<&str, RequestLine> {
     })(input)?;
     let method = Method::from_str(method_str);
 
-    let (input, _) = space1(input)?;
+    // RFC 3261 §25.1: `Request-Line = Method SP Request-URI SP SIP-Version CRLF`
+    // — exactly one SP between elements, no LWS. Accepting a run of spaces makes
+    // the Request-URI ambiguous (RFC 4475 §3.1.2.9 "Multiple SP Separating
+    // Request-Line Elements", and §3.1.2.10 for trailing SP).
+    let (input, _) = char(' ')(input)?;
     let (input, uri) = parse_uri(input)?;
-    let (input, _) = space1(input)?;
+    let (input, _) = char(' ')(input)?;
     let (input, version) = parse_version(input)?;
     let (input, _) = parse_crlf(input)?;
 

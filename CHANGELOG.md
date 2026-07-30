@@ -135,15 +135,41 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
     §8.2.2 requires a 416 Unsupported URI Scheme — which could not be sent,
     because the message failed to parse first.
 
+### Added
+- **`sip::validate` — RFC 3261 validation of messages that parse but are still
+  invalid.** A message can be perfectly parseable and yet have to be refused: an
+  unsupported version, a CSeq that disagrees with the Request-Line, an
+  unterminated quoted string in a display name. RFC 3261 wants a *specific
+  status* for these, which is only possible if the message parsed first — so the
+  parser accepts them, `validate_message` names the rejection and the status, and
+  the dispatcher answers it (505 Version Not Supported, otherwise 400 Bad
+  Request). A response that fails validation is discarded, since there is nothing
+  to answer. Runs after HEP capture, so rejected traffic still appears in packet
+  capture. Covers RFC 4475 §3.1.2.1, §3.1.2.4–6, §3.1.2.11–14, §3.1.2.16–18.
+
+  Checks are deliberately narrow so ordinary traffic cannot trip them — the
+  scalar check rejects on CSeq alone, because RFC 4475 §3.1.2.4 attributes the
+  400 to the CSeq error and explicitly permits an element to process a request
+  whose Max-Forwards alone is out of range.
+
 ### Changed
+- **Content-Length is now validated against the octets actually received.** A
+  value that is not a non-negative integer, or that claims more octets than
+  arrived, leaves the message unframeable and is rejected instead of being
+  papered over with a short read (RFC 3261 §20.14; RFC 4475 §3.1.2.2, §3.1.2.3).
+  Stream transports are unaffected — the TCP framer already waits for
+  `headers + Content-Length` octets before handing a message to the parser.
+- **The Request-Line now requires exactly one SP between elements**, per
+  `Request-Line = Method SP Request-URI SP SIP-Version CRLF` (RFC 3261 §25.1). A
+  run of spaces made the Request-URI ambiguous (RFC 4475 §3.1.2.9).
 - **RFC 4475 tests now run against the byte-exact message corpus.** The 50
   torture messages from RFC 4475 §3 are vendored under `tests/rfc4475/corpus/`
   and driven from a table classified by RFC section, replacing hand-transcribed
   approximations that could not preserve the whitespace, folding and escaping
   the messages exist to test. Fixtures the parser still handles contrary to the
   RFC are enumerated in a `KNOWN_DEVIATIONS` list that fails both on a new
-  deviation and on a stale entry, so the remaining gap is explicit and cannot
-  drift.
+  deviation and on a stale entry, so the gap is explicit and cannot drift. That
+  list is currently **empty** — all 50 fixtures are handled as the RFC requires.
 
 ## [1.5.1] — 2026-07-29
 
