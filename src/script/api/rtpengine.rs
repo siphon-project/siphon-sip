@@ -110,11 +110,14 @@ fn resolve_play_media_source(
 const DEFAULT_PROFILE: &str = "rtp_passthrough";
 
 /// The per-call values a `ws_uri` template can interpolate.
-struct WsUriContext<'a> {
-    call_id: &'a str,
-    from_tag: &'a str,
-    from_user: Option<&'a str>,
-    to_user: Option<&'a str>,
+///
+/// `pub(crate)` so the dispatcher's answer-first handover path reuses the exact
+/// #131 templating (`expand_ws_uri`) instead of duplicating it.
+pub(crate) struct WsUriContext<'a> {
+    pub(crate) call_id: &'a str,
+    pub(crate) from_tag: &'a str,
+    pub(crate) from_user: Option<&'a str>,
+    pub(crate) to_user: Option<&'a str>,
 }
 
 /// The From/To user parts of a message, for `ws_uri` templating.
@@ -163,7 +166,9 @@ fn extract_source_ip(object: &Bound<'_, PyAny>) -> Option<String> {
 ///
 /// A URI with no `{` is returned untouched, so the common non-templated case
 /// costs one scan and no allocation decisions.
-fn expand_ws_uri(template: &str, context: &WsUriContext<'_>) -> PyResult<String> {
+///
+/// `pub(crate)` so the dispatcher's answer-first handover path reuses it.
+pub(crate) fn expand_ws_uri(template: &str, context: &WsUriContext<'_>) -> PyResult<String> {
     if !template.contains('{') {
         return Ok(template.to_string());
     }

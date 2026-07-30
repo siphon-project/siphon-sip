@@ -27,11 +27,24 @@ class TestCallHandover:
         assert action.extras["deadline_ms"] is None
         assert action.extras["vars"] == {}
         assert action.extras["answer"] is False
+        assert action.extras["profile"] is None
+        assert action.extras["ws_uri"] is None
 
-    def test_handover_answer_first_mode(self):
+    def test_handover_answer_first_mode_with_media_args(self):
         call = Call()
-        call.handover("ivr-app", answer=True)
-        assert call._actions[-1].extras["answer"] is True
+        call.handover("ai-app", answer=True, profile="voice_ai",
+                      ws_uri="wss://ai.example/stream/{call_id}")
+        extras = call._actions[-1].extras
+        assert extras["answer"] is True
+        assert extras["profile"] == "voice_ai"
+        assert extras["ws_uri"] == "wss://ai.example/stream/{call_id}"
+
+    def test_handover_media_args_require_answer(self):
+        call = Call()
+        with pytest.raises(ValueError):
+            call.handover("app", profile="voice_ai")
+        with pytest.raises(ValueError):
+            call.handover("app", ws_uri="wss://ai")
 
     def test_handover_rejects_empty_app(self):
         call = Call()

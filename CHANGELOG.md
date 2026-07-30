@@ -32,9 +32,13 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   provisional (a 180 would falsely signal ringing before anything is dialed); the
   controller sends its own `progress` (180 ringback / 183+SDP early media) if it
   wants one, and the real 18x relay end-to-end once the app routes.
-  `call.handover(answer=…)` reserves the answer-first (AI-park) mode; that mode's
-  `answer_local`/`voice_ai` media round-trip is a follow-on and currently degrades
-  to deferred parking with a loud warning. First-class adapter API
+  Answer-first (AI-park) mode — `call.handover("ai-app", answer=True, ws_uri=…)` —
+  answers the call (`200 OK`) and anchors its media to the `voice_ai` WebSocket
+  bridge before handing over (via `answer_local` on the `siphon-rtp` backend, with
+  `ws_uri` templated per the media-profile expansion), so the app drives an
+  already-connected channel with the AI audio path open; on a backend that cannot
+  do it (anything but siphon-rtp) the handover fails visibly (`503`), never a fake
+  200. First-class adapter API
   (`ControlAdapter` trait + `SiphonServer::register_control_adapter`) with an
   opaque JSON DTO seam, so a protocol extension registers its own control surface
   over the same rail; the built-in SIP adapter ships in core. Prometheus metrics

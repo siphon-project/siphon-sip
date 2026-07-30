@@ -432,7 +432,9 @@ class Call:
     def handover(self, app: str, on_lost: str | None = None,
                  deadline_ms: int | None = None,
                  vars: dict[str, str] | None = None,
-                 answer: bool = False) -> None:
+                 answer: bool = False,
+                 profile: str | None = None,
+                 ws_uri: str | None = None) -> None:
         """Hand this call over to an out-of-process control application (the ARI
         *Stasis* model). siphon holds the INVITE transaction un-dialed, sends a
         keep-alive ``180``, registers the call with the control plane, and emits
@@ -459,16 +461,27 @@ class Call:
                 channel (answering commits the call; declining is a BYE, not a
                 4xx). When ``False`` (default), the call is parked un-answered and
                 the controller decides how to respond.
+            profile: Answer-first only — the media profile to anchor with
+                (default ``"voice_ai"``).
+            ws_uri: Answer-first only — the per-call WebSocket bridge URI the media
+                engine dials out for this leg's audio (computed per session /
+                tenant). Supports ``{call_id}`` / ``{from_tag}`` / ``{from_user}``
+                / ``{to_user}`` templating; falls back to the profile's own
+                ``ws_uri`` when omitted.
 
         Raises:
-            ValueError: if ``app`` is empty or ``on_lost`` is not one of
-                ``"hangup"`` / ``"continue"`` / ``"fallback"``.
+            ValueError: if ``app`` is empty, ``on_lost`` is not one of
+                ``"hangup"`` / ``"continue"`` / ``"fallback"``, or ``profile`` /
+                ``ws_uri`` are passed without ``answer=True``.
 
         Example::
 
             @b2bua.on_invite
             async def route(call):
-                if is_ivr_number(call.to_uri):
+                if is_ai_number(call.to_uri):
+                    call.handover("ai-app", answer=True,
+                                  ws_uri="wss://ai.example/stream/{call_id}")
+                elif is_ivr_number(call.to_uri):
                     call.handover("ivr-app", on_lost="hangup", deadline_ms=3000,
                                   vars={"queue": "support"})
                 else:
@@ -481,6 +494,11 @@ class Call:
                 "call.handover(on_lost=…) must be 'hangup', 'continue', or "
                 f"'fallback' (got {on_lost!r})"
             )
+        if not answer and (profile is not None or ws_uri is not None):
+            raise ValueError(
+                "call.handover(profile=…/ws_uri=…) requires answer=True "
+                "(they only apply to answer-first mode)"
+            )
         self._actions.append(Action(
             kind="handover",
             extras={
@@ -489,6 +507,8 @@ class Call:
                 "deadline_ms": deadline_ms,
                 "vars": dict(vars) if vars else {},
                 "answer": answer,
+                "profile": profile,
+                "ws_uri": ws_uri,
             },
         ))
 
