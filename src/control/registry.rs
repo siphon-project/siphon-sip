@@ -1008,6 +1008,47 @@ mod tests {
         assert_eq!(bus.owns("nope", "ivr-app", owner.id), Ownership::Unknown);
     }
 
+    #[tokio::test]
+    async fn cancel_while_parked_emits_stasis_end_and_drains() {
+        // Models the teardown the CANCEL path (`handle_b2bua_cancel`) now runs
+        // for a handed-over call the caller CANCELs before the controller acts:
+        // control_notify_terminated → on_call_terminated. The owning app must be
+        // told (StasisEnd) and every bus entry must drain — the leak the report
+        // flagged (channel/app_calls/owner cleaned only on app disconnect).
+        let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
+        let conn = bus.register_connection("ivr-app");
+        bus.offer_channel(
+            "ivr-app",
+            "ch1",
+            "call-uuid",
+            "sipcid@h",
+            "hangup",
+            HashMap::new(),
+            serde_json::json!({}),
+        );
+        assert_eq!(bus.channel_count(), 1);
+        assert_eq!(bus.owned_channels("ivr-app").len(), 1);
+
+        // Caller CANCEL, keyed on the A-leg Call-ID.
+        bus.on_call_terminated("sipcid@h", "cancelled");
+
+        // The owning connection received StasisStart then StasisEnd(cancelled).
+        let frames = conn.events.recv_many().await;
+        let stasis_end = frames
+            .iter()
+            .find_map(|frame| match frame {
+                OutboundFrame::Event(event) if event.event == "StasisEnd" => Some(event),
+                _ => None,
+            })
+            .expect("owning app must receive StasisEnd on CANCEL");
+        assert_eq!(stasis_end.payload["reason"], "cancelled");
+        assert_eq!(stasis_end.channel.as_deref(), Some("ch1"));
+
+        // Every per-call entry drained to baseline (no leak).
+        assert_eq!(bus.channel_count(), 0, "channel leaked after CANCEL");
+        assert!(bus.owned_channels("ivr-app").is_empty(), "app_calls leaked after CANCEL");
+    }
+
     #[test]
     fn per_call_vars_get_set_and_drain() {
         let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
@@ -1098,22 +1139,31 @@ mod tests {
             for index in 0..8 {
                 let conn = bus.register_connection("ivr-app");
                 let channel = format!("ch-{cycle}-{index}");
+                let sip_call_id = format!("sip-{cycle}-{index}");
                 bus.register_channel(
                     &channel,
                     &conn,
                     &format!("call-{cycle}-{index}"),
-                    &format!("sip-{cycle}-{index}"),
+                    &sip_call_id,
                     "hangup",
                     HashMap::new(),
                 );
                 bus.publish_to_channel(&channel, stasis_start(&channel, "ivr-app"));
-                conns.push((conn, channel));
+                conns.push((conn, channel, sip_call_id));
             }
             assert_eq!(bus.channel_count(), 8);
             assert_eq!(bus.app_connection_count("ivr-app"), 8);
 
-            for (conn, channel) in conns {
-                bus.remove_channel(&channel);
+            for (position, (conn, channel, sip_call_id)) in conns.into_iter().enumerate() {
+                // Alternate the teardown trigger: half via a direct hangup
+                // (remove_channel), half via the CANCEL/BYE path
+                // (on_call_terminated by sip_call_id) — the latter is what the
+                // report's leak fix restored on the CANCEL-while-parked path.
+                if position % 2 == 0 {
+                    bus.remove_channel(&channel);
+                } else {
+                    bus.on_call_terminated(&sip_call_id, "cancelled");
+                }
                 // Directly remove the fanout entry (no grace timer in a
                 // non-tokio test context).
                 if let Some(fanout) = bus.apps.get(&conn.app) {
