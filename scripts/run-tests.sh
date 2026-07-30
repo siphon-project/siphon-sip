@@ -38,6 +38,7 @@ RUN_HTTP_AUTH=false
 RUN_WEDGE=false
 RUN_BANSCAN=false
 RUN_SECURITY=false
+RUN_RFC4475=false
 RUN_WEBRTC=false
 SKIP_RUST=false
 
@@ -62,6 +63,7 @@ for arg in "$@"; do
     --wedge)      RUN_WEDGE=true;      SELECTED_MODES+=("$arg") ;;
     --banscan)    RUN_BANSCAN=true;    SELECTED_MODES+=("$arg") ;;
     --security)   RUN_SECURITY=true;   SELECTED_MODES+=("$arg") ;;
+    --rfc4475)    RUN_RFC4475=true;    SELECTED_MODES+=("$arg") ;;
     --webrtc)     RUN_WEBRTC=true;     SELECTED_MODES+=("$arg") ;;
     --skip-rust)  SKIP_RUST=true ;;
     --help|-h)
@@ -70,7 +72,7 @@ for arg in "$@"; do
       echo "Scenario modes (pick at most ONE per run):"
       echo "  --ipsec --charging --call --presence --rtpengine --rtpproxy --reinvite"
       echo "  --b2bua --b2bua-auth --gateway --auto100 --http-auth --wedge --banscan"
-      echo "  --security --webrtc"
+      echo "  --security --rfc4475 --webrtc"
       echo
       echo "  --skip-rust   skip the Rust test step (combines with any mode)"
       echo
@@ -367,6 +369,17 @@ fi
 if [[ "$RUN_SECURITY" == true ]]; then
   echo "=== rate_limit + scanner_block regression (request filter) ==="
   run_sipp bash scripts/security_test.sh
+fi
+
+# ── RFC 4475 on-the-wire regression (optional) ───────────────────────────────
+# The byte-exact torture messages go out on a real UDP socket. Each must be
+# accepted (200 from the script), refused with the status RFC 4475 names (400,
+# or 505 for a bad version), or dropped with no response where the parser cannot
+# represent the message at all. The Rust corpus test proves the decision; this
+# proves the peer actually receives it.
+if [[ "$RUN_RFC4475" == true ]]; then
+  echo "=== RFC 4475 torture corpus regression (on the wire) ==="
+  run_sipp bash scripts/rfc4475_test.sh
 fi
 
 # ── WebRTC (SIP-over-WebSocket) two-UA call test (optional) ───────────────────

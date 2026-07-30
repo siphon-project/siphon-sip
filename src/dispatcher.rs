@@ -2484,6 +2484,49 @@ fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
         );
     }
 
+    // RFC 3261 validation of a message that parsed but is still invalid — an
+    // unsupported version, a CSeq at odds with the Request-Line, a malformed
+    // address header. The peer is owed the status the RFC names, so this runs
+    // before any routing. A response that fails validation cannot be answered,
+    // so it is discarded (RFC 4475 §3.1.2.5).
+    if let Err(rejection) = crate::sip::validate::validate_message(&message) {
+        match &message.start_line {
+            StartLine::Request(_) => {
+                warn!(
+                    remote = %inbound.remote_addr,
+                    status = rejection.status,
+                    "rejecting malformed request: {}", rejection.detail
+                );
+                // Building a response needs the Via to route it back; without
+                // one there is nowhere to send it (RFC 3261 §8.2.6.1).
+                if message.headers.get("Via").is_some() {
+                    let response = build_response(
+                        &message,
+                        rejection.status,
+                        rejection.reason,
+                        state.server_header.as_deref(),
+                        &[],
+                    );
+                    send_message_from(
+                        response,
+                        inbound.transport,
+                        inbound.remote_addr,
+                        inbound.connection_id,
+                        Some(inbound.local_addr),
+                        state,
+                    );
+                }
+            }
+            StartLine::Response(_) => {
+                warn!(
+                    remote = %inbound.remote_addr,
+                    "discarding malformed response: {}", rejection.detail
+                );
+            }
+        }
+        return;
+    }
+
     // Registrar-liveness SIP-layer last-seen (Part B, fix A).  Any message
     // arriving on a P-CSCF protected port is inbound traffic from a UE with a
     // live IPsec SA — a direct liveness signal siphon observes even when the

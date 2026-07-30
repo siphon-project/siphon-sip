@@ -1,10 +1,7 @@
-//! RFC 4475 - SIP Torture Test Messages
-//! 
-//! These tests implement the torture test messages from RFC 4475
-//! to ensure RFC compliance and edge case handling.
+//! RFC 4475 — SIP Torture Test Messages.
+//!
+//! Driven from the byte-exact message corpus under `corpus/`. See
+//! `corpus_tests.rs` for the classification scheme and `corpus/ATTRIBUTION.md`
+//! for provenance.
 
-mod basic_tests;
-mod comprehensive_tests;
-mod malformed_tests;
-mod edge_cases;
-
+mod corpus_tests;

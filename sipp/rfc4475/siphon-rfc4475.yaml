@@ -1,0 +1,25 @@
+# Config for the RFC 4475 on-the-wire regression (scripts/rfc4475_test.sh).
+#
+# Deliberately plain: no security filters, no rate limiting, nothing that could
+# swallow a message for a reason other than the one under test. The only job of
+# this instance is to answer whatever reaches the script with a 200, so the
+# client can tell "accepted" from "refused with status N" from "dropped".
+#
+# The fixtures address the RFC 5737 / RFC 2606 documentation domains, so those
+# are declared local — otherwise a request could be turned away on a routing
+# decision before the validation path is exercised.
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "127.0.0.1"
+    - "0.0.0.0"
+    - "example.com"
+    - "example.net"
+    - "example.org"
+script:
+  path: "/etc/siphon/test_scripts/rfc4475_handler.py"
+log:
+  level: warn
+  format: pretty
