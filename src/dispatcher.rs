@@ -117,6 +117,13 @@ struct DispatcherState {
     transaction_manager: Arc<TransactionManager>,
     /// Timer wheel — keyed by a unique timer ID string.
     timer_wheel: Arc<DashMap<String, TimerEntry>>,
+    /// RFC 3261 §17.1 retransmission schedules for siphon-originated B2BUA
+    /// requests. The proxy datapath gets Timer A / Timer E from the client
+    /// transactions it registers; the B2BUA registers none (it owns its legs
+    /// and routes responses by branch), so without this every B-leg INVITE,
+    /// BYE and CANCEL left the socket exactly once and a single lost datagram
+    /// stalled the call until the answer-timeout sweep.
+    b2bua_retransmits: Arc<crate::b2bua::retransmit::B2buaRetransmits>,
     /// Proxy session store — links server transactions to client transactions.
     session_store: Arc<ProxySessionStore>,
     /// DNS resolver for SIP target resolution (RFC 3263).
@@ -656,6 +663,9 @@ pub async fn run(
         call_actors,
         transaction_manager,
         timer_wheel: Arc::new(DashMap::new()),
+        b2bua_retransmits: Arc::new(
+            crate::b2bua::retransmit::B2buaRetransmits::new(timer_config),
+        ),
         session_store: Arc::new(ProxySessionStore::new()),
         dns_resolver,
         hep_sender,
@@ -793,6 +803,7 @@ pub async fn run(
                 tokio::select! {
                     _ = timer_interval.tick() => {
                         fire_expired_timers(&state);
+                        sweep_b2bua_retransmits(&state);
                     }
                     _ = answer_timeout_interval.tick() => {
                         check_b2bua_answer_timeouts(&state);
@@ -1253,6 +1264,118 @@ fn clear_media_session_on_timeout(
             true
         }
         _ => false,
+    }
+}
+
+/// The local UDP socket [`send_to_target`] will egress from for `destination`,
+/// given the caller's own pin.
+///
+/// Mirrors that helper's UDP arm exactly — IPsec auto-source first (the kernel
+/// XFRM selector requires it), then the caller's pin — so anything that has to
+/// predict where a datagram will leave from (a retransmit schedule, a
+/// transaction timer entry) agrees with where it actually left from. Stream
+/// transports get `None`: they are reached over a live connection keyed by
+/// `connection_id`, and RFC 3261 §17.1.1.2/§17.1.2.2 do not retransmit on a
+/// reliable transport anyway.
+fn udp_egress_source(
+    transport: Transport,
+    destination: SocketAddr,
+    pin: Option<SocketAddr>,
+) -> Option<SocketAddr> {
+    match transport {
+        Transport::Udp => {
+            crate::script::api::ipsec::outbound_local_addr_for(destination).or(pin)
+        }
+        _ => None,
+    }
+}
+
+/// The local socket a relayed request will actually leave from, so the client
+/// transaction's Timer A / Timer E retransmits egress from the same place the
+/// first attempt did.
+///
+/// A retransmission that leaves a different socket is not a retransmission: on
+/// a multi-listener host the fallback is the *default* UDP channel — the first
+/// configured listener, typically the plain `:5060` — so a request relayed over
+/// an IPsec-protected flow would have its retries emitted outside the SA and
+/// silently dropped by the peer's kernel selector (3GPP TS 33.203 §7.4). The
+/// first send has resolved this correctly since flows shipped; the timer entry
+/// pinned `None` and quietly downgraded every retry.
+///
+/// A captured flow wins outright — that branch bypasses [`send_to_target`] and
+/// writes to `flow.local_addr` directly. Everything else defers to
+/// [`udp_egress_source`].
+fn client_retransmit_source(
+    outbound_transport: Transport,
+    destination: SocketAddr,
+    flow: Option<&crate::script::api::registrar::PyFlow>,
+    send_socket: Option<&crate::transport::SendSocket>,
+) -> Option<SocketAddr> {
+    if outbound_transport == Transport::Udp {
+        if let Some(flow) = flow {
+            return Some(flow.local_addr);
+        }
+    }
+    udp_egress_source(
+        outbound_transport,
+        destination,
+        send_socket.map(|pin| pin.addr),
+    )
+}
+
+/// Re-emit every siphon-originated B2BUA request whose RFC 3261 §17.1
+/// retransmit interval has elapsed, and reap the schedules that reached 64·T1.
+///
+/// Runs on the same 100 ms tick as [`fire_expired_timers`] and costs nothing
+/// when nothing is armed — entries exist only for requests still awaiting
+/// their first response.
+///
+/// Each retransmission goes back out through [`send_outbound_from`] with the
+/// **original** `source_local_addr`, so a flow-pinned B-leg's retransmit leaves
+/// the same protected socket the first attempt did. Falling back to the default
+/// listener here would put the retry outside the IPsec SA, which is precisely
+/// the failure this whole path exists to survive (3GPP TS 33.203 §7.4).
+fn sweep_b2bua_retransmits(state: &DispatcherState) {
+    use crate::b2bua::retransmit::Due;
+
+    // `due` walks every shard, so skip it outright on a proxy-only deployment
+    // or a B2BUA with nothing in flight — one relaxed atomic read per tick.
+    if !state.b2bua_retransmits.is_armed() {
+        return;
+    }
+
+    for event in state.b2bua_retransmits.due(std::time::Instant::now()) {
+        match event {
+            Due::Send { key, data, target, attempt } => {
+                debug!(
+                    branch = %key.branch,
+                    method = %key.method.as_str(),
+                    destination = %target.destination,
+                    source = ?target.source_local_addr,
+                    transport = %target.transport,
+                    attempt,
+                    size = data.len(),
+                    "B2BUA: retransmitting request (RFC 3261 §17.1)"
+                );
+                send_outbound_from(
+                    data,
+                    target.transport,
+                    target.destination,
+                    target.connection_id,
+                    target.source_local_addr,
+                    state,
+                );
+            }
+            Due::GaveUp { key, destination, attempts } => {
+                warn!(
+                    branch = %key.branch,
+                    method = %key.method.as_str(),
+                    %destination,
+                    attempts,
+                    "B2BUA: no response after 64*T1 — giving up on retransmitting request"
+                );
+            }
+        }
     }
 }
 
@@ -3541,6 +3664,12 @@ fn relay_request(
     // in) and is updated below for TCP/TLS once the connection is established.
     let txn_transport = crate::transaction::state::Transport::from(outbound_transport);
     let placeholder_connection_id = inbound.connection_id;
+    let retransmit_source = client_retransmit_source(
+        outbound_transport,
+        destination,
+        flow,
+        send_socket,
+    );
     let mut inserted_session_arc: Option<Arc<RwLock<ProxySession>>> = None;
     let client_key_opt = match state.transaction_manager.new_client_transaction(relayed, txn_transport) {
         Ok((client_key, actions)) => {
@@ -3554,9 +3683,7 @@ fn relay_request(
                         destination: Some(destination),
                         transport: Some(outbound_transport),
                         connection_id: Some(placeholder_connection_id),
-                        // Client transactions are outbound — no inbound
-                        // socket to pin.
-                        source_local_addr: None,
+                        source_local_addr: retransmit_source,
                     });
                 }
             }
@@ -3909,6 +4036,12 @@ fn relay_fork_branch(
     // connection is established.
     let txn_transport = crate::transaction::state::Transport::from(outbound_transport);
     let placeholder_connection_id = inbound.connection_id;
+    let retransmit_source = client_retransmit_source(
+        outbound_transport,
+        destination,
+        flow,
+        send_socket,
+    );
     let client_key_opt = match state.transaction_manager.new_client_transaction(relayed, txn_transport) {
         Ok((client_key, actions)) => {
             for action in &actions {
@@ -3921,9 +4054,7 @@ fn relay_fork_branch(
                         destination: Some(destination),
                         transport: Some(outbound_transport),
                         connection_id: Some(placeholder_connection_id),
-                        // Client transactions are outbound — no inbound
-                        // socket to pin.
-                        source_local_addr: None,
+                        source_local_addr: retransmit_source,
                     });
                 }
             }
@@ -3950,6 +4081,17 @@ fn relay_fork_branch(
     // — mirrors the relay(flow=...) path) when one is attached, else via the
     // normal resolver/pool path.
     let connection_id = if let Some(flow) = flow {
+        // This branch bypasses `send_to_target`, so it has to do that helper's
+        // HEP capture itself — otherwise a flow-pinned relay is the one request
+        // that never reaches Homer.
+        if let Some(ref hep) = state.hep_sender {
+            hep.capture_outbound(
+                state.hep_local_addr(flow.local_addr, outbound_transport),
+                destination,
+                outbound_transport,
+                &data,
+            );
+        }
         let outbound_message = OutboundMessage {
             followups: None,
             connection_id: ConnectionId(flow.connection_id),
@@ -4013,6 +4155,23 @@ fn handle_response(
     status_code: u16,
     state: &DispatcherState,
 ) {
+    // RFC 3261 §17.1.1.2 / §17.1.2.2: the first response on a branch ends
+    // retransmission of the request that provoked it — a provisional moves an
+    // INVITE client transaction Calling -> Proceeding and cancels Timer A, and
+    // any final ends the transaction.
+    //
+    // The B2BUA runs its own schedule (it registers no client transaction), so
+    // it needs its own cancel, and it has to happen *here*: several responses
+    // never reach `handle_b2bua_response` — a 100 Trying is absorbed below
+    // (§16.7 step 3), a 2xx for an already-cancelled call is diverted to the
+    // zombie path — and a leg that kept retransmitting behind a peer which
+    // already holds the request is exactly the spurious duplicate that trips
+    // merged-request detection (482).
+    //
+    // Keyed on the CSeq method so a CANCEL's own response does not stop the
+    // INVITE it shares a branch with (§9.1). Non-B2BUA responses simply miss.
+    disarm_b2bua_retransmit_for_response(&message, state);
+
     // Check if this response matches a UAC request (keepalive, health probe)
     if state.uac_sender.match_response(&message) {
         debug!(status_code = status_code, "UAC response matched");
@@ -4129,8 +4288,9 @@ fn handle_response(
     // Timer E for NICT), then absorb without forwarding.
     //
     // For a B2BUA leg there is no client transaction registered under this key
-    // (the B2BUA manages its own legs and does not arm Timer A here), so
-    // process_client_event returns Err and this is a harmless no-op.
+    // (the B2BUA manages its own legs and drives its own retransmit schedule
+    // instead — see `b2bua_retransmits` below), so process_client_event returns
+    // Err and that part is a harmless no-op.
     if status_code == 100 {
         // Drive only the INVITE client transaction (cancel Timer A). A
         // non-INVITE client transaction (NICT) treats a provisional as a
@@ -7634,6 +7794,17 @@ fn send_b2bua_to_bleg(
         Transport::Udp => source_local_addr,
         _ => None,
     };
+    // The schedule has to record the socket the datagram will *actually* leave
+    // from, which for an IPsec destination is the auto-source `send_to_target`
+    // resolves rather than the pin handed in here.
+    arm_b2bua_retransmit(
+        &message,
+        &data,
+        transport,
+        destination,
+        udp_egress_source(transport, destination, send_source),
+        state,
+    );
     send_to_target(
         data,
         &target,
@@ -7642,6 +7813,113 @@ fn send_b2bua_to_bleg(
         send_source,
         state,
     );
+}
+
+/// Arm an RFC 3261 §17.1 retransmit schedule for a siphon-originated B2BUA
+/// request, keyed on its own topmost Via branch.
+///
+/// Only requests qualify, and only those that expect a response:
+///
+/// * **Responses** also travel through [`send_b2bua_to_bleg`] (the B2BUA relays
+///   the far leg's provisionals and finals through it). Response
+///   retransmission belongs to the server transaction, never here.
+/// * **ACK** is excluded by RFC 3261 §17.1.1.3: an ACK for a non-2xx final is
+///   re-emitted only in answer to a retransmitted final, and the 2xx ACK is
+///   re-emitted by the TU when the 2xx is retransmitted (which
+///   [`crate::b2bua::actor::CallActorStore`] already drives). Putting ACK on a
+///   timer would flood the peer.
+///
+/// A message with no parseable Via branch cannot be correlated to its response,
+/// so it is left unarmed rather than retransmitted blindly.
+fn arm_b2bua_retransmit(
+    message: &SipMessage,
+    data: &Bytes,
+    transport: Transport,
+    destination: SocketAddr,
+    source_local_addr: Option<SocketAddr>,
+    state: &DispatcherState,
+) {
+    let method = match message.method() {
+        Some(method) if *method != crate::sip::message::Method::Ack => method.clone(),
+        // A response, or an ACK — see the doc comment.
+        _ => return,
+    };
+
+    let branch = match message
+        .headers
+        .get("Via")
+        .and_then(|raw| Via::parse_multi(raw).ok())
+        .and_then(|vias| vias.first().and_then(|via| via.branch.clone()))
+    {
+        Some(branch) => branch,
+        None => return,
+    };
+
+    // RFC 3261 §9.1: a CANCEL abandons the INVITE it shares a branch with, so
+    // stop retransmitting that INVITE the moment we cancel it. Doing this here
+    // covers every site that emits a CANCEL (answer timeout, LCR ring timeout,
+    // upstream CANCEL relay, deferred CANCEL drain) from one place.
+    if method == crate::sip::message::Method::Cancel {
+        state.b2bua_retransmits.disarm(
+            &crate::b2bua::retransmit::RetransmitKey::new(
+                branch.clone(),
+                crate::sip::message::Method::Invite,
+            ),
+        );
+    }
+
+    state.b2bua_retransmits.arm(
+        crate::b2bua::retransmit::RetransmitKey::new(branch, method),
+        data.clone(),
+        crate::b2bua::retransmit::RetransmitTarget {
+            destination,
+            transport,
+            // Schedules exist for UDP only (`B2buaRetransmits::arm` refuses
+            // reliable transports), and UDP egress selects its socket from
+            // `source_local_addr`, never from the connection id.
+            connection_id: ConnectionId::default(),
+            source_local_addr,
+        },
+        std::time::Instant::now(),
+    );
+}
+
+/// Cancel the retransmit schedule of the request this response answers.
+///
+/// Reads the branch off the topmost Via and the method off CSeq — the response
+/// echoes both, per RFC 3261 §8.2.6.2 — so a CANCEL's 200 stops the CANCEL and
+/// leaves the INVITE it shares a branch with alone (§9.1). Called for every
+/// inbound response; one that belongs to no B2BUA leg simply misses.
+fn disarm_b2bua_retransmit_for_response(message: &SipMessage, state: &DispatcherState) {
+    // This runs on every inbound response, including the entire proxy datapath
+    // where nothing is ever armed. Bail on one relaxed atomic read before
+    // building a key — that would otherwise cost a String clone and a shard
+    // lock per message at full CPS.
+    if !state.b2bua_retransmits.is_armed() {
+        return;
+    }
+
+    let branch = match message
+        .headers
+        .get("Via")
+        .and_then(|raw| Via::parse_multi(raw).ok())
+        .and_then(|vias| vias.first().and_then(|via| via.branch.clone()))
+    {
+        Some(branch) => branch,
+        None => return,
+    };
+    let method = match message
+        .headers
+        .get("CSeq")
+        .and_then(|raw| crate::sip::headers::cseq::CSeq::parse(raw).ok())
+    {
+        Some(cseq) => cseq.method,
+        None => return,
+    };
+
+    state
+        .b2bua_retransmits
+        .disarm(&crate::b2bua::retransmit::RetransmitKey::new(branch, method));
 }
 
 /// Create Rust-backed auth, registrar, log, and proxy utility singletons
@@ -9899,6 +10177,12 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
                 }
                 let mut targets: Vec<(SipMessage, Transport, SocketAddr, Option<SocketAddr>)> = Vec::new();
                 for b_leg in &call.b_legs {
+                    // We are giving up on this call, so stop retransmitting the
+                    // request that never drew a response. The CANCEL emitted
+                    // below covers the legs whose INVITE was stashed; this also
+                    // catches a leg whose stash never landed, which would
+                    // otherwise keep retransmitting until 64*T1.
+                    state.b2bua_retransmits.disarm_branch(&b_leg.branch);
                     if let Some(invite_arc) = b_leg.b_leg_invite.as_ref() {
                         if let Ok(invite) = invite_arc.lock() {
                             if let Some(cancel_msg) = build_cancel_from_invite(&invite) {
@@ -11054,7 +11338,44 @@ fn b2bua_send_b_leg_invite(
     // Send: over the captured flow (direct OutboundMessage, bypassing DNS/pool —
     // mirrors the proxy relay(flow=...) path) when one is attached, else via the
     // resolver/pool path.
+    //
+    // Either way the INVITE gets an RFC 3261 §17.1.1.2 Timer A schedule first
+    // (UDP only). Without it this INVITE left the socket exactly once: one lost
+    // datagram — the first packet after an idle gap, or one dropped across an
+    // IPsec re-key — meant total silence until the 30 s answer timeout
+    // synthesised a 408, with the next call seconds later succeeding.
+    arm_b2bua_retransmit(
+        &b_leg_invite,
+        &data,
+        outbound_transport,
+        destination,
+        client_retransmit_source(outbound_transport, destination, flow, send_socket),
+        state,
+    );
+
     if let Some(flow) = flow {
+        // This branch bypasses `send_to_target`/`send_outbound_from`, so it has
+        // to do their HEP capture itself — otherwise a flow-pinned B-leg INVITE
+        // is the one request that never reaches Homer.
+        if let Some(ref hep) = state.hep_sender {
+            hep.capture_outbound(
+                state.hep_local_addr(flow.local_addr, outbound_transport),
+                destination,
+                outbound_transport,
+                &data,
+            );
+        }
+        // ...and log the send. Nothing on this path logged before, so an absent
+        // "sending message" line was never evidence the INVITE had not been
+        // handed to the transport — it simply was never logged.
+        debug!(
+            call_id = %call_id,
+            destination = %destination,
+            source = %flow.local_addr,
+            transport = %outbound_transport,
+            size = data.len(),
+            "B2BUA: sending B-leg INVITE over captured flow"
+        );
         let outbound_message = OutboundMessage {
             followups: None,
             connection_id: ConnectionId(flow.connection_id),

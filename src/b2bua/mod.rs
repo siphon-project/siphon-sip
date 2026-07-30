@@ -11,8 +11,13 @@
 //! - [`transfer`]: REFER/Replaces call transfer handling.
 //! - [`header_policy`]: Versioned per-call header policy (which headers
 //!   cross the trust boundary, which are stripped, rewritten, or translated).
+//! - [`retransmit`]: RFC 3261 §17.1 retransmission schedules for
+//!   siphon-originated requests (the B2BUA owns its legs and registers no
+//!   client transaction, so it gets no Timer A / Timer E from the
+//!   transaction layer).
 
 pub mod actor;
 pub mod fork;
 pub mod header_policy;
+pub mod retransmit;
 pub mod transfer;
