@@ -1,0 +1,1 @@
+tests/rfc4475/corpus/*.dat -text -diff

@@ -113,6 +113,37 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   people away from a working path. The same page's "media profiles are identical
   across backends" statement is now qualified with the per-engine capability
   table.
+### Fixed
+- **SIP parser: four RFC 3261 grammar defects, found by importing the RFC 4475
+  torture corpus.** All four are on the receive path used for every inbound
+  datagram, so each one meant dropping a message that the RFC requires an
+  element to accept and answer:
+  - **Whitespace before `HCOLON`.** RFC 3261 §25.1 defines
+    `HCOLON = *( SP / HTAB ) ":" SWS`, so `To :` and `Via  :` are legal. The
+    header parser required the colon to follow the name immediately and
+    rejected the whole message.
+  - **`extension-method` token charset.** `extension-method = token`, which
+    admits `! % * _ + ` ' ~` alongside alphanumerics, `-` and `.`. Only the
+    latter three were accepted, so an unknown method could not be parsed and
+    therefore could not be answered with a 501.
+  - **Extension-method case.** RFC 3261 §7.1 makes the method case-sensitive.
+    Unknown methods were uppercased on parse, so the CSeq no longer echoed the
+    Request-Line and the peer saw a method mismatch.
+  - **`absoluteURI` Request-URI.** `Request-URI = SIP-URI / SIPS-URI /
+    absoluteURI`. A Request-URI in an unknown or atypical scheme
+    (`nobodyKnowsThisScheme:...`, `soap.beep://...`) is syntactically valid and
+    §8.2.2 requires a 416 Unsupported URI Scheme — which could not be sent,
+    because the message failed to parse first.
+
+### Changed
+- **RFC 4475 tests now run against the byte-exact message corpus.** The 50
+  torture messages from RFC 4475 §3 are vendored under `tests/rfc4475/corpus/`
+  and driven from a table classified by RFC section, replacing hand-transcribed
+  approximations that could not preserve the whitespace, folding and escaping
+  the messages exist to test. Fixtures the parser still handles contrary to the
+  RFC are enumerated in a `KNOWN_DEVIATIONS` list that fails both on a new
+  deviation and on a stale entry, so the remaining gap is explicit and cannot
+  drift.
 
 ## [1.5.1] — 2026-07-29
 

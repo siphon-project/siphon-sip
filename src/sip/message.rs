@@ -62,7 +62,12 @@ impl Method {
             "REFER" => Method::Refer,
             "MESSAGE" => Method::Message,
             "PUBLISH" => Method::Publish,
-            s => Method::Extension(s.to_string()),
+            // RFC 3261 §7.1: the method is case-sensitive. The known methods
+            // are matched case-insensitively for robustness on receive, but an
+            // extension method MUST keep the case it arrived in — `Foo` and
+            // `FOO` are different methods, and CSeq has to echo the
+            // Request-Line exactly or the peer sees a method mismatch.
+            _ => Method::Extension(s.to_string()),
         }
     }
 }

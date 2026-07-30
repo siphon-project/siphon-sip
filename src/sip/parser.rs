@@ -95,7 +95,17 @@ fn parse_start_line(input: &str) -> IResult<&str, StartLine> {
 
 /// Parse request line: METHOD SP Request-URI SP SIP-Version CRLF
 fn parse_request_line(input: &str) -> IResult<&str, RequestLine> {
-    let (input, method_str) = take_while1(|c: char| c.is_alphanumeric() || matches!(c, '-' | '.'))(input)?;
+    // RFC 3261 §25.1: Method = INVITEm / ACKm / ... / extension-method, where
+    // extension-method = token, and
+    //   token = 1*( alphanum / "-" / "." / "!" / "%" / "*" / "_" / "+" / "`"
+    //               / "'" / "~" )
+    // An unknown method is not a parse error — it is a 501 from the element,
+    // which cannot be sent if the message never parses. Note that "%" in a
+    // method name is a literal token character, not an escape (RFC 4475
+    // §3.1.1.5: "RE%47IST%45R" is an unknown method, NOT a REGISTER).
+    let (input, method_str) = take_while1(|c: char| {
+        c.is_alphanumeric() || matches!(c, '-' | '.' | '!' | '%' | '*' | '_' | '+' | '`' | '\'' | '~')
+    })(input)?;
     let method = Method::from_str(method_str);
 
     let (input, _) = space1(input)?;
@@ -153,6 +163,16 @@ fn parse_uri(input: &str) -> IResult<&str, SipUri> {
     // tel: URIs (RFC 3966) — common in IMS
     if let Some(rest) = input.strip_prefix("tel:") {
         return parse_tel_uri(rest);
+    }
+
+    // RFC 3261 §25.1: Request-URI = SIP-URI / SIPS-URI / absoluteURI. A URI in
+    // some other scheme is syntactically well-formed, and §8.2.2 requires the
+    // element to answer 416 Unsupported URI Scheme — a response it cannot send
+    // if the message as a whole fails to parse. RFC 4475 §3.3.2
+    // ("nobodyKnowsThisScheme:...") and §3.3.3 ("soap.beep://...") cover both
+    // the opaque and the hierarchical shape.
+    if !input.starts_with("sip:") && !input.starts_with("sips:") {
+        return parse_absolute_uri(input);
     }
 
     let (input, scheme) = alt((tag("sip:"), tag("sips:"))).parse(input)?;
@@ -266,6 +286,66 @@ fn parse_tel_uri(input: &str) -> IResult<&str, SipUri> {
     }))
 }
 
+/// Parse a non-SIP `absoluteURI` — a scheme and an opaque remainder.
+///
+/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` (RFC 3986 §3.1). The
+/// remainder is kept verbatim in [`SipUri::host`] so the URI re-serialises
+/// byte-for-byte. A trailing `:port` is split out because the URI formatter
+/// reads a colon in the host as an IPv6 literal and would bracket it.
+///
+/// This is deliberately shallow: siphon does not route on a scheme it does not
+/// implement, and all the caller needs is a parse good enough to build the 416.
+fn parse_absolute_uri(input: &str) -> IResult<&str, SipUri> {
+    let error = |kind| nom::Err::Error(nom::error::Error::new(input, kind));
+
+    let scheme_len = input
+        .find(':')
+        .filter(|&pos| pos > 0)
+        .ok_or_else(|| error(nom::error::ErrorKind::Char))?;
+    let scheme = &input[..scheme_len];
+
+    let mut scheme_chars = scheme.chars();
+    let scheme_is_valid = scheme_chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme_chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    if !scheme_is_valid {
+        return Err(error(nom::error::ErrorKind::Tag));
+    }
+
+    // The opaque part runs to whatever ends a URI in context: the SP before
+    // SIP-Version, CRLF, or the '>' closing a name-addr.
+    let rest = &input[scheme_len + 1..];
+    let end = rest
+        .find([' ', '\t', '\r', '\n', '>', ','])
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return Err(error(nom::error::ErrorKind::TakeWhile1));
+    }
+    let opaque = &rest[..end];
+
+    let (host, port) = match opaque.rsplit_once(':') {
+        Some((head, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => {
+            match tail.parse::<u16>() {
+                Ok(port) => (head, Some(port)),
+                Err(_) => (opaque, None),
+            }
+        }
+        _ => (opaque, None),
+    };
+
+    Ok((
+        &rest[end..],
+        SipUri {
+            scheme: scheme.to_string(),
+            user: None,
+            host: host.to_string(),
+            port,
+            params: Vec::new(),
+            headers: Vec::new(),
+            user_params: Vec::new(),
+        },
+    ))
+}
+
 /// Parse URI parameters: ;param=value;param2
 fn parse_uri_params(input: &str) -> IResult<&str, Vec<(String, Option<String>)>> {
     many0(preceded(
@@ -345,6 +425,10 @@ fn parse_header_line(input: &str) -> IResult<&str, (String, String)> {
 
     // Parse header name
     let (input, name) = take_while1(|c: char| !matches!(c, ':' | '\r' | '\n' | ' ' | '\t'))(input)?;
+    // RFC 3261 §25.1: HCOLON = *( SP / HTAB ) ":" SWS. Whitespace between the
+    // header name and its colon is legal and appears in the wild — RFC 4475
+    // §3.1.1.1 ("TO :") and §3.1.1.7 ("v :", "Via  :") both exercise it.
+    let (input, _) = take_while(|c: char| matches!(c, ' ' | '\t'))(input)?;
     let (input, _) = char(':')(input)?;
     let (input, _) = multispace0(input)?;
 
@@ -621,5 +705,107 @@ mod tests {
         assert_eq!(uri.host, "example.com");
         assert!(uri.user_params.is_empty());
         assert!(uri.params.iter().any(|(n, _)| n == "transport"));
+    }
+
+    /// RFC 3261 §25.1: `HCOLON = *( SP / HTAB ) ":" SWS`.
+    #[test]
+    fn header_name_may_be_separated_from_its_colon_by_whitespace() {
+        let raw = concat!(
+            "OPTIONS sip:user@example.com SIP/2.0\r\n",
+            "To : <sip:user@example.com>\r\n",
+            "From\t: <sip:caller@example.net>;tag=1\r\n",
+            "Via  : SIP/2.0/UDP host.example.com;branch=z9hG4bK1\r\n",
+            "Call-ID: hcolon.ws@example.com\r\n",
+            "CSeq: 1 OPTIONS\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        let (_, message) = parse_sip_message(raw).expect("whitespace before HCOLON is legal");
+        assert_eq!(
+            message.headers.get("Call-ID"),
+            Some("hcolon.ws@example.com".to_string()).as_ref()
+        );
+        assert!(message.headers.get("To").is_some(), "`To :` should parse");
+        assert!(message.headers.get("From").is_some(), "`From\\t:` should parse");
+        assert!(message.headers.get("Via").is_some(), "`Via  :` should parse");
+    }
+
+    /// RFC 3261 §25.1: `extension-method = token`, and `token` admits
+    /// `alphanum / "-" / "." / "!" / "%" / "*" / "_" / "+" / "`" / "'" / "~"`.
+    #[test]
+    fn extension_method_accepts_the_full_token_charset() {
+        for method in [
+            "!interesting-Method0123456789_*+`.%indeed'~",
+            "RE%47IST%45R",
+            "PROCEED~ing",
+        ] {
+            let raw = format!(
+                "{method} sip:user@example.com SIP/2.0\r\n\
+                 Via: SIP/2.0/UDP host.example.com;branch=z9hG4bK1\r\n\
+                 Call-ID: token.method@example.com\r\n\
+                 CSeq: 1 {method}\r\n\
+                 Content-Length: 0\r\n\
+                 \r\n"
+            );
+            let (_, message) =
+                parse_sip_message(&raw).unwrap_or_else(|_| panic!("`{method}` is a valid token"));
+            let StartLine::Request(request) = &message.start_line else {
+                panic!("`{method}` should parse as a request");
+            };
+            assert_eq!(request.method.as_str(), method);
+        }
+    }
+
+    /// RFC 3261 §25.1: `Request-URI = SIP-URI / SIPS-URI / absoluteURI`. An
+    /// unsupported scheme is a 416 from the element (§8.2.2), which cannot be
+    /// sent at all if the message fails to parse.
+    #[test]
+    fn request_uri_accepts_a_non_sip_absolute_uri() {
+        for (raw_uri, scheme, host, port) in [
+            (
+                "nobodyKnowsThisScheme:totallyopaquecontent",
+                "nobodyKnowsThisScheme",
+                "totallyopaquecontent",
+                None,
+            ),
+            (
+                "soap.beep://192.0.2.103:3002",
+                "soap.beep",
+                "//192.0.2.103",
+                Some(3002),
+            ),
+        ] {
+            let raw = format!(
+                "OPTIONS {raw_uri} SIP/2.0\r\n\
+                 Via: SIP/2.0/TCP host9.example.com;branch=z9hG4bK1\r\n\
+                 Call-ID: absoluteuri@example.com\r\n\
+                 CSeq: 1 OPTIONS\r\n\
+                 Content-Length: 0\r\n\
+                 \r\n"
+            );
+            let (_, message) =
+                parse_sip_message(&raw).unwrap_or_else(|_| panic!("`{raw_uri}` should parse"));
+            let StartLine::Request(request) = &message.start_line else {
+                panic!("`{raw_uri}` should parse as a request");
+            };
+            assert_eq!(request.request_uri.scheme, scheme);
+            assert_eq!(request.request_uri.host, host);
+            assert_eq!(request.request_uri.port, port);
+            // Must survive re-serialisation unchanged, or a proxy would corrupt
+            // the Request-URI while forwarding the 416.
+            assert_eq!(request.request_uri.to_string(), raw_uri);
+        }
+    }
+
+    /// The absoluteURI fallback must not swallow genuine rubbish — a scheme has
+    /// to look like one (`ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )`).
+    #[test]
+    fn absolute_uri_fallback_rejects_a_malformed_scheme() {
+        for bad in ["1nvalid:content", ":noscheme", "has space:content", "nocolon"] {
+            assert!(
+                parse_uri_standalone(bad).is_err(),
+                "`{bad}` is not a valid absoluteURI and must not parse"
+            );
+        }
     }
 }
