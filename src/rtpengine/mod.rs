@@ -22,7 +22,7 @@ pub mod siphon_rtp;
 pub use backend::MediaBackend;
 pub use client::{RtpEngineClient, RtpEngineSet};
 pub use error::RtpEngineError;
-pub use profile::{NgFlags, ProfileEntry, ProfileRegistry};
+pub use profile::{NgFlags, ProfileEntry, ProfileRegistry, WsTeeDirection};
 pub use rtpproxy::{RtpProxyClient, RtpProxyClientSet};
 pub use session::{MediaSession, MediaSessionStore};
 pub use siphon_rtp::{SiphonRtpClient, SiphonRtpClientSet};

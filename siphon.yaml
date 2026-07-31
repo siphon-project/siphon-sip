@@ -673,6 +673,27 @@ auth:
 #                       higher is less sensitive.
 #   ws_vad_hangover_ms  How long speech is held after energy drops before the
 #                       turn endpoint fires. Unset uses the engine's ~200 ms.
+#   ws_tee              Stream a COPY of this call's decoded audio to a WebSocket
+#                       media server. Not the same thing as ws_uri, and the
+#                       difference matters: ws_uri is a TAKEOVER (the WS server
+#                       becomes leg A's far side, A<->B is not wired), a tee is
+#                       SEND-ONLY and ADDITIVE (the call relays or transcodes
+#                       normally and a copy goes out, so any SIPREC fork and
+#                       recording on the leg keep running). Use it for live
+#                       transcription / agent assist / compliance on an otherwise
+#                       ordinary call. Same ws:// | wss:// rule and same
+#                       {call_id}/{from_tag}/{from_user}/{to_user} expansion as
+#                       ws_uri. A script can attach or detach one mid-call with
+#                       rtpengine.attach_ws_tee(...) / detach_ws_tee(...), and
+#                       learn when one dies via @rtpengine.on_ws_tee_ended.
+#   ws_tee_direction    Which leg(s) ws_tee streams: both (default) | caller
+#                       (the offerer) | callee (the answerer). Inert without
+#                       ws_tee.
+#   ws_tee_channels     Wire channels for ws_tee: 2 interleaves caller/callee as
+#                       stereo, 1 mixes them to mono. Only meaningful with
+#                       ws_tee_direction: both — a single-leg tee is always mono.
+#                       Unset uses the engine default (2 for both legs, 1 for
+#                       one). Inert without ws_tee.
 #   noise_suppression   Single-channel noise suppression on this leg's decoded
 #                       ingress audio. Engaged only on a userspace-transcoded leg
 #                       whose ingress codec runs at 8 or 16 kHz, and forces the
@@ -702,6 +723,21 @@ auth:
 #         noise_suppression: true
 #         echo_cancellation: true
 #       answer: *voice_ai_flags
+#
+# WebSocket tee — an ordinary relayed call, plus a copy of its audio streamed to
+# a transcription/analytics backend (the call keeps relaying; SIPREC unaffected):
+# media:
+#   backend: siphon-rtp
+#   siphon_rtp:
+#     address: "127.0.0.1:9000"
+#   profiles:
+#     recorded_call:
+#       offer: &tee_flags
+#         replace: ["origin"]
+#         ws_tee: "wss://asr.example.com/stream/{call_id}"
+#         ws_tee_direction: both        # both | caller | callee
+#         ws_tee_channels: 2            # 2 = caller/callee stereo, 1 = mixed mono
+#       answer: *tee_flags
 #
 # IPv4/IPv6 interworking — v6 access leg, v4 core:
 # media:

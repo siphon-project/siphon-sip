@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use siphon::rtpengine::profile::NgFlags;
+use siphon::rtpengine::profile::{NgFlags, WsTeeDirection};
 use siphon::rtpengine::{MediaBackend, RtpEngineSet, SiphonRtpClient, SiphonRtpClientSet};
 use siphon::sip::parser::parse_sip_message;
 
@@ -129,6 +129,222 @@ async fn media_backend_siphon_rtp_offer_rewrites_sdp() {
     assert!(rewritten.contains("30000"));
 
     backend.delete(call_id, "alice-tag").await.unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket tee — wire shape
+//
+// These assert the *exact JSON* siphon puts on the control socket, not a
+// decode/re-encode round-trip: the fake server hands back the raw frame body
+// (`frame::HEADER_LEN` is a 4-byte big-endian length prefix, so the JSON is
+// `buffer[4..consumed]`). A round-trip through the same serde impls would hide
+// a field siphon failed to carry, which is precisely the class of bug the
+// exhaustive `profile_flags_from_ng` exists to catch.
+// ---------------------------------------------------------------------------
+
+/// Spawn a fake control server that records the raw JSON body of every request
+/// it receives and answers everything `Ok`. Returns the bound address plus the
+/// receiver of recorded bodies.
+async fn spawn_recording_siphon_rtp() -> (std::net::SocketAddr, mpsc::UnboundedReceiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (record_tx, record_rx) = mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+            let record_tx = record_tx.clone();
+            tokio::spawn(async move {
+                let mut buffer: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    while let Some((request, consumed)) =
+                        frame::decode::<Request>(&buffer).expect("decode request")
+                    {
+                        // The raw JSON exactly as siphon serialised it.
+                        let body =
+                            String::from_utf8(buffer[frame::HEADER_LEN..consumed].to_vec())
+                                .expect("request body is utf-8");
+                        buffer.drain(..consumed);
+                        let _ = record_tx.send(body);
+
+                        let result = match request.command {
+                            Command::Offer { .. } | Command::Answer { .. } => CmdResult::Ok {
+                                sdp: Some(
+                                    "v=0\r\no=- 0 0 IN IP4 203.0.113.1\r\ns=-\r\nc=IN IP4 203.0.113.1\r\nt=0 0\r\nm=audio 30000 RTP/AVP 0\r\n"
+                                        .to_string(),
+                                ),
+                                duration_ms: None,
+                                to_tag: None,
+                                stats: None,
+                                play_id: None,
+                            },
+                            Command::Ping => CmdResult::Pong,
+                            _ => CmdResult::Ok {
+                                sdp: None,
+                                duration_ms: None,
+                                to_tag: None,
+                                stats: None,
+                                play_id: None,
+                            },
+                        };
+                        let response = Response {
+                            id: request.id,
+                            result,
+                        };
+                        let bytes = frame::encode(&response).expect("encode response");
+                        if stream.write_all(&bytes).await.is_err() {
+                            return;
+                        }
+                    }
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                    }
+                }
+            });
+        }
+    });
+
+    (address, record_rx)
+}
+
+/// Build a `MediaBackend::SiphonRtp` pointed at `address`.
+fn siphon_rtp_backend(address: std::net::SocketAddr) -> MediaBackend {
+    let (event_tx, _event_rx) = mpsc::channel(16);
+    let set = SiphonRtpClientSet::new(vec![(address, 2000, 1)], None, 5_000, event_tx).unwrap();
+    MediaBackend::SiphonRtp(set)
+}
+
+#[tokio::test]
+async fn attach_ws_tee_emits_the_documented_wire_shape() {
+    let (address, mut records) = spawn_recording_siphon_rtp().await;
+    let backend = siphon_rtp_backend(address);
+    backend.ping().await.unwrap();
+    records.recv().await.expect("ping recorded");
+
+    // `channels` carries skip_serializing_if and drops out when unset;
+    // `direction` does not, so the engine always receives an explicit leg
+    // selection rather than relying on its own default.
+    backend
+        .attach_ws_tee("c", "f", "ws://h/s", WsTeeDirection::Both, None)
+        .await
+        .unwrap();
+    let body = records.recv().await.expect("attach recorded");
+    assert_eq!(
+        body,
+        r#"{"id":2,"command":"attach_ws_tee","call_id":"c","from_tag":"f","ws_uri":"ws://h/s","direction":"both"}"#,
+        "attach_ws_tee wire shape drifted"
+    );
+
+    // Explicit non-default direction + channels are carried verbatim.
+    backend
+        .attach_ws_tee("c", "f", "wss://h/s", WsTeeDirection::Caller, Some(1))
+        .await
+        .unwrap();
+    let body = records.recv().await.expect("explicit attach recorded");
+    assert_eq!(
+        body,
+        r#"{"id":3,"command":"attach_ws_tee","call_id":"c","from_tag":"f","ws_uri":"wss://h/s","direction":"caller","channels":1}"#,
+        "attach_ws_tee did not carry direction/channels"
+    );
+}
+
+#[tokio::test]
+async fn detach_ws_tee_emits_the_documented_wire_shape() {
+    let (address, mut records) = spawn_recording_siphon_rtp().await;
+    let backend = siphon_rtp_backend(address);
+    backend.ping().await.unwrap();
+    records.recv().await.expect("ping recorded");
+
+    backend.detach_ws_tee("c", "f").await.unwrap();
+    let body = records.recv().await.expect("detach recorded");
+    assert_eq!(
+        body,
+        r#"{"id":2,"command":"detach_ws_tee","call_id":"c","from_tag":"f"}"#,
+        "detach_ws_tee wire shape drifted"
+    );
+}
+
+#[tokio::test]
+async fn offer_without_ws_tee_carries_no_tee_keys() {
+    // No wire drift for existing deployments: a profile that does not ask for a
+    // tee must emit exactly what it emitted before the tee fields existed.
+    let (address, mut records) = spawn_recording_siphon_rtp().await;
+    let backend = siphon_rtp_backend(address);
+    backend.ping().await.unwrap();
+    records.recv().await.expect("ping recorded");
+
+    backend
+        .offer("call-1", "tag-a", SMOKE_SDP, &NgFlags::default())
+        .await
+        .unwrap();
+    let body = records.recv().await.expect("offer recorded");
+    for key in ["ws_tee", "ws_tee_direction", "ws_tee_channels"] {
+        assert!(
+            !body.contains(key),
+            "default profile leaked {key} onto the wire: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn offer_with_ws_tee_profile_carries_it_to_the_engine() {
+    // The declarative path: a media profile carrying ws_tee reaches the engine
+    // on offer, without a second round-trip.
+    let (address, mut records) = spawn_recording_siphon_rtp().await;
+    let backend = siphon_rtp_backend(address);
+    backend.ping().await.unwrap();
+    records.recv().await.expect("ping recorded");
+
+    let flags = NgFlags {
+        ws_tee: Some("wss://asr.example/stream".to_string()),
+        ws_tee_direction: Some(WsTeeDirection::Callee),
+        ws_tee_channels: Some(1),
+        ..NgFlags::default()
+    };
+    backend.offer("call-2", "tag-a", SMOKE_SDP, &flags).await.unwrap();
+    let body = records.recv().await.expect("offer recorded");
+    assert!(
+        body.contains(r#""ws_tee":"wss://asr.example/stream""#),
+        "ws_tee missing from offer: {body}"
+    );
+    assert!(
+        body.contains(r#""ws_tee_direction":"callee""#),
+        "ws_tee_direction missing from offer: {body}"
+    );
+    assert!(
+        body.contains(r#""ws_tee_channels":1"#),
+        "ws_tee_channels missing from offer: {body}"
+    );
+}
+
+#[tokio::test]
+async fn ws_tee_is_rejected_by_backends_that_cannot_stream() {
+    // A hollow Ok here would read as "the tee is attached" while no audio ever
+    // reaches the consumer. The rtpengine backend must say so instead.
+    let ng: SocketAddr = "127.0.0.1:22239".parse().unwrap();
+    let backend =
+        MediaBackend::RtpEngine(RtpEngineSet::new(vec![(ng, 500, 1)]).await.unwrap().into());
+
+    let error = backend
+        .attach_ws_tee("c", "f", "ws://h/s", WsTeeDirection::Both, None)
+        .await
+        .expect_err("rtpengine cannot stream a websocket tee");
+    let text = error.to_string();
+    assert!(text.contains("attach_ws_tee"), "error must name the operation: {text}");
+    assert!(text.contains("rtpengine"), "error must name the backend: {text}");
+    // Never mistaken for "the call is already gone".
+    assert!(!error.is_call_not_found());
+
+    let error = backend
+        .detach_ws_tee("c", "f")
+        .await
+        .expect_err("rtpengine cannot detach a websocket tee");
+    assert!(error.to_string().contains("detach_ws_tee"));
 }
 
 #[tokio::test]

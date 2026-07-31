@@ -415,6 +415,12 @@ class _RtpEngineNamespace:
     async def unsubscribe(self, call_id, from_tag, to_tag):
         raise NotImplementedError("rtpengine.unsubscribe() not available — no media.rtpengine in config")
 
+    async def attach_ws_tee(self, target, ws_uri, direction="both", channels=None):
+        raise NotImplementedError("rtpengine.attach_ws_tee() not available — no media.rtpengine in config")
+
+    async def detach_ws_tee(self, target):
+        raise NotImplementedError("rtpengine.detach_ws_tee() not available — no media.rtpengine in config")
+
     def on_dtmf(self, func_or_none=None, *, call_id=None, from_tag=None):
         """Register a handler for inbound DTMF events from rtpengine.
 
@@ -456,6 +462,55 @@ class _RtpEngineNamespace:
             is_async = _asyncio.iscoroutinefunction(fn)
             metadata = {"call_id": call_id, "from_tag": from_tag}
             _registry.register("rtpengine.on_media_timeout", None, fn, is_async, metadata)
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def on_ws_tee_started(self, func_or_none=None, *, call_id=None, from_tag=None):
+        """Register a handler for WebSocket tee started events.
+
+        Fires once the engine has dialled the tee's server and audio is
+        flowing; ``stream_id`` correlates this event with the media stream.
+
+        Usage:
+            @rtpengine.on_ws_tee_started
+            def handle_any(call_id, from_tag, stream_id, ws_uri, direction, channels, sample_rate):
+                ...
+
+            @rtpengine.on_ws_tee_started(call_id="abc")
+            def handle_specific(call_id, from_tag, stream_id, ws_uri, direction, channels, sample_rate):
+                ...
+        """
+        def decorator(fn):
+            is_async = _asyncio.iscoroutinefunction(fn)
+            metadata = {"call_id": call_id, "from_tag": from_tag}
+            _registry.register("rtpengine.on_ws_tee_started", None, fn, is_async, metadata)
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def on_ws_tee_ended(self, func_or_none=None, *, call_id=None, from_tag=None):
+        """Register a handler for WebSocket tee ended events.
+
+        Fires exactly once per started tee, including when the *server* ends
+        it — any ``reason`` other than ``"detached"`` means the audio stream
+        died while the call is still up.
+
+        Usage:
+            @rtpengine.on_ws_tee_ended
+            def handle_any(call_id, from_tag, stream_id, reason, frames_sent, frames_dropped):
+                ...
+
+            @rtpengine.on_ws_tee_ended(call_id="abc")
+            def handle_specific(call_id, from_tag, stream_id, reason, frames_sent, frames_dropped):
+                ...
+        """
+        def decorator(fn):
+            is_async = _asyncio.iscoroutinefunction(fn)
+            metadata = {"call_id": call_id, "from_tag": from_tag}
+            _registry.register("rtpengine.on_ws_tee_ended", None, fn, is_async, metadata)
             return fn
         if func_or_none is not None:
             return decorator(func_or_none)
