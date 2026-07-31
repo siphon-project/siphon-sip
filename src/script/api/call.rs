@@ -93,6 +93,37 @@ pub enum CallAction {
     /// This marker only tells the dispatcher the call was answered so it keeps
     /// the actor alive instead of removing it as a silent (no-action) drop.
     Answered,
+    /// Hand the call over to an out-of-process control application
+    /// (`call.handover("app")`, the ARI *Stasis* model). The dispatcher holds the
+    /// INVITE transaction un-dialed, sends a keep-alive 180, registers the call
+    /// with the control plane, emits `StasisStart` with the full SIP context, and
+    /// arms a handoff deadline whose default action (503 / fallback) fires if no
+    /// controller accepts and acts in time.
+    Handover {
+        /// The target control app (must be configured in `control.apps`).
+        app: String,
+        /// Control-loss policy: "hangup" (default) / "continue" / "fallback".
+        on_lost: Option<String>,
+        /// Handoff deadline in ms; `None` uses `control.limits.handoff_deadline_ms`.
+        deadline_ms: Option<u64>,
+        /// Per-call variables seeded into the control plane's channel entry.
+        vars: std::collections::HashMap<String, String>,
+        /// Answer-first (AI-park) mode: when `true`, siphon answers with `200 OK`
+        /// and anchors media to the `voice_ai` bridge *before* handing over, so
+        /// the controller drives an already-connected channel. When `false`
+        /// (default), the call is parked un-answered (deferred mode) and the
+        /// controller decides how to respond.
+        answer: bool,
+        /// Answer-first only: the media profile to anchor with (default
+        /// `"voice_ai"`). Ignored when `answer` is `false`.
+        profile: Option<String>,
+        /// Answer-first only: the per-call WebSocket bridge URI the media engine
+        /// dials out for this leg's audio. Supports `{call_id}` / `{from_tag}` /
+        /// `{from_user}` / `{to_user}` templating (RFC-3264-answer side). Falls
+        /// back to the profile's own `ws_uri` when omitted. Ignored when `answer`
+        /// is `false`.
+        ws_uri: Option<String>,
+    },
     /// Sequential failover across an ordered list of carrier routes — LCR
     /// (`call.route(...)`) or `call.fork(strategy="sequential")`. The dispatcher
     /// dials the first routable carrier, stores the rest as the call's failover
@@ -1140,6 +1171,92 @@ impl PyCall {
         };
     }
 
+    /// Hand this call over to an out-of-process control application (ARI
+    /// *Stasis* model). siphon holds the INVITE transaction un-dialed, sends a
+    /// keep-alive ``180``, registers the call with the control plane and emits a
+    /// ``StasisStart`` carrying the full SIP context to the owning connection.
+    /// The out-of-process app then drives the call (answer / play / dtmf /
+    /// bridge / hangup) over the control WebSocket.
+    ///
+    /// A handoff deadline protects against an absent/slow controller: if no
+    /// controller accepts and acts in time, ``on_lost``'s sibling default action
+    /// fires (a ``503`` by default, or a fallback re-dispatch), so a dead
+    /// controller degrades instead of hanging calls.
+    ///
+    /// Args:
+    ///     app: The control app name (must be configured in ``control.apps``).
+    ///     on_lost: What to do if the owning connection is lost mid-call —
+    ///         ``"hangup"`` (default), ``"continue"``, or ``"fallback"``.
+    ///     deadline_ms: Handoff deadline in milliseconds; ``None`` uses
+    ///         ``control.limits.handoff_deadline_ms``.
+    ///     vars: Per-call variables seeded into the control channel, readable +
+    ///         writable by the app via ``get_var`` / ``set_var``.
+    ///     answer: Answer-first (AI-park) mode. When ``True``, siphon answers the
+    ///         call (``200 OK``) and anchors media to the ``voice_ai`` bridge
+    ///         before handing over, so the controller drives an already-connected
+    ///         channel — answering commits the call (CDR answer-time starts;
+    ///         declining is a BYE, not a 4xx). When ``False`` (default), the call
+    ///         is parked un-answered and the controller decides how to respond.
+    ///     profile: Answer-first only — the media profile to anchor with (default
+    ///         ``"voice_ai"``).
+    ///     ws_uri: Answer-first only — the per-call WebSocket bridge URI the media
+    ///         engine dials out for this leg's audio, so the app computes it per
+    ///         session/tenant. Supports ``{call_id}`` / ``{from_tag}`` /
+    ///         ``{from_user}`` / ``{to_user}`` templating; falls back to the
+    ///         profile's own ``ws_uri`` when omitted.
+    ///
+    /// Example:
+    ///     @b2bua.on_invite
+    ///     async def route(call):
+    ///         if is_ai_number(call.to_uri):
+    ///             call.handover("ai-app", answer=True,
+    ///                           ws_uri="wss://ai.example/stream/{call_id}")
+    ///         elif is_ivr_number(call.to_uri):
+    ///             call.handover("ivr-app", on_lost="hangup", deadline_ms=3000,
+    ///                           vars={"queue": "support"})
+    ///         else:
+    ///             call.dial(call.ruri)
+    #[pyo3(signature = (app, on_lost=None, deadline_ms=None, vars=None, answer=false, profile=None, ws_uri=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn handover(
+        &mut self,
+        app: &str,
+        on_lost: Option<&str>,
+        deadline_ms: Option<u64>,
+        vars: Option<std::collections::HashMap<String, String>>,
+        answer: bool,
+        profile: Option<&str>,
+        ws_uri: Option<&str>,
+    ) -> PyResult<()> {
+        if app.is_empty() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "call.handover() requires a non-empty app name",
+            ));
+        }
+        if let Some(policy) = on_lost {
+            if !matches!(policy, "hangup" | "continue" | "fallback") {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "call.handover(on_lost=…) must be 'hangup', 'continue', or 'fallback' (got '{policy}')"
+                )));
+            }
+        }
+        if !answer && (profile.is_some() || ws_uri.is_some()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "call.handover(profile=…/ws_uri=…) requires answer=True (they only apply to answer-first mode)",
+            ));
+        }
+        self.action = CallAction::Handover {
+            app: app.to_string(),
+            on_lost: on_lost.map(String::from),
+            deadline_ms,
+            vars: vars.unwrap_or_default(),
+            answer,
+            profile: profile.map(String::from),
+            ws_uri: ws_uri.map(String::from),
+        };
+        Ok(())
+    }
+
     /// UAS-mode answer — send a final 2xx response to the A-leg INVITE
     /// **immediately**, instead of bridging to a B-leg. Useful for MRF /
     /// announcement / echo / IVR servers that own the dialog themselves.
@@ -1956,6 +2073,65 @@ mod tests {
                 reason: "Not Acceptable Here".to_string()
             }
         );
+    }
+
+    #[test]
+    fn call_handover_sets_handover_action() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("queue".to_string(), "support".to_string());
+        call.handover("ivr-app", Some("hangup"), Some(3000), Some(vars.clone()), false, None, None)
+            .unwrap();
+        assert_eq!(
+            call.action(),
+            &CallAction::Handover {
+                app: "ivr-app".to_string(),
+                on_lost: Some("hangup".to_string()),
+                deadline_ms: Some(3000),
+                vars,
+                answer: false,
+                profile: None,
+                ws_uri: None,
+            }
+        );
+    }
+
+    #[test]
+    fn call_handover_answer_mode_sets_flag_and_media_args() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        call.handover("ai-app", None, None, None, true, Some("voice_ai"), Some("wss://ai/{call_id}"))
+            .unwrap();
+        assert!(matches!(
+            call.action(),
+            CallAction::Handover {
+                answer: true,
+                profile: Some(ref p),
+                ws_uri: Some(ref u),
+                ..
+            } if p == "voice_ai" && u == "wss://ai/{call_id}"
+        ));
+    }
+
+    #[test]
+    fn call_handover_media_args_require_answer_true() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        // profile/ws_uri without answer=True is a programming error.
+        assert!(call.handover("app", None, None, None, false, Some("voice_ai"), None).is_err());
+        assert!(call.handover("app", None, None, None, false, None, Some("wss://ai")).is_err());
+    }
+
+    #[test]
+    fn call_handover_rejects_empty_app_and_bad_on_lost() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        assert!(call.handover("", None, None, None, false, None, None).is_err());
+        assert!(call.handover("app", Some("explode"), None, None, false, None, None).is_err());
+        // Valid policies are accepted.
+        assert!(call.handover("app", Some("continue"), None, None, false, None, None).is_ok());
+        assert!(call.handover("app", Some("fallback"), None, None, false, None, None).is_ok());
     }
 
     #[test]
