@@ -36,6 +36,7 @@ it nowhere, with nothing logged and silence on the line.
 | Profile field | `siphon-rtp` | `rtpengine` | `rtpproxy` |
 |---|---|---|---|
 | `ws_uri`, `ws_vad`, `ws_barge_in`, `ws_vad_threshold`, `ws_vad_hangover_ms` | yes | — | — |
+| `ws_tee`, `ws_tee_direction`, `ws_tee_channels` | yes | — | — |
 | `noise_suppression`, `echo_cancellation` | yes | — | — |
 | `received_from`, `rtcp_mux` | yes | yes | — |
 | `address_family` | yes | yes | — [^af] |
@@ -44,6 +45,91 @@ it nowhere, with nothing logged and silence on the line.
     `address_family` on `rtpproxy` warns at boot rather than failing the load:
     rtpproxy's `6` modifier states the family of the address the command already
     carries, so the call still works and only IPv4/IPv6 interworking is lost.
+
+---
+
+## WebSocket audio: bridge vs tee
+
+`siphon-rtp` can stream a call's decoded audio to a WebSocket media server in
+two different shapes. They look similar in config and are not interchangeable —
+picking the wrong one is the most likely way to get this wrong.
+
+| | `ws_uri` — **bridge** | `ws_tee` / `attach_ws_tee` — **tee** |
+|---|---|---|
+| The WS server is | leg A's far side | an extra listener |
+| A↔B relay | **not wired** | stays wired |
+| Audio direction | bidirectional | send-only |
+| SIPREC / recording on the leg | n/a (there is no B leg) | keep running |
+| Typical use | voice-AI answers the call | live transcription, agent assist, compliance |
+
+**Bridge (`ws_uri`).** The engine dials the URI and the WS server *becomes* the
+far end: it receives the caller's audio as L16 and what it sends back is encoded
+toward the caller. There is no second SIP leg. This is the voice-AI
+answer-the-call shape, usually paired with `rtpengine.answer_local(...)` and the
+built-in `voice_ai` profile.
+
+**Tee (`ws_tee`).** The call relays or transcodes exactly as it otherwise would,
+*and* a copy of the decoded audio is streamed out. Additive: one decode feeds
+the peer, the recorder, any SIPREC fork and the tee — there is no second jitter
+buffer and no second decode. A plain in-kernel relay is promoted to the
+userspace pipeline for the tee's lifetime and demoted again on detach.
+
+A tee never affects the call. If the consumer stalls the engine drops frames
+rather than backing up the media path, and reports the count on the
+`ws_tee_ended` event.
+
+Declare a tee on a profile:
+
+```yaml
+media:
+  backend: siphon-rtp
+  profiles:
+    recorded_call:
+      offer:
+        ws_tee: "wss://asr.internal/stream/{call_id}"
+        ws_tee_direction: both      # both (default) | caller | callee
+        ws_tee_channels: 2          # 2 = caller/callee stereo, 1 = mixed mono
+      answer: {}
+```
+
+…or attach and detach one mid-call from a script:
+
+```python
+@b2bua.on_answer
+async def on_answer(call, reply):
+    await rtpengine.answer(reply)
+    try:
+        await rtpengine.attach_ws_tee(call, f"wss://asr.internal/{call.call_id}")
+    except RuntimeError as error:
+        log.warn(f"transcription tee unavailable: {error}")   # never fail the call
+
+@b2bua.on_bye
+async def on_bye(call):
+    await rtpengine.detach_ws_tee(call)      # idempotent; the call teardown also does it
+```
+
+`ws_tee_channels` only means anything with `ws_tee_direction: both` — a
+single-leg tee is always mono. Unset leaves the engine's default: 2 channels
+for both legs, 1 for one.
+
+**Know when a tee dies.** A tee can end without the call ending — the server
+closes the socket, or the transport fails. Nothing about the call changes, so
+this is invisible unless you watch for it:
+
+```python
+@rtpengine.on_ws_tee_ended
+def tee_down(call_id, from_tag, stream_id, reason, frames_sent, frames_dropped):
+    if reason != "detached":                  # the only orderly end
+        log.warn(f"tee {stream_id} died: {reason} after {frames_sent} frames")
+    if frames_dropped:
+        log.warn(f"tee {stream_id} dropped {frames_dropped} frames — consumer too slow")
+```
+
+siphon also logs an unexpected tee end at WARN whether or not a handler is
+registered. `@rtpengine.on_ws_tee_started` gives the matching start, carrying
+the negotiated `channels` and `sample_rate` so a consumer decodes the binary
+frames rather than guessing; `stream_id` correlates the control event with the
+`start` envelope on the socket.
 
 ---
 

@@ -1929,6 +1929,8 @@ class MockRtpEngine:
         self._subscribe_answer_sdp: bytes = b""
         self._dtmf_handlers: list[dict[str, Any]] = []
         self._media_timeout_handlers: list[dict[str, Any]] = []
+        self._ws_tee_started_handlers: list[dict[str, Any]] = []
+        self._ws_tee_ended_handlers: list[dict[str, Any]] = []
 
     @property
     def active_sessions(self) -> int:
@@ -2442,6 +2444,107 @@ class MockRtpEngine:
         })
         return True
 
+    async def attach_ws_tee(
+        self,
+        target: Any,
+        ws_uri: str,
+        direction: str = "both",
+        channels: Optional[int] = None,
+    ) -> bool:
+        """Attach a **WebSocket tee** to a live call — stream a copy of its
+        decoded audio to a WebSocket media server while the call keeps relaying.
+
+        The distinction from the ``ws_uri`` media-profile flag matters:
+
+        * ``ws_uri`` is a **takeover** — the WebSocket server *becomes* leg A's
+          far side and the A↔B relay is not wired.  That is the voice-AI
+          answer-the-call shape.
+        * A tee is **send-only and additive** — the call relays (or transcodes)
+          normally *and* streams a copy of its audio out.  Any SIPREC
+          subscription and recording on the same leg keep running untouched.
+
+        Use a tee for live transcription, agent-assist, sentiment or compliance
+        monitoring on a call that is otherwise a normal two-party call.
+
+        A tee never affects the call: the engine drops frames rather than
+        stalling the media path if the consumer cannot keep up, and a failure
+        raises rather than tearing anything down — catch it and carry on.
+
+        Requires ``media.backend: siphon-rtp``; the rtpengine and rtpproxy
+        backends raise rather than silently doing nothing.
+
+        Args:
+            target: Request, Reply, or Call object.
+            ws_uri: ``ws://`` or ``wss://`` URI the engine dials as a client.
+            direction: Which leg(s) to stream — ``"both"`` (default),
+                ``"caller"`` (the offerer) or ``"callee"`` (the answerer).
+            channels: Wire channel count — ``2`` interleaves caller/callee as
+                stereo, ``1`` mixes them to mono. Only meaningful with
+                ``direction="both"``; a single-leg tee is always mono. ``None``
+                (default) leaves the engine's choice: 2 for both legs, 1 for one.
+
+        Returns:
+            ``True`` on success.
+
+        Example::
+
+            @b2bua.on_answer
+            async def on_answer(call, reply):
+                await rtpengine.answer(reply)
+                try:
+                    await rtpengine.attach_ws_tee(call, f"wss://asr.internal/{call.call_id}")
+                except RuntimeError as error:
+                    log.warn(f"transcription tee unavailable: {error}")
+        """
+        if direction not in ("both", "caller", "callee"):
+            raise ValueError(
+                "attach_ws_tee direction must be one of both / caller / callee, "
+                f"got {direction!r}"
+            )
+        if channels is not None and channels not in (1, 2):
+            raise ValueError(
+                f"attach_ws_tee channels must be 1 or 2, got {channels}"
+            )
+        call_id, from_tag = _resolve_media_target(target)
+        self.operations.append(("attach_ws_tee", ws_uri))
+        self.media_calls.append({
+            "op": "attach_ws_tee",
+            "call_id": call_id,
+            "from_tag": from_tag,
+            "ws_uri": ws_uri,
+            "direction": direction,
+            "channels": channels,
+        })
+        return True
+
+    async def detach_ws_tee(self, target: Any) -> bool:
+        """Detach a call's **WebSocket tee**, closing its stream.
+
+        Idempotent — detaching a call with no tee is not an error. A tee is
+        also torn down automatically when the call ends, so an explicit detach
+        is only needed to stop streaming mid-call.
+
+        Requires ``media.backend: siphon-rtp``.
+
+        Args:
+            target: Request, Reply, or Call object.
+
+        Returns:
+            ``True`` on success.
+
+        Example::
+
+            await rtpengine.detach_ws_tee(call)
+        """
+        call_id, from_tag = _resolve_media_target(target)
+        self.operations.append(("detach_ws_tee", None))
+        self.media_calls.append({
+            "op": "detach_ws_tee",
+            "call_id": call_id,
+            "from_tag": from_tag,
+        })
+        return True
+
     def on_dtmf(self, func_or_none: Any = None, *,
                 call_id: Optional[str] = None,
                 from_tag: Optional[str] = None) -> Any:
@@ -2525,6 +2628,111 @@ class MockRtpEngine:
             fired += 1
         return fired
 
+    def on_ws_tee_started(self, func_or_none: Any = None, *,
+                          call_id: Optional[str] = None,
+                          from_tag: Optional[str] = None) -> Any:
+        """Register a handler for **WebSocket tee started** events.
+
+        Fires once the engine has dialled the tee's WebSocket server, sent its
+        ``start`` envelope, and begun streaming. The handler receives the
+        negotiated wire shape, so it can decode the binary frames without
+        guessing — ``stream_id`` is the correlator between this control event
+        and the media stream on the socket.
+
+        Delivered by the native **siphon-rtp** backend only.
+
+        Usage::
+
+            @rtpengine.on_ws_tee_started
+            def tee_up(call_id, from_tag, stream_id, ws_uri, direction, channels, sample_rate):
+                log.info(f"tee {stream_id}: {channels}ch @ {sample_rate}Hz -> {ws_uri}")
+
+            @rtpengine.on_ws_tee_started(call_id="abc", from_tag="ftag1")
+            def tee_up_specific(call_id, from_tag, stream_id, ws_uri, direction, channels, sample_rate):
+                ...
+        """
+        def decorator(fn: Any) -> Any:
+            self._ws_tee_started_handlers.append({
+                "fn": fn,
+                "call_id": call_id,
+                "from_tag": from_tag,
+            })
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def fire_ws_tee_started(self, call_id: str, from_tag: str, stream_id: str,
+                            ws_uri: str, direction: str = "both",
+                            channels: int = 2, sample_rate: int = 8000) -> int:
+        """Test helper: fire a ws-tee-started event.  Returns the number of
+        handlers that matched (and were invoked)."""
+        fired = 0
+        for entry in self._ws_tee_started_handlers:
+            if entry["call_id"] is not None and entry["call_id"] != call_id:
+                continue
+            if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
+                continue
+            entry["fn"](call_id, from_tag, stream_id, ws_uri, direction,
+                        channels, sample_rate)
+            fired += 1
+        return fired
+
+    def on_ws_tee_ended(self, func_or_none: Any = None, *,
+                        call_id: Optional[str] = None,
+                        from_tag: Optional[str] = None) -> Any:
+        """Register a handler for **WebSocket tee ended** events.
+
+        Fires exactly once per started tee, **including when the server ends
+        it**. That is the point of the hook: any ``reason`` other than
+        ``"detached"`` means the audio stream died while the call is still up,
+        which is otherwise invisible — the call carries on and nothing reaches
+        the consumer. Re-attach, fail over, or alert from here.
+
+        ``reason`` is one of ``"detached"`` (the script or the call teardown
+        asked for it — the only orderly end), ``"server_closed"``,
+        ``"server_stopped"``, ``"call_ended"`` or ``"transport_error"``.
+
+        ``frames_dropped`` non-zero means the consumer could not keep up; the
+        call itself was never affected.
+
+        Delivered by the native **siphon-rtp** backend only.
+
+        Usage::
+
+            @rtpengine.on_ws_tee_ended
+            async def tee_down(call_id, from_tag, stream_id, reason, frames_sent, frames_dropped):
+                if reason != "detached":
+                    log.warn(f"tee {stream_id} died: {reason}")
+        """
+        def decorator(fn: Any) -> Any:
+            self._ws_tee_ended_handlers.append({
+                "fn": fn,
+                "call_id": call_id,
+                "from_tag": from_tag,
+            })
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def fire_ws_tee_ended(self, call_id: str, from_tag: str, stream_id: str,
+                          reason: str = "detached",
+                          frames_sent: Optional[int] = None,
+                          frames_dropped: Optional[int] = None) -> int:
+        """Test helper: fire a ws-tee-ended event.  Returns the number of
+        handlers that matched (and were invoked)."""
+        fired = 0
+        for entry in self._ws_tee_ended_handlers:
+            if entry["call_id"] is not None and entry["call_id"] != call_id:
+                continue
+            if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
+                continue
+            entry["fn"](call_id, from_tag, stream_id, reason, frames_sent,
+                        frames_dropped)
+            fired += 1
+        return fired
+
     def set_subscribe_request_sdp(self, sdp: bytes) -> None:
         """Configure the SDP returned by :meth:`subscribe_request` (test helper)."""
         self._subscribe_request_sdp = sdp
@@ -2553,6 +2761,8 @@ class MockRtpEngine:
         self.media_calls.clear()
         self._dtmf_handlers.clear()
         self._media_timeout_handlers.clear()
+        self._ws_tee_started_handlers.clear()
+        self._ws_tee_ended_handlers.clear()
         self._answer_local_no_codec = False
 
 

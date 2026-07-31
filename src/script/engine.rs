@@ -126,6 +126,25 @@ pub enum HandlerKind {
         call_id: Option<String>,
         from_tag: Option<String>,
     },
+    /// `@rtpengine.on_ws_tee_started` — a WebSocket tee began streaming a
+    /// call's audio. The handler receives the negotiated wire shape so it can
+    /// correlate the control event with the media stream.
+    ///
+    /// ``call_id`` and ``from_tag`` are optional filters.
+    RtpEngineOnWsTeeStarted {
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    },
+    /// `@rtpengine.on_ws_tee_ended` — a WebSocket tee stopped, for any reason
+    /// including the *server* ending it. Emitted exactly once per started tee,
+    /// so a script learns the stream died rather than silently losing audio on
+    /// a call that is still up.
+    ///
+    /// ``call_id`` and ``from_tag`` are optional filters.
+    RtpEngineOnWsTeeEnded {
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    },
     /// Open extension point for handler kinds owned by host extensions.
     /// The string is the registry key the extension wrote (e.g.
     /// `"audit.sink"`); siphon-core does not interpret it. Per-handler
@@ -233,6 +252,46 @@ impl ScriptState {
             .iter()
             .filter(|h| match &h.kind {
                 HandlerKind::RtpEngineOnMediaTimeout { call_id: filter_cid, from_tag: filter_ftag } => {
+                    filter_cid.as_deref().map_or(true, |v| v == call_id)
+                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// Return all `RtpEngineOnWsTeeStarted` handlers whose optional
+    /// call-id/from-tag filters match the event.  `None` filters match
+    /// everything.
+    pub fn ws_tee_started_handlers(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Vec<&HandlerEntry> {
+        self.handlers
+            .iter()
+            .filter(|h| match &h.kind {
+                HandlerKind::RtpEngineOnWsTeeStarted { call_id: filter_cid, from_tag: filter_ftag } => {
+                    filter_cid.as_deref().map_or(true, |v| v == call_id)
+                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// Return all `RtpEngineOnWsTeeEnded` handlers whose optional
+    /// call-id/from-tag filters match the event.  `None` filters match
+    /// everything.
+    pub fn ws_tee_ended_handlers(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Vec<&HandlerEntry> {
+        self.handlers
+            .iter()
+            .filter(|h| match &h.kind {
+                HandlerKind::RtpEngineOnWsTeeEnded { call_id: filter_cid, from_tag: filter_ftag } => {
                     filter_cid.as_deref().map_or(true, |v| v == call_id)
                         && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
                 }
@@ -1091,6 +1150,28 @@ fn extract_handlers(
                     .and_then(|v| v.extract().ok());
                 HandlerKind::RtpEngineOnMediaTimeout { call_id, from_tag }
             }
+            "rtpengine.on_ws_tee_started" => {
+                let call_id: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("call_id").ok())
+                    .and_then(|v| v.extract().ok());
+                let from_tag: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("from_tag").ok())
+                    .and_then(|v| v.extract().ok());
+                HandlerKind::RtpEngineOnWsTeeStarted { call_id, from_tag }
+            }
+            "rtpengine.on_ws_tee_ended" => {
+                let call_id: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("call_id").ok())
+                    .and_then(|v| v.extract().ok());
+                let from_tag: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("from_tag").ok())
+                    .and_then(|v| v.extract().ok());
+                HandlerKind::RtpEngineOnWsTeeEnded { call_id, from_tag }
+            }
             other => HandlerKind::Custom { kind: other.to_owned() },
         };
 
@@ -1750,6 +1831,48 @@ async def specific_timeout(call_id, from_tag):
                 HandlerKind::RtpEngineOnMediaTimeout { call_id: Some(c), .. } if c == "abc"
             ))
             .expect("filtered media-timeout handler registered");
+        assert!(specific.is_async);
+    }
+
+    #[test]
+    fn rtpengine_on_ws_tee_decorators_register_and_filter() {
+        // Both hooks take the same (call_id, from_tag) filters as on_dtmf /
+        // on_media_timeout; a bare handler is a catch-all.
+        let source = r#"
+from siphon import rtpengine
+
+@rtpengine.on_ws_tee_started
+def any_start(call_id, from_tag, stream_id, ws_uri, direction, channels, sample_rate):
+    pass
+
+@rtpengine.on_ws_tee_ended
+def any_end(call_id, from_tag, stream_id, reason, frames_sent, frames_dropped):
+    pass
+
+@rtpengine.on_ws_tee_ended(call_id="abc", from_tag="ftag1")
+async def specific_end(call_id, from_tag, stream_id, reason, frames_sent, frames_dropped):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 3);
+
+        // Started: catch-all only, and it does not pick up the ended handlers.
+        assert_eq!(state.ws_tee_started_handlers("abc", "ftag1").len(), 1);
+
+        // Ended: catch-all everywhere, plus the filtered one on an exact match.
+        assert_eq!(state.ws_tee_ended_handlers("xyz", "other").len(), 1);
+        assert_eq!(state.ws_tee_ended_handlers("abc", "ftag1").len(), 2);
+        assert_eq!(state.ws_tee_ended_handlers("abc", "wrong").len(), 1);
+
+        // The filtered handler is the async one.
+        let specific = state
+            .handlers
+            .iter()
+            .find(|h| matches!(
+                &h.kind,
+                HandlerKind::RtpEngineOnWsTeeEnded { call_id: Some(c), .. } if c == "abc"
+            ))
+            .expect("filtered ws-tee-ended handler registered");
         assert!(specific.is_async);
     }
 

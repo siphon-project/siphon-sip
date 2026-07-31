@@ -30,6 +30,7 @@ use futures_util::future::join_all;
 use siphon_rtp_proto::{
     frame, CmdResult, Command, Event, LegSummary as ProtoLegSummary, PlayEndReason,
     PlayMediaSource as ProtoPlayMediaSource, ProfileFlags, Request, Response,
+    WsTeeDirection as ProtoWsTeeDirection, WsTeeEndReason as ProtoWsTeeEndReason,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -39,8 +40,11 @@ use tracing::{debug, info, trace, warn};
 
 use super::client::PlayMediaSource;
 use super::error::RtpEngineError;
-use super::events::{CallLegSummary, CallSummary, DtmfEvent, RtpEngineEvent};
-use super::profile::NgFlags;
+use super::events::{
+    CallLegSummary, CallSummary, DtmfEvent, RtpEngineEvent, WsTeeEndReason, WsTeeStarted,
+    WsTeeEnded,
+};
+use super::profile::{NgFlags, WsTeeDirection};
 
 /// Reserved request id for the auth handshake (real requests start at 1).
 const AUTH_REQUEST_ID: u64 = 0;
@@ -81,11 +85,33 @@ pub(crate) fn profile_flags_from_ng(flags: &NgFlags) -> ProfileFlags {
         ws_barge_in: flags.ws_barge_in,
         ws_vad_threshold: flags.ws_vad_threshold,
         ws_vad_hangover_ms: flags.ws_vad_hangover_ms,
+        ws_tee: flags.ws_tee.clone(),
+        ws_tee_direction: flags.ws_tee_direction.map(proto_ws_tee_direction),
+        ws_tee_channels: flags.ws_tee_channels,
         // The per-call address, not the `carry_received_from` policy bit — the
         // script API injects the former only when the latter is set, so an
         // opted-out profile leaves this `None` and serialises away.
         received_from: flags.received_from,
         rtcp_mux: flags.rtcp_mux.clone(),
+    }
+}
+
+/// Map siphon's [`WsTeeDirection`] onto the proto twin.
+pub(crate) fn proto_ws_tee_direction(direction: WsTeeDirection) -> ProtoWsTeeDirection {
+    match direction {
+        WsTeeDirection::Both => ProtoWsTeeDirection::Both,
+        WsTeeDirection::Caller => ProtoWsTeeDirection::Caller,
+        WsTeeDirection::Callee => ProtoWsTeeDirection::Callee,
+    }
+}
+
+/// Map the proto [`ProtoWsTeeDirection`] back onto siphon's own enum, so the
+/// generic event type stays free of the proto.
+fn ws_tee_direction_from_proto(direction: ProtoWsTeeDirection) -> WsTeeDirection {
+    match direction {
+        ProtoWsTeeDirection::Both => WsTeeDirection::Both,
+        ProtoWsTeeDirection::Caller => WsTeeDirection::Caller,
+        ProtoWsTeeDirection::Callee => WsTeeDirection::Callee,
     }
 }
 
@@ -624,6 +650,49 @@ impl SiphonRtpClient {
         )
     }
 
+    /// Attach a WebSocket tee to a live call — stream a copy of its decoded
+    /// audio to `ws_uri` while the call keeps relaying.
+    ///
+    /// Additive, unlike the `ws_uri` profile flag: the relay/transcode path, any
+    /// SIPREC subscription and the recording all keep running.  The engine
+    /// promotes a plain in-kernel relay to the userspace pipeline for the tee's
+    /// lifetime and demotes it again on detach.
+    pub async fn attach_ws_tee(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        ws_uri: &str,
+        direction: WsTeeDirection,
+        channels: Option<u8>,
+    ) -> Result<(), RtpEngineError> {
+        expect_ok(
+            self.request(Command::AttachWsTee {
+                call_id: call_id.to_string(),
+                from_tag: from_tag.to_string(),
+                ws_uri: ws_uri.to_string(),
+                direction: proto_ws_tee_direction(direction),
+                channels,
+            })
+            .await?,
+        )
+    }
+
+    /// Detach a call's WebSocket tee, closing its stream.  Idempotent — the
+    /// engine does not treat detaching a call with no tee as an error.
+    pub async fn detach_ws_tee(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        expect_ok(
+            self.request(Command::DetachWsTee {
+                call_id: call_id.to_string(),
+                from_tag: from_tag.to_string(),
+            })
+            .await?,
+        )
+    }
+
     /// Liveness check — `Ping` → `Pong`.
     pub async fn ping(&self) -> Result<(), RtpEngineError> {
         match self.request(Command::Ping).await? {
@@ -942,6 +1011,29 @@ impl SiphonRtpClientSet {
         self.select(call_id).unsubscribe(call_id, from_tag, to_tag).await
     }
 
+    /// Attach a WebSocket tee on the instance owning this call.
+    pub async fn attach_ws_tee(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        ws_uri: &str,
+        direction: WsTeeDirection,
+        channels: Option<u8>,
+    ) -> Result<(), RtpEngineError> {
+        self.select(call_id)
+            .attach_ws_tee(call_id, from_tag, ws_uri, direction, channels)
+            .await
+    }
+
+    /// Detach the WebSocket tee on the instance owning this call.
+    pub async fn detach_ws_tee(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        self.select(call_id).detach_ws_tee(call_id, from_tag).await
+    }
+
     /// Ping any one instance (the first). For quick health checks.
     pub async fn ping(&self) -> Result<(), RtpEngineError> {
         match self.clients.first() {
@@ -1099,11 +1191,54 @@ fn convert_event(event: Event) -> RtpEngineEvent {
             call_id: Some(call_id),
             from_tag: Some(from_tag),
         },
+        Event::WsTeeStarted {
+            call_id,
+            from_tag,
+            stream_id,
+            ws_uri,
+            direction,
+            channels,
+            sample_rate,
+        } => RtpEngineEvent::WsTeeStarted(WsTeeStarted {
+            call_id,
+            from_tag,
+            stream_id,
+            ws_uri,
+            direction: ws_tee_direction_from_proto(direction),
+            channels,
+            sample_rate,
+        }),
+        Event::WsTeeEnded {
+            call_id,
+            from_tag,
+            stream_id,
+            reason,
+            frames_sent,
+            frames_dropped,
+        } => RtpEngineEvent::WsTeeEnded(WsTeeEnded {
+            call_id,
+            from_tag,
+            stream_id,
+            reason: ws_tee_end_reason_from_proto(reason),
+            frames_sent,
+            frames_dropped,
+        }),
         Event::Unknown => RtpEngineEvent::Unknown {
             event: "unknown".to_string(),
             call_id: None,
             from_tag: None,
         },
+    }
+}
+
+/// Map the proto tee end-reason onto siphon's own enum.
+fn ws_tee_end_reason_from_proto(reason: ProtoWsTeeEndReason) -> WsTeeEndReason {
+    match reason {
+        ProtoWsTeeEndReason::Detached => WsTeeEndReason::Detached,
+        ProtoWsTeeEndReason::ServerClosed => WsTeeEndReason::ServerClosed,
+        ProtoWsTeeEndReason::ServerStopped => WsTeeEndReason::ServerStopped,
+        ProtoWsTeeEndReason::CallEnded => WsTeeEndReason::CallEnded,
+        ProtoWsTeeEndReason::TransportError => WsTeeEndReason::TransportError,
     }
 }
 
@@ -1701,6 +1836,9 @@ mod tests {
             ws_barge_in: true,
             ws_vad_threshold: Some(2_000_000),
             ws_vad_hangover_ms: Some(300),
+            ws_tee: Some("wss://asr.invalid/tee".into()),
+            ws_tee_direction: Some(WsTeeDirection::Callee),
+            ws_tee_channels: Some(1),
             carry_received_from: true,
             received_from: Some("198.51.100.7".parse().unwrap()),
             rtcp_mux: vec!["require".into()],
@@ -1723,6 +1861,9 @@ mod tests {
             ws_barge_in: true,
             ws_vad_threshold: Some(2_000_000),
             ws_vad_hangover_ms: Some(300),
+            ws_tee: Some("wss://asr.invalid/tee".into()),
+            ws_tee_direction: Some(ProtoWsTeeDirection::Callee),
+            ws_tee_channels: Some(1),
             received_from: Some("198.51.100.7".parse().unwrap()),
             rtcp_mux: vec!["require".into()],
         };
@@ -1788,6 +1929,70 @@ mod tests {
                 assert_eq!(from_tag, "f");
             }
             other => panic!("expected MediaTimeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_event_ws_tee_started_carries_the_negotiated_wire_shape() {
+        // The wire shape is the point: a consumer decodes the binary frames
+        // from these values rather than guessing.
+        match convert_event(Event::WsTeeStarted {
+            call_id: "c".into(),
+            from_tag: "f".into(),
+            stream_id: "s-1".into(),
+            ws_uri: "wss://asr.invalid/tee".into(),
+            direction: ProtoWsTeeDirection::Caller,
+            channels: 1,
+            sample_rate: 16_000,
+        }) {
+            RtpEngineEvent::WsTeeStarted(tee) => {
+                assert_eq!(tee.call_id, "c");
+                assert_eq!(tee.from_tag, "f");
+                assert_eq!(tee.stream_id, "s-1");
+                assert_eq!(tee.ws_uri, "wss://asr.invalid/tee");
+                assert_eq!(tee.direction, WsTeeDirection::Caller);
+                assert_eq!(tee.channels, 1);
+                assert_eq!(tee.sample_rate, 16_000);
+            }
+            other => panic!("expected WsTeeStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_event_ws_tee_ended_maps_every_reason() {
+        // Each reason must survive the proto -> siphon hop with its wire
+        // spelling intact: a script branches on this string.
+        let cases = [
+            (ProtoWsTeeEndReason::Detached, "detached", false),
+            (ProtoWsTeeEndReason::ServerClosed, "server_closed", true),
+            (ProtoWsTeeEndReason::ServerStopped, "server_stopped", true),
+            (ProtoWsTeeEndReason::CallEnded, "call_ended", true),
+            (ProtoWsTeeEndReason::TransportError, "transport_error", true),
+        ];
+        for (proto_reason, expected, expected_unexpected) in cases {
+            match convert_event(Event::WsTeeEnded {
+                call_id: "c".into(),
+                from_tag: "f".into(),
+                stream_id: "s-1".into(),
+                reason: proto_reason,
+                frames_sent: Some(4_200),
+                frames_dropped: Some(3),
+            }) {
+                RtpEngineEvent::WsTeeEnded(tee) => {
+                    assert_eq!(tee.stream_id, "s-1");
+                    assert_eq!(tee.reason.as_str(), expected);
+                    assert_eq!(tee.frames_sent, Some(4_200));
+                    assert_eq!(tee.frames_dropped, Some(3));
+                    // Only an explicit detach is an orderly end; everything else
+                    // means audio stopped while the call is still up.
+                    assert_eq!(
+                        tee.reason.is_unexpected(),
+                        expected_unexpected,
+                        "{expected} classified wrongly"
+                    );
+                }
+                other => panic!("expected WsTeeEnded, got {other:?}"),
+            }
         }
     }
 

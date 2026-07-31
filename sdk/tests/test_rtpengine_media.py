@@ -473,3 +473,133 @@ async def on_invite(call):
         operation, uri = harness.rtpengine.ws_uris[-1]
         assert operation == "answer_local"
         assert uri.startswith("wss://ai.example.com/stream/")
+
+
+class TestWebSocketTee:
+    """``attach_ws_tee`` / ``detach_ws_tee`` — the additive send-only stream.
+
+    Distinct from ``ws_uri``, which is a *takeover*: with a tee the A-to-B
+    relay stays wired and any SIPREC subscription keeps running, so this is
+    the shape for live transcription / agent-assist on an ordinary call.
+    """
+
+    def test_attach_records_defaults(self, harness):
+        call = Call(call_id="tee-1@example.invalid")
+        asyncio.run(
+            harness.rtpengine.attach_ws_tee(call, "wss://asr.example.com/s")
+        )
+        assert ("attach_ws_tee", "wss://asr.example.com/s") in harness.rtpengine.operations
+        recorded = harness.rtpengine.media_calls[-1]
+        assert recorded["op"] == "attach_ws_tee"
+        assert recorded["call_id"] == "tee-1@example.invalid"
+        assert recorded["ws_uri"] == "wss://asr.example.com/s"
+        assert recorded["direction"] == "both"
+        assert recorded["channels"] is None
+
+    def test_attach_records_direction_and_channels(self, harness):
+        asyncio.run(
+            harness.rtpengine.attach_ws_tee(
+                Call(), "wss://asr.example.com/s", direction="caller", channels=1
+            )
+        )
+        recorded = harness.rtpengine.media_calls[-1]
+        assert recorded["direction"] == "caller"
+        assert recorded["channels"] == 1
+
+    def test_attach_rejects_unknown_direction(self, harness):
+        # "send" is the obvious wrong guess: a tee is send-only by definition,
+        # so the axis the engine exposes is which leg(s), not which way.
+        with pytest.raises(ValueError, match="direction"):
+            asyncio.run(
+                harness.rtpengine.attach_ws_tee(
+                    Call(), "wss://asr.example.com/s", direction="send"
+                )
+            )
+
+    def test_attach_rejects_bad_channel_count(self, harness):
+        with pytest.raises(ValueError, match="channels"):
+            asyncio.run(
+                harness.rtpengine.attach_ws_tee(
+                    Call(), "wss://asr.example.com/s", channels=3
+                )
+            )
+
+    def test_detach_records_call(self, harness):
+        call = Call(call_id="tee-2@example.invalid")
+        asyncio.run(harness.rtpengine.detach_ws_tee(call))
+        recorded = harness.rtpengine.media_calls[-1]
+        assert recorded["op"] == "detach_ws_tee"
+        assert recorded["call_id"] == "tee-2@example.invalid"
+
+    def test_target_forms_resolve_equivalently(self, harness):
+        # Same (call_id, from_tag) resolution as the other media verbs.
+        asyncio.run(
+            harness.rtpengine.attach_ws_tee(("call-5", "ftag-5"), "wss://h/s")
+        )
+        recorded = harness.rtpengine.media_calls[-1]
+        assert recorded["call_id"] == "call-5"
+        assert recorded["from_tag"] == "ftag-5"
+
+    def test_tee_started_handler_receives_the_wire_shape(self, harness):
+        # The wire shape is the payload's point: a consumer decodes the binary
+        # frames from these values rather than guessing.
+        seen = []
+
+        @harness.rtpengine.on_ws_tee_started
+        def tee_up(call_id, from_tag, stream_id, ws_uri, direction, channels, sample_rate):
+            seen.append((call_id, from_tag, stream_id, ws_uri, direction, channels, sample_rate))
+
+        fired = harness.rtpengine.fire_ws_tee_started(
+            "c", "f", "s-1", "wss://asr.example.com/s",
+            direction="caller", channels=1, sample_rate=16000,
+        )
+        assert fired == 1
+        assert seen == [
+            ("c", "f", "s-1", "wss://asr.example.com/s", "caller", 1, 16000)
+        ]
+
+    def test_tee_ended_handler_sees_an_unexpected_reason(self, harness):
+        # The reason a handler exists: the server going away is otherwise
+        # invisible — the call carries on and nothing reaches the consumer.
+        dead = []
+
+        @harness.rtpengine.on_ws_tee_ended
+        def tee_down(call_id, from_tag, stream_id, reason, frames_sent, frames_dropped):
+            if reason != "detached":
+                dead.append((stream_id, reason, frames_sent, frames_dropped))
+
+        harness.rtpengine.fire_ws_tee_ended("c", "f", "s-1", reason="detached")
+        assert dead == []
+
+        harness.rtpengine.fire_ws_tee_ended(
+            "c", "f", "s-2", reason="transport_error",
+            frames_sent=4200, frames_dropped=3,
+        )
+        assert dead == [("s-2", "transport_error", 4200, 3)]
+
+    def test_tee_ended_handler_filters_by_call_id_and_from_tag(self, harness):
+        hits = []
+
+        @harness.rtpengine.on_ws_tee_ended(call_id="abc", from_tag="ftag1")
+        def only_ours(call_id, from_tag, stream_id, reason, frames_sent, frames_dropped):
+            hits.append(stream_id)
+
+        assert harness.rtpengine.fire_ws_tee_ended("other", "ftag1", "s-1") == 0
+        assert harness.rtpengine.fire_ws_tee_ended("abc", "wrong", "s-2") == 0
+        assert harness.rtpengine.fire_ws_tee_ended("abc", "ftag1", "s-3") == 1
+        assert hits == ["s-3"]
+
+    def test_clear_drops_registered_tee_handlers(self, harness):
+        @harness.rtpengine.on_ws_tee_started
+        def tee_up(*args):
+            pass
+
+        @harness.rtpengine.on_ws_tee_ended
+        def tee_down(*args):
+            pass
+
+        assert harness.rtpengine.fire_ws_tee_started("c", "f", "s", "ws://h/s") == 1
+        assert harness.rtpengine.fire_ws_tee_ended("c", "f", "s") == 1
+        harness.rtpengine.clear()
+        assert harness.rtpengine.fire_ws_tee_started("c", "f", "s", "ws://h/s") == 0
+        assert harness.rtpengine.fire_ws_tee_ended("c", "f", "s") == 0
