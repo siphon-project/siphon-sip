@@ -18,6 +18,22 @@ pub enum RtpEngineError {
 
     #[error("RTPEngine returned error: {0}")]
     EngineError(String),
+
+    /// The configured media backend has no way to perform this operation.
+    ///
+    /// Returned rather than a silent `Ok(())` — a hollow success on, say, an
+    /// `attach_ws_tee` against rtpengine reads as "the tee is attached" while no
+    /// audio ever reaches the consumer, which is exactly the failure the
+    /// config-load rejection of WS profile fields exists to prevent.  The
+    /// declarative path is caught at boot; this is its per-call twin for
+    /// operations a script issues directly.
+    #[error("{operation} is not supported by the {backend} media backend")]
+    Unsupported {
+        /// The operation asked for, e.g. `"attach_ws_tee"`.
+        operation: &'static str,
+        /// The configured backend's name as it appears in `media.backend`.
+        backend: &'static str,
+    },
 }
 
 impl RtpEngineError {
@@ -131,5 +147,20 @@ mod tests {
         assert!(!RtpEngineError::from(io_error).is_call_not_found());
         // An engine error that is NOT a not-found must still warn.
         assert!(!RtpEngineError::EngineError("no-encodable-codec".to_string()).is_call_not_found());
+    }
+
+    #[test]
+    fn unsupported_error_names_the_operation_and_backend() {
+        let error = RtpEngineError::Unsupported {
+            operation: "attach_ws_tee",
+            backend: "rtpengine",
+        };
+        assert_eq!(
+            error.to_string(),
+            "attach_ws_tee is not supported by the rtpengine media backend"
+        );
+        // Never mistaken for "the call is already gone" — a safety-net delete
+        // must not treat an unsupported operation as success.
+        assert!(!error.is_call_not_found());
     }
 }

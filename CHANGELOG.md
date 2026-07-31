@@ -12,6 +12,33 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   registrar.lookup(uri) if c.age_secs < 3600]`). Monotonic, and preserved
   across a restart for bindings restored from a persistence backend; a stored
   record written before age tracking reports `0`.
+- **WebSocket tee — stream a copy of a live call's audio without taking the call
+  over.** The existing `ws_uri` bridge is a *takeover*: the WebSocket server
+  becomes leg A's far side and the A↔B relay is not wired, which is right for
+  voice-AI answering a call and wrong for everything else. A tee is send-only and
+  additive — the call relays or transcodes exactly as it would otherwise, and a
+  copy of its decoded audio streams out, leaving any SIPREC subscription and
+  recording on the leg untouched. That is the shape live transcription,
+  agent-assist and compliance monitoring need. Available declaratively as the
+  `ws_tee`, `ws_tee_direction` (`both` | `caller` | `callee`) and
+  `ws_tee_channels` (2 = caller/callee stereo, 1 = mixed mono) media-profile
+  fields, and imperatively mid-call as `rtpengine.attach_ws_tee(target, ws_uri,
+  direction="both", channels=None)` / `rtpengine.detach_ws_tee(target)`. Requires
+  `media.backend: siphon-rtp` (`siphon-rtp-proto` 0.1.5 `AttachWsTee` /
+  `DetachWsTee`); rtpengine and rtpproxy reject a tee profile at config load and
+  raise on the per-call verbs rather than returning a hollow success that streams
+  nothing.
+- **`@rtpengine.on_ws_tee_started` / `@rtpengine.on_ws_tee_ended`** — a tee can
+  end while the call carries on (the server closes the socket, the transport
+  fails), which is otherwise invisible: nothing about the call changes and the
+  consumer simply stops receiving audio. `on_ws_tee_ended` reports `reason`
+  (`detached` is the only orderly one), plus `frames_sent` and `frames_dropped`
+  so a slow consumer is distinguishable from a dead one; an unexpected end is
+  logged at WARN whether or not a handler is registered. `on_ws_tee_started`
+  carries the negotiated `channels` and `sample_rate` so a consumer decodes the
+  binary frames rather than guessing, and `stream_id` correlates the control
+  event with the `start` envelope on the socket. Both take the same optional
+  `call_id` / `from_tag` filters as `@rtpengine.on_dtmf`.
 - **Media profiles can drive the `siphon-rtp` WebSocket audio bridge and its DSP
   chain.** The engine has supported handing a leg's audio to an external
   WebSocket media server (decode → L16 uplink, L16 downlink → encode, the WS

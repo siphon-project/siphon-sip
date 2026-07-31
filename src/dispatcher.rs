@@ -1213,6 +1213,138 @@ pub async fn run(
                             crate::cdr::write(media_summary_to_cdr(&summary));
                         }
                     }
+                    crate::rtpengine::events::RtpEngineEvent::WsTeeStarted(tee) => {
+                        tracing::debug!(
+                            call_id = %tee.call_id,
+                            from_tag = %tee.from_tag,
+                            stream_id = %tee.stream_id,
+                            ws_uri = %tee.ws_uri,
+                            direction = %tee.direction.as_str(),
+                            channels = tee.channels,
+                            sample_rate = tee.sample_rate,
+                            "media engine started a websocket tee"
+                        );
+                        let engine_state = state_for_events.engine.state();
+                        let handlers =
+                            engine_state.ws_tee_started_handlers(&tee.call_id, &tee.from_tag);
+                        if handlers.is_empty() {
+                            continue;
+                        }
+                        let state_ref = Arc::clone(&state_for_events);
+                        let tee_clone = tee.clone();
+                        let _ = crate::script::py_executor::try_run(move || {
+                            let engine_state = state_ref.engine.state();
+                            let handlers = engine_state
+                                .ws_tee_started_handlers(&tee_clone.call_id, &tee_clone.from_tag);
+                            pyo3::Python::attach(|python| {
+                                for handler in handlers {
+                                    let callable = handler.callable.bind(python);
+                                    let result = callable.call1((
+                                        tee_clone.call_id.as_str(),
+                                        tee_clone.from_tag.as_str(),
+                                        tee_clone.stream_id.as_str(),
+                                        tee_clone.ws_uri.as_str(),
+                                        tee_clone.direction.as_str(),
+                                        tee_clone.channels,
+                                        tee_clone.sample_rate,
+                                    ));
+                                    match result {
+                                        Ok(ret) => {
+                                            if handler.is_async {
+                                                if let Err(error) = run_coroutine(python, &ret) {
+                                                    tracing::error!(
+                                                        %error,
+                                                        "async rtpengine.on_ws_tee_started handler error"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                %error,
+                                                "rtpengine.on_ws_tee_started handler failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        })
+                        .await;
+                    }
+                    crate::rtpengine::events::RtpEngineEvent::WsTeeEnded(tee) => {
+                        // A tee that ends for anything other than an explicit
+                        // detach means audio stopped reaching the consumer while
+                        // the call is still up — the AI backend went away and the
+                        // caller is now talking to nothing.  Log that at WARN even
+                        // when no handler is registered, so it is visible rather
+                        // than inferred from missing audio.
+                        if tee.reason.is_unexpected() {
+                            tracing::warn!(
+                                call_id = %tee.call_id,
+                                from_tag = %tee.from_tag,
+                                stream_id = %tee.stream_id,
+                                reason = %tee.reason.as_str(),
+                                frames_sent = ?tee.frames_sent,
+                                frames_dropped = ?tee.frames_dropped,
+                                "websocket tee ended unexpectedly (call still up, audio no longer streaming)"
+                            );
+                        } else {
+                            tracing::debug!(
+                                call_id = %tee.call_id,
+                                from_tag = %tee.from_tag,
+                                stream_id = %tee.stream_id,
+                                reason = %tee.reason.as_str(),
+                                frames_sent = ?tee.frames_sent,
+                                frames_dropped = ?tee.frames_dropped,
+                                "websocket tee ended"
+                            );
+                        }
+                        let engine_state = state_for_events.engine.state();
+                        let handlers =
+                            engine_state.ws_tee_ended_handlers(&tee.call_id, &tee.from_tag);
+                        if handlers.is_empty() {
+                            continue;
+                        }
+                        let state_ref = Arc::clone(&state_for_events);
+                        let tee_clone = tee.clone();
+                        let _ = crate::script::py_executor::try_run(move || {
+                            let engine_state = state_ref.engine.state();
+                            let handlers = engine_state
+                                .ws_tee_ended_handlers(&tee_clone.call_id, &tee_clone.from_tag);
+                            pyo3::Python::attach(|python| {
+                                for handler in handlers {
+                                    let callable = handler.callable.bind(python);
+                                    let result = callable.call1((
+                                        tee_clone.call_id.as_str(),
+                                        tee_clone.from_tag.as_str(),
+                                        tee_clone.stream_id.as_str(),
+                                        tee_clone.reason.as_str(),
+                                        tee_clone.frames_sent,
+                                        tee_clone.frames_dropped,
+                                    ));
+                                    match result {
+                                        Ok(ret) => {
+                                            if handler.is_async {
+                                                if let Err(error) = run_coroutine(python, &ret) {
+                                                    tracing::error!(
+                                                        %error,
+                                                        "async rtpengine.on_ws_tee_ended handler error"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                %error,
+                                                "rtpengine.on_ws_tee_ended handler failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        })
+                        .await;
+                    }
                     crate::rtpengine::events::RtpEngineEvent::Unknown { event, call_id, .. } => {
                         tracing::debug!(
                             %event,
