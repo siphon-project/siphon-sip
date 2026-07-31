@@ -1,0 +1,30 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "siphon-control"
+description = "Python client for the SIPhon external control plane (siphon-control.v1) — an ARI/ESL-class rail for driving handed-over calls"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+readme = "README.md"
+dynamic = ["version"]
+keywords = ["sip", "voip", "b2bua", "control", "ari", "telephony"]
+authors = [{ name = "The SIPhon authors" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Communications :: Telephony",
+    "License :: OSI Approved :: MIT License",
+]
+
+[project.urls]
+Repository = "https://github.com/siphon-project/siphon-sip"
+
+[tool.maturin]
+module-name = "siphon_control"
+# Version-tagged wheel (no abi3): the SIPhon runtime is free-threaded CPython
+# 3.14t, where the stable ABI is unavailable. The wheel loads on both GIL and
+# free-threaded 3.14.
+features = ["pyo3/extension-module"]

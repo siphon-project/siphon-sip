@@ -1,0 +1,19 @@
+[package]
+name = "siphon-control-proto"
+description = "Wire protocol DTOs for the SIPhon external control plane (siphon-control.v1)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["sip", "voip", "b2bua", "control", "ari"]
+categories = ["network-programming"]
+readme = "README.md"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

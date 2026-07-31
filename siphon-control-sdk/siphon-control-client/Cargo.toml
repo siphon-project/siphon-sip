@@ -1,0 +1,27 @@
+[package]
+name = "siphon-control-client"
+description = "Async Rust client for the SIPhon external control plane (siphon-control.v1)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["sip", "voip", "b2bua", "control", "ari"]
+categories = ["network-programming"]
+readme = "README.md"
+
+[dependencies]
+siphon-control-proto = { path = "../siphon-control-proto", version = "0.1.0" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true, features = ["connect", "rustls-tls-webpki-roots"] }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+axum = { version = "0.8.8", features = ["ws", "tokio"] }
+tracing-subscriber = "0.3"
