@@ -366,6 +366,89 @@ pub fn next_hop_from_route(headers: &SipHeaders) -> Option<String> {
     entries.first().map(|entry| entry.uri.to_string())
 }
 
+/// Build the Route header value for a target from the Path vector stored with
+/// its registration binding (RFC 3327 §5.3).
+///
+/// The Path vector is preserved in order — Path\[0\] is the proxy nearest the
+/// registrar, so it becomes the first Route entry and therefore this branch's
+/// next hop.  Each stored value is normalized to a single `<uri;lr>` entry; a
+/// stored value that itself holds several comma-separated entries (legal, one
+/// Path header can carry a list) expands to that many Route entries, and any
+/// header-level parameters after the `>` are preserved.
+///
+/// Returns `None` for an empty Path vector — the caller then leaves the
+/// request's existing Route set alone.
+///
+/// This is what makes two bindings of one AoR independently routable: they
+/// commonly traverse different edge proxies, or the same edge proxy with a
+/// different per-registration Path token (RFC 3327 §5 / TS 24.229 §5.2.7.2),
+/// so every fork branch needs *its own* route set rather than the one the
+/// script happened to leave on the request.
+pub fn route_set_from_path(path: &[String]) -> Option<String> {
+    let mut entries: Vec<String> = Vec::new();
+    for raw in path {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        match RouteEntry::parse_multi(trimmed) {
+            Ok(parsed) if !parsed.is_empty() => {
+                // `RouteEntry`'s Display re-emits `<uri>;header-params`, so URI
+                // parameters (`;lr`, `;ob`) and header parameters both survive.
+                entries.extend(parsed.iter().map(|entry| entry.to_string()));
+            }
+            // Unparseable as a name-addr (e.g. a bare `sip:host;lr` addr-spec,
+            // which RFC 3327's grammar allows when there are no header params).
+            // Wrap it verbatim rather than dropping the hop — losing a Path
+            // entry silently would route the branch to the wrong place.
+            _ => entries.push(format!("<{}>", trimmed.trim_matches(['<', '>']).trim())),
+        }
+    }
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries.join(", "))
+    }
+}
+
+/// How one fork branch is routed: its own Route header set (from the
+/// registration binding's Path vector) and the URI to actually send it to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchRouting {
+    /// Route header value to set on this branch, replacing any Route the
+    /// request carried.  `None` when the binding has no Path — the branch then
+    /// keeps the request's existing Route set (today's bare-URI behaviour).
+    pub route_set: Option<String>,
+    /// URI to resolve for this branch's next hop: the topmost Route when a
+    /// route set applies (RFC 3261 §16.6 step 6), else the branch target.
+    pub next_hop: String,
+}
+
+/// Decide how to route one fork branch, given the branch target (the Contact
+/// URI, which stays the Request-URI) and the Path vector stored with that
+/// binding.
+///
+/// Returns `None` when the binding has a Path that cannot be turned into a
+/// usable route set.  The caller must drop that branch rather than fall back
+/// to the target URI: a binding whose Path is unusable is not reachable by
+/// Request-URI either, and silently sending it anyway is how a branch ends up
+/// delivered to the *wrong* binding.
+pub fn branch_routing(branch_path: &[String], target: &str) -> Option<BranchRouting> {
+    let Some(route_set) = route_set_from_path(branch_path) else {
+        return Some(BranchRouting {
+            route_set: None,
+            next_hop: target.to_string(),
+        });
+    };
+    let mut headers = SipHeaders::new();
+    headers.set("Route", route_set.clone());
+    let next_hop = next_hop_from_route(&headers)?;
+    Some(BranchRouting {
+        route_set: Some(route_set),
+        next_hop,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -778,6 +861,150 @@ mod tests {
     fn next_hop_from_route_none_when_no_route() {
         let headers = SipHeaders::new();
         assert!(super::next_hop_from_route(&headers).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // route_set_from_path (RFC 3327 §5.3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn route_set_from_path_preserves_order() {
+        // Path[0] is the hop nearest the registrar, so it must stay first —
+        // it is the branch's next hop.
+        let path = vec![
+            "<sip:icscf.ims.example.com;lr>".to_string(),
+            "<sip:pcscf.ims.example.com;lr>".to_string(),
+        ];
+        let route = super::route_set_from_path(&path).unwrap();
+        assert_eq!(
+            route,
+            "<sip:icscf.ims.example.com;lr>, <sip:pcscf.ims.example.com;lr>"
+        );
+    }
+
+    #[test]
+    fn route_set_from_path_keeps_token_userpart() {
+        // The whole point of per-branch route sets: the opaque per-registration
+        // token in the Path userpart is what the edge proxy resolves back to a
+        // binding (RFC 3327 §5 / TS 24.229 §5.2.7.2).
+        let path = vec!["<sip:TOKEN-B@edge.example.com;lr>".to_string()];
+        let route = super::route_set_from_path(&path).unwrap();
+        assert!(route.contains("TOKEN-B@edge.example.com"));
+    }
+
+    #[test]
+    fn route_set_from_path_expands_comma_separated_value() {
+        // One Path header may carry a list; each entry becomes its own Route.
+        let path = vec!["<sip:a.example.com;lr>, <sip:b.example.com;lr>".to_string()];
+        let route = super::route_set_from_path(&path).unwrap();
+        assert_eq!(route, "<sip:a.example.com;lr>, <sip:b.example.com;lr>");
+        let entries = RouteEntry::parse_multi(&route).unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn route_set_from_path_preserves_header_params() {
+        let path = vec!["<sip:edge.example.com;lr>;ob".to_string()];
+        let route = super::route_set_from_path(&path).unwrap();
+        assert_eq!(route, "<sip:edge.example.com;lr>;ob");
+    }
+
+    #[test]
+    fn route_set_from_path_wraps_bare_addr_spec() {
+        // RFC 3327's path-value allows a bare addr-spec; it must not be dropped.
+        let path = vec!["sip:edge.example.com;lr".to_string()];
+        let route = super::route_set_from_path(&path).unwrap();
+        assert_eq!(route, "<sip:edge.example.com;lr>");
+        assert!(super::next_hop_from_route(&route_headers(&route)).is_some());
+    }
+
+    #[test]
+    fn route_set_from_path_empty_is_none() {
+        assert!(super::route_set_from_path(&[]).is_none());
+        assert!(super::route_set_from_path(&["   ".to_string()]).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // branch_routing — the per-branch decision the proxy fork path makes
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn branch_routing_sends_each_branch_through_its_own_path() {
+        // The reported bug, at the decision that causes it: two bindings of one
+        // AoR behind the same Path-token edge proxy.  Each branch must resolve
+        // to its OWN token, otherwise branch 1 is just a retry of binding 0.
+        let branch_a = super::branch_routing(
+            &["<sip:TOKEN-A@edge.example.com;lr>".to_string()],
+            "sip:alice@10.0.0.1:5060",
+        )
+        .unwrap();
+        let branch_b = super::branch_routing(
+            &["<sip:TOKEN-B@edge.example.com;lr>".to_string()],
+            "sip:alice@10.0.0.2:5060",
+        )
+        .unwrap();
+
+        assert_eq!(
+            branch_a.route_set.as_deref(),
+            Some("<sip:TOKEN-A@edge.example.com;lr>")
+        );
+        assert_eq!(
+            branch_b.route_set.as_deref(),
+            Some("<sip:TOKEN-B@edge.example.com;lr>")
+        );
+        assert_ne!(
+            branch_a.route_set, branch_b.route_set,
+            "the two branches must not share a route set"
+        );
+        // Both go to the same edge proxy host — the token in the Route is what
+        // distinguishes the bindings, so the next hop being equal is correct.
+        assert!(branch_a.next_hop.contains("TOKEN-A@edge.example.com"));
+        assert!(branch_b.next_hop.contains("TOKEN-B@edge.example.com"));
+    }
+
+    #[test]
+    fn branch_routing_without_path_keeps_target_routing() {
+        let routing = super::branch_routing(&[], "sip:alice@10.0.0.1:5060").unwrap();
+        assert!(
+            routing.route_set.is_none(),
+            "no Path must leave the request's Route set untouched"
+        );
+        assert_eq!(routing.next_hop, "sip:alice@10.0.0.1:5060");
+    }
+
+    #[test]
+    fn branch_routing_next_hop_is_top_route_not_the_contact() {
+        // RFC 3261 §16.6 step 6 — with a route set, the branch goes to the top
+        // Route.  The Contact URI stays the Request-URI (applied by the caller).
+        let routing = super::branch_routing(
+            &[
+                "<sip:icscf.ims.example.com;lr>".to_string(),
+                "<sip:pcscf.ims.example.com;lr>".to_string(),
+            ],
+            "sip:alice@10.0.0.1:5060",
+        )
+        .unwrap();
+        assert!(routing.next_hop.contains("icscf.ims.example.com"));
+        assert!(!routing.next_hop.contains("10.0.0.1"));
+    }
+
+    #[test]
+    fn branch_routing_drops_branch_with_unusable_path() {
+        // A binding whose Path cannot be parsed into a route set is not
+        // reachable by Request-URI either — falling back to the target would
+        // deliver the branch to the wrong binding, which is the bug being fixed.
+        assert!(super::branch_routing(&["not a uri at all".to_string()], "sip:a@b").is_none());
+    }
+
+    #[test]
+    fn route_set_from_path_next_hop_is_first_entry() {
+        let path = vec![
+            "<sip:first.example.com;lr>".to_string(),
+            "<sip:second.example.com;lr>".to_string(),
+        ];
+        let route = super::route_set_from_path(&path).unwrap();
+        let hop = super::next_hop_from_route(&route_headers(&route)).unwrap();
+        assert!(hop.contains("first.example.com"));
     }
 
     #[test]

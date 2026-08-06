@@ -27,6 +27,15 @@ pub struct StoredContact {
     /// this field fall back to treating `expires_secs` as remaining.
     #[serde(default)]
     pub expires_at: Option<u64>,
+    /// When the binding was created/refreshed, as Unix epoch seconds.
+    ///
+    /// `Contact::registered_at` is a monotonic `Instant`, which cannot cross a
+    /// process boundary — without this the age of every binding restored from a
+    /// backend would reset to zero on restart, and "prefer the most recently
+    /// registered binding" would silently become "prefer an arbitrary one"
+    /// after a restart.  `None` for entries written before this field existed.
+    #[serde(default)]
+    pub registered_at_epoch: Option<u64>,
     /// Call-ID that created this binding.
     pub call_id: String,
     /// CSeq sequence number.
@@ -101,6 +110,9 @@ impl StoredContact {
             q: contact.q,
             expires_secs: remaining,
             expires_at: Some(now_epoch + remaining),
+            registered_at_epoch: Some(
+                now_epoch.saturating_sub(contact.registered_at.elapsed().as_secs()),
+            ),
             call_id: contact.call_id.clone(),
             cseq: contact.cseq,
             source_addr: contact.source_addr.map(|a| a.to_string()),
@@ -138,6 +150,27 @@ impl StoredContact {
         self.remaining_secs() == 0
     }
 
+    /// Rebuild the monotonic `registered_at` for a restored binding so its age
+    /// survives the restart (see [`registered_at_epoch`](Self::registered_at_epoch)).
+    ///
+    /// Falls back to "now" when the stored epoch is missing (legacy entry) or
+    /// lies in the future (clock stepped backwards on a shared backend) —
+    /// treating an unknown age as zero only ever makes a binding look *newer*,
+    /// which is the safe direction: a fresh binding is never preferred less
+    /// than it should be, and expiry is governed by `expires_at`, not this.
+    fn restored_registered_at(&self) -> std::time::Instant {
+        let now = std::time::Instant::now();
+        let Some(registered_at_epoch) = self.registered_at_epoch else {
+            return now;
+        };
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let age = Duration::from_secs(now_epoch.saturating_sub(registered_at_epoch));
+        now.checked_sub(age).unwrap_or(now)
+    }
+
     /// Convert to an in-memory Contact type.
     /// Returns `None` if the URI is unparseable or the contact has expired.
     pub fn to_contact(&self) -> Option<super::Contact> {
@@ -162,7 +195,7 @@ impl StoredContact {
         Some(super::Contact {
             uri,
             q: self.q,
-            registered_at: std::time::Instant::now(),
+            registered_at: self.restored_registered_at(),
             expires: Duration::from_secs(remaining),
             call_id: self.call_id.clone(),
             cseq: self.cseq,
@@ -1423,6 +1456,7 @@ mod tests {
             q: 1.0,
             expires_secs: 3600,
             expires_at: Some(now_epoch + 3600),
+            registered_at_epoch: None,
             call_id: "call-1".to_string(),
             cseq: 1,
             source_addr: None,
@@ -1452,6 +1486,58 @@ mod tests {
         assert_eq!(back.uri, stored.uri);
         assert_eq!(back.q, stored.q);
         assert_eq!(back.call_id, stored.call_id);
+    }
+
+    #[test]
+    fn stored_contact_preserves_registration_age_across_restart() {
+        // `Contact::registered_at` is a monotonic Instant and cannot cross a
+        // process boundary.  Without the epoch, every binding restored from
+        // Redis/Postgres would come back looking brand new and
+        // "prefer the most recently registered binding" would degrade to
+        // "prefer an arbitrary one" after a restart.
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut stored = sample_stored_contact();
+        stored.registered_at_epoch = Some(now_epoch - 900);
+
+        let contact = stored.to_contact().unwrap();
+        assert!(
+            (899..=901).contains(&contact.age_seconds()),
+            "restored binding must keep its age, got {}",
+            contact.age_seconds()
+        );
+
+        // And it survives the trip back out to the backend.
+        let back = StoredContact::from_contact(&contact);
+        let round_tripped = back.registered_at_epoch.expect("epoch must be written");
+        assert!(round_tripped.abs_diff(now_epoch - 900) <= 1);
+    }
+
+    #[test]
+    fn stored_contact_without_epoch_reports_zero_age() {
+        // Legacy entry written before age tracking: report a zero age rather
+        // than a nonsense one.  Zero only ever makes a binding look newer,
+        // which is the safe direction — expiry is governed by `expires_at`.
+        let stored = sample_stored_contact();
+        assert!(stored.registered_at_epoch.is_none());
+        let contact = stored.to_contact().unwrap();
+        assert_eq!(contact.age_seconds(), 0);
+    }
+
+    #[test]
+    fn stored_contact_with_future_epoch_reports_zero_age() {
+        // Clock stepped backwards on a shared backend — must not panic or
+        // produce a wrapped age.
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut stored = sample_stored_contact();
+        stored.registered_at_epoch = Some(now_epoch + 10_000);
+        let contact = stored.to_contact().unwrap();
+        assert_eq!(contact.age_seconds(), 0);
     }
 
     #[test]
@@ -1583,6 +1669,7 @@ mod tests {
             q: 1.0,
             expires_secs: 3600,
             expires_at: Some(now_epoch + 3600),
+            registered_at_epoch: None,
             call_id: "c1".to_string(),
             cseq: 1,
             source_addr: Some("10.0.0.1:50000".into()),
@@ -1674,6 +1761,7 @@ mod tests {
         let stored = StoredContact {
             expires_secs: 0,
             expires_at: Some(1), // epoch second 1 — long expired
+            registered_at_epoch: None,
             ..sample_stored_contact()
         };
         assert!(stored.is_expired());
@@ -1689,6 +1777,7 @@ mod tests {
         let stored = StoredContact {
             expires_secs: 9999, // stale value — should be ignored
             expires_at: Some(now_epoch + 100),
+            registered_at_epoch: None,
             ..sample_stored_contact()
         };
         let remaining = stored.remaining_secs();
@@ -1701,6 +1790,7 @@ mod tests {
         let stored = StoredContact {
             expires_secs: 500,
             expires_at: None,
+            registered_at_epoch: None,
             ..sample_stored_contact()
         };
         assert_eq!(stored.remaining_secs(), 500);
@@ -1781,6 +1871,7 @@ mod tests {
                 q: 1.0,
                 expires_secs: 3600,
                 expires_at: Some(now_epoch + 3600),
+                registered_at_epoch: None,
                 call_id: "c1".to_string(),
                 cseq: 1,
                 source_addr: None,
@@ -1805,6 +1896,7 @@ mod tests {
                     q: 1.0,
                     expires_secs: 3600,
                     expires_at: Some(now_epoch + 3600),
+                    registered_at_epoch: None,
                     call_id: "c2".to_string(),
                     cseq: 1,
                     source_addr: None,
@@ -1825,6 +1917,7 @@ mod tests {
                     q: 0.5,
                     expires_secs: 1800,
                     expires_at: Some(now_epoch + 1800),
+                    registered_at_epoch: None,
                     call_id: "c3".to_string(),
                     cseq: 2,
                     source_addr: None,
@@ -1865,6 +1958,7 @@ mod tests {
                 q: 1.0,
                 expires_secs: 0,
                 expires_at: Some(1), // long expired
+                registered_at_epoch: None,
                 call_id: "c1".to_string(),
                 cseq: 1,
                 source_addr: None,
@@ -1906,6 +2000,7 @@ mod tests {
                 q: 1.0,
                 expires_secs: 3600,
                 expires_at: Some(now_epoch + 3600),
+                registered_at_epoch: None,
                 call_id: "c1".to_string(),
                 cseq: 1,
                 source_addr: None,

@@ -92,7 +92,10 @@ def screen(request):
 
 ## Send to voicemail when everything fails
 
-`@proxy.on_failure` fires once all branches of a relay/fork have failed.
+`@proxy.on_failure` fires once all branches of a relay/fork have failed — for a
+single-destination relay that means any non-2xx final. `request.relay(...)` from
+the handler re-targets on the same server transaction, so the caller keeps
+waiting rather than seeing the failure.
 
 ```python
 @proxy.on_failure

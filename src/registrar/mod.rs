@@ -186,6 +186,21 @@ pub struct Contact {
     pub kind: ContactKind,
 }
 
+/// Order routable bindings the way a terminating request should try them:
+/// highest q first (RFC 3261 §20.10 — the caller's declared preference), and
+/// within one q value the most recently registered binding first.
+///
+/// Recency is the tiebreak rather than the primary key because q is an explicit
+/// instruction from the registering UA; but since almost no UE sends q, recency
+/// is what actually orders a real AoR's bindings.
+fn sort_by_preference(contacts: &mut [Contact]) {
+    contacts.sort_by(|a, b| {
+        b.q.partial_cmp(&a.q)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.age_seconds().cmp(&b.age_seconds()))
+    });
+}
+
 impl Contact {
     /// Seconds remaining until this contact expires.
     pub fn remaining_seconds(&self) -> u64 {
@@ -196,6 +211,18 @@ impl Contact {
     /// Whether this contact has expired.
     pub fn is_expired(&self) -> bool {
         self.registered_at.elapsed() >= self.expires
+    }
+
+    /// Seconds since this binding was created or last refreshed.
+    ///
+    /// The ordering signal for "prefer the most recently registered binding",
+    /// which is what a terminating request wants when a subscriber's SIM has
+    /// moved to a new handset and the old binding is still inside its granted
+    /// expiry.  Remaining `expires` cannot answer that: a UE that asked for
+    /// 600 s and registered a second ago has less time left than one that asked
+    /// for 3600 s an hour ago.
+    pub fn age_seconds(&self) -> u64 {
+        self.registered_at.elapsed().as_secs()
     }
 }
 
@@ -966,7 +993,16 @@ impl Registrar {
     }
 
     /// Look up routable contacts for an AoR. Returns non-expired UE-side
-    /// contacts sorted by q descending.
+    /// contacts sorted by q descending, most recently registered first within
+    /// one q value.
+    ///
+    /// The q-value is the caller's declared preference (RFC 3261 §20.10) and so
+    /// dominates.  Most UEs send no q at all, which leaves every binding at the
+    /// same value and makes recency the effective order — the right default for
+    /// a terminating request when a subscriber's SIM has moved to a new handset
+    /// and the previous binding is still inside its granted expiry.  (Before
+    /// this the list came back in backend insertion order, i.e. oldest first,
+    /// while this doc already claimed q ordering.)
     ///
     /// If `aor` is an alias of an IMS implicit registration set's primary,
     /// returns the primary's contacts (so terminating routing on a non-primary
@@ -978,7 +1014,7 @@ impl Registrar {
     /// merged view that reg-event NOTIFY emission uses.
     pub fn lookup(&self, aor: &str) -> Vec<Contact> {
         let primary = self.resolve_alias(aor);
-        match self.bindings.get(primary.as_str()) {
+        let mut out: Vec<Contact> = match self.bindings.get(primary.as_str()) {
             Some(entry) => entry
                 .value()
                 .iter()
@@ -986,7 +1022,9 @@ impl Registrar {
                 .cloned()
                 .collect(),
             None => Vec::new(),
-        }
+        };
+        sort_by_preference(&mut out);
+        out
     }
 
     /// Look up every non-expired contact for an AoR, including AS-side
@@ -1064,7 +1102,7 @@ impl Registrar {
                 }
             }
         }
-        out.sort_by(|a, b| b.q.partial_cmp(&a.q).unwrap_or(std::cmp::Ordering::Equal));
+        sort_by_preference(&mut out);
         out
     }
 
@@ -2841,6 +2879,117 @@ mod tests {
         let contacts = registrar.lookup("sip:alice@example.com");
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].path, path);
+    }
+
+    #[test]
+    fn lookup_returns_most_recently_registered_first() {
+        // A subscriber's SIM moved to a new handset and the old binding is
+        // still inside its granted expiry.  A terminating request should try
+        // the new one first; before this, lookup() handed back backend
+        // insertion order (oldest first) while claiming to sort.
+        let registrar = Registrar::default();
+        registrar
+            .save_full(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600, 1.0, "old-handset".into(), 1,
+                None, None, None, None,
+                Vec::new(),
+                FlowCapture::default(),
+                Vec::new(),
+            )
+            .unwrap();
+        registrar
+            .save_full(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.2"),
+                3600, 1.0, "new-handset".into(), 1,
+                None, None, None, None,
+                Vec::new(),
+                FlowCapture::default(),
+                Vec::new(),
+            )
+            .unwrap();
+
+        // Age the first binding so recency is unambiguous.
+        if let Some(mut entry) = registrar.bindings.get_mut("sip:alice@example.com") {
+            for contact in entry.value_mut().iter_mut() {
+                if contact.call_id == "old-handset" {
+                    contact.registered_at = Instant::now() - Duration::from_secs(600);
+                }
+            }
+        }
+
+        let contacts = registrar.lookup("sip:alice@example.com");
+        assert_eq!(contacts.len(), 2);
+        assert_eq!(contacts[0].call_id, "new-handset");
+        assert_eq!(contacts[1].call_id, "old-handset");
+    }
+
+    #[test]
+    fn lookup_q_value_beats_recency() {
+        // q is the registering UA's explicit preference (RFC 3261 §20.10), so
+        // it must dominate; recency only breaks ties.
+        let registrar = Registrar::default();
+        registrar
+            .save_full(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600, 1.0, "preferred-but-old".into(), 1,
+                None, None, None, None,
+                Vec::new(),
+                FlowCapture::default(),
+                Vec::new(),
+            )
+            .unwrap();
+        registrar
+            .save_full(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.2"),
+                3600, 0.3, "recent-but-deprioritised".into(), 1,
+                None, None, None, None,
+                Vec::new(),
+                FlowCapture::default(),
+                Vec::new(),
+            )
+            .unwrap();
+        if let Some(mut entry) = registrar.bindings.get_mut("sip:alice@example.com") {
+            for contact in entry.value_mut().iter_mut() {
+                if contact.call_id == "preferred-but-old" {
+                    contact.registered_at = Instant::now() - Duration::from_secs(3000);
+                }
+            }
+        }
+
+        let contacts = registrar.lookup("sip:alice@example.com");
+        assert_eq!(contacts[0].call_id, "preferred-but-old");
+    }
+
+    #[test]
+    fn contact_age_seconds_tracks_registration_time() {
+        let registrar = Registrar::default();
+        registrar
+            .save_full(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600, 1.0, "c1".into(), 1,
+                None, None, None, None,
+                Vec::new(),
+                FlowCapture::default(),
+                Vec::new(),
+            )
+            .unwrap();
+        if let Some(mut entry) = registrar.bindings.get_mut("sip:alice@example.com") {
+            for contact in entry.value_mut().iter_mut() {
+                contact.registered_at = Instant::now() - Duration::from_secs(120);
+            }
+        }
+
+        let contacts = registrar.lookup("sip:alice@example.com");
+        assert!((119..=121).contains(&contacts[0].age_seconds()));
+        // Remaining expiry cannot stand in for age — this binding still has
+        // most of its hour left despite being two minutes old.
+        assert!(contacts[0].remaining_seconds() > 3000);
     }
 
     #[test]

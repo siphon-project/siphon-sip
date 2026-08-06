@@ -7,6 +7,11 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **`Contact.age_secs`** — seconds since a binding was created or last
+  refreshed, for scripts that need their own recency rule (`[c for c in
+  registrar.lookup(uri) if c.age_secs < 3600]`). Monotonic, and preserved
+  across a restart for bindings restored from a persistence backend; a stored
+  record written before age tracking reports `0`.
 - **Media profiles can drive the `siphon-rtp` WebSocket audio bridge and its DSP
   chain.** The engine has supported handing a leg's audio to an external
   WebSocket media server (decode → L16 uplink, L16 downlink → encode, the WS
@@ -92,6 +97,68 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   list is currently **empty** — all 50 fixtures are handled as the RFC requires.
 
 ### Fixed
+- **A terminating request can now fail over between the bindings of one AoR.**
+  An AoR with more than one live binding where only one was reachable was
+  undeliverable for the full lifetime of the dead binding — observed as a
+  79-minute total loss of terminating MESSAGE to a subscriber who was
+  registered, reachable and successfully sending throughout; the same shape
+  applied to terminating INVITE. Four separate defects sat between a script and
+  "try the next contact":
+  - `request.fork()` sent every branch with the **first** contact's route set.
+    Two bindings of one AoR normally have *different* RFC 3327 Path vectors —
+    different edge proxies, or the same edge proxy with a different
+    per-registration token — so downstream resolved every branch back to
+    binding 0. With `strategy="sequential"` that made failover retry the dead
+    contact N times and answer the same error. A `Contact` passed to `fork()`
+    now gets its own Route header set built from its Path (in order, RFC 3327
+    §5.3), and that route set decides the branch's next hop (RFC 3261 §16.6
+    step 6); the Request-URI stays the Contact URI. Bare-string targets keep
+    pure Request-URI routing, which is also the way to opt a target out.
+  - **`@proxy.on_failure` never fired for a single-destination
+    `request.relay()`** — it was dispatched only from the fork aggregator's
+    all-branches-failed arm, so a proxy's global failure policy was invisible
+    for the commonest case in a proxy and a registered handler simply never
+    ran. It now fires for any non-2xx final on a plain relay. `487 Request
+    Terminated` is excluded: the transaction was cancelled by the UAC, and
+    re-targeting there would resurrect an abandoned call (`@proxy.on_cancel`
+    is the hook for that teardown).
+  - **Neither failure hook could re-target the request.** Both handed the
+    script a `Request` with its inbound flow deliberately replayed for exactly
+    that purpose, then dropped it — the action a handler set with
+    `request.relay()` / `request.fork()` was never executed, and because the
+    reply had not been relayed the error was suppressed too. A retrying
+    handler therefore sent nothing at all and the UAC waited for its own timer.
+    Both `@proxy.on_failure` and the per-relay `on_failure=` callback now start
+    the re-targeted request on the same server transaction, bounded at 8
+    retargets per transaction (a chain of fresh client transactions has no
+    protocol timer to bound it). This is what the shipped
+    [`examples/ims_icscf.py`](examples/ims_icscf.py) S-CSCF failover and the
+    cookbook's failure-route snippet always claimed to do.
+  - **`Contact` exposed no registration time,** so bindings could not be
+    ordered by recency; remaining `expires` is not a substitute, since a UE
+    that asked for 600 s and registered a second ago has less time left than
+    one that asked for 3600 s an hour ago.
+- **The 2xx ACK was relayed once per fork branch,** all resolving to the one UAS
+  that answered, because the ACK path iterated the session's client branches
+  (a comment there assumed "typically just one"). A 2xx ACK is a new request
+  routed by the dialog route set (RFC 3261 §13.2.2.4) and belongs to exactly one
+  remote target; a strict UAS treats the duplicate as an out-of-sequence request
+  on a dialog it has already confirmed. Now sent once per distinct resolved hop.
+- **`registrar.lookup()` did not sort,** despite its own documentation and both
+  sibling lookups promising q-value order — it returned backend insertion order
+  (oldest first). It now returns highest q first (RFC 3261 §20.10), and within
+  one q value the most recently registered binding first. Since almost no UE
+  sends q, recency is what actually orders a real AoR's bindings, which is the
+  right default when a subscriber's SIM has moved to a new handset and the
+  previous binding is still inside its granted expiry.
+- **A binding's Path now outranks its captured inbound flow when routing a fork
+  branch.** A binding registered *through* a proxy is reached via its Path
+  vector; the captured flow answers the narrower "the Contact URI is
+  unreachable, write back on the connection the REGISTER arrived on" question,
+  and using it here sent the branch to the REGISTER's source while dropping the
+  token that identifies which binding the request is for. With no Path the flow
+  is unchanged — still the only way back to a WebSocket UE (RFC 5626 §5.3 /
+  RFC 7118 §5).
 - **B2BUA-originated requests are now retransmitted per RFC 3261 §17.1 on
   unreliable transports.** The proxy datapath relays through the transaction
   layer and so has always had Timer A (INVITE, §17.1.1.2) and Timer E

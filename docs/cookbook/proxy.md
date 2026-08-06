@@ -77,6 +77,21 @@ def failure_route(request, reply):
     reply.relay()
 ```
 
+`@proxy.on_failure` also fires for a plain single-destination `request.relay()`
+— there is nothing to aggregate, so every non-2xx final response is "it failed".
+The one exclusion is `487 Request Terminated`: the caller cancelled, and
+re-targeting there would resurrect a call they have already abandoned (use
+`@proxy.on_cancel` for that teardown).
+
+The handler has three ways out. `reply.relay()` forwards the failure; a
+`request.reply(code, reason)` answers with something else; and
+`request.relay(...)` / `request.fork(...)` **re-targets** — a fresh attempt on
+the same server transaction, so the caller keeps waiting on its original request
+instead of seeing the error. Returning without any of them drops silently.
+Re-targeting is bounded at 8 attempts per transaction (nothing in the protocol
+bounds a chain of fresh client transactions), after which the failure is
+forwarded.
+
 And to touch responses on the way back (rewrite headers, strip internal info):
 
 ```python

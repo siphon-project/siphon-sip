@@ -29,7 +29,7 @@ Content-Length: 0
 ]]>
   </send>
 
-  <recv request="ACK" optional="true" />
+  <recv request="ACK" />
 
   <pause milliseconds="100" />
 
@@ -49,7 +49,7 @@ Content-Length: 0
 ]]>
   </send>
 
-  <recv request="ACK" optional="true" />
+  <recv request="ACK" />
 
   <pause milliseconds="100" />
 
@@ -94,7 +94,7 @@ a=rtpmap:0 PCMU/8000
 ]]>
   </send>
 
-  <recv request="ACK" optional="true" />
+  <recv request="ACK" />
 
   <!-- Wait for BYE -->
   <recv request="BYE" />
