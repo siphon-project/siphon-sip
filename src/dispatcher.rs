@@ -1560,8 +1560,30 @@ fn process_timer_actions_with_followups(
                 state.timer_wheel.remove(&timer_id);
             }
             Action::Timeout => {
+                // RFC 3261 §16.7 step 2: when a client transaction times out
+                // (Timer B for INVITE, Timer F otherwise), the proxy MUST
+                // behave as if a 408 had been received on that branch.  Logging
+                // and reaping left the upstream UAC waiting on its `100 Trying`
+                // until its own Timer F — the proxy knew the branch was dead 32
+                // seconds earlier and said nothing.
+                //
+                // This is the backstop for *every* way a branch can go quiet,
+                // not just the connect failures §16.9 covers: a black-holed
+                // route, a peer that accepts the TCP connection and never
+                // answers, a datagram lost on the wire.
+                //
+                // Server transactions reach this arm too (Timer H waiting for
+                // an ACK); `fail_branch_locally` no-ops for anything that is
+                // not a client branch of a live proxy session.
                 warn!(key = %key, "transaction timeout");
-                // Session cleanup happens via sweep_stale_entries
+                fail_branch_locally(
+                    key,
+                    408,
+                    "Request Timeout",
+                    "client transaction timed out (RFC 3261 §16.7)",
+                    state,
+                );
+                // Remaining session cleanup happens via sweep_stale_entries.
             }
             Action::ProtocolError(message) => {
                 warn!(key = %key, "transaction protocol error: {message}");
@@ -3836,7 +3858,7 @@ fn relay_request(
     //     to the live accepted-connection write half registered in
     //     `connection_map`.  No DNS, no pool lookup.
     //   - URI-relay: the legacy path through `send_to_target`.
-    let connection_id = if let Some(local) = flow_local_addr {
+    let outcome = if let Some(local) = flow_local_addr {
         let outbound_message = OutboundMessage {
             followups: None,
             connection_id: ConnectionId(flow.map(|f| f.connection_id).unwrap_or(0)),
@@ -3853,6 +3875,7 @@ fn relay_request(
                 transport = %outbound_transport,
                 "flow-relay outbound send failed: {error}"
             );
+            SendOutcome::failed()
         } else {
             debug!(
                 destination = %destination,
@@ -3860,8 +3883,8 @@ fn relay_request(
                 connection_id = ?cid,
                 "relayed via captured flow"
             );
+            SendOutcome::sent(cid)
         }
-        cid
     } else {
         // Build the legacy RelayTarget for the URI path.
         let target = RelayTarget {
@@ -3878,6 +3901,26 @@ fn relay_request(
             state,
         )
     };
+    let connection_id = outcome.connection_id;
+
+    // RFC 3261 §16.9: a transport error on forwarding MUST be handled as if a
+    // 503 had been received on that branch.  Without this the branch simply
+    // goes quiet — the upstream UAC sits on the 100 Trying until its own
+    // Timer F, which is 32 s of nothing where the caller should have been
+    // told in milliseconds.
+    if outcome.delivery_failed {
+        if let Some(ref client_key) = client_key_opt {
+            fail_branch_locally(
+                client_key,
+                503,
+                "Service Unavailable",
+                "transport error on forwarding (RFC 3261 §16.9)",
+                state,
+            );
+            return;
+        }
+    }
+
     // Patch the session's ClientBranch via the locally-held `Arc` we got
     // back from `session_store.insert(...)` rather than re-looking up
     // through the store: at high CPS on TCP loopback the UAS 200 OK can
@@ -4300,7 +4343,7 @@ fn relay_fork_branch(
     // Send: over the captured flow (direct OutboundMessage, bypassing DNS/pool
     // — mirrors the relay(flow=...) path) when one is attached, else via the
     // normal resolver/pool path.
-    let connection_id = if let Some(flow) = flow {
+    let outcome = if let Some(flow) = flow {
         // This branch bypasses `send_to_target`, so it has to do that helper's
         // HEP capture itself — otherwise a flow-pinned relay is the one request
         // that never reaches Homer.
@@ -4324,12 +4367,32 @@ fn relay_fork_branch(
         let cid = outbound_message.connection_id;
         if let Err(error) = state.outbound.send(outbound_message) {
             error!(branch = %branch, destination = %destination, transport = %outbound_transport, "fork: flow send failed: {error}");
+            SendOutcome::failed()
+        } else {
+            SendOutcome::sent(cid)
         }
-        cid
     } else {
         let relay_target = RelayTarget { address: destination, transport: Some(outbound_transport), server_name: None };
         send_to_target(data, &relay_target, inbound.transport, inbound.connection_id, send_socket.map(|pin| pin.addr), state)
     };
+    let connection_id = outcome.connection_id;
+
+    // RFC 3261 §16.9 — a transport error on this branch is a 503 on this
+    // branch.  Feeding it to the aggregator is what lets a parallel fork carry
+    // on with its other branches and a sequential fork move to the next one,
+    // instead of the whole fork stalling on a branch that never left the box.
+    if outcome.delivery_failed {
+        if let Some(ref client_key) = client_key_opt {
+            fail_branch_locally(
+                client_key,
+                503,
+                "Service Unavailable",
+                "transport error on forwarding (RFC 3261 §16.9)",
+                state,
+            );
+            return;
+        }
+    }
 
     debug!(
         branch = %branch,
@@ -4638,6 +4701,139 @@ fn execute_failure_retarget(
         "on_failure: re-targeted the request"
     );
     true
+}
+
+/// Rewrite a 503 the proxy is about to forward upstream into a 500
+/// (RFC 3261 §16.7 step 6), returning the status code actually forwarded.
+///
+/// A 503 means *this* next hop is unavailable. Passing it to the UAC would
+/// invite it to treat the proxy itself as out of service (RFC 3261 §20.33
+/// Retry-After semantics), which is both wrong and self-inflicted: the proxy is
+/// fine, one downstream target is not.
+///
+/// Any other status is returned unchanged.
+fn downgrade_503_for_upstream(
+    message: &mut SipMessage,
+    status_code: u16,
+    server_key: &TransactionKey,
+) -> u16 {
+    if status_code != 503 {
+        return status_code;
+    }
+    if let StartLine::Response(ref mut status_line) = message.start_line {
+        status_line.status_code = 500;
+        status_line.reason_phrase = "Server Internal Error".to_string();
+    }
+    // Retry-After on a 503 is about the unavailable downstream, not about us.
+    message.headers.remove("Retry-After");
+    debug!(
+        key = %server_key,
+        "forwarding 503 upstream as 500 (RFC 3261 §16.7)"
+    );
+    500
+}
+
+/// Answer a proxy client branch that will never be answered from the network,
+/// by injecting the response RFC 3261 says the proxy must behave as if it had
+/// received.
+///
+/// Two callers, one rule each:
+///
+/// * **§16.9** — a transport error on forwarding is a **503** on that branch.
+/// * **§16.7 step 2** — a client transaction that times out (Timer B / Timer F)
+///   is a **408** on that branch.
+///
+/// Both used to end at a `warn!` and nothing else, so the upstream UAC was left
+/// holding a `100 Trying` until its own Timer F fired: 32 s of silence where
+/// the proxy already knew the answer.
+///
+/// The response is routed through the ordinary [`handle_response`] path rather
+/// than being forwarded directly, because everything that has to happen next is
+/// already implemented there and only there — fork aggregation (so a parallel
+/// fork keeps waiting on its live branches and a sequential fork advances to
+/// the next target), `@proxy.on_reply` / `@proxy.on_failure`, CDR finalisation,
+/// and the handoff to the server transaction. A direct forward would need its
+/// own copy of all of it and would drift.
+///
+/// No-ops when the branch has no proxy session: a B2BUA leg registers no client
+/// transaction, and a session already torn down by a winning branch has nothing
+/// left to answer.
+fn fail_branch_locally(
+    client_key: &TransactionKey,
+    status_code: u16,
+    reason: &str,
+    cause: &str,
+    state: &DispatcherState,
+) {
+    let Some(session_arc) = state.session_store.get_by_client_key(client_key) else {
+        debug!(
+            key = %client_key,
+            status = status_code,
+            "no proxy session for branch — nothing to answer ({cause})"
+        );
+        return;
+    };
+
+    let (original_request, inbound_local_addr, branch) = {
+        let Ok(session) = session_arc.read() else {
+            error!("proxy session lock poisoned while failing a branch");
+            return;
+        };
+        (
+            session.original_request.clone(),
+            session.inbound_local_addr,
+            session.client_branches.get(client_key).cloned(),
+        )
+    };
+
+    // RFC 3261 §17.1.4: on a transport failure the client transaction goes
+    // straight to Terminated. Dropping it here also stops the synthetic
+    // response below from being fed back into it — which for an INVITE would
+    // otherwise emit an ACK to a peer that never sent anything.
+    state.transaction_manager.remove(client_key);
+
+    let mut response = build_response(
+        &original_request,
+        status_code,
+        reason,
+        state.server_header.as_deref(),
+        &[],
+    );
+
+    // `build_response` copies the request's Via stack, whose top is the UAC's.
+    // The response path keys the branch off the *topmost* Via and strips it, so
+    // put back the Via this proxy stamped on the outbound request — the one the
+    // transaction key was built from — or the injected response matches no
+    // branch and is dropped as an orphan.
+    let branch_transport = branch.as_ref().map(|b| b.transport).unwrap_or(Transport::Udp);
+    let via_value = format!(
+        "SIP/2.0/{} {};branch={}",
+        branch_transport, client_key.sent_by, client_key.branch,
+    );
+    let mut vias = vec![via_value];
+    vias.extend(response.headers.get_all("Via").cloned().unwrap_or_default());
+    response.headers.set_all("Via", vias);
+
+    warn!(
+        key = %client_key,
+        status = status_code,
+        "answering branch locally: {cause}"
+    );
+
+    let inbound = InboundMessage {
+        remote_addr: branch
+            .as_ref()
+            .map(|b| b.destination)
+            .unwrap_or(inbound_local_addr),
+        local_addr: inbound_local_addr,
+        connection_id: branch
+            .as_ref()
+            .map(|b| b.connection_id)
+            .unwrap_or_default(),
+        transport: branch_transport,
+        data: Bytes::new(),
+    };
+    handle_response(inbound, response, status_code, state);
 }
 
 /// Handle an inbound SIP response — route back to the original sender.
@@ -5406,6 +5602,18 @@ fn handle_response(
                     }
                     crate::proxy::fork::ForkAction::ForwardBestError(best_code) => {
                         debug!(best_code = best_code, "fork: all branches failed");
+                        // RFC 3261 §16.7 step 6 — the proxy does not pass a 503
+                        // upstream even when it is the best error it has (which
+                        // it will be whenever every branch hit a transport
+                        // error, §16.9).  This arm builds and sends its own
+                        // response, so it needs the rule applied at the source
+                        // rather than at the shared forward path below.
+                        let best_code = if best_code == 503 {
+                            debug!("fork: best error is 503 — forwarding 500 (RFC 3261 §16.7)");
+                            500
+                        } else {
+                            best_code
+                        };
                         let reason = best_error_reason(best_code);
                         let Ok(session) = session_arc.read() else {
                             error!("session_arc read lock poisoned");
@@ -5546,6 +5754,19 @@ fn handle_response(
                 // (cdr.auto_emit). Forked failures finalize at ForwardBestError.
                 cdr_finalize_proxy_fail(state, &original_request, status_code);
             }
+
+            // RFC 3261 §16.7 step 6: a proxy does not pass a 503 upstream — a
+            // downstream element being unavailable is not the caller's
+            // business, and a UAC that saw it would take the whole proxy out of
+            // service. It forwards 500 instead. This covers a 503 the proxy
+            // synthesized for a transport error (§16.9) as well as one a
+            // downstream server actually sent.
+            //
+            // Script-generated finals (`request.reply(503)`,
+            // `reply.reject(503)`) never reach here — they are not responses
+            // this proxy is forwarding on behalf of a branch — so the IMS
+            // P-CSCF media-authorization 503 is unaffected.
+            let status_code = downgrade_503_for_upstream(&mut message, status_code, &server_key);
 
             // Feed the response into the server transaction for caching
             let server_event = if status_code < 200 {
@@ -6108,6 +6329,44 @@ fn contact_fallback_target(
 /// TCP/TLS when no existing inbound connection is available.
 ///
 /// Returns the `ConnectionId` used (new pool connection or the existing one).
+/// What a downstream send did.
+///
+/// The connection id alone cannot carry this: on failure the stream transports
+/// return `ConnectionId::default()` as a sentinel, but UDP returns the caller's
+/// `fallback_connection_id` — which several call sites legitimately pass as
+/// `ConnectionId::default()`. A caller cannot tell the two apart, which is why
+/// a transport failure used to reach nobody.
+#[derive(Debug, Clone, Copy)]
+struct SendOutcome {
+    /// Connection the message went out on, or `ConnectionId::default()` when it
+    /// did not go out at all.
+    connection_id: ConnectionId,
+    /// The transport refused the message outright — a pool connect failed, a
+    /// WebSocket peer has no live connection, the outbound channel is gone.
+    ///
+    /// RFC 3261 §16.9 makes this equivalent to having received a 503 on that
+    /// branch, so a caller that owns a client transaction must answer upstream
+    /// rather than fall silent.
+    ///
+    /// `false` is **not** a delivery guarantee: a UDP datagram that is enqueued
+    /// and then lost reports success here, and only the client transaction's
+    /// timeout (§16.7 step 2) covers that.
+    delivery_failed: bool,
+}
+
+impl SendOutcome {
+    fn sent(connection_id: ConnectionId) -> Self {
+        Self { connection_id, delivery_failed: false }
+    }
+
+    fn failed() -> Self {
+        Self {
+            connection_id: ConnectionId::default(),
+            delivery_failed: true,
+        }
+    }
+}
+
 fn send_to_target(
     data: Bytes,
     target: &RelayTarget,
@@ -6115,7 +6374,7 @@ fn send_to_target(
     fallback_connection_id: ConnectionId,
     send_source: Option<SocketAddr>,
     state: &DispatcherState,
-) -> ConnectionId {
+) -> SendOutcome {
     let transport = target.transport.unwrap_or(fallback_transport);
     let destination = target.address;
     // A script `send_socket=` egress pin translated to a bind address:
@@ -6160,7 +6419,7 @@ fn send_to_target(
                         connection_id = ?connection_id,
                         "relayed via TCP pool"
                     );
-                    connection_id
+                    SendOutcome::sent(connection_id)
                 }
                 Err(error) => {
                     // Pool send failed (connect refused, broken pipe, etc.).
@@ -6176,7 +6435,7 @@ fn send_to_target(
                         destination = %destination,
                         "TCP pool send failed: {error}"
                     );
-                    ConnectionId::default()
+                    SendOutcome::failed()
                 }
             }
         }
@@ -6206,11 +6465,11 @@ fn send_to_target(
                             bind = %bind,
                             "relayed via source-bound TLS pool (send_socket)"
                         );
-                        connection_id
+                        SendOutcome::sent(connection_id)
                     }
                     Err(error) => {
                         error!(destination = %destination, "source-bound TLS pool send failed: {error}");
-                        ConnectionId::default()
+                        SendOutcome::failed()
                     }
                 };
             }
@@ -6242,7 +6501,7 @@ fn send_to_target(
                         "relayed via TLS connection reuse"
                     );
                 }
-                connection_id
+                SendOutcome::sent(connection_id)
             } else {
                 // No inbound connection to reuse — create outbound TLS via pool
                 let pool = Arc::clone(&state.connection_pool);
@@ -6258,13 +6517,13 @@ fn send_to_target(
                             connection_id = ?connection_id,
                             "relayed via TLS pool"
                         );
-                        connection_id
+                        SendOutcome::sent(connection_id)
                     }
                     Err(error) => {
                         // Same rationale as the TCP arm above — never echo to
                         // the inbound connection on outbound failure.
                         error!(destination = %destination, "TLS pool send failed: {error}");
-                        ConnectionId::default()
+                        SendOutcome::failed()
                     }
                 }
             }
@@ -6306,7 +6565,7 @@ fn send_to_target(
                             "relayed via WS/WSS connection reuse"
                         );
                     }
-                    connection_id
+                    SendOutcome::sent(connection_id)
                 }
                 None => {
                     warn!(
@@ -6314,7 +6573,7 @@ fn send_to_target(
                         %transport,
                         "no live WS/WSS connection to reuse — dropping (client-initiated transport cannot be dialed; use relay(flow=...) for MT routing)"
                     );
-                    ConnectionId::default()
+                    SendOutcome::failed()
                 }
             }
         }
@@ -6346,9 +6605,13 @@ fn send_to_target(
                 server_name: None,
             };
             if let Err(error) = state.outbound.send(outbound_message) {
+                // The outbound router is gone (shutdown, or the task died).
+                // Nothing will ever carry this message, so report it as a
+                // transport failure rather than a delivered send.
                 error!("failed to enqueue relayed request: {error}");
+                return SendOutcome::failed();
             }
-            fallback_connection_id
+            SendOutcome::sent(fallback_connection_id)
         }
     }
 }
@@ -19123,6 +19386,81 @@ mod tests {
     use crate::sip::parser::parse_sip_message;
     use crate::sip::uri::SipUri;
     use crate::sip::builder::SipMessageBuilder;
+
+    // -----------------------------------------------------------------------
+    // Transport failure / timeout must become a response (RFC 3261 §16.7, §16.9)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn send_outcome_distinguishes_failure_from_a_zero_connection_id() {
+        // The bug that hid every transport error: the stream transports
+        // returned `ConnectionId::default()` as a failure sentinel, but UDP
+        // returns the caller's `fallback_connection_id` — which several call
+        // sites pass as exactly that value. A caller could not tell "the pool
+        // refused it" from "UDP sent it with no connection id".
+        let udp_success = SendOutcome::sent(ConnectionId::default());
+        assert!(!udp_success.delivery_failed);
+        assert_eq!(udp_success.connection_id, ConnectionId::default());
+
+        let refused = SendOutcome::failed();
+        assert!(refused.delivery_failed);
+        assert_eq!(refused.connection_id, ConnectionId::default());
+
+        // Same connection id, opposite meaning — which is the whole point.
+        assert_eq!(udp_success.connection_id, refused.connection_id);
+        assert_ne!(udp_success.delivery_failed, refused.delivery_failed);
+    }
+
+    fn response_for_downgrade(status_code: u16, reason: &str) -> SipMessage {
+        SipMessageBuilder::new()
+            .response(status_code, reason.to_string())
+            .via("SIP/2.0/UDP proxy.example.com;branch=z9hG4bK-1".to_string())
+            .to("<sip:bob@example.com>;tag=b".to_string())
+            .from("<sip:alice@example.com>;tag=a".to_string())
+            .call_id("downgrade-test".to_string())
+            .cseq("1 INVITE".to_string())
+            .header("Retry-After", "120".to_string())
+            .content_length(0)
+            .build()
+            .unwrap()
+    }
+
+    fn downgrade_key() -> TransactionKey {
+        TransactionKey::new(
+            "z9hG4bK-server".to_string(),
+            Method::Invite,
+            "192.0.2.1:5060".to_string(),
+        )
+    }
+
+    #[test]
+    fn a_503_is_forwarded_upstream_as_500() {
+        // RFC 3261 §16.7 step 6. A downstream element being unavailable is not
+        // the caller's business, and a UAC that saw the 503 would take the
+        // whole proxy out of service.
+        let mut response = response_for_downgrade(503, "Service Unavailable");
+        let forwarded = downgrade_503_for_upstream(&mut response, 503, &downgrade_key());
+
+        assert_eq!(forwarded, 500);
+        assert_eq!(response.status_code(), Some(500));
+        let wire = String::from_utf8(response.to_bytes()).unwrap();
+        assert!(wire.starts_with("SIP/2.0 500 Server Internal Error"));
+        // Retry-After described the unavailable downstream, not this proxy.
+        assert!(!wire.contains("Retry-After"));
+    }
+
+    #[test]
+    fn other_status_codes_are_forwarded_untouched() {
+        for (code, reason) in [(404, "Not Found"), (408, "Request Timeout"), (200, "OK"), (500, "Server Internal Error")] {
+            let mut response = response_for_downgrade(code, reason);
+            let forwarded = downgrade_503_for_upstream(&mut response, code, &downgrade_key());
+            assert_eq!(forwarded, code, "{code} must be forwarded unchanged");
+            assert_eq!(response.status_code(), Some(code));
+            // Only the 503 path strips Retry-After.
+            let wire = String::from_utf8(response.to_bytes()).unwrap();
+            assert!(wire.contains("Retry-After"), "{code} must keep Retry-After");
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Media CDR from an end-of-call summary (media.backend: siphon-rtp)
