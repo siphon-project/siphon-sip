@@ -281,6 +281,22 @@ jobs:
       - name: Route self-identity (in-dialog BYE must be relayed, not 404'd)
         run: scripts/route_selfid_test.sh
 
+  # ── A forwarding transport error must become a response ────────────────────
+  # RFC 3261 §16.9 makes a transport error on forwarding a 503 on that branch,
+  # and §16.7 step 6 forwards it upstream as a 500.  Without it the branch goes
+  # silent and the caller waits out its own Timer F (32 s) for an answer the
+  # proxy already had.  Deterministic: the next hop is a container that is up
+  # and listening on nothing, so the connect is refused immediately, and the
+  # caller demands the 500 within 20 s.
+  sipp-transport-error:
+    runs-on: ubuntu-latest
+    needs: rust-tests
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Transport error on forwarding must be answered, not dropped
+        run: scripts/transport_error_test.sh
+
   # ── Terminating failover across an AoR's bindings ──────────────────────────
   # An AoR with two live bindings where only one is reachable must still be
   # deliverable.  Two things have to hold, and neither is visible in the

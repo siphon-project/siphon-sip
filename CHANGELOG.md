@@ -97,6 +97,35 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   list is currently **empty** — all 50 fixtures are handled as the RFC requires.
 
 ### Fixed
+- **A proxied request whose branch never got an answer now gets one.** Two
+  independent paths ended at a `warn!` and told nobody, so the upstream UAC sat
+  on its `100 Trying` until its own Timer F — 32 s of silence for a failure the
+  proxy already knew about. Observed as a call clearing on an application
+  server's 30 s media timeout instead of in milliseconds.
+  - **A transport error on forwarding is now a 503 on that branch (RFC 3261
+    §16.9).** `send_to_target` logged the pool failure and returned
+    `ConnectionId::default()` as a sentinel — but that value could not carry the
+    meaning: the stream transports return it on failure while UDP returns the
+    caller's `fallback_connection_id`, which several call sites legitimately
+    pass as exactly that. It now returns a `SendOutcome` that says outright
+    whether the transport refused the message.
+  - **A client transaction timeout is now a 408 on that branch (RFC 3261 §16.7
+    step 2).** The timeout arm logged and reaped without telling the server
+    transaction anything. This is the backstop for every way a branch can go
+    quiet — a black-holed route, a peer that accepts the connection and never
+    answers, a datagram lost on the wire — not just the connect failures §16.9
+    covers.
+  - Both are injected through the ordinary response path, so fork aggregation
+    behaves as it would for a real response: a parallel fork keeps waiting on
+    its live branches, a sequential fork advances to the next target, and
+    `@proxy.on_reply` / `@proxy.on_failure`, CDR finalisation and the
+    server-transaction handoff all run unchanged.
+- **A 503 is no longer forwarded upstream; the proxy sends 500 instead**
+  (RFC 3261 §16.7 step 6), and drops the `Retry-After` that described the
+  unavailable downstream. A 503 says *this next hop* is unavailable, and a UAC
+  that saw it would take the whole proxy out of service. Locally generated
+  finals (`request.reply(503)`, `reply.reject(503)`) are unaffected — they are
+  not responses the proxy is forwarding on behalf of a branch.
 - **The reg-event NOTIFY a UE receives is now a conformant in-dialog request.**
   Two independent defects made it one a strict baseband rejects; measured, a
   handset validating it de-registered itself 21–32 s after each successful

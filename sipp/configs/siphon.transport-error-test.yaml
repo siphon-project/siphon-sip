@@ -1,0 +1,27 @@
+# siphon.transport-error-test.yaml — a forwarding transport error must become a
+# response, not silence (RFC 3261 §16.9 + §16.7).
+#
+# Used with: sipp/docker-compose.yaml --profile transport-error
+#            (scripts/transport_error_test.sh)
+# Script:    scripts/transport_error_proxy.py
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+  tcp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.14"
+
+advertised_address: "172.20.0.14"
+
+script:
+  path: "scripts/transport_error_proxy.py"
+  reload: auto
+
+log:
+  level: debug
+  format: pretty
