@@ -314,3 +314,94 @@ fn test_branch_count() {
 fn test_default_strategy_is_parallel() {
     assert_eq!(ForkStrategy::default(), ForkStrategy::Parallel);
 }
+#[test]
+fn a_real_answer_beats_a_transport_error_the_proxy_invented() {
+    let mut aggregator = make_aggregator(2, ForkStrategy::Parallel);
+    aggregator.mark_trying(0);
+    aggregator.mark_trying(1);
+
+    aggregator.mark_local_failure(0);
+    assert_eq!(
+        aggregator.on_branch_response(0, 503),
+        ForkAction::ContinueWaiting,
+        "the live branch has not answered yet"
+    );
+
+    assert_eq!(
+        aggregator.on_branch_response(1, 486),
+        ForkAction::ForwardBestError(486),
+        "the callee's own answer is what the caller needs to hear"
+    );
+}
+
+#[test]
+fn a_real_answer_beats_a_timeout_the_proxy_invented() {
+    let mut aggregator = make_aggregator(2, ForkStrategy::Parallel);
+    aggregator.mark_trying(0);
+    aggregator.mark_trying(1);
+
+    aggregator.mark_local_failure(0);
+    aggregator.on_branch_response(0, 408);
+
+    assert_eq!(
+        aggregator.on_branch_response(1, 404),
+        ForkAction::ForwardBestError(404)
+    );
+}
+
+#[test]
+fn local_failures_are_still_forwarded_when_they_are_all_there_is() {
+    let mut aggregator = make_aggregator(2, ForkStrategy::Parallel);
+    aggregator.mark_trying(0);
+    aggregator.mark_trying(1);
+
+    aggregator.mark_local_failure(0);
+    aggregator.on_branch_response(0, 503);
+    aggregator.mark_local_failure(1);
+
+    assert_eq!(
+        aggregator.on_branch_response(1, 408),
+        ForkAction::ForwardBestError(503),
+        "with nothing real to prefer, normal class ordering applies"
+    );
+}
+
+#[test]
+fn peer_responses_keep_their_class_ordering_among_themselves() {
+    let mut aggregator = make_aggregator(2, ForkStrategy::Parallel);
+    aggregator.mark_trying(0);
+    aggregator.mark_trying(1);
+
+    aggregator.on_branch_response(0, 486);
+    assert_eq!(
+        aggregator.on_branch_response(1, 503),
+        ForkAction::ForwardBestError(503)
+    );
+}
+
+#[test]
+fn a_sequential_fork_advances_past_a_branch_the_proxy_failed() {
+    let mut aggregator = make_aggregator(2, ForkStrategy::Sequential);
+    aggregator.mark_trying(0);
+
+    aggregator.mark_local_failure(0);
+    assert_eq!(
+        aggregator.on_branch_response(0, 503),
+        ForkAction::TryNext(1)
+    );
+
+    aggregator.mark_trying(1);
+    assert_eq!(
+        aggregator.on_branch_response(1, 404),
+        ForkAction::ForwardBestError(404)
+    );
+}
+
+#[test]
+fn branches_start_out_attributed_to_the_peer() {
+    let aggregator = make_aggregator(3, ForkStrategy::Parallel);
+    assert!(aggregator
+        .branches
+        .iter()
+        .all(|branch| branch.origin == ResponseOrigin::Peer));
+}
