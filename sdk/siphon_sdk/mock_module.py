@@ -26,6 +26,19 @@ from siphon_sdk.smpp import MockSmpp
 from siphon_sdk.http import MockHttp
 
 
+def _strip_nameaddr(value: str) -> str:
+    """Reduce a name-addr header value to its bare URI.
+
+    ``"Alice" <sip:alice@ex>;tag=abc`` → ``sip:alice@ex``.  Mirrors the Rust
+    side so a script can pass a raw header value straight through.
+    """
+    trimmed = value.strip()
+    start, end = trimmed.find("<"), trimmed.rfind(">")
+    if 0 <= start < end:
+        return trimmed[start + 1:end]
+    return trimmed.split(";")[0].strip()
+
+
 # ---------------------------------------------------------------------------
 # Handler registry
 # ---------------------------------------------------------------------------
@@ -1409,13 +1422,18 @@ class MockRegistrar:
         return fn
 
     def reginfo_xml(self, aor: str, state: str = "full",
-                    version: int = 0) -> str:
+                    version: int = 0, include_as_contacts: bool = False) -> str:
         """Generate RFC 3680 reginfo XML for an AoR.
 
-        Returns the XML document as a string.  Includes both UE-side
-        bindings and AS-side capability records (TS 24.229 §5.4.2.1.2)
-        — the latter surface their RFC 3840 feature tags as
-        ``<unknown-param>`` children (RFC 3680 §5.3.2).
+        Returns the XML document as a string.  Lists what the **user**
+        registered: AS-side capability records (from
+        :meth:`save_as_contact`) are excluded by default, because RFC 3680
+        §5.2 defines ``<contact>`` as a contact registered for the address
+        of record and an AS that answered a third-party REGISTER has not
+        registered one (TS 24.229 §5.4.1.7).  Emitting them showed the UE
+        contacts against its own IMPU that it never created.  The
+        iFC-matched capability set reaches the UE through RFC 6809
+        ``Feature-Caps`` on the REGISTER 200 OK instead.
 
         Registration state is ``"active"`` when at least one UE-side
         contact exists, otherwise ``"terminated"`` (AS-only AoRs don't
@@ -1425,6 +1443,11 @@ class MockRegistrar:
             aor: Address of Record (e.g. ``"sip:alice@example.com"``).
             state: ``"full"`` or ``"partial"`` (default ``"full"``).
             version: reginfo version counter (default 0).
+            include_as_contacts: also emit AS capability records as
+                ``<contact>`` elements, with their RFC 3840 feature tags as
+                ``<unknown-param>`` children (RFC 3680 §5.3.2).  Default
+                ``False`` — only for a watcher known to want them, never
+                for a UE.
 
         Returns:
             XML string conforming to RFC 3680.
@@ -1448,6 +1471,8 @@ class MockRegistrar:
         as_ = [c for c in contacts if getattr(c, "kind", "ue") == "as"]
         ue.sort(key=lambda c: c.q, reverse=True)
         as_.sort(key=lambda c: c.q, reverse=True)
+        if not include_as_contacts:
+            as_ = []
         for contact in (*ue, *as_):
             params_xml = ""
             for name, value in getattr(contact, "params", []) or []:
@@ -4793,11 +4818,16 @@ class MockPresence:
     def subscribe_dialog(self, subscriber: str, resource: str,
                          event: str = "reg", expires: int = 3600,
                          call_id: str = "", from_tag: str = "",
-                         to_tag: str = "", route_set: Optional[list] = None) -> str:
+                         to_tag: str = "", route_set: Optional[list] = None,
+                         local_uri: Optional[str] = None,
+                         remote_uri: Optional[str] = None) -> str:
         """Create a subscription with dialog state for in-dialog NOTIFY.
 
         Args:
-            subscriber: Watcher URI (Contact from the SUBSCRIBE).
+            subscriber: Watcher **Contact** URI from the SUBSCRIBE — the
+                dialog's remote target.  Used for the NOTIFY's Request-URI
+                and to resolve where to send it; it is *not* what goes in
+                ``To`` (see ``remote_uri``).
             resource: Presentity URI being watched.
             event: Event package name.
             expires: Subscription duration in seconds.
@@ -4805,6 +4835,16 @@ class MockPresence:
             from_tag: From-tag from the SUBSCRIBE.
             to_tag: To-tag from the SUBSCRIBE.
             route_set: Route headers from Record-Route.
+            local_uri: The SUBSCRIBE's **To URI** — the dialog's local URI,
+                which RFC 3261 §12.2.1.1 requires in the ``From`` of every
+                in-dialog NOTIFY.  Pass ``str(request.to_uri)``.
+            remote_uri: The SUBSCRIBE's **From URI** — the dialog's remote
+                URI, required in the ``To``.  Pass ``str(request.from_uri)``.
+
+        Both URI arguments default to ``resource``, which is correct for any
+        package where the subscriber watches an AoR directly (the reg event
+        package).  Supply them for a watcher subscribed to somebody else's
+        resource, where the remote URI is the watcher's own AoR.
 
         Returns:
             Subscription ID string.
@@ -4819,6 +4859,8 @@ class MockPresence:
             "from_tag": from_tag,
             "to_tag": to_tag,
             "route_set": route_set or [],
+            "local_uri": _strip_nameaddr(local_uri) if local_uri else resource,
+            "remote_uri": _strip_nameaddr(remote_uri) if remote_uri else resource,
         }
         return sub_id
 

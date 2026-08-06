@@ -1346,24 +1346,44 @@ impl PyRegistrar {
     /// Returns the XML document as a string. Used to build NOTIFY bodies
     /// for reg event subscriptions.
     ///
+    /// The document lists what the **user** registered.  AS-side capability
+    /// records — captured by :meth:`save_as_contact` from third-party REGISTER
+    /// 200 OKs — are excluded by default: RFC 3680 §5.2 defines ``<contact>`` as
+    /// a contact registered for the address of record, and an application
+    /// server that answered a 3PR has not registered one (TS 24.229 §5.4.1.7
+    /// makes the 3PR a notification to the AS, distinct from §5.7 where an AS
+    /// registers on the user's behalf).  Including them showed the UE several
+    /// ``state="active" event="registered"`` contacts against its own IMPU that
+    /// it never created.  The iFC-matched capability set still reaches the UE
+    /// through RFC 6809 ``Feature-Caps`` on the REGISTER 200 OK, which also
+    /// reaches UEs that never subscribe to the reg event package.
+    ///
     /// Args:
     ///     aor: Address of Record (e.g. "sip:alice@example.com")
     ///     state: "full" or "partial" (default "full")
     ///     version: reginfo version counter (default 0)
-    #[pyo3(signature = (aor, state="full", version=0))]
-    fn reginfo_xml(&self, aor: &str, state: &str, version: u32) -> PyResult<String> {
+    ///     include_as_contacts: emit AS capability records as ``<contact>``
+    ///         elements too (default ``False``).  Only for a watcher that is
+    ///         known to want them — never for a UE.
+    #[pyo3(signature = (aor, state="full", version=0, include_as_contacts=false))]
+    fn reginfo_xml(
+        &self,
+        aor: &str,
+        state: &str,
+        version: u32,
+        include_as_contacts: bool,
+    ) -> PyResult<String> {
         let aor = normalize_aor(aor);
-        // Merged UE + AS view — without this the NOTIFY would drop every
-        // iFC-matched AS feature tag (`+g.3gpp.smsip`,
-        // `+g.3gpp.icsi-ref`, …) the S-CSCF captured on the 3PR 200 OK
-        // (TS 24.229 §5.4.2.1.2).  `lookup_all` returns UE-first then AS,
-        // each sorted by q descending.
+        // Merged UE + AS view: `build_full_reginfo` needs to see AS records to
+        // decide the registration state (an AoR with only AS records is not
+        // registered), even though it does not render them by default.
+        // `lookup_all` returns UE-first then AS, each sorted by q descending.
         let contacts = self.inner.lookup_all(&aor);
         let reginfo_state = match state {
             "partial" => reginfo::ReginfoState::Partial,
             _ => reginfo::ReginfoState::Full,
         };
-        let body = reginfo::build_full_reginfo(&aor, &contacts, version);
+        let body = reginfo::build_full_reginfo(&aor, &contacts, version, include_as_contacts);
         // Override the state from the builder (which always uses Full)
         let body = reginfo::ReginfoBody {
             state: reginfo_state,
@@ -1686,15 +1706,30 @@ mod tests {
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].kind(), "ue");
 
-        // reginfo XML must surface the AS feature tag.
-        let xml = py_reg.reginfo_xml("sip:alice@ims.example.com", "full", 0).unwrap();
+        // The default document is what the UE registered: the AS record is
+        // stored and routable-excluded, but it is not a <contact> of the user's
+        // registration (RFC 3680 §5.2).
+        let default_xml = py_reg
+            .reginfo_xml("sip:alice@ims.example.com", "full", 0, false)
+            .unwrap();
+        assert!(
+            !default_xml.contains("mmtel.ims.example.com:8060"),
+            "AS record must not be a contact of the user's registration:\n{default_xml}"
+        );
+        assert!(
+            default_xml.contains("10.0.0.1"),
+            "the UE's own binding must still be there:\n{default_xml}"
+        );
+
+        // Opt in and the capability surface is unchanged.
+        let xml = py_reg.reginfo_xml("sip:alice@ims.example.com", "full", 0, true).unwrap();
         assert!(
             xml.contains("mmtel.ims.example.com:8060"),
-            "AS contact URI missing from reginfo XML:\n{xml}"
+            "AS contact URI missing from opted-in reginfo XML:\n{xml}"
         );
         assert!(
             xml.contains("<unknown-param name=\"+g.3gpp.icsi-ref\">"),
-            "AS feature tag missing from reginfo XML:\n{xml}"
+            "AS feature tag missing from opted-in reginfo XML:\n{xml}"
         );
     }
 
@@ -1732,7 +1767,7 @@ mod tests {
             .unwrap());
 
         // Find the AS contact and check its expiry was honored.
-        let xml = py_reg.reginfo_xml("sip:alice@ims.example.com", "full", 0).unwrap();
+        let xml = py_reg.reginfo_xml("sip:alice@ims.example.com", "full", 0, true).unwrap();
         // The exact Expires value lands in the reginfo XML for the AS
         // contact (with the grace cap left to the registrar layer).
         // Looser check: presence + non-zero.

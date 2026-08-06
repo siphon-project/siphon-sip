@@ -97,6 +97,41 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   list is currently **empty** — all 50 fixtures are handled as the RFC requires.
 
 ### Fixed
+- **The reg-event NOTIFY a UE receives is now a conformant in-dialog request.**
+  Two independent defects made it one a strict baseband rejects; measured, a
+  handset validating it de-registered itself 21–32 s after each successful
+  registration, repeatedly, until it stopped attempting IMS registration at all.
+  Permissive basebands on the same cores tolerated it and stayed registered, so
+  it only became user-visible on handsets that validate.
+  - **`presence.notify()` put the subscriber's Contact URI in both `From` and
+    `To`.** RFC 3261 §12.2.1.1 requires the dialog's *URIs* there — the local
+    URI (the SUBSCRIBE's To) in `From`, the remote URI (its From) in `To` — and
+    the Contact is the remote target, which belongs in the Request-URI alone.
+    The tags were already correct, so dialog matching by (Call-ID, from-tag,
+    to-tag) succeeded and a permissive UA answered 200; only a UA that also
+    validates the URIs (RFC 6665 §4.4.1) rejected it. The subscription now
+    records the dialog's URIs, via two optional `presence.subscribe_dialog()`
+    arguments — `local_uri=` / `remote_uri=`, both defaulting to `resource`,
+    which is already correct for any package where the subscriber watches an AoR
+    directly (the reg event package, TS 24.341 §5.3.2.4) and in every case
+    better than the Contact. Supply them for a watcher subscribed to somebody
+    else's resource, where the remote URI is the watcher's own AoR and cannot be
+    derived. The Request-URI and next hop still come from the Contact, so a
+    NOTIFY that must reach the UE directly is unaffected.
+  - **`registrar.reginfo_xml()` rendered AS capability records as `<contact>`
+    elements of the user's own registration.** A UE with one binding saw its own
+    contact plus one per iFC-matched application server, all
+    `state="active" event="registered"` against its own IMPU and
+    indistinguishable from its own. RFC 3680 §5.2 defines `<contact>` as a
+    contact registered *for the address of record*, and an AS that answered a
+    third-party REGISTER has not registered one — TS 24.229 §5.4.1.7 makes the
+    3PR a notification to the AS, distinct from §5.7 where an AS genuinely
+    registers on the user's behalf. AS records are still stored, still excluded
+    from routing, and still available to a watcher that asks
+    (`include_as_contacts=True`); they are simply no longer part of the default
+    document. The UE-facing capability surface is RFC 6809 `Feature-Caps` on the
+    REGISTER 200 OK, which also reaches UEs that never subscribe to the reg
+    event package.
 - **A terminating request can now fail over between the bindings of one AoR.**
   An AoR with more than one live binding where only one was reachable was
   undeliverable for the full lifetime of the dead binding — observed as a
