@@ -122,6 +122,7 @@ class Contact:
         uri: The contact URI string (e.g. ``"sip:alice@192.168.1.5:5060"``).
         q: Quality value between 0.0 and 1.0 (higher = preferred).
         expires: Seconds remaining until this binding expires.
+        age_secs: Seconds since the binding was created or last refreshed.
     """
 
     uri: str
@@ -134,9 +135,33 @@ class Contact:
     expires: int = 3600
     """Seconds remaining until this contact binding expires."""
 
+    age_secs: int = 0
+    """Seconds since this binding was created or last refreshed.
+
+    Use for recency rules — :attr:`expires` cannot answer that question,
+    because it is time *remaining* and every UE asks for a different
+    lifetime: a handset that requested 600 s and registered a second ago
+    sorts below one that requested 3600 s an hour ago.
+
+    ``registrar.lookup()`` already returns bindings most-recent-first
+    within one q-value; this is for scripts that need a different rule::
+
+        fresh = [c for c in registrar.lookup(uri) if c.age_secs < 3600]
+
+    Monotonic (immune to wall-clock steps) and preserved across a restart
+    for bindings restored from a persistence backend.  A binding whose
+    stored record pre-dates age tracking reports ``0``."""
+
     path: list = field(default_factory=list)
     """RFC 3327 Path headers stored with this binding.
-    Use as Route headers when routing terminating requests to this contact."""
+
+    Passing the ``Contact`` itself to ``request.fork()`` makes the proxy
+    build this branch's Route header set from the Path automatically (in
+    order, per RFC 3327 §5.3) and route the branch by its topmost entry —
+    which is what lets the bindings of one AoR fail over independently,
+    since two bindings usually carry different Path tokens.  Read it
+    directly only when routing by hand with
+    ``request.set_header("Route", ...)``."""
 
     instance_id: Optional[str] = None
     """Stable identity of the siphon instance that originally accepted the

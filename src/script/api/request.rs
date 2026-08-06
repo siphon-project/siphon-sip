@@ -112,9 +112,18 @@ pub enum RequestAction {
     /// the only way to reach a WebSocket UE) instead of DNS-resolving the URI.
     /// A flow is only attached for a `Contact` the local process accepted
     /// (`Contact.is_local`); bare-string targets always carry `None`.
+    ///
+    /// `routes` is also parallel to `targets`: it holds the RFC 3327 Path
+    /// vector stored with that binding.  A non-empty entry becomes that
+    /// branch's Route header set (and therefore its next hop), replacing any
+    /// Route the script left on the request — without this every branch would
+    /// inherit branch 0's route set and a Path-token edge proxy would resolve
+    /// them all back to the *same* binding.  Bare-string targets carry an
+    /// empty vector and keep pure Request-URI routing.
     Fork {
         targets: Vec<String>,
         flows: Vec<Option<super::registrar::PyFlow>>,
+        routes: Vec<Vec<String>>,
         strategy: String,
         /// Force-send-socket egress pin applied to every branch (see
         /// [`RequestAction::Relay::send_socket`]).  A per-branch flow (`flows[i]`)
@@ -919,6 +928,19 @@ impl PyRequest {
     /// captured inbound flow — RFC 5626 §5.3 connection reuse, mandatory for
     /// WebSocket UEs (RFC 7118 §5).  Bare strings (and non-local contacts) are
     /// DNS-resolved as before.
+    ///
+    /// A `Contact` that carries an RFC 3327 Path vector additionally gets its
+    /// **own** Route header set on that branch, built from the Path in order
+    /// (RFC 3327 §5.3), and that route set decides the branch's next hop.  This
+    /// is what makes failover between the bindings of one AoR work: two
+    /// bindings usually have different Path vectors (different edge proxies, or
+    /// the same edge proxy with a different per-registration token), so without
+    /// it every branch would go out with branch 0's route set and a Path-token
+    /// proxy would deliver them all back to the first binding.  The branch's
+    /// Request-URI is still the Contact URI.
+    ///
+    /// Pass a bare URI string (`request.fork([c.uri for c in contacts])`) to
+    /// opt a target out of Path routing and route purely by Request-URI.
     #[pyo3(signature = (targets, strategy="parallel", send_socket=None))]
     fn fork(
         &mut self,
@@ -929,20 +951,24 @@ impl PyRequest {
         validate_send_socket(send_socket.as_deref())?;
         let mut target_uris: Vec<String> = Vec::with_capacity(targets.len());
         let mut flows: Vec<Option<super::registrar::PyFlow>> = Vec::with_capacity(targets.len());
+        let mut routes: Vec<Vec<String>> = Vec::with_capacity(targets.len());
         for item in targets {
             if let Ok(contact) = item.extract::<PyRef<super::registrar::PyContact>>() {
-                let (uri, flow) = contact.fork_target();
+                let (uri, flow, path) = contact.fork_target();
                 target_uris.push(uri);
                 flows.push(flow);
+                routes.push(path);
             } else {
                 // Bare URI string (or anything string-coercible).
                 target_uris.push(item.extract::<String>()?);
                 flows.push(None);
+                routes.push(Vec::new());
             }
         }
         self.action = RequestAction::Fork {
             targets: target_uris,
             flows,
+            routes,
             strategy: strategy.to_string(),
             send_socket,
         };
@@ -1772,6 +1798,33 @@ mod tests {
         PyRequest::new(message, "udp".to_string(), "10.0.0.1".to_string(), 5060)
     }
 
+    /// A registered binding with an RFC 3327 Path vector, as `registrar.lookup()`
+    /// hands it to a script.
+    fn contact_with_path(uri: &str, path: Vec<String>) -> super::super::registrar::PyContact {
+        let contact = crate::registrar::Contact {
+            uri: crate::sip::parser::parse_uri_standalone(uri).unwrap(),
+            q: 1.0,
+            registered_at: std::time::Instant::now(),
+            expires: std::time::Duration::from_secs(3600),
+            call_id: "reg-call-id".into(),
+            cseq: 1,
+            source_addr: None,
+            source_transport: Some("udp".into()),
+            sip_instance: None,
+            reg_id: None,
+            path,
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: None,
+            inbound_local_addr: None,
+            inbound_connection_id: None,
+            params: Vec::new(),
+            kind: crate::registrar::ContactKind::Ue,
+        };
+        super::super::registrar::PyContact::from_rust_contact(&contact)
+    }
+
     #[test]
     fn method_returns_invite() {
         let request = make_request();
@@ -2092,10 +2145,48 @@ mod tests {
                 RequestAction::Fork {
                     targets: vec!["sip:a@host".to_string(), "sip:b@host".to_string()],
                     flows: vec![None, None],
+                    routes: vec![vec![], vec![]],
                     strategy: "sequential".to_string(),
                     send_socket: None,
                 }
             );
+        });
+    }
+
+    #[test]
+    fn fork_carries_each_contacts_own_path() {
+        // The bug this guards: every branch used to go out with whatever Route
+        // the script left on the request (branch 0's Path in practice), so a
+        // Path-token edge proxy resolved every branch back to the *first*
+        // binding — sequential forking retried the dead contact N times.
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let mut request = make_request();
+            let contact_a = contact_with_path(
+                "sip:alice@10.0.0.1:5060",
+                vec!["<sip:TOKEN-A@edge.example.com;lr>".to_string()],
+            );
+            let contact_b = contact_with_path(
+                "sip:alice@10.0.0.2:5060",
+                vec!["<sip:TOKEN-B@edge.example.com;lr>".to_string()],
+            );
+            let targets: Vec<Bound<'_, PyAny>> = vec![
+                Py::new(py, contact_a).unwrap().into_bound(py).into_any(),
+                Py::new(py, contact_b).unwrap().into_bound(py).into_any(),
+                // A bare string opts out of Path routing entirely.
+                pyo3::types::PyString::new(py, "sip:carol@10.0.0.3").into_any(),
+            ];
+            request.fork(targets, "sequential", None).unwrap();
+            match request.action() {
+                RequestAction::Fork { targets, routes, .. } => {
+                    assert_eq!(targets.len(), 3);
+                    assert_eq!(routes.len(), 3, "routes must stay parallel to targets");
+                    assert_eq!(routes[0], vec!["<sip:TOKEN-A@edge.example.com;lr>".to_string()]);
+                    assert_eq!(routes[1], vec!["<sip:TOKEN-B@edge.example.com;lr>".to_string()]);
+                    assert!(routes[2].is_empty(), "bare string target carries no Path");
+                }
+                other => panic!("expected Fork, got {other:?}"),
+            }
         });
     }
 

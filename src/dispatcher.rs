@@ -3381,7 +3381,7 @@ fn handle_request(
                 send_socket.as_ref(),
             );
         }
-        RequestAction::Fork { targets, flows, strategy, send_socket } => {
+        RequestAction::Fork { targets, flows, routes, strategy, send_socket } => {
             if targets.is_empty() {
                 warn!("fork with empty targets list");
                 let response = build_response(&message_guard, 500, "No Targets", state.server_header.as_deref(), &[]);
@@ -3400,12 +3400,15 @@ fn handle_request(
                     &message_guard,
                     targets,
                     flows,
+                    routes,
                     fork_strategy,
                     record_routed,
                     &inbound,
                     server_key.as_ref(),
                     state,
                     send_socket.as_ref(),
+                    on_reply_cb,
+                    on_failure_cb,
                 );
             }
         }
@@ -3902,16 +3905,20 @@ fn relay_request(
 ///
 /// Creates a ProxySession with a ForkAggregator and sends to all targets
 /// (parallel) or just the first (sequential, rest tried on failure).
+#[allow(clippy::too_many_arguments)]
 fn relay_fork_request(
     message: &SipMessage,
     targets: &[String],
     flows: &[Option<crate::script::api::registrar::PyFlow>],
+    routes: &[Vec<String>],
     strategy: crate::proxy::fork::ForkStrategy,
     record_routed: bool,
     inbound: &InboundMessage,
     server_key: Option<&TransactionKey>,
     state: &DispatcherState,
     send_socket: Option<&crate::transport::SendSocket>,
+    on_reply_callback: Option<Py<PyAny>>,
+    on_failure_callback: Option<Py<PyAny>>,
 ) {
     use crate::proxy::fork::ForkAggregator;
 
@@ -3937,8 +3944,59 @@ fn relay_fork_request(
         Some(key) => key.clone(),
         None => {
             // Fall back to single-target relay if no server transaction —
-            // carry the first branch's flow so a single WS contact still routes.
-            relay_request(message, targets.first().map(|s| s.as_str()), record_routed, inbound, None, state, None, None, None, None, flows.first().and_then(|f| f.as_ref()), send_socket);
+            // carry the first branch's flow so a single WS contact still
+            // routes, its Path route set so it still reaches the right
+            // binding, and the per-relay callbacks the script attached (this
+            // path is a plain relay in everything but name, so silently
+            // dropping them would make `relay(on_failure=…)` a no-op).
+            let first_target = targets.first().map(|s| s.as_str()).unwrap_or("");
+            let first_path = routes.first().map(Vec::as_slice).unwrap_or(&[]);
+            let Some(routing) = core::branch_routing(first_path, first_target) else {
+                warn!(
+                    target = %first_target,
+                    path = ?first_path,
+                    "fork: single target has an unusable Path route set — dropping"
+                );
+                return;
+            };
+            // A branch with a Path route set is routed by its top Route
+            // (RFC 3261 §16.6 step 6), not by the Contact URI — passing no
+            // next-hop lets relay_request pick that Route up itself.
+            let has_route_set = routing.route_set.is_some();
+            let next_hop = if has_route_set {
+                None
+            } else {
+                targets.first().map(|s| s.as_str())
+            };
+            let single_message;
+            let relay_message = match routing.route_set {
+                Some(route_value) => {
+                    let mut cloned = message.clone();
+                    cloned.headers.set("Route", route_value);
+                    single_message = cloned;
+                    &single_message
+                }
+                None => message,
+            };
+            relay_request(
+                relay_message,
+                next_hop,
+                record_routed,
+                inbound,
+                None,
+                state,
+                on_reply_callback,
+                on_failure_callback,
+                None,
+                None,
+                // Same precedence as a real fork branch: a Path route set
+                // outranks the captured flow (see `relay_fork_branch`).
+                flows
+                    .first()
+                    .and_then(|f| f.as_ref())
+                    .filter(|_| !has_route_set),
+                send_socket,
+            );
             return;
         }
     };
@@ -3954,6 +4012,7 @@ fn relay_fork_request(
     );
     session.fork_aggregator = Some(Arc::clone(&aggregator));
     session.fork_flows = flows.to_vec();
+    session.fork_routes = routes.to_vec();
     session.fork_send_socket = send_socket.cloned();
 
     // Determine which branches to start now
@@ -3982,6 +4041,7 @@ fn relay_fork_request(
             &session_arc,
             &aggregator,
             flows.get(branch_index).and_then(|f| f.as_ref()),
+            routes.get(branch_index).map(Vec::as_slice).unwrap_or(&[]),
             send_socket,
             state,
         );
@@ -3992,6 +4052,13 @@ fn relay_fork_request(
 ///
 /// Resolves the target, adds Via, sends the request, creates a client transaction,
 /// and registers the branch in the ProxySession.
+///
+/// `branch_path` is this branch's RFC 3327 Path vector (empty for a bare-URI
+/// target).  When non-empty it becomes the branch's Route header set, replacing
+/// whatever Route the request carried, and the top Route becomes the branch's
+/// next hop (RFC 3327 §5.3 + RFC 3261 §16.6 step 6).  The Request-URI stays the
+/// branch target either way.
+#[allow(clippy::too_many_arguments)]
 fn relay_fork_branch(
     message: &SipMessage,
     target: &str,
@@ -4002,12 +4069,45 @@ fn relay_fork_branch(
     session_arc: &Arc<RwLock<ProxySession>>,
     aggregator: &Arc<std::sync::Mutex<crate::proxy::fork::ForkAggregator>>,
     flow: Option<&crate::script::api::registrar::PyFlow>,
+    branch_path: &[String],
     send_socket: Option<&crate::transport::SendSocket>,
     state: &DispatcherState,
 ) {
+    // This branch's own route set, from the Path stored with its registration
+    // binding.  Two bindings of one AoR usually traverse different proxy chains
+    // (or the same edge proxy with a different per-registration token), so
+    // without this every branch inherits branch 0's Route and a Path-token
+    // proxy resolves them all back to the *first* binding — the second branch
+    // is then a retry of the first, not a second contact.
+    let routing = match core::branch_routing(branch_path, target) {
+        Some(routing) => routing,
+        None => {
+            warn!(
+                target = %target,
+                branch = branch_index,
+                path = ?branch_path,
+                "fork: branch has an unusable Path route set — dropping the branch"
+            );
+            return;
+        }
+    };
+    let branch_route_set = routing.route_set;
+
+    // A Path route set outranks the captured inbound flow.  A binding with a
+    // Path was registered *through* an intermediate proxy, and RFC 3327 §5.3
+    // makes that vector the route set for reaching it — the per-registration
+    // token in the Path URI is the only thing that tells the edge proxy which
+    // of its bindings this request is for.  The captured flow answers a
+    // narrower question ("the Contact URI is unreachable, write back on the
+    // connection the REGISTER came in on"), and using it here would send the
+    // branch to the REGISTER's source while dropping the token that identifies
+    // the binding.  With no Path, the flow is still the only way back to a
+    // WebSocket UE (RFC 5626 §5.3 / RFC 7118 §5), so nothing changes there.
+    let flow = flow.filter(|_| branch_route_set.is_none());
+
     // Resolve the branch destination + transport: over the captured inbound flow
-    // (RFC 5626 §5.3 connection reuse — the only way back to a WebSocket UE,
-    // RFC 7118 §5) when one is attached, else by DNS-resolving the target URI.
+    // when one applies, else by DNS-resolving the branch's top Route (RFC 3261
+    // §16.6 step 6) or, with no route set, the target URI.
     let (mut destination, mut outbound_transport) = if let Some(flow) = flow {
         let transport = match flow.transport.as_str() {
             "udp" => Transport::Udp,
@@ -4022,10 +4122,13 @@ fn relay_fork_branch(
         };
         (flow.source_addr, transport)
     } else {
-        let relay_target = match resolve_target(target, &state.dns_resolver) {
+        // Route set present → the next hop is its topmost entry, not the
+        // Contact URI (RFC 3261 §16.6 step 6).  This is what actually sends
+        // branch N through binding N's own edge proxy.
+        let relay_target = match resolve_target(&routing.next_hop, &state.dns_resolver) {
             Some(t) => t,
             None => {
-                warn!(target = %target, branch = branch_index, "fork: cannot resolve target");
+                warn!(target = %routing.next_hop, branch = branch_index, "fork: cannot resolve target");
                 return;
             }
         };
@@ -4040,6 +4143,14 @@ fn relay_fork_branch(
 
     // Clone and modify message
     let mut relayed = message.clone();
+
+    // Give the branch its own route set (RFC 3327 §5.3).  This *replaces* any
+    // Route on the request: the Path vector is the complete route set for
+    // reaching this binding, and leaving an inherited entry in front of it
+    // would send the branch through the previous binding's proxy chain.
+    if let Some(ref route_value) = branch_route_set {
+        relayed.headers.set("Route", route_value.clone());
+    }
 
     if core::decrement_max_forwards(&mut relayed.headers).is_err() {
         return; // caller handles the error for the whole fork
@@ -4255,6 +4366,278 @@ fn relay_fork_branch(
             }
         }
     }
+}
+
+/// Upper bound on how many times `@proxy.on_failure` may re-target one server
+/// transaction.  A retarget is a fresh client transaction on the same server
+/// transaction, so no protocol timer bounds the chain — a script that always
+/// retries would loop until the UAC gave up.  Eight is far above any real
+/// failover depth (an AoR's bindings, a gateway list) and low enough that a
+/// runaway script fails fast and loudly.
+const MAX_FAILURE_RETARGETS: u8 = 8;
+
+/// A retarget requested by an `@proxy.on_failure` handler (or by a per-relay
+/// `on_failure=` callback) — the script called `request.relay()` /
+/// `request.fork()` instead of forwarding the error.
+struct FailureRetarget {
+    /// The Relay/Fork action the handler set.
+    action: RequestAction,
+    /// The request as the handler left it — Route, Request-URI and headers may
+    /// all have been rewritten to point at the next candidate.
+    request: SipMessage,
+    on_reply_callback: Option<Py<PyAny>>,
+    on_failure_callback: Option<Py<PyAny>>,
+    send_via_transport: Option<String>,
+    send_via_target: Option<String>,
+}
+
+/// What the `@proxy.on_failure` handlers decided.
+struct FailureHandlerOutcome {
+    /// The error response, as the handlers left it.
+    response: SipMessage,
+    /// Whether a handler called `reply.relay()` — false means "suppress".
+    forwarded: bool,
+    /// Set when a handler re-targeted the request instead.
+    retarget: Option<FailureRetarget>,
+}
+
+/// Run the `@proxy.on_failure` handlers for a failed relay or fork.
+///
+/// The handlers get the original request (with its inbound flow replayed, so
+/// Path-token MT routing works on the retry) and the error response.  They may
+/// forward the error (`reply.relay()`), replace it (`request.reply()`), drop it
+/// silently, or re-target the request (`request.relay()` / `request.fork()`) —
+/// the last of which is returned as a [`FailureRetarget`] for the caller to
+/// execute.
+fn run_proxy_failure_handlers(
+    response: SipMessage,
+    original_request: SipMessage,
+    transport: Transport,
+    source_addr: SocketAddr,
+    inbound_local_addr: SocketAddr,
+    connection_id: ConnectionId,
+    state: &DispatcherState,
+) -> FailureHandlerOutcome {
+    let engine_state = state.engine.state();
+    let failure_handlers = engine_state.handlers_for(&HandlerKind::ProxyFailure);
+    if failure_handlers.is_empty() {
+        return FailureHandlerOutcome {
+            response,
+            forwarded: true,
+            retarget: None,
+        };
+    }
+
+    let response_arc = Arc::new(std::sync::Mutex::new(response));
+    let request_arc = Arc::new(std::sync::Mutex::new(original_request));
+    let reply = PyReply::new(Arc::clone(&response_arc));
+    let mut py_request = PyRequest::with_local_domains(
+        Arc::clone(&request_arc),
+        transport.to_string(),
+        source_addr.ip().to_string(),
+        source_addr.port(),
+        Arc::clone(&state.local_domains),
+    )
+    .with_self_identity(Arc::clone(&state.self_identity));
+    // Replay the inbound flow capture so the failure handler can do Path-token
+    // MT routing (`registrar.lookup_by_token` + `request.relay(flow=…)`) on the
+    // retry — the same context the on_request handler saw.
+    py_request.set_local_port(inbound_local_addr.port());
+    py_request.set_inbound_flow(inbound_local_addr, connection_id.0);
+
+    let (forwarded, action, on_reply_callback, on_failure_callback, send_via_transport, send_via_target) =
+        Python::attach(|python| {
+            let py_reply = match Py::new(python, reply) {
+                Ok(obj) => obj,
+                Err(error) => {
+                    error!("failed to create PyReply for on_failure: {error}");
+                    return (true, RequestAction::None, None, None, None, None);
+                }
+            };
+            let py_req = match Py::new(python, py_request) {
+                Ok(obj) => obj,
+                Err(error) => {
+                    error!("failed to create PyRequest for on_failure: {error}");
+                    return (true, RequestAction::None, None, None, None, None);
+                }
+            };
+
+            for handler in &failure_handlers {
+                let callable = handler.callable.bind(python);
+                match callable.call1((py_req.bind(python), py_reply.bind(python))) {
+                    Ok(ret) => {
+                        if handler.is_async {
+                            if let Err(error) = run_coroutine(python, &ret) {
+                                error!("async on_failure handler error: {error}");
+                                return (true, RequestAction::None, None, None, None, None);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        error!("on_failure handler error: {error}");
+                        return (true, RequestAction::None, None, None, None, None);
+                    }
+                }
+            }
+
+            let forwarded = py_reply.borrow(python).was_forwarded();
+            let mut borrowed = py_req.borrow_mut(python);
+            (
+                forwarded,
+                borrowed.action().clone(),
+                borrowed.take_on_reply_callback(),
+                borrowed.take_on_failure_callback(),
+                borrowed.via_transport_override().map(|s| s.to_string()),
+                borrowed.via_target_override().map(|s| s.to_string()),
+            )
+        });
+
+    let response = match Arc::try_unwrap(response_arc) {
+        Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
+        Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+    };
+
+    // Only Relay/Fork is a retarget.  `RequestAction::Reply` is the script
+    // answering the UAC itself — that lands on the normal reply path below via
+    // the response the handler mutated; `None` is the documented silent drop.
+    let retarget = match action {
+        RequestAction::Relay { .. } | RequestAction::Fork { .. } => {
+            let request = match Arc::try_unwrap(request_arc) {
+                Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
+                Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            };
+            Some(FailureRetarget {
+                action,
+                request,
+                on_reply_callback,
+                on_failure_callback,
+                send_via_transport,
+                send_via_target,
+            })
+        }
+        _ => None,
+    };
+
+    FailureHandlerOutcome {
+        response,
+        forwarded,
+        retarget,
+    }
+}
+
+/// Execute a retarget an `@proxy.on_failure` handler asked for: start a fresh
+/// client transaction (or fork) on the *same* server transaction, so the UAC
+/// keeps waiting on its original request instead of seeing the failure.
+///
+/// Returns `false` when the retarget was refused (retry budget exhausted); the
+/// caller then forwards the error response as if no retarget had been asked
+/// for, which is the only outcome that still answers the UAC.
+#[allow(clippy::too_many_arguments)]
+fn execute_failure_retarget(
+    retarget: FailureRetarget,
+    server_key: &TransactionKey,
+    record_routed: bool,
+    transport: Transport,
+    source_addr: SocketAddr,
+    inbound_local_addr: SocketAddr,
+    connection_id: ConnectionId,
+    previous_retargets: u8,
+    state: &DispatcherState,
+) -> bool {
+    if previous_retargets >= MAX_FAILURE_RETARGETS {
+        warn!(
+            server_key = %server_key,
+            retargets = previous_retargets,
+            "on_failure: retarget budget exhausted — forwarding the failure instead"
+        );
+        return false;
+    }
+
+    // Drop the exhausted session (and its client-key indices) before the new
+    // one is inserted for the same server key — otherwise the retry's response
+    // would find the old, completed session.
+    state.session_store.remove_by_server_key(server_key);
+
+    let inbound = InboundMessage {
+        remote_addr: source_addr,
+        local_addr: inbound_local_addr,
+        connection_id,
+        transport,
+        data: Bytes::new(),
+    };
+
+    match retarget.action {
+        RequestAction::Relay {
+            ref next_hop,
+            ref flow,
+            ref send_socket,
+        } => {
+            let send_socket = state.resolve_send_socket(send_socket.as_deref());
+            relay_request(
+                &retarget.request,
+                next_hop.as_deref(),
+                record_routed,
+                &inbound,
+                Some(server_key),
+                state,
+                retarget.on_reply_callback,
+                retarget.on_failure_callback,
+                retarget.send_via_transport.as_deref(),
+                retarget.send_via_target.as_deref(),
+                flow.as_ref(),
+                send_socket.as_ref(),
+            );
+        }
+        RequestAction::Fork {
+            ref targets,
+            ref flows,
+            ref routes,
+            ref strategy,
+            ref send_socket,
+        } => {
+            if targets.is_empty() {
+                warn!(server_key = %server_key, "on_failure: fork with no targets — forwarding the failure");
+                return false;
+            }
+            let fork_strategy = match strategy.as_str() {
+                "sequential" => crate::proxy::fork::ForkStrategy::Sequential,
+                _ => crate::proxy::fork::ForkStrategy::Parallel,
+            };
+            let send_socket = state.resolve_send_socket(send_socket.as_deref());
+            relay_fork_request(
+                &retarget.request,
+                targets,
+                flows,
+                routes,
+                fork_strategy,
+                record_routed,
+                &inbound,
+                Some(server_key),
+                state,
+                send_socket.as_ref(),
+                retarget.on_reply_callback,
+                retarget.on_failure_callback,
+            );
+        }
+        _ => return false,
+    }
+
+    // Carry the retry count onto the session the relay just created so the
+    // chain stays bounded.  Looked up rather than threaded through the relay
+    // signatures; a response that beats this write only costs one extra
+    // permitted retarget, which the budget still bounds.
+    if let Some(session_arc) = state.session_store.get_by_server_key(server_key) {
+        if let Ok(mut session) = session_arc.write() {
+            session.failure_retargets = previous_retargets.saturating_add(1);
+        }
+    }
+
+    debug!(
+        server_key = %server_key,
+        retarget = previous_retargets + 1,
+        "on_failure: re-targeted the request"
+    );
+    true
 }
 
 /// Handle an inbound SIP response — route back to the original sender.
@@ -4624,7 +5007,7 @@ fn handle_response(
 
     if let Some(ref client_key) = client_txn_key {
         if let Some(session_arc) = state.session_store.get_by_client_key(client_key) {
-            let (source_addr, inbound_local_addr, connection_id, transport, server_key, fork_agg, branch_index, original_request, relay_on_reply, relay_on_failure, client_branch, final_response_sent) = {
+            let (source_addr, inbound_local_addr, connection_id, transport, server_key, fork_agg, branch_index, original_request, relay_on_reply, relay_on_failure, client_branch, final_response_sent, record_routed, failure_retargets) = {
                 let session = match session_arc.read() {
                     Ok(s) => s,
                     Err(error) => {
@@ -4651,6 +5034,8 @@ fn handle_response(
                     relay_on_failure,
                     session.client_branches.get(client_key).cloned(),
                     session.final_response_sent,
+                    session.record_routed,
+                    session.failure_retargets,
                 )
             };
 
@@ -4762,7 +5147,16 @@ fn handle_response(
             if relay_on_reply.is_some() || (relay_on_failure.is_some() && status_code >= 400) {
                 let msg_arc = Arc::new(std::sync::Mutex::new(message));
                 let req_arc = Arc::new(std::sync::Mutex::new(original_request.clone()));
-                let (updated_msg, cb_forward, cb_reject): (Option<SipMessage>, bool, Option<(u16, String)>) = Python::attach(|python| {
+                type RelayCallbackOutcome = (
+                    bool,
+                    Option<(u16, String)>,
+                    // Set only when the on_failure callback ran and re-targeted
+                    // the request: (action, on_reply, on_failure, via transport,
+                    // via target).  Scoped to that callback so an on_reply
+                    // callback calling relay() can never be mistaken for one.
+                    Option<(RequestAction, Option<Py<PyAny>>, Option<Py<PyAny>>, Option<String>, Option<String>)>,
+                );
+                let (cb_forward, cb_reject, cb_retarget): RelayCallbackOutcome = Python::attach(|python| {
                     let py_reply_obj = PyReply::new(Arc::clone(&msg_arc))
                         .with_response_source(
                             inbound.remote_addr.ip().to_string(),
@@ -4772,7 +5166,7 @@ fn handle_response(
                         Ok(obj) => obj,
                         Err(error) => {
                             error!("failed to create PyReply for relay callback: {error}");
-                            return (None, true, None);
+                            return (true, None, None);
                         }
                     };
                     let py_req = {
@@ -4797,10 +5191,11 @@ fn handle_response(
                             Ok(obj) => obj,
                             Err(error) => {
                                 error!("failed to create PyRequest for relay callback: {error}");
-                                return (None, true, None);
+                                return (true, None, None);
                             }
                         }
                     };
+                    let mut retarget = None;
 
                     // on_reply callback: (request, reply)
                     if let Some(ref on_reply) = relay_on_reply {
@@ -4836,13 +5231,31 @@ fn handle_response(
                                     error!("relay on_failure callback error: {error}");
                                 }
                             }
+                            // A per-relay on_failure callback may re-target the
+                            // request too, on the same terms as the global
+                            // `@proxy.on_failure` handler.  Read the action here
+                            // — inside the on_failure arm — so an on_reply
+                            // callback that calls relay() is never mistaken for
+                            // a failure retarget.
+                            let mut borrowed = py_req.borrow_mut(python);
+                            if matches!(
+                                borrowed.action(),
+                                RequestAction::Relay { .. } | RequestAction::Fork { .. }
+                            ) {
+                                retarget = Some((
+                                    borrowed.action().clone(),
+                                    borrowed.take_on_reply_callback(),
+                                    borrowed.take_on_failure_callback(),
+                                    borrowed.via_transport_override().map(|s| s.to_string()),
+                                    borrowed.via_target_override().map(|s| s.to_string()),
+                                ));
+                            }
                         }
                     }
 
                     let reply_ref = py_reply.borrow(python);
-                    (None, reply_ref.was_forwarded(), reply_ref.reject_action())
+                    (reply_ref.was_forwarded(), reply_ref.reject_action(), retarget)
                 });
-                let _ = updated_msg; // unused — message stays in msg_arc
                 // A per-relay on_reply callback can reject too (same contract as
                 // the global `@proxy.on_reply` handler) — fail the in-progress
                 // INVITE upstream + CANCEL downstream.  Reached only when the
@@ -4862,6 +5275,36 @@ fn handle_response(
                     );
                     return;
                 }
+                // The per-relay on_failure callback re-targeted the request —
+                // start it on the same server transaction instead of answering
+                // the UAC with this failure.
+                if let Some((action, on_reply_cb, on_failure_cb, via_transport, via_target)) = cb_retarget {
+                    let retargeted_request = match Arc::try_unwrap(req_arc) {
+                        Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
+                        Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                    };
+                    if execute_failure_retarget(
+                        FailureRetarget {
+                            action,
+                            request: retargeted_request,
+                            on_reply_callback: on_reply_cb,
+                            on_failure_callback: on_failure_cb,
+                            send_via_transport: via_transport,
+                            send_via_target: via_target,
+                        },
+                        &server_key,
+                        record_routed,
+                        transport,
+                        source_addr,
+                        inbound_local_addr,
+                        connection_id,
+                        failure_retargets,
+                        state,
+                    ) {
+                        return;
+                    }
+                    // Budget exhausted — fall through and answer the UAC.
+                }
                 if !cb_forward {
                     state.session_store.remove_client_key(client_key);
                     return;
@@ -4871,6 +5314,64 @@ fn handle_response(
                     Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
                     Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
                 };
+            }
+
+            // --- Global @proxy.on_failure for a single-target relay ---
+            //
+            // A fork reaches the handlers through the aggregator's
+            // ForwardBestError arm below.  A plain `request.relay()` has no
+            // aggregator at all, so before this the global failure policy was
+            // simply never invoked for the commonest case in a proxy — a script
+            // could register `@proxy.on_failure`, see it never fire, and have
+            // no way to express failover (the shipped I-CSCF S-CSCF failover
+            // example depended on exactly this).  With one branch there is
+            // nothing to aggregate: every non-2xx final response *is* "all
+            // branches failed".
+            //
+            // 487 is excluded: the transaction was cancelled by the UAC, so a
+            // retarget would resurrect a call the caller has already abandoned.
+            // `@proxy.on_cancel` is the hook for that teardown.
+            if fork_agg.is_none()
+                && (300..700).contains(&status_code)
+                && status_code != 487
+                && !final_response_sent
+            {
+                let outcome = run_proxy_failure_handlers(
+                    message,
+                    original_request.clone(),
+                    transport,
+                    source_addr,
+                    inbound_local_addr,
+                    connection_id,
+                    state,
+                );
+
+                if let Some(retarget) = outcome.retarget {
+                    if execute_failure_retarget(
+                        retarget,
+                        &server_key,
+                        record_routed,
+                        transport,
+                        source_addr,
+                        inbound_local_addr,
+                        connection_id,
+                        failure_retargets,
+                        state,
+                    ) {
+                        return;
+                    }
+                    // Budget exhausted — fall through and answer the UAC.
+                }
+
+                if !outcome.forwarded {
+                    debug!(
+                        status = status_code,
+                        "on_failure handler suppressed error response (single relay)"
+                    );
+                    state.session_store.remove_client_key(client_key);
+                    return;
+                }
+                message = outcome.response;
             }
 
             // --- Fork aggregator decision ---
@@ -4944,85 +5445,50 @@ fn handle_response(
                         };
 
                         // Invoke @proxy.on_failure handlers before forwarding
-                        let engine_state = state.engine.state();
-                        let failure_handlers = engine_state.handlers_for(&HandlerKind::ProxyFailure);
-                        if !failure_handlers.is_empty() {
-                            let response_arc = Arc::new(std::sync::Mutex::new(best_response));
-                            let reply = PyReply::new(Arc::clone(&response_arc));
-                            let request_arc = Arc::new(std::sync::Mutex::new(original_request));
-                            let mut py_request = PyRequest::with_local_domains(
-                                request_arc,
-                                transport.to_string(),
-                                source_addr.ip().to_string(),
-                                source_addr.port(),
-                                Arc::clone(&state.local_domains),
-                            )
-                            .with_self_identity(Arc::clone(&state.self_identity));
-                            // Replay the inbound flow capture so the
-                            // failure handler can do Path-token MT
-                            // routing (`registrar.lookup_by_token` +
-                            // `request.relay(flow=…)`) on retry.
-                            py_request.set_local_port(inbound_local_addr.port());
-                            py_request.set_inbound_flow(inbound_local_addr, connection_id.0);
+                        let outcome = run_proxy_failure_handlers(
+                            best_response,
+                            original_request,
+                            transport,
+                            source_addr,
+                            inbound_local_addr,
+                            connection_id,
+                            state,
+                        );
 
-                            let forwarded = Python::attach(|python| {
-                                let py_reply = match Py::new(python, reply) {
-                                    Ok(obj) => obj,
-                                    Err(e) => {
-                                        error!("failed to create PyReply for on_failure: {e}");
-                                        return true;
-                                    }
-                                };
-                                let py_req = match Py::new(python, py_request) {
-                                    Ok(obj) => obj,
-                                    Err(e) => {
-                                        error!("failed to create PyRequest for on_failure: {e}");
-                                        return true;
-                                    }
-                                };
-
-                                for handler in &failure_handlers {
-                                    let callable = handler.callable.bind(python);
-                                    let result = callable.call1((py_req.bind(python), py_reply.bind(python),));
-                                    match result {
-                                        Ok(ret) => {
-                                            if handler.is_async {
-                                                if let Err(e) = run_coroutine(python, &ret) {
-                                                    error!("async on_failure handler error: {e}");
-                                                    return true;
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            error!("on_failure handler error: {e}");
-                                            return true;
-                                        }
-                                    }
-                                }
-
-                                let result = py_reply.borrow(python).was_forwarded();
-                                result
-                            });
-
-                            if !forwarded {
-                                debug!("on_failure handler suppressed error response");
-                                state.session_store.remove_by_server_key(&server_key);
+                        // The handler re-targeted the request (`request.relay()`
+                        // / `request.fork()`) — start it on the same server
+                        // transaction and leave the UAC waiting rather than
+                        // answering the failure.  Nothing else may run: no
+                        // response upstream, no failed CDR.
+                        if let Some(retarget) = outcome.retarget {
+                            if execute_failure_retarget(
+                                retarget,
+                                &server_key,
+                                record_routed,
+                                transport,
+                                source_addr,
+                                inbound_local_addr,
+                                connection_id,
+                                failure_retargets,
+                                state,
+                            ) {
                                 return;
                             }
-
-                            let final_response = match Arc::try_unwrap(response_arc) {
-                                Ok(mutex) => mutex.into_inner().unwrap_or_else(|e| e.into_inner()),
-                                Err(arc) => arc.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-                            };
-                            // 3GPP TS 33.203 §7.4: the relayed-back response
-                            // must egress on the same SA's local endpoint
-                            // that the request arrived on.  Pass the session's
-                            // captured inbound_local_addr so the OutboundRouter
-                            // hits the right per-listener UDP channel.
-                            send_message_from(final_response, transport, source_addr, connection_id, Some(inbound_local_addr), state);
-                        } else {
-                            send_message_from(best_response, transport, source_addr, connection_id, Some(inbound_local_addr), state);
+                            // Budget exhausted — fall through and answer the UAC.
                         }
+
+                        if !outcome.forwarded {
+                            debug!("on_failure handler suppressed error response");
+                            state.session_store.remove_by_server_key(&server_key);
+                            return;
+                        }
+
+                        // 3GPP TS 33.203 §7.4: the relayed-back response must
+                        // egress on the same SA's local endpoint that the
+                        // request arrived on.  Pass the session's captured
+                        // inbound_local_addr so the OutboundRouter hits the
+                        // right per-listener UDP channel.
+                        send_message_from(outcome.response, transport, source_addr, connection_id, Some(inbound_local_addr), state);
 
                         // CDR: both forwarded paths converge here (a retrying /
                         // suppressing on_failure handler already returned above),
@@ -9350,7 +9816,7 @@ fn start_next_fork_branch(
     server_key: &TransactionKey,
     state: &DispatcherState,
 ) {
-    let (original_request, record_routed, source_addr, connection_id, transport, agg, branch_flow, send_socket) = {
+    let (original_request, record_routed, source_addr, connection_id, transport, agg, branch_flow, branch_path, send_socket) = {
         let session = match session_arc.read() {
             Ok(s) => s,
             Err(_) => return,
@@ -9363,6 +9829,9 @@ fn start_next_fork_branch(
             session.transport,
             session.fork_aggregator.clone(),
             session.fork_flows.get(next_index).cloned().flatten(),
+            // The failover branch's own Path route set — the whole reason
+            // sequential forking across an AoR's bindings can work at all.
+            session.fork_routes.get(next_index).cloned().unwrap_or_default(),
             session.fork_send_socket.clone(),
         )
     };
@@ -9398,6 +9867,7 @@ fn start_next_fork_branch(
             session_arc,
             &agg,
             branch_flow.as_ref(),
+            &branch_path,
             send_socket.as_ref(),
             state,
         );
@@ -9513,7 +9983,21 @@ fn handle_ack_via_session(
         }
     };
 
-    // Forward ACK to each client branch (typically just one for a completed call)
+    // Forward the ACK once per distinct downstream destination.
+    //
+    // A 2xx ACK is a new request routed by the *dialog route set* (RFC 3261
+    // §13.2.2.4), so every branch of a fork resolves it to the same place: the
+    // one UAS that answered.  Iterating the branches without this guard sent
+    // the UAS one ACK per branch — harmless on the wire only if the UAS is
+    // forgiving, but a strict one treats the duplicate as an out-of-sequence
+    // request on a dialog it has already confirmed.  The dedupe key is the
+    // resolved hop, not the branch, so a session that genuinely has two remote
+    // targets still gets one ACK each.
+    // Keyed on the resolved hop only — NOT on the connection id, which is
+    // derived per branch (for UDP it is a hash of the branch's own remote
+    // address) and would make two branches that resolve to the same UAS look
+    // like different hops.
+    let mut sent_destinations: Vec<(SocketAddr, Transport)> = Vec::new();
     for client_key in &session.client_keys {
         if let Some(client_branch) = session.get_client_branch(client_key) {
             let mut ack_downstream = message.clone();
@@ -9594,6 +10078,17 @@ fn handle_ack_via_session(
                 &state.via_host(&out_transport),
                 Some(state.via_port(&out_transport)),
             );
+
+            let hop = (destination, out_transport);
+            if sent_destinations.contains(&hop) {
+                debug!(
+                    client_key = %client_key,
+                    %destination,
+                    "2xx ACK already relayed to this hop by another fork branch — skipping"
+                );
+                continue;
+            }
+            sent_destinations.push(hop);
 
             let data = Bytes::from(ack_downstream.to_bytes());
             debug!(

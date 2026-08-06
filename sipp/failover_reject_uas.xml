@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  The destination that must be failed over FROM.  Answers 404 to one INVITE and
+  exits.  Used twice by the failover acceptance test:
+
+    - as the edge proxy holding a binding that is gone (the SIM moved, the
+      security association was replaced).  Receiving the INVITE here at all
+      proves branch 0 was routed by that binding's own Path.
+    - as the primary backend of the @proxy.on_failure re-target scenario.
+
+  Either way the call is only rescued if the *next* attempt goes somewhere
+  else, which is the behaviour under test.
+
+  Run: sipp -sf failover_reject_uas.xml -p 5060
+-->
+<scenario name="Failover reject">
+
+  <recv request="INVITE" />
+
+  <send>
+    <![CDATA[
+SIP/2.0 404 Not Found
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag90[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Mandatory: siphon's INVITE client transaction ACKs a non-2xx hop-by-hop
+       (RFC 3261 §17.1.1.3), so this always arrives. -->
+  <recv request="ACK" rtd="true" />
+
+</scenario>

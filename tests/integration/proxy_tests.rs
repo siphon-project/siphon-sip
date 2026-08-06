@@ -713,3 +713,120 @@ fn concurrent_registrar_access() {
         assert_eq!(contacts[0].uri.host, format!("10.0.0.{}", i + 1));
     }
 }
+fn binding_with_path(host: &str, path: Vec<String>) -> siphon::registrar::Contact {
+    siphon::registrar::Contact {
+        uri: SipUri::new(host.to_string()).with_user("alice".to_string()).with_port(5060),
+        q: 1.0,
+        registered_at: std::time::Instant::now(),
+        expires: std::time::Duration::from_secs(3600),
+        call_id: format!("reg-{host}"),
+        cseq: 1,
+        source_addr: None,
+        source_transport: Some("udp".to_string()),
+        sip_instance: None,
+        reg_id: None,
+        path,
+        pending: false,
+        instance_id: None,
+        instance_epoch: None,
+        flow_token: None,
+        inbound_local_addr: None,
+        inbound_connection_id: None,
+        params: Vec::new(),
+        kind: siphon::registrar::ContactKind::Ue,
+    }
+}
+
+#[test]
+fn two_bindings_of_one_aor_get_independent_route_sets() {
+    use siphon::proxy::core::branch_routing;
+    use siphon::script::api::registrar::PyContact;
+
+    let binding_a = binding_with_path("10.0.0.1", vec!["<sip:TOKEN-A@edge.example.com;lr>".to_string()]);
+    let binding_b = binding_with_path("10.0.0.2", vec!["<sip:TOKEN-B@edge.example.com;lr>".to_string()]);
+
+    let (uri_a, _flow_a, path_a) = PyContact::from_rust_contact(&binding_a).fork_target();
+    let (uri_b, _flow_b, path_b) = PyContact::from_rust_contact(&binding_b).fork_target();
+
+    let branch_a = branch_routing(&path_a, &uri_a).expect("binding A must be routable");
+    let branch_b = branch_routing(&path_b, &uri_b).expect("binding B must be routable");
+
+    assert_eq!(branch_a.route_set.as_deref(), Some("<sip:TOKEN-A@edge.example.com;lr>"));
+    assert_eq!(branch_b.route_set.as_deref(), Some("<sip:TOKEN-B@edge.example.com;lr>"));
+    assert!(branch_a.next_hop.contains("TOKEN-A"));
+    assert!(branch_b.next_hop.contains("TOKEN-B"));
+
+    assert!(uri_a.contains("10.0.0.1"));
+    assert!(uri_b.contains("10.0.0.2"));
+}
+
+#[test]
+fn binding_without_path_still_routes_by_contact_uri() {
+    use siphon::proxy::core::branch_routing;
+    use siphon::script::api::registrar::PyContact;
+
+    let binding = binding_with_path("10.0.0.7", Vec::new());
+    let (uri, _flow, path) = PyContact::from_rust_contact(&binding).fork_target();
+    let routing = branch_routing(&path, &uri).expect("routable");
+    assert!(routing.route_set.is_none());
+    assert_eq!(routing.next_hop, uri);
+}
+
+#[test]
+fn multi_hop_path_becomes_the_full_route_set_in_order() {
+    use siphon::proxy::core::branch_routing;
+    use siphon::script::api::registrar::PyContact;
+
+    let binding = binding_with_path(
+        "10.0.0.3",
+        vec![
+            "<sip:icscf.ims.example.com;lr>".to_string(),
+            "<sip:pcscf.ims.example.com;lr>".to_string(),
+        ],
+    );
+    let (uri, _flow, path) = PyContact::from_rust_contact(&binding).fork_target();
+    let routing = branch_routing(&path, &uri).expect("routable");
+
+    assert_eq!(
+        routing.route_set.as_deref(),
+        Some("<sip:icscf.ims.example.com;lr>, <sip:pcscf.ims.example.com;lr>")
+    );
+    assert!(routing.next_hop.contains("icscf.ims.example.com"));
+}
+
+#[test]
+fn registrar_lookup_orders_bindings_newest_first() {
+    let registrar = Registrar::new(RegistrarConfig::default());
+
+    registrar
+        .save_with_source(
+            "sip:alice@example.com",
+            SipUri::new("10.0.0.1".to_string()).with_user("alice".to_string()).with_port(5060),
+            3600,
+            1.0,
+            "old-handset".to_string(),
+            1,
+            None,
+            Some("udp".to_string()),
+        )
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    registrar
+        .save_with_source(
+            "sip:alice@example.com",
+            SipUri::new("10.0.0.2".to_string()).with_user("alice".to_string()).with_port(5060),
+            3600,
+            1.0,
+            "new-handset".to_string(),
+            1,
+            None,
+            Some("udp".to_string()),
+        )
+        .unwrap();
+
+    let contacts = registrar.lookup("sip:alice@example.com");
+    assert_eq!(contacts.len(), 2);
+    assert_eq!(contacts[0].call_id, "new-handset");
+    assert_eq!(contacts[1].call_id, "old-handset");
+    assert!(contacts[1].age_seconds() >= contacts[0].age_seconds());
+}

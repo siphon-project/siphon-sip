@@ -76,6 +76,16 @@ pub struct ProxySession {
     /// branches started after the first.  `PyFlow` is plain data (no
     /// `Py<PyAny>`), so cloning it off the dispatcher thread is sound.
     pub fork_flows: Vec<Option<crate::script::api::registrar::PyFlow>>,
+    /// Per-fork-branch Route header set, parallel to the aggregator's branches.
+    /// Built from the RFC 3327 Path vector stored with that branch's
+    /// registration binding (`Contact.path`), so each branch is routed through
+    /// *its own* proxy chain / per-registration Path token rather than through
+    /// whatever Route the script left on the request.  Empty means "leave the
+    /// request's Route set alone" (a bare-URI target).  Stored on the session
+    /// so sequential forking (`start_next_fork_branch`) can recover the route
+    /// set for branches started after the first — the branch that actually
+    /// matters for failover.
+    pub fork_routes: Vec<Vec<String>>,
     /// Script `send_socket=` egress pin for the whole fork, stored so sequential
     /// forking (`start_next_fork_branch`) applies the same source-socket pin to
     /// branches started after the first.  `SendSocket` is plain data (no
@@ -101,6 +111,14 @@ pub struct ProxySession {
     /// ACKed by the client transaction) instead of forwarding a second final
     /// response upstream.
     pub final_response_sent: bool,
+    /// How many times an `@proxy.on_failure` handler has already re-targeted
+    /// this server transaction via `request.relay()` / `request.fork()`.
+    ///
+    /// A retarget starts a fresh client transaction on the *same* server
+    /// transaction, so nothing in the protocol bounds the chain — Max-Forwards
+    /// is decremented from the original request each time, exactly as it is for
+    /// the branches of one fork.  This counter is that bound.
+    pub failure_retargets: u8,
 }
 
 impl ProxySession {
@@ -120,6 +138,7 @@ impl ProxySession {
             client_branches: HashMap::new(),
             fork_aggregator: None,
             fork_flows: Vec::new(),
+            fork_routes: Vec::new(),
             fork_send_socket: None,
             branch_index_map: HashMap::new(),
             source_addr,
@@ -132,6 +151,7 @@ impl ProxySession {
             on_reply_callback: None,
             on_failure_callback: None,
             final_response_sent: false,
+            failure_retargets: 0,
         }
     }
 

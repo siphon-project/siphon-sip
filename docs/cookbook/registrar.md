@@ -74,10 +74,21 @@ A few things worth knowing:
 
 - **`registrar.save(request)` sends the 200 OK for you** (with the granted Expires,
   clamped by `max_expires`). You don't reply yourself.
-- **`request.fork(contacts)`** passes the `Contact` objects (not just `.uri`). For a
-  binding this node accepted, that routes over the captured inbound flow — the only
-  way to reach a WebSocket UE (RFC 5626 §5.3 connection reuse). Non-local contacts
-  fall back to URI routing.
+- **`request.fork(contacts)`** passes the `Contact` objects (not just `.uri`). That
+  matters for two reasons. A binding this node accepted routes over the captured
+  inbound flow — the only way to reach a WebSocket UE (RFC 5626 §5.3 connection
+  reuse). And a binding registered *through* an edge proxy gets its own Route
+  header set built from its RFC 3327 Path, so each branch goes out through the
+  proxy chain (and the per-registration Path token) that binding was registered
+  with. Without that, every branch would carry the first binding's route set and a
+  Path-token edge proxy would deliver them all back to the same contact, which is
+  the difference between real failover and retrying one dead binding N times.
+  Pass `[c.uri for c in contacts]` to opt out and route purely by Request-URI.
+- **Bindings come back in the order to try them**: highest q first (RFC 3261
+  §20.10), then most recently registered. Most UEs send no q, so recency is
+  usually what orders them — the right default when a SIM has moved to a new
+  handset and the previous binding is still inside its granted expiry. Use
+  `Contact.age_secs` if you need your own rule.
 - **`request.fix_nated_register()`** rewrites the Contact with the source the packet
   actually came from, so NAT'd clients are reachable. Pair it with `nat:` config.
 

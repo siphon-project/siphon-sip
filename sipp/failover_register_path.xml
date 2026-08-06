@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  REGISTER carrying an RFC 3327 Path header, as an edge proxy would insert it.
+
+  The Path URI's userpart is a per-registration token: the edge proxy resolves
+  it back to *this* binding when a terminating request comes back through it.
+  Two UEs of the same AoR register with different tokens through different
+  edges, which is what makes each binding independently routable — and what a
+  fork has to preserve per branch.
+
+  -key regpath  the full Path header value, e.g. "<sip:token-a@172.20.0.90:5060;lr>"
+  -key regq     the Contact q-value that orders the bindings, e.g. "1.0"
+
+  Run: sipp <proxy>:5060 -sf failover_register_path.xml -s bob \
+            -key regpath '<sip:token-a@172.20.0.90:5060;lr>' -key regq 1.0 -m 1
+-->
+<scenario name="REGISTER with Path">
+
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 REGISTER
+Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>;q=[regq];expires=3600
+Path: [regpath]
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <recv response="200" rtd="true" />
+
+</scenario>

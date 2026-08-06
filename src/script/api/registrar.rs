@@ -141,6 +141,8 @@ pub struct PyContact {
     q_value: f32,
     /// Seconds remaining until this contact expires.
     expires_remaining: u64,
+    /// Seconds since the binding was created or last refreshed.
+    age_seconds: u64,
     /// Source address of the REGISTER (for NAT traversal routing).
     /// Format: "sip:ip:port;transport=proto" — like OpenSIPS received_avp.
     received_string: Option<String>,
@@ -195,6 +197,29 @@ impl PyContact {
     #[getter]
     fn expires(&self) -> u64 {
         self.expires_remaining
+    }
+
+    /// Seconds since this binding was created or last refreshed.
+    ///
+    /// Use this to order bindings by recency — ``expires`` cannot answer that
+    /// question, because it is time *remaining* and every UE asks for a
+    /// different lifetime: a handset that requested 600 s and registered a
+    /// second ago sorts below one that requested 3600 s an hour ago.
+    ///
+    /// ``registrar.lookup()`` already returns bindings most-recent-first within
+    /// one q-value, so this is for scripts that need a different rule — e.g.
+    /// "ignore anything older than an hour":
+    ///
+    /// ```text
+    /// fresh = [c for c in registrar.lookup(uri) if c.age_secs < 3600]
+    /// ```
+    ///
+    /// Monotonic, so it is immune to wall-clock steps.  It survives a restart
+    /// for bindings restored from a persistence backend; a binding whose stored
+    /// record pre-dates age tracking reports ``0``.
+    #[getter]
+    fn age_secs(&self) -> u64 {
+        self.age_seconds
     }
 
     /// The received address (source IP:port of the REGISTER).
@@ -319,19 +344,25 @@ impl PyContact {
         Self::from_rust_contact_with_registrar(contact, None)
     }
 
-    /// `(uri, flow)` for flow-aware `request.fork()` / `call.fork()`.
+    /// `(uri, flow, path)` for flow-aware `request.fork()` / `call.fork()`.
     ///
     /// The captured flow is only surfaced when this binding was accepted by the
     /// **local** process (`is_local`); a binding restored from a shared backend
     /// on another instance carries a `connection_id` that is meaningless here,
     /// so it falls back to URI routing.  The URI is always the Contact URI.
-    pub fn fork_target(&self) -> (String, Option<PyFlow>) {
+    ///
+    /// `path` is this binding's RFC 3327 Path vector.  Two bindings of one AoR
+    /// generally have *different* Path vectors — different edge proxies, or the
+    /// same edge proxy with a different per-registration token — so the proxy
+    /// turns it into a per-branch Route set rather than sending every branch
+    /// with whatever Route the script left on the request.
+    pub fn fork_target(&self) -> (String, Option<PyFlow>, Vec<String>) {
         let flow = if self.is_local_value {
             self.flow_value.clone()
         } else {
             None
         };
-        (self.uri_string.clone(), flow)
+        (self.uri_string.clone(), flow, self.path_headers.clone())
     }
 
     /// Same as [`from_rust_contact`] but resolves `is_local` against the
@@ -378,6 +409,7 @@ impl PyContact {
                         uri_string: contact.uri.to_string(),
                         q_value: contact.q,
                         expires_remaining: contact.remaining_seconds(),
+                        age_seconds: contact.age_seconds(),
                         received_string,
                         path_headers: contact.path.clone(),
                         instance_id_value: contact.instance_id.clone(),
@@ -402,6 +434,7 @@ impl PyContact {
             uri_string: contact.uri.to_string(),
             q_value: contact.q,
             expires_remaining: contact.remaining_seconds(),
+            age_seconds: contact.age_seconds(),
             received_string,
             path_headers: contact.path.clone(),
             instance_id_value: contact.instance_id.clone(),
@@ -1893,6 +1926,7 @@ mod tests {
             uri_string: "sip:alice@10.0.0.1".to_string(),
             q_value: 1.0,
             expires_remaining: 3600,
+            age_seconds: 0,
             received_string: None,
             path_headers: vec![],
             instance_id_value: None,
@@ -2383,16 +2417,57 @@ mod tests {
 
         // Non-local → flow withheld, URI carried for DNS routing.
         py.is_local_value = false;
-        let (uri, flow) = py.fork_target();
+        let (uri, flow, _path) = py.fork_target();
         assert!(flow.is_none(), "non-local binding must not surface its flow");
         assert!(uri.contains("bob@df7jal23ls0d.invalid"));
 
         // Local → flow surfaced for connection reuse.
         py.is_local_value = true;
-        let (_, flow) = py.fork_target();
+        let (_, flow, _path) = py.fork_target();
         let flow = flow.expect("local binding must surface its captured flow");
         assert_eq!(flow.transport, "wss");
         assert_eq!(flow.connection_id, 0xc0ffee);
+    }
+
+    #[test]
+    fn fork_target_carries_the_bindings_own_path() {
+        // Per-branch route sets are the whole failover story: two bindings of
+        // one AoR carry different Path tokens, and the fork branch must be
+        // routed by *its own* one.  A cross-instance binding still surfaces
+        // its Path (unlike the flow) — Path is routable from anywhere, a
+        // captured connection_id is not.
+        let path = vec!["<sip:TOKEN-B@edge.example.com;lr>".to_string()];
+        let contact = Contact {
+            uri: SipUri::new("10.0.0.2".to_string()).with_user("bob".into()),
+            q: 1.0,
+            registered_at: std::time::Instant::now(),
+            expires: std::time::Duration::from_secs(3600),
+            call_id: "c2".into(),
+            cseq: 1,
+            source_addr: Some("10.0.0.2:50000".parse().unwrap()),
+            source_transport: Some("udp".into()),
+            sip_instance: None,
+            reg_id: None,
+            path: path.clone(),
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: Some("TOKEN-B".into()),
+            inbound_local_addr: Some("127.0.0.1:5060".parse().unwrap()),
+            inbound_connection_id: Some(7),
+            params: Vec::new(),
+            kind: crate::registrar::ContactKind::Ue,
+        };
+        let mut py = PyContact::from_rust_contact(&contact);
+
+        py.is_local_value = false;
+        let (_, flow, carried) = py.fork_target();
+        assert!(flow.is_none());
+        assert_eq!(carried, path, "Path must survive a non-local binding");
+
+        py.is_local_value = true;
+        let (_, _, carried) = py.fork_target();
+        assert_eq!(carried, path);
     }
 
     #[test]

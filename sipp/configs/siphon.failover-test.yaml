@@ -1,0 +1,31 @@
+# siphon.failover-test.yaml — terminating failover across an AoR's bindings.
+#
+# Used with: sipp/docker-compose.yaml --profile failover (scripts/failover_test.sh)
+# Script:    scripts/failover_proxy.py
+#
+# No auth: both acceptance scenarios are about routing, and the fixture
+# registers each UE exactly once.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.13"
+
+advertised_address: "172.20.0.13"
+
+script:
+  path: "scripts/failover_proxy.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+log:
+  level: debug
+  format: pretty

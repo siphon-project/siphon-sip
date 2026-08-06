@@ -1345,7 +1345,11 @@ impl PyCall {
         let mut flows: Vec<Option<super::registrar::PyFlow>> = Vec::with_capacity(targets.len());
         for item in targets {
             if let Ok(contact) = item.extract::<PyRef<super::registrar::PyContact>>() {
-                let (uri, flow) = contact.fork_target();
+                // The binding's Path vector is deliberately not consumed here:
+                // the B2BUA builds a fresh B-leg INVITE with its own route set,
+                // so a per-branch Path route set needs separate plumbing to the
+                // dial path (the proxy path consumes it via RequestAction::Fork).
+                let (uri, flow, _path) = contact.fork_target();
                 target_uris.push(uri);
                 flows.push(flow);
             } else {
