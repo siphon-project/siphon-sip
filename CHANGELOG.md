@@ -97,6 +97,27 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   list is currently **empty** — all 50 fixtures are handled as the RFC requires.
 
 ### Fixed
+- **A branch the proxy failed itself no longer outranks a real answer from a
+  sibling branch.** Now that a transport error becomes a 503 and a timeout a
+  408, straight class ordering (5xx beats 4xx) handed a branch that never left
+  the box the win over one that reached a phone: a parallel fork where branch A
+  hit a transport error and branch B answered `486 Busy Here` told the caller
+  `500 Server Internal Error`. A locally synthesized failure describes this
+  proxy's plumbing, not the callee, so any peer-originated response is now
+  preferred; ordering among real responses is unchanged, and a fork where every
+  branch failed locally still forwards its best synthesized error.
+- **`call.fork()` and `call.dial()` now route a binding through its RFC 3327
+  Path.** The B2BUA builds a fresh B-leg INVITE, and it was sent to the
+  callee's Contact URI — the address the Path exists to route around (NAT,
+  IPsec, a userless or `.invalid` contact). A callee registered through an edge
+  proxy was therefore unreachable in B2BUA mode even with a single binding.
+  `call.fork()` gains a per-branch route set from each `Contact`'s Path
+  (parallel *and* sequential, so serial failover reaches each binding's own
+  proxy chain and its per-registration token), and the B-leg now takes its
+  destination from the topmost Route when no explicit `next_hop=` is given
+  (RFC 3261 §16.6 step 6) — which also makes the existing `route=` argument on
+  `call.dial()` actually routable rather than a header that decorated an INVITE
+  sent somewhere else.
 - **A proxied request whose branch never got an answer now gets one.** Two
   independent paths ended at a `warn!` and told nobody, so the upstream UAC sat
   on its `100 Trying` until its own Timer F — 32 s of silence for a failure the
