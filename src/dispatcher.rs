@@ -4906,7 +4906,7 @@ fn fail_branch_locally(
         return;
     };
 
-    let (original_request, inbound_local_addr, branch) = {
+    let (original_request, inbound_local_addr, branch, fork_aggregator, branch_index) = {
         let Ok(session) = session_arc.read() else {
             error!("proxy session lock poisoned while failing a branch");
             return;
@@ -4915,8 +4915,22 @@ fn fail_branch_locally(
             session.original_request.clone(),
             session.inbound_local_addr,
             session.client_branches.get(client_key).cloned(),
+            session.fork_aggregator.clone(),
+            session.branch_index_map.get(client_key).copied(),
         )
     };
+
+    // Tell the aggregator this branch's answer is ours, not the callee's,
+    // *before* injecting it.  A sibling branch that actually reached an
+    // endpoint must win the best-error selection: without this a transport
+    // error (503, class 5xx) would outrank a real `486 Busy Here` (class 4xx)
+    // and the caller would hear "Server Internal Error" instead of "Busy".
+    if let (Some(aggregator), Some(index)) = (&fork_aggregator, branch_index) {
+        match aggregator.lock() {
+            Ok(mut agg) => agg.mark_local_failure(index),
+            Err(_) => error!("fork aggregator lock poisoned while failing a branch"),
+        }
+    }
 
     // RFC 3261 §17.1.4: on a transport failure the client transaction goes
     // straight to Terminated. Dropping it here also stops the synthetic
@@ -11775,16 +11789,25 @@ fn handle_b2bua_invite(
             );
             set_b2bua_answer_deadline(&call_id, timeout, state);
         }
-        CallAction::Fork { targets, flows, strategy: _, send_socket, timeout } => {
+        CallAction::Fork { targets, flows, routes, strategy: _, send_socket, timeout } => {
             debug!(call_id = %call_id, targets = ?targets, "B2BUA: forking B-legs");
             let send_socket = state.resolve_send_socket(send_socket.as_deref());
             for (index, target) in targets.iter().enumerate() {
+                // Each branch gets the route set of *its own* binding (RFC 3327
+                // §5.3), which also decides where the branch is sent.  A shared
+                // route set would put every branch through the first binding's
+                // proxy chain — and, behind a Path-token edge proxy, deliver
+                // them all back to the first binding.
+                let branch_path = routes.get(index).map(Vec::as_slice).unwrap_or(&[]);
+                let branch_route = crate::proxy::core::route_set_from_path(branch_path)
+                    .map(|value| vec![value])
+                    .unwrap_or_default();
                 b2bua_send_b_leg_invite(
                     &call_id,
                     target,
                     None,
                     flows.get(index).and_then(|f| f.as_ref()),
-                    &[],
+                    &branch_route,
                     send_socket.as_ref(),
                     None,
                     &message_guard,
@@ -11933,7 +11956,23 @@ fn b2bua_send_b_leg_invite(
         };
         (flow.source_addr, transport)
     } else {
-        let routing_uri = next_hop.unwrap_or(target_uri);
+        // RFC 3261 §16.6 step 6: with a route set and no explicit next-hop, the
+        // request goes to the topmost Route — not to the Request-URI.  Without
+        // this the B-leg carried the Route header but was still *sent* to the
+        // target URI, so a `route=` set was decorative: an INVITE for a UE
+        // registered through an edge proxy went to the UE's own Contact, which
+        // is exactly the address that is unreachable (NAT, IPsec, a userless or
+        // `.invalid` contact) and is why the binding has a Path at all.
+        let route_next_hop = if next_hop.is_none() && !b_leg_route.is_empty() {
+            let mut route_headers = crate::sip::headers::SipHeaders::new();
+            route_headers.set("Route", b_leg_route.join(", "));
+            core::next_hop_from_route(&route_headers)
+        } else {
+            None
+        };
+        let routing_uri = next_hop
+            .or(route_next_hop.as_deref())
+            .unwrap_or(target_uri);
         let relay_target = match resolve_target(routing_uri, &state.dns_resolver) {
             Some(t) => t,
             None => {
@@ -11941,6 +11980,7 @@ fn b2bua_send_b_leg_invite(
                     call_id = %call_id,
                     target = %target_uri,
                     next_hop = ?next_hop,
+                    route_next_hop = ?route_next_hop,
                     "B2BUA: cannot resolve destination",
                 );
                 return;

@@ -62,6 +62,15 @@ pub enum CallAction {
     Fork {
         targets: Vec<String>,
         flows: Vec<Option<super::registrar::PyFlow>>,
+        /// Also parallel to `targets`: the RFC 3327 Path vector stored with that
+        /// binding, becoming that branch's Route header set (and, with no
+        /// explicit next-hop, its destination — RFC 3261 §16.6 step 6).
+        ///
+        /// Two bindings of one AoR generally carry different Path vectors, so a
+        /// shared route set would send every branch through the first binding's
+        /// proxy chain.  Bare-string targets carry an empty vector and keep
+        /// pure Request-URI routing.
+        routes: Vec<Vec<String>>,
         strategy: String,
         /// Force-send-socket egress pin applied to every B-leg branch (see
         /// [`CallAction::Dial::send_socket`]).  A per-branch flow still takes
@@ -1325,6 +1334,19 @@ impl PyCall {
     /// connection reuse, mandatory for WebSocket callees (RFC 7118 §5 / RFC
     /// 5626 §5.3).  `header_policy` / `copy` / `strip` / `translate` apply to
     /// every branch — per-branch policy is a follow-up enhancement.
+    ///
+    /// A `Contact` that carries an RFC 3327 Path vector additionally gets its
+    /// **own** Route header set on that branch, built from the Path in order
+    /// (§5.3), and that route set is where the branch is sent (RFC 3261 §16.6
+    /// step 6).  Without it a callee registered through an edge proxy is
+    /// unreachable — the B-leg would go to the UE's own Contact, which is the
+    /// address the Path exists to route around (NAT, IPsec, a userless or
+    /// `.invalid` contact) — and two bindings of one AoR would share the first
+    /// one's route set.  Bare-string targets keep pure Request-URI routing.
+    ///
+    /// `strategy="sequential"` carries the same route set per carrier (as an
+    /// explicit next-hop plus a `Route` header), so serial failover across an
+    /// AoR's bindings reaches each binding's own proxy chain.
     #[pyo3(signature = (targets, strategy="parallel", timeout=30, header_policy=None, copy=Vec::new(), strip=Vec::new(), translate=Vec::new(), send_socket=None, auth_passthrough=false, number_policy=None))]
     #[allow(clippy::too_many_arguments)]
     fn fork(
@@ -1343,18 +1365,17 @@ impl PyCall {
         super::request::validate_send_socket(send_socket.as_deref())?;
         let mut target_uris: Vec<String> = Vec::with_capacity(targets.len());
         let mut flows: Vec<Option<super::registrar::PyFlow>> = Vec::with_capacity(targets.len());
+        let mut branch_paths: Vec<Vec<String>> = Vec::with_capacity(targets.len());
         for item in targets {
             if let Ok(contact) = item.extract::<PyRef<super::registrar::PyContact>>() {
-                // The binding's Path vector is deliberately not consumed here:
-                // the B2BUA builds a fresh B-leg INVITE with its own route set,
-                // so a per-branch Path route set needs separate plumbing to the
-                // dial path (the proxy path consumes it via RequestAction::Fork).
-                let (uri, flow, _path) = contact.fork_target();
+                let (uri, flow, path) = contact.fork_target();
                 target_uris.push(uri);
                 flows.push(flow);
+                branch_paths.push(path);
             } else {
                 target_uris.push(item.extract::<String>()?);
                 flows.push(None);
+                branch_paths.push(Vec::new());
             }
         }
         // Number normalization applies to every branch target plus the A-leg
@@ -1371,11 +1392,28 @@ impl PyCall {
             // silently ignored before). Each target becomes a routable-by-R-URI
             // carrier; captured inbound flows are not carried on the sequential
             // path (use parallel for WebSocket connection reuse).
+            //
+            // A binding registered through an edge proxy carries its route set
+            // as an explicit next-hop plus a `Route` header on that carrier, so
+            // serial failover across an AoR's bindings reaches each binding's
+            // own proxy chain — and the per-registration Path token that tells
+            // that proxy which binding the call is for.
             let routes = target_uris
                 .into_iter()
-                .map(|uri| crate::lcr::Route {
-                    ruri: Some(uri),
-                    ..Default::default()
+                .zip(branch_paths.iter())
+                .map(|(uri, path)| {
+                    let routing = crate::proxy::core::branch_routing(path, &uri);
+                    let mut route = crate::lcr::Route {
+                        ruri: Some(uri),
+                        ..Default::default()
+                    };
+                    if let Some(routing) = routing {
+                        if let Some(route_set) = routing.route_set {
+                            route.headers.insert("Route".to_string(), route_set);
+                            route.next_hop = Some(routing.next_hop);
+                        }
+                    }
+                    route
                 })
                 .collect();
             self.action = CallAction::RouteSequence {
@@ -1387,6 +1425,7 @@ impl PyCall {
             self.action = CallAction::Fork {
                 targets: target_uris,
                 flows,
+                routes: branch_paths,
                 strategy: strategy.to_string(),
                 send_socket,
                 timeout,
@@ -2100,6 +2139,113 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// A registered binding with an RFC 3327 Path vector, as
+    /// `registrar.lookup()` hands it to a script.
+    fn binding_with_path(uri: &str, path: Vec<String>) -> super::super::registrar::PyContact {
+        let contact = crate::registrar::Contact {
+            uri: crate::sip::parser::parse_uri_standalone(uri).unwrap(),
+            q: 1.0,
+            registered_at: std::time::Instant::now(),
+            expires: std::time::Duration::from_secs(3600),
+            call_id: "reg-call-id".into(),
+            cseq: 1,
+            source_addr: None,
+            source_transport: Some("udp".into()),
+            sip_instance: None,
+            reg_id: None,
+            path,
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: None,
+            inbound_local_addr: None,
+            inbound_connection_id: None,
+            params: Vec::new(),
+            kind: crate::registrar::ContactKind::Ue,
+        };
+        super::super::registrar::PyContact::from_rust_contact(&contact)
+    }
+
+    #[test]
+    fn parallel_fork_carries_each_bindings_own_path() {
+        // The B2BUA builds a fresh B-leg INVITE, so a binding registered
+        // through an edge proxy is only reachable if that branch carries the
+        // binding's own Path as its route set.  A shared one would send every
+        // branch through the first binding's proxy chain.
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let message = Arc::new(Mutex::new(make_invite()));
+            let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+            let contact_a = binding_with_path(
+                "sip:bob@10.0.0.2:5060",
+                vec!["<sip:TOKEN-A@edge.example.com;lr>".to_string()],
+            );
+            let contact_b = binding_with_path(
+                "sip:bob@10.0.0.3:5060",
+                vec!["<sip:TOKEN-B@edge.example.com;lr>".to_string()],
+            );
+            let targets: Vec<Bound<'_, PyAny>> = vec![
+                Py::new(py, contact_a).unwrap().into_bound(py).into_any(),
+                Py::new(py, contact_b).unwrap().into_bound(py).into_any(),
+                pyo3::types::PyString::new(py, "sip:carol@10.0.0.4").into_any(),
+            ];
+            call.fork(targets, "parallel", 30, None, vec![], vec![], vec![], None, false, None)
+                .unwrap();
+
+            match call.action() {
+                CallAction::Fork { targets, routes, .. } => {
+                    assert_eq!(targets.len(), 3);
+                    assert_eq!(routes.len(), 3, "routes stay parallel to targets");
+                    assert_eq!(routes[0], vec!["<sip:TOKEN-A@edge.example.com;lr>".to_string()]);
+                    assert_eq!(routes[1], vec!["<sip:TOKEN-B@edge.example.com;lr>".to_string()]);
+                    assert!(routes[2].is_empty(), "a bare string target carries no Path");
+                }
+                other => panic!("expected Fork, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn sequential_fork_carries_each_bindings_path_as_route_and_next_hop() {
+        // The sequential path runs through the LCR route-sequence engine, so
+        // the binding's route set has to arrive as an explicit next-hop (where
+        // the branch is sent) plus a Route header (the per-registration token
+        // that tells the edge proxy which binding the call is for).
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|py| {
+            let message = Arc::new(Mutex::new(make_invite()));
+            let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+            let contact = binding_with_path(
+                "sip:bob@10.0.0.2:5060",
+                vec!["<sip:TOKEN-A@edge.example.com;lr>".to_string()],
+            );
+            let targets: Vec<Bound<'_, PyAny>> = vec![
+                Py::new(py, contact).unwrap().into_bound(py).into_any(),
+                pyo3::types::PyString::new(py, "sip:carol@10.0.0.4").into_any(),
+            ];
+            call.fork(targets, "sequential", 30, None, vec![], vec![], vec![], None, false, None)
+                .unwrap();
+
+            match call.action() {
+                CallAction::RouteSequence { routes, .. } => {
+                    assert_eq!(routes.len(), 2);
+                    // The binding routes through its edge proxy, R-URI intact.
+                    assert_eq!(routes[0].ruri.as_deref(), Some("sip:bob@10.0.0.2:5060"));
+                    assert!(routes[0].next_hop.as_deref().unwrap().contains("TOKEN-A@edge.example.com"));
+                    assert_eq!(
+                        routes[0].headers.get("Route").map(String::as_str),
+                        Some("<sip:TOKEN-A@edge.example.com;lr>")
+                    );
+                    // A bare string keeps pure R-URI routing, exactly as before.
+                    assert_eq!(routes[1].ruri.as_deref(), Some("sip:carol@10.0.0.4"));
+                    assert!(routes[1].next_hop.is_none());
+                    assert!(routes[1].headers.is_empty());
+                }
+                other => panic!("expected RouteSequence, got {other:?}"),
+            }
+        });
+    }
+
     #[test]
     fn call_fork() {
         pyo3::Python::initialize();
@@ -2116,6 +2262,7 @@ mod tests {
                 &CallAction::Fork {
                     targets: vec!["sip:bob@10.0.0.2".to_string(), "sip:bob@10.0.0.3".to_string()],
                     flows: vec![None, None],
+                    routes: vec![vec![], vec![]],
                     strategy: "parallel".to_string(),
                     send_socket: None,
                     timeout: 30,

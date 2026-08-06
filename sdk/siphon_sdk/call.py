@@ -579,11 +579,17 @@ class Call:
 
         Args:
             targets: List of URI strings or :class:`Contact` objects.  Pass
-                ``Contact`` objects (not just ``.uri``) so a binding this
-                process accepted (``contact.is_local``) routes its branch over
-                the captured inbound flow — RFC 5626 §5.3 connection reuse,
-                mandatory for a WebSocket callee (RFC 7118 §5).  Non-local
-                contacts fall back to URI routing.
+                ``Contact`` objects (not just ``.uri``) for two reasons.  A
+                binding this process accepted (``contact.is_local``) routes its
+                branch over the captured inbound flow — RFC 5626 §5.3
+                connection reuse, mandatory for a WebSocket callee (RFC 7118
+                §5).  And a binding registered through an edge proxy gets its
+                own RFC 3327 Path as that branch's Route set, which is also
+                where the branch is sent (RFC 3261 §16.6 step 6) — without it
+                the B-leg goes to the UE's own Contact, the address the Path
+                exists to route around, and two bindings of one AoR would share
+                the first one's route set.  Bare strings keep pure Request-URI
+                routing.
             strategy: ``"parallel"`` (ring all, first answer wins) or
                       ``"sequential"`` (try in order).
             timeout: Per-branch INVITE timeout in seconds.
