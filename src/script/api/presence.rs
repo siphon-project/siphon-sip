@@ -27,7 +27,8 @@ use std::time::Duration;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::presence::{PresenceStore, Subscription};
+use crate::presence::{NotifyDialogState, PresenceStore, Subscription};
+use crate::script::api::subscribe_state::strip_nameaddr;
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::message::Method;
 use crate::sip::parser::parse_uri_standalone;
@@ -141,7 +142,10 @@ impl PyPresence {
     /// ``notify()`` can send in-dialog NOTIFYs per RFC 3265 §3.2.2.
     ///
     /// Args:
-    ///     subscriber: Watcher URI (Contact from the SUBSCRIBE).
+    ///     subscriber: Watcher **Contact** URI from the SUBSCRIBE — the dialog's
+    ///         remote target.  Used for the NOTIFY's Request-URI and to resolve
+    ///         where to send it; it is *not* what goes in ``To`` (see
+    ///         ``remote_uri``).
     ///     resource: Presentity URI being watched.
     ///     event: Event package name (e.g. ``"reg"``).
     ///     expires: Subscription duration in seconds.
@@ -149,10 +153,22 @@ impl PyPresence {
     ///     from_tag: From-tag from the SUBSCRIBE (subscriber's tag).
     ///     to_tag: To-tag from the SUBSCRIBE (notifier's tag, set by S-CSCF).
     ///     route_set: Route headers from Record-Route of the SUBSCRIBE dialog.
+    ///     local_uri: The SUBSCRIBE's **To URI** — the dialog's local URI, which
+    ///         RFC 3261 §12.2.1.1 requires in the ``From`` of every in-dialog
+    ///         NOTIFY.  Pass ``str(request.to_uri)``.
+    ///     remote_uri: The SUBSCRIBE's **From URI** — the dialog's remote URI,
+    ///         required in the ``To``.  Pass ``str(request.from_uri)``.
+    ///
+    /// Both URI arguments default to ``resource`` when omitted, which is
+    /// correct for any package where the subscriber watches an AoR directly
+    /// (the reg event package, TS 24.341 §5.3.2.4).  Supply them explicitly for
+    /// a watcher subscribed to somebody else's resource, where the remote URI
+    /// is the watcher's own AoR and cannot be derived here.
     ///
     /// Returns:
     ///     Subscription ID string.
-    #[pyo3(signature = (subscriber, resource, event, expires, call_id, from_tag, to_tag, route_set=None))]
+    #[pyo3(signature = (subscriber, resource, event, expires, call_id, from_tag, to_tag, route_set=None, local_uri=None, remote_uri=None))]
+    #[allow(clippy::too_many_arguments)]
     fn subscribe_dialog(
         &self,
         subscriber: &str,
@@ -163,6 +179,8 @@ impl PyPresence {
         from_tag: &str,
         to_tag: &str,
         route_set: Option<Vec<String>>,
+        local_uri: Option<String>,
+        remote_uri: Option<String>,
     ) -> String {
         let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
         let subscription = Subscription::with_dialog(
@@ -176,6 +194,8 @@ impl PyPresence {
             from_tag.to_string(),
             to_tag.to_string(),
             route_set.unwrap_or_default(),
+            local_uri.map(|uri| strip_nameaddr(&uri)),
+            remote_uri.map(|uri| strip_nameaddr(&uri)),
         );
         self.store.add_subscription(subscription);
         subscription_id
@@ -342,13 +362,23 @@ impl PyPresence {
         })?;
 
         // Look up subscription and extract + increment CSeq atomically
-        let (subscriber, event, call_id, from_tag, to_tag, route_set, cseq) =
-            self.store.prepare_notify(subscription_id).ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "subscription '{subscription_id}' not found or has no dialog state \
-                     — use subscribe_dialog() to create subscriptions with dialog fields"
-                ))
-            })?;
+        let dialog = self.store.prepare_notify(subscription_id).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "subscription '{subscription_id}' not found or has no dialog state \
+                 — use subscribe_dialog() to create subscriptions with dialog fields"
+            ))
+        })?;
+        let NotifyDialogState {
+            subscriber,
+            local_uri,
+            remote_uri,
+            event,
+            call_id,
+            from_tag,
+            to_tag,
+            route_set,
+            cseq,
+        } = dialog;
 
         // Determine transport destination: first Route header, or subscriber URI
         let resolve_target: String = route_set.first()
@@ -410,17 +440,24 @@ impl PyPresence {
         let branch = format!("z9hG4bK-py-{}", uuid::Uuid::new_v4());
         let via = format!("SIP/2.0/{} {};branch={}", transport, target.address, branch);
         let cseq_str = format!("{} NOTIFY", cseq);
-        // In NOTIFY: From = notifier (our tag = to_tag from SUBSCRIBE),
-        //            To = subscriber (their tag = from_tag from SUBSCRIBE)
+        // RFC 3261 §12.2.1.1 — a request sent within a dialog carries the
+        // dialog's *URIs*, not its remote target:
+        //   From = the local URI  (the SUBSCRIBE's To URI)  + our tag  (to_tag)
+        //   To   = the remote URI (the SUBSCRIBE's From URI) + their tag (from_tag)
+        // The remote target (the subscriber's Contact) is the Request-URI only,
+        // set below.  Putting the Contact in From/To instead produced a NOTIFY
+        // that matched by tags — so a permissive UA answered 200 — but that a
+        // baseband validating the URIs (as RFC 6665 §4.4.1 entitles it to)
+        // treats as invalid, after which it de-registers.
         let from_header = if to_tag.is_empty() {
-            format!("<{}>;tag={}", ruri, uuid::Uuid::new_v4())
+            format!("<{}>;tag={}", local_uri, uuid::Uuid::new_v4())
         } else {
-            format!("<{}>;tag={}", ruri, to_tag)
+            format!("<{}>;tag={}", local_uri, to_tag)
         };
         let to_header = if from_tag.is_empty() {
-            format!("<{}>", subscriber)
+            format!("<{}>", remote_uri)
         } else {
-            format!("<{}>;tag={}", subscriber, from_tag)
+            format!("<{}>;tag={}", remote_uri, from_tag)
         };
 
         let mut builder = SipMessageBuilder::new()
@@ -611,6 +648,93 @@ mod tests {
         assert!(!presence.unsubscribe("sub-nonexistent"));
     }
 
+    /// RFC 3261 §12.2.1.1: an in-dialog NOTIFY carries the dialog's URIs in
+    /// From/To.  The subscriber's Contact is the *remote target* and belongs in
+    /// the Request-URI only.
+    ///
+    /// The bug this guards: both From and To carried the Contact, so a NOTIFY
+    /// matched by tags (permissive UAs answered 200) but was rejected by a
+    /// baseband that validates the URIs, which then de-registered.
+    #[test]
+    fn notify_dialog_uris_come_from_the_dialog_not_the_contact() {
+        let store = make_store();
+        let presence = PyPresence::new(Arc::clone(&store));
+
+        // What a P-CSCF/S-CSCF sees on a reg-event SUBSCRIBE: the Contact is a
+        // UUID@ip:port, both dialog URIs are the AoR.
+        let contact = "sip:f81d4fae-7dec-11d0-a765-00a0c91e6bf6@198.51.100.7:43080";
+        let aor = "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org";
+        let sub_id = presence.subscribe_dialog(
+            contact,
+            aor,
+            "reg",
+            7200,
+            "call-1",
+            "ftag-ue",
+            "scscf-notifier",
+            None,
+            Some(format!("<{aor}>")),
+            Some(format!("<{aor}>;tag=ftag-ue")),
+        );
+
+        let dialog = store.prepare_notify(&sub_id).expect("dialog state");
+        assert_eq!(dialog.subscriber, contact, "R-URI still targets the Contact");
+        assert_eq!(dialog.local_uri, aor, "From must be the dialog's local URI");
+        assert_eq!(dialog.remote_uri, aor, "To must be the dialog's remote URI");
+        // Display names / tags supplied by a script are stripped — a From URI
+        // carrying a second tag would be malformed.
+        assert!(!dialog.remote_uri.contains("tag="));
+        assert!(!dialog.local_uri.contains('<'));
+    }
+
+    /// A subscription created before the dialog URIs were captured must not
+    /// fall back to the Contact — the resource AoR is the notifier's URI for
+    /// every package where the subscriber watches an AoR directly.
+    #[test]
+    fn notify_dialog_uris_fall_back_to_the_resource_not_the_contact() {
+        let store = make_store();
+        let presence = PyPresence::new(Arc::clone(&store));
+
+        let contact = "sip:uuid@198.51.100.7:43080";
+        let aor = "sip:001010000000001@ims.example.com";
+        let sub_id = presence.subscribe_dialog(
+            contact, aor, "reg", 7200, "call-2", "ftag", "notif", None, None, None,
+        );
+
+        let dialog = store.prepare_notify(&sub_id).expect("dialog state");
+        assert_eq!(dialog.local_uri, aor);
+        assert_eq!(dialog.remote_uri, aor);
+        assert_ne!(dialog.local_uri, contact);
+        assert_ne!(dialog.remote_uri, contact);
+    }
+
+    /// A presence watcher subscribed to somebody else's resource: the remote
+    /// URI is the watcher's own AoR and differs from both the resource and the
+    /// Contact, so it has to be supplied.
+    #[test]
+    fn notify_dialog_uris_differ_for_a_third_party_watcher() {
+        let store = make_store();
+        let presence = PyPresence::new(Arc::clone(&store));
+
+        let sub_id = presence.subscribe_dialog(
+            "sip:bob@10.0.0.9:5060",
+            "sip:alice@example.com",
+            "presence",
+            3600,
+            "call-3",
+            "ftag-bob",
+            "notif",
+            None,
+            Some("<sip:alice@example.com>".to_string()),
+            Some("<sip:bob@example.com>".to_string()),
+        );
+
+        let dialog = store.prepare_notify(&sub_id).expect("dialog state");
+        assert_eq!(dialog.local_uri, "sip:alice@example.com");
+        assert_eq!(dialog.remote_uri, "sip:bob@example.com");
+        assert_eq!(dialog.subscriber, "sip:bob@10.0.0.9:5060");
+    }
+
     #[test]
     fn find_by_dialog_then_refresh_and_unsubscribe() {
         // Models the S-CSCF reg-event flow: an initial subscribe_dialog, then an
@@ -627,6 +751,8 @@ mod tests {
             "call-abc",
             "ftag-alice",
             "scscf-notif",
+            None,
+            None,
             None,
         );
 

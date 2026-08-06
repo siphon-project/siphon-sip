@@ -1173,7 +1173,7 @@ fn extract_tag(value: &str) -> Option<String> {
 /// Strip display-name and angle-brackets from a name-addr header value,
 /// returning only the URI portion.  Falls back to the whole trimmed
 /// value on parse failure.
-fn strip_nameaddr(value: &str) -> String {
+pub(crate) fn strip_nameaddr(value: &str) -> String {
     let trimmed = value.trim();
     if let (Some(l), Some(r)) = (trimmed.find('<'), trimmed.rfind('>')) {
         if l < r {

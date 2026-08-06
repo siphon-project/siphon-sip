@@ -180,9 +180,15 @@ async def handle_subscribe(request):
         # dialog identifiers (Call-ID + tags) so the lookup has something to
         # match — subscribe() (no dialog state) would not be findable.
         request.set_reply_to_tag(SCSCF_NOTIFIER_TAG)
+        # local_uri / remote_uri are the dialog's URIs (the SUBSCRIBE's To and
+        # From). RFC 3261 §12.2.1.1 puts them in the From and To of every
+        # in-dialog NOTIFY; `subscriber` is the remote target and belongs in the
+        # Request-URI only. Pass a Contact as `subscriber` when the NOTIFY must
+        # reach the UE directly rather than being re-resolved through the I-CSCF.
         presence.subscribe_dialog(
             str(request.from_uri), aor, "reg", expires,
             request.call_id, request.from_tag, SCSCF_NOTIFIER_TAG,
+            local_uri=str(request.to_uri), remote_uri=str(request.from_uri),
         )
 
         request.set_header("Subscription-State", f"active;expires={expires}")

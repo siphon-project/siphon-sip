@@ -224,15 +224,27 @@ impl ReginfoBody {
 
 /// Build a full-state reginfo document from current registrar contacts.
 ///
-/// `contacts` should be the merged view (UE + AS) from `Registrar::lookup_all`
-/// so watchers see iFC-matched AS feature tags (`+g.3gpp.smsip`,
-/// `+g.3gpp.icsi-ref`, …) alongside the UE's own bindings per
-/// TS 24.229 §5.4.2.1.2.
+/// `contacts` should be the merged view (UE + AS) from `Registrar::lookup_all`,
+/// so the registration state below can see whether any UE binding exists.
 ///
 /// Registration state is `Active` when there is at least one non-expired
 /// UE-side contact, otherwise `Terminated` — an AoR populated only by AS
 /// capability records is treated as terminated (the user is not registered).
-pub fn build_full_reginfo(aor: &str, contacts: &[Contact], version: u32) -> ReginfoBody {
+///
+/// AS-side records are **not** emitted as `<contact>` elements unless
+/// `include_as_contacts` is set: RFC 3680 §5.2 defines `<contact>` as a contact
+/// registered *for the address of record*, and an application server that
+/// answered a third-party REGISTER has not registered one. TS 24.229 §5.4.1.7
+/// makes the 3PR a notification to the AS, distinct from §5.7 where an AS
+/// genuinely registers on the user's behalf. Emitting them anyway showed the UE
+/// several `state="active" event="registered"` contacts against its own IMPU
+/// that it never created, indistinguishable from its own binding.
+pub fn build_full_reginfo(
+    aor: &str,
+    contacts: &[Contact],
+    version: u32,
+    include_as_contacts: bool,
+) -> ReginfoBody {
     let has_ue = contacts
         .iter()
         .any(|c| !c.is_expired() && c.kind == ContactKind::Ue);
@@ -245,6 +257,7 @@ pub fn build_full_reginfo(aor: &str, contacts: &[Contact], version: u32) -> Regi
     let reginfo_contacts: Vec<ReginfoContact> = contacts
         .iter()
         .filter(|contact| !contact.is_expired())
+        .filter(|contact| include_as_contacts || contact.kind == ContactKind::Ue)
         .map(|contact| ReginfoContact {
             uri: contact.uri.to_string(),
             state: ContactState::Active,
@@ -686,6 +699,75 @@ mod tests {
         }
     }
 
+    fn make_as_contact(host: &str, user: Option<&str>) -> Contact {
+        let mut contact = make_contact("unused", 3600);
+        let mut uri = SipUri::new(host.to_string());
+        uri.user = user.map(|u| u.to_string());
+        contact.uri = uri;
+        contact.kind = ContactKind::As;
+        contact.params = vec![("+g.3gpp.smsip".to_string(), None)];
+        contact
+    }
+
+    /// RFC 3680 §5.2 — `<contact>` is a contact registered *for the address of
+    /// record*.  An AS that answered a third-party REGISTER has not registered
+    /// one (TS 24.229 §5.4.1.7), so it must not appear as a binding of the
+    /// user's own IMPU.  A UE reading the document otherwise sees several
+    /// `state="active" event="registered"` contacts it never created.
+    #[test]
+    fn as_records_are_not_contacts_of_the_registration() {
+        let contacts = vec![
+            make_contact("sip:alice@10.0.0.1:5060", 3600),
+            make_as_contact("mmtel.ims.example.com", None),
+            make_as_contact("ims.example.com", Some("ipsmgw")),
+        ];
+        let body = build_full_reginfo("sip:alice@ims.example.com", &contacts, 0, false);
+
+        assert_eq!(
+            body.registrations[0].contacts.len(),
+            1,
+            "only the UE's own binding is a contact of the registration"
+        );
+        let xml = body.to_xml();
+        assert!(xml.contains("10.0.0.1"));
+        assert!(!xml.contains("mmtel.ims.example.com"));
+        assert!(!xml.contains("ipsmgw"));
+        // The user is still registered — the UE binding is live.
+        assert_eq!(body.registrations[0].state, RegistrationState::Active);
+    }
+
+    /// The capability records are still available to a watcher that asks for
+    /// them, so the TS 24.229 §5.4.2.1.2 feature-tag surface is not lost —
+    /// it is just off by default and never sent to a UE.
+    #[test]
+    fn as_records_are_emitted_when_explicitly_requested() {
+        let contacts = vec![
+            make_contact("sip:alice@10.0.0.1:5060", 3600),
+            make_as_contact("mmtel.ims.example.com", None),
+        ];
+        let body = build_full_reginfo("sip:alice@ims.example.com", &contacts, 0, true);
+
+        assert_eq!(body.registrations[0].contacts.len(), 2);
+        let xml = body.to_xml();
+        assert!(xml.contains("mmtel.ims.example.com"));
+        assert!(xml.contains("+g.3gpp.smsip"));
+    }
+
+    /// An AoR that only ever had AS records is not registered, and the document
+    /// must say so — with no contacts at all, not with the AS records standing
+    /// in for a registration.
+    #[test]
+    fn as_only_aor_is_terminated_with_no_contacts() {
+        let body = build_full_reginfo(
+            "sip:alice@ims.example.com",
+            &[make_as_contact("mmtel.ims.example.com", None)],
+            0,
+            false,
+        );
+        assert_eq!(body.registrations[0].state, RegistrationState::Terminated);
+        assert!(body.registrations[0].contacts.is_empty());
+    }
+
     #[test]
     fn content_type() {
         assert_eq!(ReginfoBody::content_type(), "application/reginfo+xml");
@@ -694,7 +776,7 @@ mod tests {
     #[test]
     fn full_reginfo_with_active_contacts() {
         let contacts = vec![make_contact("sip:alice@10.0.0.1:5060", 3600)];
-        let body = build_full_reginfo("sip:alice@ims.example.com", &contacts, 0);
+        let body = build_full_reginfo("sip:alice@ims.example.com", &contacts, 0, false);
 
         assert_eq!(body.version, 0);
         assert_eq!(body.state, ReginfoState::Full);
@@ -717,7 +799,7 @@ mod tests {
 
     #[test]
     fn full_reginfo_no_contacts_is_terminated() {
-        let body = build_full_reginfo("sip:bob@ims.example.com", &[], 5);
+        let body = build_full_reginfo("sip:bob@ims.example.com", &[], 5, false);
 
         assert_eq!(body.registrations[0].state, RegistrationState::Terminated);
         assert!(body.registrations[0].contacts.is_empty());
@@ -759,13 +841,13 @@ mod tests {
 
     #[test]
     fn stable_registration_id() {
-        let body1 = build_full_reginfo("sip:alice@ims.example.com", &[], 0);
-        let body2 = build_full_reginfo("sip:alice@ims.example.com", &[], 1);
+        let body1 = build_full_reginfo("sip:alice@ims.example.com", &[], 0, false);
+        let body2 = build_full_reginfo("sip:alice@ims.example.com", &[], 1, false);
         // Same AoR should produce same registration ID.
         assert_eq!(body1.registrations[0].id, body2.registrations[0].id);
 
         // Different AoR should produce different registration ID.
-        let body3 = build_full_reginfo("sip:bob@ims.example.com", &[], 0);
+        let body3 = build_full_reginfo("sip:bob@ims.example.com", &[], 0, false);
         assert_ne!(body1.registrations[0].id, body3.registrations[0].id);
     }
 
@@ -868,7 +950,7 @@ mod tests {
     #[test]
     fn parse_roundtrips_through_to_xml() {
         // Build a body, serialize it, parse it back, verify equivalence.
-        let original = build_full_reginfo("sip:alice@ims.example.com", &[], 5);
+        let original = build_full_reginfo("sip:alice@ims.example.com", &[], 5, false);
         let xml = original.to_xml();
         let parsed = parse_reginfo(&xml).unwrap();
         assert_eq!(parsed.version, 5);
@@ -1013,7 +1095,7 @@ mod tests {
             params: vec![("+g.3gpp.smsip".to_string(), None)],
             kind: ContactKind::As,
         };
-        let body = build_full_reginfo("sip:alice@ims.example.com", &[as_only], 0);
+        let body = build_full_reginfo("sip:alice@ims.example.com", &[as_only], 0, false);
         assert_eq!(body.registrations[0].state, RegistrationState::Terminated);
     }
 

@@ -90,6 +90,25 @@ pub struct Subscription {
     pub route_set: Vec<String>,
     /// CSeq counter for NOTIFYs sent within this dialog.
     pub local_cseq: u32,
+    /// Dialog **local URI** — the notifier's own address of record, taken from
+    /// the SUBSCRIBE's To URI.  RFC 3261 §12.2.1.1 requires it in the `From` of
+    /// every request sent within the dialog.
+    ///
+    /// `None` for subscriptions created before the URIs were captured; the
+    /// notify path then falls back to `resource`, which is the notifier's URI
+    /// for every package where the subscriber watches an AoR directly (the reg
+    /// event package, TS 24.341 §5.3.2.4).
+    pub local_uri: Option<String>,
+    /// Dialog **remote URI** — the subscriber's address of record, taken from
+    /// the SUBSCRIBE's From URI.  RFC 3261 §12.2.1.1 requires it in the `To` of
+    /// every request sent within the dialog.
+    ///
+    /// This is NOT `subscriber`: that field holds the subscriber's *Contact*
+    /// (the remote target), which belongs in the Request-URI only.  For the reg
+    /// event package the two happen to differ only in that the Contact carries
+    /// a UUID userpart and a port, which is exactly the difference a validating
+    /// baseband rejects.
+    pub remote_uri: Option<String>,
 }
 
 impl Subscription {
@@ -118,10 +137,19 @@ impl Subscription {
             to_tag: None,
             route_set: vec![],
             local_cseq: 0,
+            local_uri: None,
+            remote_uri: None,
         }
     }
 
     /// Create a subscription with full dialog state from a SUBSCRIBE request.
+    ///
+    /// `local_uri` / `remote_uri` are the dialog's URIs (the SUBSCRIBE's To and
+    /// From URIs).  They are what RFC 3261 §12.2.1.1 requires in the `From` and
+    /// `To` of an in-dialog NOTIFY; `subscriber` holds the remote *target* (the
+    /// Contact) and belongs in the Request-URI only.  `None` falls back to
+    /// `resource` at notify time.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_dialog(
         id: String,
         subscriber: String,
@@ -133,6 +161,8 @@ impl Subscription {
         from_tag: String,
         to_tag: String,
         route_set: Vec<String>,
+        local_uri: Option<String>,
+        remote_uri: Option<String>,
     ) -> Self {
         let dialog_id = Some(format!("{}:{}:{}", call_id, from_tag, to_tag));
         Self {
@@ -150,7 +180,31 @@ impl Subscription {
             to_tag: Some(to_tag),
             route_set,
             local_cseq: 0,
+            local_uri,
+            remote_uri,
         }
+    }
+
+    /// The dialog's local URI — what belongs in an in-dialog `From`.
+    ///
+    /// Falls back to `resource` when the dialog was created without it: for
+    /// every package where the subscriber watches an AoR directly, the resource
+    /// *is* the notifier's URI.  Never the Contact, which is what made a
+    /// validating baseband reject the NOTIFY.
+    pub fn notify_from_uri(&self) -> &str {
+        self.local_uri.as_deref().unwrap_or(&self.resource)
+    }
+
+    /// The dialog's remote URI — what belongs in an in-dialog `To`.
+    ///
+    /// Falls back to `resource` for the same reason as
+    /// [`notify_from_uri`](Self::notify_from_uri): for the reg event package the
+    /// subscriber and the resource are the same AoR (TS 24.341 §5.3.2.4).  A
+    /// watcher subscribed to *someone else's* resource must supply the URI at
+    /// subscribe time — the Contact cannot be reduced to an AoR here, and
+    /// guessing one would be worse than an AoR-shaped fallback.
+    pub fn notify_to_uri(&self) -> &str {
+        self.remote_uri.as_deref().unwrap_or(&self.resource)
     }
 
     /// Returns `true` if the subscription has exceeded its expiry duration.
@@ -244,9 +298,25 @@ fn generate_etag(entity: &str, body: &str) -> String {
 }
 
 /// Dialog state required to build an in-dialog NOTIFY, as returned by
-/// [`PresenceStore::prepare_notify`]:
-/// `(subscriber, event, call_id, from_tag, to_tag, route_set, cseq)`.
-type NotifyDialogState = (String, String, String, String, String, Vec<String>, u32);
+/// [`PresenceStore::prepare_notify`].
+#[derive(Debug, Clone)]
+pub struct NotifyDialogState {
+    /// Subscriber Contact — the dialog's remote target, for the Request-URI
+    /// and destination resolution only.
+    pub subscriber: String,
+    /// Dialog local URI — the `From` URI (RFC 3261 §12.2.1.1).
+    pub local_uri: String,
+    /// Dialog remote URI — the `To` URI (RFC 3261 §12.2.1.1).
+    pub remote_uri: String,
+    pub event: String,
+    pub call_id: String,
+    /// The subscriber's tag; becomes the NOTIFY's To-tag.
+    pub from_tag: String,
+    /// The notifier's tag; becomes the NOTIFY's From-tag.
+    pub to_tag: String,
+    pub route_set: Vec<String>,
+    pub cseq: u32,
+}
 
 /// Concurrent presence store — manages subscriptions and published documents.
 ///
@@ -299,22 +369,25 @@ impl PresenceStore {
 
     /// Prepare dialog state for an in-dialog NOTIFY, incrementing CSeq atomically.
     ///
-    /// Returns `(subscriber, event, call_id, from_tag, to_tag, route_set, cseq)`
-    /// or `None` if the subscription doesn't exist or has no dialog state.
+    /// Returns `None` if the subscription doesn't exist or has no dialog state.
     pub fn prepare_notify(&self, id: &str) -> Option<NotifyDialogState> {
         let mut entry = self.subscriptions.get_mut(id)?;
         let subscription = entry.value_mut();
         let call_id = subscription.call_id.clone()?;
+        let local_uri = subscription.notify_from_uri().to_string();
+        let remote_uri = subscription.notify_to_uri().to_string();
         let cseq = subscription.next_cseq();
-        Some((
-            subscription.subscriber.clone(),
-            subscription.event.clone(),
+        Some(NotifyDialogState {
+            subscriber: subscription.subscriber.clone(),
+            local_uri,
+            remote_uri,
+            event: subscription.event.clone(),
             call_id,
-            subscription.from_tag.clone().unwrap_or_default(),
-            subscription.to_tag.clone().unwrap_or_default(),
-            subscription.route_set.clone(),
+            from_tag: subscription.from_tag.clone().unwrap_or_default(),
+            to_tag: subscription.to_tag.clone().unwrap_or_default(),
+            route_set: subscription.route_set.clone(),
             cseq,
-        ))
+        })
     }
 
     /// Remove a subscription entirely (from both subscriptions and watchers maps).
@@ -1073,6 +1146,8 @@ mod tests {
             from_tag.to_string(),
             "scscf-notif".to_string(),
             vec![],
+            None,
+            None,
         )
     }
 
