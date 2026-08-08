@@ -1,0 +1,31 @@
+# Standalone, excluded workspace for the external control-plane client SDKs.
+#
+# Kept OUT of the siphon-sip package/workspace on purpose (mirrors `siphon-bin/`):
+# a root `cargo build` of siphon-sip never sweeps these crates, and they carry
+# their own Cargo.lock so their dependency graph is independent of the server.
+# The three crates are published independently to crates.io / PyPI as a manual
+# release step (nothing here publishes on its own).
+[workspace]
+resolver = "2"
+members = [
+    "siphon-control-proto",
+    "siphon-control-client",
+    "siphon-control",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/siphon-project/siphon-sip"
+authors = ["The SIPhon authors"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+tokio = { version = "1.50", features = ["rt", "rt-multi-thread", "macros", "net", "time", "sync"] }
+tokio-tungstenite = "0.29"
+futures-util = "0.3"

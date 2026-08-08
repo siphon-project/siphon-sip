@@ -1,0 +1,34 @@
+[package]
+name = "siphon-control"
+description = "Python bindings for the SIPhon external control plane (siphon-control.v1)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["sip", "voip", "b2bua", "control", "ari"]
+categories = ["network-programming"]
+readme = "README.md"
+
+[lib]
+name = "siphon_control"
+# cdylib for the Python extension module. On Linux the `extension-module`
+# feature leaves libpython symbols undefined (resolved by the interpreter at
+# import), so `cargo build`/`clippy` work; `cargo test` on this crate is NOT run
+# (it would need to link libpython) — the pytest suite covers it instead.
+crate-type = ["cdylib"]
+
+[dependencies]
+siphon-control-client = { path = "../siphon-control-client", version = "0.1.0" }
+siphon-control-proto = { path = "../siphon-control-proto", version = "0.1.0" }
+# No abi3: the target interpreter is free-threaded CPython 3.14t (the SIPhon
+# runtime), and the stable ABI (abi3) is not available on free-threaded builds.
+# A standard version-tagged wheel loads on both GIL and free-threaded 3.14.
+pyo3 = { version = "0.29", features = ["extension-module"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+serde_json = { workspace = true }
+tokio = { version = "1.50", features = ["sync"] }
+
+[package.metadata.maturin]
+name = "siphon_control"
