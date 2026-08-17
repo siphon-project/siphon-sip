@@ -8,7 +8,11 @@
 # .github/workflows/release.yaml, which fans out to crates.io (siphon-sip), PyPI
 # (siphon-sip, version derived from the tag via hatch-vcs), GHCR, and a GitHub
 # Release with the deb/rpm/tarball + SBOM. release.yaml's verify-version job
-# refuses to publish if Cargo.toml ever drifts from the tag.
+# refuses to publish if Cargo.toml ever drifts from the tag. The same tag push
+# also publishes the docs site (pages.yaml), so siphon-sip.org documents the
+# released version rather than whatever last landed on main — a prerelease tag
+# (-rc) publishes the packages but deliberately leaves the site on the last
+# stable release.
 #
 # Usage:
 #   scripts/cut-release.sh 1.0.0
@@ -135,3 +139,7 @@ git push --quiet origin "$TAG"
 echo
 echo "Released $TAG — release.yaml is now publishing crates.io + PyPI + GHCR + GitHub Release."
 echo "Watch it:  gh run watch \$(gh run list --workflow=release.yaml --limit 1 --json databaseId --jq '.[0].databaseId')"
+case "$TAG" in
+  *-*) echo "Prerelease tag — the docs site stays on the last stable release." ;;
+  *)   echo "pages.yaml is publishing the docs site for $TAG to siphon-sip.org." ;;
+esac

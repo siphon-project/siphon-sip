@@ -1,24 +1,32 @@
 name: docs
 
 # Builds the mkdocs-material site from docs/ and publishes it to GitHub Pages.
-# On pull requests it only builds (with --strict, so broken links/nav fail the
-# check); on push to main it builds and deploys.
+#
+# The published site tracks RELEASES, not main: it is deployed from a `v*` tag
+# so siphon-sip.org always documents the version an operator can actually
+# install, never unreleased work sitting on main. Pull requests and main both
+# build with --strict (broken links/nav fail the check) but never deploy.
+#
+# `workflow_dispatch` is the escape hatch: run it from a branch to publish that
+# branch's docs out of band (e.g. a typo fix that shouldn't wait for a release).
+#
+# No `paths:` filter on the push trigger — the filter applies to the whole push
+# event, tags included, and a release commit only touches Cargo.toml +
+# CHANGELOG.md, so a docs-shaped path filter would swallow the tag and the site
+# would never publish. The build is ~1 min; running it on every main push is the
+# cheaper trade than a release that silently skips its own docs deploy.
 
 on:
   push:
     branches: [main]
+    tags: ["v*"]
+  pull_request:
     paths:
       - docs/**
       - mkdocs.yml
       - .github/workflows/pages.yaml
       # The API reference is rendered from the SDK docstrings, so an SDK
       # change can break the strict build — re-validate on those too.
-      - sdk/**
-  pull_request:
-    paths:
-      - docs/**
-      - mkdocs.yml
-      - .github/workflows/pages.yaml
       - sdk/**
   workflow_dispatch:
 
@@ -49,8 +57,13 @@ jobs:
           path: site
 
   deploy:
-    # Deploy only from main; PRs just validate the build above.
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    # Deploy only on a stable release tag (or an explicit manual run); pushes to
+    # main and PRs stop after the strict build above. The `-` test skips
+    # prereleases the same way the release workflow's `latest=auto` keeps an
+    # -rc.N tag from moving the :latest image.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-'))
     needs: build
     runs-on: ubuntu-latest
     permissions:
