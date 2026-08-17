@@ -105,6 +105,39 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the existing `address_family` treatment — the engines ignore an unknown value
   silently, which otherwise lands as a call quietly negotiated the wrong way.
 
+- **Bump the `siphon-bin` SMPP extension to siphon-smpp v1.4.0.** The pin was
+  still on v1.3.0: the 1.5.1 entry announcing a move to v1.3.1 never reached
+  `siphon-bin/Cargo.toml`, so the manifest and that entry disagreed and the
+  extension shipped a release behind what was documented. This moves straight to
+  v1.4.0 and picks up both releases:
+  - **Optional parameters (TLVs) are readable and writable from a script**, as a
+    dict keyed by SMPP 3.4 spec name or by raw integer tag on `submit_via`,
+    `submit_multi_via`, `data_via`, `deliver_to` and `data_to`; inbound, `Pdu`
+    gained `tlvs`, `tlv(name_or_tag)` and typed shortcuts. That is what makes
+    messages past the 254-byte `short_message` limit, `sar_*` concatenation and
+    receipts carrying `receipted_message_id` / `message_state` possible at all.
+  - **`data_sm` carried no message in either direction.** It has no
+    `short_message` field — the body exists only as the `message_payload`
+    optional parameter (§4.2.2) — so `data_via` / `data_to` took no message
+    argument and inbound `data_sm` always arrived empty. Both ends now carry it,
+    and the new `pdu.body` reads whichever of the two the peer used.
+  - **A `short_message` over 254 bytes panicked the SMPP runtime**, because
+    smpp34's constructors `assert!` on the limit and script input reached them
+    unchecked — a 255-byte body took down the tokio task instead of failing the
+    call. It now raises.
+  - **Inbound `alert_notification` reached handlers as garbage** — its decode
+    started at byte 0 while the read loop hands it a complete PDU, so every field
+    was 16 bytes off, and it did so without erroring.
+  - **`smpp34` 1.2.1's lost-response fix** (the v1.3.1 content): both writer
+    tasks registered a request's pending-response entry only *after* the socket
+    write returned, and the read loop drops any response it has no entry for, so
+    a response landing in that gap was discarded and the caller blocked until its
+    30s response timer expired — the PDU was lost, not merely slow. It hit the
+    SMSC→ESME direction too, i.e. the delivery-receipt path.
+
+  Only affects builds with `--features smpp`; the plain `siphon` binary is
+  unaffected.
+
 - **Content-Length is now validated against the octets actually received.** A
   value that is not a non-negative integer, or that claims more octets than
   arrived, leaves the message unframeable and is rejected instead of being
