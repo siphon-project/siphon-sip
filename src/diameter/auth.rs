@@ -51,7 +51,7 @@ impl SourceIpAcl {
     }
 
     /// Add an entry from a config string — either a CIDR (`10.0.0.0/24`) or a
-    /// bare address (`172.16.0.1`, treated as a /32 or /128 host route).
+    /// bare address (`192.0.2.1`, treated as a /32 or /128 host route).
     pub fn add_str(&mut self, cidr: &str, tenant: &str, peer: &str) -> Result<(), AclParseError> {
         self.add(parse_cidr(cidr)?, tenant, peer);
         Ok(())
@@ -133,11 +133,11 @@ mod tests {
     #[test]
     fn acl_matches_bare_ip_and_cidr() {
         let mut acl = SourceIpAcl::new();
-        acl.add_str("172.16.0.150", "default", "ip-sm-gw").unwrap();
+        acl.add_str("192.0.2.186", "default", "ip-sm-gw").unwrap();
         acl.add_str("10.0.0.0/24", "default", "mme-pool").unwrap();
 
         assert_eq!(
-            acl.lookup("172.16.0.150".parse().unwrap()),
+            acl.lookup("192.0.2.186".parse().unwrap()),
             Some(AclMatch {
                 tenant: "default".into(),
                 peer: "ip-sm-gw".into()

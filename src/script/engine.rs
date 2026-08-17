@@ -2315,7 +2315,7 @@ from siphon import b2bua
 def new_call(call):
     call.dial(
         "sip:1000@ims.mnc001.mcc001.3gppnetwork.org",
-        next_hop="sip:192.0.2.111:4060",
+        next_hop="sip:192.0.2.178:4060",
     )
 "#;
         let state = compile_temp_script(source).unwrap();
@@ -2361,12 +2361,12 @@ def new_call(call):
             assert_eq!(target_parsed.user.as_deref(), Some("1000"));
 
             // Contract 2: next_hop is what the dispatcher resolves for the wire
-            // destination — host = 192.0.2.111, port = 4060.
+            // destination — host = 192.0.2.178, port = 4060.
             let next_hop_str = next_hop.as_deref()
                 .expect("next_hop must be set");
             let next_hop_parsed = parse_uri_standalone(next_hop_str)
                 .expect("next_hop_uri must parse");
-            assert_eq!(next_hop_parsed.host, "192.0.2.111");
+            assert_eq!(next_hop_parsed.host, "192.0.2.178");
             assert_eq!(next_hop_parsed.port, Some(4060));
             assert!(next_hop_parsed.user.is_none(),
                 "next_hop is a routing destination, not a called party");

@@ -1054,7 +1054,7 @@ mod tests {
         assert!(default.1.try_recv().is_ok());
 
         // Unknown source (not a registered listener) → default channel.
-        router.send(make(Some(addr("172.16.0.1:5060")))).unwrap();
+        router.send(make(Some(addr("192.0.2.1:5060")))).unwrap();
         assert!(default.1.try_recv().is_ok());
     }
 
@@ -1183,7 +1183,7 @@ mod tests {
         assert!(registry.resolve(Transport::Tls, addr("10.0.0.1:5060")).is_none());
 
         // An address siphon isn't listening on does not resolve.
-        assert!(registry.resolve(Transport::Udp, addr("172.16.0.1:5060")).is_none());
+        assert!(registry.resolve(Transport::Udp, addr("192.0.2.1:5060")).is_none());
     }
 
     #[test]

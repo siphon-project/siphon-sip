@@ -4906,7 +4906,7 @@ fn fail_branch_locally(
         return;
     };
 
-    let (original_request, inbound_local_addr, branch) = {
+    let (original_request, inbound_local_addr, branch, fork_aggregator, branch_index) = {
         let Ok(session) = session_arc.read() else {
             error!("proxy session lock poisoned while failing a branch");
             return;
@@ -4915,8 +4915,22 @@ fn fail_branch_locally(
             session.original_request.clone(),
             session.inbound_local_addr,
             session.client_branches.get(client_key).cloned(),
+            session.fork_aggregator.clone(),
+            session.branch_index_map.get(client_key).copied(),
         )
     };
+
+    // Tell the aggregator this branch's answer is ours, not the callee's,
+    // *before* injecting it.  A sibling branch that actually reached an
+    // endpoint must win the best-error selection: without this a transport
+    // error (503, class 5xx) would outrank a real `486 Busy Here` (class 4xx)
+    // and the caller would hear "Server Internal Error" instead of "Busy".
+    if let (Some(aggregator), Some(index)) = (&fork_aggregator, branch_index) {
+        match aggregator.lock() {
+            Ok(mut agg) => agg.mark_local_failure(index),
+            Err(_) => error!("fork aggregator lock poisoned while failing a branch"),
+        }
+    }
 
     // RFC 3261 §17.1.4: on a transport failure the client transaction goes
     // straight to Terminated. Dropping it here also stops the synthetic
@@ -6383,11 +6397,60 @@ fn resolve_tcp_path(
     reachable.then_some(candidate)
 }
 
+/// Whether a B-leg INVITE routes over the binding's captured inbound flow, or
+/// is freshly resolved because it has a Path route set to follow.
+///
+/// A Path route set wins — the same precedence `relay_fork_branch` applies on the
+/// proxy path, and the reason is RFC 3327 §5.3: the Path *is* the route set for
+/// terminating requests to that binding, an explicit statement by the edge proxy
+/// that MT traffic comes back through it carrying its per-registration token.
+/// Routing over the flow instead reaches whatever address the REGISTER happened
+/// to arrive from and drops that statement on the floor — and since
+/// `registrar.lookup()` marks a binding this process accepted as `is_local`, its
+/// flow is surfaced, so flow-first would mean a single siphon acting as both
+/// registrar and B2BUA never honoured a Path at all.
+///
+/// A binding with **no** Path still routes over its flow, which is what keeps
+/// connection reuse (RFC 5626 §5.3, mandatory for a WebSocket callee per RFC
+/// 7118 §5) working for a UE that registered directly.
+fn b_leg_flow<'a>(
+    flow: Option<&'a crate::script::api::registrar::PyFlow>,
+    b_leg_route: &[String],
+) -> Option<&'a crate::script::api::registrar::PyFlow> {
+    flow.filter(|_| b_leg_route.is_empty())
+}
+
+/// Which URI a B-leg INVITE's wire destination is resolved from.
+///
+/// Precedence, highest first:
+///
+/// 1. an explicit `next_hop=` — the script overrode routing outright;
+/// 2. the topmost `Route` of the B-leg route set (RFC 3261 §16.6 step 6), which
+///    for a binding registered through an edge proxy is its RFC 3327 Path;
+/// 3. the target URI, i.e. plain Request-URI routing.
+///
+/// Separate from the R-URI, which stays `target_uri` in every case so the called
+/// party's IMPU shape survives on the wire.  Every destination decision in
+/// [`b2bua_send_b_leg_invite`] resolves from this one value — the initial
+/// resolve and the over-MTU TCP re-probe alike, so the two cannot disagree about
+/// which host the B-leg is going to.
+fn b_leg_routing_uri<'a>(
+    next_hop: Option<&'a str>,
+    route_next_hop: Option<&'a str>,
+    target_uri: &'a str,
+) -> &'a str {
+    next_hop.or(route_next_hop).unwrap_or(target_uri)
+}
+
 /// Apply the RFC 3261 §18.1.1 over-MTU UDP→TCP decision for one outbound
 /// request.  Given the current transport, the serialised (pre-Via) request
 /// length and its next hop, returns `Some((Tcp, tcp_addr))` when the request is
 /// too big for UDP and a TCP path resolves, else `None` (keep UDP — logging the
 /// forced over-MTU send when a switch was wanted but no TCP path exists).
+///
+/// `target_uri_string` decides *which host* is probed, and the probe's result
+/// replaces `destination` — so it must be the URI `destination` itself was
+/// resolved from, not some other URI attached to the same request.
 fn mtu_tcp_upgrade(
     mtu: Option<u16>,
     outbound_transport: Transport,
@@ -11800,16 +11863,25 @@ fn handle_b2bua_invite(
             );
             set_b2bua_answer_deadline(&call_id, timeout, state);
         }
-        CallAction::Fork { targets, flows, strategy: _, send_socket, timeout } => {
+        CallAction::Fork { targets, flows, routes, strategy: _, send_socket, timeout } => {
             debug!(call_id = %call_id, targets = ?targets, "B2BUA: forking B-legs");
             let send_socket = state.resolve_send_socket(send_socket.as_deref());
             for (index, target) in targets.iter().enumerate() {
+                // Each branch gets the route set of *its own* binding (RFC 3327
+                // §5.3), which also decides where the branch is sent.  A shared
+                // route set would put every branch through the first binding's
+                // proxy chain — and, behind a Path-token edge proxy, deliver
+                // them all back to the first binding.
+                let branch_path = routes.get(index).map(Vec::as_slice).unwrap_or(&[]);
+                let branch_route = crate::proxy::core::route_set_from_path(branch_path)
+                    .map(|value| vec![value])
+                    .unwrap_or_default();
                 b2bua_send_b_leg_invite(
                     &call_id,
                     target,
                     None,
                     flows.get(index).and_then(|f| f.as_ref()),
-                    &[],
+                    &branch_route,
                     send_socket.as_ref(),
                     None,
                     &message_guard,
@@ -12312,11 +12384,35 @@ fn b2bua_send_b_leg_invite(
     extra_headers: &[(String, String)],
     state: &DispatcherState,
 ) {
+    // Shadowed rather than branched so every flow-derived decision below — MTU
+    // bias, egress pin, Via sent-by, Contact, leg connection id — treats a
+    // Path-routed B-leg as the freshly-resolved leg it now is.
+    let flow = b_leg_flow(flow, b_leg_route);
+
+    // RFC 3261 §16.6 step 6: with a route set and no explicit next-hop, the
+    // request goes to the topmost Route — not to the Request-URI.  Without this
+    // the B-leg carried the Route header but was still *sent* to the target URI,
+    // so a `route=` set was decorative: an INVITE for a UE registered through an
+    // edge proxy went to the UE's own Contact, which is exactly the address that
+    // is unreachable (NAT, IPsec, a userless or `.invalid` contact) and is why
+    // the binding has a Path at all.
+    let route_next_hop = if next_hop.is_none() && !b_leg_route.is_empty() {
+        let mut route_headers = crate::sip::headers::SipHeaders::new();
+        route_headers.set("Route", b_leg_route.join(", "));
+        core::next_hop_from_route(&route_headers)
+    } else {
+        None
+    };
+    // The single URI every destination decision below resolves from — both the
+    // initial resolve and the over-MTU TCP re-probe.  One binding on purpose:
+    // the two must never disagree about which host this B-leg is going to.
+    let routing_uri = b_leg_routing_uri(next_hop, route_next_hop.as_deref(), target_uri);
+
     // Resolve the wire destination: over the captured inbound flow (RFC 5626
     // §5.3 connection reuse — the only way to reach a WebSocket callee, RFC
-    // 7118 §5) when one is attached, else from next_hop when set, else from
-    // target.  R-URI construction below still uses target_uri unconditionally —
-    // that split is the whole point of next_hop.
+    // 7118 §5) when one is attached, else from `routing_uri`.  R-URI
+    // construction below still uses target_uri unconditionally — that split is
+    // the whole point of next_hop.
     let (mut destination, mut outbound_transport) = if let Some(flow) = flow {
         let transport = match flow.transport.as_str() {
             "udp" => Transport::Udp,
@@ -12331,7 +12427,6 @@ fn b2bua_send_b_leg_invite(
         };
         (flow.source_addr, transport)
     } else {
-        let routing_uri = next_hop.unwrap_or(target_uri);
         let relay_target = match resolve_target(routing_uri, &state.dns_resolver) {
             Some(t) => t,
             None => {
@@ -12339,6 +12434,7 @@ fn b2bua_send_b_leg_invite(
                     call_id = %call_id,
                     target = %target_uri,
                     next_hop = ?next_hop,
+                    route_next_hop = ?route_next_hop,
                     "B2BUA: cannot resolve destination",
                 );
                 return;
@@ -12355,12 +12451,17 @@ fn b2bua_send_b_leg_invite(
     // call — the reachability probe in resolve_tcp_path keeps UDP when the peer
     // has no TCP listener; an under-estimate simply leaves a borderline B-leg on
     // UDP (fragmenting, as it would pre-feature).
+    // It probes `routing_uri` — the same URI the UDP destination was resolved
+    // from, which with a route set is the topmost Route and not the callee's
+    // Contact.  Handing it the Contact instead would let resolve_tcp_path's
+    // A/AAAA lookup replace the destination with the Contact's own address, so
+    // an over-MTU B-leg would bypass the very Path the resolve above followed.
     if state.mtu.is_some() && flow.is_none() {
         if let Some((tcp_transport, tcp_addr)) = mtu_tcp_upgrade(
             state.mtu,
             outbound_transport,
             original_request.to_bytes().len(),
-            next_hop.unwrap_or(target_uri),
+            routing_uri,
             destination,
             &state.dns_resolver,
         ) {
@@ -21344,7 +21445,7 @@ mod tests {
             let prack = build_b2bua_prack_message(
                 &dialog(),
                 crate::transport::Transport::Udp,
-                "172.16.0.153",
+                "192.0.2.149",
                 5060,
                 &target,
                 1,
@@ -21418,11 +21519,11 @@ mod tests {
         // remains (after the proxy popped its own), that Route is the next hop —
         // NOT the Request-URI (the UE Contact) and NOT the cached INVITE branch.
         let ack = ack_request_with_route(Some(
-            "<sip:172.16.0.101:5060;transport=udp;lr>, <sip:172.16.0.101:5060;transport=tcp;lr>",
+            "<sip:192.0.2.143:5060;transport=udp;lr>, <sip:192.0.2.143:5060;transport=tcp;lr>",
         ));
         let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("ACK has a next hop");
         let parsed = parse_uri_standalone(&next_hop).unwrap();
-        assert_eq!(parsed.host, "172.16.0.101");
+        assert_eq!(parsed.host, "192.0.2.143");
         assert_eq!(parsed.port, Some(5060));
         assert_ne!(
             parsed.host, "100.65.0.2",
@@ -21459,17 +21560,17 @@ mod tests {
         // Request-URI. The cached-branch path mis-delivered the ACK so the UAS
         // never confirmed the dialog.
         let mut ack = ack_request_with_route(Some(
-            "<sip:172.16.0.121:6060;lr>, <sip:172.16.0.101:5060;transport=udp;lr>",
+            "<sip:192.0.2.132:6060;lr>, <sip:192.0.2.143:5060;transport=udp;lr>",
         ));
 
         // Mirror handle_ack_via_session: consume our own leading Route entries.
-        let identity = ack_identity(&[("172.16.0.121", &[6060])]);
+        let identity = ack_identity(&[("192.0.2.132", &[6060])]);
         core::consume_self_routes(&mut ack.headers, &identity);
 
         let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("next hop");
         let parsed = parse_uri_standalone(&next_hop).unwrap();
         assert_eq!(
-            parsed.host, "172.16.0.101",
+            parsed.host, "192.0.2.143",
             "ACK must follow the dialog route set to the P-CSCF",
         );
         assert_eq!(parsed.port, Some(5060));
@@ -21487,11 +21588,11 @@ mod tests {
         // the apparent next hop — a routing loop. The ACK must consume both
         // self-Routes (via pop_local_routes) and forward to the P-CSCF, exactly
         // as loose_route() does for the in-dialog BYE on this dialog.
-        let identity = ack_identity(&[("172.16.0.121", &[6060])]);
+        let identity = ack_identity(&[("192.0.2.132", &[6060])]);
         let mut ack = ack_request_with_route(Some(
-            "<sip:172.16.0.121:6060;transport=tcp;lr>, \
-             <sip:172.16.0.121:6060;transport=udp;lr>, \
-             <sip:172.16.0.101:5060;transport=udp;lr>",
+            "<sip:192.0.2.132:6060;transport=tcp;lr>, \
+             <sip:192.0.2.132:6060;transport=udp;lr>, \
+             <sip:192.0.2.143:5060;transport=udp;lr>",
         ));
 
         // Mirror handle_ack_via_session's route consumption.
@@ -21500,7 +21601,7 @@ mod tests {
         let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("next hop");
         let parsed = parse_uri_standalone(&next_hop).unwrap();
         assert_eq!(
-            parsed.host, "172.16.0.101",
+            parsed.host, "192.0.2.143",
             "ACK must skip our own double Record-Route and follow the route set",
         );
         assert_eq!(parsed.port, Some(5060));
@@ -21513,10 +21614,10 @@ mod tests {
         // whenever it carried `;lr`, stripping a downstream proxy's own Route
         // and sending the ACK a hop too far. It now applies the same
         // self-identity test the in-dialog BYE does.
-        let identity = ack_identity(&[("172.16.0.121", &[6060])]);
+        let identity = ack_identity(&[("192.0.2.132", &[6060])]);
         let mut ack = ack_request_with_route(Some(
-            "<sip:172.16.0.101:5060;transport=udp;lr>, \
-             <sip:172.16.0.199:5060;transport=udp;lr>",
+            "<sip:192.0.2.143:5060;transport=udp;lr>, \
+             <sip:192.0.2.168:5060;transport=udp;lr>",
         ));
 
         let popped = core::consume_self_routes(&mut ack.headers, &identity);
@@ -21525,7 +21626,7 @@ mod tests {
         let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("next hop");
         let parsed = parse_uri_standalone(&next_hop).unwrap();
         assert_eq!(
-            parsed.host, "172.16.0.101",
+            parsed.host, "192.0.2.143",
             "ACK must still go to the first Route, not past it",
         );
     }
@@ -21536,10 +21637,10 @@ mod tests {
         // carries our advertised/bind address, which `domain.local` need not
         // list. The ACK resolves self-identity from the same widened set, so
         // both in-dialog paths agree about the same dialog's route set.
-        let identity = ack_identity(&[("172.16.0.121", &[6060])]);
+        let identity = ack_identity(&[("192.0.2.132", &[6060])]);
         let mut ack = ack_request_with_route(Some(
-            "<sip:172.16.0.121:6060;transport=udp;lr>, \
-             <sip:172.16.0.101:5060;transport=udp;lr>",
+            "<sip:192.0.2.132:6060;transport=udp;lr>, \
+             <sip:192.0.2.143:5060;transport=udp;lr>",
         ));
 
         let popped = core::consume_self_routes(&mut ack.headers, &identity);
@@ -21547,7 +21648,7 @@ mod tests {
 
         let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("next hop");
         let parsed = parse_uri_standalone(&next_hop).unwrap();
-        assert_eq!(parsed.host, "172.16.0.101");
+        assert_eq!(parsed.host, "192.0.2.143");
     }
 
     // -----------------------------------------------------------------------
@@ -22457,6 +22558,100 @@ a=rtpmap:8 PCMA/8000\r\n";
         );
     }
 
+    #[test]
+    fn b_leg_flow_yields_to_a_path_route_set() {
+        // A binding registered directly keeps connection reuse; a binding
+        // registered through an edge proxy is routed by its Path instead, or a
+        // single siphon that is both registrar and B2BUA would never honour one
+        // (its own bindings are is_local, so their flow is always surfaced).
+        let flow = crate::script::api::registrar::PyFlow {
+            transport: "wss".to_string(),
+            source_addr: "10.0.0.1:50000".parse().unwrap(),
+            local_addr: "127.0.0.1:443".parse().unwrap(),
+            connection_id: 0xc0ffee,
+        };
+        let route = vec!["<sip:TOKEN-A@edge.example.com;lr>".to_string()];
+
+        assert!(
+            b_leg_flow(Some(&flow), &[]).is_some(),
+            "no Path — the captured flow still routes the B-leg (RFC 5626 §5.3)"
+        );
+        assert!(
+            b_leg_flow(Some(&flow), &route).is_none(),
+            "a Path route set outranks the flow (RFC 3327 §5.3)"
+        );
+        assert!(b_leg_flow(None, &[]).is_none());
+        assert!(b_leg_flow(None, &route).is_none());
+    }
+
+    #[test]
+    fn b_leg_routing_uri_prefers_next_hop_then_route_then_target() {
+        let target = "sip:bob@ue.example.com";
+        let route = "sip:TOKEN-A@edge.example.com;lr";
+        let next_hop = "sip:192.0.2.178:4060";
+
+        // An explicit next_hop= overrides everything (BGCF / I-CSCF pin).
+        assert_eq!(b_leg_routing_uri(Some(next_hop), Some(route), target), next_hop);
+        assert_eq!(b_leg_routing_uri(Some(next_hop), None, target), next_hop);
+        // RFC 3261 §16.6 step 6 — a route set with no next_hop routes via the
+        // topmost Route, i.e. the binding's RFC 3327 Path, NOT the Contact.
+        assert_eq!(b_leg_routing_uri(None, Some(route), target), route);
+        // Neither → plain Request-URI routing, as before the Path feature.
+        assert_eq!(b_leg_routing_uri(None, None, target), target);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mtu_tcp_upgrade_probes_the_uri_it_is_given_not_the_udp_destination() {
+        // Why b2bua_send_b_leg_invite must hand the over-MTU probe the same URI
+        // it resolved the UDP destination from: the probe's own A/AAAA lookup
+        // REPLACES that destination.  Two live TCP listeners stand in for an
+        // edge proxy (where a Path-routed B-leg belongs) and a callee Contact
+        // (where it must not go); "localhost" is a non-numeric host, so the
+        // lookup path runs rather than the numeric short-circuit.
+        let resolver = test_resolver();
+        // "localhost" resolves to both loopback families and the order between
+        // two lookups is not stable, so each stand-in listens on BOTH — whichever
+        // candidate the probe picks, the port is what identifies the host it
+        // chose, and the port is the assertion below.
+        let Some((edge_v4, edge_v6)) = loopback_pair() else {
+            return; // no dual-family loopback here — nothing to discriminate
+        };
+        let Some((contact_v4, _contact_v6)) = loopback_pair() else {
+            return;
+        };
+        let edge_addr = edge_v4.local_addr().unwrap();
+        let contact_addr = contact_v4.local_addr().unwrap();
+        assert_eq!(edge_v6.local_addr().unwrap().port(), edge_addr.port());
+
+        let probe = |uri: String| {
+            mtu_tcp_upgrade(Some(1280), Transport::Udp, 1300, &uri, edge_addr, &resolver)
+                .map(|(transport, addr)| (transport, addr.port(), addr.ip().is_loopback()))
+        };
+
+        // Destination resolved from the Route; probing that same Route keeps it.
+        assert_eq!(
+            probe(format!("sip:TOKEN-A@localhost:{}", edge_addr.port())),
+            Some((Transport::Tcp, edge_addr.port(), true)),
+        );
+        // Same destination, but probing the *Contact* URI drags the B-leg to the
+        // Contact's address — the address the Path exists to route around.  This
+        // is what passing the wrong URI here costs.
+        assert_eq!(
+            probe(format!("sip:bob@localhost:{}", contact_addr.port())),
+            Some((Transport::Tcp, contact_addr.port(), true)),
+        );
+    }
+
+    /// A TCP listener pair on the same port, one per loopback family, so a
+    /// `localhost` lookup answers with a live listener whichever family it
+    /// returns first.  `None` when the v6 twin cannot be bound (v4-only host).
+    fn loopback_pair() -> Option<(std::net::TcpListener, std::net::TcpListener)> {
+        let v4 = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).ok()?;
+        let port = v4.local_addr().ok()?.port();
+        let v6 = std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).ok()?;
+        Some((v4, v6))
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_tcp_path_numeric_probes_reachability() {
         let resolver = test_resolver();
@@ -22973,11 +23168,11 @@ a=rtpmap:8 PCMA/8000\r\n";
         let client_key = TransactionKey::new(
             "z9hG4bK-invite-branch-B".to_string(),
             Method::Invite,
-            "172.16.0.111:4060".to_string(),
+            "192.0.2.178:4060".to_string(),
         );
         let via = cancel_via_for_client_branch(&client_key, Transport::Udp);
         assert_eq!(
-            via, "SIP/2.0/UDP 172.16.0.111:4060;branch=z9hG4bK-invite-branch-B",
+            via, "SIP/2.0/UDP 192.0.2.178:4060;branch=z9hG4bK-invite-branch-B",
             "forwarded CANCEL must reuse the INVITE's top Via branch + sent-by (RFC 3261 §9.1)",
         );
     }

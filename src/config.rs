@@ -1872,7 +1872,7 @@ fn default_dialog_backend() -> DialogBackendType {
 /// ```yaml
 /// cache:
 ///   - name: "cnam"
-///     url: "redis://172.16.0.252:6379"
+///     url: "redis://192.0.2.131:6379"
 ///     local_ttl_secs: 60
 ///     local_max_entries: 10000
 /// ```
@@ -4563,7 +4563,7 @@ script:
   path: "scripts/proxy_default.py"
 cache:
   - name: "cnam"
-    url: "redis://172.16.0.252:6379"
+    url: "redis://192.0.2.131:6379"
     local_ttl_secs: 60
     local_max_entries: 10000
 "#;
@@ -6213,10 +6213,10 @@ diameter:
         origin_realm: "epc.mnc001.mcc001.3gppnetwork.org"
       clients:
         - name: mme
-          allowed_ips: ["172.16.0.0/24"]
+          allowed_ips: ["192.0.2.0/24"]
           expected_origin_host: "mme.epc.example.org"
       servers:
-        - { name: hss, host: "172.16.0.61", port: 3868, transport: tcp }
+        - { name: hss, host: "192.0.2.164", port: 3868, transport: tcp }
 "#;
         let config = Config::from_str(yaml).expect("Diameter server config should parse");
         let diameter = config.diameter.expect("diameter section");
@@ -6229,7 +6229,7 @@ diameter:
         let tenant = diameter.tenants.get("default").expect("default tenant");
         assert_eq!(tenant.identity.origin_host, "diam.epc.mnc001.mcc001.3gppnetwork.org");
         assert_eq!(tenant.clients[0].name, "mme");
-        assert_eq!(tenant.clients[0].allowed_ips, vec!["172.16.0.0/24"]);
+        assert_eq!(tenant.clients[0].allowed_ips, vec!["192.0.2.0/24"]);
         assert_eq!(tenant.servers[0].name, "hss");
         assert_eq!(tenant.servers[0].port, 3868);
 
@@ -6256,7 +6256,7 @@ diameter:
         origin_host: "hss.epc.example.org"
         origin_realm: "epc.example.org"
       connect_to:
-        - { name: upstream, host: "172.16.0.10", port: 3868, transport: sctp }
+        - { name: upstream, host: "192.0.2.137", port: 3868, transport: sctp }
 "#;
         let config = Config::from_str(yaml).expect("HSS connect_to config should parse");
         let diameter = config.diameter.expect("diameter section");

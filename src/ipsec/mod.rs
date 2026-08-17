@@ -2817,7 +2817,7 @@ mod tests {
     async fn sweep_expired_reaps_only_past_deadline_pairs() {
         let manager = IpsecManager::with_partition(XfrmBackend::IpCommand, 60000, 1024);
         let abandoned: IpAddr = "192.0.2.60".parse().unwrap();
-        let active: IpAddr = "192.0.2.61".parse().unwrap();
+        let active: IpAddr = "192.0.2.164".parse().unwrap();
 
         // Abandoned UE: deadline already in the past.
         let mut stale = test_sa_pair(abandoned, 6601, 10000);

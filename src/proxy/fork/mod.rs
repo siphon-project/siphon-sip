@@ -53,6 +53,22 @@ pub enum BranchState {
     Cancelled,
 }
 
+/// Where a branch's final response came from.
+///
+/// A proxy answers a branch itself when it cannot be completed — a transport
+/// error on forwarding (RFC 3261 §16.9 → 503) or a client transaction timeout
+/// (§16.7 step 2 → 408).  Those are statements about *this proxy's* plumbing,
+/// not about the callee, so when a sibling branch reached a real endpoint its
+/// answer is the one the caller wants to hear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResponseOrigin {
+    /// A real response, from the downstream peer.
+    #[default]
+    Peer,
+    /// Synthesized by this proxy because the branch never got an answer.
+    Local,
+}
+
 /// A single branch of a forked request.
 #[derive(Debug, Clone)]
 pub struct ForkBranch {
@@ -60,6 +76,10 @@ pub struct ForkBranch {
     pub target: SipUri,
     /// Current state of this branch.
     pub state: BranchState,
+    /// Where this branch's final response came from.  Set to
+    /// [`Local`](ResponseOrigin::Local) by [`ForkAggregator::mark_local_failure`]
+    /// before the proxy injects its own response for the branch.
+    pub origin: ResponseOrigin,
 }
 
 /// Action the proxy core should take after a branch response arrives.
@@ -110,6 +130,7 @@ impl ForkAggregator {
             .map(|target| ForkBranch {
                 target,
                 state: BranchState::Pending,
+                origin: ResponseOrigin::Peer,
             })
             .collect();
 
@@ -148,6 +169,20 @@ impl ForkAggregator {
     pub fn mark_cancelled(&mut self, index: usize) {
         if index < self.branches.len() {
             self.branches[index].state = BranchState::Cancelled;
+        }
+    }
+
+    /// Record that the *next* final response on this branch is one the proxy
+    /// synthesized for itself, not one a peer sent.
+    ///
+    /// Called immediately before the proxy injects a 503 (transport error,
+    /// RFC 3261 §16.9) or a 408 (transaction timeout, §16.7 step 2) for a
+    /// branch that will never be answered from the network, so
+    /// [`best_error`](Self::best_error) can keep it from outranking a real
+    /// answer from a sibling branch.
+    pub fn mark_local_failure(&mut self, index: usize) {
+        if index < self.branches.len() {
+            self.branches[index].origin = ResponseOrigin::Local;
         }
     }
 
@@ -225,17 +260,32 @@ impl ForkAggregator {
         }
     }
 
-    /// The "best" (highest-priority) error code among completed branches.
+    /// The "best" error code among completed branches.
     ///
-    /// Priority: 6xx > 5xx > 4xx > 3xx.  Within a class, the highest code wins.
+    /// **A real answer always beats one this proxy invented.** A branch the
+    /// proxy failed locally (transport error → 503, timeout → 408) says
+    /// something about our plumbing; a branch that reached an endpoint and came
+    /// back `486 Busy Here` says something about the callee, and that is what
+    /// the caller needs to hear. Without this rule the class ordering below
+    /// would hand a 503 (class 5xx) the win over a 486 (class 4xx) and the
+    /// caller would be told "Server Internal Error" while a phone was ringing
+    /// busy next to it.
+    ///
+    /// Within whichever set is chosen: 6xx > 5xx > 4xx > 3xx, highest code
+    /// first inside a class.
     fn best_error(&self) -> u16 {
-        self.branches
-            .iter()
-            .filter_map(|branch| match branch.state {
-                BranchState::Completed(code) if code >= 300 => Some(code),
-                _ => None,
-            })
-            .max_by(|a, b| error_priority(*a).cmp(&error_priority(*b)))
+        let completed = |origin: ResponseOrigin| {
+            self.branches
+                .iter()
+                .filter(move |branch| branch.origin == origin)
+                .filter_map(|branch| match branch.state {
+                    BranchState::Completed(code) if code >= 300 => Some(code),
+                    _ => None,
+                })
+                .max_by(|a, b| error_priority(*a).cmp(&error_priority(*b)))
+        };
+        completed(ResponseOrigin::Peer)
+            .or_else(|| completed(ResponseOrigin::Local))
             .unwrap_or(500)
     }
 

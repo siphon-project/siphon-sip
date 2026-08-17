@@ -1,0 +1,41 @@
+# siphon.b2bua-path-test.yaml — routing a B2BUA B-leg through the binding's
+# RFC 3327 Path.
+#
+# Used with: sipp/docker-compose.yaml --profile b2bua-path
+#            (scripts/b2bua_path_test.sh)
+# Script:    scripts/b2bua_path.py
+#
+# No auth: every scenario is about routing, and each UE registers exactly once.
+#
+# listen.mtu is set (1280, the IPv6 minimum) for the fourth scenario only: it
+# puts the RFC 3261 §18.1.1 over-MTU UDP→TCP re-probe in play, so a padded
+# INVITE must still follow the route set rather than resolving the callee's
+# Contact host.  The other three scenarios send small INVITEs that stay well
+# under the mtu-200 = 1080-byte threshold, so the bias never triggers for them.
+
+listen:
+  mtu: 1280
+  udp:
+    - "0.0.0.0:5060"
+  tcp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.15"
+
+advertised_address: "172.20.0.15"
+
+script:
+  path: "scripts/b2bua_path.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+log:
+  level: debug
+  format: pretty

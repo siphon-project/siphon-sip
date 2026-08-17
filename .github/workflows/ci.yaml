@@ -316,6 +316,26 @@ jobs:
       - name: Terminating failover (per-binding Path + on_failure retarget)
         run: scripts/failover_test.sh
 
+  # ── B2BUA: routing a binding through its RFC 3327 Path ─────────────────────
+  # The B2BUA half of the job above, and a separate code path: it builds a FRESH
+  # B-leg INVITE rather than forwarding the caller's, so it used to send it to
+  # the callee's Contact — the one address the Path exists to route around, which
+  # left a callee registered through an edge proxy unreachable even with a single
+  # binding.  Four scenarios: parallel fork, sequential fork (per-branch route
+  # sets), call.dial(route=…), and an over-MTU B-leg whose §18.1.1 UDP→TCP
+  # re-probe must follow the route set rather than resolving the Contact host.
+  # Deterministic: every caller demands a 200, and each scenario asserts which
+  # downstream actually received the INVITE — including that the MTU decoy did
+  # NOT.
+  sipp-b2bua-path:
+    runs-on: ubuntu-latest
+    needs: rust-tests
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: B2BUA B-leg follows the binding's Path (fork, dial, over-MTU)
+        run: scripts/b2bua_path_test.sh
+
   # IPv6 leg — manual dispatch only.  A user-defined compose network with
   # enable_ipv6 + a private ULA subnet keeps all traffic inside the bridge (no
   # host IPv6 egress needed), but docker's IPv6 bridge is not reliable on

@@ -148,13 +148,13 @@ async fn host_with_explicit_port_skips_srv() {
     let resolver = SipResolver::from_system().unwrap();
 
     let results = resolver
-        .resolve("172.16.0.1", Some(5070), "sip", Some("udp"))
+        .resolve("192.0.2.1", Some(5070), "sip", Some("udp"))
         .await;
 
     assert_eq!(results.len(), 1);
     assert_eq!(
         results[0].address,
-        "172.16.0.1:5070".parse::<SocketAddr>().unwrap()
+        "192.0.2.1:5070".parse::<SocketAddr>().unwrap()
     );
     assert_eq!(results[0].transport.as_deref(), Some("udp"));
 }

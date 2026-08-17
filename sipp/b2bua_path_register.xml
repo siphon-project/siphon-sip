@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  REGISTER carrying an RFC 3327 Path header, with the Contact URI supplied
+  separately from the sender's own address.
+
+  Same shape as failover_register_path.xml, plus a parameterised Contact: the
+  B2BUA scenarios need a binding whose Contact is somewhere the call can NOT be
+  completed (a UE behind NAT / an IPsec SA / a `.invalid` contact), so that a
+  B-leg arriving at the edge proves it followed the Path and not the Contact.
+  The Path URI's userpart is the per-registration token the edge resolves back
+  to this binding.
+
+  -key regcontact  full Contact URI, e.g. "sip:bob@172.20.0.99:5060"
+  -key regpath     full Path header value, e.g. "<sip:token-a@172.20.0.94:5060;lr>"
+  -key regq        Contact q-value ordering the bindings, e.g. "1.0"
+
+  Run: sipp <b2bua>:5060 -sf b2bua_path_register.xml -s bob \
+            -key regcontact 'sip:bob@172.20.0.99:5060' \
+            -key regpath '<sip:token-a@172.20.0.94:5060;lr>' \
+            -key regq 1.0 -m 1
+-->
+<scenario name="REGISTER with Path and an explicit Contact">
+
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 REGISTER
+Contact: <[regcontact]>;q=[regq];expires=3600
+Path: [regpath]
+Max-Forwards: 70
+User-Agent: SIPp/siphon-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <recv response="200" rtd="true" />
+
+</scenario>

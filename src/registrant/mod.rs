@@ -1437,7 +1437,7 @@ fn default_contact_uri(username: &str, address: SocketAddr, transport: Transport
 /// Request-URI. Uses the full SIP-URI parser so host and port are split
 /// correctly — `SipUri::new("host:port")` would put the whole thing in the
 /// host field, and the IPv6 heuristic in `format_sip_host` would then bracket
-/// it (`sip:[172.16.0.101:5060]`), which breaks the registrar's DNS/relay.
+/// it (`sip:[192.0.2.143:5060]`), which breaks the registrar's DNS/relay.
 fn registrar_request_uri(registrar_uri: &str) -> SipUri {
     crate::sip::parser::parse_uri_standalone(registrar_uri).unwrap_or_else(|_| {
         SipUri::new(
@@ -1608,11 +1608,11 @@ mod tests {
         manager.add(entry);
 
         let mut listen = HashMap::new();
-        listen.insert(Transport::Tls, "172.16.0.153:5061".parse().unwrap());
+        listen.insert(Transport::Tls, "192.0.2.149:5061".parse().unwrap());
 
         let result = manager.build_register(
             "sip:trunk@carrier.com",
-            "172.16.0.153:5060".parse().unwrap(),
+            "192.0.2.149:5060".parse().unwrap(),
             &listen,
             3600,
         );
@@ -1625,12 +1625,12 @@ mod tests {
         let raw = String::from_utf8_lossy(&bytes);
         // Contact should use TLS listen port and transport param
         assert!(
-            raw.contains("172.16.0.153:5061;transport=tls"),
+            raw.contains("192.0.2.149:5061;transport=tls"),
             "Contact should use TLS port 5061 and transport=tls: {raw}"
         );
         // Via should also use TLS port
         assert!(
-            raw.contains("SIP/2.0/TLS 172.16.0.153:5061"),
+            raw.contains("SIP/2.0/TLS 192.0.2.149:5061"),
             "Via should use TLS port 5061: {raw}"
         );
     }
@@ -2452,7 +2452,7 @@ mod tests {
     fn build_register_ip_registrar_and_impi_contact_are_well_formed() {
         let manager = make_manager();
         // 3GPP test range; IMPI username + IPv4:port registrar — the combo
-        // that produced `sip:[172.16.0.101:5060]` and `user@domain@ip`.
+        // that produced `sip:[192.0.2.143:5060]` and `user@domain@ip`.
         let credentials = aka::AkaCredentials::from_hex(
             "465b5ce8b199b49faa5f0a2ee238a6bc",
             None,
@@ -2463,8 +2463,8 @@ mod tests {
         let aor = "sip:001019999999999@ims.mnc01.mcc001.3gppnetwork.org";
         let entry = RegistrantEntry::new(
             aor.to_string(),
-            "sip:172.16.0.101:5060".to_string(),
-            "172.16.0.101:5060".parse().unwrap(),
+            "sip:192.0.2.143:5060".to_string(),
+            "192.0.2.143:5060".parse().unwrap(),
             Transport::Udp,
             RegistrantCredentials {
                 username: "001019999999999@ims.mnc01.mcc001.3gppnetwork.org".to_string(),
@@ -2485,10 +2485,10 @@ mod tests {
 
         // Request-URI: IPv4:port, no brackets.
         assert!(
-            raw.starts_with("REGISTER sip:172.16.0.101:5060 SIP/2.0"),
+            raw.starts_with("REGISTER sip:192.0.2.143:5060 SIP/2.0"),
             "R-URI must not be bracketed: {raw}"
         );
-        assert!(!raw.contains("sip:[172.16.0.101"), "{raw}");
+        assert!(!raw.contains("sip:[192.0.2.143"), "{raw}");
 
         // Via carries rport (RFC 3581) so the P-CSCF can respond to the actual
         // source port (NAT / symmetric-response robustness).
