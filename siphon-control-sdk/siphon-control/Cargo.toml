@@ -20,8 +20,8 @@ name = "siphon_control"
 crate-type = ["cdylib"]
 
 [dependencies]
-siphon-control-client = { path = "../siphon-control-client", version = "0.1.0" }
-siphon-control-proto = { path = "../siphon-control-proto", version = "0.1.0" }
+siphon-control-client = { path = "../siphon-control-client", version = "0.1.1" }
+siphon-control-proto = { path = "../siphon-control-proto", version = "0.1.1" }
 # No abi3: the target interpreter is free-threaded CPython 3.14t (the SIPhon
 # runtime), and the stable ABI (abi3) is not available on free-threaded builds.
 # A standard version-tagged wheel loads on both GIL and free-threaded 3.14.
