@@ -14,7 +14,7 @@ request-id correlation, and reconnect + `resync`. You write `call.answer()` /
 would.
 
 - **Python** (`control_client.py`) uses [`siphon-control`](../../siphon-control-sdk/siphon-control),
-  which ships the **inbound-persistent** client.
+  which ships **both** connection modes.
 - **TypeScript** (`control_client.ts`) uses [`@siphon-project/control`](../../siphon-control-sdk/typescript),
   which ships **both** connection modes.
 
@@ -39,9 +39,8 @@ the control-plane reference at <https://siphon-sip.org/reference/control-plane/>
   configured application) and `resync`s to re-attach its calls after a reconnect.
   This is `SipClient` (TypeScript) / `ControlClient` (Python).
 
-The TypeScript example selects the mode with `SIPHON_CONTROL_MODE`
-(`outbound` | `inbound`). The Python SDK ships the inbound-persistent client, so
-the Python example is inbound.
+Both examples select the mode with `SIPHON_CONTROL_MODE` (`outbound` |
+`inbound`), defaulting to `outbound`.
 
 ## siphon configuration
 
@@ -90,7 +89,11 @@ pip install siphon-control            # once published
 # ...or from this repo, into the active venv:
 #   cd ../../siphon-control-sdk/siphon-control && maturin develop
 
-IVR_APP_TOKEN=changeme-dev-token python control_client.py
+# outbound (default): this app is the server siphon dials
+SIPHON_CONTROL_BIND=0.0.0.0:8443 IVR_APP_TOKEN=changeme-dev-token python control_client.py
+
+# inbound: this app dials siphon's control.listen
+SIPHON_CONTROL_MODE=inbound IVR_APP_TOKEN=changeme-dev-token python control_client.py
 ```
 
 ## Run the TypeScript client
@@ -122,8 +125,8 @@ npm run typecheck
 
 | var | default | applies to | meaning |
 |---|---|---|---|
-| `SIPHON_CONTROL_MODE` | `outbound` | TypeScript | `outbound` (server) or `inbound` (client) |
+| `SIPHON_CONTROL_MODE` | `outbound` | both | `outbound` (server) or `inbound` (client) |
 | `IVR_APP_TOKEN` | `changeme-dev-token` | both | bearer token (must match `control.apps[].token`) |
 | `SIPHON_CONTROL_APP` | `ivr-app` | both | app name asserted in `hello` (inbound) |
-| `SIPHON_CONTROL_BIND` | `127.0.0.1:8443` | TypeScript outbound | `host:port` this app listens on for siphon's dials |
+| `SIPHON_CONTROL_BIND` | `127.0.0.1:8443` | outbound | `host:port` this app listens on for siphon's dials |
 | `SIPHON_CONTROL_URL` | `ws://127.0.0.1:9092/control/ws` | inbound | siphon's control listener URL |

@@ -49,4 +49,13 @@ jobs:
       # the build + test dry run above.
       - name: Publish to npm (Trusted Publishing — OIDC, no token)
         if: startsWith(github.ref, 'refs/tags/control-sdk-v')
-        run: npm publish --provenance --access public
+        # Idempotent re-tag: skip if this version is already on npm so a re-run
+        # of a control-sdk-v* tag never fails on an existing version.
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          published="$(npm view "@siphon-project/control@${version}" version 2>/dev/null || true)"
+          if [ -n "$published" ]; then
+            echo "@siphon-project/control@${version} already published, skipping"
+          else
+            npm publish --provenance --access public
+          fi
