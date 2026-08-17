@@ -528,7 +528,7 @@ class Call:
             # apply the trust-domain-boundary preset for outbound hygiene.
             call.dial(
                 "sip:1000@ims.mnc001.mcc001.3gppnetwork.org",
-                next_hop="sip:192.0.2.111:4060",
+                next_hop="sip:192.0.2.178:4060",
                 header_policy="ims-trust-domain-boundary@2026",
                 copy=["X-Operator-Tag"],
                 strip=["History-Info"],

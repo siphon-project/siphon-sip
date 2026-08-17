@@ -20825,7 +20825,7 @@ mod tests {
             let prack = build_b2bua_prack_message(
                 &dialog(),
                 crate::transport::Transport::Udp,
-                "172.16.0.153",
+                "192.0.2.149",
                 5060,
                 &target,
                 1,
@@ -20899,11 +20899,11 @@ mod tests {
         // remains (after the proxy popped its own), that Route is the next hop —
         // NOT the Request-URI (the UE Contact) and NOT the cached INVITE branch.
         let ack = ack_request_with_route(Some(
-            "<sip:172.16.0.101:5060;transport=udp;lr>, <sip:172.16.0.101:5060;transport=tcp;lr>",
+            "<sip:192.0.2.143:5060;transport=udp;lr>, <sip:192.0.2.143:5060;transport=tcp;lr>",
         ));
         let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("ACK has a next hop");
         let parsed = parse_uri_standalone(&next_hop).unwrap();
-        assert_eq!(parsed.host, "172.16.0.101");
+        assert_eq!(parsed.host, "192.0.2.143");
         assert_eq!(parsed.port, Some(5060));
         assert_ne!(
             parsed.host, "100.65.0.2",
@@ -20940,17 +20940,17 @@ mod tests {
         // Request-URI. The cached-branch path mis-delivered the ACK so the UAS
         // never confirmed the dialog.
         let mut ack = ack_request_with_route(Some(
-            "<sip:172.16.0.121:6060;lr>, <sip:172.16.0.101:5060;transport=udp;lr>",
+            "<sip:192.0.2.132:6060;lr>, <sip:192.0.2.143:5060;transport=udp;lr>",
         ));
 
         // Mirror handle_ack_via_session: consume our own leading Route entries.
-        let identity = ack_identity(&[("172.16.0.121", &[6060])]);
+        let identity = ack_identity(&[("192.0.2.132", &[6060])]);
         core::consume_self_routes(&mut ack.headers, &identity);
 
         let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("next hop");
         let parsed = parse_uri_standalone(&next_hop).unwrap();
         assert_eq!(
-            parsed.host, "172.16.0.101",
+            parsed.host, "192.0.2.143",
             "ACK must follow the dialog route set to the P-CSCF",
         );
         assert_eq!(parsed.port, Some(5060));
@@ -20968,11 +20968,11 @@ mod tests {
         // the apparent next hop — a routing loop. The ACK must consume both
         // self-Routes (via pop_local_routes) and forward to the P-CSCF, exactly
         // as loose_route() does for the in-dialog BYE on this dialog.
-        let identity = ack_identity(&[("172.16.0.121", &[6060])]);
+        let identity = ack_identity(&[("192.0.2.132", &[6060])]);
         let mut ack = ack_request_with_route(Some(
-            "<sip:172.16.0.121:6060;transport=tcp;lr>, \
-             <sip:172.16.0.121:6060;transport=udp;lr>, \
-             <sip:172.16.0.101:5060;transport=udp;lr>",
+            "<sip:192.0.2.132:6060;transport=tcp;lr>, \
+             <sip:192.0.2.132:6060;transport=udp;lr>, \
+             <sip:192.0.2.143:5060;transport=udp;lr>",
         ));
 
         // Mirror handle_ack_via_session's route consumption.
@@ -20981,7 +20981,7 @@ mod tests {
         let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("next hop");
         let parsed = parse_uri_standalone(&next_hop).unwrap();
         assert_eq!(
-            parsed.host, "172.16.0.101",
+            parsed.host, "192.0.2.143",
             "ACK must skip our own double Record-Route and follow the route set",
         );
         assert_eq!(parsed.port, Some(5060));
@@ -20994,10 +20994,10 @@ mod tests {
         // whenever it carried `;lr`, stripping a downstream proxy's own Route
         // and sending the ACK a hop too far. It now applies the same
         // self-identity test the in-dialog BYE does.
-        let identity = ack_identity(&[("172.16.0.121", &[6060])]);
+        let identity = ack_identity(&[("192.0.2.132", &[6060])]);
         let mut ack = ack_request_with_route(Some(
-            "<sip:172.16.0.101:5060;transport=udp;lr>, \
-             <sip:172.16.0.199:5060;transport=udp;lr>",
+            "<sip:192.0.2.143:5060;transport=udp;lr>, \
+             <sip:192.0.2.168:5060;transport=udp;lr>",
         ));
 
         let popped = core::consume_self_routes(&mut ack.headers, &identity);
@@ -21006,7 +21006,7 @@ mod tests {
         let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("next hop");
         let parsed = parse_uri_standalone(&next_hop).unwrap();
         assert_eq!(
-            parsed.host, "172.16.0.101",
+            parsed.host, "192.0.2.143",
             "ACK must still go to the first Route, not past it",
         );
     }
@@ -21017,10 +21017,10 @@ mod tests {
         // carries our advertised/bind address, which `domain.local` need not
         // list. The ACK resolves self-identity from the same widened set, so
         // both in-dialog paths agree about the same dialog's route set.
-        let identity = ack_identity(&[("172.16.0.121", &[6060])]);
+        let identity = ack_identity(&[("192.0.2.132", &[6060])]);
         let mut ack = ack_request_with_route(Some(
-            "<sip:172.16.0.121:6060;transport=udp;lr>, \
-             <sip:172.16.0.101:5060;transport=udp;lr>",
+            "<sip:192.0.2.132:6060;transport=udp;lr>, \
+             <sip:192.0.2.143:5060;transport=udp;lr>",
         ));
 
         let popped = core::consume_self_routes(&mut ack.headers, &identity);
@@ -21028,7 +21028,7 @@ mod tests {
 
         let next_hop = ack_next_hop_uri(&ack.headers, &ack.start_line).expect("next hop");
         let parsed = parse_uri_standalone(&next_hop).unwrap();
-        assert_eq!(parsed.host, "172.16.0.101");
+        assert_eq!(parsed.host, "192.0.2.143");
     }
 
     // -----------------------------------------------------------------------

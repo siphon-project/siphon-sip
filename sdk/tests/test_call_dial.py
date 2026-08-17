@@ -32,14 +32,14 @@ class TestCallDial:
         call = Call()
         call.dial(
             "sip:1000@ims.mnc001.mcc001.3gppnetwork.org",
-            next_hop="sip:192.0.2.111:4060",
+            next_hop="sip:192.0.2.178:4060",
         )
         action = call._actions[0]
         assert action.kind == "dial"
         # `target` is what drives the B-leg R-URI host (preserves IMPU shape).
         assert action.targets == ["sip:1000@ims.mnc001.mcc001.3gppnetwork.org"]
         # `next_hop` is what the dispatcher resolves for the wire destination.
-        assert action.next_hop == "sip:192.0.2.111:4060"
+        assert action.next_hop == "sip:192.0.2.178:4060"
 
     def test_dial_next_hop_with_timeout(self):
         call = Call()
