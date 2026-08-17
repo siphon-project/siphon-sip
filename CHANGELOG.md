@@ -144,7 +144,10 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   destination from the topmost Route when no explicit `next_hop=` is given
   (RFC 3261 §16.6 step 6) — which also makes the existing `route=` argument on
   `call.dial()` actually routable rather than a header that decorated an INVITE
-  sent somewhere else.
+  sent somewhere else. The RFC 3261 §18.1.1 over-MTU UDP→TCP re-probe follows
+  the same URI, so an over-MTU B-leg no longer resolves the callee's Contact
+  host and lands there in spite of the route set (`mtu:` configured, UDP, a
+  DNS-named Contact).
 - **A proxied request whose branch never got an answer now gets one.** Two
   independent paths ended at a `warn!` and told nobody, so the upstream UAC sat
   on its `100 Trying` until its own Timer F — 32 s of silence for a failure the
