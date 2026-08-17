@@ -1,74 +1,47 @@
 # Remote-control client examples
 
 Two small external applications — one Python, one TypeScript — that drive live
-calls over siphon's control WebSocket (ARI/ESL-class). A B2BUA script hands a
-call over with `call.handover("ivr-app")` (the ARI *Stasis* model); the
-out-of-process app then answers, sets a per-call variable, holds briefly, and
-hangs up. Calls that are not handed over are unaffected.
+calls over siphon's control WebSocket (ARI/ESL-class) using the official client
+**SDKs**. A B2BUA script hands a call over with `call.handover("ivr-app")` (the
+ARI *Stasis* model); the out-of-process app then answers, sets a per-call
+variable, holds briefly, and hangs up. Calls that are not handed over are
+unaffected.
 
-Both clients support **both connection modes** and default to
-**outbound per-call-connect**.
+Both examples use the SDK — the official interop path. There is **no manual
+frame construction**: the SDK owns the transport, the `hello` handshake,
+request-id correlation, and reconnect + `resync`. You write `call.answer()` /
+`call.transfer(...)` / `call.hangup()`, exactly as an in-process siphon script
+would.
+
+- **Python** (`control_client.py`) uses [`siphon-control`](../../siphon-control-sdk/siphon-control),
+  which ships the **inbound-persistent** client.
+- **TypeScript** (`control_client.ts`) uses [`@siphon-project/control`](../../siphon-control-sdk/typescript),
+  which ships **both** connection modes.
+
+The raw `siphon-control.v1` JSON protocol these SDKs speak (the command / reply /
+event envelope, the verb set, the error codes) is documented under the hood in
+the control-plane reference at <https://siphon-sip.org/reference/control-plane/>
+— you do not need it to use the examples.
 
 ## Connection modes
-
-Same JSON-over-WebSocket protocol (subprotocol `siphon-control.v1`) on the
-socket in either mode.
 
 - **Outbound per-call-connect (the documented default).** The app runs a
   WebSocket **server**; siphon dials it once per handed-over call and the
   accepting socket owns that call (the FreeSWITCH-outbound model). There is **no
   `hello`** — the first frame the app receives is `StasisStart`. Use this for
   multi-pod / autoscaled controllers: siphon always dials *out*, so the "which
-  pod owns the call" affinity problem cannot arise. The app must echo the
-  `siphon-control.v1` subprotocol on accept (both example servers do).
+  pod owns the call" affinity problem cannot arise. In the TypeScript SDK this is
+  `SipServer`.
 
 - **Inbound persistent.** The app is a WebSocket **client** that connects in to
   `control.listen` and owns calls assigned to it (round-robin across the app's
   connections). It sends a first `hello` (whose `app` must match the token's
-  configured application) and can `resync` to re-attach its calls after a
-  reconnect.
+  configured application) and `resync`s to re-attach its calls after a reconnect.
+  This is `SipClient` (TypeScript) / `ControlClient` (Python).
 
-Select the mode with `SIPHON_CONTROL_MODE` (`outbound` | `inbound`).
-
-## Wire protocol
-
-Single WebSocket per connection, JSON text frames, request-id correlated.
-Adapter commands carry `module` (`"sip"`); substrate commands (`hello`,
-`resync`, `describe`, `set_var`, `get_var`) omit it.
-
-```
-command  (client → siphon)  { "id":"c-1", "type":"command", "module":"sip",
-                              "verb":"answer", "target":{"channel":"<id>"},
-                              "args":{"code":200} }
-reply    (siphon → client)  { "id":"c-1", "type":"reply", "status":"ok",
-                              "result":{...} }   // or "status":"error", "error":{code,message}
-event    (siphon → client)  { "type":"event", "event":"StasisStart",
-                              "channel":"<id>", "call_id":"<uuid>",
-                              "sip_call_id":"<cid>", "payload":{...} }
-```
-
-Every event carries the stable id triple `{channel, call_id, sip_call_id}` —
-`sip_call_id` is byte-identical to the CDR `call_id` and the HEP correlation
-chunk, so your logs join Homer + billing with no mapping table.
-
-## Phase-1 verb set
-
-| verb | module | args | notes |
-|---|---|---|---|
-| `answer` | sip | `{code, reason?, body?, content_type?}` | send a UAS 2xx to the parked A-leg |
-| `progress` | sip | `{code, reason?, body?, content_type?}` | send a 1xx / early media |
-| `reject` | sip | `{code, reason?}` | final non-2xx + tear down |
-| `hangup` | sip | `{reason?}` | BYE an answered call, or reject an unanswered one |
-| `refer` | sip | `{to, replaces?}` | in-dialog REFER on the A-leg |
-| `set_header` / `get_header` | sip | `{name, value?}` | on the stored A-leg INVITE |
-| `set_var` / `get_var` | — | `{key, value?}` | per-call variables (drain with the call) |
-| `resync` | — | — | re-attach + enumerate this app's owned calls |
-| `describe` | — | — | list the registered adapters + their verb/event schema |
-
-A command against a dead/unknown call returns a typed `not_found`; a command
-targeting another app's call returns `forbidden` — neither ever hangs.
-(`play` / `dtmf` / `bridge` / `originate` / media-stream verbs arrive in later
-phases over the same protocol and envelope.)
+The TypeScript example selects the mode with `SIPHON_CONTROL_MODE`
+(`outbound` | `inbound`). The Python SDK ships the inbound-persistent client, so
+the Python example is inbound.
 
 ## siphon configuration
 
@@ -106,30 +79,39 @@ async def route(call):
 ```
 
 `answer=True` (answer-first / AI-park) answers the call and anchors its media to
-the `voice_ai` WebSocket bridge before handing over, so the app drives an
-already-connected channel; it requires the `siphon-rtp` media backend.
+the WebSocket bridge before handing over, so the app drives an already-connected
+channel; it requires the `siphon-rtp` media backend.
 
 ## Run the Python client
 
 ```bash
-pip install "websockets>=14"
+# install the SDK:
+pip install siphon-control            # once published
+# ...or from this repo, into the active venv:
+#   cd ../../siphon-control-sdk/siphon-control && maturin develop
 
-# outbound (default): this app is the server siphon dials
-SIPHON_CONTROL_BIND=0.0.0.0:8443 IVR_APP_TOKEN=changeme-dev-token python control_client.py
-
-# inbound: this app dials siphon's control.listen
-SIPHON_CONTROL_MODE=inbound IVR_APP_TOKEN=changeme-dev-token python control_client.py
+IVR_APP_TOKEN=changeme-dev-token python control_client.py
 ```
 
 ## Run the TypeScript client
 
-```bash
-npm install
+The example depends on `@siphon-project/control` via a `file:` path to the sibling
+package, so it is runnable before the SDK is published. **Build the SDK first**
+(its `dist/` is what the `file:` dependency resolves):
 
-# outbound (default)
+```bash
+# build the sibling SDK once:
+npm --prefix ../../siphon-control-sdk/typescript install
+npm --prefix ../../siphon-control-sdk/typescript run build
+
+# then this example:
+npm install                           # wires up the file: dependency
+# ...once published, this is simply `npm i @siphon-project/control`.
+
+# outbound (default): this app is the server siphon dials
 SIPHON_CONTROL_BIND=0.0.0.0:8443 IVR_APP_TOKEN=changeme-dev-token npm start
 
-# inbound
+# inbound: this app dials siphon's control.listen
 SIPHON_CONTROL_MODE=inbound IVR_APP_TOKEN=changeme-dev-token npm start
 
 # type-check only
@@ -140,8 +122,8 @@ npm run typecheck
 
 | var | default | applies to | meaning |
 |---|---|---|---|
-| `SIPHON_CONTROL_MODE` | `outbound` | both | `outbound` (server) or `inbound` (client) |
+| `SIPHON_CONTROL_MODE` | `outbound` | TypeScript | `outbound` (server) or `inbound` (client) |
 | `IVR_APP_TOKEN` | `changeme-dev-token` | both | bearer token (must match `control.apps[].token`) |
-| `SIPHON_CONTROL_APP` | `ivr-app` | inbound | app name asserted in `hello` |
-| `SIPHON_CONTROL_BIND` | `127.0.0.1:8443` | outbound | `host:port` this app listens on for siphon's dials |
+| `SIPHON_CONTROL_APP` | `ivr-app` | both | app name asserted in `hello` (inbound) |
+| `SIPHON_CONTROL_BIND` | `127.0.0.1:8443` | TypeScript outbound | `host:port` this app listens on for siphon's dials |
 | `SIPHON_CONTROL_URL` | `ws://127.0.0.1:9092/control/ws` | inbound | siphon's control listener URL |

@@ -1,0 +1,67 @@
+{
+  "name": "@siphon-project/control",
+  "version": "0.1.0",
+  "description": "TypeScript client for the SIPhon external control plane (siphon-control.v1) — an ARI/ESL-class rail for driving handed-over calls out of process.",
+  "type": "module",
+  "license": "MIT",
+  "author": "The SIPhon authors",
+  "homepage": "https://github.com/siphon-project/siphon-sip",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/siphon-project/siphon-sip.git",
+    "directory": "siphon-control-sdk/typescript"
+  },
+  "bugs": {
+    "url": "https://github.com/siphon-project/siphon-sip/issues"
+  },
+  "keywords": [
+    "sip",
+    "voip",
+    "b2bua",
+    "control",
+    "ari",
+    "esl",
+    "telephony",
+    "websocket"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false,
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@types/ws": "^8.5.13",
+    "tsup": "^8.3.5",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.5"
+  }
+}
