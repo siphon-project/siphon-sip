@@ -163,6 +163,9 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          # Idempotent re-tag: skip any wheel/sdist already on PyPI so
+          # re-running a control-sdk-v* tag never fails on an existing version.
+          skip-existing: true
 
   # ── Publish crates to crates.io (Trusted Publishing — OIDC, no token) ───
   # Dependency order: siphon-control-proto first, then siphon-control-client
@@ -187,10 +190,25 @@ jobs:
         uses: rust-lang/crates-io-auth-action@v1
         id: auth
       - name: Publish siphon-control-proto
-        run: cargo publish -p siphon-control-proto --manifest-path siphon-control-sdk/Cargo.toml
+        # Idempotent re-tag: skip if this version is already on crates.io so a
+        # re-run of a control-sdk-v* tag never fails on an existing version.
+        # crates.io rejects requests without a User-Agent, hence -A.
+        run: |
+          version="$(grep -m1 '^version = ' siphon-control-sdk/Cargo.toml | sed -E 's/^version = "(.*)"/\1/')"
+          if curl -sf -A "siphon-control-sdk release (github.com/siphon-project/siphon-sip)" "https://crates.io/api/v1/crates/siphon-control-proto/${version}" -o /dev/null; then
+            echo "siphon-control-proto ${version} already published, skipping"
+          else
+            cargo publish -p siphon-control-proto --manifest-path siphon-control-sdk/Cargo.toml
+          fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
       - name: Publish siphon-control-client
-        run: cargo publish -p siphon-control-client --manifest-path siphon-control-sdk/Cargo.toml
+        run: |
+          version="$(grep -m1 '^version = ' siphon-control-sdk/Cargo.toml | sed -E 's/^version = "(.*)"/\1/')"
+          if curl -sf -A "siphon-control-sdk release (github.com/siphon-project/siphon-sip)" "https://crates.io/api/v1/crates/siphon-control-client/${version}" -o /dev/null; then
+            echo "siphon-control-client ${version} already published, skipping"
+          else
+            cargo publish -p siphon-control-client --manifest-path siphon-control-sdk/Cargo.toml
+          fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

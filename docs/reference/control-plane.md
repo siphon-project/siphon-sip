@@ -18,6 +18,7 @@ the SDKs don't cover.
 | --- | --- |
 | Build a controller in **Python** | `pip install siphon-control` |
 | Build a controller in **Rust** | `cargo add siphon-control-client` |
+| Build a controller in **TypeScript** | `npm i @siphon-project/control` |
 | Build a controller in **another language** | the [raw `siphon-control.v1` protocol](#under-the-hood-the-raw-protocol) |
 
 ## Python — `siphon-control`
@@ -89,9 +90,42 @@ works for any adapter) and a typed `sip` facade (`sip::Call`) layered on top. A
 rejected command maps to `ControlError::Command` carrying the stable
 `ControlErrorCode`.
 
+## TypeScript — `@siphon-project/control`
+
+```bash
+npm i @siphon-project/control
+```
+
+```typescript
+import { SipClient, ControlError } from "@siphon-project/control";
+
+const client = await SipClient.connect({
+  url: "ws://siphon:9090/control/ws",
+  app: "ivr-app",
+  token: "s3cr3t",
+});
+
+await client.onCall(async (call) => {
+  await call.answer();                        // UAS 2xx to the parked A-leg
+  try {
+    await call.transfer("sip:agent@pbx");     // REFER; awaits the correlated reply
+  } catch (error) {
+    if (error instanceof ControlError) {
+      console.log("transfer rejected:", error.code);  // stable code
+    }
+  }
+  await call.hangup();
+});                                            // connect, dispatch, reconnect + resync
+```
+
+The same `Call` verbs as the Python and Rust facades. `SipClient` / `SipServer`
+are the SIP facade over the generic `ControlClient` / `ControlServer` core; both
+expose `onCall(handler)` and the identical `Call` handle — `SipServer` is the
+per-call-connect twin (siphon dials the app).
+
 ## Connection modes
 
-Both SDKs support the two modes, over the same JSON-over-WebSocket protocol.
+All three SDKs support the two modes, over the same JSON-over-WebSocket protocol.
 
 - **Outbound per-call-connect (the multi-pod default).** Your app runs a
   WebSocket server; siphon dials it once per handed-over call and the accepting
