@@ -22,6 +22,7 @@ use tracing::{debug, info, warn};
 
 use super::bencode::{self, BencodeValue};
 use super::error::RtpEngineError;
+use super::profile::WsTeeDirection;
 
 /// One decoded media-engine event.
 #[derive(Debug, Clone)]
@@ -43,6 +44,14 @@ pub enum RtpEngineEvent {
     /// scraping logs.  Emitted by the `siphon-rtp` native backend only; the
     /// rtpengine NG backend does not surface it.
     CallSummary(CallSummary),
+    /// A WebSocket tee started streaming — the engine dialled the server, sent
+    /// `start`, and the call's decoded audio is now flowing.  Emitted by the
+    /// `siphon-rtp` native backend only.
+    WsTeeStarted(WsTeeStarted),
+    /// A WebSocket tee stopped, for any reason including the *server* ending it.
+    /// Emitted exactly once per started tee, so a script learns the stream died
+    /// rather than silently losing audio.  `siphon-rtp` native backend only.
+    WsTeeEnded(WsTeeEnded),
     /// An event we didn't recognise — passed through for logging.
     Unknown {
         event: String,
@@ -124,6 +133,88 @@ pub struct CallLegSummary {
     /// `"full"` (MOS includes the G.107 delay term) or `"loss+jitter"` — how the
     /// MOS was derived.
     pub mos_basis: Option<String>,
+}
+
+/// A WebSocket tee started streaming, carried by
+/// [`RtpEngineEvent::WsTeeStarted`].  Carries the negotiated wire shape so a
+/// consumer can decode the binary frames without guessing.
+#[derive(Debug, Clone)]
+pub struct WsTeeStarted {
+    /// SIP Call-ID the media session is keyed on.
+    pub call_id: String,
+    /// The teed leg's from-tag.
+    pub from_tag: String,
+    /// The tee's stream id, matching the `start` frame on the WebSocket — the
+    /// correlator between this control event and the media stream itself.
+    pub stream_id: String,
+    /// The URI the engine dialled.
+    pub ws_uri: String,
+    /// Which leg(s) are being streamed.
+    pub direction: WsTeeDirection,
+    /// Wire channels: 1 = mono/mixed, 2 = caller/callee interleaved.
+    pub channels: u8,
+    /// Wire sample rate in Hz (L16, little-endian).
+    pub sample_rate: u32,
+}
+
+/// A WebSocket tee stopped, carried by [`RtpEngineEvent::WsTeeEnded`].
+#[derive(Debug, Clone)]
+pub struct WsTeeEnded {
+    pub call_id: String,
+    pub from_tag: String,
+    /// The stream id from the matching [`WsTeeStarted`].
+    pub stream_id: String,
+    /// Why the stream ended.
+    pub reason: WsTeeEndReason,
+    /// Wire frames handed to the transport over the tee's lifetime.
+    pub frames_sent: Option<u64>,
+    /// Frames dropped because the server stalled (bounded queue full) or a
+    /// channel ring overflowed.  Non-zero means the consumer could not keep up;
+    /// the call itself was never affected.
+    pub frames_dropped: Option<u64>,
+}
+
+/// Why a WebSocket tee stream ended.  A siphon-side mirror of the native
+/// backend's `siphon_rtp_proto::WsTeeEndReason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsTeeEndReason {
+    /// The script detached it, or the call was torn down.
+    Detached,
+    /// The WebSocket server closed the connection.
+    ServerClosed,
+    /// The WebSocket server sent a `stop` control frame.
+    ServerStopped,
+    /// The call's media path went away, so no further audio can be teed.
+    CallEnded,
+    /// A WebSocket/transport error ended the stream.
+    TransportError,
+    /// A reason this build of siphon does not know — a newer engine.  Carries
+    /// the wire spelling so a script can still act on it rather than seeing the
+    /// tee end for no stated reason.
+    Other(&'static str),
+}
+
+impl WsTeeEndReason {
+    /// The wire spelling, as handed to Python handlers.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Detached => "detached",
+            Self::ServerClosed => "server_closed",
+            Self::ServerStopped => "server_stopped",
+            Self::CallEnded => "call_ended",
+            Self::TransportError => "transport_error",
+            Self::Other(reason) => reason,
+        }
+    }
+
+    /// Whether the tee ended for a reason the script did not ask for.
+    ///
+    /// `detached` is the only orderly end — every other reason means audio
+    /// stopped reaching the consumer while the call was still up, which is the
+    /// silent-failure case a handler exists to catch.
+    pub fn is_unexpected(self) -> bool {
+        !matches!(self, Self::Detached)
+    }
 }
 
 /// Helpers for extracting values from a bencoded event dict.

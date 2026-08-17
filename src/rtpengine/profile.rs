@@ -11,9 +11,10 @@
 //! Operators can define additional profiles (or override built-ins) in the YAML
 //! config under `media.profiles`.
 //!
-//! Not every flag is honourable by every media backend — the WebSocket bridge
-//! and DSP knobs are native `siphon-rtp` extensions, and `rtpproxy` has no
-//! equivalent for `address_family`, `received_from` or `rtcp_mux`.  A profile
+//! Not every flag is honourable by every media backend — the WebSocket bridge,
+//! the WebSocket tee and the DSP knobs are native `siphon-rtp` extensions, and
+//! `rtpproxy` has no equivalent for `address_family`, `received_from` or
+//! `rtcp_mux`.  A profile
 //! asking for something its configured backend cannot do is rejected at config
 //! load; see `MediaBackendKind::unsupported_profile_fields`.
 
@@ -270,6 +271,50 @@ impl Default for ProfileRegistry {
     }
 }
 
+/// Which leg(s) of a call a WebSocket tee streams.
+///
+/// A siphon-side mirror of the native backend's `siphon_rtp_proto::WsTeeDirection`,
+/// so the config and profile layers stay free of the proto type — the same posture
+/// [`super::events::CallSummary`] takes for the call-summary event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WsTeeDirection {
+    /// Both legs: stereo (channel 0 = caller, channel 1 = callee) unless
+    /// [`NgFlags::ws_tee_channels`] is 1, which mixes them to mono.
+    #[default]
+    Both,
+    /// Only the caller's (offerer's) audio, as a mono monologue.
+    Caller,
+    /// Only the callee's (answerer's) audio, as a mono monologue.
+    Callee,
+}
+
+impl WsTeeDirection {
+    /// The YAML / Python spelling, matching the proto's `snake_case` wire form.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Caller => "caller",
+            Self::Callee => "callee",
+        }
+    }
+
+    /// Parse the YAML / Python spelling, case-insensitively.
+    ///
+    /// Returns `None` for anything else so the caller can raise a named error
+    /// rather than silently relaying a direction the engine would reject.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "both" => Some(Self::Both),
+            "caller" => Some(Self::Caller),
+            "callee" => Some(Self::Callee),
+            _ => None,
+        }
+    }
+
+    /// The accepted values, for error messages.
+    pub const VALUES: [&'static str; 3] = ["both", "caller", "callee"];
+}
+
 /// NG protocol flags sent with offer/answer commands.
 #[derive(Debug, Clone, Default)]
 pub struct NgFlags {
@@ -346,6 +391,31 @@ pub struct NgFlags {
     /// fires.  `None` uses the engine's ~200 ms default.  Only meaningful with
     /// [`NgFlags::ws_vad`] / [`NgFlags::ws_barge_in`].
     pub ws_vad_hangover_ms: Option<u32>,
+    /// Attach a **WebSocket tee** to this call at offer/answer time — the
+    /// declarative twin of `rtpengine.attach_ws_tee(...)`, so a profile can turn
+    /// the tee on without a second round-trip.
+    ///
+    /// The critical distinction from [`NgFlags::ws_uri`]: `ws_uri` is a
+    /// **takeover** — the WS server *becomes* leg A's far side and the A↔B relay
+    /// is not wired.  A tee is **send-only and additive** — the call relays (or
+    /// transcodes) normally *and* streams a copy of its decoded audio to this
+    /// URI, leaving any SIPREC subscription and recording untouched.  Setting
+    /// both on one profile is legal but almost never what you want.
+    ///
+    /// Applied once the call's media path exists (on `answer` / `answer_local`)
+    /// and torn down with the call.
+    ///
+    /// A native `siphon-rtp` extension: the NG/bencode and rtpproxy backends
+    /// have no equivalent and cannot honour it.
+    pub ws_tee: Option<String>,
+    /// Which leg(s) [`NgFlags::ws_tee`] streams.  `None` leaves the engine's
+    /// default (both).  Inert without [`NgFlags::ws_tee`].
+    pub ws_tee_direction: Option<WsTeeDirection>,
+    /// Wire channel count for [`NgFlags::ws_tee`]: `2` interleaves caller/callee
+    /// as stereo, `1` mixes them to mono.  Only meaningful streaming both legs —
+    /// a single-leg tee is always mono.  `None` leaves the engine's default (2
+    /// for both legs, 1 for one).  Inert without [`NgFlags::ws_tee`].
+    pub ws_tee_channels: Option<u8>,
     /// Profile **policy**: carry the real post-NAT source IP the proxy saw this
     /// request arrive from (rtpengine's `received from`) on offer/answer.
     ///
@@ -397,6 +467,9 @@ impl NgFlags {
             ws_barge_in: config.ws_barge_in,
             ws_vad_threshold: config.ws_vad_threshold,
             ws_vad_hangover_ms: config.ws_vad_hangover_ms,
+            ws_tee: config.ws_tee.clone(),
+            ws_tee_direction: config.ws_tee_direction,
+            ws_tee_channels: config.ws_tee_channels,
             carry_received_from: config.received_from,
             received_from: None,
             rtcp_mux: config.rtcp_mux.clone(),
@@ -464,12 +537,13 @@ impl NgFlags {
             let items: Vec<&str> = self.rtcp_mux.iter().map(|s| s.as_str()).collect();
             pairs.push(("rtcp-mux", BencodeValue::string_list(&items)));
         }
-        // The WS bridge and DSP knobs (ws_uri, ws_vad, ws_barge_in,
-        // ws_vad_threshold, ws_vad_hangover_ms, noise_suppression,
-        // echo_cancellation) are native siphon-rtp extensions with no NG
-        // equivalent, so they are deliberately not emitted here.  A profile that
-        // sets them on this backend is rejected at config load rather than
-        // silently degraded — see `MediaBackendKind::unsupported_profile_fields`.
+        // The WS bridge, WS tee and DSP knobs (ws_uri, ws_vad, ws_barge_in,
+        // ws_vad_threshold, ws_vad_hangover_ms, ws_tee, ws_tee_direction,
+        // ws_tee_channels, noise_suppression, echo_cancellation) are native
+        // siphon-rtp extensions with no NG equivalent, so they are deliberately
+        // not emitted here.  A profile that sets them on this backend is rejected
+        // at config load rather than silently degraded — see
+        // `MediaBackendKind::unsupported_profile_fields`.
 
         pairs
     }

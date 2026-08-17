@@ -6,6 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::path::Path;
 use std::sync::LazyLock;
 use crate::error::{Result, SiphonError};
+use crate::rtpengine::profile::WsTeeDirection;
 
 // ---------------------------------------------------------------------------
 // Environment variable expansion — `${VAR}` and `${VAR:-default}`
@@ -1805,9 +1806,9 @@ impl MediaBackendKind {
 
     /// Which of `flags`' set fields this backend has no way to express.
     ///
-    /// The WebSocket bridge and the DSP knobs are native `siphon-rtp`
-    /// extensions; `received_from` and `rtcp_mux` are also real rtpengine NG
-    /// keys but have no `rtpproxy` equivalent.
+    /// The WebSocket bridge, the WebSocket tee and the DSP knobs are native
+    /// `siphon-rtp` extensions; `received_from` and `rtcp_mux` are also real
+    /// rtpengine NG keys but have no `rtpproxy` equivalent.
     ///
     /// A field the engine cannot honour is not a degraded call, it is a dead
     /// one — a `ws_uri` the engine never sees means the leg is answered and
@@ -1839,6 +1840,15 @@ impl MediaBackendKind {
             }
             if flags.echo_cancellation {
                 unsupported.push("echo_cancellation");
+            }
+            if flags.ws_tee.is_some() {
+                unsupported.push("ws_tee");
+            }
+            if flags.ws_tee_direction.is_some() {
+                unsupported.push("ws_tee_direction");
+            }
+            if flags.ws_tee_channels.is_some() {
+                unsupported.push("ws_tee_channels");
             }
         }
 
@@ -2125,12 +2135,52 @@ where
         .collect()
 }
 
-/// Serde deserializer for a media profile's `ws_uri`.
+/// Validate a WebSocket URI field, naming `field` in the error.
 ///
-/// The engine dials this as a WebSocket client, so anything that is not
+/// The engine dials these as a WebSocket client, so anything that is not
 /// `ws://` / `wss://` can never connect.  Caught here rather than as a
-/// connect failure per call.
+/// connect failure per call.  `field` is threaded through so an operator with
+/// a bad `ws_tee` is not told about `ws_uri`, a field they never set.
+fn validate_ws_uri_field<E>(value: Option<String>, field: &str) -> std::result::Result<Option<String>, E>
+where
+    E: serde::de::Error,
+{
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    let scheme = trimmed.split("://").next().unwrap_or_default();
+    match scheme.to_ascii_lowercase().as_str() {
+        "ws" | "wss" if trimmed.contains("://") => Ok(Some(trimmed.to_string())),
+        _ => Err(E::custom(format!(
+            "media profile {field} must be a ws:// or wss:// URI, got {value:?}"
+        ))),
+    }
+}
+
+/// Serde deserializer for a media profile's `ws_uri`.
 fn deserialize_ws_uri<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    validate_ws_uri_field(Option::deserialize(deserializer)?, "ws_uri")
+}
+
+/// Serde deserializer for a media profile's `ws_tee`.
+fn deserialize_ws_tee<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    validate_ws_uri_field(Option::deserialize(deserializer)?, "ws_tee")
+}
+
+/// Validate `ws_tee_direction` against the three values the engine accepts.
+///
+/// A direction the engine would reject is a config error rather than a value
+/// relayed onto the wire, matching how `address_family` is validated at load.
+fn deserialize_ws_tee_direction<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<WsTeeDirection>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -2140,14 +2190,12 @@ where
     let Some(value) = value else {
         return Ok(None);
     };
-    let trimmed = value.trim();
-    let scheme = trimmed.split("://").next().unwrap_or_default();
-    match scheme.to_ascii_lowercase().as_str() {
-        "ws" | "wss" if trimmed.contains("://") => Ok(Some(trimmed.to_string())),
-        _ => Err(de::Error::custom(format!(
-            "media profile ws_uri must be a ws:// or wss:// URI, got {value:?}"
-        ))),
-    }
+    WsTeeDirection::parse(&value).map(Some).ok_or_else(|| {
+        de::Error::custom(format!(
+            "media profile ws_tee_direction must be one of {}, got {value:?}",
+            WsTeeDirection::VALUES.join(" / ")
+        ))
+    })
 }
 
 /// A user-defined RTPEngine media profile with separate offer/answer NG flags.
@@ -2227,6 +2275,31 @@ pub struct NgFlagsConfig {
     /// uses the engine default.
     #[serde(default)]
     pub ws_vad_hangover_ms: Option<u32>,
+    /// Attach a **WebSocket tee** to this call: the engine dials this URI and
+    /// streams a copy of the call's decoded audio to it as L16.  `siphon-rtp`
+    /// backend only.
+    ///
+    /// Distinct from `ws_uri`, and the distinction matters: `ws_uri` is a
+    /// *takeover* (the WS server becomes leg A's far side, the A↔B relay is not
+    /// wired), a tee is *send-only and additive* (the call relays normally and
+    /// the tee streams a copy, leaving SIPREC and recording untouched).
+    ///
+    /// Supports the same `{call_id}`, `{from_tag}`, `{from_user}` and
+    /// `{to_user}` placeholders as `ws_uri`, expanded per call.  A script can
+    /// attach or detach a tee on a live call with
+    /// `rtpengine.attach_ws_tee(...)` / `rtpengine.detach_ws_tee(...)`.
+    #[serde(default, deserialize_with = "deserialize_ws_tee")]
+    pub ws_tee: Option<String>,
+    /// Which leg(s) `ws_tee` streams: `both` (default), `caller` or `callee`.
+    /// Inert without `ws_tee`.
+    #[serde(default, deserialize_with = "deserialize_ws_tee_direction")]
+    pub ws_tee_direction: Option<WsTeeDirection>,
+    /// Wire channel count for `ws_tee`: `2` interleaves caller/callee as stereo,
+    /// `1` mixes them to mono.  Only meaningful with `ws_tee_direction: both` —
+    /// a single-leg tee is always mono.  Unset uses the engine default (2 for
+    /// both legs, 1 for one).  Inert without `ws_tee`.
+    #[serde(default)]
+    pub ws_tee_channels: Option<u8>,
     /// Carry the real post-NAT source IP the proxy saw the request arrive from
     /// (rtpengine's `received from`), gating the leg's media ingress to it.
     ///
@@ -4986,6 +5059,121 @@ media:
         assert!(
             message.contains("voice_ai_custom"),
             "error should name the profile: {message}"
+        );
+    }
+
+    #[test]
+    fn parses_media_profile_websocket_tee_fields() {
+        let yaml = ws_profile_yaml(
+            SIPHON_RTP_BACKEND,
+            "      offer:\n        ws_tee: \"wss://asr.example.com/{call_id}\"\n        \
+             ws_tee_direction: \"callee\"\n        ws_tee_channels: 1\n      answer: {}\n",
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        let media = config.media.unwrap();
+        let offer = &media.profiles.get("voice_ai_custom").unwrap().offer;
+        assert_eq!(
+            offer.ws_tee.as_deref(),
+            Some("wss://asr.example.com/{call_id}")
+        );
+        assert_eq!(offer.ws_tee_direction, Some(WsTeeDirection::Callee));
+        assert_eq!(offer.ws_tee_channels, Some(1));
+    }
+
+    /// A profile that does not ask for a tee must stay byte-identical on the
+    /// wire to what it emitted before these knobs existed.
+    #[test]
+    fn media_profile_websocket_tee_fields_default_off() {
+        let yaml = ws_profile_yaml(
+            RTPENGINE_BACKEND,
+            "      offer:\n        replace: [\"origin\"]\n      answer: {}\n",
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        let media = config.media.unwrap();
+        let offer = &media.profiles.get("voice_ai_custom").unwrap().offer;
+        assert!(offer.ws_tee.is_none());
+        assert!(offer.ws_tee_direction.is_none());
+        assert!(offer.ws_tee_channels.is_none());
+    }
+
+    #[test]
+    fn accepts_media_profile_ws_tee_direction_case_insensitively() {
+        let yaml = ws_profile_yaml(
+            SIPHON_RTP_BACKEND,
+            "      offer:\n        ws_tee: \"wss://asr.example.com/s\"\n        \
+             ws_tee_direction: \" Caller \"\n      answer: {}\n",
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        let media = config.media.unwrap();
+        assert_eq!(
+            media
+                .profiles
+                .get("voice_ai_custom")
+                .unwrap()
+                .offer
+                .ws_tee_direction,
+            Some(WsTeeDirection::Caller)
+        );
+    }
+
+    #[test]
+    fn rejects_media_profile_bad_ws_tee_direction() {
+        let yaml = ws_profile_yaml(
+            SIPHON_RTP_BACKEND,
+            "      offer:\n        ws_tee: \"wss://asr.example.com/s\"\n        \
+             ws_tee_direction: \"send\"\n      answer: {}\n",
+        );
+        let error = Config::from_str(&yaml).expect_err("unknown direction must be rejected");
+        assert!(
+            error.to_string().contains("ws_tee_direction"),
+            "error should name the field: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_media_profile_non_websocket_ws_tee_scheme() {
+        let yaml = ws_profile_yaml(
+            SIPHON_RTP_BACKEND,
+            "      offer:\n        ws_tee: \"https://asr.example.com/s\"\n      answer: {}\n",
+        );
+        let error = Config::from_str(&yaml).expect_err("https:// must be rejected");
+        assert!(
+            error.to_string().contains("ws_tee"),
+            "error should name the field: {error}"
+        );
+    }
+
+    /// Same reasoning as `ws_uri`: a tee the engine never receives streams
+    /// nothing, so the consumer sits silent on a call that looks healthy.
+    #[test]
+    fn rejects_websocket_tee_profile_on_rtpengine_backend() {
+        let yaml = ws_profile_yaml(
+            RTPENGINE_BACKEND,
+            "      offer:\n        ws_tee: \"wss://asr.example.com/s\"\n      answer: {}\n",
+        );
+        let error = Config::from_str(&yaml).expect_err("ws_tee on rtpengine must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("ws_tee") && message.contains("rtpengine"),
+            "error should name the field and the backend: {message}"
+        );
+        assert!(
+            message.contains("voice_ai_custom"),
+            "error should name the profile: {message}"
+        );
+    }
+
+    #[test]
+    fn rejects_websocket_tee_profile_on_rtpproxy_backend() {
+        let yaml = ws_profile_yaml(
+            RTPPROXY_BACKEND,
+            "      offer:\n        ws_tee: \"wss://asr.example.com/s\"\n      answer: {}\n",
+        );
+        let error = Config::from_str(&yaml).expect_err("ws_tee on rtpproxy must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("ws_tee") && message.contains("rtpproxy"),
+            "error should name the field and the backend: {message}"
         );
     }
 

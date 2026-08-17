@@ -25,7 +25,7 @@ use tracing::debug;
 
 use super::client::{PlayMediaSource, RtpEngineSet};
 use super::error::RtpEngineError;
-use super::profile::NgFlags;
+use super::profile::{NgFlags, WsTeeDirection};
 use super::rtpproxy::RtpProxyClientSet;
 use super::siphon_rtp::SiphonRtpClientSet;
 
@@ -391,6 +391,59 @@ impl MediaBackend {
             Self::RtpEngine(set) => set.unsubscribe(call_id, from_tag, to_tag).await,
             Self::SiphonRtp(client) => client.unsubscribe(call_id, from_tag, to_tag).await,
             Self::RtpProxy(client) => client.unsubscribe(call_id, from_tag, to_tag).await,
+        }
+    }
+
+    /// Attach a WebSocket tee to a live call — stream a copy of its decoded
+    /// audio to `ws_uri` while the call keeps relaying.
+    ///
+    /// A native `siphon-rtp` extension.  The rtpengine and rtpproxy backends
+    /// return [`RtpEngineError::Unsupported`] rather than `Ok(())`: a hollow
+    /// success would read as "the tee is attached" while nothing ever reaches
+    /// the consumer.  The declarative twin (`ws_tee` on a media profile) is
+    /// rejected at config load for the same reason.
+    pub async fn attach_ws_tee(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        ws_uri: &str,
+        direction: WsTeeDirection,
+        channels: Option<u8>,
+    ) -> Result<(), RtpEngineError> {
+        match self {
+            Self::SiphonRtp(client) => {
+                client
+                    .attach_ws_tee(call_id, from_tag, ws_uri, direction, channels)
+                    .await
+            }
+            Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
+                operation: "attach_ws_tee",
+                backend: "rtpengine",
+            }),
+            Self::RtpProxy(_) => Err(RtpEngineError::Unsupported {
+                operation: "attach_ws_tee",
+                backend: "rtpproxy",
+            }),
+        }
+    }
+
+    /// Detach a call's WebSocket tee.  Idempotent on `siphon-rtp`; unsupported
+    /// on the other backends for the same reason as [`Self::attach_ws_tee`].
+    pub async fn detach_ws_tee(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        match self {
+            Self::SiphonRtp(client) => client.detach_ws_tee(call_id, from_tag).await,
+            Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
+                operation: "detach_ws_tee",
+                backend: "rtpengine",
+            }),
+            Self::RtpProxy(_) => Err(RtpEngineError::Unsupported {
+                operation: "detach_ws_tee",
+                backend: "rtpproxy",
+            }),
         }
     }
 

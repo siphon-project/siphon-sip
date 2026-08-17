@@ -16,7 +16,7 @@ use pyo3::types::PyDict;
 use tracing::{debug, warn};
 
 use crate::rtpengine::client::PlayMediaSource;
-use crate::rtpengine::profile::{NgFlags, ProfileRegistry};
+use crate::rtpengine::profile::{NgFlags, ProfileRegistry, WsTeeDirection};
 use crate::rtpengine::MediaBackend;
 use crate::rtpengine::RtpEngineError;
 use crate::rtpengine::session::{MediaSession, MediaSessionStore};
@@ -1235,6 +1235,139 @@ impl PyRtpEngine {
         })
     }
 
+    /// Attach a **WebSocket tee** to a live call — stream a copy of its decoded
+    /// audio to a WebSocket media server while the call keeps relaying.
+    ///
+    /// The distinction from the ``ws_uri`` media-profile flag matters:
+    ///
+    /// * ``ws_uri`` is a **takeover** — the WebSocket server *becomes* leg A's
+    ///   far side and the A↔B relay is not wired.  That is the voice-AI
+    ///   answer-the-call shape.
+    /// * A tee is **send-only and additive** — the call relays (or transcodes)
+    ///   normally *and* streams a copy of its audio out.  Any SIPREC
+    ///   subscription and recording on the same leg keep running untouched.
+    ///
+    /// Use a tee for live transcription, agent-assist, sentiment or compliance
+    /// monitoring on a call that is otherwise a normal two-party call.
+    ///
+    /// A tee never affects the call: the engine drops frames rather than
+    /// stalling the media path if the consumer cannot keep up, and a failure
+    /// here raises rather than tearing anything down — catch it and carry on.
+    ///
+    /// Requires ``media.backend: siphon-rtp``; the rtpengine and rtpproxy
+    /// backends raise rather than silently doing nothing.
+    ///
+    /// ```python,ignore
+    /// @b2bua.on_answer
+    /// async def on_answer(call, reply):
+    ///     await rtpengine.answer(reply)
+    ///     try:
+    ///         await rtpengine.attach_ws_tee(call, f"wss://asr.internal/{call.call_id}")
+    ///     except RuntimeError as error:
+    ///         log.warn(f"transcription tee unavailable: {error}")
+    /// ```
+    ///
+    /// Args:
+    ///     target: Request, Reply or Call identifying the media session.
+    ///     ws_uri: ``ws://`` or ``wss://`` URI the engine dials as a client.
+    ///     direction: Which leg(s) to stream — ``"both"`` (default),
+    ///         ``"caller"`` (the offerer) or ``"callee"`` (the answerer).
+    ///     channels: Wire channel count — ``2`` interleaves caller/callee as
+    ///         stereo, ``1`` mixes them to mono.  Only meaningful with
+    ///         ``direction="both"``; a single-leg tee is always mono.  ``None``
+    ///         (default) leaves the engine's choice: 2 for both legs, 1 for one.
+    #[pyo3(signature = (target, ws_uri, direction="both", channels=None))]
+    fn attach_ws_tee<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+        ws_uri: String,
+        direction: &str,
+        channels: Option<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (call_id, from_tag) = resolve_call_from_tag(target)?;
+
+        let direction = WsTeeDirection::parse(direction).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "rtpengine.attach_ws_tee direction must be one of {}, got {direction:?}",
+                WsTeeDirection::VALUES.join(" / ")
+            ))
+        })?;
+
+        // Caught here rather than at the engine so the script gets a precise
+        // error instead of a generic engine rejection.
+        if let Some(channels) = channels {
+            if channels != 1 && channels != 2 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "rtpengine.attach_ws_tee channels must be 1 or 2, got {channels}"
+                )));
+            }
+        }
+
+        let client = Arc::clone(&self.client);
+
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            client
+                .attach_ws_tee(&call_id, &from_tag, &ws_uri, direction, channels)
+                .await
+                .map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "rtpengine.attach_ws_tee failed: {error}"
+                    ))
+                })?;
+            debug!(
+                call_id = %call_id,
+                from_tag = %from_tag,
+                ws_uri = %ws_uri,
+                direction = %direction.as_str(),
+                ?channels,
+                "rtpengine attach_ws_tee"
+            );
+            Ok(true)
+        })
+    }
+
+    /// Detach a call's **WebSocket tee**, closing its stream.
+    ///
+    /// Idempotent — detaching a call with no tee is not an error.  A tee is
+    /// also torn down automatically when the call ends, so an explicit detach
+    /// is only needed to stop streaming mid-call.
+    ///
+    /// Requires ``media.backend: siphon-rtp``.
+    ///
+    /// ```python,ignore
+    /// await rtpengine.detach_ws_tee(call)
+    /// ```
+    ///
+    /// Args:
+    ///     target: Request, Reply or Call identifying the media session.
+    #[pyo3(signature = (target))]
+    fn detach_ws_tee<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let client = Arc::clone(&self.client);
+
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            client
+                .detach_ws_tee(&call_id, &from_tag)
+                .await
+                .map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "rtpengine.detach_ws_tee failed: {error}"
+                    ))
+                })?;
+            debug!(
+                call_id = %call_id,
+                from_tag = %from_tag,
+                "rtpengine detach_ws_tee"
+            );
+            Ok(true)
+        })
+    }
+
     /// Register a handler for inbound DTMF events from rtpengine.
     ///
     /// rtpengine must be configured with ``dtmf-log-ng-tcp-uri=tcp://<siphon>``
@@ -1354,6 +1487,126 @@ def make_decorator(call_id, from_tag):
 
         // Support both `@on_media_timeout` (bare) and
         // `@on_media_timeout(call_id=...)` forms.
+        match func_or_none {
+            Some(func) => decorator.call1((func.bind(python),)),
+            None => Ok(decorator),
+        }
+    }
+
+    /// Register a handler for **WebSocket tee started** events.
+    ///
+    /// Fires once the engine has dialled the tee's WebSocket server, sent its
+    /// ``start`` envelope, and begun streaming.  The handler receives the
+    /// negotiated wire shape, so it can decode the binary frames without
+    /// guessing — ``stream_id`` is the correlator between this control event
+    /// and the media stream on the socket.
+    ///
+    /// Delivered by the native **siphon-rtp** backend only.
+    ///
+    /// ```python,ignore
+    /// @rtpengine.on_ws_tee_started
+    /// def tee_up(call_id, from_tag, stream_id, ws_uri, direction, channels, sample_rate):
+    ///     log.info(f"tee {stream_id}: {channels}ch @ {sample_rate}Hz -> {ws_uri}")
+    /// ```
+    ///
+    /// Args:
+    ///     func_or_none: When applied directly (``@rtpengine.on_ws_tee_started``)
+    ///         this is the function.  When called with keyword filters the
+    ///         return value is a decorator.
+    ///     call_id: Optional engine call-id filter.
+    ///     from_tag: Optional from-tag filter.
+    #[pyo3(signature = (func_or_none=None, *, call_id=None, from_tag=None))]
+    fn on_ws_tee_started<'py>(
+        &self,
+        python: Python<'py>,
+        func_or_none: Option<Py<PyAny>>,
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let code = r#"
+def make_decorator(call_id, from_tag):
+    import asyncio
+    import _siphon_registry
+    def decorator(fn):
+        is_async = asyncio.iscoroutinefunction(fn)
+        metadata = {"call_id": call_id, "from_tag": from_tag}
+        _siphon_registry.register("rtpengine.on_ws_tee_started", None, fn, is_async, metadata)
+        return fn
+    return decorator
+"#;
+        let globals = PyDict::new(python);
+        python.run(&std::ffi::CString::new(code).unwrap(), Some(&globals), None)?;
+        let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("failed to build on_ws_tee_started decorator")
+        })?;
+        let decorator = make_decorator.call1((call_id, from_tag))?;
+
+        // Support both `@on_ws_tee_started` (bare) and
+        // `@on_ws_tee_started(call_id=...)` forms.
+        match func_or_none {
+            Some(func) => decorator.call1((func.bind(python),)),
+            None => Ok(decorator),
+        }
+    }
+
+    /// Register a handler for **WebSocket tee ended** events.
+    ///
+    /// Fires exactly once per started tee, **including when the server ends
+    /// it**.  That is the point of the hook: any ``reason`` other than
+    /// ``"detached"`` means the audio stream died while the call is still up,
+    /// which is otherwise invisible — the call carries on and nothing reaches
+    /// the consumer.  Re-attach, fail over, or alert from here.
+    ///
+    /// ``reason`` is one of ``"detached"`` (the script or the call teardown
+    /// asked for it — the only orderly end), ``"server_closed"``,
+    /// ``"server_stopped"``, ``"call_ended"`` or ``"transport_error"``.
+    ///
+    /// ``frames_dropped`` non-zero means the consumer could not keep up; the
+    /// call itself was never affected.
+    ///
+    /// Delivered by the native **siphon-rtp** backend only.
+    ///
+    /// ```python,ignore
+    /// @rtpengine.on_ws_tee_ended
+    /// async def tee_down(call_id, from_tag, stream_id, reason, frames_sent, frames_dropped):
+    ///     if reason != "detached":
+    ///         log.warn(f"tee {stream_id} died: {reason}")
+    /// ```
+    ///
+    /// Args:
+    ///     func_or_none: When applied directly (``@rtpengine.on_ws_tee_ended``)
+    ///         this is the function.  When called with keyword filters the
+    ///         return value is a decorator.
+    ///     call_id: Optional engine call-id filter.
+    ///     from_tag: Optional from-tag filter.
+    #[pyo3(signature = (func_or_none=None, *, call_id=None, from_tag=None))]
+    fn on_ws_tee_ended<'py>(
+        &self,
+        python: Python<'py>,
+        func_or_none: Option<Py<PyAny>>,
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let code = r#"
+def make_decorator(call_id, from_tag):
+    import asyncio
+    import _siphon_registry
+    def decorator(fn):
+        is_async = asyncio.iscoroutinefunction(fn)
+        metadata = {"call_id": call_id, "from_tag": from_tag}
+        _siphon_registry.register("rtpengine.on_ws_tee_ended", None, fn, is_async, metadata)
+        return fn
+    return decorator
+"#;
+        let globals = PyDict::new(python);
+        python.run(&std::ffi::CString::new(code).unwrap(), Some(&globals), None)?;
+        let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("failed to build on_ws_tee_ended decorator")
+        })?;
+        let decorator = make_decorator.call1((call_id, from_tag))?;
+
+        // Support both `@on_ws_tee_ended` (bare) and
+        // `@on_ws_tee_ended(call_id=...)` forms.
         match func_or_none {
             Some(func) => decorator.call1((func.bind(python),)),
             None => Ok(decorator),
