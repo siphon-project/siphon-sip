@@ -147,7 +147,13 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   sent somewhere else. The RFC 3261 §18.1.1 over-MTU UDP→TCP re-probe follows
   the same URI, so an over-MTU B-leg no longer resolves the callee's Contact
   host and lands there in spite of the route set (`mtu:` configured, UDP, a
-  DNS-named Contact).
+  DNS-named Contact). A Path route set now also **outranks the binding's
+  captured inbound flow** on a B-leg, matching the precedence the proxy path
+  already documented: `registrar.lookup()` marks a binding this process accepted
+  as `is_local` and surfaces its flow, so flow-first meant a single siphon acting
+  as both registrar and B2BUA never honoured a Path at all. A binding with no
+  Path still routes over its flow, so connection reuse for a directly-registered
+  WebSocket callee (RFC 5626 §5.3 / RFC 7118 §5) is unchanged.
 - **A proxied request whose branch never got an answer now gets one.** Two
   independent paths ended at a `warn!` and told nobody, so the upstream UAC sat
   on its `100 Trying` until its own Timer F — 32 s of silence for a failure the

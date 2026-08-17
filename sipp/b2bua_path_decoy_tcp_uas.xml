@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  The decoy for the over-MTU B2BUA Path scenario: a TCP-ONLY listener sitting at
+  the DNS name the callee's Contact points at.
+
+  Its whole job is to make the WRONG decision succeed.  siphon's §18.1.1 re-probe
+  only switches an over-MTU B-leg to TCP if a TCP listener actually answers, so
+  without something listening here a mis-probed B-leg would quietly stay on UDP
+  and land at the right place anyway, hiding the bug.  With this listener up, a
+  re-probe that resolves the Contact instead of the route set delivers the B-leg
+  here — where nothing answers it, so the caller never sees a 200 and this
+  container's log carries the INVITE that should have gone to the edge.
+
+  Run: sipp -sf b2bua_path_decoy_tcp_uas.xml -t t1 -p 5060
+-->
+<scenario name="B2BUA Path decoy (TCP, answers nothing)">
+
+  <!-- Deliberately no response: being reached at all is the failure. -->
+  <recv request="INVITE" />
+
+  <pause milliseconds="20000" />
+
+</scenario>

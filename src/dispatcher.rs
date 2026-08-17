@@ -6397,6 +6397,29 @@ fn resolve_tcp_path(
     reachable.then_some(candidate)
 }
 
+/// Whether a B-leg INVITE routes over the binding's captured inbound flow, or
+/// is freshly resolved because it has a Path route set to follow.
+///
+/// A Path route set wins — the same precedence `relay_fork_branch` applies on the
+/// proxy path, and the reason is RFC 3327 §5.3: the Path *is* the route set for
+/// terminating requests to that binding, an explicit statement by the edge proxy
+/// that MT traffic comes back through it carrying its per-registration token.
+/// Routing over the flow instead reaches whatever address the REGISTER happened
+/// to arrive from and drops that statement on the floor — and since
+/// `registrar.lookup()` marks a binding this process accepted as `is_local`, its
+/// flow is surfaced, so flow-first would mean a single siphon acting as both
+/// registrar and B2BUA never honoured a Path at all.
+///
+/// A binding with **no** Path still routes over its flow, which is what keeps
+/// connection reuse (RFC 5626 §5.3, mandatory for a WebSocket callee per RFC
+/// 7118 §5) working for a UE that registered directly.
+fn b_leg_flow<'a>(
+    flow: Option<&'a crate::script::api::registrar::PyFlow>,
+    b_leg_route: &[String],
+) -> Option<&'a crate::script::api::registrar::PyFlow> {
+    flow.filter(|_| b_leg_route.is_empty())
+}
+
 /// Which URI a B-leg INVITE's wire destination is resolved from.
 ///
 /// Precedence, highest first:
@@ -11963,6 +11986,11 @@ fn b2bua_send_b_leg_invite(
     extra_headers: &[(String, String)],
     state: &DispatcherState,
 ) {
+    // Shadowed rather than branched so every flow-derived decision below — MTU
+    // bias, egress pin, Via sent-by, Contact, leg connection id — treats a
+    // Path-routed B-leg as the freshly-resolved leg it now is.
+    let flow = b_leg_flow(flow, b_leg_route);
+
     // RFC 3261 §16.6 step 6: with a route set and no explicit next-hop, the
     // request goes to the topmost Route — not to the Request-URI.  Without this
     // the B-leg carried the Route header but was still *sent* to the target URI,
@@ -21908,6 +21936,32 @@ a=rtpmap:8 PCMA/8000\r\n";
             mtu_tcp_upgrade(Some(1280), Transport::Udp, 1300, &dest.to_string(), dest, &resolver),
             None,
         );
+    }
+
+    #[test]
+    fn b_leg_flow_yields_to_a_path_route_set() {
+        // A binding registered directly keeps connection reuse; a binding
+        // registered through an edge proxy is routed by its Path instead, or a
+        // single siphon that is both registrar and B2BUA would never honour one
+        // (its own bindings are is_local, so their flow is always surfaced).
+        let flow = crate::script::api::registrar::PyFlow {
+            transport: "wss".to_string(),
+            source_addr: "10.0.0.1:50000".parse().unwrap(),
+            local_addr: "127.0.0.1:443".parse().unwrap(),
+            connection_id: 0xc0ffee,
+        };
+        let route = vec!["<sip:TOKEN-A@edge.example.com;lr>".to_string()];
+
+        assert!(
+            b_leg_flow(Some(&flow), &[]).is_some(),
+            "no Path — the captured flow still routes the B-leg (RFC 5626 §5.3)"
+        );
+        assert!(
+            b_leg_flow(Some(&flow), &route).is_none(),
+            "a Path route set outranks the flow (RFC 3327 §5.3)"
+        );
+        assert!(b_leg_flow(None, &[]).is_none());
+        assert!(b_leg_flow(None, &route).is_none());
     }
 
     #[test]

@@ -3599,6 +3599,436 @@ services:
     profiles:
       - transport-error
 
+  # ── B2BUA: routing a binding through its RFC 3327 Path ──────────────────────
+  # The B2BUA builds a FRESH B-leg INVITE, so none of the proxy-side Path work
+  # applies to it.  Every scenario registers a binding whose Contact is somewhere
+  # the call cannot be completed (172.20.0.200 — in-subnet, no container, so a
+  # UDP send there is silently dropped exactly like a NATed or `.invalid`
+  # contact), and points the Path at a live edge.  A B-leg that arrives at the
+  # edge therefore proves it was routed by the route set, not the Contact URI.
+  #
+  #  1. bob      — parallel call.fork() over ONE binding.  Edge .84 answers 200.
+  #  2. bobseq   — sequential call.fork() over TWO bindings with different Path
+  #                tokens.  Edge .85 answers 404 (its binding is gone), so the
+  #                second branch must be routed by binding B's OWN Path and
+  #                reach edge .86.
+  #  3. bobdial  — call.dial(uri, route=contact.path).  `route=` predates this
+  #                fixture but only ever set the header.
+  #  4. bobmtu   — parallel fork driven by an over-MTU INVITE, with the Contact
+  #                host a resolvable DNS name (the decoy) holding a live TCP
+  #                listener.  The §18.1.1 UDP→TCP re-probe must follow the same
+  #                URI the destination came from; probing the Contact resolves
+  #                the decoy and lands the B-leg there instead of the edge.
+  #
+  # Driver: scripts/b2bua_path_test.sh
+
+  siphon-b2bua-path:
+    image: sipp-siphon
+    build:
+      context: ..
+    container_name: siphon-b2bua-path
+    volumes:
+      - ./configs/siphon.b2bua-path-test.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.15
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - b2bua-path
+
+  # ── The registering UEs.  Each exits after its one REGISTER (-m 1), which is
+  # also why the Contact must not be the sender's own address: these processes
+  # are gone by the time the call arrives.
+
+  # 1. bob — one binding, Path -> edge .84.
+  sipp-b2bua-path-register-bob:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-path:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.17
+    entrypoint:
+      - sipp
+      - "172.20.0.15:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_path_register.xml
+      - -s
+      - bob
+      - -key
+      - regcontact
+      - "sip:bob@172.20.0.200:5060"
+      - -key
+      - regpath
+      - "<sip:token-bob@172.20.0.84:5060;lr>"
+      - -key
+      - regq
+      - "1.0"
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+      - -trace_err
+    profiles:
+      - b2bua-path
+
+  # 2a. bobseq binding A — Path -> edge .85 (answers 404), q=1.0 so the
+  #     sequential fork tries it first.
+  sipp-b2bua-path-register-seq-a:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-path:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.18
+    entrypoint:
+      - sipp
+      - "172.20.0.15:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_path_register.xml
+      - -s
+      - bobseq
+      - -key
+      - regcontact
+      - "sip:bobseq@172.20.0.200:5060"
+      - -key
+      - regpath
+      - "<sip:token-seq-a@172.20.0.85:5060;lr>"
+      - -key
+      - regq
+      - "1.0"
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+      - -trace_err
+    profiles:
+      - b2bua-path
+
+  # 2b. bobseq binding B — Path -> edge .86 (answers 200), q=0.5 so it is the
+  #     failover branch, not the first one tried.
+  sipp-b2bua-path-register-seq-b:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-path:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.19
+    entrypoint:
+      - sipp
+      - "172.20.0.15:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_path_register.xml
+      - -s
+      - bobseq
+      - -key
+      - regcontact
+      - "sip:bobseq@172.20.0.201:5060"
+      - -key
+      - regpath
+      - "<sip:token-seq-b@172.20.0.86:5060;lr>"
+      - -key
+      - regq
+      - "0.5"
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+      - -trace_err
+    profiles:
+      - b2bua-path
+
+  # 3. bobdial — one binding, Path -> edge .84, dialled via call.dial(route=…).
+  sipp-b2bua-path-register-dial:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-path:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.38
+    entrypoint:
+      - sipp
+      - "172.20.0.15:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_path_register.xml
+      - -s
+      - bobdial
+      - -key
+      - regcontact
+      - "sip:bobdial@172.20.0.200:5060"
+      - -key
+      - regpath
+      - "<sip:token-dial@172.20.0.84:5060;lr>"
+      - -key
+      - regq
+      - "1.0"
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+      - -trace_err
+    profiles:
+      - b2bua-path
+
+  # 4. bobmtu — Contact host is the decoy's DNS NAME (resolvable, and holding a
+  #    live TCP listener), Path -> the UDP-only edge .84.  This is the pair the
+  #    §18.1.1 re-probe can get wrong: resolving the Contact finds a TCP path and
+  #    replaces the destination, resolving the Route does not.
+  sipp-b2bua-path-register-mtu:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua-path:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.48
+    entrypoint:
+      - sipp
+      - "172.20.0.15:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_path_register.xml
+      - -s
+      - bobmtu
+      - -key
+      - regcontact
+      - "sip:bobmtu@sipp-b2bua-path-decoy:5060"
+      - -key
+      - regpath
+      - "<sip:token-mtu@172.20.0.84:5060;lr>"
+      - -key
+      - regq
+      - "1.0"
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+      - -trace_err
+    profiles:
+      - b2bua-path
+
+  # ── The edges.  Reusing the failover fixture's UAS scenarios: identical roles
+  # (one answers, one rejects) and the B-leg flow is the same INVITE/200/ACK/BYE.
+
+  # Answers 180 + 200 — the edge for bob, bobdial and bobmtu.  UDP only, which is
+  # what makes the MTU scenario's re-probe decision observable: there is no TCP
+  # path here, so a correctly-probed over-MTU B-leg stays on UDP and still lands.
+  sipp-b2bua-path-edge-answer:
+    image: ctaloi/sipp:latest
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.84
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/failover_answer_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-path
+
+  # bobseq binding A's edge: answers 503, this edge is out of service.
+  #
+  # 503 and not the 404 the proxy-side failover fixture uses, because the B2BUA's
+  # sequential strategy advances through the LCR route-sequence engine, and there
+  # a 404 is deliberately NOT a reroute cause (`lcr::default_reroute_causes` —
+  # definitive call outcomes are opt-in per carrier, so a 404 ends the call by
+  # design).  The claim under test is which host each branch is SENT to, so the
+  # fixture uses a default reroute cause rather than switching the policy on with
+  # an `lcr.reroute_causes` knob that could mask the routing it is meant to prove.
+  sipp-b2bua-path-edge-reject:
+    image: ctaloi/sipp:latest
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.85
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_lcr_carrier_a_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-path
+
+  # bobseq binding B's edge: reachable only if the failover branch was routed by
+  # binding B's own Path.
+  sipp-b2bua-path-edge-answer-b:
+    image: ctaloi/sipp:latest
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.86
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/failover_answer_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - b2bua-path
+
+  # The decoy: a TCP-ONLY listener at the DNS name bobmtu's Contact points at.
+  # It exists so the wrong probe SUCCEEDS — a refused connect would keep the
+  # B-leg on UDP and hide the bug.  It answers nothing, so a B-leg delivered here
+  # fails the call as well as showing up in this container's log.
+  sipp-b2bua-path-decoy:
+    image: ctaloi/sipp:latest
+    container_name: sipp-b2bua-path-decoy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.87
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_path_decoy_tcp_uas.xml
+      - -t
+      - t1
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "60"
+      - -trace_err
+    profiles:
+      - b2bua-path
+
+  # The caller.  Demands a 200 — a 404/408/503 arriving instead is the failure
+  # signal.  failover_uac.xml is reused for the three small-INVITE scenarios
+  # (-s bob | bobseq | bobdial); the MTU one needs its own padded body.
+  sipp-b2bua-path-uac:
+    image: ctaloi/sipp:latest
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.16
+    entrypoint:
+      - sipp
+      - "172.20.0.15:5060"
+      - -sf
+      - /sipp/scenarios/failover_uac.xml
+      - -s
+      - bob
+      - -m
+      - "1"
+      - -timeout
+      - "25"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-path
+
+  sipp-b2bua-path-uac-seq:
+    image: ctaloi/sipp:latest
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.56
+    entrypoint:
+      - sipp
+      - "172.20.0.15:5060"
+      - -sf
+      - /sipp/scenarios/failover_uac.xml
+      - -s
+      - bobseq
+      - -m
+      - "1"
+      - -timeout
+      - "25"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-path
+
+  sipp-b2bua-path-uac-dial:
+    image: ctaloi/sipp:latest
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.57
+    entrypoint:
+      - sipp
+      - "172.20.0.15:5060"
+      - -sf
+      - /sipp/scenarios/failover_uac.xml
+      - -s
+      - bobdial
+      - -m
+      - "1"
+      - -timeout
+      - "25"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-path
+
+  sipp-b2bua-path-uac-mtu:
+    image: ctaloi/sipp:latest
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.49
+    entrypoint:
+      - sipp
+      - "172.20.0.15:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_path_oversized_uac.xml
+      - -s
+      - bobmtu
+      - -m
+      - "1"
+      - -timeout
+      - "25"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-path
+
 # ── Network ────────────────────────────────────────────────────────────────
 networks:
   sipnet:
