@@ -39,6 +39,45 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   binary frames rather than guessing, and `stream_id` correlates the control
   event with the `start` envelope on the socket. Both take the same optional
   `call_id` / `from_tag` filters as `@rtpengine.on_dtmf`.
+- **External remote-control plane (ARI/ESL-class) — Phase 1.** An out-of-process
+  application can now drive B2BUA calls over a WebSocket, in the model Asterisk
+  has with ARI and FreeSWITCH with ESL. A Python `@b2bua.on_invite` handler hands
+  a call over with `call.handover("app")` (the ARI *Stasis* model): siphon holds
+  the INVITE transaction un-dialed and emits a
+  `StasisStart` carrying the full SIP context (real headers, source, R-URI shape,
+  body) plus a stable `{channel, call_id, sip_call_id}` id triple that joins CDR
+  and HEP with no mapping table. The app then answers / progresses / rejects /
+  hangs up / refers the call and reads-writes per-call variables over the socket;
+  each command binds to the shipped imperative B2BUA rail and returns immediately
+  (a far-end outcome — the callee answering / BYEing — arrives later as an event,
+  never as the command reply). New `control:` config block with per-app bearer
+  tokens (constant-time compared, feeding the existing auto-ban store), two
+  connection modes (a persistent inbound WebSocket listener, and outbound
+  per-call-connect where siphon dials the controller at handover — the
+  multi-pod default), exactly-one-owner dispatch with per-tenant scoping
+  (`forbidden` on a cross-app target), a bounded per-connection outbound queue
+  with per-call event/reply ordering and drop-oldest backpressure that can never
+  stall the datapath, a handoff deadline with a safe default action (`503` /
+  fallback) when no controller acts in time, and `resync` reattach after a
+  controller reconnects within the grace window. A parked call is held only by
+  the transaction layer's automatic `100 Trying` — siphon synthesizes no
+  provisional (a 180 would falsely signal ringing before anything is dialed); the
+  controller sends its own `progress` (180 ringback / 183+SDP early media) if it
+  wants one, and the real 18x relay end-to-end once the app routes.
+  Answer-first (AI-park) mode — `call.handover("ai-app", answer=True, ws_uri=…)` —
+  answers the call (`200 OK`) and anchors its media to the `voice_ai` WebSocket
+  bridge before handing over (via `answer_local` on the `siphon-rtp` backend, with
+  `ws_uri` templated per the media-profile expansion), so the app drives an
+  already-connected channel with the AI audio path open; on a backend that cannot
+  do it (anything but siphon-rtp) the handover fails visibly (`503`), never a fake
+  200. First-class adapter API
+  (`ControlAdapter` trait + `SiphonServer::register_control_adapter`) with an
+  opaque JSON DTO seam, so a protocol extension registers its own control surface
+  over the same rail; the built-in SIP adapter ships in core. Prometheus metrics
+  `siphon_control_connections`, `siphon_control_controlled_calls`,
+  `siphon_control_commands_total`, `siphon_control_events_dropped_total`,
+  `siphon_control_auth_failures_total` and `siphon_control_handoff_timeouts_total`.
+  SDK: `call.handover(app, on_lost=, deadline_ms=, vars=)`.
 - **Media profiles can drive the `siphon-rtp` WebSocket audio bridge and its DSP
   chain.** The engine has supported handing a leg's audio to an external
   WebSocket media server (decode → L16 uplink, L16 downlink → encode, the WS

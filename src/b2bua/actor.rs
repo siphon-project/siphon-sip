@@ -841,6 +841,21 @@ pub struct CallActor {
     /// Sequential-failover (LCR / `fork(strategy="sequential")`) state. `None`
     /// for a plain single dial or a parallel fork. See [`RouteSequenceState`].
     pub route_sequence: Option<RouteSequenceState>,
+    /// The external control app this call was handed over to
+    /// (`call.handover("app")`), if any. When `Some`, the call is *parked under
+    /// control*: siphon holds the INVITE transaction un-dialed while the
+    /// out-of-process app decides, and the answer-deadline sweep applies the
+    /// handoff default action (not the 408 path) if the app never acts.
+    pub control_app: Option<String>,
+    /// Control-loss policy for a handed-over call ("hangup"/"continue"/
+    /// "fallback"). Owned by the control plane on owner disconnect; stored here
+    /// for observability.
+    pub on_control_loss: Option<String>,
+    /// True while a handed-over call is still awaiting the controller's first
+    /// action. The answer-deadline sweep reads this to apply the handoff default
+    /// instead of the 408 timeout teardown. Cleared once the controller acts
+    /// (answer/progress transitions the state) or the call is torn down.
+    pub handoff_pending: bool,
 }
 
 impl CallActor {
@@ -877,7 +892,17 @@ impl CallActor {
             answer_deadline: None,
             auth_passthrough: false,
             route_sequence: None,
+            control_app: None,
+            on_control_loss: None,
+            handoff_pending: false,
         }
+    }
+
+    /// Whether this call is parked under external control awaiting the
+    /// controller's first action (the answer-deadline sweep uses this to apply
+    /// the handoff default rather than the 408 teardown).
+    pub fn is_handoff_pending(&self) -> bool {
+        self.control_app.is_some() && self.handoff_pending
     }
 
     /// Pop the next carrier from the failover queue, mark it active, and return
@@ -2164,6 +2189,34 @@ impl CallActorStore {
     pub fn set_answer_deadline(&self, call_id: &str, deadline: std::time::Instant) {
         if let Some(mut call) = self.calls.get_mut(call_id) {
             call.answer_deadline = Some(deadline);
+        }
+    }
+
+    /// Mark a call parked under external control (`call.handover("app")`).
+    /// Sets the control app + control-loss policy and flags the call as awaiting
+    /// the controller's first action.
+    pub fn set_control_owner(&self, call_id: &str, app: &str, on_control_loss: Option<&str>) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.control_app = Some(app.to_string());
+            call.on_control_loss = on_control_loss.map(String::from);
+            call.handoff_pending = true;
+        }
+    }
+
+    /// The control app owning a call, if any (cloned).
+    pub fn control_app(&self, call_id: &str) -> Option<String> {
+        self.calls.get(call_id).and_then(|call| call.control_app.clone())
+    }
+
+    /// Record that the controlling app has acted on a parked call: clear the
+    /// handoff deadline so the sweep no longer applies the default action, and
+    /// clear the pending flag. Idempotent.
+    pub fn mark_controller_acted(&self, call_id: &str) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            if call.control_app.is_some() {
+                call.handoff_pending = false;
+                call.answer_deadline = None;
+            }
         }
     }
 

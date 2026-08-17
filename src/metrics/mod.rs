@@ -253,6 +253,22 @@ pub struct SiphonMetrics {
     /// Number of arenas (heaps). Each is a ~64 MB reservation; a rising count
     /// is per-thread-arena proliferation under free-threaded concurrency.
     pub glibc_arena_count: IntGauge,
+
+    // --- External remote-control plane ---
+    /// Live control-plane connections per app (drains to 0 on disconnect).
+    pub control_connections: IntGaugeVec,
+    /// Live controlled calls (handed over, not yet ended) per app — a
+    /// drain-to-zero gauge, the control-plane analogue of proxy_dialog_sessions.
+    pub control_controlled_calls: IntGaugeVec,
+    /// Commands applied, by app + verb.
+    pub control_commands_total: IntCounterVec,
+    /// Events dropped by slow-consumer backpressure, by app.
+    pub control_events_dropped_total: IntCounterVec,
+    /// Control-plane auth failures (bad/missing token on the upgrade).
+    pub control_auth_failures_total: IntCounter,
+    /// Handoff deadlines that fired (no controller accepted + acted in time),
+    /// by app.
+    pub control_handoff_timeouts_total: IntCounterVec,
 }
 
 impl SiphonMetrics {
@@ -533,7 +549,47 @@ impl SiphonMetrics {
             "Number of glibc malloc arenas (each a ~64 MB reservation; rises with per-thread contention)",
         )?;
 
+        let control_connections = IntGaugeVec::new(
+            Opts::new("siphon_control_connections", "Live control-plane connections per app"),
+            &["app"],
+        )?;
+        let control_controlled_calls = IntGaugeVec::new(
+            Opts::new(
+                "siphon_control_controlled_calls",
+                "Live controlled calls per app (handed over, not yet ended)",
+            ),
+            &["app"],
+        )?;
+        let control_commands_total = IntCounterVec::new(
+            Opts::new("siphon_control_commands_total", "Control-plane commands applied"),
+            &["app", "verb"],
+        )?;
+        let control_events_dropped_total = IntCounterVec::new(
+            Opts::new(
+                "siphon_control_events_dropped_total",
+                "Control-plane events dropped by slow-consumer backpressure",
+            ),
+            &["app"],
+        )?;
+        let control_auth_failures_total = IntCounter::new(
+            "siphon_control_auth_failures_total",
+            "Control-plane auth failures (bad/missing token on the upgrade)",
+        )?;
+        let control_handoff_timeouts_total = IntCounterVec::new(
+            Opts::new(
+                "siphon_control_handoff_timeouts_total",
+                "Control-plane handoff deadlines that fired (no controller acted in time)",
+            ),
+            &["app"],
+        )?;
+
         // Register all metrics
+        registry.register(Box::new(control_connections.clone()))?;
+        registry.register(Box::new(control_controlled_calls.clone()))?;
+        registry.register(Box::new(control_commands_total.clone()))?;
+        registry.register(Box::new(control_events_dropped_total.clone()))?;
+        registry.register(Box::new(control_auth_failures_total.clone()))?;
+        registry.register(Box::new(control_handoff_timeouts_total.clone()))?;
         registry.register(Box::new(requests_total.clone()))?;
         registry.register(Box::new(responses_total.clone()))?;
         registry.register(Box::new(transactions_active.clone()))?;
@@ -645,6 +701,12 @@ impl SiphonMetrics {
             glibc_free_bytes,
             glibc_mmap_bytes,
             glibc_arena_count,
+            control_connections,
+            control_controlled_calls,
+            control_commands_total,
+            control_events_dropped_total,
+            control_auth_failures_total,
+            control_handoff_timeouts_total,
         })
     }
 }
