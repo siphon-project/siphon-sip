@@ -3,6 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
+  "license": "MIT",
   "description": "Example external control application for the siphon control plane (uses the @siphon/control SDK)",
   "scripts": {
     "start": "tsx control_client.ts",
