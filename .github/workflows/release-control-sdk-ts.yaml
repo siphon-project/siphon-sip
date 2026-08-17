@@ -1,0 +1,52 @@
+name: release-control-sdk-ts
+
+# Publishes the TypeScript control-plane SDK (@siphon/control) to npm.
+#
+# The TS SDK is versioned independently of the siphon-sip crate (tied to the
+# control protocol, matching the Rust/Python SDKs), so it has its own tag prefix
+# `control-sdk-v*` and its own workflow. A `workflow_dispatch` run builds + tests
+# without publishing (dry run); only a `control-sdk-v*` tag publishes.
+
+on:
+  push:
+    tags:
+      - "control-sdk-v*"
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: siphon-control-sdk/typescript
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC for npm Trusted Publishing (no stored NPM_TOKEN)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      # npm OIDC Trusted Publishing needs npm >= 11.5.1 (newer than the version
+      # bundled with the runner); provenance is minted from the id-token below.
+      - name: Upgrade npm (Trusted Publishing support)
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      # Publish only on a real tag — a manual workflow_dispatch run stops after
+      # the build + test dry run above.
+      - name: Publish to npm (Trusted Publishing — OIDC, no token)
+        if: startsWith(github.ref, 'refs/tags/control-sdk-v')
+        run: npm publish --provenance --access public
