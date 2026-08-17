@@ -50,6 +50,7 @@ from siphon import timer, metrics, sdp, sbi, ipsec, rtpengine, isc
 | [Diameter](diameter.md) | Cx / Rx / Sh / Rf interfaces and inbound-request handling |
 | [IMS control](ims.md) | iFC evaluation, SBI/N5, presence, lawful intercept, SRS |
 | [Observability](observability.md) | Logging, cache, CDR, custom metrics, timers |
+| [Control plane (remote SDKs)](control-plane.md) | Driving handed-over calls from an out-of-process app (`pip install siphon-control`, `cargo add siphon-control-client`) |
 | [Testing harness](testing.md) | The pytest harness and its result objects |
 
 !!! note "Extension namespaces"

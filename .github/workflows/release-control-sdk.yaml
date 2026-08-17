@@ -1,0 +1,196 @@
+# .github/workflows/release-control-sdk.yaml — Build + publish the external
+# control-plane SDKs on their OWN tag train, independent of siphon core.
+#
+# The SDKs live in the standalone excluded workspace `siphon-control-sdk/`
+# (crates siphon-control-proto + siphon-control-client, and the PyO3
+# `siphon-control` Python package). They version independently of the siphon
+# server — tied to the `siphon-control.v1` protocol — so they release on a
+# `control-sdk-vX.Y.Z` tag rather than the core `vX.Y.Z` tag that
+# release.yaml watches.
+#
+# Publishing uses the same OIDC Trusted Publishing as release.yaml: no stored
+# tokens — `pypa/gh-action-pypi-publish` mints PyPI's, `rust-lang/crates-io-auth-action`
+# mints crates.io's. `siphon-control` is a NATIVE extension (PyO3), so wheels
+# are built with maturin, per-interpreter: cp314 (GIL) AND cp314t
+# (free-threaded) are separate ABIs — the SIPhon runtime is free-threaded, so
+# both ship. There is no abi3 for free-threaded builds, hence version-tagged
+# wheels, one per interpreter.
+name: Release control SDK
+
+on:
+  push:
+    tags: ["control-sdk-v*"]
+  # Manual dry-run: builds every wheel + the sdist so cp314t coverage can be
+  # confirmed off a branch. The publish jobs are tag-gated and stay skipped.
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Native extension: build the wheel against the crate's own manifest.
+  MANIFEST: siphon-control-sdk/siphon-control/Cargo.toml
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Version gate ───────────────────────────────────────────────────────
+  # The tag is the single source of truth. The three crates share the
+  # siphon-control-sdk workspace version; the wheel derives its version from
+  # that crate (maturin, `dynamic = ["version"]`). Refuse to publish if the
+  # in-tree version disagrees with the tag. Skipped on workflow_dispatch, which
+  # gates the publish jobs off too (a dry-run never publishes).
+  verify-version:
+    if: startsWith(github.ref, 'refs/tags/control-sdk-v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: siphon-control-sdk version must equal the tag
+        run: |
+          tag_version="${GITHUB_REF_NAME#control-sdk-v}"
+          cargo_version="$(grep -m1 '^version = ' siphon-control-sdk/Cargo.toml | sed -E 's/^version = "(.*)"/\1/')"
+          echo "tag=$tag_version cargo=$cargo_version"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::siphon-control-sdk/Cargo.toml version ($cargo_version) does not match tag ($tag_version) — bump [workspace.package] version in the release commit."
+            exit 1
+          fi
+
+  # ── Build manylinux wheels (cp314 + cp314t) ────────────────────────────
+  # maturin-action runs these inside the pyo3/maturin manylinux container, so
+  # the interpreters come from the container's /opt/python, NOT from the host.
+  # The free-threaded build (cp314t) is a distinct ABI → a distinct wheel,
+  # built against the `python3.14t` interpreter.
+  wheels-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    target: x86_64,  pyver: "3.14",  abi: cp314,  interpreter: /opt/python/cp314-cp314/bin/python3.14 }
+          - { os: ubuntu-latest,    target: x86_64,  pyver: "3.14t", abi: cp314t, interpreter: /opt/python/cp314-cp314t/bin/python3.14t }
+          - { os: ubuntu-24.04-arm, target: aarch64, pyver: "3.14",  abi: cp314,  interpreter: /opt/python/cp314-cp314/bin/python3.14 }
+          - { os: ubuntu-24.04-arm, target: aarch64, pyver: "3.14t", abi: cp314t, interpreter: /opt/python/cp314-cp314t/bin/python3.14t }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build wheel (${{ matrix.target }} / ${{ matrix.abi }})
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: auto
+          args: >-
+            --release
+            --out dist
+            --manifest-path ${{ env.MANIFEST }}
+            --interpreter ${{ matrix.interpreter }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-linux-${{ matrix.target }}-${{ matrix.abi }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # ── Build macOS + Windows wheels (cp314 + cp314t) ──────────────────────
+  # No manylinux container here — the interpreter comes from setup-python,
+  # which installs the free-threaded build for a `3.14t` request and exposes
+  # its absolute path. Feeding that exact path to maturin keeps the GIL and
+  # free-threaded rows building against the right interpreter.
+  wheels-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,       target: aarch64, pyver: "3.14",  abi: cp314 }
+          - { os: macos-14,       target: aarch64, pyver: "3.14t", abi: cp314t }
+          - { os: macos-13,       target: x86_64,  pyver: "3.14",  abi: cp314 }
+          - { os: macos-13,       target: x86_64,  pyver: "3.14t", abi: cp314t }
+          - { os: windows-latest, target: x64,     pyver: "3.14",  abi: cp314 }
+          - { os: windows-latest, target: x64,     pyver: "3.14t", abi: cp314t }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        id: py
+        with:
+          python-version: ${{ matrix.pyver }}
+      - name: Build wheel (${{ matrix.os }} / ${{ matrix.target }} / ${{ matrix.abi }})
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: >-
+            --release
+            --out dist
+            --manifest-path ${{ env.MANIFEST }}
+            --interpreter ${{ steps.py.outputs.python-path }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}-${{ matrix.abi }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # ── Source distribution ────────────────────────────────────────────────
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: >-
+            --out dist
+            --manifest-path ${{ env.MANIFEST }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: wheels-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # ── Publish siphon-control to PyPI (Trusted Publishing — OIDC, no token) ─
+  # Tag-gated: never runs on a workflow_dispatch dry-run (verify-version is
+  # skipped there, which skips this job too).
+  pypi:
+    if: startsWith(github.ref, 'refs/tags/control-sdk-v')
+    needs: [verify-version, wheels-linux, wheels-native, sdist]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # OIDC for PyPI Trusted Publishing
+    steps:
+      - name: Gather every wheel + the sdist
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: wheels-*
+          merge-multiple: true
+      - name: Publish to PyPI (Trusted Publishing — OIDC, no token)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  # ── Publish crates to crates.io (Trusted Publishing — OIDC, no token) ───
+  # Dependency order: siphon-control-proto first, then siphon-control-client
+  # (which depends on it). cargo publish (>=1.66) blocks until the crate is in
+  # the index, so the client's verification build can resolve proto from the
+  # registry with no manual sleep. The Python `siphon-control` crate is a
+  # cdylib extension module and is NOT published to crates.io — it ships as a
+  # wheel to PyPI.
+  crates-io:
+    if: startsWith(github.ref, 'refs/tags/control-sdk-v')
+    needs: [verify-version, wheels-linux, wheels-native, sdist]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # mint a short-lived crates.io token via GitHub OIDC
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: siphon-control-sdk
+      - name: Authenticate to crates.io (OIDC Trusted Publishing)
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - name: Publish siphon-control-proto
+        run: cargo publish -p siphon-control-proto --manifest-path siphon-control-sdk/Cargo.toml
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - name: Publish siphon-control-client
+        run: cargo publish -p siphon-control-client --manifest-path siphon-control-sdk/Cargo.toml
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

@@ -1,10 +1,22 @@
-# Remote-control client examples
+# Remote-control client examples (low-level protocol reference)
+
+> **Building a real controller? Use the SDKs, not this.** The supported way to
+> drive handed-over calls is the client SDKs, which hide the wire (no manual
+> JSON, no request-id bookkeeping, no reconnect loop):
+>
+> - Python: `pip install siphon-control`
+> - Rust: `cargo add siphon-control-client`
+>
+> See the [control-plane reference](https://siphon-sip.org/reference/control-plane/)
+> and [`siphon-control-sdk/`](../../siphon-control-sdk/). The two clients below
+> are a **hand-rolled `siphon-control.v1` reference** — read them to build a
+> client in a language the SDKs don't cover, or to understand the wire.
 
 Two small external applications — one Python, one TypeScript — that drive live
-calls over siphon's control WebSocket (ARI/ESL-class). A B2BUA script hands a
-call over with `call.handover("ivr-app")` (the ARI *Stasis* model); the
-out-of-process app then answers, sets a per-call variable, holds briefly, and
-hangs up. Calls that are not handed over are unaffected.
+calls over siphon's control WebSocket (ARI/ESL-class) **without an SDK**. A
+B2BUA script hands a call over with `call.handover("ivr-app")` (the ARI *Stasis*
+model); the out-of-process app then answers, sets a per-call variable, holds
+briefly, and hangs up. Calls that are not handed over are unaffected.
 
 Both clients support **both connection modes** and default to
 **outbound per-call-connect**.

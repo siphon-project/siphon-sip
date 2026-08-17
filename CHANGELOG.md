@@ -78,6 +78,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `siphon_control_commands_total`, `siphon_control_events_dropped_total`,
   `siphon_control_auth_failures_total` and `siphon_control_handoff_timeouts_total`.
   SDK: `call.handover(app, on_lost=, deadline_ms=, vars=)`.
+- **Control-plane client SDKs are the official interop path**, now installable:
+  `pip install siphon-control` (Python) and `cargo add siphon-control-client`
+  (Rust) hide the `siphon-control.v1` wire so a controller is written with
+  `@client.on_call` / `await call.answer()` instead of hand-rolled JSON. They
+  version independently of siphon core against the protocol and ship on their own
+  `control-sdk-v*` release train (PyPI + crates.io via OIDC Trusted Publishing).
+  The raw JSON protocol is now framed as the under-the-hood reference for
+  building a client in another language. See the
+  [control-plane reference](https://siphon-sip.org/reference/control-plane/).
 - **Media profiles can drive the `siphon-rtp` WebSocket audio bridge and its DSP
   chain.** The engine has supported handing a leg's audio to an external
   WebSocket media server (decode → L16 uplink, L16 downlink → encode, the WS

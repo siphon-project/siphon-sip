@@ -75,6 +75,7 @@ nav:
       - Diameter: reference/diameter.md
       - IMS control: reference/ims.md
       - Observability: reference/observability.md
+      - Control plane (remote SDKs): reference/control-plane.md
       - Testing harness: reference/testing.md
   - Running in production:
       - Transports & networking: transports.md
