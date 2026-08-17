@@ -3,17 +3,16 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Example external control application for the siphon control plane",
+  "description": "Example external control application for the siphon control plane (uses the @siphon/control SDK)",
   "scripts": {
     "start": "tsx control_client.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "@siphon/control": "file:../../siphon-control-sdk/typescript"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "@types/ws": "^8.5.12",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
   }
