@@ -1,0 +1,481 @@
+//! Python bindings (PyO3) for the SIPhon external control plane.
+//!
+//! Wraps [`siphon_control_client`]. Async methods return Python awaitables via
+//! `pyo3-async-runtimes`, so a control app reads like idiomatic asyncio:
+//!
+//! ```python
+//! from siphon_control import ControlClient
+//!
+//! client = ControlClient(app="ivr-app", token="s3cr3t",
+//!                        url="ws://siphon:9090/control/ws")
+//!
+//! @client.on_call
+//! async def handle(call):
+//!     await call.answer()
+//!     await call.transfer("sip:agent@pbx")   # raises ControlError on a typed error
+//!
+//! await client.run()
+//! ```
+//!
+//! The layering mirrors the Rust crate: `ControlClient.command(...)` is the
+//! generic `{module, verb, target, args}` primitive for any adapter, and the
+//! `on_call` decorator + `Call` verbs are the SIP facade on top.
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use pyo3::exceptions::{PyException, PyValueError};
+use pyo3::prelude::*;
+use pyo3::types::PyList;
+use pyo3_async_runtimes::TaskLocals;
+
+use siphon_control_client::proto::ControlErrorCode;
+use siphon_control_client::sip::{Call as RustCall, SipClient};
+use siphon_control_client::{ClientConfig, ControlError as ClientError};
+
+pyo3::create_exception!(
+    siphon_control,
+    ControlError,
+    PyException,
+    "Raised when a control command is rejected (carrying a stable `.code`) or the connection fails."
+);
+
+// ---------------------------------------------------------------------------
+// JSON <-> Python conversion (via the stdlib `json` module — robust + dep-free)
+// ---------------------------------------------------------------------------
+
+fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
+    let text =
+        serde_json::to_string(value).map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let json = py.import("json")?;
+    Ok(json.call_method1("loads", (text,))?.unbind())
+}
+
+fn py_to_json(object: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
+    if object.is_none() {
+        return Ok(serde_json::Value::Null);
+    }
+    let json = object.py().import("json")?;
+    let text: String = json.call_method1("dumps", (object,))?.extract()?;
+    serde_json::from_str(&text).map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
+fn optional_json(object: Option<Bound<'_, PyAny>>) -> PyResult<serde_json::Value> {
+    match object {
+        Some(object) => py_to_json(&object),
+        None => Ok(serde_json::Value::Null),
+    }
+}
+
+fn code_to_str(code: ControlErrorCode) -> Option<String> {
+    serde_json::to_value(code)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+}
+
+/// Map a client error to the Python `ControlError` exception, attaching `.code`.
+fn to_pyerr(error: ClientError) -> PyErr {
+    let code = error.code().and_then(code_to_str);
+    let message = error.to_string();
+    Python::attach(|py| {
+        let err = ControlError::new_err(message);
+        let _ = err.value(py).setattr("code", code);
+        err
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Call pyclass
+// ---------------------------------------------------------------------------
+
+/// A handed-over SIP call. Async methods return awaitables.
+#[pyclass(module = "siphon_control", name = "Call")]
+struct Call {
+    inner: RustCall,
+}
+
+#[pymethods]
+impl Call {
+    #[getter]
+    fn channel_id(&self) -> String {
+        self.inner.channel_id().to_string()
+    }
+
+    #[getter]
+    fn call_id(&self) -> Option<String> {
+        self.inner.call_id().map(str::to_string)
+    }
+
+    #[getter]
+    fn sip_call_id(&self) -> Option<String> {
+        self.inner.sip_call_id().map(str::to_string)
+    }
+
+    #[getter]
+    fn app(&self) -> Option<String> {
+        self.inner.app().map(str::to_string)
+    }
+
+    #[getter]
+    fn is_reattached(&self) -> bool {
+        self.inner.is_reattached()
+    }
+
+    #[getter]
+    fn payload(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        json_to_py(py, self.inner.payload())
+    }
+
+    fn answer<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.answer().await.map_err(to_pyerr)
+        })
+    }
+
+    #[pyo3(signature = (code, reason=None, body=None, content_type=None))]
+    fn answer_with<'py>(
+        &self,
+        py: Python<'py>,
+        code: u16,
+        reason: Option<String>,
+        body: Option<String>,
+        content_type: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.answer_with(code, reason.as_deref(), body.as_deref(), content_type.as_deref())
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    fn progress<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.progress().await.map_err(to_pyerr)
+        })
+    }
+
+    #[pyo3(signature = (code, reason=None))]
+    fn reject<'py>(
+        &self,
+        py: Python<'py>,
+        code: u16,
+        reason: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.reject(code, reason.as_deref()).await.map_err(to_pyerr)
+        })
+    }
+
+    #[pyo3(signature = (reason=None))]
+    fn hangup<'py>(&self, py: Python<'py>, reason: Option<String>) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match reason {
+                Some(reason) => call.hangup_with_reason(&reason).await,
+                None => call.hangup().await,
+            }
+            .map_err(to_pyerr)
+        })
+    }
+
+    fn refer<'py>(&self, py: Python<'py>, to: String) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.refer(&to).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Blind-transfer alias for `refer`.
+    fn transfer<'py>(&self, py: Python<'py>, to: String) -> PyResult<Bound<'py, PyAny>> {
+        self.refer(py, to)
+    }
+
+    fn set_header<'py>(
+        &self,
+        py: Python<'py>,
+        name: String,
+        value: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.set_header(&name, &value).await.map_err(to_pyerr)
+        })
+    }
+
+    fn get_header<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.get_header(&name).await.map_err(to_pyerr)
+        })
+    }
+
+    fn set_var<'py>(
+        &self,
+        py: Python<'py>,
+        key: String,
+        value: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.set_var(&key, &value).await.map_err(to_pyerr)
+        })
+    }
+
+    fn get_var<'py>(&self, py: Python<'py>, key: String) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.get_var(&key).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Play an announcement — raises `ControlError` (`code == "unsupported_verb"`)
+    /// until the server implements media.
+    fn play_file<'py>(&self, py: Python<'py>, file: String) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.play_file(&file).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Send DTMF — raises `ControlError` (`code == "unsupported_verb"`) today.
+    fn dtmf<'py>(&self, py: Python<'py>, digits: String) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.dtmf(&digits).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Send an arbitrary SIP verb + args, returning the reply `result` object.
+    #[pyo3(signature = (verb, args=None))]
+    fn command<'py>(
+        &self,
+        py: Python<'py>,
+        verb: String,
+        args: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        let args = optional_json(args)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let value = call.command(&verb, args).await.map_err(to_pyerr)?;
+            Python::attach(|py| json_to_py(py, &value))
+        })
+    }
+
+    /// Await the next event for this call — a dict `{kind, payload}` or `None`.
+    fn next_event<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match call.next_event().await {
+                Some(event) => Python::attach(|py| {
+                    let dict = pyo3::types::PyDict::new(py);
+                    dict.set_item("kind", event.kind.as_str())?;
+                    dict.set_item("payload", json_to_py(py, &event.payload)?)?;
+                    Ok(dict.into_any().unbind())
+                }),
+                None => Ok(Python::attach(|py| py.None())),
+            }
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Call(channel_id={:?}, sip_call_id={:?}, reattached={})",
+            self.inner.channel_id(),
+            self.inner.sip_call_id(),
+            self.inner.is_reattached()
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ControlClient pyclass
+// ---------------------------------------------------------------------------
+
+struct ClientInner {
+    config: ClientConfig,
+    client: tokio::sync::Mutex<Option<Arc<SipClient>>>,
+    handler: Mutex<Option<Py<PyAny>>>,
+}
+
+/// The control client. Construct it, register a handler with `@client.on_call`,
+/// then `await client.run()`.
+#[pyclass(module = "siphon_control", name = "ControlClient")]
+struct ControlClient {
+    inner: Arc<ClientInner>,
+}
+
+#[pymethods]
+impl ControlClient {
+    #[new]
+    #[pyo3(signature = (app, token, url=None, protocol=1, reply_timeout_ms=10_000, reconnect_backoff_ms=1_000))]
+    fn new(
+        app: String,
+        token: String,
+        url: Option<String>,
+        protocol: u32,
+        reply_timeout_ms: u64,
+        reconnect_backoff_ms: u64,
+    ) -> Self {
+        let url = url.unwrap_or_else(|| "ws://127.0.0.1:9090/control/ws".to_string());
+        let mut config = ClientConfig::new(url, app, token);
+        config.protocol = protocol;
+        config.reply_timeout = Duration::from_millis(reply_timeout_ms);
+        config.reconnect_backoff = Duration::from_millis(reconnect_backoff_ms);
+        Self {
+            inner: Arc::new(ClientInner {
+                config,
+                client: tokio::sync::Mutex::new(None),
+                handler: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// Register the per-call handler. Usable as a decorator: `@client.on_call`.
+    fn on_call(&self, py: Python<'_>, handler: Py<PyAny>) -> Py<PyAny> {
+        *lock(&self.inner.handler) = Some(handler.clone_ref(py));
+        handler
+    }
+
+    /// Connect + `hello` (idempotent). Returns an awaitable resolving to `None`.
+    fn connect<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            ensure_client(&inner).await?;
+            Ok(())
+        })
+    }
+
+    /// Fetch the registered adapters' schema (`describe`).
+    fn describe<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let client = ensure_client(&inner).await?;
+            let value = client.describe().await.map_err(to_pyerr)?;
+            Python::attach(|py| json_to_py(py, &value))
+        })
+    }
+
+    /// Send a raw command on any module — the generic `{module, verb, target,
+    /// args}` primitive. Returns the reply `result` object.
+    #[pyo3(signature = (verb, module=None, target=None, args=None))]
+    fn command<'py>(
+        &self,
+        py: Python<'py>,
+        verb: String,
+        module: Option<String>,
+        target: Option<Bound<'py, PyAny>>,
+        args: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        let target = optional_json(target)?;
+        let args = optional_json(args)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let client = ensure_client(&inner).await?;
+            let value = client
+                .command(module.as_deref(), &verb, target, args)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| json_to_py(py, &value))
+        })
+    }
+
+    /// Connect (if needed), register the handler bridge, then drive the
+    /// supervised connection loop (reconnect + resync) to completion.
+    fn run<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        // Capture the running loop's task locals *now* (on the Python thread) so
+        // the handler bridge can drive Python coroutines from Rust.
+        let locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        let handler = lock(&self.inner.handler).as_ref().map(|h| h.clone_ref(py));
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let client = ensure_client(&inner).await?;
+            if let Some(handler) = handler {
+                install_handler_bridge(&client, handler, locals);
+            }
+            client.run().await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+
+    /// Stop the client and unblock `run`.
+    fn shutdown(&self) {
+        if let Ok(guard) = self.inner.client.try_lock() {
+            if let Some(client) = guard.as_ref() {
+                client.shutdown();
+            }
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Connect the underlying [`SipClient`] once, caching it.
+async fn ensure_client(inner: &Arc<ClientInner>) -> PyResult<Arc<SipClient>> {
+    let mut guard = inner.client.lock().await;
+    if let Some(client) = guard.as_ref() {
+        return Ok(Arc::clone(client));
+    }
+    let client = Arc::new(SipClient::connect(inner.config.clone()).await.map_err(to_pyerr)?);
+    *guard = Some(Arc::clone(&client));
+    Ok(client)
+}
+
+/// Bridge the Rust call handler to the stored Python coroutine function: for each
+/// handed-over call, build a `Call` pyobject, invoke the handler, and drive the
+/// returned coroutine on the asyncio loop captured in `locals`.
+fn install_handler_bridge(client: &SipClient, handler: Py<PyAny>, locals: TaskLocals) {
+    client.set_call_handler(move |call: RustCall| {
+        let handler = Python::attach(|py| handler.clone_ref(py));
+        let locals = locals.clone();
+        async move {
+            dispatch_to_python(handler, locals, call).await;
+            Ok(())
+        }
+    });
+}
+
+async fn dispatch_to_python(handler: Py<PyAny>, locals: TaskLocals, call: RustCall) {
+    let outcome = pyo3_async_runtimes::tokio::scope(locals, async move {
+        let awaitable = Python::attach(|py| -> PyResult<Option<_>> {
+            let py_call = Bound::new(py, Call { inner: call })?;
+            let result = handler.bind(py).call1((py_call,))?;
+            if result.hasattr("__await__")? {
+                Ok(Some(pyo3_async_runtimes::tokio::into_future(result)?))
+            } else {
+                Ok(None)
+            }
+        });
+        match awaitable {
+            Ok(Some(future)) => future.await.map(|_| ()),
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        }
+    })
+    .await;
+    if let Err(error) = outcome {
+        Python::attach(|py| error.print(py));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Module init
+// ---------------------------------------------------------------------------
+
+#[pymodule]
+#[pyo3(name = "siphon_control")]
+fn siphon_control(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<ControlClient>()?;
+    module.add_class::<Call>()?;
+    module.add("ControlError", module.py().get_type::<ControlError>())?;
+    module.add(
+        "__all__",
+        PyList::new(module.py(), ["ControlClient", "Call", "ControlError"])?,
+    )?;
+    Ok(())
+}
