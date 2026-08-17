@@ -1,26 +1,56 @@
 //! Python bindings (PyO3) for the SIPhon external control plane.
 //!
 //! Wraps [`siphon_control_client`]. Async methods return Python awaitables via
-//! `pyo3-async-runtimes`, so a control app reads like idiomatic asyncio:
+//! `pyo3-async-runtimes`, so a control app reads like idiomatic asyncio.
 //!
-//! ```python
-//! from siphon_control import ControlClient
+//! # Two connection modes (both exposed here)
 //!
-//! client = ControlClient(app="ivr-app", token="s3cr3t",
-//!                        url="ws://siphon:9090/control/ws")
+//! - **Inbound-persistent** — [`ControlClient`]. The app dials siphon's
+//!   `/control/ws` and keeps one long-lived socket (does the `hello`
+//!   handshake). Simplest to reason about; ideal for development and
+//!   single-process controllers.
 //!
-//! @client.on_call
-//! async def handle(call):
-//!     await call.answer()
-//!     await call.transfer("sip:agent@pbx")   # raises ControlError on a typed error
+//!   ```python
+//!   from siphon_control import ControlClient
 //!
-//! await client.run()
-//! ```
+//!   client = ControlClient(app="ivr-app", token="s3cr3t",
+//!                          url="ws://siphon:9090/control/ws")
 //!
-//! The layering mirrors the Rust crate: `ControlClient.command(...)` is the
-//! generic `{module, verb, target, args}` primitive for any adapter, and the
-//! `on_call` decorator + `Call` verbs are the SIP facade on top.
+//!   @client.on_call
+//!   async def handle(call):
+//!       await call.answer()
+//!       await call.transfer("sip:agent@pbx")   # raises ControlError on a typed error
+//!
+//!   await client.run()
+//!   ```
+//!
+//! - **Per-call-connect** — [`ControlServer`]. *siphon dials the app* at
+//!   handover, so the app is a WebSocket server; each accepted connection owns
+//!   exactly one call and the first frame is a pushed `StasisStart` (no `hello`
+//!   from the app side). This is the documented production default for
+//!   multi-pod controllers — "the audio lands on the wrong pod" is structurally
+//!   impossible when the accepting socket *is* the call.
+//!
+//!   ```python
+//!   from siphon_control import ControlServer
+//!
+//!   server = ControlServer(app="ivr-app", token="s3cr3t", bind="0.0.0.0:8790")
+//!
+//!   @server.on_call
+//!   async def handle(call):
+//!       await call.answer()
+//!       await call.transfer("sip:agent@pbx")
+//!
+//!   await server.serve()
+//!   ```
+//!
+//! Both modes reuse the SAME `@on_call` decorator and the SAME [`Call`] handle;
+//! only the transport differs (dial-out vs. be-dialed). The layering mirrors the
+//! Rust crate: `ControlClient.command(...)` is the generic `{module, verb,
+//! target, args}` primitive for any adapter, and the `on_call` decorator +
+//! `Call` verbs are the SIP facade on top.
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,8 +60,8 @@ use pyo3::types::PyList;
 use pyo3_async_runtimes::TaskLocals;
 
 use siphon_control_client::proto::ControlErrorCode;
-use siphon_control_client::sip::{Call as RustCall, SipClient};
-use siphon_control_client::{ClientConfig, ControlError as ClientError};
+use siphon_control_client::sip::{Call as RustCall, SipClient, SipServer};
+use siphon_control_client::{ClientConfig, ControlError as ClientError, ServerConfig};
 
 pyo3::create_exception!(
     siphon_control,
@@ -464,6 +494,129 @@ async fn dispatch_to_python(handler: Py<PyAny>, locals: TaskLocals, call: RustCa
 }
 
 // ---------------------------------------------------------------------------
+// ControlServer pyclass (per-call-connect mode — siphon dials the app)
+// ---------------------------------------------------------------------------
+
+struct ServerInner {
+    config: ServerConfig,
+    server: tokio::sync::Mutex<Option<Arc<SipServer>>>,
+    handler: Mutex<Option<Py<PyAny>>>,
+    local_addr: Mutex<Option<String>>,
+}
+
+/// The per-call-connect control server: **siphon dials the app**, so this is a
+/// WebSocket server. Construct it, register a handler with `@server.on_call`,
+/// then `await server.serve()`. Each accepted connection owns exactly one call;
+/// the first frame is a pushed `StasisStart` (no `hello`).
+#[pyclass(module = "siphon_control", name = "ControlServer")]
+struct ControlServer {
+    inner: Arc<ServerInner>,
+}
+
+#[pymethods]
+impl ControlServer {
+    #[new]
+    #[pyo3(signature = (app, token, bind=None, reply_timeout_ms=10_000))]
+    fn new(app: String, token: String, bind: Option<String>, reply_timeout_ms: u64) -> PyResult<Self> {
+        let bind = bind.unwrap_or_else(|| "0.0.0.0:8790".to_string());
+        let listen: SocketAddr = bind
+            .parse()
+            .map_err(|error| PyValueError::new_err(format!("invalid bind address {bind:?}: {error}")))?;
+        let mut config = ServerConfig::new(listen, app, token);
+        config.reply_timeout = Duration::from_millis(reply_timeout_ms);
+        Ok(Self {
+            inner: Arc::new(ServerInner {
+                config,
+                server: tokio::sync::Mutex::new(None),
+                handler: Mutex::new(None),
+                local_addr: Mutex::new(None),
+            }),
+        })
+    }
+
+    /// Register the per-call handler. Usable as a decorator: `@server.on_call`.
+    /// Reuses the SAME `Call` handle + dispatch as `ControlClient.on_call`.
+    fn on_call(&self, py: Python<'_>, handler: Py<PyAny>) -> Py<PyAny> {
+        *lock(&self.inner.handler) = Some(handler.clone_ref(py));
+        handler
+    }
+
+    /// Bind the listener (idempotent). Returns an awaitable resolving to the
+    /// bound address string, e.g. `"127.0.0.1:54321"` — useful when binding to
+    /// port `0` to learn the ephemeral port before siphon dials in.
+    fn bind<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            ensure_server(&inner).await?;
+            Ok(lock(&inner.local_addr).clone())
+        })
+    }
+
+    /// The bound address once [`ControlServer::bind`] (or `serve`) has run, else
+    /// `None`. When constructed with a port-`0` bind, this is where siphon dials.
+    #[getter]
+    fn local_addr(&self) -> Option<String> {
+        lock(&self.inner.local_addr).clone()
+    }
+
+    /// Bind (if needed), register the handler bridge, then run the accept loop
+    /// forever — accepting each per-call dial siphon makes. Runs until the
+    /// awaitable is cancelled or the listener fails.
+    fn serve<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.serve_impl(py)
+    }
+
+    /// Alias for [`ControlServer::serve`].
+    fn run<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        self.serve_impl(py)
+    }
+}
+
+impl ControlServer {
+    fn serve_impl<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = Arc::clone(&self.inner);
+        // Capture the running loop's task locals *now* (on the Python thread) so
+        // the handler bridge can drive Python coroutines from Rust.
+        let locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+        let handler = lock(&self.inner.handler).as_ref().map(|h| h.clone_ref(py));
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let server = ensure_server(&inner).await?;
+            if let Some(handler) = handler {
+                install_server_handler_bridge(&server, handler, locals);
+            }
+            server.run().await.map_err(to_pyerr)?;
+            Ok(())
+        })
+    }
+}
+
+/// Bind the underlying [`SipServer`] once, caching it + its bound address.
+async fn ensure_server(inner: &Arc<ServerInner>) -> PyResult<Arc<SipServer>> {
+    let mut guard = inner.server.lock().await;
+    if let Some(server) = guard.as_ref() {
+        return Ok(Arc::clone(server));
+    }
+    let server = Arc::new(SipServer::bind(inner.config.clone()).await.map_err(to_pyerr)?);
+    let bound = server.local_addr().map_err(to_pyerr)?;
+    *lock(&inner.local_addr) = Some(bound.to_string());
+    *guard = Some(Arc::clone(&server));
+    Ok(server)
+}
+
+/// Bridge the stored Python handler to the SIP server, reusing the same
+/// per-call dispatch as the inbound client (identical `Call` + coroutine drive).
+fn install_server_handler_bridge(server: &SipServer, handler: Py<PyAny>, locals: TaskLocals) {
+    server.set_call_handler(move |call: RustCall| {
+        let handler = Python::attach(|py| handler.clone_ref(py));
+        let locals = locals.clone();
+        async move {
+            dispatch_to_python(handler, locals, call).await;
+            Ok(())
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Module init
 // ---------------------------------------------------------------------------
 
@@ -471,11 +624,15 @@ async fn dispatch_to_python(handler: Py<PyAny>, locals: TaskLocals, call: RustCa
 #[pyo3(name = "siphon_control")]
 fn siphon_control(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<ControlClient>()?;
+    module.add_class::<ControlServer>()?;
     module.add_class::<Call>()?;
     module.add("ControlError", module.py().get_type::<ControlError>())?;
     module.add(
         "__all__",
-        PyList::new(module.py(), ["ControlClient", "Call", "ControlError"])?,
+        PyList::new(
+            module.py(),
+            ["ControlClient", "ControlServer", "Call", "ControlError"],
+        )?,
     )?;
     Ok(())
 }
