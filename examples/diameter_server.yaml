@@ -44,10 +44,10 @@ diameter:
   # reaches a script.
   clients:
     - name: client-a
-      allowed_ips: ["172.16.0.150", "172.16.0.0/24"]
+      allowed_ips: ["192.0.2.150", "192.0.2.0/24"]
       expected_origin_host: "client-a.epc.mnc001.mcc001.3gppnetwork.org"
 
   # Backend(s) this server connects out to and relays toward. Referenced by
   # name from the script via diameter.peer_pool(..., "backend").
   servers:
-    - { name: backend, host: "172.16.0.61", port: 3868, transport: tcp }
+    - { name: backend, host: "192.0.2.61", port: 3868, transport: tcp }

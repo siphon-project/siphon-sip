@@ -2210,7 +2210,7 @@ mod tests {
     #[test]
     fn loose_route_non_local_route_not_consumed() {
         // RFC 3261 §16.4: a proxy must only consume Routes that match itself.
-        // A TAS (domain 172.16.0.152) receiving a Route to scscf.example.com
+        // A TAS (domain 192.0.2.152) receiving a Route to scscf.example.com
         // must NOT consume it — relay() should follow the Route to the S-CSCF.
         let message = SipMessage {
             start_line: StartLine::Request(RequestLine {
@@ -2226,7 +2226,7 @@ mod tests {
             },
             body: vec![],
         };
-        let local_domains = Arc::new(vec!["172.16.0.152".to_string()]);
+        let local_domains = Arc::new(vec!["192.0.2.152".to_string()]);
         let mut request = PyRequest::with_local_domains(
             Arc::new(Mutex::new(message)),
             "tcp".to_string(),
