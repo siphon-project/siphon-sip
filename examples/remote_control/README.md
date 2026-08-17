@@ -15,7 +15,7 @@ would.
 
 - **Python** (`control_client.py`) uses [`siphon-control`](../../siphon-control-sdk/siphon-control),
   which ships the **inbound-persistent** client.
-- **TypeScript** (`control_client.ts`) uses [`@siphon/control`](../../siphon-control-sdk/typescript),
+- **TypeScript** (`control_client.ts`) uses [`@siphon-project/control`](../../siphon-control-sdk/typescript),
   which ships **both** connection modes.
 
 The raw `siphon-control.v1` JSON protocol these SDKs speak (the command / reply /
@@ -95,7 +95,7 @@ IVR_APP_TOKEN=changeme-dev-token python control_client.py
 
 ## Run the TypeScript client
 
-The example depends on `@siphon/control` via a `file:` path to the sibling
+The example depends on `@siphon-project/control` via a `file:` path to the sibling
 package, so it is runnable before the SDK is published. **Build the SDK first**
 (its `dist/` is what the `file:` dependency resolves):
 
@@ -106,7 +106,7 @@ npm --prefix ../../siphon-control-sdk/typescript run build
 
 # then this example:
 npm install                           # wires up the file: dependency
-# ...once published, this is simply `npm i @siphon/control`.
+# ...once published, this is simply `npm i @siphon-project/control`.
 
 # outbound (default): this app is the server siphon dials
 SIPHON_CONTROL_BIND=0.0.0.0:8443 IVR_APP_TOKEN=changeme-dev-token npm start

@@ -2,7 +2,7 @@
  * Example external control application for the siphon control plane — TypeScript SDK.
  *
  * Drives live B2BUA calls a script hands over with `call.handover("ivr-app")` (the
- * ARI *Stasis* model) over siphon's control WebSocket, using the `@siphon/control`
+ * ARI *Stasis* model) over siphon's control WebSocket, using the `@siphon-project/control`
  * SDK. The SDK owns the wire completely: no `ws`, no manual JSON, no request-id
  * bookkeeping — you get a `Call` whose verbs read like an in-process siphon script
  * (`call.answer()` / `call.transfer(...)` / `call.hangup()`).
@@ -25,7 +25,7 @@
  * Select the mode with `SIPHON_CONTROL_MODE` (`outbound` | `inbound`).
  *
  * Install the SDK:
- *   npm i @siphon/control            # once published
+ *   npm i @siphon-project/control            # once published
  *   # this example already depends on it via a file: path to the sibling package,
  *   # so `npm install` here wires it up (build the SDK first — see README.md).
  *
@@ -38,8 +38,8 @@
  *
  * See README.md for the matching siphon `control:` config and handover script.
  */
-import { SipClient, SipServer, ControlError } from "@siphon/control";
-import type { Call } from "@siphon/control";
+import { SipClient, SipServer, ControlError } from "@siphon-project/control";
+import type { Call } from "@siphon-project/control";
 
 const MODE = (process.env.SIPHON_CONTROL_MODE ?? "outbound").toLowerCase();
 const APP_NAME = process.env.SIPHON_CONTROL_APP ?? "ivr-app";

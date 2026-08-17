@@ -4,13 +4,13 @@
   "private": true,
   "type": "module",
   "license": "MIT",
-  "description": "Example external control application for the siphon control plane (uses the @siphon/control SDK)",
+  "description": "Example external control application for the siphon control plane (uses the @siphon-project/control SDK)",
   "scripts": {
     "start": "tsx control_client.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@siphon/control": "file:../../siphon-control-sdk/typescript"
+    "@siphon-project/control": "file:../../siphon-control-sdk/typescript"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

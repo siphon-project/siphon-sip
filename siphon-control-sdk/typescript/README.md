@@ -1,4 +1,4 @@
-# @siphon/control (TypeScript)
+# @siphon-project/control (TypeScript)
 
 TypeScript / Node client for the [SIPhon](https://github.com/siphon-project/siphon-sip)
 external control plane (`siphon-control.v1`) — an ARI/ESL-class rail for driving
@@ -11,14 +11,13 @@ The wire is hidden: no manual JSON, no request-id bookkeeping, no hand-rolled
 scripting API (`call.answer()`, `call.terminate()`, `call.transfer()`, …), so an
 out-of-process controller reads like an in-process script.
 
-> **Package name.** Published as the scoped `@siphon/control`. If the `@siphon`
-> npm organization is unavailable at publish time, the fallback is the unscoped
-> `siphon-control` — the import surface is identical either way.
+> **Package name.** Published as `@siphon-project/control` (scoped to the
+> `siphon-project` npm org).
 
 ## Install
 
 ```sh
-npm install @siphon/control ws
+npm install @siphon-project/control ws
 ```
 
 `ws` is a peer runtime dependency (the Node WebSocket implementation).
@@ -26,7 +25,7 @@ npm install @siphon/control ws
 ## Quick start
 
 ```ts
-import { SipClient, ControlError } from "@siphon/control";
+import { SipClient, ControlError } from "@siphon-project/control";
 
 const client = await SipClient.connect({
   url: "ws://siphon:9090/control/ws",
@@ -60,7 +59,7 @@ Same wire protocol (subprotocol `siphon-control.v1`), two ways to connect:
   impossible.
 
 ```ts
-import { SipServer } from "@siphon/control";
+import { SipServer } from "@siphon-project/control";
 
 const server = await SipServer.bind({
   host: "0.0.0.0",

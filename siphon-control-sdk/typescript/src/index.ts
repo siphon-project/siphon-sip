@@ -1,5 +1,5 @@
 /**
- * `@siphon/control` — the TypeScript client SDK for the SIPhon external control
+ * `@siphon-project/control` — the TypeScript client SDK for the SIPhon external control
  * plane (`siphon-control.v1`), an ARI/ESL-class rail for driving handed-over
  * calls out of process. The third client language alongside the Rust and Python
  * SDKs, over the byte-identical wire.
@@ -16,7 +16,7 @@
  *   over `command("sip", …)`, and `StasisStart`→`Call` dispatch lives there.
  *
  * ```ts
- * import { SipClient } from "@siphon/control";
+ * import { SipClient } from "@siphon-project/control";
  *
  * const client = await SipClient.connect({
  *   url: "ws://siphon:9090/control/ws",

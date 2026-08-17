@@ -1,5 +1,5 @@
 {
-  "name": "@siphon/control",
+  "name": "@siphon-project/control",
   "version": "0.1.0",
   "description": "TypeScript client for the SIPhon external control plane (siphon-control.v1) — an ARI/ESL-class rail for driving handed-over calls out of process.",
   "type": "module",

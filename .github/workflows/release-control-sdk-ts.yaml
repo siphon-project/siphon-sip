@@ -1,6 +1,6 @@
 name: release-control-sdk-ts
 
-# Publishes the TypeScript control-plane SDK (@siphon/control) to npm.
+# Publishes the TypeScript control-plane SDK (@siphon-project/control) to npm.
 #
 # The TS SDK is versioned independently of the siphon-sip crate (tied to the
 # control protocol, matching the Rust/Python SDKs), so it has its own tag prefix
