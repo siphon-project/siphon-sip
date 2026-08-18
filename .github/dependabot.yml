@@ -1,7 +1,7 @@
 # Dependabot — weekly, grouped to keep PR noise low.
 #
-# NOTE: cargo PRs must NOT be auto-merged. CLAUDE.md mandates the 16-row perf
-# baseline + mem-leak test before every commit, and CI does not run perf — a
+# NOTE: cargo PRs must NOT be auto-merged. Project policy mandates the 16-row
+# perf baseline + mem-leak test before every commit, and CI does not run perf — a
 # crate bump that is green in CI can still regress throughput or leak. Treat
 # each cargo PR as "green CI AND I ran the perf/mem baseline". github-actions
 # and docker bumps are safe to merge on green CI.
@@ -17,6 +17,33 @@ updates:
     groups:
       cargo-minor-patch:
         update-types: ["minor", "patch"]
+
+  # The two EXCLUDED standalone workspaces. They carry their own Cargo.lock, so
+  # the "/" entry above never touches them — which is precisely how siphon-bin/
+  # drifted onto a crossbeam-epoch advisory (RUSTSEC-2026-0204) that the root
+  # workspace had already been bumped off, and a yanked spin, without anything
+  # noticing. Without this block the weekly audit only ever reports that drift
+  # after the fact; this is what stops it accumulating.
+  #
+  # siphon-bin also git-deps siphon-sip at `branch = "main"`, and Dependabot
+  # advances that locked SHA — which is what keeps the composition from quietly
+  # building an ever-older lib. The EXTENSION crates are pinned to release tags
+  # on purpose (deliberate, reviewed bumps — see siphon-bin/Cargo.toml), and
+  # Dependabot mis-resolves tag-pinned cargo git deps (dependabot-core#10913),
+  # so they are ignored here and bumped by hand.
+  - package-ecosystem: cargo
+    directories:
+      - "/siphon-bin"
+      - "/siphon-control-sdk"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-excluded-workspaces-minor-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "siphon-smpp"
+      - dependency-name: "siphon-http"
 
   # Pinned action versions in the workflows (checkout, rust-cache, docker/*, …).
   - package-ecosystem: github-actions
