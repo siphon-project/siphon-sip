@@ -17041,6 +17041,35 @@ fn b2bua_send_uas_response(
 
     let mut response =
         build_response(invite, code, reason, state.server_header.as_deref(), &reply_headers);
+
+    // RFC 3261 §12.1.1 / §13.3.1.4: a UAS MUST put a Contact in a response that
+    // establishes a dialog — the 2xx, and an 18x that opens an early one. It is
+    // the remote target the UAC builds ACK / BYE / re-INVITE / PRACK against, so
+    // without it a well-behaved UAC has nowhere to send them: it renders an
+    // empty Request-URI and the in-dialog request is unparseable on arrival.
+    // The relayed B-leg path already does this; UAS mode (`call.answer()` /
+    // `call.progress()`, i.e. every single-leg answer including the voice-AI
+    // one) had no B-leg 2xx to copy a Contact from and set none at all.
+    //
+    // Host and port are resolved exactly as the relayed path resolves them:
+    // `a_leg_advertised_host` applies the advertised_address fallback and never
+    // leaks an unspecified bind address, and the port is the listener the INVITE
+    // actually arrived on — on a multi-homed host that is not `via_port()`, and
+    // a Contact naming the wrong port strands every in-dialog request.
+    if code > 100 {
+        let host = state.a_leg_advertised_host(local_addr, &transport);
+        let port = a_leg_advertised_port(local_addr, state.via_port(&transport));
+        response.headers.set(
+            "Contact",
+            format!(
+                "<sip:{}:{};transport={}>",
+                host,
+                port,
+                transport.to_string().to_lowercase()
+            ),
+        );
+    }
+
     if let Some(body_bytes) = body {
         if let Some(ct) = content_type {
             response.headers.set("Content-Type", ct.to_string());

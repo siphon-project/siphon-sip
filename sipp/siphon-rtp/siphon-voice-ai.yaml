@@ -1,0 +1,54 @@
+# siphon config for the voice-AI functional test (sipp/voice_ai_uac.xml).
+#
+# Drives examples/voice_ai_b2bua.py against the mock siphon-rtp control server
+# (sipp/siphon-rtp/mock_siphon_rtp.py), so the composition is tested without
+# building the engine. The mock anchors SDP on 203.0.113.1 and records every
+# command it receives; it does not move audio. The audio path is proven
+# separately against a real engine — see docs/cookbook/voice-ai.md.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "ai.example.com"
+
+advertised_address: "172.20.0.51"
+
+script:
+  path: "/etc/siphon/examples/voice_ai_b2bua.py"
+
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "172.20.0.50:8080"
+    timeout_ms: 2000
+
+  profiles:
+    voice_ai:
+      offer: &voice_ai_flags
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin"]
+        noise_suppression: true
+        echo_cancellation: true
+        ws_vad: true
+        ws_barge_in: true
+        ws_vad_hangover_ms: 300
+      answer: *voice_ai_flags
+
+# The UAC's address, so call.from_gateway("carriers") passes and the script
+# answers instead of rejecting 403.
+gateway:
+  groups:
+    - name: "carriers"
+      probe:
+        enabled: false
+      destinations:
+        - uri: "sip:uac.test:5060"
+          address: "172.20.0.52:5060"
+
+log:
+  level: info

@@ -16,7 +16,10 @@ set -euo pipefail
 run_sipp() {
   local rc=0
   "$@" || rc=$?
-  if [[ $rc -ne 0 && $rc -ne 255 ]]; then
+  if [[ $rc -ne 0 ]]; then
+    # 255 used to be exempted here. It is what SIPp returns when a scenario
+    # times out — including when an assertion fails and the call never
+    # completes — so exempting it made every scenario that hangs report green.
     echo "FAILED (exit $rc): $*"
     exit $rc
   fi
@@ -29,6 +32,7 @@ RUN_CALL=false
 RUN_PRESENCE=false
 RUN_RTPENGINE=false
 RUN_RTPPROXY=false
+RUN_VOICE_AI=false
 RUN_REINVITE=false
 RUN_B2BUA=false
 RUN_B2BUA_AUTH=false
@@ -54,6 +58,7 @@ for arg in "$@"; do
     --presence)   RUN_PRESENCE=true;   SELECTED_MODES+=("$arg") ;;
     --rtpengine)  RUN_RTPENGINE=true;  SELECTED_MODES+=("$arg") ;;
     --rtpproxy)   RUN_RTPPROXY=true;   SELECTED_MODES+=("$arg") ;;
+    --voice-ai)   RUN_VOICE_AI=true;   SELECTED_MODES+=("$arg") ;;
     --reinvite)   RUN_REINVITE=true;   SELECTED_MODES+=("$arg") ;;
     --b2bua)      RUN_B2BUA=true;      SELECTED_MODES+=("$arg") ;;
     --b2bua-auth) RUN_B2BUA_AUTH=true; SELECTED_MODES+=("$arg") ;;
@@ -71,6 +76,7 @@ for arg in "$@"; do
       echo
       echo "Scenario modes (pick at most ONE per run):"
       echo "  --ipsec --charging --call --presence --rtpengine --rtpproxy --reinvite"
+      echo "  --voice-ai"
       echo "  --b2bua --b2bua-auth --gateway --auto100 --http-auth --wedge --banscan"
       echo "  --security --rfc4475 --webrtc"
       echo
@@ -172,6 +178,14 @@ if [[ "$RUN_RTPENGINE" == true ]]; then
   echo "=== SIPp RTPEngine test (register bob → INVITE with media anchoring) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile rtpengine run --rm sipp-rtpengine-register
   run_sipp docker compose -f "$COMPOSE_FILE" --profile rtpengine up --abort-on-container-exit sipp-rtpengine-uac sipp-rtpengine-uas
+fi
+
+# ── Step 7a: Voice-AI B2BUA test (optional) ───────────────────────────────
+if [[ "$RUN_VOICE_AI" == true ]]; then
+  echo "=== SIPp voice-AI test (single-leg answer_local + WebSocket bridge) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile voice-ai up \
+    --abort-on-container-exit --exit-code-from sipp-voice-ai-uac sipp-voice-ai-uac
+  docker compose -f "$COMPOSE_FILE" --profile voice-ai rm -sf sipp-voice-ai-uac 2>/dev/null || true
 fi
 
 # ── Step 7b: Classic rtpproxy proxy test (optional) ───────────────────────

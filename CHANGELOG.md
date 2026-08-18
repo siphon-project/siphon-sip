@@ -7,6 +7,42 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **Worked voice-AI example — a carrier call answered by an AI over a WebSocket.**
+  `examples/voice_ai_b2bua.py` + `.yaml` compose the shipped pieces into the
+  single-leg shape: identify the carrier by source IP, `rtpengine.answer_local()`
+  with the `voice_ai` profile and a per-call `ws_uri`, answer with the SDP the
+  engine synthesised, and surface DTMF. There is no B leg — the media engine
+  anchors the call with the WebSocket server as the far side. A control-plane
+  variant (`examples/voice_ai_control.py` + `voice_ai_control_app.py`) drives the
+  same media path with the policy in an external application via
+  `call.handover(..., answer=True, ws_uri=...)`. Documented end to end in
+  `docs/cookbook/voice-ai.md`, including how to tell a working bridge from a
+  call that merely returns audio. Requires a `siphon-rtp` engine of **0.1.5 or
+  later**: earlier builds accept `ws_uri` on `answer_local` and silently never
+  dial it.
+- **Functional coverage for the voice-AI path** — `scripts/run-tests.sh --voice-ai`
+  drives a real INVITE through the example against a mock siphon-rtp control
+  server (`sipp/siphon-rtp/mock_siphon_rtp.py`, the JSON-over-TCP twin of the
+  existing rtpengine NG mock) and asserts the answer SDP is anchored on the
+  engine's media address rather than echoing the caller's own `c=` back.
+
+### Fixed
+- **A UAS-mode B2BUA answer carried no `Contact`, so no in-dialog request could
+  be addressed to it.** RFC 3261 §12.1.1 / §13.3.1.4 require a dialog-establishing
+  response to carry the Contact the UAC builds its remote target from. The
+  relayed path set one from the B-leg's 2xx, but `call.answer()` / `call.progress()`
+  — every single-leg answer, including every voice-AI call — had no B-leg to copy
+  from and set none at all. A well-behaved UAC therefore had nowhere to send ACK,
+  BYE, re-INVITE or PRACK: SIPp renders the empty target as `BYE  SIP/2.0`, which
+  arrives unparseable, and the call is only released when a timer fires. Host and
+  port now resolve exactly as the relayed path resolves them, so the Contact names
+  the listener the INVITE actually arrived on rather than the first-configured one.
+- **A SIPp scenario that timed out reported success.** `run_sipp` in
+  `scripts/run-tests.sh` exempted exit code 255, which is precisely what SIPp
+  returns when a scenario times out — including when an assertion fails and the
+  call never completes. Any hanging scenario was green.
+
+### Added
 - **`Contact.age_secs`** — seconds since a binding was created or last
   refreshed, for scripts that need their own recency rule (`[c for c in
   registrar.lookup(uri) if c.age_secs < 3600]`). Monotonic, and preserved

@@ -52,6 +52,7 @@ nav:
       - SBC (B2BUA): cookbook/sbc.md
       - WhatsApp calling: cookbook/whatsapp-calling.md
       - Call transfer (REFER): cookbook/call-transfer.md
+      - Voice AI (WebSocket bridge): cookbook/voice-ai.md
       - Number normalization: cookbook/number-normalization.md
       - Number routing (LNP / redirect): cookbook/number-routing.md
       - Media & RTP profiles: cookbook/media-rtp.md

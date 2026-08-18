@@ -1,0 +1,77 @@
+# SIPhon voice-AI, control-plane variant — see examples/voice_ai_control.py
+#
+# Identical media path to examples/voice_ai_b2bua.yaml (single-leg answer, audio
+# bridged to a WebSocket media server). The difference is the `control:` block:
+# the script hands each answered call to an external application, which owns the
+# policy from there.
+#
+# The audio does not traverse the control plane. The media engine dials the AI's
+# WebSocket directly; `control:` carries call control only.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+  tcp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "ai.example.com"
+
+advertised_address: "ai.example.com"
+
+script:
+  path: "examples/voice_ai_control.py"
+
+# The external application. Inbound-persistent here (the app connects in to
+# `listen`) because the Python SDK ships that client; for the outbound
+# per-call-connect model — siphon dials the app once per call, which is what you
+# want for a multi-pod controller — use `apps:` with `per_call_connect: true`
+# instead. See examples/remote_control/README.md.
+control:
+  listen: "127.0.0.1:9092"
+  apps:
+    - name: "voice-ai-app"
+      token: "${IVR_APP_TOKEN:-changeme-dev-token}"
+  limits:
+    event_queue_depth: 1024
+    reattach_grace_secs: 10
+
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "127.0.0.1:8080"     # siphon-rtp --control
+    timeout_ms: 2000
+
+  profiles:
+    voice_ai:
+      offer: &voice_ai_flags
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin"]
+        noise_suppression: true
+        echo_cancellation: true
+        ws_vad: true
+        ws_barge_in: true
+        ws_vad_hangover_ms: 300
+      answer: *voice_ai_flags
+
+gateway:
+  groups:
+    - name: "carriers"
+      probe:
+        enabled: true
+        interval_secs: 15
+        failure_threshold: 3
+      destinations:
+        - uri: "sip:gw1.carrier.example:5060"
+          address: "198.51.100.11:5060"
+        - uri: "sip:gw2.carrier.example:5060"
+          address: "198.51.100.12:5060"
+
+admin:
+  listen: "127.0.0.1:8081"
+
+log:
+  level: info
