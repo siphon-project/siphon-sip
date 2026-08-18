@@ -165,8 +165,8 @@ export function parseInboundFrame(text: string): ReplyFrame | EventFrame | null 
 /**
  * The verbs the built-in SIP adapter accepts (`module = "sip"`).
  *
- * These are the exact wire tokens. The Phase-1 server implements
- * `answer`/`progress`/`reject`/`hangup`/`refer`/`set_header`/`get_header`;
+ * These are the exact wire tokens. The server implements
+ * `answer`/`progress`/`reject`/`hangup`/`refer`/`route`/`set_header`/`get_header`;
  * the rest (`remove_header`, `accept_refer`, `reject_refer`, `play`, `dtmf`)
  * are accepted names the server answers `unsupported_verb` until it implements
  * them.
@@ -177,6 +177,7 @@ export const SipVerb = {
   Reject: "reject",
   Hangup: "hangup",
   Refer: "refer",
+  Route: "route",
   SetHeader: "set_header",
   GetHeader: "get_header",
   RemoveHeader: "remove_header",

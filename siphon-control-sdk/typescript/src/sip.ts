@@ -90,6 +90,41 @@ export interface AcceptReferOptions {
   mode?: "terminate" | "transparent";
 }
 
+/** A {@link Call.route} target carrying per-target overrides. */
+export interface RouteTargetObject {
+  /** The B-leg request URI to dial. */
+  uri: string;
+  /** Route egress to this next hop instead of resolving `uri`. */
+  nextHop?: string;
+  /** Headers injected on this attempt's B-leg INVITE. */
+  headers?: Record<string, string>;
+  /** Per-target ring timeout in seconds. */
+  timeout?: number;
+}
+
+/**
+ * One entry in a {@link Call.route} target list: a bare URI string, or a
+ * {@link RouteTargetObject} with per-target overrides.
+ */
+export type RouteTarget = string | RouteTargetObject;
+
+function routeTargetToWire(target: RouteTarget): unknown {
+  if (typeof target === "string") {
+    return target;
+  }
+  const object: Record<string, unknown> = { uri: target.uri };
+  if (target.nextHop !== undefined) {
+    object.next_hop = target.nextHop;
+  }
+  if (target.headers !== undefined) {
+    object.headers = target.headers;
+  }
+  if (target.timeout !== undefined) {
+    object.timeout = target.timeout;
+  }
+  return object;
+}
+
 function stringValue(result: unknown): string | null {
   if (typeof result === "object" && result !== null) {
     const value = (result as { value?: unknown }).value;
@@ -189,6 +224,36 @@ export class Call {
         early_only: replaces.earlyOnly ?? false,
       },
     });
+  }
+
+  /**
+   * Un-park this controlled call and dial the B-leg via siphon's LCR
+   * sequential-failover engine, returning control to siphon.
+   *
+   * `targets` is a non-empty list of carriers tried cheapest-first: each entry
+   * is a bare URI string or a {@link RouteTargetObject}
+   * (`{uri, nextHop?, headers?, timeout?}`). `strategy` defaults to
+   * `"sequential"` (v1 supports only sequential/single — anything else rejects
+   * with `code === "unsupported_verb"`). `headers` is applied to every
+   * attempt's B-leg INVITE.
+   *
+   * Resolves to the reply `result` (`{channel, state: "routing", targets}`). An
+   * empty / invalid `targets` list rejects with `code === "bad_request"`; a call
+   * that is already gone rejects with `code === "not_found"`.
+   */
+  async route(
+    targets: RouteTarget[],
+    strategy = "sequential",
+    headers?: Record<string, string>,
+  ): Promise<unknown> {
+    const args: Record<string, unknown> = {
+      targets: targets.map(routeTargetToWire),
+      strategy,
+    };
+    if (headers !== undefined) {
+      args.headers = headers;
+    }
+    return this.sip(SipVerb.Route, args);
   }
 
   /**

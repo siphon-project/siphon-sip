@@ -30,6 +30,84 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 // ---------------------------------------------------------------------------
+// route() target
+// ---------------------------------------------------------------------------
+
+/// One entry in a [`Call::route`] target list: a B-leg URI plus optional
+/// per-target overrides.
+///
+/// A bare URI (no overrides) serializes to a plain string on the wire; a target
+/// carrying any override serializes to `{uri, next_hop?, headers?, timeout?}` —
+/// both shapes the server's `route` verb accepts. Build a bare-URI target with
+/// [`RouteTarget::uri`], or from a `&str` / `String`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteTarget {
+    /// The B-leg request URI to dial.
+    pub uri: String,
+    /// Route egress to this next hop instead of resolving `uri` (optional).
+    pub next_hop: Option<String>,
+    /// Headers injected on this attempt's B-leg INVITE (optional).
+    pub headers: Vec<(String, String)>,
+    /// Per-target ring timeout in seconds (optional).
+    pub timeout_secs: Option<u32>,
+}
+
+impl RouteTarget {
+    /// A bare-URI target with no overrides.
+    pub fn uri(uri: impl Into<String>) -> Self {
+        Self {
+            uri: uri.into(),
+            next_hop: None,
+            headers: Vec::new(),
+            timeout_secs: None,
+        }
+    }
+
+    /// True when this target carries no overrides (serializes as a bare string).
+    fn is_bare(&self) -> bool {
+        self.next_hop.is_none() && self.headers.is_empty() && self.timeout_secs.is_none()
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        if self.is_bare() {
+            return json!(self.uri);
+        }
+        let mut object = serde_json::Map::new();
+        object.insert("uri".to_string(), json!(self.uri));
+        if let Some(next_hop) = &self.next_hop {
+            object.insert("next_hop".to_string(), json!(next_hop));
+        }
+        if !self.headers.is_empty() {
+            object.insert("headers".to_string(), headers_to_json(&self.headers));
+        }
+        if let Some(timeout) = self.timeout_secs {
+            object.insert("timeout".to_string(), json!(timeout));
+        }
+        serde_json::Value::Object(object)
+    }
+}
+
+impl From<&str> for RouteTarget {
+    fn from(uri: &str) -> Self {
+        Self::uri(uri)
+    }
+}
+
+impl From<String> for RouteTarget {
+    fn from(uri: String) -> Self {
+        Self::uri(uri)
+    }
+}
+
+fn headers_to_json(headers: &[(String, String)]) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    for (name, value) in headers {
+        object.insert(name.clone(), json!(value));
+    }
+    serde_json::Value::Object(object)
+}
+
+// ---------------------------------------------------------------------------
 // Call handle
 // ---------------------------------------------------------------------------
 
@@ -238,6 +316,40 @@ impl Call {
             "replaces": { "call_id": call_id, "from_tag": from_tag, "to_tag": to_tag, "early_only": early_only }
         });
         self.sip(SipVerb::Refer, args).await.map(drop)
+    }
+
+    /// Un-park this controlled call and dial the B-leg via siphon's LCR
+    /// sequential-failover engine, returning control to siphon.
+    ///
+    /// `targets` is a non-empty ordered list of carriers tried cheapest-first: a
+    /// bare URI ([`RouteTarget::uri`] / a `&str`) or a [`RouteTarget`] carrying
+    /// `next_hop` / `headers` / `timeout_secs` overrides. `strategy` defaults to
+    /// `"sequential"` when `None` (the server's default; v1 supports only
+    /// `sequential`/`single` — anything else resolves to
+    /// [`ControlError::is_unsupported_verb`]). `headers` is applied to every
+    /// attempt's B-leg INVITE.
+    ///
+    /// On success siphon owns the call thereafter and the control app is
+    /// released; the returned value is the reply `result`
+    /// (`{channel, state: "routing", targets: N}`). An empty / invalid `targets`
+    /// list resolves to a `bad_request` error, and a call that is already gone to
+    /// `not_found`.
+    pub async fn route(
+        &self,
+        targets: Vec<RouteTarget>,
+        strategy: Option<&str>,
+        headers: Vec<(String, String)>,
+    ) -> Result<serde_json::Value, ControlError> {
+        let mut args = json!({
+            "targets": targets.iter().map(RouteTarget::to_json).collect::<Vec<_>>(),
+        });
+        if let Some(strategy) = strategy {
+            args["strategy"] = json!(strategy);
+        }
+        if !headers.is_empty() {
+            args["headers"] = headers_to_json(&headers);
+        }
+        self.sip(SipVerb::Route, args).await
     }
 
     /// Set a header on the stored A-leg INVITE.
@@ -630,5 +742,130 @@ impl SipServer {
     /// Accept siphon's per-call dials forever.
     pub async fn run(&self) -> Result<(), ControlError> {
         self.server.run().await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — the emitted `route` frame shape (recording CommandTransport).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use siphon_control_proto::ChannelSnapshot;
+    use std::collections::HashMap;
+
+    #[derive(Clone)]
+    struct Recorded {
+        module: Option<String>,
+        verb: String,
+        target: serde_json::Value,
+        args: serde_json::Value,
+    }
+
+    /// A [`CommandTransport`] that records every command and returns a canned
+    /// result — the Rust twin of the TypeScript `RecordingTransport`.
+    struct RecordingTransport {
+        calls: Mutex<Vec<Recorded>>,
+        result: serde_json::Value,
+    }
+
+    impl CommandTransport for RecordingTransport {
+        fn command(
+            &self,
+            module: Option<String>,
+            verb: String,
+            target: serde_json::Value,
+            args: serde_json::Value,
+        ) -> BoxFuture<'_, Result<serde_json::Value, ControlError>> {
+            lock(&self.calls).push(Recorded {
+                module,
+                verb,
+                target,
+                args,
+            });
+            let result = self.result.clone();
+            Box::pin(async move { Ok(result) })
+        }
+    }
+
+    fn make_call(transport: Arc<dyn CommandTransport>) -> Call {
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let snapshot = ChannelSnapshot {
+            channel: "ch1".to_string(),
+            call_id: "call-uuid".to_string(),
+            sip_call_id: "sip@host".to_string(),
+            state: "answered".to_string(),
+            vars: HashMap::new(),
+        };
+        Call::from_snapshot(transport, snapshot, event_rx)
+    }
+
+    #[tokio::test]
+    async fn route_emits_targets_strategy_and_headers() {
+        let recorder = Arc::new(RecordingTransport {
+            calls: Mutex::new(Vec::new()),
+            result: json!({ "channel": "ch1", "state": "routing", "targets": 2 }),
+        });
+        let call = make_call(recorder.clone());
+
+        let result = call
+            .route(
+                vec![
+                    RouteTarget::from("sip:carrier1@gw1"),
+                    RouteTarget {
+                        uri: "sip:carrier2@gw2".to_string(),
+                        next_hop: Some("sip:1.2.3.4:5060".to_string()),
+                        headers: vec![("X-Foo".to_string(), "bar".to_string())],
+                        timeout_secs: Some(30),
+                    },
+                ],
+                Some("sequential"),
+                vec![("X-Trace".to_string(), "abc".to_string())],
+            )
+            .await
+            .expect("route ok");
+
+        assert_eq!(result["state"], "routing");
+        assert_eq!(result["targets"], 2);
+
+        let recorded = lock(&recorder.calls).clone();
+        assert_eq!(recorded.len(), 1);
+        let frame = &recorded[0];
+        assert_eq!(frame.module.as_deref(), Some("sip"));
+        assert_eq!(frame.verb, "route");
+        assert_eq!(frame.target, json!({ "channel": "ch1" }));
+        assert_eq!(
+            frame.args,
+            json!({
+                "targets": [
+                    "sip:carrier1@gw1",
+                    {
+                        "uri": "sip:carrier2@gw2",
+                        "next_hop": "sip:1.2.3.4:5060",
+                        "headers": { "X-Foo": "bar" },
+                        "timeout": 30
+                    }
+                ],
+                "strategy": "sequential",
+                "headers": { "X-Trace": "abc" }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn route_omits_strategy_and_headers_when_absent() {
+        let recorder = Arc::new(RecordingTransport {
+            calls: Mutex::new(Vec::new()),
+            result: json!({ "channel": "ch1", "state": "routing", "targets": 1 }),
+        });
+        let call = make_call(recorder.clone());
+
+        call.route(vec![RouteTarget::uri("sip:only@gw")], None, Vec::new())
+            .await
+            .expect("route ok");
+
+        let recorded = lock(&recorder.calls).clone();
+        assert_eq!(recorded[0].args, json!({ "targets": ["sip:only@gw"] }));
     }
 }
