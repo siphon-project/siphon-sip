@@ -26,6 +26,24 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   existing rtpengine NG mock) and asserts the answer SDP is anchored on the
   engine's media address rather than echoing the caller's own `c=` back.
 
+### Changed
+- **`tls.method` is now enforced — it used to be parsed and ignored.** The
+  setting was deserialized into the TLS config and never read: the acceptor was
+  built from a bare `rustls::ServerConfig::builder()`, so a config asking for
+  `TLSv1_3` still completed TLS 1.2 handshakes and the documented default
+  (`TLSv1_3`) described a floor nothing applied. It is now a **minimum**
+  version, applied to the `listen.tls` / `listen.wss` acceptor **and** to
+  outbound TLS from the connection pool: `TLSv1_2` negotiates 1.2 or 1.3,
+  `TLSv1_3` negotiates 1.3 only and refuses a TLS 1.2 peer in either direction.
+  The default is now `TLSv1_2`, which is exactly what siphon has always
+  negotiated, so an unset `method` changes nothing. **Anyone who explicitly set
+  `method: TLSv1_3` gets the tightening they asked for and will now refuse TLS
+  1.2 peers** — check both directions (subscriber clients and upstream trunks)
+  before upgrading, or set `TLSv1_2` to keep 1.2 available. Values are validated
+  at config load: `TLSv1_2` / `TLSv1_3` in the OpenSSL/Kamailio spellings
+  (`TLSv1.2`, `TLSv1.2+`, `1.2`), while TLS 1.0/1.1, SSL and typos are a startup
+  error instead of a silently-ignored string.
+
 ### Fixed
 - **A UAS-mode B2BUA answer carried no `Contact`, so no in-dialog request could
   be addressed to it.** RFC 3261 §12.1.1 / §13.3.1.4 require a dialog-establishing

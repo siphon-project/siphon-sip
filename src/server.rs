@@ -1426,8 +1426,17 @@ impl SiphonServer {
                 }
                 _ => None,
             };
+        // One floor for both directions: `tls.method` governs the versions siphon
+        // accepts on its listeners and the versions it offers when it dials out.
+        // No `tls:` block at all means the default floor (TLS 1.2), i.e. exactly
+        // what outbound TLS negotiated before the setting was honored.
+        let outbound_tls_method =
+            config.tls.as_ref().map(|t| t.method).unwrap_or_default();
         let tls_client_config =
-            match transport::pool::build_outbound_tls_config(outbound_client_identity) {
+            match transport::pool::build_outbound_tls_config(
+                outbound_client_identity,
+                outbound_tls_method,
+            ) {
                 Ok(config) => config,
                 Err(error) => {
                     eprintln!("Failed to build outbound TLS client config: {error}");
@@ -1456,6 +1465,7 @@ impl SiphonServer {
                 &connection_pool,
                 certificate_path,
                 private_key_path,
+                outbound_tls_method,
             );
         }
 

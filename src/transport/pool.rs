@@ -23,6 +23,7 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
+use crate::config::TlsMethod;
 use crate::transport::{
     ConnectionId, InboundMessage, StreamConnections, Transport,
     configure_tcp_socket, next_connection_id,
@@ -199,14 +200,23 @@ pub fn load_outbound_client_identity(
 ///
 /// When `identity` is `Some`, siphon presents that client certificate chain +
 /// key; when `None`, no client certificate is presented (prior behavior).
+///
+/// `method` is the `tls.method` floor, applied here as well as on the inbound
+/// acceptor: it is one process-wide statement about which TLS versions siphon
+/// speaks, so `TLSv1_3` refuses to *dial* a TLS 1.2 trunk just as it refuses to
+/// accept a TLS 1.2 client. Without a `tls:` block the default floor (1.2)
+/// applies, which is what outbound TLS has always negotiated.
 pub fn build_outbound_tls_config(
     identity: Option<OutboundClientIdentity>,
+    method: TlsMethod,
 ) -> Result<Arc<tokio_rustls::rustls::ClientConfig>, std::io::Error> {
     use tokio_rustls::rustls;
 
-    let builder = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(NoVerify));
+    let builder = rustls::ClientConfig::builder_with_protocol_versions(
+        crate::transport::tls::protocol_versions(method),
+    )
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(NoVerify));
 
     let config = match identity {
         Some(identity) => builder
@@ -928,6 +938,7 @@ impl ConnectionPool {
         pool: &Arc<ConnectionPool>,
         certificate_path: &str,
         private_key_path: &str,
+        method: TlsMethod,
     ) {
         let cert_path = PathBuf::from(certificate_path);
         let key_path = PathBuf::from(private_key_path);
@@ -1000,7 +1011,7 @@ impl ConnectionPool {
                         // then the cert; wait for the pair to settle.
                         std::thread::sleep(std::time::Duration::from_millis(150));
                         match load_outbound_client_identity(&certificate_path, &private_key_path)
-                            .and_then(|identity| build_outbound_tls_config(Some(identity)))
+                            .and_then(|identity| build_outbound_tls_config(Some(identity), method))
                         {
                             Ok(new_config) => pool.reload_tls_client_config(new_config),
                             Err(error) => warn!(%error,
@@ -1050,7 +1061,7 @@ mod tests {
             None,
             None,
             None,
-            build_outbound_tls_config(None).expect("outbound tls config"),
+            build_outbound_tls_config(None, TlsMethod::default()).expect("outbound tls config"),
         );
 
         // Send via pool
@@ -1103,7 +1114,7 @@ mod tests {
             None,
             None,
             None,
-            build_outbound_tls_config(None).expect("outbound tls config"),
+            build_outbound_tls_config(None, TlsMethod::default()).expect("outbound tls config"),
         );
 
         let id1 = pool
@@ -1146,7 +1157,7 @@ mod tests {
             None,
             None,
             None,
-            build_outbound_tls_config(None).expect("outbound tls config"),
+            build_outbound_tls_config(None, TlsMethod::default()).expect("outbound tls config"),
         );
 
         let id1 = pool
@@ -1214,7 +1225,7 @@ mod tests {
             None,
             None,
             None,
-            build_outbound_tls_config(None).expect("outbound tls config"),
+            build_outbound_tls_config(None, TlsMethod::default()).expect("outbound tls config"),
         );
 
         let connection_id = pool
@@ -1255,7 +1266,7 @@ mod tests {
             None,
             None,
             None,
-            build_outbound_tls_config(None).expect("outbound tls config"),
+            build_outbound_tls_config(None, TlsMethod::default()).expect("outbound tls config"),
         );
         // Short timeout so the test exercises the timeout branch in ms.
         pool.connect_timeout = Duration::from_millis(150);
@@ -1326,7 +1337,7 @@ mod tests {
             None,
             None,
             None,
-            build_outbound_tls_config(None).expect("outbound tls config"),
+            build_outbound_tls_config(None, TlsMethod::default()).expect("outbound tls config"),
         ));
 
         // Fire N concurrent sends from the same fixed source.
@@ -1452,7 +1463,7 @@ mod tests {
     async fn build_outbound_tls_config_none_and_some_both_build() {
         ensure_crypto_provider();
         // No client identity — prior behavior (no client auth).
-        assert!(build_outbound_tls_config(None).is_ok());
+        assert!(build_outbound_tls_config(None, TlsMethod::default()).is_ok());
 
         // A valid client identity, loaded via the production PEM loader.
         let certs = generate_mtls_certs();
@@ -1466,7 +1477,7 @@ mod tests {
             key_path.to_str().unwrap(),
         )
         .expect("client identity must load");
-        assert!(build_outbound_tls_config(Some(identity)).is_ok());
+        assert!(build_outbound_tls_config(Some(identity), TlsMethod::default()).is_ok());
     }
 
     #[test]
@@ -1488,6 +1499,76 @@ mod tests {
         assert!(
             matches!(ip_name, ServerName::IpAddress(_)),
             "IP destination must yield an IpAddress ServerName"
+        );
+    }
+
+    /// A plain TLS server acceptor pinned to TLS 1.2 — stands in for a legacy
+    /// carrier trunk that never got a 1.3 stack.
+    fn tls12_only_server_acceptor(certs: &MtlsCerts) -> tokio_rustls::TlsAcceptor {
+        use tokio_rustls::rustls::{version, ServerConfig};
+
+        let server_config = ServerConfig::builder_with_protocol_versions(&[&version::TLS12])
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certs.server_cert_der.clone()],
+                certs.server_key_der.clone_key(),
+            )
+            .expect("server config");
+        tokio_rustls::TlsAcceptor::from(Arc::new(server_config))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tls_method_floor_applies_to_outbound_handshakes() {
+        // `tls.method` is one process-wide statement about the TLS versions
+        // siphon speaks, so a 1.3 floor must also stop siphon *dialling* a TLS
+        // 1.2 trunk — enforcing it only on the listener would leave the same
+        // "claimed floor nothing enforces" gap on the outbound side.
+        ensure_crypto_provider();
+        let certs = generate_mtls_certs();
+
+        async fn dial(
+            certs: &MtlsCerts,
+            method: TlsMethod,
+        ) -> Result<ConnectionId, std::io::Error> {
+            let acceptor = tls12_only_server_acceptor(certs);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let server_addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.expect("accept");
+                let _ = acceptor.accept(tcp).await;
+            });
+
+            let client_config =
+                build_outbound_tls_config(None, method).expect("outbound client config");
+            let (inbound_tx, _inbound_rx) = flume::unbounded();
+            let pool = ConnectionPool::new(
+                Arc::new(DashMap::new()),
+                inbound_tx,
+                "127.0.0.1:5060".parse().unwrap(),
+                None,
+                None,
+                None,
+                client_config,
+            );
+
+            let outcome = pool
+                .send_tls(
+                    server_addr,
+                    Some("localhost"),
+                    Bytes::from_static(b"OPTIONS sip:peer@example.com SIP/2.0\r\n\r\n"),
+                )
+                .await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+            outcome
+        }
+
+        assert!(
+            dial(&certs, TlsMethod::Tls13).await.is_err(),
+            "tls.method TLSv1_3 must refuse to dial a TLS 1.2-only peer"
+        );
+        assert!(
+            dial(&certs, TlsMethod::Tls12).await.is_ok(),
+            "the default TLS 1.2 floor must still dial a TLS 1.2-only peer"
         );
     }
 
@@ -1522,7 +1603,8 @@ mod tests {
             key_path.to_str().unwrap(),
         )
         .expect("client identity must load");
-        let client_config = build_outbound_tls_config(Some(identity)).expect("client config");
+        let client_config = build_outbound_tls_config(Some(identity), TlsMethod::default())
+            .expect("client config");
 
         let connection_map = Arc::new(DashMap::new());
         let (inbound_tx, _inbound_rx) = flume::unbounded();
@@ -1563,7 +1645,8 @@ mod tests {
             acceptor2.accept(tcp).await.is_err()
         });
 
-        let no_auth_config = build_outbound_tls_config(None).expect("no-auth client config");
+        let no_auth_config = build_outbound_tls_config(None, TlsMethod::default())
+            .expect("no-auth client config");
         let connection_map2 = Arc::new(DashMap::new());
         let (inbound_tx2, _inbound_rx2) = flume::unbounded();
         let pool2 = ConnectionPool::new(
@@ -1641,7 +1724,7 @@ mod tests {
 
         // Pool starts with the CA-A client identity (wrong CA for these servers).
         let identity_a = identity_from_pem(&certs_a.client_cert_pem, &certs_a.client_key_pem);
-        let config_a = build_outbound_tls_config(Some(identity_a)).expect("config a");
+        let config_a = build_outbound_tls_config(Some(identity_a), TlsMethod::default()).expect("config a");
         let connection_map = Arc::new(DashMap::new());
         let (inbound_tx, _inbound_rx) = flume::unbounded();
         let pool = ConnectionPool::new(
@@ -1680,7 +1763,7 @@ mod tests {
 
         // Swap in the renewed identity signed by CA-B.
         let identity_b = identity_from_pem(&certs_b.client_cert_pem, &certs_b.client_key_pem);
-        let config_b = build_outbound_tls_config(Some(identity_b)).expect("config b");
+        let config_b = build_outbound_tls_config(Some(identity_b), TlsMethod::default()).expect("config b");
         pool.reload_tls_client_config(config_b);
 
         // (b) A fresh outbound handshake now SUCCEEDS with the new identity.
@@ -1761,7 +1844,7 @@ mod tests {
             None,
             None,
             None,
-            build_outbound_tls_config(None).expect("outbound tls config"),
+            build_outbound_tls_config(None, TlsMethod::default()).expect("outbound tls config"),
         );
 
         pool.send_tls(tls_addr, Some("localhost"), Bytes::from_static(b"PING"))
@@ -1773,7 +1856,7 @@ mod tests {
         assert_eq!(pool.active_connections(), 2, "both connections pooled");
 
         pool.reload_tls_client_config(
-            build_outbound_tls_config(None).expect("outbound tls config"),
+            build_outbound_tls_config(None, TlsMethod::default()).expect("outbound tls config"),
         );
 
         assert_eq!(

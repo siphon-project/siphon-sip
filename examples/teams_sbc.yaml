@@ -32,7 +32,8 @@ tls:
   # Microsoft-supported CA.
   certificate: "/etc/siphon/tls/sbc.example.com/fullchain.pem"
   private_key: "/etc/siphon/tls/sbc.example.com/privkey.pem"
-  method: "TLSv1_2"           # Teams requires TLS 1.2
+  method: "TLSv1_2"           # minimum version: Teams requires 1.2, and this
+                              # floor still lets a 1.3-capable peer use 1.3
 
   # Client identity presented to Teams on the OUTBOUND leg (SBC -> Teams).
   # Direct Routing is mutual TLS: without this, Teams aborts the handshake with

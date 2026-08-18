@@ -1257,8 +1257,16 @@ pub struct TlsServerConfig {
     /// `certificate`/`private_key` to every client, exactly as before.
     #[serde(default)]
     pub certificates: Vec<SniCertificate>,
-    #[serde(default = "default_tls_method")]
-    pub method: String,
+    /// Minimum TLS protocol version siphon negotiates — on the `listen.tls` /
+    /// `listen.wss` listeners this block serves, and on outbound SIP TLS
+    /// connections from the connection pool.
+    ///
+    /// This is a **floor**, not an exact version: `TLSv1_2` (the default)
+    /// negotiates TLS 1.2 or 1.3, `TLSv1_3` negotiates 1.3 only. TLS 1.0/1.1
+    /// are rejected at config load — RFC 8996 deprecates them and the rustls
+    /// stack siphon is built on does not implement them.
+    #[serde(default)]
+    pub method: TlsMethod,
     /// If true, client certificates are required and verified against
     /// `client_ca`. Requires `client_ca` to be set, else startup fails.
     #[serde(default)]
@@ -1307,8 +1315,82 @@ pub struct SniCertificate {
     pub private_key: String,
 }
 
-fn default_tls_method() -> String {
-    "TLSv1_3".to_owned()
+/// Minimum TLS protocol version, from `tls.method`.
+///
+/// Named `method` after the OpenSSL/Kamailio spelling operators already have in
+/// their configs, but the semantics are a floor: `TLSv1_2` serves TLS 1.2 *and*
+/// 1.3, `TLSv1_3` serves 1.3 only. Only these two exist — RFC 8996 deprecates
+/// TLS 1.0/1.1 and rustls does not implement them, so a config asking for one
+/// fails at load rather than silently getting something newer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TlsMethod {
+    /// TLS 1.2 and above. The default, and what siphon has always served.
+    #[default]
+    Tls12,
+    /// TLS 1.3 only — TLS 1.2 handshakes are refused.
+    Tls13,
+}
+
+impl TlsMethod {
+    /// The spelling used in `siphon.yaml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TlsMethod::Tls12 => "TLSv1_2",
+            TlsMethod::Tls13 => "TLSv1_3",
+        }
+    }
+}
+
+impl std::fmt::Display for TlsMethod {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TlsMethod {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        // Accept every spelling an operator plausibly carries over from
+        // OpenSSL/Kamailio/OpenSIPS: `TLSv1_2`, `TLSv1.2`, `TLSv1.2+`, `1.2`.
+        // The `+` suffix (Kamailio's "this version or higher") is redundant
+        // here because the value is already a floor, so it is accepted and
+        // ignored rather than rejected.
+        let normalized = value
+            .trim()
+            .trim_end_matches('+')
+            .trim()
+            .to_ascii_lowercase()
+            .replace('_', ".");
+        let version = normalized
+            .strip_prefix("tlsv")
+            .or_else(|| normalized.strip_prefix("tls"))
+            .unwrap_or(normalized.as_str());
+
+        match version {
+            "1.2" => Ok(TlsMethod::Tls12),
+            "1.3" => Ok(TlsMethod::Tls13),
+            "1" | "1.0" | "1.1" | "sslv2" | "sslv3" | "sslv23" | "ssl" => Err(format!(
+                "tls.method '{value}': TLS 1.0/1.1 and SSL are deprecated (RFC 8996) and \
+                 are not implemented — use TLSv1_2 (minimum 1.2, negotiates 1.2 or \
+                 1.3) or TLSv1_3 (1.3 only)"
+            )),
+            _ => Err(format!(
+                "tls.method '{value}' is not a TLS version siphon supports — use TLSv1_2 \
+                 (minimum 1.2, negotiates 1.2 or 1.3) or TLSv1_3 (1.3 only)"
+            )),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TlsMethod {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4665,11 +4747,98 @@ tls:
         let config = Config::from_str(yaml).unwrap();
         let tls = config.tls.unwrap();
         assert_eq!(tls.certificate, "/etc/siphon/tls/example.com.crt");
-        assert_eq!(tls.method, "TLSv1_3");
+        assert_eq!(tls.method, TlsMethod::Tls13);
         assert!(!tls.verify_client);
         // Outbound client-certificate (mutual TLS) fields default to None.
         assert!(tls.client_certificate.is_none());
         assert!(tls.client_private_key.is_none());
+    }
+
+    #[test]
+    fn tls_method_defaults_to_tls12_floor() {
+        // Unset `method` must keep serving what siphon has always served
+        // (TLS 1.2 + 1.3). A 1.3 default here would silently drop every TLS 1.2
+        // peer on upgrade.
+        let yaml = r#"
+listen:
+  tls:
+    - "0.0.0.0:5061"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+tls:
+  certificate: "/etc/siphon/tls/example.com.crt"
+  private_key: "/etc/siphon/tls/example.com.key"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        let tls = config.tls.unwrap();
+        assert_eq!(tls.method, TlsMethod::Tls12);
+    }
+
+    #[test]
+    fn tls_method_accepts_openssl_and_kamailio_spellings() {
+        for spelling in ["TLSv1_2", "TLSv1.2", "tlsv1_2", " TLSv1_2 ", "TLSv1.2+", "1.2"] {
+            assert_eq!(
+                spelling.parse::<TlsMethod>(),
+                Ok(TlsMethod::Tls12),
+                "{spelling} should parse as the TLS 1.2 floor"
+            );
+        }
+        for spelling in ["TLSv1_3", "TLSv1.3", "tlsv1_3", "TLSv1.3+", "1.3"] {
+            assert_eq!(
+                spelling.parse::<TlsMethod>(),
+                Ok(TlsMethod::Tls13),
+                "{spelling} should parse as the TLS 1.3 floor"
+            );
+        }
+    }
+
+    #[test]
+    fn tls_method_rejects_deprecated_versions() {
+        for spelling in ["TLSv1", "TLSv1_0", "TLSv1_1", "SSLv3", "SSLv23"] {
+            let error = spelling
+                .parse::<TlsMethod>()
+                .expect_err("deprecated TLS/SSL versions must be rejected");
+            assert!(
+                error.contains("RFC 8996"),
+                "error should name the deprecation: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn tls_method_rejects_unknown_value_at_config_load() {
+        // Fail closed and loud: an unrecognised value used to be accepted and
+        // ignored, so a typo read as a hardened config while nothing enforced it.
+        let yaml = r#"
+listen:
+  tls:
+    - "0.0.0.0:5061"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+tls:
+  certificate: "/etc/siphon/tls/example.com.crt"
+  private_key: "/etc/siphon/tls/example.com.key"
+  method: "TLSv1_4"
+"#;
+        let error = Config::from_str(yaml).expect_err("unknown tls.method must fail config load");
+        let error = error.to_string();
+        assert!(
+            error.contains("TLSv1_2") && error.contains("TLSv1_3"),
+            "error should list the accepted values: {error}"
+        );
+    }
+
+    #[test]
+    fn tls_method_display_round_trips() {
+        for method in [TlsMethod::Tls12, TlsMethod::Tls13] {
+            assert_eq!(method.to_string().parse::<TlsMethod>(), Ok(method));
+        }
     }
 
     #[test]
