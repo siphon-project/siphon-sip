@@ -161,6 +161,7 @@ checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
  "axum-macros",
+ "base64 0.22.1",
  "bytes",
  "form_urlencoded",
  "futures-util",
@@ -179,8 +180,10 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
+ "sha1",
  "sync_wrapper",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tower-layer",
  "tower-service",
@@ -548,9 +551,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -2686,15 +2689,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
 name = "rustls-pki-types"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3006,8 +3000,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-http"
-version = "1.0.1"
-source = "git+https://github.com/siphon-project/siphon-http?tag=v1.0.1#9f5e03a7045ddf4b15b942866e191738ccb3b011"
+version = "1.0.2"
+source = "git+https://github.com/siphon-project/siphon-http?tag=v1.0.2#99b639d5734699ec4212503f92d6d61d1e2337d1"
 dependencies = [
  "async-trait",
  "axum",
@@ -3021,7 +3015,6 @@ dependencies = [
  "pyo3-async-runtimes",
  "reqwest",
  "rustls",
- "rustls-pemfile",
  "serde",
  "serde_yaml",
  "siphon-sip",
@@ -3048,7 +3041,7 @@ dependencies = [
 [[package]]
 name = "siphon-sip"
 version = "1.5.1"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#a37bc217b2ff4ae5335d1dfdaef3dffaf6805fab"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#9b31ea61de803508eacd1649695ff6602d064569"
 dependencies = [
  "aes",
  "arc-swap",
@@ -3188,9 +3181,9 @@ dependencies = [
 
 [[package]]
 name = "spin"
-version = "0.9.8"
+version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
  "lock_api",
 ]
