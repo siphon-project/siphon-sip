@@ -232,7 +232,7 @@ fn cx_mar_avps_resolve_through_dictionary() {
 #[test]
 fn ro_ccr_with_ims_data_encode_decode() {
     let ims = ImsChargingData {
-        calling_party: Some("sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()),
+        calling_party: vec!["sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()],
         called_party: Some("sip:bob@ims.mnc001.mcc001.3gppnetwork.org".into()),
         sip_method: Some("INVITE".into()),
         role_of_node: Some(NodeRole::OriginatingRole),
@@ -279,7 +279,7 @@ fn ro_ccr_with_ims_data_encode_decode() {
 #[test]
 fn rf_acr_shares_ims_data_with_ro() {
     let ims = ImsChargingData {
-        calling_party: Some("sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()),
+        calling_party: vec!["sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()],
         called_party: Some("sip:bob@ims.mnc001.mcc001.3gppnetwork.org".into()),
         sip_method: Some("BYE".into()),
         role_of_node: Some(NodeRole::TerminatingRole),
@@ -313,7 +313,7 @@ fn rf_acr_shares_ims_data_with_ro() {
 #[test]
 fn ro_and_rf_different_app_ids_same_ims_data() {
     let ims = ImsChargingData {
-        calling_party: Some("sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()),
+        calling_party: vec!["sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()],
         called_party: Some("sip:bob@ims.mnc001.mcc001.3gppnetwork.org".into()),
         sip_method: Some("INVITE".into()),
         role_of_node: Some(NodeRole::OriginatingRole),
@@ -550,7 +550,7 @@ fn full_ims_call_flow_cx_ro_rf() {
 
     // Step 2: Ro CCR-Initial for online charging
     let ims = ImsChargingData {
-        calling_party: Some("sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()),
+        calling_party: vec!["sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()],
         called_party: Some("sip:bob@ims.mnc001.mcc001.3gppnetwork.org".into()),
         sip_method: Some("INVITE".into()),
         role_of_node: Some(NodeRole::OriginatingRole),
@@ -599,7 +599,7 @@ fn full_ims_call_flow_cx_ro_rf() {
 #[test]
 fn full_ims_call_flow_all_four_interfaces() {
     let ims = ImsChargingData {
-        calling_party: Some("sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()),
+        calling_party: vec!["sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()],
         called_party: Some("sip:bob@ims.mnc001.mcc001.3gppnetwork.org".into()),
         sip_method: Some("INVITE".into()),
         role_of_node: Some(NodeRole::OriginatingRole),

@@ -18,7 +18,7 @@ use tracing::info;
 use crate::diameter::codec::*;
 use crate::diameter::dictionary::{self, avp};
 use crate::diameter::peer::DiameterPeer;
-use crate::diameter::ro::{ImsChargingData, SmsChargingData};
+use crate::diameter::ro::{ImsChargingData, SmsChargingData, SubscriberId};
 
 // ── Service-Context-Id (TS 32.260 §5.0) ────────────────────────────────
 
@@ -152,6 +152,12 @@ pub struct AccountingParams<'a> {
     /// `User-Name` AVP (RFC 6733 §8.14) — typically a SIP URI / IMPU
     /// identifying the served subscriber.
     pub user_name: Option<&'a str>,
+    /// `Subscription-Id` AVP (RFC 4006 §8.46) — **0..n** per TS 32.299
+    /// §6.2.2.  Identifies the served party in the form the CDF bills on
+    /// (E.164 / IMSI / SIP URI).  Without it a CDR carries no subscriber
+    /// identity at all and the collector has to resolve the IMPU against an
+    /// HSS after the fact, which only works for locally-provisioned users.
+    pub subscription_ids: &'a [SubscriberId],
     /// `Termination-Cause` AVP (RFC 6733 §8.15).  Mandatory in ACR-STOP;
     /// must be `None` for START/INTERIM/EVENT.
     pub termination_cause: Option<u32>,
@@ -170,6 +176,7 @@ impl<'a> AccountingParams<'a> {
             event_timestamp: None,
             service_context_id: None,
             user_name: None,
+            subscription_ids: &[],
             termination_cause: None,
         }
     }
@@ -220,6 +227,13 @@ pub fn encode_acr_payload(
     // subscriber's SIP URI / IMPU.
     if let Some(name) = params.user_name {
         payload.extend_from_slice(&encode_avp_utf8(avp::USER_NAME, name));
+    }
+
+    // Subscription-Id (RFC 4006 §8.46), 0..n — the served party's billable
+    // identity.  Repeated rather than merged so a subscriber addressed by both
+    // an IMPU and an E.164 alias lands as two typed AVPs.
+    for subscriber in params.subscription_ids {
+        payload.extend_from_slice(&subscriber.encode());
     }
 
     // Event-Timestamp (RFC 6733 §8.21) — required for START/STOP/INTERIM
@@ -513,7 +527,7 @@ mod tests {
     #[test]
     fn ims_data_invite_originating() {
         let data = ImsChargingData {
-            calling_party: Some("sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()),
+            calling_party: vec!["sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()],
             called_party: Some("sip:bob@ims.mnc001.mcc001.3gppnetwork.org".into()),
             sip_method: Some("INVITE".into()),
             role_of_node: Some(NodeRole::OriginatingRole),
@@ -534,7 +548,7 @@ mod tests {
     #[test]
     fn ims_data_register_event_pcscf() {
         let data = ImsChargingData {
-            calling_party: Some("sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()),
+            calling_party: vec!["sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()],
             sip_method: Some("REGISTER".into()),
             role_of_node: Some(NodeRole::OriginatingRole),
             node_functionality: Some(NodeFunctionality::PCscf),
@@ -603,7 +617,7 @@ mod tests {
     #[test]
     fn acr_start_wire_roundtrip() {
         let ims = ImsChargingData {
-            calling_party: Some("sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()),
+            calling_party: vec!["sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()],
             called_party: Some("sip:bob@ims.mnc001.mcc001.3gppnetwork.org".into()),
             sip_method: Some("INVITE".into()),
             role_of_node: Some(NodeRole::OriginatingRole),
@@ -712,7 +726,7 @@ mod tests {
     #[test]
     fn acr_event_wire_roundtrip() {
         let ims = ImsChargingData {
-            calling_party: Some("sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()),
+            calling_party: vec!["sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()],
             called_party: None,
             sip_method: Some("MESSAGE".into()),
             role_of_node: Some(NodeRole::OriginatingRole),
@@ -1171,6 +1185,246 @@ mod tests {
         assert!(
             svc.get("SMS-Information").is_some(),
             "SMS-Information must nest under the single Service-Information"
+        );
+    }
+
+    // ── Wire-level AVP cardinality (TS 32.299 §6.2.2) ───────────────────
+    //
+    // These walk the encoded bytes rather than `decode_diameter`, whose JSON
+    // view keys AVPs by name and so collapses a repeated AVP to whichever
+    // occurrence it saw last — exactly the property under test here.
+
+    struct WireAvp<'a> {
+        code: u32,
+        data: &'a [u8],
+    }
+
+    /// Split one run of encoded AVPs into (code, payload) pairs, skipping the
+    /// vendor-id word when the V bit is set and honouring the 4-octet padding
+    /// (RFC 6733 §4.1).
+    fn split_avps(buf: &[u8]) -> Vec<WireAvp<'_>> {
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        while offset + 8 <= buf.len() {
+            let code = u32::from_be_bytes([
+                buf[offset],
+                buf[offset + 1],
+                buf[offset + 2],
+                buf[offset + 3],
+            ]);
+            let flags = buf[offset + 4];
+            let length =
+                u32::from_be_bytes([0, buf[offset + 5], buf[offset + 6], buf[offset + 7]]) as usize;
+            if length < 8 || offset + length > buf.len() {
+                break;
+            }
+            let header = if flags & 0x80 != 0 { 12 } else { 8 };
+            out.push(WireAvp {
+                code,
+                data: &buf[offset + header..offset + length],
+            });
+            offset += length.div_ceil(4) * 4;
+        }
+        out
+    }
+
+    fn avps_with_code(buf: &[u8], code: u32) -> Vec<&[u8]> {
+        split_avps(buf)
+            .into_iter()
+            .filter(|avp| avp.code == code)
+            .map(|avp| avp.data)
+            .collect()
+    }
+
+    fn first_avp(buf: &[u8], code: u32) -> Option<&[u8]> {
+        avps_with_code(buf, code).into_iter().next()
+    }
+
+    /// Descend Service-Information (873) → IMS-Information (876).
+    fn ims_information(payload: &[u8]) -> &[u8] {
+        let service_info = first_avp(payload, avp::SERVICE_INFORMATION)
+            .expect("Service-Information must be present");
+        first_avp(service_info, avp::IMS_INFORMATION).expect("IMS-Information must be present")
+    }
+
+    fn utf8(data: &[u8]) -> String {
+        String::from_utf8(data.to_vec()).expect("UTF8String AVP")
+    }
+
+    fn diameter_time(data: &[u8]) -> u64 {
+        let secs = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as u64;
+        secs - crate::diameter::codec::NTP_UNIX_EPOCH_OFFSET
+    }
+
+    fn unix_secs(time: SystemTime) -> u64 {
+        time.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    fn encode_for_test(params: &AccountingParams<'_>) -> Vec<u8> {
+        encode_acr_payload(
+            "scscf.ims.mnc001.mcc001.3gppnetwork.org",
+            "ims.mnc001.mcc001.3gppnetwork.org",
+            "ims.mnc001.mcc001.3gppnetwork.org",
+            None,
+            "scscf.ims.mnc001.mcc001.3gppnetwork.org;1;1",
+            params,
+        )
+    }
+
+    /// A P-Asserted-Identity asserting an IMPU, its tel alias and the
+    /// IMSI-derived IMPU must produce three Calling-Party-Address AVPs — not
+    /// one AVP holding the raw header line.
+    #[test]
+    fn calling_party_address_repeats_once_per_identity() {
+        let ims = ImsChargingData {
+            calling_party: vec![
+                "sip:3001@ims.mnc001.mcc001.3gppnetwork.org".into(),
+                "tel:3001".into(),
+                "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org".into(),
+            ],
+            called_party: Some("sip:3002@ims.mnc001.mcc001.3gppnetwork.org".into()),
+            ..Default::default()
+        };
+        let mut params = AccountingParams::new(AccountingRecordType::StartRecord);
+        params.ims_data = Some(&ims);
+        let payload = encode_for_test(&params);
+
+        let addresses: Vec<String> = avps_with_code(ims_information(&payload), avp::CALLING_PARTY_ADDRESS)
+            .into_iter()
+            .map(utf8)
+            .collect();
+        assert_eq!(
+            addresses,
+            vec![
+                "sip:3001@ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+                "tel:3001".to_string(),
+                "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            ]
+        );
+        for address in &addresses {
+            assert!(
+                !address.contains(','),
+                "identities must not be concatenated: {address}"
+            );
+        }
+    }
+
+    /// Subscription-Id is what the CDF bills on; without it every CDR lands
+    /// with an empty subscriber and the collector has to resolve the IMPU
+    /// out-of-band.
+    #[test]
+    fn subscription_id_emitted_once_per_served_identity_and_typed_by_scheme() {
+        let subscribers = [
+            SubscriberId::sip_uri("sip:3001@ims.mnc001.mcc001.3gppnetwork.org"),
+            SubscriberId::msisdn("+31612345678"),
+            SubscriberId::imsi("001010000000001"),
+        ];
+        let mut params = AccountingParams::new(AccountingRecordType::StartRecord);
+        params.subscription_ids = &subscribers;
+        let payload = encode_for_test(&params);
+
+        let ids = avps_with_code(&payload, avp::SUBSCRIPTION_ID);
+        assert_eq!(ids.len(), 3, "Subscription-Id is 0..n, one per identity");
+
+        let decoded: Vec<(u64, String)> = ids
+            .iter()
+            .map(|group| {
+                let kind = first_avp(group, avp::SUBSCRIPTION_ID_TYPE)
+                    .map(|d| u32::from_be_bytes([d[0], d[1], d[2], d[3]]) as u64)
+                    .expect("Subscription-Id-Type");
+                let data = first_avp(group, avp::SUBSCRIPTION_ID_DATA)
+                    .map(utf8)
+                    .expect("Subscription-Id-Data");
+                (kind, data)
+            })
+            .collect();
+        assert_eq!(
+            decoded,
+            vec![
+                (2, "sip:3001@ims.mnc001.mcc001.3gppnetwork.org".to_string()), // END_USER_SIP_URI
+                (0, "+31612345678".to_string()),                              // END_USER_E164
+                (1, "001010000000001".to_string()),                           // END_USER_IMSI
+            ]
+        );
+    }
+
+    #[test]
+    fn acr_without_subscription_ids_emits_none() {
+        let params = AccountingParams::new(AccountingRecordType::StartRecord);
+        let payload = encode_for_test(&params);
+        assert!(avps_with_code(&payload, avp::SUBSCRIPTION_ID).is_empty());
+    }
+
+    /// The answer instant. ACR-START is emitted on the 200 OK, so
+    /// Event-Timestamp is the answer and Time-Stamps must carry the INVITE and
+    /// the 200 OK separately — otherwise a CDF cannot separate ring time from
+    /// billable duration, which is the whole point of the AVP.
+    #[test]
+    fn acr_start_carries_both_time_stamps() {
+        let invite_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_787_059_616);
+        let answer_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_787_059_622);
+        let ims = ImsChargingData {
+            sip_method: Some("INVITE".into()),
+            request_timestamp: Some(invite_at),
+            response_timestamp: Some(answer_at),
+            ..Default::default()
+        };
+        let mut params = AccountingParams::new(AccountingRecordType::StartRecord);
+        params.ims_data = Some(&ims);
+        params.event_timestamp = Some(answer_at);
+        let payload = encode_for_test(&params);
+
+        let time_stamps =
+            first_avp(ims_information(&payload), avp::TIME_STAMPS).expect("Time-Stamps");
+        let request = first_avp(time_stamps, avp::SIP_REQUEST_TIMESTAMP)
+            .map(diameter_time)
+            .expect("SIP-Request-Timestamp");
+        let response = first_avp(time_stamps, avp::SIP_RESPONSE_TIMESTAMP)
+            .map(diameter_time)
+            .expect("SIP-Response-Timestamp");
+        let event = first_avp(&payload, avp::EVENT_TIMESTAMP)
+            .map(diameter_time)
+            .expect("Event-Timestamp");
+
+        assert_eq!(request, unix_secs(invite_at));
+        assert_eq!(response, unix_secs(answer_at));
+        assert_eq!(event, unix_secs(answer_at), "START is stamped at the answer");
+        assert_eq!(
+            response - request,
+            6,
+            "ring time must be recoverable from Time-Stamps alone"
+        );
+    }
+
+    /// An unsuccessful session establishment is reported as ACR-EVENT with a
+    /// negative Cause-Code (TS 32.299 §7.2.35) — the only record a failed call
+    /// produces, and the only one that ever distinguishes failure from success.
+    #[test]
+    fn acr_event_for_failed_setup_carries_negative_cause_code() {
+        let ims = ImsChargingData {
+            sip_method: Some("INVITE".into()),
+            cause_code: sip_status_to_cause_code(486),
+            ims_charging_identifier: Some("icid-failed-setup".into()),
+            ..Default::default()
+        };
+        let mut params = AccountingParams::new(AccountingRecordType::EventRecord);
+        params.ims_data = Some(&ims);
+        let payload = encode_for_test(&params);
+
+        let ims_info = ims_information(&payload);
+        let cause = first_avp(ims_info, avp::CAUSE_CODE)
+            .map(|d| i32::from_be_bytes([d[0], d[1], d[2], d[3]]))
+            .expect("Cause-Code");
+        assert_eq!(cause, -486);
+        assert_eq!(
+            first_avp(ims_info, avp::IMS_CHARGING_IDENTIFIER).map(utf8),
+            Some("icid-failed-setup".to_string()),
+            "the failure record must correlate with the rest of the session"
+        );
+        assert_eq!(
+            first_avp(&payload, avp::ACCOUNTING_RECORD_TYPE)
+                .map(|d| u32::from_be_bytes([d[0], d[1], d[2], d[3]])),
+            Some(1) // EVENT
         );
     }
 }

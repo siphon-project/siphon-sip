@@ -248,6 +248,23 @@ struct DispatcherState {
     /// when `rf_charger` is `None` so the auto-emit hot path branches
     /// out cheaply.
     rf_sessions: Arc<DashMap<String, Arc<ProxyRfState>>>,
+    /// Primary `rf_sessions` keys with an ACR-START **in flight**, so the
+    /// dedupe gate holds across the CDF round-trip.
+    ///
+    /// `rf_sessions` only gains an entry once ACR-START has been answered, but
+    /// the two legs of an intra-node call are answered within milliseconds of
+    /// each other — the S-CSCF's speculative dual-ACR terminating record
+    /// (spawned off the originating leg's 2xx) and the terminating leg's own
+    /// record both passed a `contains_key` check before either insert landed,
+    /// so the node opened two TERMINATING records on one ICID.  Only one of
+    /// them is reachable from the BYE, so the other never gets an ACR-STOP and
+    /// emits an ACR-INTERIM every `interim_interval_secs` until the 24h
+    /// max-lifetime backstop fires.
+    ///
+    /// Reserving the key synchronously — before the spawn — closes that
+    /// window.  Entries are removed as soon as ACR-START resolves either way;
+    /// the orphan sweep reaps any whose task died mid-flight.
+    rf_pending_starts: Arc<DashMap<String, std::time::Instant>>,
     /// Ro online-charging service (RFC 8506 / TS 32.299) — `None` when `ro:`
     /// is unset/disabled or no Diameter peers are configured.
     ro_charger: Option<Arc<crate::diameter::ro_service::RoChargingService>>,
@@ -707,6 +724,7 @@ pub async fn run(
         is_draining: drain.clone(),
         rf_charger,
         rf_sessions: Arc::new(DashMap::new()),
+        rf_pending_starts: Arc::new(DashMap::new()),
         ro_charger,
         ro_sessions: Arc::new(DashMap::new()),
         cdr_sessions: Arc::new(DashMap::new()),
@@ -1781,11 +1799,31 @@ async fn sweep_stale_entries(state: &DispatcherState) {
     // Proxy Rf charging sessions — one Arc may be filed under several keys
     // (storage_keys aliases), so retain on the value's age to drop every alias
     // of an orphan in one pass.
+    //
+    // Dropping the map entry is not enough on its own: the accounting session
+    // owns an ACR-INTERIM timer task and a slot in the `siphon_rf_sessions`
+    // gauge, and both outlive the entry. Claim the stop as the entry goes so
+    // the timer is aborted and the gauge released here rather than at the
+    // charging layer's own 24h backstop.
     let rf_before = state.rf_sessions.len();
-    state
-        .rf_sessions
-        .retain(|_, st| now.duration_since(st.created_at) < ORPHAN_CALL_TTL);
+    state.rf_sessions.retain(|_, st| {
+        let live = now.duration_since(st.created_at) < ORPHAN_CALL_TTL;
+        if !live {
+            if let Some(charger) = state.rf_charger.as_ref() {
+                charger.release_abandoned(st.rf_session());
+            }
+        }
+        live
+    });
     let expired_rf = rf_before.saturating_sub(state.rf_sessions.len()) as u64;
+
+    // In-flight ACR-START reservations — released by their own task on every
+    // normal exit path; this only reaps one whose task never ran to completion
+    // (runtime shutdown mid-flight), so a wedged key can't dedupe every future
+    // record for that ICID.
+    state
+        .rf_pending_starts
+        .retain(|_, started| now.duration_since(*started) < ORPHAN_CALL_TTL);
 
     // Auto-emit CDR sessions — orphan backstop. Normal calls drain on their
     // teardown hook (BYE / failure / cancel / timeout); this only reaps entries
@@ -5554,7 +5592,7 @@ fn handle_response(
                         // on_reply / on_failure callback see the
                         // same listener context as the on_request
                         // handler did (P-CSCF Path-token MT routing
-                        // — see CLAUDE.md / TS 24.229 §5.2.7.2).
+                        // — TS 24.229 §5.2.7.2).
                         req.set_local_port(inbound_local_addr.port());
                         req.set_inbound_flow(inbound_local_addr, connection_id.0);
                         match Py::new(python, req) {
@@ -5826,6 +5864,16 @@ fn handle_response(
                             None
                         };
 
+                        // Rf: same story — the INVITE is about to be moved into
+                        // the on_failure PyRequest, and the ACR-EVENT for an
+                        // unsuccessful setup may only be emitted once the
+                        // failure is actually forwarded upstream.
+                        let rf_fail_request = state
+                            .rf_charger
+                            .as_ref()
+                            .filter(|charger| charger.auto_emit_proxy())
+                            .map(|_| original_request.clone());
+
                         // Invoke @proxy.on_failure handlers before forwarding
                         let outcome = run_proxy_failure_handlers(
                             best_response,
@@ -5885,6 +5933,19 @@ fn handle_response(
                             );
                         }
 
+                        // Rf ACR-EVENT for the forked failure, at the same
+                        // convergence point and under the same once-only rule
+                        // (TS 32.260 §5.2.2.1).
+                        if let Some(invite) = &rf_fail_request {
+                            spawn_rf_proxy_event_on_failed_invite(
+                                state,
+                                &server_key,
+                                invite,
+                                best_code,
+                                &session_arc,
+                            );
+                        }
+
                         state.session_store.remove_by_server_key(&server_key);
                         return;
                     }
@@ -5915,7 +5976,7 @@ fn handle_response(
             if (200..300).contains(&status_code)
                 && server_key.method == crate::sip::message::Method::Invite
             {
-                spawn_rf_proxy_start_if_invite(state, &server_key, &original_request);
+                spawn_rf_proxy_start_if_invite(state, &server_key, &original_request, &session_arc);
                 // CDR: stamp the answer time on the tracked call (cdr.auto_emit).
                 cdr_mark_proxy_answer(state, &original_request, status_code);
             } else if (300..700).contains(&status_code)
@@ -5923,6 +5984,18 @@ fn handle_response(
                 && status_code != 407
                 && server_key.method == crate::sip::message::Method::Invite
             {
+                // Rf ACR-EVENT on unsuccessful session establishment
+                // (TS 32.260 §5.2.2.1). Without it, moving ACR-START to the 2xx
+                // would drop every unanswered and rejected call from the record
+                // set entirely — and it is the only record that ever carries a
+                // non-zero Cause-Code.
+                spawn_rf_proxy_event_on_failed_invite(
+                    state,
+                    &server_key,
+                    &original_request,
+                    status_code,
+                    &session_arc,
+                );
                 // CDR: a single-relay INVITE received a final non-2xx (not an
                 // auth challenge — the UA re-sends those) → the call failed
                 // (cdr.auto_emit). Forked failures finalize at ForwardBestError.
@@ -9496,6 +9569,136 @@ fn cdr_finalize_b2bua_fail(state: &DispatcherState, internal_call_id: &str, resp
     );
 }
 
+/// `Time-Stamps` for a record about to be emitted for `session`: the wall-clock
+/// instant its INVITE arrived, plus now for the response.
+///
+/// The proxy session's `created_at` is the INVITE's arrival, so this is the
+/// only place the pair can be recovered — by the time the 2xx lands, the
+/// request instant is long past and sampling the clock inside the ACR builder
+/// would stamp the answer time into `SIP-Request-Timestamp`, leaving the CDF
+/// with no way to tell ring time from talk time.
+fn rf_timestamps_for_session(
+    session_arc: &Arc<std::sync::RwLock<crate::proxy::session::ProxySession>>,
+) -> crate::diameter::rf_service::SipTimestamps {
+    match session_arc.read() {
+        Ok(session) => {
+            crate::diameter::rf_service::SipTimestamps::from_request_instant(session.created_at)
+        }
+        // A poisoned lock means some other task panicked mid-call; the record
+        // is still worth emitting, just without a trustworthy request instant.
+        Err(_) => crate::diameter::rf_service::SipTimestamps::now(),
+    }
+}
+
+/// Spawn ACR-EVENT for an INVITE that got a final non-2xx (TS 32.260
+/// §5.2.2.1 — "unsuccessful session establishment").
+///
+/// This is the only Rf record a failed call ever produces: no accounting
+/// session is opened, so there is no START/STOP pair, and it is the only place
+/// a non-zero `Cause-Code` reaches the CDF. Without it, a collector cannot
+/// distinguish "nobody answered" from "never attempted".
+///
+/// Auth challenges (401/407) are excluded — the UA re-sends against them and
+/// the retry is the same call attempt, not a new failed one. 487 is *not*
+/// excluded: a caller who hung up during alerting is a real, reportable
+/// unsuccessful setup.
+fn spawn_rf_proxy_event_on_failed_invite(
+    state: &DispatcherState,
+    server_key: &TransactionKey,
+    original_request: &SipMessage,
+    status_code: u16,
+    session_arc: &Arc<std::sync::RwLock<crate::proxy::session::ProxySession>>,
+) {
+    let charger = match state.rf_charger.as_ref() {
+        Some(c) if c.auto_emit_proxy() => Arc::clone(c),
+        _ => return,
+    };
+    if server_key.method != crate::sip::message::Method::Invite {
+        return;
+    }
+    if status_code == 401 || status_code == 407 {
+        return;
+    }
+    // Only an *initial* INVITE can fail to establish a session. A re-INVITE
+    // carries a To-tag and belongs to a dialog that is already up and already
+    // has its own accounting session, so a failed one is a mid-call event, not
+    // a failed setup.
+    if original_request
+        .typed_to()
+        .ok()
+        .flatten()
+        .and_then(|to| to.tag)
+        .is_some()
+    {
+        return;
+    }
+    let Some(cause_code) = crate::diameter::rf::sip_status_to_cause_code(status_code) else {
+        return;
+    };
+    let timestamps = rf_timestamps_for_session(session_arc);
+
+    let local_predicate = rf_local_uri_predicate(&state.local_domains);
+    let mut ims_data = crate::diameter::rf_service::ims_data_from_request(
+        original_request,
+        charger.node_functionality(),
+        &local_predicate,
+        timestamps,
+    );
+    if let Some((call_id, from_tag)) = rf_extract_dialog_parts(original_request) {
+        let drained = crate::diameter::rf_service::read_rf_charging_params(&format!(
+            "{}\0{}",
+            call_id, from_tag
+        ));
+        crate::diameter::rf_service::apply_charging_params(&mut ims_data, drained);
+    }
+    ims_data.cause_code = Some(cause_code);
+
+    let user_name = crate::diameter::rf_service::served_party_identities(&ims_data)
+        .into_iter()
+        .next();
+    debug!(
+        status_code,
+        cause_code, "rf: proxy ACR-EVENT for unsuccessful session establishment"
+    );
+    tokio::spawn(async move {
+        charger.acr_event(ims_data, user_name).await;
+    });
+}
+
+/// Holds an `rf_pending_starts` reservation for as long as the ACR-START it
+/// guards is in flight, and releases it on drop — so a rejected START, a
+/// dropped peer, or a panic can't wedge the key permanently.
+struct RfStartReservation {
+    pending: Arc<DashMap<String, std::time::Instant>>,
+    key: String,
+}
+
+impl Drop for RfStartReservation {
+    fn drop(&mut self) {
+        self.pending.remove(&self.key);
+    }
+}
+
+/// Claim `key` for an ACR-START that is about to be spawned.  `None` means
+/// another task is already opening a record under it — the caller must not
+/// spawn a second one.
+fn rf_reserve_start(
+    pending: &Arc<DashMap<String, std::time::Instant>>,
+    key: &str,
+) -> Option<RfStartReservation> {
+    use dashmap::mapref::entry::Entry;
+    match pending.entry(key.to_string()) {
+        Entry::Occupied(_) => None,
+        Entry::Vacant(slot) => {
+            slot.insert(std::time::Instant::now());
+            Some(RfStartReservation {
+                pending: Arc::clone(pending),
+                key: key.to_string(),
+            })
+        }
+    }
+}
+
 /// Spawn ACR-START for the INVITE that just got a 2xx forwarded by the
 /// proxy.  No-op when `rf_charger` is unset, auto-emit is disabled, or
 /// the original method wasn't INVITE.
@@ -9518,6 +9721,7 @@ fn spawn_rf_proxy_start_if_invite(
     state: &DispatcherState,
     server_key: &TransactionKey,
     original_request: &SipMessage,
+    session_arc: &Arc<std::sync::RwLock<crate::proxy::session::ProxySession>>,
 ) {
     use crate::diameter::rf_service::{
         rf_icid_key, rf_dialog_key as build_rf_dialog_key, rf_session_storage_keys, RfRole,
@@ -9549,6 +9753,9 @@ fn spawn_rf_proxy_start_if_invite(
         }
     };
     let icid = rf_extract_icid(original_request);
+    // Resolved only once charging is known to be on — an operator running
+    // without Rf must not pay a session read-lock per answered call.
+    let timestamps = rf_timestamps_for_session(session_arc);
 
     // Build the IMS data first so we can key the dedupe by the
     // *actual* role (orig vs term) the request resolves to.  Hard-
@@ -9562,6 +9769,7 @@ fn spawn_rf_proxy_start_if_invite(
         original_request,
         charger.node_functionality(),
         &local_predicate,
+        timestamps,
     );
     // Apply any script-supplied charging params (set via
     // `request.set_charging_param("outgoing-trunk-group-id", "...")`).
@@ -9590,6 +9798,15 @@ fn spawn_rf_proxy_start_if_invite(
         );
         return;
     }
+    // Hold the key for the duration of the CDF round-trip, not just up to the
+    // spawn — see `DispatcherState::rf_pending_starts`.
+    let Some(primary_reservation) = rf_reserve_start(&state.rf_pending_starts, &primary_key) else {
+        debug!(
+            primary_key = %primary_key,
+            "rf: proxy ACR-START skipped — record already opening"
+        );
+        return;
+    };
     debug!(
         primary_key = %primary_key,
         role = primary_role.as_suffix(),
@@ -9618,7 +9835,6 @@ fn spawn_rf_proxy_start_if_invite(
         None
     };
 
-    let primary_user_name = ims_data.calling_party.clone();
     let rf_sessions = Arc::clone(&state.rf_sessions);
 
     if let Some(term_user) = term_user_name {
@@ -9631,10 +9847,11 @@ fn spawn_rf_proxy_start_if_invite(
             &from_tag,
             RfRole::Terminating,
         );
-        // TERM-side dedupe: an iFC re-dispatch could land on the
-        // same dialog with a different role mapping.  Cheap probe of
-        // the first storage key (ICID-keyed when present, else
-        // dialog fallback) catches the duplicate before we spawn.
+        // TERM-side dedupe: the terminating leg of an intra-node call reaches
+        // this function on its own 2xx and resolves to the same `:term` key,
+        // so without the in-flight reservation both it and this speculative
+        // record open one — same ICID, same role, two Session-Ids, and only
+        // one of them reachable from the BYE.
         if let Some(first_term_key) = term_keys.first() {
             if state.rf_sessions.contains_key(first_term_key) {
                 debug!(
@@ -9643,7 +9860,9 @@ fn spawn_rf_proxy_start_if_invite(
                 );
                 // Fall through to spawn the ORIG record.
                 let _ = term_user;
-            } else {
+            } else if let Some(term_reservation) =
+                rf_reserve_start(&state.rf_pending_starts, first_term_key)
+            {
                 let mut ims_term = ims_data.clone();
                 ims_term.role_of_node = Some(crate::diameter::ro::NodeRole::TerminatingRole);
                 let charger_term = Arc::clone(&charger);
@@ -9651,6 +9870,9 @@ fn spawn_rf_proxy_start_if_invite(
                 let term_user_for_record = term_user.clone();
                 let term_keys_for_spawn = term_keys.clone();
                 tokio::spawn(async move {
+                    // Held until the task ends so the reservation outlives the
+                    // ACR-START round-trip and is released on every exit path.
+                    let _reservation = term_reservation;
                     let session = match charger_term
                         .acr_start(ims_term.clone(), Some(term_user_for_record.clone()))
                         .await
@@ -9669,6 +9891,11 @@ fn spawn_rf_proxy_start_if_invite(
                         rf_sessions_term.insert(key, Arc::clone(&entry));
                     }
                 });
+            } else {
+                debug!(
+                    term_key = %first_term_key,
+                    "rf: dual-ACR TERM skipped — record already opening"
+                );
             }
         }
     }
@@ -9692,7 +9919,16 @@ fn spawn_rf_proxy_start_if_invite(
             RfRole::Terminating => crate::diameter::ro::NodeRole::TerminatingRole,
         });
     }
+    // User-Name names the *served* party (TS 32.260 §5.1), which on the
+    // standalone terminating leg of an intra-node call is the callee — taking
+    // the calling party unconditionally put the caller's IMPU on the callee's
+    // record.
+    let primary_user_name =
+        crate::diameter::rf_service::served_party_identities(&ims_primary)
+            .into_iter()
+            .next();
     tokio::spawn(async move {
+        let _reservation = primary_reservation;
         let session = match charger
             .acr_start(ims_primary.clone(), primary_user_name.clone())
             .await
@@ -9811,6 +10047,12 @@ fn spawn_rf_proxy_stop_if_tracked(state: &DispatcherState, bye: &SipMessage) {
                 let user_name = entry.user_name.clone();
                 ims_data.sip_method = Some("BYE".to_string());
                 ims_data.cause_code = cause_code.or(Some(0));
+                // Time-Stamps describes *this* record's trigger request
+                // (TS 32.299 §7.2.183), and for a STOP that is the BYE — not
+                // the INVITE the START already reported. Carrying the INVITE
+                // instant forward left a record whose Event-Type said BYE and
+                // whose request timestamp was minutes older.
+                ims_data.request_timestamp = Some(response_timestamp);
                 ims_data.response_timestamp = Some(response_timestamp);
                 charger
                     .acr_stop(
@@ -9905,6 +10147,9 @@ pub async fn ro_authorize_b2bua(
         &invite,
         charger.node_functionality(),
         local_predicate,
+        // Ro authorizes before the call is answered, so the INVITE is the
+        // present event and there is no response instant yet.
+        crate::diameter::rf_service::SipTimestamps::now(),
     );
     ims_data.role_of_node = Some(crate::diameter::ro::NodeRole::B2buaRole);
 
@@ -9913,7 +10158,9 @@ pub async fn ro_authorize_b2bua(
         None => {
             let party = match charger.config().charge.as_str() {
                 "term" => ims_data.called_party.clone(),
-                _ => ims_data.calling_party.clone(),
+                // The calling party may be asserted under several identities;
+                // charge the first, which is the canonical IMPU.
+                _ => ims_data.calling_party.first().cloned(),
             };
             let Some(party_uri) = party else {
                 warn!(call_id = %internal_call_id,
@@ -10027,6 +10274,13 @@ fn spawn_rf_b2bua_start(
         );
         return;
     }
+    let Some(reservation) = rf_reserve_start(&state.rf_pending_starts, &key) else {
+        debug!(
+            call_id = %internal_call_id,
+            "rf: B2BUA ACR-START skipped — record already opening"
+        );
+        return;
+    };
     debug!(
         call_id = %internal_call_id,
         "rf: B2BUA ACR-START spawning"
@@ -10038,11 +10292,21 @@ fn spawn_rf_b2bua_start(
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     };
+    // The call actor's creation instant is the A-leg INVITE's arrival; this
+    // record is built at the answer, so both ends of Time-Stamps come from
+    // there rather than from a clock sample taken now.
+    let timestamps = match state.call_actors.created_at(internal_call_id) {
+        Some(invite_received) => {
+            crate::diameter::rf_service::SipTimestamps::from_request_instant(invite_received)
+        }
+        None => crate::diameter::rf_service::SipTimestamps::now(),
+    };
     let local_predicate = rf_local_uri_predicate(&state.local_domains);
     let mut ims_data = crate::diameter::rf_service::ims_data_from_request(
         &invite_clone,
         charger.node_functionality(),
         local_predicate,
+        timestamps,
     );
     // Drain any script-supplied charging params keyed by the A-leg
     // dialog (BGCF / MGCF auto-emit stamping trunk-group-id, etc.).
@@ -10059,9 +10323,12 @@ fn spawn_rf_b2bua_start(
     // they want the role override they can call
     // diameter.rf_acr_* manually with role_of_node=...
     ims_data.role_of_node = Some(crate::diameter::ro::NodeRole::B2buaRole);
-    let user_name = ims_data.calling_party.clone();
+    let user_name = crate::diameter::rf_service::served_party_identities(&ims_data)
+        .into_iter()
+        .next();
     let rf_sessions = Arc::clone(&state.rf_sessions);
     tokio::spawn(async move {
+        let _reservation = reservation;
         let session = match charger.acr_start(ims_data.clone(), user_name.clone()).await {
             Some(s) => s,
             None => return,
@@ -10133,6 +10400,8 @@ fn spawn_rf_b2bua_stop(
         };
         ims_data.sip_method = Some("BYE".to_string());
         ims_data.cause_code = cause_code.or(Some(0));
+        // See the proxy stop path: Time-Stamps on a STOP describes the BYE.
+        ims_data.request_timestamp = Some(response_timestamp);
         ims_data.response_timestamp = Some(response_timestamp);
         charger
             .acr_stop(
@@ -21083,7 +21352,7 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // Registrar-liveness SA-idle sweep — SIP last-seen fold-in + probe
-    // hysteresis (Part B, prodcore-1 false-dereg fix)
+    // hysteresis (Part B of the false-deregistration fix)
     // -----------------------------------------------------------------------
 
     fn ip(addr: &str) -> std::net::IpAddr {
@@ -24510,5 +24779,84 @@ a=rtpmap:8 PCMA/8000\r\n";
         let detail = "é".repeat(4096);
         let logged = truncate_for_log(&detail);
         assert!(logged.ends_with("more bytes elided)"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Rf ACR-START dedupe across the CDF round-trip (TS 32.260 §5.1)
+    // -----------------------------------------------------------------------
+
+    /// The duplicate-record bug, reproduced: an intra-node call reaches
+    /// `spawn_rf_proxy_start_if_invite` twice within milliseconds — once as the
+    /// originating leg's speculative dual-ACR terminating record, once as the
+    /// terminating leg's own record — and both resolve to the same
+    /// `icid:<ICID>:term` key.
+    ///
+    /// `rf_sessions` only gains its entry after the CDF answers ACR-START, so
+    /// the `contains_key` gate alone lets both through and the node opens two
+    /// TERMINATING records on one ICID.  Only one is reachable from the BYE, so
+    /// the other never gets an ACR-STOP and emits an ACR-INTERIM every cadence
+    /// tick until the 24h backstop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_acr_starts_on_one_key_open_a_single_record() {
+        let rf_sessions: Arc<DashMap<String, u32>> = Arc::new(DashMap::new());
+        let pending: Arc<DashMap<String, std::time::Instant>> = Arc::new(DashMap::new());
+        let key = "icid:f58d8725-f905-437d-bb63-92610e417bd0:term";
+
+        let mut legs = Vec::new();
+        for leg in 0..2u32 {
+            let rf_sessions = Arc::clone(&rf_sessions);
+            let pending = Arc::clone(&pending);
+            legs.push(tokio::spawn(async move {
+                // Both legs observe an empty map — this is the window the old
+                // gate could not close.
+                assert!(
+                    !rf_sessions.contains_key(key),
+                    "the record cannot be filed before either ACR-START is answered"
+                );
+                let Some(reservation) = rf_reserve_start(&pending, key) else {
+                    return false;
+                };
+                // Stand in for the CDF round-trip: the ACA is what unblocks the
+                // insert, and it takes long enough for the other leg to arrive.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                rf_sessions.insert(key.to_string(), leg);
+                drop(reservation);
+                true
+            }));
+        }
+
+        let mut opened = 0;
+        for leg in legs {
+            if leg.await.expect("leg task") {
+                opened += 1;
+            }
+        }
+
+        assert_eq!(opened, 1, "exactly one leg may open the accounting record");
+        assert_eq!(rf_sessions.len(), 1);
+        assert!(
+            pending.is_empty(),
+            "the reservation must be released once ACR-START resolves"
+        );
+    }
+
+    /// A reservation is released even when ACR-START never files a record —
+    /// a CDF rejection must not wedge the key for the life of the process.
+    #[test]
+    fn a_dropped_reservation_frees_the_key() {
+        let pending: Arc<DashMap<String, std::time::Instant>> = Arc::new(DashMap::new());
+        let key = "icid:abc:orig";
+
+        let first = rf_reserve_start(&pending, key).expect("first claim wins");
+        assert!(
+            rf_reserve_start(&pending, key).is_none(),
+            "a second claim must lose while the first is in flight"
+        );
+        drop(first);
+        assert!(pending.is_empty());
+        assert!(
+            rf_reserve_start(&pending, key).is_some(),
+            "the key is claimable again once the in-flight START resolved"
+        );
     }
 }

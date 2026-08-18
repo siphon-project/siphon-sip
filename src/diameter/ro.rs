@@ -180,7 +180,33 @@ impl SubscriberId {
         }
     }
 
-    fn encode(&self) -> Vec<u8> {
+    /// Classify a bare SIP-layer identity (an IMPU taken from
+    /// `P-Asserted-Identity`, `From`, or a `To` URI) into the
+    /// `Subscription-Id-Type` the CDF expects per RFC 4006 §8.47:
+    ///
+    /// - `tel:` URIs and bare `+E.164` strings → `END_USER_E164`, with the
+    ///   scheme stripped so the CDF stores a dialable number rather than a URI.
+    /// - everything else (`sip:` / `sips:` IMPUs) → `END_USER_SIP_URI`,
+    ///   kept verbatim.
+    ///
+    /// IMSI-typed records are never inferred here — an IMSI is not derivable
+    /// from a SIP identity, so callers that hold one build it with
+    /// [`SubscriberId::imsi`].
+    pub fn from_identity(identity: &str) -> Self {
+        let trimmed = identity.trim();
+        if let Some(number) = trimmed.strip_prefix("tel:") {
+            // A tel URI may carry parameters (`tel:+31612345678;phone-context=…`);
+            // only the subscriber part belongs in Subscription-Id-Data.
+            let number = number.split(';').next().unwrap_or(number);
+            return Self::msisdn(number);
+        }
+        if trimmed.starts_with('+') && trimmed[1..].chars().all(|c| c.is_ascii_digit()) {
+            return Self::msisdn(trimmed);
+        }
+        Self::sip_uri(trimmed)
+    }
+
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut inner = Vec::new();
         inner.extend_from_slice(&encode_avp_u32(avp::SUBSCRIPTION_ID_TYPE, self.kind.as_u32()));
         inner.extend_from_slice(&encode_avp_utf8(avp::SUBSCRIPTION_ID_DATA, &self.data));
@@ -227,7 +253,13 @@ impl ServiceUnit {
 /// is not applicable.
 #[derive(Debug, Clone, Default)]
 pub struct ImsChargingData {
-    pub calling_party: Option<String>,
+    /// `Calling-Party-Address` (TS 32.299 §7.2.33) — **0..n**.  A SIP
+    /// `P-Asserted-Identity` may assert several identities for one party
+    /// (typically a `sip:` IMPU plus its `tel:` alias), and the spec models
+    /// that as a repeated AVP, not one concatenated string.  Order is
+    /// significant only in that the first entry is treated as canonical for
+    /// `User-Name` and for the served-party `Subscription-Id`.
+    pub calling_party: Vec<String>,
     pub called_party: Option<String>,
     pub sip_method: Option<String>,
     pub event: Option<String>,
@@ -306,7 +338,11 @@ impl ImsChargingData {
                 session_id,
             ));
         }
-        if let Some(ref caller) = self.calling_party {
+        // Calling-Party-Address is 0..n (TS 32.299 §7.2.33) — repeat the AVP
+        // once per asserted identity.  Concatenating them into a single AVP
+        // loses the boundaries and breaks the moment an identity contains the
+        // separator.
+        for caller in &self.calling_party {
             ims_inner.extend_from_slice(&encode_avp_utf8_3gpp(
                 avp::CALLING_PARTY_ADDRESS,
                 caller,
@@ -520,7 +556,7 @@ pub struct SmsChargingData {
     pub client_address: Option<std::net::IpAddr>,
     /// `Data-Coding-Scheme (2001)` — Integer32, GSM TS 23.038 DCS octet.
     pub data_coding_scheme: Option<i32>,
-    /// `SMS-Result (3408)` (TS 32.299 §7.2.211) — Unsigned32 result
+    /// `SMS-Result (3409)` (TS 32.299 §7.2.211) — Unsigned32 result
     /// code for the SMS submission/delivery attempt. 0=Success;
     /// non-zero values map to the SMS-Result enumeration (typically
     /// surfaced from the SM-RP-CAUSE / Mobile Application Part cause).
@@ -542,7 +578,7 @@ pub struct SmsChargingData {
     /// `SM-Device-Trigger-Indicator (3407)` — Enumerated.  0=Not_Trigger,
     /// 1=Trigger (TS 32.299 §7.2.169a).
     pub sm_device_trigger_indicator: Option<u32>,
-    /// `MTC-IWF-Address (3413)` — Address AVP, identity of the
+    /// `MTC-IWF-Address (3406)` — Address AVP, identity of the
     /// originating MTC-IWF when this SM is a device-trigger.
     pub mtc_iwf_address: Option<std::net::IpAddr>,
 
@@ -1205,7 +1241,7 @@ mod tests {
     #[test]
     fn ims_charging_invite_originating() {
         let data = ImsChargingData {
-            calling_party: Some("sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()),
+            calling_party: vec!["sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()],
             called_party: Some("sip:bob@ims.mnc001.mcc001.3gppnetwork.org".into()),
             sip_method: Some("INVITE".into()),
             role_of_node: Some(NodeRole::OriginatingRole),
@@ -1223,7 +1259,7 @@ mod tests {
     #[test]
     fn ims_charging_bye_with_cause_code() {
         let data = ImsChargingData {
-            calling_party: Some("sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()),
+            calling_party: vec!["sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()],
             called_party: Some("sip:bob@ims.mnc001.mcc001.3gppnetwork.org".into()),
             sip_method: Some("BYE".into()),
             role_of_node: Some(NodeRole::OriginatingRole),
@@ -1670,7 +1706,7 @@ mod tests {
         let sub = SubscriberId::msisdn("+15551234567");
         let rsu = ServiceUnit { time_seconds: Some(3600), ..Default::default() };
         let ims = ImsChargingData {
-            calling_party: Some("sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()),
+            calling_party: vec!["sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()],
             called_party: Some("sip:bob@ims.mnc001.mcc001.3gppnetwork.org".into()),
             sip_method: Some("INVITE".into()),
             role_of_node: Some(NodeRole::OriginatingRole),

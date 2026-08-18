@@ -989,9 +989,9 @@ mod tests {
     ///
     /// Gates on jemalloc `allocated` (live bytes), **not** RSS.  jemalloc
     /// retains freed pages, so RSS stays elevated under a constant,
-    /// completed-call workload even with zero leak — per CLAUDE.md, "RSS
-    /// alone is too noisy to gate on (jemalloc retains freed pages) — gate
-    /// on `allocated`".  `allocated` is the precise leak signal; RSS is
+    /// completed-call workload even with zero leak — project convention is
+    /// that RSS alone is too noisy to gate on for exactly that reason, so the
+    /// gate is `allocated`.  It is the precise leak signal; RSS is
     /// still printed for context.
     ///
     /// Skipped if jemalloc stats are unavailable.  jemalloc-gated because the

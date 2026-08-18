@@ -116,6 +116,46 @@ class TestRfMock:
             == "sip:bob@example.com"
         )
 
+    def test_acr_carries_subscription_id_for_the_served_party(self):
+        """A CDR with no Subscription-Id has no billable subscriber on it —
+        the collector is left resolving the IMPU against an HSS after the
+        fact, which only works for locally-provisioned users."""
+        from siphon import diameter
+        diameter.rf_acr_start(
+            sip_method="INVITE",
+            calling_party="sip:alice@ims.example.com",
+            subscription_id=["sip:alice@ims.example.com", "001010000000001"],
+            subscription_id_type=["sip", "imsi"],
+        )
+        captured = self.diameter.captured_acrs()
+        assert captured[-1]["subscription_id"] == [
+            "sip:alice@ims.example.com",
+            "001010000000001",
+        ]
+        assert captured[-1]["subscription_id_type"] == ["sip", "imsi"]
+
+    def test_acr_accepts_a_single_subscription_id(self):
+        from siphon import diameter
+        diameter.rf_acr_event(sip_method="MESSAGE", subscription_id="+31612345678")
+        assert self.diameter.captured_acrs()[-1]["subscription_id"] == "+31612345678"
+
+    def test_acr_event_reports_a_failed_session_setup(self):
+        """TS 32.260 §5.2.2.1: an unsuccessful establishment is the one record
+        that carries a non-zero Cause-Code, and it must correlate by ICID with
+        the rest of the attempt."""
+        from siphon import diameter
+        diameter.rf_acr_event(
+            sip_method="INVITE",
+            ims_charging_identifier="icid-failed-1",
+            cause_code=-486,
+        )
+        captured = self.diameter.captured_acrs()[-1]
+        assert captured["record_type"] == "EVENT"
+        assert captured["cause_code"] == -486
+        assert captured["ims_charging_identifier"] == "icid-failed-1"
+
+
+
 
 class TestRequestChargingParams:
     """Test ``request.set_charging_param`` — the BGCF auto-emit
