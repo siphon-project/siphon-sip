@@ -92,4 +92,6 @@ export type {
   ResponseOptions,
   ReferReplaces,
   AcceptReferOptions,
+  RouteTarget,
+  RouteTargetObject,
 } from "./sip";

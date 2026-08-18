@@ -118,6 +118,7 @@ def test_module_surface():
     assert hasattr(ControlServer, "serve")
     assert hasattr(ControlServer, "run")
     assert hasattr(Call, "answer")
+    assert hasattr(Call, "route")
     assert issubclass(ControlError, Exception)
 
 
@@ -162,6 +163,114 @@ def test_on_call_async_dispatch():
             assert channel == "ch1"
             assert reattached is False
             assert header == "203.0.113.7"
+
+            client.shutdown()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(run_task, timeout=5)
+
+    asyncio.run(scenario())
+
+
+def test_route_verb_roundtrip():
+    """`call.route(...)` emits the `route` command and returns the routing result."""
+
+    async def scenario():
+        recorded = {}
+
+        async def route_stub(websocket):
+            auth = websocket.request.headers.get("Authorization", "")
+            if auth != f"Bearer {TOKEN}":
+                await websocket.close(code=1008, reason="unauthorized")
+                return
+            said_hello = False
+            async for message in websocket:
+                frame = json.loads(message)
+                frame_id = frame.get("id")
+                verb = frame.get("verb")
+                if not said_hello:
+                    assert verb == "hello", "first frame must be hello"
+                    await _reply_ok(
+                        websocket,
+                        frame_id,
+                        {"app": APP, "protocol": 1, "subprotocol": SUBPROTOCOL},
+                    )
+                    said_hello = True
+                elif verb == "test_push_stasis":
+                    await websocket.send(
+                        json.dumps(
+                            {
+                                "type": "event",
+                                "event": "StasisStart",
+                                "channel": "ch1",
+                                "app": APP,
+                                "call_id": "call-uuid",
+                                "sip_call_id": "sipcid@host",
+                                "payload": {},
+                            }
+                        )
+                    )
+                    await _reply_ok(websocket, frame_id, {})
+                elif verb == "route":
+                    recorded["frame"] = frame
+                    await _reply_ok(
+                        websocket,
+                        frame_id,
+                        {"channel": "ch1", "state": "routing", "targets": 2},
+                    )
+                else:
+                    await _reply_ok(websocket, frame_id, {"state": "answered"})
+
+        async with websockets.serve(
+            route_stub, "127.0.0.1", 0, subprotocols=[SUBPROTOCOL]
+        ) as server:
+            port = server.sockets[0].getsockname()[1]
+            url = f"ws://127.0.0.1:{port}/control/ws"
+            client = ControlClient(app=APP, token=TOKEN, url=url)
+            done = asyncio.get_event_loop().create_future()
+
+            @client.on_call
+            async def handle(call):
+                result = await call.route(
+                    [
+                        "sip:carrier1@gw1",
+                        {
+                            "uri": "sip:carrier2@gw2",
+                            "next_hop": "sip:1.2.3.4:5060",
+                            "headers": {"X-Foo": "bar"},
+                            "timeout": 30,
+                        },
+                    ],
+                    strategy="sequential",
+                    headers={"X-Trace": "abc"},
+                )
+                if not done.done():
+                    done.set_result(result)
+
+            await client.connect()
+            run_task = asyncio.ensure_future(client.run())
+            await asyncio.sleep(0.3)
+            await client.command("test_push_stasis")
+
+            result = await asyncio.wait_for(done, timeout=5)
+            assert result == {"channel": "ch1", "state": "routing", "targets": 2}
+
+            frame = recorded["frame"]
+            assert frame["module"] == "sip"
+            assert frame["verb"] == "route"
+            assert frame["target"]["channel"] == "ch1"
+            assert frame["args"] == {
+                "targets": [
+                    "sip:carrier1@gw1",
+                    {
+                        "uri": "sip:carrier2@gw2",
+                        "next_hop": "sip:1.2.3.4:5060",
+                        "headers": {"X-Foo": "bar"},
+                        "timeout": 30,
+                    },
+                ],
+                "strategy": "sequential",
+                "headers": {"X-Trace": "abc"},
+            }
 
             client.shutdown()
             with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):

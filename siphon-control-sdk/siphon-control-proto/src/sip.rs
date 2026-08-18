@@ -25,6 +25,8 @@ pub enum SipVerb {
     Hangup,
     /// Send an in-dialog REFER on the A-leg.
     Refer,
+    /// Un-park the call and dial the B-leg via LCR sequential failover.
+    Route,
     /// Set a header on the stored A-leg INVITE.
     SetHeader,
     /// Read a header from the stored A-leg INVITE.
@@ -40,6 +42,7 @@ impl SipVerb {
             SipVerb::Reject => "reject",
             SipVerb::Hangup => "hangup",
             SipVerb::Refer => "refer",
+            SipVerb::Route => "route",
             SipVerb::SetHeader => "set_header",
             SipVerb::GetHeader => "get_header",
         }
@@ -122,6 +125,7 @@ mod tests {
     #[test]
     fn sip_verb_wire_tokens() {
         assert_eq!(SipVerb::Answer.as_str(), "answer");
+        assert_eq!(SipVerb::Route.as_str(), "route");
         assert_eq!(SipVerb::SetHeader.as_str(), "set_header");
         assert_eq!(SipVerb::GetHeader.to_string(), "get_header");
     }

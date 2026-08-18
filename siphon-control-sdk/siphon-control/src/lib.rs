@@ -60,7 +60,7 @@ use pyo3::types::PyList;
 use pyo3_async_runtimes::TaskLocals;
 
 use siphon_control_client::proto::ControlErrorCode;
-use siphon_control_client::sip::{Call as RustCall, SipClient, SipServer};
+use siphon_control_client::sip::{Call as RustCall, RouteTarget, SipClient, SipServer};
 use siphon_control_client::{ClientConfig, ControlError as ClientError, ServerConfig};
 
 pyo3::create_exception!(
@@ -112,6 +112,53 @@ fn to_pyerr(error: ClientError) -> PyErr {
         let _ = err.value(py).setattr("code", code);
         err
     })
+}
+
+/// Extract one `route` target: a bare URI `str`, or a dict
+/// `{uri, next_hop?, headers?, timeout?}`.
+fn extract_route_target(item: &Bound<'_, PyAny>) -> PyResult<RouteTarget> {
+    if let Ok(uri) = item.extract::<String>() {
+        return Ok(RouteTarget::uri(uri));
+    }
+    let dict = item.cast::<pyo3::types::PyDict>().map_err(|_| {
+        PyValueError::new_err(
+            "each route target must be a URI str or a dict {uri, next_hop, headers, timeout}",
+        )
+    })?;
+    let uri: String = match dict.get_item("uri")? {
+        Some(value) => value.extract()?,
+        None => return Err(PyValueError::new_err("route target dict requires a string 'uri'")),
+    };
+    let next_hop = match dict.get_item("next_hop")? {
+        Some(value) if !value.is_none() => Some(value.extract::<String>()?),
+        _ => None,
+    };
+    let headers = match dict.get_item("headers")? {
+        Some(value) if !value.is_none() => extract_headers(&value)?,
+        _ => Vec::new(),
+    };
+    let timeout_secs = match dict.get_item("timeout")? {
+        Some(value) if !value.is_none() => Some(value.extract::<u32>()?),
+        _ => None,
+    };
+    Ok(RouteTarget {
+        uri,
+        next_hop,
+        headers,
+        timeout_secs,
+    })
+}
+
+/// Extract a `{name: value}` header dict into ordered string pairs.
+fn extract_headers(object: &Bound<'_, PyAny>) -> PyResult<Vec<(String, String)>> {
+    let dict = object
+        .cast::<pyo3::types::PyDict>()
+        .map_err(|_| PyValueError::new_err("headers must be a dict of str -> str"))?;
+    let mut pairs = Vec::with_capacity(dict.len());
+    for (key, value) in dict.iter() {
+        pairs.push((key.extract::<String>()?, value.extract::<String>()?));
+    }
+    Ok(pairs)
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +269,44 @@ impl Call {
     /// Blind-transfer alias for `refer`.
     fn transfer<'py>(&self, py: Python<'py>, to: String) -> PyResult<Bound<'py, PyAny>> {
         self.refer(py, to)
+    }
+
+    /// Un-park this controlled call and dial the B-leg via siphon's LCR
+    /// sequential-failover engine, returning control to siphon.
+    ///
+    /// `targets` is a non-empty list of carriers tried cheapest-first: each entry
+    /// is a bare URI `str` or a dict `{"uri", "next_hop"?, "headers"?, "timeout"?}`.
+    /// `strategy` defaults to `"sequential"` (v1 supports only sequential/single —
+    /// anything else raises `ControlError` with `code == "unsupported_verb"`).
+    /// `headers` is an optional dict applied to every attempt's B-leg INVITE.
+    ///
+    /// Returns the reply `result` (`{"channel", "state": "routing", "targets": N}`).
+    /// An empty / invalid `targets` list raises `ControlError` (`code ==
+    /// "bad_request"`); a call that is already gone raises `code == "not_found"`.
+    #[pyo3(signature = (targets, strategy="sequential".to_string(), headers=None))]
+    fn route<'py>(
+        &self,
+        py: Python<'py>,
+        targets: Vec<Bound<'py, PyAny>>,
+        strategy: String,
+        headers: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut route_targets = Vec::with_capacity(targets.len());
+        for item in targets {
+            route_targets.push(extract_route_target(&item)?);
+        }
+        let extra_headers = match headers {
+            Some(headers) => extract_headers(&headers)?,
+            None => Vec::new(),
+        };
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let value = call
+                .route(route_targets, Some(strategy.as_str()), extra_headers)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| json_to_py(py, &value))
+        })
     }
 
     fn set_header<'py>(

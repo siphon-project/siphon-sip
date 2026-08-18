@@ -25,6 +25,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   server (`sipp/siphon-rtp/mock_siphon_rtp.py`, the JSON-over-TCP twin of the
   existing rtpengine NG mock) and asserts the answer SDP is anchored on the
   engine's media address rather than echoing the caller's own `c=` back.
+- **`route()` on the control-plane SDK's `sip` facade — all three bindings.**
+  Wraps the server's `route` verb (un-parks a handed-over call and dials the
+  B-leg via siphon's LCR sequential-failover engine, returning control to
+  siphon): `call.route(targets, strategy="sequential", headers=…)` in Python and
+  TypeScript, and an async `Call::route(targets, strategy, headers)` on the Rust
+  client, where a target is a bare URI or `{uri, next_hop?, headers?, timeout?}`.
+  It returns the reply result (`{channel, state: "routing", targets}`) and
+  raises/rejects the typed `unsupported_verb` / `bad_request` / `not_found`
+  errors like the sibling verbs. The control SDK version is unchanged (its own
+  `control-sdk-v*` train cuts the release).
 
 ### Fixed
 - **A UAS-mode B2BUA answer carried no `Contact`, so no in-dialog request could

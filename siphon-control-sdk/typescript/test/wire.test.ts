@@ -46,6 +46,7 @@ describe("SipVerb wire tokens + event names", () => {
   it("maps verbs to the exact wire tokens", () => {
     expect(SipVerb.Answer).toBe("answer");
     expect(SipVerb.Hangup).toBe("hangup");
+    expect(SipVerb.Route).toBe("route");
     expect(SipVerb.SetHeader).toBe("set_header");
     expect(SipVerb.GetHeader).toBe("get_header");
     expect(SipVerb.RemoveHeader).toBe("remove_header");
@@ -149,6 +150,59 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
       { module: MODULE_SIP, verb: "remove_header", target: { channel: "ch1" }, args: { name: "X-Tag" } },
       { module: null, verb: "set_var", target: { channel: "ch1" }, args: { key: "queue", value: "support" } },
       { module: null, verb: "get_var", target: { channel: "ch1" }, args: { key: "queue" } },
+    ]);
+  });
+
+  it("route — bare-URI + full-object targets, strategy + command headers", async () => {
+    const transport = new RecordingTransport({ channel: "ch1", state: "routing", targets: 2 });
+    const call = makeCall(transport);
+    const result = await call.route(
+      [
+        "sip:carrier1@gw1",
+        {
+          uri: "sip:carrier2@gw2",
+          nextHop: "sip:1.2.3.4:5060",
+          headers: { "X-Foo": "bar" },
+          timeout: 30,
+        },
+      ],
+      "sequential",
+      { "X-Trace": "abc" },
+    );
+    expect(result).toEqual({ channel: "ch1", state: "routing", targets: 2 });
+    expect(transport.calls).toEqual([
+      {
+        module: MODULE_SIP,
+        verb: "route",
+        target: { channel: "ch1" },
+        args: {
+          targets: [
+            "sip:carrier1@gw1",
+            {
+              uri: "sip:carrier2@gw2",
+              next_hop: "sip:1.2.3.4:5060",
+              headers: { "X-Foo": "bar" },
+              timeout: 30,
+            },
+          ],
+          strategy: "sequential",
+          headers: { "X-Trace": "abc" },
+        },
+      },
+    ]);
+  });
+
+  it("route — defaults strategy to sequential, omits headers when unset", async () => {
+    const transport = new RecordingTransport({ channel: "ch1", state: "routing", targets: 1 });
+    const call = makeCall(transport);
+    await call.route(["sip:only@gw"]);
+    expect(transport.calls).toEqual([
+      {
+        module: MODULE_SIP,
+        verb: "route",
+        target: { channel: "ch1" },
+        args: { targets: ["sip:only@gw"], strategy: "sequential" },
+      },
     ]);
   });
 
