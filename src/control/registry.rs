@@ -626,14 +626,48 @@ impl ControlBus {
         }
     }
 
-    /// Remove the channel owning `sip_call_id`, returning its owning app + the
-    /// channel id (for a `StasisEnd` before removal). O(channels) — a per-call
-    /// teardown path, not per-packet.
-    fn channel_id_for_sip_call_id(&self, sip_call_id: &str) -> Option<String> {
+    /// The channel id owning `sip_call_id`, if controlled (for a `StasisEnd` /
+    /// release before removal). O(channels) — a per-call teardown path, not
+    /// per-packet.
+    pub fn channel_id_for_sip_call_id(&self, sip_call_id: &str) -> Option<String> {
         self.channels
             .iter()
             .find(|entry| entry.value().sip_call_id == sip_call_id)
             .map(|entry| entry.key().clone())
+    }
+
+    /// Release a controlled channel back to siphon (the controller handed control
+    /// back with a routing decision — `route`), emitting a `StasisEnd` with the
+    /// given `reason` to the owning connection and draining the channel from the
+    /// bus. **Distinct from teardown-on-hangup** ([`on_call_terminated`]): the
+    /// underlying call lives on — siphon now owns it and drives the B-leg dial
+    /// itself. Idempotent — a no-op when the channel is unknown. Returns whether
+    /// a channel was released.
+    ///
+    /// [`on_call_terminated`]: Self::on_call_terminated
+    pub fn release_channel(&self, channel_id: &str, reason: &str) -> bool {
+        let (app, call_actor_id, sip_call_id) = match self.channels.get(channel_id) {
+            Some(entry) => (
+                entry.app.clone(),
+                entry.call_actor_id.clone(),
+                entry.sip_call_id.clone(),
+            ),
+            None => return false,
+        };
+        self.publish_to_channel(
+            channel_id,
+            EventFrame::new(
+                "StasisEnd",
+                channel_id,
+                &app,
+                &call_actor_id,
+                &sip_call_id,
+                serde_json::json!({ "reason": reason }),
+            ),
+        );
+        self.remove_channel(channel_id);
+        debug!(%channel_id, %sip_call_id, reason, "control plane: channel released (control returned to siphon)");
+        true
     }
 
     /// Whether the given connection owns the channel (authZ for a command).
@@ -1047,6 +1081,90 @@ mod tests {
         // Every per-call entry drained to baseline (no leak).
         assert_eq!(bus.channel_count(), 0, "channel leaked after CANCEL");
         assert!(bus.owned_channels("ivr-app").is_empty(), "app_calls leaked after CANCEL");
+    }
+
+    #[tokio::test]
+    async fn release_channel_emits_stasis_end_routed_and_drains() {
+        // The `route` return-control path: the controller hands the call back to
+        // siphon. The owning app must be told (StasisEnd{reason:"routed"}) and the
+        // bus must drain — but unlike a hangup, the underlying call lives on
+        // (siphon dials the B-leg). Keyed by channel id (not sip_call_id).
+        let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
+        let conn = bus.register_connection("ivr-app");
+        bus.offer_channel(
+            "ivr-app",
+            "ch1",
+            "call-uuid",
+            "sipcid@h",
+            "hangup",
+            HashMap::new(),
+            serde_json::json!({}),
+        );
+        assert_eq!(bus.channel_count(), 1);
+        assert_eq!(bus.channel_id_for_sip_call_id("sipcid@h").as_deref(), Some("ch1"));
+
+        assert!(bus.release_channel("ch1", "routed"));
+
+        let frames = conn.events.recv_many().await;
+        let stasis_end = frames
+            .iter()
+            .find_map(|frame| match frame {
+                OutboundFrame::Event(event) if event.event == "StasisEnd" => Some(event),
+                _ => None,
+            })
+            .expect("owning app must receive StasisEnd on release");
+        assert_eq!(stasis_end.payload["reason"], "routed");
+        assert_eq!(stasis_end.channel.as_deref(), Some("ch1"));
+
+        // Every per-call entry drained to baseline (no leak).
+        assert_eq!(bus.channel_count(), 0, "channel leaked after release");
+        assert!(bus.owned_channels("ivr-app").is_empty(), "app_calls leaked after release");
+        assert!(bus.channel_id_for_sip_call_id("sipcid@h").is_none());
+        // Idempotent: a second release is a clean no-op.
+        assert!(!bus.release_channel("ch1", "routed"));
+    }
+
+    /// Steady-state leak gate for the return-control (`route`) path: N cycles of
+    /// register-conn + offer-channel + release-channel → both maps drain to their
+    /// starting `len()`. The co-located analogue of `mem_leak_test.sh` gating
+    /// `siphon_proxy_dialog_sessions → 0`, for the release path specifically.
+    #[test]
+    fn release_channel_steady_state_drains_to_baseline() {
+        let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
+        assert_eq!(bus.channel_count(), 0);
+
+        for cycle in 0..5 {
+            let mut conns = Vec::new();
+            for index in 0..8 {
+                let conn = bus.register_connection("ivr-app");
+                let channel = format!("ch-{cycle}-{index}");
+                bus.offer_channel(
+                    "ivr-app",
+                    &channel,
+                    &format!("call-{cycle}-{index}"),
+                    &format!("sip-{cycle}-{index}"),
+                    "hangup",
+                    HashMap::new(),
+                    serde_json::json!({}),
+                );
+                conns.push((conn, channel));
+            }
+            assert_eq!(bus.channel_count(), 8);
+
+            for (conn, channel) in conns {
+                // Return control to siphon (the call lives on) rather than hangup.
+                assert!(bus.release_channel(&channel, "routed"));
+                if let Some(fanout) = bus.apps.get(&conn.app) {
+                    fanout.remove(conn.id);
+                }
+                conn.events.close();
+                bus.apps.remove_if(&conn.app, |_, fanout| fanout.is_empty());
+            }
+
+            assert_eq!(bus.channel_count(), 0, "channels leaked on cycle {cycle}");
+            assert_eq!(bus.app_count(), 0, "apps leaked on cycle {cycle}");
+            assert!(bus.app_calls.is_empty(), "app_calls index leaked on cycle {cycle}");
+        }
     }
 
     #[test]

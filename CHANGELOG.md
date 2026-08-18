@@ -114,6 +114,24 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `siphon_control_commands_total`, `siphon_control_events_dropped_total`,
   `siphon_control_auth_failures_total` and `siphon_control_handoff_timeouts_total`.
   SDK: `call.handover(app, on_lost=, deadline_ms=, vars=)`.
+- **Control-plane `route` verb that returns control to siphon with a routing
+  decision.** A controller that parked a call (deferred handover) can now hand
+  control back so siphon dials the B-leg itself: `route` un-parks the call and
+  runs the shipped LCR sequential-failover engine across the supplied `targets`,
+  then owns the call thereafter (`@b2bua.on_failure` handles carrier failover).
+  This is the consult-and-return flow. An app queries an external LCR / rating
+  engine out-of-process (no pool blocked while it thinks) and returns the
+  decision as a command. `targets` is a non-empty array of bare URI strings or
+  `{uri, next_hop?, headers?, timeout?}` objects; `strategy` defaults to
+  `sequential` (v1 runs the sequential engine only, so a parallel/other strategy
+  is a typed `unsupported_verb`, never a silent sequential); an optional command
+  `headers` object is applied to every attempt's B-leg INVITE. On success siphon
+  replies `{state: "routing", targets: N}`, releases the control app (the
+  ControlBus channel drains and a `StasisEnd{reason: "routed"}` is emitted so the
+  app knows control returned, and the call lives on), and dials the first carrier.
+  No routable carrier answers the A-leg `503`; a later B-leg ring-timeout takes
+  the normal `408` path. Reuses the same `CallAction::RouteSequence` machinery as
+  in-process `call.route(...)` / `call.fork(strategy="sequential")`.
 - **Control-plane client SDKs are the official interop path**, now installable:
   `pip install siphon-control` (Python) and `cargo add siphon-control-client`
   (Rust) hide the `siphon-control.v1` wire so a controller is written with
