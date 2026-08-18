@@ -51,6 +51,21 @@ edge_received_invite() {
   "${COMPOSE[@]}" logs "$1" 2>/dev/null | grep -a "> INVITE" | grep -qE "INVITE +[1-9]"
 }
 
+# `docker compose logs` is not synchronous with a container's stdout: a line the
+# container has already written can take a moment to reach the log driver, so
+# grepping once the instant a call returns is a race. Poll to a deadline for the
+# assertions that expect a line to BE there.
+wait_edge_received_invite() {
+  local deadline=$((SECONDS + 15))
+  while (( SECONDS < deadline )); do
+    if edge_received_invite "$1"; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
 echo "=== B2BUA: routing a binding through its RFC 3327 Path ==="
 echo "[*] Building siphon image..."
 "${COMPOSE[@]}" build siphon-b2bua-path
@@ -78,7 +93,7 @@ if [[ ${rc} -ne 0 ]]; then
   "${COMPOSE[@]}" logs sipp-b2bua-path-edge-answer 2>/dev/null | tail -30 || true
   fail "the call was not answered (exit ${rc}) — the B-leg did not follow the binding's Path"
 fi
-edge_received_invite sipp-b2bua-path-edge-answer \
+wait_edge_received_invite sipp-b2bua-path-edge-answer \
   || fail "the edge never received the INVITE — the B-leg was sent to the Contact URI"
 
 "${COMPOSE[@]}" rm -sf sipp-b2bua-path-edge-answer >/dev/null 2>&1 || true
@@ -108,9 +123,9 @@ if [[ ${rc} -ne 0 ]]; then
   "${COMPOSE[@]}" logs sipp-b2bua-path-edge-answer-b 2>/dev/null | tail -30 || true
   fail "the call was not answered (exit ${rc}) — the failover branch did not reach binding B's edge"
 fi
-edge_received_invite sipp-b2bua-path-edge-reject \
+wait_edge_received_invite sipp-b2bua-path-edge-reject \
   || fail "binding A's edge never received the INVITE — branch 0 was not routed by its Path"
-edge_received_invite sipp-b2bua-path-edge-answer-b \
+wait_edge_received_invite sipp-b2bua-path-edge-answer-b \
   || fail "binding B's edge never received the INVITE — the failover branch reused binding A's route set"
 
 "${COMPOSE[@]}" rm -sf sipp-b2bua-path-edge-reject sipp-b2bua-path-edge-answer-b >/dev/null 2>&1 || true
@@ -136,7 +151,7 @@ if [[ ${rc} -ne 0 ]]; then
   "${COMPOSE[@]}" logs sipp-b2bua-path-edge-answer 2>/dev/null | tail -30 || true
   fail "the call was not answered (exit ${rc}) — dial's route= set the header but not the destination"
 fi
-edge_received_invite sipp-b2bua-path-edge-answer \
+wait_edge_received_invite sipp-b2bua-path-edge-answer \
   || fail "the edge never received the INVITE — dial ignored its route set when picking a destination"
 
 "${COMPOSE[@]}" rm -sf sipp-b2bua-path-edge-answer >/dev/null 2>&1 || true
@@ -168,8 +183,11 @@ if [[ ${rc} -ne 0 ]]; then
   "${COMPOSE[@]}" logs sipp-b2bua-path-decoy 2>/dev/null | tail -30 || true
   fail "the call was not answered (exit ${rc}) — the over-MTU B-leg left the route set"
 fi
-edge_received_invite sipp-b2bua-path-edge-answer \
+wait_edge_received_invite sipp-b2bua-path-edge-answer \
   || fail "the edge never received the over-MTU INVITE"
+# One-shot on purpose: this asserts a line is ABSENT, so polling for it would
+# only burn the deadline. The preceding wait_ call already gave the log driver
+# time to catch up on this run's output.
 if edge_received_invite sipp-b2bua-path-decoy; then
   fail "the decoy received the INVITE — the §18.1.1 re-probe resolved the Contact host and moved the B-leg there"
 fi

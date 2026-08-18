@@ -24,6 +24,22 @@ fail() {
   exit 1
 }
 
+# `docker compose logs` is not synchronous with the container's stdout: a line
+# the container has already written can take a moment to reach the log driver.
+# Grepping once, the instant the call returns, is therefore a race — it has gone
+# red on a run whose own failure dump (the same logs, read 200 ms later) did
+# contain the line. Poll to a deadline instead of sampling once.
+wait_for_log() {
+  local pattern="$1" deadline=$((SECONDS + 15))
+  while (( SECONDS < deadline )); do
+    if "${COMPOSE[@]}" logs siphon-transport-error 2>/dev/null | grep -q "${pattern}"; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
 echo "=== Transport error on forwarding must be answered (RFC 3261 §16.9 / §16.7) ==="
 echo "[*] Building siphon image..."
 "${COMPOSE[@]}" build siphon-transport-error
@@ -41,7 +57,7 @@ if [[ ${rc} -ne 0 ]]; then
 fi
 
 # The 500 must be the proxy's own §16.7 downgrade, not a relayed 503.
-if "${COMPOSE[@]}" logs siphon-transport-error 2>/dev/null | grep -q "TCP pool send failed"; then
+if wait_for_log "TCP pool send failed"; then
   echo "[*] confirmed: the pool send did fail (so the 500 came from the error path)"
 else
   fail "the pool send never failed — the test did not exercise the transport-error path"
