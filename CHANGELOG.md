@@ -35,8 +35,28 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   raises/rejects the typed `unsupported_verb` / `bad_request` / `not_found`
   errors like the sibling verbs. The control SDK version is unchanged (its own
   `control-sdk-v*` train cuts the release).
+- **`Contact.received` on the SDK mock — the field the engine tells you to
+  route on.** `PyContact` exposes it and its doc-comment says to prefer it over
+  `uri` (a Contact URI can carry a private/NATed address), but the SDK's
+  `Contact` dataclass did not model it: `contact.received or contact.uri`
+  raised `AttributeError` under the mocks, and because
+  `docs/reference/types.md` renders that dataclass, the field was documented
+  nowhere. It is now on the dataclass, `registrar.save()` / `save_proxy()`
+  stamp it from the REGISTER's source address in the engine's URI shape, and
+  `add_contact()` carries an explicitly-built one through — so the NAT case the
+  field exists for (private Contact URI, public source) is finally
+  constructible in a test. Additive, defaulting to `None`.
 
 ### Changed
+- **`Contact.received` is a SIP URI, not a bare `host:port` — the doc-comment
+  now says so.** The value has always been
+  `sip:<ip>:<port>;transport=<proto>` (the OpenSIPS `received_avp` shape),
+  which is what lets `request.fork([c.received or c.uri for c in contacts])`
+  work, but the getter's doc-comment described it as "source IP:port". Only
+  the comment changed.
+- **`request.fix_nated_register()` writes the observed source port into
+  `rport=`** instead of a hardcoded `5060`. SDK mock only; the engine already
+  used the real port.
 - **`tls.method` is now enforced — it used to be parsed and ignored.** The
   setting was deserialized into the TLS config and never read: the acceptor was
   built from a bare `rustls::ServerConfig::builder()`, so a config asking for

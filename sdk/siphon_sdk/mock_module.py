@@ -795,6 +795,25 @@ class MockB2bua:
 # Registrar namespace
 # ---------------------------------------------------------------------------
 
+def _received_of(request: Any) -> str:
+    """Source address a REGISTER arrived from, as the engine records it.
+
+    The production registrar stamps every binding with the transport-level
+    source address so scripts can route on ``contact.received`` rather than
+    the (possibly private / NATed) Contact URI.  It stores it as a SIP URI —
+    ``"sip:<ip>:<port>;transport=<proto>"``, the OpenSIPS ``received_avp``
+    shape — so the value can go straight into ``fork()`` / ``relay()``.
+    Mirror that exactly here, or a script that tests green against the mock
+    would fork to something the engine never produces.
+
+    Falls back to port 5060 / ``udp`` for duck-typed request stand-ins that
+    only model ``source_ip``.
+    """
+    port = getattr(request, "source_port", 5060)
+    transport = getattr(request, "transport", "udp") or "udp"
+    return f"sip:{request.source_ip}:{port};transport={transport}"
+
+
 class MockRegistrar:
     """Mock registrar with an in-memory contact store.
 
@@ -855,7 +874,11 @@ class MockRegistrar:
         must **not** call ``request.reply(200, "OK")`` afterwards.
 
         In the mock, extracts the To URI as AoR and stores a default
-        contact binding.
+        contact binding.  The binding is stamped with
+        :attr:`~siphon_sdk.types.Contact.received` from the request's
+        source address, as the production registrar does — so
+        ``contact.received or contact.uri`` resolves the same way it
+        will on the engine.
 
         Args:
             request: The REGISTER request object.
@@ -897,7 +920,7 @@ class MockRegistrar:
         default_uri = f"sip:{request.ruri.user or 'user'}@{request.source_ip}:5060"
         already_exists = any(c.uri == default_uri for c in contacts)
         if not already_exists:
-            contact = Contact(uri=default_uri)
+            contact = Contact(uri=default_uri, received=_received_of(request))
             if flow_token is not None:
                 contact.flow_token = flow_token
                 # Reconstitute the Flow view from request context.
@@ -954,6 +977,10 @@ class MockRegistrar:
         3. No 200 OK is generated — the proxy will relay the upstream's
            response itself.
 
+        Like :meth:`save`, the cached binding is stamped with
+        :attr:`~siphon_sdk.types.Contact.received` from the REGISTER's
+        source address.
+
         A grace of ~32 s (RFC 3261 Timer F = 64·T1) is added on top so
         a ``NOTIFY[reg-event;state=terminated]`` from the registrar at
         expiry has a transaction-timer window to land before the proxy
@@ -1006,7 +1033,9 @@ class MockRegistrar:
         default_uri = f"sip:{request.ruri.user or 'user'}@{request.source_ip}:5060"
         already_exists = any(c.uri == default_uri for c in contacts)
         if not already_exists:
-            contacts.append(Contact(uri=default_uri))
+            contacts.append(
+                Contact(uri=default_uri, received=_received_of(request))
+            )
         event_type = "refreshed" if already_exists else "registered"
         self._fire_on_change(aor, event_type)
         if aliases:

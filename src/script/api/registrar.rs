@@ -222,12 +222,15 @@ impl PyContact {
         self.age_seconds
     }
 
-    /// The received address (source IP:port of the REGISTER).
+    /// The transport source address of the REGISTER, as a SIP URI:
+    /// `"sip:<ip>:<port>;transport=<proto>"` (the OpenSIPS `received_avp`
+    /// shape), *not* a bare `host:port` — so it can be handed straight to
+    /// `fork()` / `relay()`.
     ///
     /// Returns `None` if the contact was not saved with source address info.
     /// When present, this should be used for routing instead of `uri` — the
     /// Contact URI may contain a private/NAT address, while `received` has
-    /// the actual reachable address (like OpenSIPS `received_avp`).
+    /// the actual reachable address.
     #[getter]
     fn received(&self) -> Option<&str> {
         self.received_string.as_deref()
