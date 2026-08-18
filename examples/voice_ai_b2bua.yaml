@@ -1,0 +1,76 @@
+# SIPhon voice-AI B2BUA — see examples/voice_ai_b2bua.py
+#
+# A carrier call is answered by siphon itself and its audio bridged to an external
+# WebSocket media server (the AI). There is no B leg: the media engine anchors the
+# call as a single-leg session with the WebSocket server as the far side.
+#
+# Requires the native siphon-rtp engine — the WebSocket bridge is an engine
+# extension with no rtpengine or rtpproxy equivalent, so a profile that sets
+# ws_uri on either of those backends fails the config load rather than answering
+# the call and bridging it nowhere.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+  tcp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "ai.example.com"
+
+advertised_address: "ai.example.com"
+
+script:
+  path: "examples/voice_ai_b2bua.py"
+
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "127.0.0.1:8080"     # siphon-rtp --control
+    timeout_ms: 2000
+
+  profiles:
+    # Overrides the built-in `voice_ai` profile. The built-in leaves ws_uri unset
+    # (there is no sensible default endpoint) and the script passes it per call;
+    # everything else here is live on its own.
+    voice_ai:
+      offer: &voice_ai_flags
+        transport_protocol: "RTP/AVP"   # plain RTP toward the carrier
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin"]
+        # Clean the uplink toward the inference server. The AI downlink is the
+        # echo reference, so AEC cancels the phone's return path.
+        noise_suppression: true
+        echo_cancellation: true
+        # Turn boundaries without the server running its own VAD, and local
+        # barge-in so playout is cut on the caller's speech edge with no server
+        # round-trip.
+        ws_vad: true
+        ws_barge_in: true
+        ws_vad_hangover_ms: 300
+      answer: *voice_ai_flags
+
+# The carrier trunk. Membership is what call.from_gateway("carriers") tests —
+# source-IP only, so treat it as a trust signal on TLS/TCP and a direction hint
+# on UDP. Addresses are RFC 5737 documentation range.
+gateway:
+  groups:
+    - name: "carriers"
+      probe:
+        enabled: true
+        interval_secs: 15
+        failure_threshold: 3
+      destinations:
+        - uri: "sip:gw1.carrier.example:5060"
+          address: "198.51.100.11:5060"
+        - uri: "sip:gw2.carrier.example:5060"
+          address: "198.51.100.12:5060"
+
+# Readiness / liveness for a container or load balancer.
+admin:
+  listen: "127.0.0.1:8081"
+
+log:
+  level: info
