@@ -97,10 +97,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # macOS is arm64-only: GitHub's Intel (macos-13) runners are so
+          # starved that a release can queue for hours, and the publish jobs
+          # need every wheel. Intel-Mac users install from the sdist. Revisit
+          # via a cross-compile row (target: x86_64 on macos-14) if demand shows.
           - { os: macos-14,       target: aarch64, pyver: "3.14",  abi: cp314 }
           - { os: macos-14,       target: aarch64, pyver: "3.14t", abi: cp314t }
-          - { os: macos-13,       target: x86_64,  pyver: "3.14",  abi: cp314 }
-          - { os: macos-13,       target: x86_64,  pyver: "3.14t", abi: cp314t }
           - { os: windows-latest, target: x64,     pyver: "3.14",  abi: cp314 }
           - { os: windows-latest, target: x64,     pyver: "3.14t", abi: cp314t }
     runs-on: ${{ matrix.os }}
