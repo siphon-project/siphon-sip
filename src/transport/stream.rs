@@ -262,6 +262,17 @@ pub(crate) async fn serve_sip_stream<R, W>(
                     break;
                 }
                 Ok(Ok(size)) => accumulator.extend_from_slice(&read_buf[..size]),
+                // A peer that disappears without a TLS close_notify (rustls
+                // reports it as `UnexpectedEof`) is ordinary internet
+                // behaviour — scanners and browsers do it constantly, and it
+                // says nothing an operator can act on. Every other read error
+                // still warns.
+                Ok(Err(error)) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                    debug!(
+                        "{transport} connection {connection_id:?} from {remote_addr} closed without close_notify"
+                    );
+                    break;
+                }
                 Ok(Err(error)) => {
                     warn!("{transport} read error on {connection_id:?} from {remote_addr}: {error}");
                     break;
@@ -434,6 +445,73 @@ pub(crate) async fn sniff_stream<S: AsyncRead + Unpin>(
             // Silent (or still mid-line) peer: assume raw SIP and let the SIP
             // read loop apply its own framing, garbage and idle rules.
             Err(_) => return Ok((StreamProtocol::Sip, buffer)),
+        }
+    }
+}
+
+/// What a raw-SIP-only listener should do with a freshly accepted connection.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SipOnlyVerdict {
+    /// Speaks SIP. The bytes the decision consumed seed the framer.
+    Serve(BytesMut),
+    /// Not SIP, and the peer chose to send it: drop the connection and count a
+    /// strong auto-ban signal. The string names the shape for the log.
+    Abuse(&'static str),
+    /// Ended before a first line arrived. Drop, but count nothing: an L4 health
+    /// check (connect, then close, no data) is indistinguishable from this.
+    Gone,
+}
+
+/// Classify a connection accepted on a listener that speaks only raw SIP.
+///
+/// A listener that is not half of a mux has no WebSocket side to hand an HTTP
+/// request line to, so an upgrade line is as much "not SIP" here as random
+/// bytes are — both are [`SipOnlyVerdict::Abuse`].
+///
+/// Framing alone never catches the HTTP case. A complete HTTP header block
+/// satisfies [`extract_sip_message_length`] — it looks for `\r\n\r\n` and a
+/// `Content-Length`, and an HTTP request has the first and defaults the second
+/// to zero — so the probe frames as a "message", reaches the dispatcher, and is
+/// rejected only by the parser, which has no connection to close and no source
+/// to record. A vulnerability scanner walking `/phpinfo.php`, `/info.php`, …
+/// over TLS on the SIP port could therefore probe indefinitely. Deciding here,
+/// from the first line, closes the connection on the first probe and bans the
+/// source on the fourth (weight 3 against the default threshold of 10).
+pub(crate) async fn classify_sip_only<S: AsyncRead + Unpin>(stream: &mut S) -> SipOnlyVerdict {
+    match sniff_stream(stream).await {
+        Ok((StreamProtocol::Sip, prefix)) => SipOnlyVerdict::Serve(prefix),
+        Ok((StreamProtocol::WebSocket, _)) => SipOnlyVerdict::Abuse("an HTTP request line"),
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+            SipOnlyVerdict::Abuse("non-SIP bytes")
+        }
+        Err(_) => SipOnlyVerdict::Gone,
+    }
+}
+
+/// Run [`classify_sip_only`] and act on it: log, feed the auto-ban store, and
+/// return the framer seed only when the connection may proceed.
+///
+/// `None` means the caller must stop. An abusive connection is dropped without
+/// a reply — a SIP port that answers a probe fingerprints itself, which is why
+/// every other drop on this path is silent too.
+///
+/// Cost is one classification per *connection*, on the first read the framer
+/// would have made anyway. Nothing is added to the per-message path.
+pub(crate) async fn sniff_sip_or_drop<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    remote_addr: SocketAddr,
+    transport: Transport,
+) -> Option<BytesMut> {
+    match classify_sip_only(stream).await {
+        SipOnlyVerdict::Serve(prefix) => Some(prefix),
+        SipOnlyVerdict::Abuse(shape) => {
+            warn!("{shape} from {remote_addr} on the SIP-only {transport} listener; dropping connection");
+            crate::security::record_malformed_message(remote_addr.ip(), &transport.to_string());
+            None
+        }
+        SipOnlyVerdict::Gone => {
+            debug!("{transport} connection from {remote_addr} ended before its first line");
+            None
         }
     }
 }
@@ -832,5 +910,116 @@ mod tests {
         client.write_all(b"HELO example.com\r\n").await.unwrap();
         served.await.unwrap();
         assert!(!connection_map.contains_key(&ConnectionId(42)));
+    }
+
+    // --- classify_sip_only (listeners that are not half of a mux) -----------
+
+    /// The probe that motivated the classifier: a complete, well-formed HTTP
+    /// request, as a vulnerability scanner sends it to a TLS SIP port.
+    const HTTP_PROBE: &[u8] = concat!(
+        "GET /phpinfo.php HTTP/1.1\r\n",
+        "Host: proxy.example.com\r\n",
+        "User-Agent: Mozilla/5.0\r\n",
+        "\r\n",
+    )
+    .as_bytes();
+
+    #[tokio::test]
+    async fn classify_sip_only_serves_sip_and_keeps_the_consumed_prefix() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client.write_all(INVITE).await.unwrap();
+        match classify_sip_only(&mut server).await {
+            SipOnlyVerdict::Serve(prefix) => assert_eq!(
+                &prefix[..],
+                INVITE,
+                "consumed bytes must be handed back to seed the framer"
+            ),
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn classify_sip_only_rejects_a_complete_http_probe() {
+        // Why the classifier has to exist: framing alone reports this probe as
+        // a complete message (an HTTP header block ends in \r\n\r\n and has no
+        // Content-Length, so the length is the header block), which is how it
+        // used to reach the parser with the connection still open and the
+        // source never counted.
+        assert_eq!(
+            extract_sip_message_length(HTTP_PROBE),
+            Some(HTTP_PROBE.len()),
+            "precondition: framing cannot tell this from a SIP message"
+        );
+
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client.write_all(HTTP_PROBE).await.unwrap();
+        assert_eq!(
+            classify_sip_only(&mut server).await,
+            SipOnlyVerdict::Abuse("an HTTP request line")
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_sip_only_rejects_a_websocket_upgrade() {
+        // Valid on a wss listener or a tls+wss mux, abuse on a SIP-only one:
+        // there is no WebSocket half here to hand it to.
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client.write_all(UPGRADE).await.unwrap();
+        assert_eq!(
+            classify_sip_only(&mut server).await,
+            SipOnlyVerdict::Abuse("an HTTP request line")
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_sip_only_rejects_binary_garbage() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client.write_all(b"\x16\x03\x01\x00\x9c").await.unwrap();
+        assert_eq!(
+            classify_sip_only(&mut server).await,
+            SipOnlyVerdict::Abuse("non-SIP bytes")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn classify_sip_only_keeps_a_silent_peer() {
+        // RFC 5923 connection reuse: a peer may open a connection and wait for
+        // siphon to send the first request. Never mistaken for a probe.
+        let (_client, mut server) = tokio::io::duplex(4096);
+        assert_eq!(
+            classify_sip_only(&mut server).await,
+            SipOnlyVerdict::Serve(BytesMut::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn classify_sip_only_does_not_count_a_connect_and_close() {
+        // An L4 health check (an AWS NLB target check, say) connects and closes
+        // without sending anything. Dropped, but never an auto-ban signal —
+        // banning it would take siphon out of its own load balancer.
+        let (client, mut server) = tokio::io::duplex(4096);
+        drop(client);
+        assert_eq!(classify_sip_only(&mut server).await, SipOnlyVerdict::Gone);
+    }
+
+    #[tokio::test]
+    async fn sniff_sip_or_drop_returns_a_seed_only_for_sip() {
+        let scanner = "203.0.113.9:41000".parse().unwrap();
+
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client.write_all(INVITE).await.unwrap();
+        let seed = sniff_sip_or_drop(&mut server, scanner, Transport::Tls)
+            .await
+            .expect("SIP must be served");
+        assert_eq!(&seed[..], INVITE);
+
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client.write_all(HTTP_PROBE).await.unwrap();
+        assert!(
+            sniff_sip_or_drop(&mut server, scanner, Transport::Tls)
+                .await
+                .is_none(),
+            "an HTTP probe must not reach the framer"
+        );
     }
 }

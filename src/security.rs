@@ -683,7 +683,7 @@ mod tests {
         assert!(store.record_strong_failure(source)); // 2 -> ban
     }
 
-    // --- record_handshake_failure (TLS/WSS/WS auto-ban signal) -------------
+    // --- transport auto-ban signals (handshake failure, non-SIP bytes) -----
     //
     // This test owns the process-global AUTO_BAN OnceLock: no other test (and no
     // code outside server.rs startup) installs a store, so the install here is
@@ -691,14 +691,24 @@ mod tests {
     // (RFC 5737, 198.51.100.0/24) that no other test touches, so the lingering
     // global store cannot perturb the ACL/auth tests that share the binary.
     #[test]
-    fn handshake_failures_feed_the_auto_ban_store_and_acl() {
+    fn transport_abuse_signals_feed_the_auto_ban_store_and_acl() {
         // Before any store is installed, the helper must be a cheap no-op and
         // never panic — the whole feature is off until failed_auth_ban is set.
         let never = ip("198.51.100.78");
         crate::security::record_handshake_failure(never, "TLS");
 
-        // Install a low-threshold store (3 failures / 600 s window / 1 h ban).
-        let store = Arc::new(AutoBanStore::new(3, 600, 3600, &[], 1));
+        // Install a low-threshold store (3 weighted failures / 600 s window /
+        // 1 h ban), with a strong signal weighted at the full threshold so the
+        // two confidence levels are told apart below.
+        //
+        // Loopback is trusted, and that matters beyond this test: the store
+        // installed here stays live for the rest of the binary, and the
+        // transport tests drive real 127.0.0.1 sockets through paths that
+        // report abuse signals (a non-SIP probe, a failed handshake). Without
+        // this, one such test bans loopback and every socket test that runs
+        // after it is refused at accept.
+        let loopback = ["127.0.0.0/8".to_string(), "::1/128".to_string()];
+        let store = Arc::new(AutoBanStore::new(3, 600, 3600, &loopback, 3));
         set_auto_ban(Arc::clone(&store));
 
         // Handshake failures accumulate per-IP across transports and ban at the
@@ -712,6 +722,14 @@ mod tests {
 
         // The pre-install no-op IP never accrued a count.
         assert!(!store.is_banned(never));
+
+        // Non-SIP bytes on a stream transport are a *strong* signal: the source
+        // completed a TCP handshake (so it is not spoofed) and then sent
+        // something that cannot be SIP. One probe is enough at this weight,
+        // where a handshake failure needed three.
+        let prober = ip("198.51.100.79");
+        crate::security::record_malformed_message(prober, "TLS");
+        assert!(store.is_banned(prober));
 
         // End-to-end: the banned scanner is now dropped at transport accept by
         // the ACL (which consults the same global store), while an IP that never

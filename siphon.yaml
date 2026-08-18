@@ -404,8 +404,10 @@ auth:
 #     #     - present-but-invalid digest credentials (wrong password), or a
 #     #       forged / stale / replayed nonce  [over UDP this stays weight 1,
 #     #       since a UDP source is spoofable and would amplify a reflected ban]
-#     #     - non-SIP / unparseable bytes on a TCP/TLS stream (HTTP probe, TLS
-#     #       record on the plaintext port, random bytes)
+#     #     - non-SIP bytes on a TCP/TLS stream, decided from the connection's
+#     #       first line before the SIP framer runs (an HTTP probe such as a
+#     #       /phpinfo.php scan, a TLS record on the plaintext port, random
+#     #       bytes); the connection is closed and never answered
 #     #     - a request whose User-Agent matched scanner_block, over a
 #     #       connection-oriented transport (UDP scanner UAs are dropped, not banned)
 #     # A successful auth resets the source's counter, so a legit client that
