@@ -37,6 +37,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   username the A-leg authenticated as (`None` if never challenged). Also stamped
   onto the call's CDR as `auth_user`; a B2BUA call is tracked at INVITE time, so
   a caller authenticated inside `@b2bua.on_invite` previously left the field empty.
+- **Raw SIP and SIP-over-WebSocket on one listening socket.** Configure the same
+  address under both `listen.tls` and `listen.wss` (or both `listen.tcp` and
+  `listen.ws`) and siphon serves both protocols from a single listener,
+  classifying each connection from its first line: a SIP start line ends with
+  ` SIP/2.0` (RFC 3261 §7.1/§7.2), a WebSocket upgrade ends with ` HTTP/1.1`
+  (RFC 6455 §4.1), and the two grammars are disjoint, so the split is exact
+  rather than heuristic. One port, one firewall pinhole and one certificate now
+  serve a browser UE on WSS and a SIP trunk on TLS — which matters where the
+  port is not yours to choose (443 outbound from a guest network, 5061 expected
+  to be raw SIP by a carrier). Downstream everything sees the transport the
+  connection turned out to speak, so Via/Contact generation, flow capture, MT
+  routing and outbound distribution are unchanged; the classification costs one
+  step per connection and nothing per message. A peer that connects and stays
+  silent (connection reuse, RFC 5923) is treated as raw SIP after two seconds.
+  Only `tcp`+`ws` and `tls`+`wss` can share a socket: any other pairing on one
+  address (notably plaintext with TLS, where a ClientHello is not a SIP message)
+  is now a startup error with a message naming both lists and the address.
 - **Worked voice-AI example — a carrier call answered by an AI over a WebSocket.**
   `examples/voice_ai_b2bua.py` + `.yaml` compose the shipped pieces into the
   single-leg shape: identify the carrier by source IP, `rtpengine.answer_local()`
@@ -97,6 +114,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `call.reject()` did not, so every script-driven rejection answered a
   dialog-forming INVITE with the request's tagless `To`. Both paths now share one
   helper.
+- **The same address under two `listen:` protocols silently half-worked.** Every
+  stream listener binds with `SO_REUSEPORT`, so configuring one address under
+  both `listen.tls` and `listen.wss` (an entirely reasonable-looking way to ask
+  for both on one port) started two listeners that both bound successfully and
+  had the kernel distribute arriving connections between them — roughly half of
+  the WSS clients landed in the raw-SIP reader and half of the TLS peers in the
+  WebSocket handshake, with no error logged anywhere. That configuration now
+  does what it reads like (see the multiplexed listener above), and the pairings
+  that genuinely cannot share a socket are rejected at startup.
 - **A UAS-mode B2BUA answer carried no `Contact`, so no in-dialog request could
   be addressed to it.** RFC 3261 §12.1.1 / §13.3.1.4 require a dialog-establishing
   response to carry the Contact the UAC builds its remote target from. The
@@ -261,6 +287,12 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   whose Max-Forwards alone is out of range.
 
 ### Changed
+- **TLS connection lifecycle logs moved from `info` to `debug`.** The four
+  stream transports now share one per-connection reader/writer, and it logs
+  "closed by peer", idle timeout and cleanup at `debug` — what the TCP listener
+  (the highest-volume of them) already did. A TLS edge with thousands of UEs no
+  longer prints a line per connection close at `info`. Warnings and errors are
+  unchanged.
 - **siphon refuses to start when a `media.profiles` entry sets a field its
   `media.backend` cannot honour,** naming the profile, the direction and the
   field. The WebSocket and DSP flags are `siphon-rtp` only; `received_from` and

@@ -15,11 +15,12 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::TlsServerConfig;
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, StreamConnections, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
 use crate::transport::acl::TransportAcl;
+use crate::transport::stream::{bind_tcp_listener, spawn_outbound_distributor};
 
 /// Handle a single WebSocket connection after the upgrade handshake.
 /// Generic over the underlying stream (plain TCP for WS, TLS for WSS).
@@ -28,7 +29,7 @@ use crate::transport::acl::TransportAcl;
 // (`http::Response<Option<String>>`) is large, but the type is fixed by the
 // callback contract — it can't be boxed — so allow the lint here.
 #[allow(clippy::result_large_err)]
-async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     transport_variant: Transport,
     connection_id: ConnectionId,
@@ -171,68 +172,6 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     info!("WS connection {:?} cleaned up", connection_id);
 }
 
-/// Spawn an outbound dispatcher task that routes outbound messages to
-/// per-connection senders via the connection map.
-fn spawn_outbound_dispatcher(
-    outbound_rx: flume::Receiver<OutboundMessage>,
-    connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>>,
-    label: &'static str,
-) {
-    tokio::spawn(async move {
-        while let Ok(outbound) = outbound_rx.recv_async().await {
-            if let Some(sender) = connection_map.get(&outbound.connection_id) {
-                // Non-blocking: NEVER park in `send().await` here (see tcp.rs for
-                // the full rationale). Awaiting a send to a non-reading peer's full
-                // bounded channel would park this single distributor while holding
-                // the `connection_map` shard guard — stalling all outbound and
-                // blocking accept's `insert` on the same shard. `try_send` sheds
-                // for a backed-up (stuck) peer instead.
-                let connection_id = outbound.connection_id;
-                // Frames of one message keep their relative order — same
-                // per-connection channel, single distributor task.
-                for frame in outbound.into_frames() {
-                    match sender.try_send(frame) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            warn!("{} outbound dropped: connection {:?} send buffer full (slow/stuck peer)", label, connection_id);
-                            break;
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            warn!("{} outbound dropped: connection {:?} closed", label, connection_id);
-                            break;
-                        }
-                    }
-                }
-            } else {
-                debug!("{} outbound: connection {:?} not found (may have closed)", label, outbound.connection_id);
-            }
-        }
-    });
-}
-
-/// Create a TCP listener with SO_REUSEADDR/SO_REUSEPORT and optional TOS set
-/// before binding.  Shared by WS and WSS listeners.
-fn bind_tcp_listener(
-    local_addr: SocketAddr,
-    tos: Option<u32>,
-    _label: &str,
-) -> std::io::Result<tokio::net::TcpListener> {
-    let socket = if local_addr.is_ipv6() {
-        tokio::net::TcpSocket::new_v6()?
-    } else {
-        tokio::net::TcpSocket::new_v4()?
-    };
-    socket.set_reuseaddr(true)?;
-    #[cfg(unix)]
-    socket.set_reuseport(true)?;
-    // DSCP / DiffServ marking (RFC 4594) — family-aware, best-effort.
-    if let Some(tos) = tos {
-        super::apply_tos(&socket2::SockRef::from(&socket), tos);
-    }
-    socket.bind(local_addr)?;
-    socket.listen(1024)
-}
-
 /// Spawn a plain WebSocket (WS) listener.
 pub async fn listen(
     local_addr: SocketAddr,
@@ -244,10 +183,10 @@ pub async fn listen(
     tos: Option<u32>,
     close_tx: Option<flume::Sender<u64>>,
 ) {
-    spawn_outbound_dispatcher(outbound_rx, connection_map.clone(), "WS");
+    spawn_outbound_distributor(outbound_rx, connection_map.clone(), Transport::WebSocket, None);
 
     tokio::spawn(async move {
-        let listener = match bind_tcp_listener(local_addr, tos, "WS") {
+        let listener = match bind_tcp_listener(local_addr, tos) {
             Ok(listener) => listener,
             Err(error) => {
                 error!("failed to bind WS listener on {local_addr}: {error}");
@@ -313,10 +252,15 @@ pub async fn listen_secure(
         std::process::exit(1);
     });
 
-    spawn_outbound_dispatcher(outbound_rx, connection_map.clone(), "WSS");
+    spawn_outbound_distributor(
+        outbound_rx,
+        connection_map.clone(),
+        Transport::WebSocketSecure,
+        None,
+    );
 
     tokio::spawn(async move {
-        let listener = match bind_tcp_listener(local_addr, tos, "WSS") {
+        let listener = match bind_tcp_listener(local_addr, tos) {
             Ok(listener) => listener,
             Err(error) => {
                 error!("failed to bind WSS listener on {local_addr}: {error}");

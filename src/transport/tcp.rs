@@ -12,14 +12,14 @@ use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
-use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
+use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, configure_tcp_socket, next_connection_id};
 use crate::transport::acl::TransportAcl;
-use crate::transport::crlf_keepalive::{drain_leading_crlf_keepalives, CrlfPongTracker};
+use crate::transport::crlf_keepalive::CrlfPongTracker;
 use crate::transport::pool::ConnectionPool;
+use crate::transport::stream::{bind_tcp_listener, serve_sip_stream, spawn_outbound_distributor, StreamContext};
 
 /// Spawn a TCP listener. For each accepted connection a task is spawned that:
 ///   1. Reads inbound SIP messages and sends them to `inbound_tx`
@@ -39,111 +39,22 @@ pub async fn listen(
     crlf_pong_tracker: Option<Arc<CrlfPongTracker>>,
     close_tx: Option<flume::Sender<u64>>,
 ) {
-    // Spawn a task that distributes outbound messages to per-connection senders.
-    // When no existing connection matches (`ConnectionId::default()` from fire-
-    // and-forget UAC sends, or a connection that has since closed), fall back
-    // to the outbound `ConnectionPool` to open a new TCP connection.  Without
-    // this fallback the message would be silently dropped — the bug that left
+    // Distribute outbound messages to per-connection senders. When no existing
+    // connection matches (`ConnectionId::default()` from fire-and-forget UAC
+    // sends, or a connection that has since closed), the distributor falls back
+    // to the outbound `ConnectionPool` to open a new TCP connection. Without
+    // that fallback the message would be silently dropped — the bug that left
     // in-dialog NOTIFY frames built but never written to the wire when the
     // Route header pointed at a destination with no live inbound connection.
-    let connection_map_clone = connection_map.clone();
-    tokio::spawn(async move {
-        while let Ok(outbound) = outbound_rx.recv_async().await {
-            if let Some(sender) = connection_map_clone.get(&outbound.connection_id) {
-                // Non-blocking: NEVER park in `send().await` here. This task is the
-                // single outbound distributor and it holds the `connection_map`
-                // shard read guard for the whole `if let`. A non-reading peer
-                // fills its bounded channel; an awaiting send would then park
-                // holding the guard — stalling outbound for every connection
-                // (head-of-line) and blocking the accept loop's `insert` on the
-                // same shard (accept stops, backlog fills, engine wedges).
-                // `try_send` keeps the guard for only the synchronous send and
-                // sheds for a backed-up (stuck) peer — it will retransmit or its
-                // connection will close.
-                let connection_id = outbound.connection_id;
-                // Frames of one message keep their relative order: they enter
-                // the same per-connection channel back to back, and this is the
-                // only distributor task feeding it.
-                for frame in outbound.into_frames() {
-                    match sender.try_send(frame) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            warn!("TCP outbound dropped: connection {:?} send buffer full (slow/stuck peer)", connection_id);
-                            break;
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            warn!("TCP outbound dropped: connection {:?} closed", connection_id);
-                            break;
-                        }
-                    }
-                }
-            } else if let Some(ref pool) = pool {
-                let destination = outbound.destination;
-                let requested_connection_id = outbound.connection_id;
-                // Sequential await per frame — the pool coalesces to one
-                // connection per destination, so frames stay in order on it.
-                for frame in outbound.into_frames() {
-                    match pool.send_tcp(destination, frame).await {
-                        Ok(connection_id) => {
-                            debug!(
-                                destination = %destination,
-                                connection_id = ?connection_id,
-                                "TCP outbound: sent via pool"
-                            );
-                        }
-                        Err(error) => {
-                            warn!(
-                                destination = %destination,
-                                connection_id = ?requested_connection_id,
-                                "TCP outbound pool connect failed: {error}"
-                            );
-                            break;
-                        }
-                    }
-                }
-            } else {
-                warn!(
-                    destination = %outbound.destination,
-                    connection_id = ?outbound.connection_id,
-                    "TCP outbound dropped: no live connection and no pool available"
-                );
-            }
-        }
-    });
+    spawn_outbound_distributor(outbound_rx, connection_map.clone(), Transport::Tcp, pool);
 
     tokio::spawn(async move {
-        // Use TcpSocket so we can set SO_REUSEADDR/SO_REUSEPORT before binding.
-        // This allows the outbound connection pool to also bind to this address,
-        // enabling outbound connections from the well-known SIP port.
-        let socket = if local_addr.is_ipv6() {
-            match tokio::net::TcpSocket::new_v6() {
-                Ok(socket) => socket,
-                Err(error) => { error!("failed to create TCP socket: {error}"); return; }
-            }
-        } else {
-            match tokio::net::TcpSocket::new_v4() {
-                Ok(socket) => socket,
-                Err(error) => { error!("failed to create TCP socket: {error}"); return; }
-            }
-        };
-        if let Err(error) = socket.set_reuseaddr(true) {
-            error!("failed to set SO_REUSEADDR: {error}"); return;
-        }
-        #[cfg(unix)]
-        if let Err(error) = socket.set_reuseport(true) {
-            error!("failed to set SO_REUSEPORT: {error}"); return;
-        }
-        // DSCP / DiffServ marking (RFC 4594) — family-aware (IP_TOS on v4,
-        // IPV6_TCLASS on v6), best-effort so it never fails the listener.
-        if let Some(tos) = tos {
-            super::apply_tos(&socket2::SockRef::from(&socket), tos);
-        }
-        if let Err(error) = socket.bind(local_addr) {
-            error!("failed to bind TCP listener to {local_addr}: {error}"); return;
-        }
-        let listener = match socket.listen(1024) {
+        let listener = match bind_tcp_listener(local_addr, tos) {
             Ok(listener) => listener,
-            Err(error) => { error!("failed to listen on TCP socket: {error}"); return; }
+            Err(error) => {
+                error!("failed to bind TCP listener to {local_addr}: {error}");
+                return;
+            }
         };
         info!("TCP listener on {}", local_addr);
 
@@ -165,110 +76,31 @@ pub async fn listen(
                     let close_tx = close_tx.clone();
                     tokio::spawn(async move {
                         let local_addr = socket.local_addr().unwrap_or(local_addr);
-                        let (mut reader, mut writer) = socket.into_split();
-
-                        // Per-connection outbound channel.  Cloned for the read
-                        // task so it can write RFC 5626 §4.4.1 pong (`\r\n`)
-                        // responses back over the same connection.
-                        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
-                        connection_map.insert(connection_id, outbound_tx.clone());
-                        let keepalive_writer = outbound_tx;
-
-                        // Read task with idle timeout and SIP stream framing (RFC 3261 §18.3)
-                        let inbound_tx_clone = inbound_tx.clone();
-                        let read_task = tokio::spawn(async move {
-                            let mut accumulator = BytesMut::with_capacity(65536);
-                            let mut read_buf = [0u8; 8192];
-                            loop {
-                                match tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, reader.read(&mut read_buf)).await {
-                                    Ok(Ok(0)) => {
-                                        debug!("TCP connection {:?} closed by peer", connection_id);
-                                        break;
-                                    }
-                                    Ok(Ok(size)) => {
-                                        accumulator.extend_from_slice(&read_buf[..size]);
-
-                                        // Extract all complete SIP messages from the buffer
-                                        loop {
-                                            // RFC 5626 §4.4.1 keepalive handling + RFC 3261 §7.5
-                                            // stray-CRLF stripping in one pass.
-                                            drain_leading_crlf_keepalives(
-                                                &mut accumulator,
-                                                connection_id,
-                                                &keepalive_writer,
-                                                crlf_pong_tracker.as_ref(),
-                                            );
-                                            if accumulator.is_empty() {
-                                                break;
-                                            }
-                                            let message_len = match extract_sip_message_length(&accumulator) {
-                                                Some(len) if len <= accumulator.len() => len,
-                                                Some(_) => break, // header block complete, body still arriving — wait
-                                                None => match classify_incomplete_stream(&accumulator) {
-                                                    StreamVerdict::MaybeSip => break, // SIP still arriving — need more data
-                                                    StreamVerdict::Garbage => {
-                                                        warn!("non-SIP bytes from {} on TCP {:?}; dropping connection", remote_addr, connection_id);
-                                                        crate::security::record_malformed_message(remote_addr.ip(), "TCP");
-                                                        return; // close the connection
-                                                    }
-                                                },
-                                            };
-                                            let data = accumulator.split_to(message_len).freeze();
-                                            let message = InboundMessage {
-                                                connection_id,
-                                                transport: Transport::Tcp,
-                                                local_addr,
-                                                remote_addr,
-                                                data,
-                                            };
-                                            if let Err(e) = inbound_tx_clone.send_async(message).await {
-                                                error!("TCP inbound enqueue failed: {}", e);
-                                                return;
-                                            }
-                                        }
-                                    }
-                                    Ok(Err(e)) => {
-                                        warn!("TCP read error on {:?}: {}", connection_id, e);
-                                        break;
-                                    }
-                                    Err(_) => {
-                                        debug!("TCP connection {:?} idle timeout ({}s)", connection_id, CONNECTION_IDLE_TIMEOUT.as_secs());
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-
-                        // Write task
-                        let write_task = tokio::spawn(async move {
-                            while let Some(data) = outbound_rx.recv().await {
-                                if let Err(e) = writer.write_all(&data).await {
-                                    warn!("TCP write error on {:?}: {}", connection_id, e);
-                                    break;
-                                }
-                            }
-                        });
-
-                        // Wait for either half to close, then clean up.
-                        tokio::select! {
-                            _ = read_task => {}
-                            _ = write_task => {}
-                        }
-
-                        connection_map.remove(&connection_id);
-                        // RFC 5626 §4.2.2 flow failure: tell the registrar the
-                        // inbound flow is gone so it can deregister any binding
-                        // that arrived on this connection.  Best-effort; the
-                        // drain task no-ops for connections that never
-                        // registered.
-                        if let Some(close_tx) = &close_tx {
-                            let _ = close_tx.send(connection_id.0);
-                        }
-                        debug!("TCP connection {:?} cleaned up", connection_id);
+                        let (reader, writer) = socket.into_split();
+                        serve_sip_stream(
+                            reader,
+                            writer,
+                            StreamContext {
+                                transport: Transport::Tcp,
+                                connection_id,
+                                local_addr,
+                                remote_addr,
+                            },
+                            BytesMut::new(),
+                            inbound_tx,
+                            connection_map,
+                            // TCP reaches peers through the outbound pool, not
+                            // by sending back over the inbound flow, so it does
+                            // not register in the stream-connection registry.
+                            None,
+                            crlf_pong_tracker,
+                            close_tx,
+                        )
+                        .await;
                     });
                 }
-                Err(e) => {
-                    error!("TCP accept error: {}", e);
+                Err(error) => {
+                    error!("TCP accept error: {}", error);
                 }
             }
         }

@@ -1262,6 +1262,14 @@ impl SiphonServer {
             if dscp == 0 { None } else { Some(config::dscp_to_tos(dscp)) }
         };
 
+        // Reject listen addresses that cannot share one socket, and work out
+        // which ones are shared legitimately, before any listener is bound.
+        let (tcp_ws_mux, tls_wss_mux) = resolve_mux_addresses(&config.listen)
+            .unwrap_or_else(|error| {
+                eprintln!("{error}");
+                std::process::exit(1);
+            });
+
         // UDP
         for entry in &config.listen.udp {
             let addr: std::net::SocketAddr = entry.address().parse().unwrap_or_else(|error| {
@@ -1338,6 +1346,25 @@ impl SiphonServer {
                 );
                 None
             };
+
+        // --- Protocol mux (raw SIP + SIP-over-WebSocket on one socket) ---
+        // An address that appears under both `listen.tcp` and `listen.ws` (or
+        // both `listen.tls` and `listen.wss`) is served by a single muxed
+        // listener that classifies each connection from its first line
+        // (RFC 3261 §7.1 start-line vs RFC 6455 §4.1 request line), instead of
+        // two listeners which — both binding with SO_REUSEPORT — would have the
+        // kernel split arriving connections between them arbitrarily.
+        let tcp_listen = listen_addr_map(&config.listen.tcp, "TCP");
+        let tls_listen = listen_addr_map(&config.listen.tls, "TLS");
+        let ws_listen = listen_addr_map(&config.listen.ws, "WS");
+        let wss_listen = listen_addr_map(&config.listen.wss, "WSS");
+        // Declared here (rather than beside their listeners) because a muxed
+        // listener registers into the same per-transport map as the dedicated
+        // one, so a WS connection is reachable identically either way.
+        let ws_connection_map: Arc<dashmap::DashMap<transport::ConnectionId, tokio::sync::mpsc::Sender<bytes::Bytes>>> =
+            Arc::new(dashmap::DashMap::new());
+        let wss_connection_map: Arc<dashmap::DashMap<transport::ConnectionId, tokio::sync::mpsc::Sender<bytes::Bytes>>> =
+            Arc::new(dashmap::DashMap::new());
 
         // TCP
         let tcp_connection_map = Arc::new(dashmap::DashMap::new());
@@ -1471,6 +1498,9 @@ impl SiphonServer {
 
         // Spawn TCP listeners now that the pool exists.
         for (addr, tos, dscp) in tcp_entries {
+            if tcp_ws_mux.contains(&addr) {
+                continue; // served by the TCP+WS mux listener below
+            }
             info!(addr = %addr, dscp = ?dscp, "starting TCP transport");
             transport::tcp::listen(addr, inbound_tx.clone(), tcp_outbound_rx.clone(), Arc::clone(&tcp_connection_map), Arc::clone(&transport_acl), tos, Some(Arc::clone(&connection_pool)), crlf_pong_tracker.clone(), connection_close_tx.clone()).await;
         }
@@ -1489,6 +1519,9 @@ impl SiphonServer {
                     advertised_addrs.entry(transport::Transport::Tls).or_insert_with(|| adv.to_string());
                 }
                 listener_registry_entries.push((transport::Transport::Tls, addr, entry.advertise().map(str::to_string)));
+                if tls_wss_mux.contains(&addr) {
+                    continue; // served by the TLS+WSS mux listener below
+                }
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting TLS transport");
                 transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map), Arc::clone(&transport_acl), stream_connections.clone(), tos, Some(Arc::clone(&connection_pool)), crlf_pong_tracker.clone(), connection_close_tx.clone()).await;
@@ -1496,7 +1529,6 @@ impl SiphonServer {
         }
 
         // WebSocket
-        let ws_connection_map = Arc::new(dashmap::DashMap::new());
         for entry in &config.listen.ws {
             let addr: std::net::SocketAddr = entry.address().parse().unwrap_or_else(|error| {
                 eprintln!("Invalid WS listen address '{}': {error}", entry.address());
@@ -1510,6 +1542,9 @@ impl SiphonServer {
                 advertised_addrs.entry(transport::Transport::WebSocket).or_insert_with(|| adv.to_string());
             }
             listener_registry_entries.push((transport::Transport::WebSocket, addr, entry.advertise().map(str::to_string)));
+            if tcp_ws_mux.contains(&addr) {
+                continue; // served by the TCP+WS mux listener below
+            }
             let tos = resolve_tos(entry);
             info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting WS transport");
             transport::ws::listen(addr, inbound_tx.clone(), ws_outbound_rx.clone(), Arc::clone(&ws_connection_map), Arc::clone(&transport_acl), stream_connections.clone(), tos, connection_close_tx.clone()).await;
@@ -1517,7 +1552,6 @@ impl SiphonServer {
 
         // WSS
         if let Some(ref tls_config) = config.tls {
-            let wss_connection_map = Arc::new(dashmap::DashMap::new());
             for entry in &config.listen.wss {
                 let addr: std::net::SocketAddr = entry.address().parse().unwrap_or_else(|error| {
                     eprintln!("Invalid WSS listen address '{}': {error}", entry.address());
@@ -1531,9 +1565,76 @@ impl SiphonServer {
                     advertised_addrs.entry(transport::Transport::WebSocketSecure).or_insert_with(|| adv.to_string());
                 }
                 listener_registry_entries.push((transport::Transport::WebSocketSecure, addr, entry.advertise().map(str::to_string)));
+                if tls_wss_mux.contains(&addr) {
+                    continue; // served by the TLS+WSS mux listener below
+                }
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting WSS transport");
                 transport::ws::listen_secure(addr, tls_config, inbound_tx.clone(), wss_outbound_rx.clone(), Arc::clone(&wss_connection_map), Arc::clone(&transport_acl), stream_connections.clone(), tos, connection_close_tx.clone()).await;
+            }
+        }
+
+        // --- Protocol-multiplexed listeners (raw SIP + WebSocket, one socket) ---
+        // Both halves already registered in `listen_addrs` / `advertised_addrs`
+        // / the listener registry in the per-transport loops above, so Via and
+        // Contact generation, flow capture and MT routing see a normal listener
+        // on each transport — only the socket is shared.
+        for addr in tcp_ws_mux {
+            let tos = resolve_tos(tcp_listen[&addr]);
+            if resolve_tos(ws_listen[&addr]) != tos {
+                warn!(addr = %addr,
+                    "listen.tcp and listen.ws set different dscp on the shared address; \
+                     using the listen.tcp value for the muxed socket");
+            }
+            info!(addr = %addr, dscp = ?tcp_listen[&addr].dscp().or(global_dscp),
+                "starting TCP+WS mux transport");
+            transport::mux::listen(
+                addr,
+                None,
+                transport::mux::MuxChannels {
+                    sip_outbound_rx: tcp_outbound_rx.clone(),
+                    sip_connection_map: Arc::clone(&tcp_connection_map),
+                    websocket_outbound_rx: ws_outbound_rx.clone(),
+                    websocket_connection_map: Arc::clone(&ws_connection_map),
+                },
+                inbound_tx.clone(),
+                Arc::clone(&transport_acl),
+                stream_connections.clone(),
+                tos,
+                Some(Arc::clone(&connection_pool)),
+                crlf_pong_tracker.clone(),
+                connection_close_tx.clone(),
+            )
+            .await;
+        }
+        if let Some(ref tls_config) = config.tls {
+            for addr in tls_wss_mux {
+                let tos = resolve_tos(tls_listen[&addr]);
+                if resolve_tos(wss_listen[&addr]) != tos {
+                    warn!(addr = %addr,
+                        "listen.tls and listen.wss set different dscp on the shared address; \
+                         using the listen.tls value for the muxed socket");
+                }
+                info!(addr = %addr, dscp = ?tls_listen[&addr].dscp().or(global_dscp),
+                    "starting TLS+WSS mux transport");
+                transport::mux::listen(
+                    addr,
+                    Some(tls_config),
+                    transport::mux::MuxChannels {
+                        sip_outbound_rx: tls_outbound_rx.clone(),
+                        sip_connection_map: Arc::clone(&tls_connection_map),
+                        websocket_outbound_rx: wss_outbound_rx.clone(),
+                        websocket_connection_map: Arc::clone(&wss_connection_map),
+                    },
+                    inbound_tx.clone(),
+                    Arc::clone(&transport_acl),
+                    stream_connections.clone(),
+                    tos,
+                    Some(Arc::clone(&connection_pool)),
+                    crlf_pong_tracker.clone(),
+                    connection_close_tx.clone(),
+                )
+                .await;
             }
         }
 
@@ -3083,8 +3184,199 @@ fn pcf_notification_body_to_json(raw: &[u8]) -> Option<String> {
     serde_json::to_string(&value).ok()
 }
 
+/// Work out which listen addresses are shared between two protocol lists, and
+/// reject the pairings that cannot share one socket.
+///
+/// Raw SIP and SIP-over-WebSocket are distinguishable on one socket because
+/// their start lines are disjoint (RFC 3261 §7.1 ` SIP/2.0` versus RFC 6455
+/// §4.1 ` HTTP/1.1`), so `tcp`+`ws` and `tls`+`wss` are multiplexed by
+/// [`transport::mux`]. Every other overlap is a configuration error: plaintext
+/// and TLS cannot share a socket at all (a ClientHello is not a SIP message),
+/// and the remaining combinations mix a secure listener with a plaintext one.
+///
+/// Returns `(tcp+ws addresses, tls+wss addresses)`.
+fn resolve_mux_addresses(
+    listen: &config::ListenConfig,
+) -> Result<(Vec<std::net::SocketAddr>, Vec<std::net::SocketAddr>), String> {
+    fn addresses(
+        entries: &[config::ListenEntry],
+        label: &str,
+    ) -> Result<Vec<std::net::SocketAddr>, String> {
+        entries
+            .iter()
+            .map(|entry| {
+                entry.address().parse::<std::net::SocketAddr>().map_err(|error| {
+                    format!("Invalid {label} listen address '{}': {error}", entry.address())
+                })
+            })
+            .collect()
+    }
+
+    let tcp = addresses(&listen.tcp, "TCP")?;
+    let tls = addresses(&listen.tls, "TLS")?;
+    let ws = addresses(&listen.ws, "WS")?;
+    let wss = addresses(&listen.wss, "WSS")?;
+
+    let shared = |left: &[std::net::SocketAddr], right: &[std::net::SocketAddr]| -> Vec<std::net::SocketAddr> {
+        left.iter().filter(|addr| right.contains(addr)).copied().collect()
+    };
+
+    for (left, left_label, right, right_label) in [
+        (&tcp, "tcp", &tls, "tls"),
+        (&tcp, "tcp", &wss, "wss"),
+        (&tls, "tls", &ws, "ws"),
+        (&ws, "ws", &wss, "wss"),
+    ] {
+        if let Some(addr) = shared(left, right).first() {
+            return Err(format!(
+                "listen.{left_label} and listen.{right_label} are both configured on {addr}, \
+                 which cannot share one socket. Only tcp+ws and tls+wss can be multiplexed \
+                 on the same port."
+            ));
+        }
+    }
+
+    Ok((shared(&tcp, &ws), shared(&tls, &wss)))
+}
+
+/// Parse a configured listen address, exiting with a clear message when it is
+/// malformed (a typo in `listen:` must never start a half-configured server).
+fn parse_listen_addr(address: &str, label: &str) -> std::net::SocketAddr {
+    address.parse().unwrap_or_else(|error| {
+        eprintln!("Invalid {label} listen address '{address}': {error}");
+        std::process::exit(1);
+    })
+}
+
+/// Index one `listen:` list by socket address, so overlapping addresses across
+/// two lists can be detected (and their entries recovered) before any listener
+/// is spawned.
+fn listen_addr_map<'a>(
+    entries: &'a [config::ListenEntry],
+    label: &str,
+) -> std::collections::HashMap<std::net::SocketAddr, &'a config::ListenEntry> {
+    entries
+        .iter()
+        .map(|entry| (parse_listen_addr(entry.address(), label), entry))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    use crate::config::{ListenConfig, ListenEntry};
+
+    fn listen_on(addresses: &[&str]) -> Vec<ListenEntry> {
+        addresses.iter().map(|a| ListenEntry::Plain((*a).to_string())).collect()
+    }
+
+    #[test]
+    fn mux_pairs_tcp_with_ws_on_a_shared_address() {
+        let listen = ListenConfig {
+            tcp: listen_on(&["0.0.0.0:5060", "0.0.0.0:5070"]),
+            ws: listen_on(&["0.0.0.0:5060"]),
+            ..ListenConfig::default()
+        };
+        let (tcp_ws, tls_wss) = resolve_mux_addresses(&listen).unwrap();
+        assert_eq!(tcp_ws, vec!["0.0.0.0:5060".parse().unwrap()]);
+        assert!(tls_wss.is_empty());
+    }
+
+    #[test]
+    fn mux_pairs_tls_with_wss_on_a_shared_address() {
+        let listen = ListenConfig {
+            tls: listen_on(&["0.0.0.0:5061"]),
+            wss: listen_on(&["0.0.0.0:5061"]),
+            ..ListenConfig::default()
+        };
+        let (tcp_ws, tls_wss) = resolve_mux_addresses(&listen).unwrap();
+        assert!(tcp_ws.is_empty());
+        assert_eq!(tls_wss, vec!["0.0.0.0:5061".parse().unwrap()]);
+    }
+
+    #[test]
+    fn distinct_addresses_are_never_muxed() {
+        let listen = ListenConfig {
+            tcp: listen_on(&["0.0.0.0:5060"]),
+            ws: listen_on(&["0.0.0.0:5080"]),
+            tls: listen_on(&["0.0.0.0:5061"]),
+            wss: listen_on(&["0.0.0.0:5081"]),
+            ..ListenConfig::default()
+        };
+        let (tcp_ws, tls_wss) = resolve_mux_addresses(&listen).unwrap();
+        assert!(tcp_ws.is_empty() && tls_wss.is_empty());
+    }
+
+    #[test]
+    fn plaintext_and_tls_may_not_share_a_socket() {
+        // A TLS ClientHello is not a SIP message — there is nothing to sniff.
+        let listen = ListenConfig {
+            tcp: listen_on(&["0.0.0.0:5060"]),
+            tls: listen_on(&["0.0.0.0:5060"]),
+            ..ListenConfig::default()
+        };
+        let error = resolve_mux_addresses(&listen).unwrap_err();
+        assert!(error.contains("listen.tcp and listen.tls"), "{error}");
+        assert!(error.contains("0.0.0.0:5060"), "{error}");
+    }
+
+    #[test]
+    fn mismatched_security_pairings_are_rejected() {
+        for (label, listen) in [
+            (
+                "tcp+wss",
+                ListenConfig {
+                    tcp: listen_on(&["0.0.0.0:5060"]),
+                    wss: listen_on(&["0.0.0.0:5060"]),
+                    ..ListenConfig::default()
+                },
+            ),
+            (
+                "tls+ws",
+                ListenConfig {
+                    tls: listen_on(&["0.0.0.0:5061"]),
+                    ws: listen_on(&["0.0.0.0:5061"]),
+                    ..ListenConfig::default()
+                },
+            ),
+            (
+                "ws+wss",
+                ListenConfig {
+                    ws: listen_on(&["0.0.0.0:5062"]),
+                    wss: listen_on(&["0.0.0.0:5062"]),
+                    ..ListenConfig::default()
+                },
+            ),
+        ] {
+            assert!(
+                resolve_mux_addresses(&listen).is_err(),
+                "{label} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn udp_may_reuse_a_stream_listener_address() {
+        // Different socket type — no conflict to resolve.
+        let listen = ListenConfig {
+            udp: listen_on(&["0.0.0.0:5060"]),
+            tcp: listen_on(&["0.0.0.0:5060"]),
+            ws: listen_on(&["0.0.0.0:5060"]),
+            ..ListenConfig::default()
+        };
+        let (tcp_ws, _) = resolve_mux_addresses(&listen).unwrap();
+        assert_eq!(tcp_ws, vec!["0.0.0.0:5060".parse().unwrap()]);
+    }
+
+    #[test]
+    fn malformed_listen_address_is_reported() {
+        let listen = ListenConfig {
+            ws: listen_on(&["not-an-address"]),
+            ..ListenConfig::default()
+        };
+        let error = resolve_mux_addresses(&listen).unwrap_err();
+        assert!(error.contains("Invalid WS listen address"), "{error}");
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

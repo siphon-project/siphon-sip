@@ -50,8 +50,19 @@ listen:
   # wss:
   #   - "0.0.0.0:443"   # SIP over Secure WebSocket
   #                      # WSS shares the TLS cert from the `tls:` block below.
-  #                      # It's a separate listener because the HTTP upgrade
-  #                      # handshake differs from raw SIP/TLS.
+  #
+  # One socket for both protocols: give the SAME address to tls: and wss: (or
+  # to tcp: and ws:) and siphon serves raw SIP and the WebSocket upgrade from a
+  # single listener, classifying each connection from its first line
+  # (" SIP/2.0" vs " HTTP/1.1" — the two grammars are disjoint).  One port, one
+  # firewall pinhole, one certificate for browser UEs and SIP trunks alike:
+  #   tls:
+  #     - "0.0.0.0:5061"
+  #   wss:
+  #     - "0.0.0.0:5061"
+  # Only tcp+ws and tls+wss can share a socket.  Plaintext and TLS cannot (a
+  # ClientHello is not a SIP message), so any other pairing on one address is a
+  # startup error rather than a silently half-working listener.
   #
   # Per-socket advertised address (like OpenSIPS `socket ... as ...`).
   # Use when the bind IP differs from what external peers should see

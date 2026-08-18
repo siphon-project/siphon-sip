@@ -5,6 +5,8 @@ pub mod udp;
 pub mod tcp;
 pub mod tls;
 pub mod ws;
+pub mod stream;
+pub mod mux;
 #[cfg(feature = "sctp")]
 pub mod sctp;
 pub mod pool;
