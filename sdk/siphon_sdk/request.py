@@ -1140,11 +1140,17 @@ class Request:
     def fix_nated_register(self) -> None:
         """Add ``received=`` and ``rport=`` to top Via using source IP:port.
 
-        Used by edge proxies / P-CSCFs for NAT traversal on REGISTER.
+        Used by edge proxies / P-CSCFs for NAT traversal on REGISTER.  Both
+        values come from :attr:`source_ip` / :attr:`source_port`, so a
+        ``Request`` constructed with a NATed source port writes that port
+        into ``rport=`` rather than a fixed 5060.
         """
         via = self.get_header("Via")
         if via:
-            self.set_header("Via", f"{via};received={self._source_ip};rport=5060")
+            self.set_header(
+                "Via",
+                f"{via};received={self._source_ip};rport={self._source_port}",
+            )
 
     def fix_nated_contact(self) -> None:
         """Rewrite Contact URI host:port with source IP:port.

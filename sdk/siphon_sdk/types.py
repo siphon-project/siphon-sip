@@ -120,6 +120,7 @@ class Contact:
 
     Attributes:
         uri: The contact URI string (e.g. ``"sip:alice@192.168.1.5:5060"``).
+        received: Source address of the REGISTER as a SIP URI, or ``None``.
         q: Quality value between 0.0 and 1.0 (higher = preferred).
         expires: Seconds remaining until this binding expires.
         age_secs: Seconds since the binding was created or last refreshed.
@@ -127,6 +128,24 @@ class Contact:
 
     uri: str
     """Contact URI as a string."""
+
+    received: Optional[str] = None
+    """Transport source address of the REGISTER that created this binding, as
+    a SIP URI — ``"sip:<ip>:<port>;transport=<proto>"``, the shape OpenSIPS
+    puts in its ``received_avp``.  ``None`` when the binding was saved without
+    source address info.
+
+    Prefer this over :attr:`uri` when routing: a Contact URI can carry a
+    private or NATed address, while this is the address the UE is actually
+    reachable on::
+
+        request.fork([c.received or c.uri for c in contacts])
+
+    Behind NAT the two differ — the UE advertises ``sip:alice@10.0.0.5:5060``
+    in its Contact while the packet arrives from ``198.51.100.20:41234`` — and
+    only the latter is routable.  It is a full URI rather than a bare
+    ``host:port`` precisely so it can be handed to ``fork()`` / ``relay()``
+    verbatim."""
 
     q: float = 1.0
     """Quality value (0.0–1.0).  Higher values are preferred.

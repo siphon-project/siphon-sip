@@ -280,6 +280,22 @@ harness.reset()
 | `reginfo_xml(aor, state, version) -> str` | Generate reginfo XML (RFC 3680) |
 | `on_change` | Decorator: fires on registration state changes |
 
+`lookup()` returns `Contact` objects:
+
+| Field | Description |
+|-------|-------------|
+| `uri` | Contact URI as advertised by the UE |
+| `received` | Transport source of the REGISTER as a SIP URI (`sip:<ip>:<port>;transport=<proto>`), or `None`. Prefer it over `uri` when routing — the Contact URI may carry a private/NAT address (`contact.received or contact.uri`) |
+| `q` | Quality value (0.0–1.0), higher wins |
+| `expires` | Seconds remaining on the binding |
+| `age_secs` | Seconds since the binding was created or refreshed |
+| `path` | RFC 3327 Path headers stored with the binding |
+| `instance_id` / `instance_epoch` | Which siphon instance/process accepted the REGISTER |
+| `is_local` | `True` when *this* process accepted the binding |
+| `flow_token` / `flow` | Captured inbound flow for RFC 5626 connection reuse |
+| `params` | Contact-header params preserved from the REGISTER (RFC 3840 feature tags) |
+| `kind` | `"ue"` (routable) or `"as"` (AS capability record) |
+
 ### Auth
 
 | Method | Description |
