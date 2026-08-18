@@ -42,7 +42,7 @@ listen:
 tls:
   certificate: "/etc/siphon/tls/example.com.crt"
   private_key:  "/etc/siphon/tls/example.com.key"
-  method: "TLSv1_3"             # TLSv1_2 | TLSv1_3
+  method: "TLSv1_2"             # minimum TLS version: TLSv1_2 | TLSv1_3
   # INBOUND mTLS — siphon verifies clients that connect INTO it (applies to
   # listen.tls AND listen.wss):
   verify_client: false
@@ -52,6 +52,14 @@ tls:
   client_certificate: "/etc/siphon/tls/client.crt"
   client_private_key: "/etc/siphon/tls/client.key"
 ```
+
+`method` is the **minimum** TLS version, not an exact one: `TLSv1_2` (the
+default) negotiates TLS 1.2 or 1.3, `TLSv1_3` negotiates 1.3 only and refuses a
+TLS 1.2 peer. It applies in both directions — the `listen.tls` / `listen.wss`
+listeners this block serves, and the outbound TLS connections siphon dials — so
+raising the floor also stops siphon connecting to a trunk that has not moved off
+TLS 1.2. TLS 1.0/1.1 and SSL are rejected at config load (RFC 8996 deprecates
+them; the rustls stack does not implement them), as is any unrecognised value.
 
 The two mTLS directions are independent. `verify_client` / `client_ca` govern
 **inbound** mutual TLS — siphon verifying the certificate of a peer connecting

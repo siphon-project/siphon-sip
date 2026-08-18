@@ -267,7 +267,10 @@ async fn tcp_outbound_fallback_to_pool_when_no_connection() {
         None,
         None,
         None,
-        siphon::transport::pool::build_outbound_tls_config(None)
+        siphon::transport::pool::build_outbound_tls_config(
+            None,
+            siphon::config::TlsMethod::default(),
+        )
             .expect("outbound tls config"),
     ));
 
@@ -688,7 +691,7 @@ fn generate_test_tls_config(directory: &tempfile::TempDir) -> siphon::config::Tl
         certificate: cert_path.to_str().unwrap().to_string(),
         private_key: key_path.to_str().unwrap().to_string(),
         certificates: vec![],
-        method: "TLSv1_3".to_string(),
+        method: siphon::config::TlsMethod::default(),
         verify_client: false,
         client_ca: None,
         client_certificate: None,

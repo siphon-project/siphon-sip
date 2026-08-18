@@ -699,7 +699,7 @@ mod tests {
             certificate: cert_path.to_str().unwrap().to_string(),
             private_key: key_path.to_str().unwrap().to_string(),
             certificates: vec![],
-            method: "TLSv1_3".to_string(),
+            method: crate::config::TlsMethod::default(),
             verify_client: false,
             client_ca: None,
             client_certificate: None,

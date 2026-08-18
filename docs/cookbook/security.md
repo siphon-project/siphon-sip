@@ -101,6 +101,11 @@ tls:
   client_ca: "/etc/siphon/tls/client-ca.pem"
 ```
 
+`method` is the minimum TLS version. `TLSv1_3` here is a real 1.3-only floor —
+it refuses TLS 1.2 peers on the listeners *and* on outbound connections siphon
+dials, so check both sides can do 1.3 before hardening. `TLSv1_2` (the default)
+negotiates 1.2 or 1.3.
+
 `verify_client: true` requires a client cert chaining to `client_ca` (fails closed at
 startup if `client_ca` is missing). It applies to `listen.tls` **and** `listen.wss`.
 

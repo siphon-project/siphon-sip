@@ -21,7 +21,7 @@ use tokio_rustls::rustls::sign::CertifiedKey;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
-use crate::config::TlsServerConfig;
+use crate::config::{TlsMethod, TlsServerConfig};
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, StreamConnections, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
 use crate::transport::acl::TransportAcl;
 use crate::transport::crlf_keepalive::{drain_leading_crlf_keepalives, CrlfPongTracker};
@@ -261,6 +261,26 @@ fn build_cert_resolver(tls_config: &TlsServerConfig) -> io::Result<SniCertResolv
     Ok(SniCertResolver { exact, wildcard, default })
 }
 
+/// The rustls protocol-version list for a configured `tls.method` floor.
+///
+/// `tls.method` is a minimum, so `Tls12` yields rustls' own default set (1.2 +
+/// 1.3) and only `Tls13` narrows it. Used by both the inbound acceptor here and
+/// the outbound client config in [`crate::transport::pool`], so one setting
+/// governs the TLS versions siphon negotiates in either direction.
+pub(crate) fn protocol_versions(
+    method: TlsMethod,
+) -> &'static [&'static tokio_rustls::rustls::SupportedProtocolVersion] {
+    use tokio_rustls::rustls::version::{TLS12, TLS13};
+
+    static TLS12_FLOOR: &[&tokio_rustls::rustls::SupportedProtocolVersion] = &[&TLS12, &TLS13];
+    static TLS13_ONLY: &[&tokio_rustls::rustls::SupportedProtocolVersion] = &[&TLS13];
+
+    match method {
+        TlsMethod::Tls12 => TLS12_FLOOR,
+        TlsMethod::Tls13 => TLS13_ONLY,
+    }
+}
+
 /// Build a `TlsAcceptor` from the certificate and key paths in config.
 pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAcceptor> {
     use rustls_pki_types::pem::PemObject;
@@ -276,7 +296,17 @@ pub fn build_tls_acceptor(tls_config: &TlsServerConfig) -> io::Result<TlsAccepto
     // setting `verify_client: true` gave false assurance. When enabled we
     // require a client certificate that chains to `client_ca`; a missing CA is
     // a hard startup error (fail closed) rather than a silent downgrade.
-    let builder = rustls::ServerConfig::builder();
+    // Honor `tls.method` as the minimum protocol version. Previously this was a
+    // bare `builder()` (rustls default = TLS 1.2 + 1.3) and the config value was
+    // parsed but never read, so `method: TLSv1_3` claimed a floor nothing
+    // enforced — a TLS 1.2 peer still handshook fine.
+    let builder = rustls::ServerConfig::builder_with_protocol_versions(protocol_versions(
+        tls_config.method,
+    ));
+    info!(
+        min_version = %tls_config.method,
+        "TLS listener minimum protocol version"
+    );
     let server_config = if tls_config.verify_client {
         let ca_path = tls_config.client_ca.as_ref().ok_or_else(|| {
             io::Error::new(
@@ -759,7 +789,7 @@ mod tests {
             certificate: cert_path.to_str().unwrap().to_string(),
             private_key: key_path.to_str().unwrap().to_string(),
             certificates: vec![],
-            method: "TLSv1_3".to_string(),
+            method: TlsMethod::default(),
             verify_client: false,
             client_ca: None,
             client_certificate: None,
@@ -783,7 +813,7 @@ mod tests {
             certificate: "/nonexistent/cert.pem".to_string(),
             private_key: "/nonexistent/key.pem".to_string(),
             certificates: vec![],
-            method: "TLSv1_3".to_string(),
+            method: TlsMethod::default(),
             verify_client: false,
             client_ca: None,
             client_certificate: None,
@@ -829,7 +859,7 @@ mod tests {
             certificate: cert_path.to_str().unwrap().to_string(),
             private_key: key_path.to_str().unwrap().to_string(),
             certificates: vec![],
-            method: "TLSv1_3".to_string(),
+            method: TlsMethod::default(),
             verify_client: false,
             client_ca: None,
             client_certificate: None,
@@ -852,6 +882,133 @@ mod tests {
         assert!(
             result.is_err(),
             "verify_client=true without client_ca must fail closed"
+        );
+    }
+
+    /// Drive one real handshake against `build_tls_acceptor` with a client
+    /// pinned to `client_versions`, and report the version that got negotiated.
+    ///
+    /// Version enforcement is only observable on the wire — a `ServerConfig`
+    /// exposes no "which versions did you enable" accessor — so this is the only
+    /// way to prove `tls.method` is honored rather than merely parsed.
+    async fn handshake_version(
+        tls_config: &TlsServerConfig,
+        client_versions: &[&'static tokio_rustls::rustls::SupportedProtocolVersion],
+    ) -> Result<tokio_rustls::rustls::ProtocolVersion, String> {
+        use rustls_pki_types::pem::PemObject;
+        use tokio_rustls::rustls;
+        use tokio_rustls::TlsConnector;
+
+        let acceptor = build_tls_acceptor(tls_config).map_err(|error| error.to_string())?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            // Result deliberately ignored: on a version mismatch the server
+            // errors too, and the assertion under test is the client's.
+            let _ = acceptor.accept(stream).await;
+        });
+
+        let cert_pem = std::fs::read(&tls_config.certificate).expect("read test cert");
+        let mut cursor = std::io::Cursor::new(cert_pem);
+        let certs: Vec<_> = rustls_pki_types::CertificateDer::pem_reader_iter(&mut cursor)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("parse test cert");
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in &certs {
+            root_store.add(cert.clone()).expect("trust test cert");
+        }
+
+        let client_config = rustls::ClientConfig::builder_with_protocol_versions(client_versions)
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let tcp_stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let server_name = rustls_pki_types::ServerName::try_from("localhost").expect("server name");
+
+        let outcome = connector
+            .connect(server_name, tcp_stream)
+            .await
+            .map(|stream| {
+                stream
+                    .get_ref()
+                    .1
+                    .protocol_version()
+                    .expect("negotiated protocol version")
+            })
+            .map_err(|error| error.to_string());
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+        outcome
+    }
+
+    #[tokio::test]
+    async fn tls_method_tls13_refuses_a_tls12_client() {
+        // `method: TLSv1_3` used to be parsed and dropped on the floor, so a TLS
+        // 1.2 peer handshook fine against a config that claimed 1.3-only.
+        ensure_crypto_provider();
+        use tokio_rustls::rustls::version::{TLS12, TLS13};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut tls_config = write_test_cert(&directory);
+        tls_config.method = TlsMethod::Tls13;
+
+        let refused = handshake_version(&tls_config, &[&TLS12]).await;
+        assert!(
+            refused.is_err(),
+            "tls.method TLSv1_3 must refuse a TLS 1.2 client, got {refused:?}"
+        );
+
+        let accepted = handshake_version(&tls_config, &[&TLS13]).await;
+        assert_eq!(
+            accepted,
+            Ok(tokio_rustls::rustls::ProtocolVersion::TLSv1_3),
+            "tls.method TLSv1_3 must still serve TLS 1.3"
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_method_tls12_is_a_floor_not_a_pin() {
+        // TLSv1_2 is a minimum: a 1.3-capable peer must still get 1.3, or
+        // "require at least 1.2" would silently become "downgrade everyone".
+        ensure_crypto_provider();
+        use tokio_rustls::rustls::version::{TLS12, TLS13};
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut tls_config = write_test_cert(&directory);
+        tls_config.method = TlsMethod::Tls12;
+
+        assert_eq!(
+            handshake_version(&tls_config, &[&TLS12]).await,
+            Ok(tokio_rustls::rustls::ProtocolVersion::TLSv1_2)
+        );
+        assert_eq!(
+            handshake_version(&tls_config, &[&TLS13]).await,
+            Ok(tokio_rustls::rustls::ProtocolVersion::TLSv1_3)
+        );
+    }
+
+    #[tokio::test]
+    async fn default_tls_method_keeps_serving_tls12_and_tls13() {
+        // The default must not tighten on upgrade: a config with no `method` line
+        // serves exactly what siphon served before the setting was wired.
+        ensure_crypto_provider();
+        use tokio_rustls::rustls::version::{TLS12, TLS13};
+
+        let directory = tempfile::tempdir().unwrap();
+        let tls_config = write_test_cert(&directory);
+        assert_eq!(tls_config.method, TlsMethod::Tls12, "default floor");
+
+        assert_eq!(
+            handshake_version(&tls_config, &[&TLS12]).await,
+            Ok(tokio_rustls::rustls::ProtocolVersion::TLSv1_2)
+        );
+        assert_eq!(
+            handshake_version(&tls_config, &[&TLS13]).await,
+            Ok(tokio_rustls::rustls::ProtocolVersion::TLSv1_3)
         );
     }
 
