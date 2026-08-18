@@ -326,6 +326,17 @@ impl CdrSession {
         }
     }
 
+    /// Record the authenticated username after the fact.
+    ///
+    /// The proxy path knows `auth_user` before the session is built, but a
+    /// B2BUA call is tracked at INVITE time — *before* `@b2bua.on_invite` runs
+    /// — so a caller authenticated inside that handler
+    /// (`auth.require_proxy_digest(call, …)`) can only be stamped on once the
+    /// handler returns.
+    pub fn set_auth_user(&mut self, auth_user: String) {
+        self.auth_user = Some(auth_user);
+    }
+
     /// Merge extra fields to auto-stamp onto the finalized CDR (later keys win).
     /// Used for LCR route `cdr_fields` when a carrier wins.
     pub fn merge_extra(&mut self, fields: &std::collections::HashMap<String, String>) {
@@ -879,6 +890,30 @@ mod tests {
             Some("Ozona/5.0".to_string()),
             Some("alice".to_string()),
         )
+    }
+
+    #[test]
+    fn cdr_session_set_auth_user_after_the_fact() {
+        // A B2BUA call is tracked at INVITE time, before @b2bua.on_invite runs,
+        // so a caller authenticated inside that handler
+        // (auth.require_proxy_digest(call, …)) can only be stamped on once the
+        // handler returns.
+        let mut session = CdrSession::new(
+            "b2bua-call@host".to_string(),
+            "sip:alice@example.com".to_string(),
+            "sip:bob@example.com".to_string(),
+            "sip:bob@10.0.0.2".to_string(),
+            "10.0.0.1".to_string(),
+            "udp".to_string(),
+            None,
+            None,
+        );
+        assert!(session.clone().finalize("caller", None, None).auth_user.is_none());
+
+        session.set_auth_user("alice".to_string());
+        session.mark_answered(200);
+        let cdr = session.finalize("caller", None, None);
+        assert_eq!(cdr.auth_user.as_deref(), Some("alice"));
     }
 
     #[test]

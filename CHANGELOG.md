@@ -7,6 +7,36 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **`auth.require_proxy_digest()` / `require_www_digest()` / `require_digest()` /
+  `verify_digest()` now take a B2BUA `Call` as well as a proxy `Request`, so a
+  B2BUA can challenge its own caller.** Registering any `@b2bua.*` handler makes
+  the dispatcher route INVITE straight to the B2BUA path, so `@proxy.on_request`
+  never sees it — and the digest helpers only accepted a `Request`. There was no
+  way to authenticate an INVITE in B2BUA mode at all; the only auth on that path
+  was relaying a *downstream* challenge (`call.dial(auth_passthrough=True)`).
+  Now:
+
+  ```python
+  @b2bua.on_invite
+  def new_call(call):
+      if not auth.require_proxy_digest(call, realm="example.com"):
+          return                      # 407 armed; siphon answers the A-leg
+      log.info(f"call from {call.auth_user}")
+      call.dial(str(call.ruri))
+  ```
+
+  On a `Call` the challenge is armed as the same deferred reject
+  `call.reject()` produces, so siphon answers the A-leg INVITE and drops the
+  call actor without ever building a B-leg INVITE. On success the caller's
+  hop-by-hop `Proxy-Authorization` is stripped from the message the B-leg INVITE
+  is built from (RFC 3261 §22.3). Passing anything other than a `Request` or a
+  `Call` raises `TypeError` naming both. `require_ims_digest` /
+  `require_aka_digest` stay `Request`-only: IMS and AKA digest are REGISTER-time
+  procedures and REGISTER never reaches the B2BUA path.
+- **`call.auth_user`** — the B2BUA twin of `request.auth_user`, carrying the
+  username the A-leg authenticated as (`None` if never challenged). Also stamped
+  onto the call's CDR as `auth_user`; a B2BUA call is tracked at INVITE time, so
+  a caller authenticated inside `@b2bua.on_invite` previously left the field empty.
 - **Worked voice-AI example — a carrier call answered by an AI over a WebSocket.**
   `examples/voice_ai_b2bua.py` + `.yaml` compose the shipped pieces into the
   single-leg shape: identify the carrier by source IP, `rtpengine.answer_local()`
@@ -55,6 +85,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   error instead of a silently-ignored string.
 
 ### Fixed
+- **Every digest challenge but the weakest was dropped on the wire.**
+  `auth.require_*_digest` builds one challenge per algorithm — MD5 + SHA-256 +
+  SHA-512-256, as RFC 7616 §3.7 asks for — so a single 401/407 serves RFC 2617
+  and RFC 7616 clients alike. The response builder copied only the first value,
+  so the wire carried MD5 alone and no client could negotiate up from it. All
+  values are now copied, as separate header lines.
+- **A locally-generated B2BUA final response carried no `To` tag.** RFC 3261
+  §8.2.6.2 requires a UAS to tag every response but 100, and siphon is the UAS
+  on the A-leg. The 408 ring-timeout path stamped the A-leg dialog's tag but
+  `call.reject()` did not, so every script-driven rejection answered a
+  dialog-forming INVITE with the request's tagless `To`. Both paths now share one
+  helper.
 - **A UAS-mode B2BUA answer carried no `Contact`, so no in-dialog request could
   be addressed to it.** RFC 3261 §12.1.1 / §13.3.1.4 require a dialog-establishing
   response to carry the Contact the UAC builds its remote target from. The

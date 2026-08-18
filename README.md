@@ -408,9 +408,10 @@ registrar.save(request)
 registrar.lookup(uri)       # -> list[Contact]
 registrar.is_registered(uri)
 
-# Auth
+# Auth — takes a Request (proxy) or a Call (B2BUA)
 auth.require_www_digest(request, realm)    # 401 challenge (REGISTER)
 auth.require_proxy_digest(request, realm)  # 407 challenge (INVITE)
+auth.require_proxy_digest(call, realm)     # 407 challenge from @b2bua.on_invite
 
 # Gateway routing
 gateway.select("carriers")                  # weighted round-robin

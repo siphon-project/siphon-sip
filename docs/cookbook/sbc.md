@@ -163,6 +163,49 @@ def on_invite(call):
     call.dial(gateway.select("carriers").uri)
 ```
 
+## Authenticate the caller before dialling anything
+
+A B2BUA facing untrusted callers should challenge them, not just route them.
+Registering any `@b2bua.*` handler takes INVITE off the proxy path, so a
+`@proxy.on_request("INVITE")` challenge would never run — pass the `call` to the
+digest helpers instead:
+
+```python
+from siphon import auth, b2bua, gateway, log
+
+@b2bua.on_invite
+def on_invite(call):
+    if not auth.require_proxy_digest(call, realm=DOMAIN):
+        return                      # 407 armed; siphon answers the A-leg
+
+    log.info(f"authenticated {call.auth_user}")
+    call.media.anchor(engine="rtpengine")
+    call.dial(gateway.select("carriers").uri)
+```
+
+An unauthenticated caller gets siphon's own 407 and **no B-leg is dialled** —
+the challenge is armed as the call's deferred reject, so the call actor is
+dropped before any trunk sees traffic. That ordering is the point: a toll-fraud
+probe never reaches your carrier. The caller re-INVITEs with credentials,
+`require_proxy_digest` returns `True`, and the hop-by-hop `Proxy-Authorization`
+is stripped before the B-leg INVITE is built (RFC 3261 §22.3).
+
+Pair it with anti-spoofing on the caller ID, as on the proxy path:
+
+```python
+    from_user = call.from_uri.user if call.from_uri else None
+    if call.auth_user != from_user:
+        call.reject(403, "Forbidden")
+        return
+```
+
+!!! note "Two different auth directions"
+    Challenging on the `call` is siphon authenticating **its caller**.
+    `call.dial(..., auth_passthrough=True)` is the opposite: a *downstream* PBX
+    or trunk challenges, and siphon relays that challenge to the caller to answer
+    end-to-end. A third option, `call.set_credentials(user, password)`, has
+    siphon answer the downstream challenge itself.
+
 ## Upstream trunk requiring mutual TLS
 
 Some upstream SIP trunks require siphon to present a **client certificate** when
