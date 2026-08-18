@@ -148,10 +148,16 @@ jobs:
   # jobs above never build it. This job is the bit-rot guard for the
   # composition: it proves the `siphon` binary still compiles (and is
   # clippy-clean) with no extensions, with each extension on its own, and with
-  # every extension at once. Because the deps are git `branch = "main"`, this
-  # builds against current siphon-sip / extension mains — i.e. it validates the
-  # composition against the latest published lib, not the in-tree lib of this
-  # checkout (the deliberate git-dep tradeoff).
+  # every extension at once. It builds the lib the way an operator would — from
+  # the git deps, NOT from the in-tree source of this checkout (the deliberate
+  # git-dep tradeoff), so an in-tree change reaches this job only once it is on
+  # main and siphon-bin/Cargo.lock has advanced onto it.
+  #
+  # That lock is the reason this is a bit-rot guard and not a freshness check:
+  # `cargo build` resolves the exact SHA committed there, so this job is green
+  # against a siphon-sip main it may be many commits behind. Dependabot advances
+  # the lock weekly (.github/dependabot.yml) — that, not this job, is what keeps
+  # the composition current.
   #
   # Adding an extension module: give it its own build + clippy pair below. The
   # combined leg rides on the `full` aggregate feature, so it picks the new
