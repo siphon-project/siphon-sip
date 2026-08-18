@@ -7,6 +7,40 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **SIGTRAN/SS7 extension module.** `siphon-bin` gains a `sigtran` feature that
+  composes [siphon-sigtran](https://github.com/siphon-project/siphon-sigtran)
+  v1.0.0 into the drop-in `siphon` binary, alongside the existing `smpp` and
+  `http` modules (and in the `full` aggregate). It carries MTP3 user traffic
+  over kernel SCTP (M3UA / M2PA / SUA), resolves MTP3 routes and SCCP Global
+  Title Translation in Rust, and hands locally-addressed dialogues to the script
+  for MAP / CAP / INAP termination:
+
+  ```yaml
+  # siphon.yaml
+  extensions:
+    sigtran: /etc/siphon/sigtran.yaml
+  ```
+
+  ```python
+  from siphon import ss7, gsm_map
+
+  ss7.routes.add(dpc=3000, as_="msc", priority=1)
+
+  @gsm_map.on_operation("mo-forward-sm")
+  async def on_mo(dialogue, arg):
+      dialogue.reply(gsm_map.mo_forward_sm_res())
+      dialogue.end()
+  ```
+
+  The four namespaces plus `SigtranError` and the module functions are mounted
+  in one pass through `SiphonServer::register_module_extension` (below).
+
+  Build with `cargo build -p siphon-bin --release --features sigtran`. Unlike the
+  other modules this one has a system dependency — `async-sctp` links `libsctp`,
+  so `libsctp-dev` is needed to build and `libsctp1` to run (both are in the
+  `siphon-bin` container image). See
+  [Extensions](https://siphon-sip.org/extensions/) and
+  [sigtran.siphon-sip.org](https://sigtran.siphon-sip.org/).
 - **`SiphonServer::register_module_extension(name, hook)`** — embedding API for
   an extension whose surface is more than one attribute. The hook is handed the
   `siphon` package module itself and mounts its own namespaces, shared types,
@@ -111,6 +145,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   error instead of a silently-ignored string.
 
 ### Fixed
+- **Extension-module startup diagnostics were being swallowed.** `siphon-bin`
+  composes its extension modules at *builder* time, before `SiphonServer::run()`
+  installs the tracing subscriber, so every `tracing::error!` / `warn!` in that
+  layer went nowhere. A binary whose `extensions.smpp` (or `.http`) pointed at a
+  missing or unparseable file started up completely silent with the module
+  disabled, and the documented "loud on mismatch" warning for a config block
+  whose cargo feature was not compiled in never printed either. Those
+  diagnostics now go to stderr, where the rest of siphon's pre-subscriber
+  startup output goes, and name the offending path.
 - **Every digest challenge but the weakest was dropped on the wire.**
   `auth.require_*_digest` builds one challenge per algorithm — MD5 + SHA-256 +
   SHA-512-256, as RFC 7616 §3.7 asks for — so a single 401/407 serves RFC 2617

@@ -1,4 +1,4 @@
-# SIPhon container image WITH opt-in extension modules (SMPP, HTTP).
+# SIPhon container image WITH opt-in extension modules (SMPP, HTTP, SIGTRAN).
 #
 # This builds the `siphon-bin` package — a drop-in `siphon` binary that composes
 # optional extension crates behind cargo features — with `--features smpp` by
@@ -15,6 +15,12 @@
 #   docker build -f siphon-bin/Dockerfile --build-arg FEATURES=http -t siphon-http siphon-bin/
 #   docker build -f siphon-bin/Dockerfile --build-arg FEATURES=full -t siphon-ext  siphon-bin/
 #
+# The SIGTRAN module needs kernel SCTP: async-sctp links libsctp (hence
+# libsctp-dev in the builder and libsctp1 in the runtime below), and the
+# container needs the sctp module loaded on the HOST plus NET_ADMIN-ish
+# capabilities to open SCTP sockets — `--sysctl`-free but not namespace-free.
+# Run with host networking for SIGTRAN, same as for SIP.
+#
 # The image bakes NO default script/config (the SMPP handler lives in your
 # script, e.g. siphon-smpp's examples/echo.py). Mount siphon.yaml + smpp.yaml +
 # your script at runtime.
@@ -24,12 +30,16 @@ FROM debian:trixie-slim AS builder
 
 ARG FEATURES=smpp
 
+# libsctp-dev is unconditional: the `sigtran` feature's async-sctp dep links
+# libsctp, and a build-arg-conditional apt step would fail only at link time,
+# deep into a long build.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         build-essential \
         pkg-config \
         libssl-dev \
+        libsctp-dev \
         xz-utils \
         git \
     && rm -rf /var/lib/apt/lists/*
@@ -62,6 +72,7 @@ FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         libssl3 \
+        libsctp1 \
         iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -81,15 +92,18 @@ COPY --from=builder /build/target/release/siphon /usr/local/bin/siphon
 ENV PYTHON_GIL=0
 ENV PYTHONFAULTHANDLER=1
 
-# SIP (5060/udp+tcp, 5061/tls) + SMPP (2775/tcp, the smpp.yaml default).
+# SIP (5060/udp+tcp, 5061/tls) + SMPP (2775/tcp, the smpp.yaml default) +
+# SIGTRAN (2905/sctp, the M3UA well-known port).
 EXPOSE 5060/udp
 EXPOSE 5060/tcp
 EXPOSE 5061/tcp
 EXPOSE 2775/tcp
+EXPOSE 2905/sctp
 
 WORKDIR /etc/siphon
 
-# Mount siphon.yaml (with an `extensions.smpp` pointer), smpp.yaml, and your
-# script. Run with host networking in production to avoid SIP NAT issues.
+# Mount siphon.yaml (with the `extensions.<module>` pointers), the per-module
+# configs (smpp.yaml / http.yaml / sigtran.yaml), and your script. Run with host
+# networking in production to avoid SIP NAT issues.
 ENTRYPOINT ["/usr/local/bin/siphon"]
 CMD ["--config", "/etc/siphon/siphon.yaml"]

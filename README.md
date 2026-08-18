@@ -154,7 +154,7 @@ Cargo feature. Enable it explicitly (and install `libsctp-dev` first on Linux):
 cargo install siphon-sip --features sctp
 ```
 
-#### Optional extension modules (SMPP, …)
+#### Optional extension modules (SMPP, HTTP, SIGTRAN, …)
 
 Protocol extensions that aren't part of the core SIP datapath live in their own
 crates and are composed into a drop-in `siphon` binary by the separate
@@ -166,15 +166,22 @@ extension binary only if you need one:
 # SMPP 3.4 (scriptable `smpp` namespace: @smpp.on_pdu / @smpp.on_bind)
 cargo build -p siphon-bin --release --features smpp
 
-# …or as a container image (operator mounts siphon.yaml + smpp.yaml + script):
-docker build -f siphon-bin/Dockerfile -t siphon-smpp siphon-bin/
+# SIGTRAN/SS7 — M3UA/M2PA/SUA over SCTP, MTP3 routing, SCCP GTT, MAP/CAP/INAP
+# termination (scriptable `ss7` / `gsm_map` / `gsm_cap` / `inap` namespaces).
+# Needs libsctp-dev at build time and libsctp1 at runtime.
+cargo build -p siphon-bin --release --features sigtran
+
+# …or as a container image (operator mounts siphon.yaml + the module configs +
+# script). `full` turns on every module at once:
+docker build -f siphon-bin/Dockerfile --build-arg FEATURES=full -t siphon-ext siphon-bin/
 ```
 
-Point siphon at the extension's config from `siphon.yaml`:
+Point siphon at each extension's config from `siphon.yaml`:
 
 ```yaml
 extensions:
   smpp: /etc/siphon/smpp.yaml
+  sigtran: /etc/siphon/sigtran.yaml
 ```
 
 If `extensions.smpp` is present but the binary was built without `--features
