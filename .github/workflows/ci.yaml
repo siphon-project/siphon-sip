@@ -183,6 +183,12 @@ jobs:
         with:
           workspaces: siphon-bin
 
+      # siphon-sigtran reaches kernel SCTP through async-sctp, which links
+      # libsctp — needed to LINK the `sigtran` and `full` legs below, not just
+      # to run them.
+      - name: Install libsctp
+        run: sudo apt-get update && sudo apt-get install -y libsctp-dev
+
       # Feature off: plain composition (an `extensions.smpp` block parses and is
       # skipped with a loud warning — no siphon-smpp/smpp34 in the graph).
       - name: Build (no extensions)
@@ -204,6 +210,15 @@ jobs:
 
       - name: Clippy (--features http)
         run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --features http -- -D warnings
+
+      # Same for siphon-sigtran: SIGTRAN/SS7 transport, routing and MAP/CAP/INAP
+      # termination. This is the one module that mounts its surface through
+      # `register_module_extension` rather than a single namespace.
+      - name: Build (--features sigtran)
+        run: PYO3_PYTHON=python3.14 cargo build --features sigtran
+
+      - name: Clippy (--features sigtran)
+        run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --features sigtran -- -D warnings
 
       # Every module at once — the real drop-in binary, and the only leg that
       # catches cross-extension breakage: a version skew between two extension

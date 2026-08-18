@@ -16,10 +16,9 @@ use siphon_smpp::SmppConfig;
 pub fn register(builder: SiphonServer, config: &Config) -> SiphonServer {
     let Some(path) = config.extension_path("smpp") else {
         if config.extension_config("smpp").is_some() {
-            tracing::error!(
-                target: "siphon",
+            super::startup_diagnostic(
                 "extensions.smpp must reference a path to an smpp.yaml \
-                 (inline form not yet supported); SMPP disabled"
+                 (inline form not yet supported); SMPP disabled",
             );
         }
         return builder;
@@ -30,11 +29,10 @@ pub fn register(builder: SiphonServer, config: &Config) -> SiphonServer {
             .register_namespace_with("smpp", siphon_smpp::namespace(cfg.clone()))
             .register_task(siphon_smpp::task(cfg)),
         Err(error) => {
-            tracing::error!(
-                target: "siphon",
-                path = %path.display(),
-                "smpp extension config failed to load: {error}; SMPP disabled"
-            );
+            super::startup_diagnostic(&format!(
+                "smpp extension config {} failed to load: {error}; SMPP disabled",
+                path.display()
+            ));
             builder
         }
     }

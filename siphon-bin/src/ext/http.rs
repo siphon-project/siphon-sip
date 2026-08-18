@@ -15,10 +15,9 @@ use siphon_http::HttpConfig;
 pub fn register(builder: SiphonServer, config: &Config) -> SiphonServer {
     let Some(path) = config.extension_path("http") else {
         if config.extension_config("http").is_some() {
-            tracing::error!(
-                target: "siphon",
+            super::startup_diagnostic(
                 "extensions.http must reference a path to an http.yaml \
-                 (inline form not yet supported); HTTP disabled"
+                 (inline form not yet supported); HTTP disabled",
             );
         }
         return builder;
@@ -29,11 +28,10 @@ pub fn register(builder: SiphonServer, config: &Config) -> SiphonServer {
             .register_namespace_with("http", siphon_http::namespace(cfg.clone()))
             .register_task(siphon_http::task(cfg)),
         Err(error) => {
-            tracing::error!(
-                target: "siphon",
-                path = %path.display(),
-                "http extension config failed to load: {error}; HTTP disabled"
-            );
+            super::startup_diagnostic(&format!(
+                "http extension config {} failed to load: {error}; HTTP disabled",
+                path.display()
+            ));
             builder
         }
     }
