@@ -211,10 +211,26 @@ chunk, so logs join Homer and billing with no mapping table.
 | `reject` | sip | `{code, reason?}` | final non-2xx + tear down |
 | `hangup` | sip | `{reason?}` | BYE an answered call, or reject an unanswered one |
 | `refer` | sip | `{to, replaces?}` | in-dialog REFER on the A-leg |
+| `route` | sip | `{targets, strategy?, headers?}` | return control to siphon: un-park the call and dial the B-leg via LCR sequential failover |
 | `set_header` / `get_header` | sip | `{name, value?}` | on the stored A-leg INVITE |
 | `set_var` / `get_var` | — | `{key, value?}` | per-call variables (drain with the call) |
 | `resync` | — | — | re-attach + enumerate this app's owned calls |
 | `describe` | — | — | list the registered adapters + their verb/event schema |
+
+`route` is the consult-and-return flow: an app parks a call (deferred handover),
+decides routing out-of-process (LCR / rating / business logic), then hands
+control back to siphon with the decision. `targets` is a non-empty array of
+either bare URI strings or objects `{uri, next_hop?, headers?, timeout?}`;
+`strategy` defaults to `"sequential"` (v1 runs the LCR sequential-failover
+engine only, so anything else is a typed `unsupported_verb`, never a silent
+sequential); `headers` is an optional object applied to every attempt's B-leg
+INVITE. On success siphon replies `{state: "routing", targets: N}`, emits a
+`StasisEnd{reason: "routed"}` on the owning connection (control returned, the
+call lives on), then owns the call: it dials the first carrier and advances
+through the rest on reject/timeout, with `@b2bua.on_failure` handling carrier
+failover. `continue` (bare hand-back, siphon re-decides routing through the
+script's `@b2bua.on_*` handlers) is a follow-up, pending the control-loss
+`fallback` re-dispatch path.
 
 `play` / `dtmf` / `bridge` / `originate` / media-stream verbs arrive in later
 phases over the same envelope.

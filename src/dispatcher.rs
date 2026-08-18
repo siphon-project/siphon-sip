@@ -16980,6 +16980,159 @@ pub fn b2bua_refer_call(
     b2bua_send_outbound_refer(&control.state, &internal_call_id, /*on_a_leg=*/ true, &refer_to)
 }
 
+/// One routing target for [`b2bua_route_call`]. Built by the control adapter from
+/// the `route` verb's `targets[]` — a bare URI (`ruri` only) or an object
+/// carrying a per-target `next_hop` / `headers` / ring `timeout`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteTarget {
+    /// The Request-URI for this carrier attempt.
+    pub uri: String,
+    /// Optional wire next-hop (steer egress without reshaping the R-URI).
+    pub next_hop: Option<String>,
+    /// Headers to inject on this attempt's B-leg INVITE.
+    pub headers: Vec<(String, String)>,
+    /// Per-attempt ring timeout (seconds); falls back to the call default.
+    pub timeout_secs: Option<u32>,
+}
+
+/// Why [`b2bua_route_call`] could not accept a return-control routing decision —
+/// mapped to a typed control-plane error by the adapter (never a silent
+/// pretend-success).
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RouteError {
+    /// A strategy other than sequential/single was requested. v1 runs the LCR
+    /// sequential-failover engine only; parallel-fork return is a fast-follow.
+    #[error("unsupported routing strategy '{0}' (v1 supports 'sequential'/'single')")]
+    UnsupportedStrategy(String),
+    /// The routing decision named no targets.
+    #[error("route requires at least one target")]
+    NoTargets,
+}
+
+/// Imperatively hand a *parked* (deferred-handover) controlled B2BUA call back to
+/// siphon **with a routing decision** — the control-plane `route` verb.
+///
+/// The call is currently parked under external control (`CallState::Ringing`,
+/// un-dialed, `control_app=Some`, `handoff_pending=true`, the A-leg INVITE
+/// stored). This un-parks it: siphon runs its **normal B-leg dial with LCR
+/// sequential failover** across `targets` — the shipped [`CallAction::RouteSequence`]
+/// engine (`start_route_sequence` + [`b2bua_advance_route`], dialing via
+/// `b2bua_send_b_leg_invite`) — and owns the call thereafter
+/// (`@b2bua.on_failure` handles carrier failover). The control app is released:
+/// the ControlBus channel drains and a `StasisEnd{reason:"routed"}` is emitted so
+/// the app knows control returned (leak-critical).
+///
+/// v1 runs the sequential engine only; a strategy other than `sequential` /
+/// `single` returns [`RouteError::UnsupportedStrategy`] rather than silently
+/// doing sequential. Returns `Ok(true)` when the call was un-parked and the first
+/// carrier dialed (or a clean 503 sent to the A-leg when no carrier was
+/// routable), `Ok(false)` when the call / dispatcher is gone (never panics), and
+/// `Err(..)` for an invalid decision. Safe to call from any thread (enters the
+/// dispatcher runtime), mirroring [`b2bua_refer_call`] / [`b2bua_terminate_call`].
+pub fn b2bua_route_call(
+    sip_call_id: &str,
+    targets: Vec<RouteTarget>,
+    strategy: &str,
+    extra_headers: &[(String, String)],
+) -> Result<bool, RouteError> {
+    // v1 scope: sequential / single-target only (the shipped RouteSequence
+    // engine). Reject anything else with a typed error — never pretend to fork.
+    if !(strategy.eq_ignore_ascii_case("sequential") || strategy.eq_ignore_ascii_case("single")) {
+        return Err(RouteError::UnsupportedStrategy(strategy.to_string()));
+    }
+    if targets.is_empty() {
+        return Err(RouteError::NoTargets);
+    }
+
+    let Some(control) = B2BUA_CONTROL.get() else {
+        return Ok(false);
+    };
+    let state = &control.state;
+    let Some(internal_call_id) = state.call_actors.find_by_sip_call_id(sip_call_id) else {
+        warn!(%sip_call_id, "b2bua_route_call: no such call");
+        return Ok(false);
+    };
+
+    // Clone the stored A-leg INVITE as the dial template (b2bua_advance_route
+    // derives each B-leg INVITE from it). A handed-over call always stores it.
+    let template = {
+        let Some(invite_arc) = state
+            .call_actors
+            .get_call(&internal_call_id)
+            .and_then(|call| call.a_leg_invite.clone())
+        else {
+            warn!(call_id = %internal_call_id, "b2bua_route_call: no stored A-leg INVITE to dial from");
+            return Ok(false);
+        };
+        let Ok(invite) = invite_arc.lock() else {
+            error!(call_id = %internal_call_id, "b2bua_route_call: invite lock poisoned");
+            return Ok(false);
+        };
+        invite.clone()
+    };
+
+    // The send path may spawn (TCP/TLS connect) and the caller may be on a
+    // non-tokio thread — establish the runtime.
+    let _enter = control.runtime.enter();
+
+    // Build the failover queue from the targets (R-URI-only carriers, mirroring
+    // call.rs's call.route() / fork(strategy="sequential") construction). A
+    // command-level `extra_headers` set applies to every attempt; a per-target
+    // header overrides it on key collision.
+    let default_timeout = 30u32;
+    let routes: Vec<crate::lcr::Route> = targets
+        .into_iter()
+        .map(|target| {
+            let mut headers: std::collections::HashMap<String, String> =
+                extra_headers.iter().cloned().collect();
+            headers.extend(target.headers);
+            crate::lcr::Route {
+                ruri: Some(target.uri),
+                next_hop: target.next_hop,
+                timeout_secs: Some(target.timeout_secs.unwrap_or(default_timeout)),
+                headers,
+                ..Default::default()
+            }
+        })
+        .collect();
+
+    // Release control ownership: drain the ControlBus channel + emit
+    // StasisEnd{reason:"routed"} so the app knows control returned (leak-critical),
+    // and clear the park state so a later B-leg ring-timeout takes the normal 408
+    // path, not the parked-503 handoff default.
+    if let Some(bus) = crate::control::ControlBus::global() {
+        if let Some(channel_id) = bus.channel_id_for_sip_call_id(sip_call_id) {
+            bus.release_channel(&channel_id, "routed");
+        }
+    }
+    state.call_actors.release_control_owner(&internal_call_id);
+
+    // Un-park: start the sequential-failover sequence and dial the first carrier.
+    let carrier_count = routes.len();
+    state.call_actors.start_route_sequence(
+        &internal_call_id,
+        crate::b2bua::actor::RouteSequenceState {
+            pending: routes.into(),
+            active: None,
+            best_error: None,
+            send_socket: None,
+            default_timeout,
+        },
+    );
+    info!(
+        call_id = %internal_call_id,
+        carriers = carrier_count,
+        "control plane: route — un-parked, dialing B-leg via LCR sequential failover"
+    );
+    if !b2bua_advance_route(&internal_call_id, &template, state) {
+        // No carrier was routable — answer the A-leg 503 and tear down, mirroring
+        // the CallAction::RouteSequence "no routable carrier" arm.
+        warn!(call_id = %internal_call_id, "control plane: route — no routable carrier, 503 to A-leg");
+        b2bua_reject_call(&internal_call_id, 503, "No Route");
+    }
+    Ok(true)
+}
+
 /// Build and send a UAS response (final 2xx or provisional 1xx) for a B2BUA call
 /// from an imperative `call.answer()` / `call.progress()`.
 ///

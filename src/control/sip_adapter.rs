@@ -43,6 +43,7 @@ impl ControlAdapter for SipControlAdapter {
                 verb("reject", "Send a final non-2xx and tear the call down (args: code, reason)"),
                 verb("hangup", "BYE an answered call, or reject an unanswered one (args: reason)"),
                 verb("refer", "Send an in-dialog REFER on the A-leg (args: to, replaces)"),
+                verb("route", "Return control to siphon with a routing decision: un-park the call and dial the B-leg via LCR sequential failover (args: targets, strategy, headers)"),
                 verb("set_header", "Set a header on the stored A-leg INVITE (args: name, value)"),
                 verb("get_header", "Read a header from the stored A-leg INVITE (args: name)"),
             ],
@@ -89,6 +90,7 @@ fn apply_sip(command: AdapterCommand) -> ControlResult {
         "reject" => reject(&channel, &command.args),
         "hangup" => hangup(&channel, &command.args),
         "refer" => refer(&channel, &command.args),
+        "route" => route(&channel, &command.args),
         "set_header" => set_header(&channel, &command.args),
         "get_header" => get_header(&channel, &command.args),
         // Media verbs (play/stop/dtmf/collect_dtmf) bind to MediaBackend and land
@@ -263,6 +265,105 @@ fn parse_replaces_arg(
     }))
 }
 
+/// Return control to siphon with a routing decision (the `route` verb). Un-parks
+/// the deferred-handover call and dials the B-leg via siphon's LCR sequential
+/// failover; siphon owns the call thereafter and the control app is released.
+///
+/// `args.targets` is a non-empty array of either bare URI strings or objects
+/// `{uri, next_hop?, headers?, timeout?}`; `args.strategy` defaults to
+/// `"sequential"` (v1 supports only sequential/single — anything else is a typed
+/// error, never a silent sequential); `args.headers` is an optional object
+/// applied to every attempt's B-leg INVITE.
+fn route(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
+    let Some(targets_json) = args.get("targets").and_then(|v| v.as_array()) else {
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "route requires args.targets (a non-empty array of URIs or {uri, next_hop, headers, timeout})",
+        );
+    };
+    if targets_json.is_empty() {
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "route requires at least one target",
+        );
+    }
+    let mut targets = Vec::with_capacity(targets_json.len());
+    for item in targets_json {
+        match parse_route_target(item) {
+            Ok(target) => targets.push(target),
+            Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
+        }
+    }
+    let strategy = args.get("strategy").and_then(|v| v.as_str()).unwrap_or("sequential");
+    let extra_headers = parse_extra_headers(args.get("headers"));
+    let target_count = targets.len();
+
+    match crate::dispatcher::b2bua_route_call(&channel.sip_call_id, targets, strategy, &extra_headers) {
+        Ok(true) => ControlResult::Ok(serde_json::json!({
+            "channel": channel.channel_id,
+            "state": "routing",
+            "targets": target_count,
+        })),
+        Ok(false) => ControlResult::error(ControlErrorCode::NotFound, "call is gone"),
+        Err(crate::dispatcher::RouteError::UnsupportedStrategy(strategy)) => ControlResult::error(
+            ControlErrorCode::UnsupportedVerb,
+            format!("unsupported routing strategy '{strategy}' — v1 supports sequential/single"),
+        ),
+        Err(crate::dispatcher::RouteError::NoTargets) => ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "route requires at least one target",
+        ),
+    }
+}
+
+/// Parse one `targets[]` entry: a bare URI string, or an object
+/// `{uri, next_hop?, headers?, timeout?}`.
+fn parse_route_target(item: &serde_json::Value) -> Result<crate::dispatcher::RouteTarget, String> {
+    if let Some(uri) = item.as_str() {
+        return Ok(crate::dispatcher::RouteTarget {
+            uri: uri.to_string(),
+            next_hop: None,
+            headers: Vec::new(),
+            timeout_secs: None,
+        });
+    }
+    let Some(object) = item.as_object() else {
+        return Err(
+            "each target must be a URI string or an object {uri, next_hop, headers, timeout}".to_string(),
+        );
+    };
+    let Some(uri) = object.get("uri").and_then(|v| v.as_str()) else {
+        return Err("target object requires a string 'uri'".to_string());
+    };
+    let next_hop = object.get("next_hop").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let headers = object.get("headers").map(parse_json_headers).unwrap_or_default();
+    let timeout_secs = object.get("timeout").and_then(|v| v.as_u64()).map(|t| t as u32);
+    Ok(crate::dispatcher::RouteTarget {
+        uri: uri.to_string(),
+        next_hop,
+        headers,
+        timeout_secs,
+    })
+}
+
+/// Parse a command-level `headers` object (applied to every route attempt).
+fn parse_extra_headers(value: Option<&serde_json::Value>) -> Vec<(String, String)> {
+    value.map(parse_json_headers).unwrap_or_default()
+}
+
+/// Collect string→string pairs from a JSON object (non-string values skipped).
+fn parse_json_headers(value: &serde_json::Value) -> Vec<(String, String)> {
+    value
+        .as_object()
+        .map(|object| {
+            object
+                .iter()
+                .filter_map(|(name, value)| value.as_str().map(|v| (name.clone(), v.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn set_header(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
     let (Some(name), Some(header_value)) = (
         args.get("name").and_then(|v| v.as_str()),
@@ -320,7 +421,7 @@ mod tests {
         let schema = SipControlAdapter::new().describe();
         assert_eq!(schema.module, "sip");
         let verbs: Vec<&str> = schema.verbs.iter().map(|v| v.verb.as_str()).collect();
-        for expected in ["answer", "progress", "reject", "hangup", "refer"] {
+        for expected in ["answer", "progress", "reject", "hangup", "refer", "route"] {
             assert!(verbs.contains(&expected), "missing verb {expected}");
         }
     }
@@ -396,6 +497,110 @@ mod tests {
             result,
             ControlResult::Error { code: ControlErrorCode::NotFound, .. }
         ));
+    }
+
+    #[test]
+    fn route_without_targets_is_bad_request() {
+        // No args.targets at all → bad_request before touching the store.
+        let result = route(&channel(), &serde_json::json!({}));
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+        ));
+    }
+
+    #[test]
+    fn route_empty_targets_is_bad_request() {
+        let result = route(&channel(), &serde_json::json!({ "targets": [] }));
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+        ));
+    }
+
+    #[test]
+    fn route_target_object_without_uri_is_bad_request() {
+        let result = route(
+            &channel(),
+            &serde_json::json!({ "targets": [{ "next_hop": "sip:gw@1.2.3.4" }] }),
+        );
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+        ));
+    }
+
+    #[test]
+    fn route_unsupported_strategy_is_typed_error() {
+        // A non-sequential strategy must be a typed unsupported error, NEVER a
+        // silent fall-through to sequential. b2bua_route_call validates the
+        // strategy before touching the dispatcher, so this holds without one.
+        let result = route(
+            &channel(),
+            &serde_json::json!({ "targets": ["sip:1@carrier.example"], "strategy": "parallel" }),
+        );
+        assert!(
+            matches!(result, ControlResult::Error { code: ControlErrorCode::UnsupportedVerb, .. }),
+            "unsupported strategy must be a typed UnsupportedVerb, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn route_valid_targets_without_dispatcher_is_not_found() {
+        // With no B2BUA_CONTROL installed (unit context), a well-formed route
+        // reaches b2bua_route_call and returns not_found — never hangs.
+        let result = route(
+            &channel(),
+            &serde_json::json!({ "targets": ["sip:1@carrier.example"] }),
+        );
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+        ));
+    }
+
+    #[test]
+    fn route_dispatches_through_apply_sip() {
+        // Prove the "route" arm is wired in apply_sip (reaches b2bua_route_call →
+        // not_found with no dispatcher, rather than unsupported_verb).
+        let result = apply_sip(AdapterCommand {
+            verb: "route".to_string(),
+            args: serde_json::json!({ "targets": ["sip:1@carrier.example"] }),
+            target: ResolvedTarget::Channel(channel()),
+        });
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+        ));
+    }
+
+    #[test]
+    fn parse_route_target_string_and_object() {
+        // Bare URI string form.
+        let string_target = parse_route_target(&serde_json::json!("sip:1@carrier.example")).unwrap();
+        assert_eq!(string_target.uri, "sip:1@carrier.example");
+        assert!(string_target.next_hop.is_none());
+        assert!(string_target.headers.is_empty());
+        assert!(string_target.timeout_secs.is_none());
+
+        // Full object form.
+        let object_target = parse_route_target(&serde_json::json!({
+            "uri": "sip:2@carrier.example",
+            "next_hop": "sip:gw@203.0.113.7:5060",
+            "headers": { "X-Carrier-Token": "abc" },
+            "timeout": 12,
+        }))
+        .unwrap();
+        assert_eq!(object_target.uri, "sip:2@carrier.example");
+        assert_eq!(object_target.next_hop.as_deref(), Some("sip:gw@203.0.113.7:5060"));
+        assert_eq!(object_target.timeout_secs, Some(12));
+        assert_eq!(
+            object_target.headers,
+            vec![("X-Carrier-Token".to_string(), "abc".to_string())]
+        );
+
+        // A bare number is neither a string nor an object → error.
+        assert!(parse_route_target(&serde_json::json!(42)).is_err());
     }
 
     #[test]

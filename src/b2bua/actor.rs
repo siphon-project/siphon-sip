@@ -2220,6 +2220,23 @@ impl CallActorStore {
         }
     }
 
+    /// Release a parked call from external control: clear the control owner + the
+    /// control-loss policy + the handoff-pending flag, so the call becomes an
+    /// ordinary autonomous B2BUA call. Used when the controller hands control
+    /// back to siphon with a routing decision (`route`): siphon dials the B-leg
+    /// itself and owns the call thereafter. Clearing `control_app` is what
+    /// disarms the handoff-timeout path in `fail_b2bua_call_on_timeout`
+    /// (`is_handoff_pending` gates on `control_app.is_some()`), so a later B-leg
+    /// ring-timeout takes the normal 408 path, not the parked-503 default.
+    /// Idempotent.
+    pub fn release_control_owner(&self, call_id: &str) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.control_app = None;
+            call.on_control_loss = None;
+            call.handoff_pending = false;
+        }
+    }
+
     /// Internal call IDs of calls that have blown their answer deadline while
     /// still un-answered (`Calling`/`Ringing`).
     ///
@@ -2532,6 +2549,66 @@ mod tests {
             actor.active_route().map(|route| route.carrier_id.as_str()),
             Some("c")
         );
+    }
+
+    #[test]
+    fn release_control_owner_clears_park_state() {
+        // A call parked under external control (deferred handover) → the
+        // controller hands control back with a routing decision. Releasing must
+        // clear the owner + control-loss policy AND disarm the handoff-pending
+        // path so a later B-leg ring-timeout takes the normal 408 route, not the
+        // parked-503 default.
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        store.set_control_owner(&call_id, "ivr-app", Some("hangup"));
+        assert_eq!(store.control_app(&call_id).as_deref(), Some("ivr-app"));
+        assert!(store
+            .get_call(&call_id)
+            .is_some_and(|call| call.is_handoff_pending()));
+
+        store.release_control_owner(&call_id);
+
+        assert!(store.control_app(&call_id).is_none());
+        let call = store.get_call(&call_id).expect("call still present");
+        assert!(!call.is_handoff_pending(), "handoff must be disarmed after release");
+        assert!(call.on_control_loss.is_none());
+        // The call lives on — release does not remove it.
+        assert!(matches!(call.state, CallState::Calling));
+    }
+
+    #[test]
+    fn parked_call_unparks_into_route_sequence() {
+        // Models the store-level transition b2bua_route_call performs: a parked
+        // (deferred-handover) call, on a routing decision, is released from
+        // control AND a sequential route sequence is started — so the shipped LCR
+        // engine (b2bua_advance_route) then dials the B-leg. (The dispatcher
+        // wiring around this is the same shipped rail the imperative fns use.)
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        // Park under control (deferred handover): Ringing + control owner.
+        store.set_state(&call_id, CallState::Ringing);
+        store.set_control_owner(&call_id, "ivr-app", Some("hangup"));
+        assert!(!store.is_route_sequence(&call_id));
+
+        // Route: release control, then start the sequential-failover queue.
+        store.release_control_owner(&call_id);
+        store.start_route_sequence(
+            &call_id,
+            RouteSequenceState {
+                pending: [lcr_route("a"), lcr_route("b")].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+
+        // The call is now an autonomous LCR sequence, no longer under control.
+        assert!(store.is_route_sequence(&call_id));
+        assert!(store.control_app(&call_id).is_none());
+        assert!(store.has_pending_routes(&call_id));
+        assert!(!store
+            .get_call(&call_id)
+            .is_some_and(|call| call.is_handoff_pending()));
+        // The first carrier is dialable.
+        assert_eq!(store.take_next_route(&call_id).unwrap().carrier_id, "a");
     }
 
     #[test]
