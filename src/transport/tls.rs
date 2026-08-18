@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert};
@@ -25,7 +25,7 @@ use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, StreamConn
 use crate::transport::acl::TransportAcl;
 use crate::transport::crlf_keepalive::CrlfPongTracker;
 use crate::transport::pool::ConnectionPool;
-use crate::transport::stream::{bind_tcp_listener, serve_sip_stream, spawn_outbound_distributor, StreamContext};
+use crate::transport::stream::{bind_tcp_listener, serve_sip_stream, sniff_sip_or_drop, spawn_outbound_distributor, StreamContext};
 
 /// Live-swappable TLS acceptor — read by every accept loop, replaced
 /// atomically by the file watcher when the cert or key on disk changes.
@@ -547,7 +547,7 @@ pub async fn listen(
                         // Perform TLS handshake under a bounded timeout so a peer
                         // that connects and stalls mid-handshake (slowloris) cannot
                         // pin a task + socket indefinitely.
-                        let tls_stream = match tokio::time::timeout(
+                        let mut tls_stream = match tokio::time::timeout(
                             TLS_HANDSHAKE_TIMEOUT,
                             acceptor.accept(tcp_stream),
                         )
@@ -566,10 +566,23 @@ pub async fn listen(
                             }
                         };
 
+                        let local_addr = tls_stream.get_ref().0.local_addr().unwrap_or(local_addr);
+                        // Decide from the first line that this really is SIP,
+                        // before any byte reaches the framer — an HTTP probe
+                        // frames as a complete "message" and would otherwise
+                        // be caught only by the parser, too late to close the
+                        // connection or count the source. Classifying ahead of
+                        // the connection id also keeps a probe out of the
+                        // connection map and out of the accept log.
+                        let Some(seed) =
+                            sniff_sip_or_drop(&mut tls_stream, remote_addr, Transport::Tls).await
+                        else {
+                            return;
+                        };
+
                         let connection_id = next_connection_id();
                         debug!("TLS accepted {} as {:?}", remote_addr, connection_id);
 
-                        let local_addr = tls_stream.get_ref().0.local_addr().unwrap_or(local_addr);
                         let (reader, writer) = tokio::io::split(tls_stream);
                         serve_sip_stream(
                             reader,
@@ -580,7 +593,7 @@ pub async fn listen(
                                 local_addr,
                                 remote_addr,
                             },
-                            BytesMut::new(),
+                            seed,
                             inbound_tx,
                             connection_map,
                             Some(stream_connections),

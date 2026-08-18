@@ -122,6 +122,27 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   error instead of a silently-ignored string.
 
 ### Fixed
+- **An HTTP probe on a SIP-only TCP/TLS listener was neither dropped nor
+  counted.** Stream framing (RFC 3261 §18.3) measures a message by finding
+  `\r\n\r\n` and reading `Content-Length` — which a well-formed HTTP request
+  also satisfies — so a vulnerability scanner's `GET /phpinfo.php HTTP/1.1` was
+  framed as a complete "message", queued to the dispatcher and rejected only by
+  the parser: the connection stayed open, the whole attacker-supplied buffer was
+  logged at `warn`, and nothing was recorded against the source, so
+  `security.failed_auth_ban` never fired no matter how long the scan ran. Only
+  an *incomplete* frame was ever classified. Dedicated `listen.tcp` /
+  `listen.tls` listeners now classify each connection from its first line —
+  the same check a `tcp+ws` / `tls+wss` mux already applied — and close it
+  before the framer runs when it is not SIP, counting a strong auto-ban signal
+  (a scanner is banned on its fourth probe at the default weights). An HTTP
+  request line is not SIP on a listener with no WebSocket half, so it is treated
+  like any other non-SIP bytes, and the probe is never answered. A peer that
+  connects and sends nothing still serves as raw SIP (connection reuse,
+  RFC 5923), and a connect-and-close L4 health check is still never counted as
+  abuse. The parse-error log line is now capped, so an unparseable message can
+  no longer decide how much it writes into the log, and a TLS peer that
+  disappears without `close_notify` — every scanner, and most browsers — logs at
+  `debug` instead of `warn`.
 - **Every digest challenge but the weakest was dropped on the wire.**
   `auth.require_*_digest` builds one challenge per algorithm — MD5 + SHA-256 +
   SHA-512-256, as RFC 7616 §3.7 asks for — so a single 401/407 serves RFC 2617

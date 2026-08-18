@@ -4,6 +4,7 @@
 //! Python script handlers, and sends responses back through the transport.
 //! Implements stateless proxy relay with Via-based response routing.
 
+use std::borrow::Cow;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -2600,6 +2601,30 @@ fn build_dereg_register(
     builder.content_length(0).build()
 }
 
+/// Cap an attacker-controlled string before it reaches the log.
+///
+/// A parse error quotes the bytes that failed to parse, so without a cap the
+/// source of an unparseable message decides how much it writes into the
+/// operator's log — a scanner sending a full browser request header block emits
+/// a kilobyte per probe. The head is what identifies the traffic; the rest is
+/// noise.
+fn truncate_for_log(detail: &str) -> Cow<'_, str> {
+    const MAX_LOGGED_BYTES: usize = 200;
+    if detail.len() <= MAX_LOGGED_BYTES {
+        return Cow::Borrowed(detail);
+    }
+    // Never split a UTF-8 character (the cap is a byte count, the string is not).
+    let mut end = MAX_LOGGED_BYTES;
+    while end > 0 && !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(format!(
+        "{}… ({} more bytes elided)",
+        &detail[..end],
+        detail.len() - end
+    ))
+}
+
 /// Handle a single inbound SIP message (request or response).
 fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
     // Defensive drop of all-whitespace UDP datagrams (RFC 3261 §7.5 — peers
@@ -2623,7 +2648,10 @@ fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
     let message = match parse_sip_message_bytes(&inbound.data) {
         Ok(message) => message,
         Err(error) => {
-            warn!(remote = %inbound.remote_addr, "SIP parse error: {error}");
+            warn!(
+                remote = %inbound.remote_addr,
+                "SIP parse error: {}", truncate_for_log(&error.to_string())
+            );
             return;
         }
     };
@@ -24455,4 +24483,32 @@ a=rtpmap:8 PCMA/8000\r\n";
         assert!(!to_has_tag(&out_of_dialog));
     }
 
+    // --- truncate_for_log ---------------------------------------------------
+
+    #[test]
+    fn short_log_detail_is_passed_through_unchanged() {
+        let detail = "start line parse error";
+        assert!(matches!(truncate_for_log(detail), Cow::Borrowed(_)));
+        assert_eq!(truncate_for_log(detail), detail);
+    }
+
+    #[test]
+    fn long_log_detail_is_capped() {
+        // A scanner's browser header block quoted back by the parse error: the
+        // source of an unparseable message must not decide how much it writes
+        // into the log.
+        let detail = format!("SIP parse error: {}", "A".repeat(4096));
+        let logged = truncate_for_log(&detail);
+        assert!(logged.len() < 300, "capped, got {} bytes", logged.len());
+        assert!(logged.starts_with("SIP parse error: AAA"));
+        assert!(logged.ends_with("more bytes elided)"));
+    }
+
+    #[test]
+    fn log_detail_is_never_cut_mid_character() {
+        // Multi-byte UTF-8 straddling the cap must not panic on a byte slice.
+        let detail = "é".repeat(4096);
+        let logged = truncate_for_log(&detail);
+        assert!(logged.ends_with("more bytes elided)"));
+    }
 }

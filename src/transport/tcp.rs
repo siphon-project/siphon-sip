@@ -10,7 +10,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
@@ -19,7 +19,7 @@ use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport,
 use crate::transport::acl::TransportAcl;
 use crate::transport::crlf_keepalive::CrlfPongTracker;
 use crate::transport::pool::ConnectionPool;
-use crate::transport::stream::{bind_tcp_listener, serve_sip_stream, spawn_outbound_distributor, StreamContext};
+use crate::transport::stream::{bind_tcp_listener, serve_sip_stream, sniff_sip_or_drop, spawn_outbound_distributor, StreamContext};
 
 /// Spawn a TCP listener. For each accepted connection a task is spawned that:
 ///   1. Reads inbound SIP messages and sends them to `inbound_tx`
@@ -60,22 +60,36 @@ pub async fn listen(
 
         loop {
             match listener.accept().await {
-                Ok((socket, remote_addr)) => {
+                Ok((mut socket, remote_addr)) => {
                     if !acl.is_allowed(remote_addr.ip()) {
                         debug!("TCP rejected {} by ACL", remote_addr);
                         continue;
                     }
-                    let connection_id = next_connection_id();
                     let inbound_tx = inbound_tx.clone();
                     let connection_map = connection_map.clone();
 
                     configure_tcp_socket(&socket, tos);
-                    debug!("TCP accepted {} as {:?}", remote_addr, connection_id);
 
                     let crlf_pong_tracker = crlf_pong_tracker.clone();
                     let close_tx = close_tx.clone();
                     tokio::spawn(async move {
                         let local_addr = socket.local_addr().unwrap_or(local_addr);
+                        // Decide from the first line that this really is SIP,
+                        // before any byte reaches the framer — an HTTP probe
+                        // frames as a complete "message" and would otherwise be
+                        // caught only by the parser, too late to close the
+                        // connection or count the source. Classifying ahead of
+                        // the connection id also keeps a probe out of the
+                        // connection map and out of the accept log.
+                        let Some(seed) =
+                            sniff_sip_or_drop(&mut socket, remote_addr, Transport::Tcp).await
+                        else {
+                            return;
+                        };
+
+                        let connection_id = next_connection_id();
+                        debug!("TCP accepted {} as {:?}", remote_addr, connection_id);
+
                         let (reader, writer) = socket.into_split();
                         serve_sip_stream(
                             reader,
@@ -86,7 +100,7 @@ pub async fn listen(
                                 local_addr,
                                 remote_addr,
                             },
-                            BytesMut::new(),
+                            seed,
                             inbound_tx,
                             connection_map,
                             // TCP reaches peers through the outbound pool, not
@@ -374,5 +388,97 @@ mod tests {
     fn extract_content_length_compact_form() {
         let headers = b"INVITE sip:bob@example.com SIP/2.0\r\nl: 200";
         assert_eq!(extract_content_length(headers), Some(200));
+    }
+
+    // --- end to end: the listener only serves connections that speak SIP ----
+
+    /// Bind a port, release it, and start a TCP SIP listener on it.
+    async fn spawn_listener() -> (SocketAddr, flume::Receiver<InboundMessage>) {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let (inbound_tx, inbound_rx) = flume::unbounded();
+        let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
+        listen(
+            addr,
+            inbound_tx,
+            outbound_rx,
+            Arc::new(DashMap::new()),
+            Arc::new(TransportAcl::new(vec![], vec![])),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        // listen() binds inside a spawned task.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        (addr, inbound_rx)
+    }
+
+    #[tokio::test]
+    async fn listener_drops_an_http_probe_without_dispatching_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (addr, inbound_rx) = spawn_listener().await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                concat!(
+                    "GET /phpinfo.php HTTP/1.1\r\n",
+                    "Host: proxy.example.com\r\n",
+                    "User-Agent: Mozilla/5.0\r\n",
+                    "\r\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        // The listener closes the connection instead of framing the probe as a
+        // message: read returns EOF, and nothing was answered.
+        let mut response = Vec::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .expect("connection must be closed, not held open")
+        .unwrap();
+        assert_eq!(read, 0, "a SIP port must not answer a probe");
+        assert!(inbound_rx.is_empty(), "the probe must never reach the dispatcher");
+    }
+
+    #[tokio::test]
+    async fn listener_still_dispatches_sip_arriving_in_the_first_segment() {
+        use tokio::io::AsyncWriteExt;
+
+        // The bytes the classifier consumes to decide must be handed to the
+        // framer, so a request that fits entirely in the first segment is not
+        // swallowed by the decision.
+        let (addr, inbound_rx) = spawn_listener().await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let register = concat!(
+            "REGISTER sip:example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/TCP 10.0.0.1:5060;branch=z9hG4bK776\r\n",
+            "From: <sip:alice@example.com>;tag=abc123\r\n",
+            "To: <sip:alice@example.com>\r\n",
+            "Call-ID: tcp-sniff-test@example.com\r\n",
+            "CSeq: 1 REGISTER\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        client.write_all(register.as_bytes()).await.unwrap();
+
+        let inbound = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            inbound_rx.recv_async(),
+        )
+        .await
+        .expect("SIP must still be dispatched")
+        .unwrap();
+        assert_eq!(&inbound.data[..], register.as_bytes());
+        assert_eq!(inbound.transport, Transport::Tcp);
     }
 }

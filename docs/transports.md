@@ -126,6 +126,26 @@ share one socket. Only tcp+ws and tls+wss can be multiplexed on the same port.
 UDP is a separate socket type and never conflicts — `udp` and `tcp` on
 `0.0.0.0:5060` is the normal SIP setup, not a shared socket.
 
+### Listeners that speak only SIP
+
+A dedicated `listen.tcp` or `listen.tls` socket applies the same first-line
+check, with one difference: there is no WebSocket half to hand an HTTP request
+to, so an upgrade line is treated exactly like random bytes. Either way the
+connection is closed before a byte reaches the SIP framer, and the source is
+counted as a strong `security.failed_auth_ban` signal.
+
+This is what stops a vulnerability scanner walking `/phpinfo.php`, `/info.php`
+and friends against a TLS SIP port. Framing alone cannot: an HTTP header block
+ends in `\r\n\r\n` and carries no `Content-Length`, so it looks like a complete
+message and is rejected only by the parser — after the probe has been queued,
+with the connection still open and nothing recorded against the source. Deciding
+from the first line closes the connection on the first probe and, at the default
+weights, bans the source on the fourth.
+
+The connection is never answered. A SIP port that replies to a probe tells the
+prober what it found, which is also why a blocked request is dropped rather than
+rejected.
+
 ### Per-domain certificates (inbound SNI)
 
 One listener can serve a different certificate per server name, selected from
