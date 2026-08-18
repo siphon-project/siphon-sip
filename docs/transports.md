@@ -72,6 +72,60 @@ sends the resolved target hostname as SNI (RFC 6066) instead of the destination
 IP, so a hostname-vhost front-end can route the handshake; bare-IP next hops
 send no SNI, as before.
 
+### One port for SIP and WebSocket
+
+Give the same address to both `tls:` and `wss:` (or to both `tcp:` and `ws:`)
+and siphon serves both protocols from a single socket:
+
+```yaml
+listen:
+  tls:
+    - "0.0.0.0:5061"
+  wss:
+    - "0.0.0.0:5061"            # same address — one socket, both protocols
+```
+
+One port, one firewall pinhole, one certificate for a browser UE on WSS and a
+SIP trunk on TLS. Useful where the port is not yours to choose: 443 is often the
+only outbound port a guest or corporate network allows, and carriers routinely
+expect 5061 to be raw SIP over TLS.
+
+Each connection is classified from its first line and then handled exactly as
+it would have been on a dedicated listener:
+
+| First line                      | Treated as | Transport stamped |
+|---------------------------------|------------|-------------------|
+| `REGISTER sip:… SIP/2.0`        | raw SIP    | `tls` / `tcp`     |
+| `SIP/2.0 200 OK`                | raw SIP    | `tls` / `tcp`     |
+| `GET / HTTP/1.1`                | WebSocket upgrade | `wss` / `ws` |
+| anything else                   | dropped (and counted as a malformed message) | — |
+
+The two grammars are disjoint — a SIP start line ends with ` SIP/2.0`
+(RFC 3261 §7.1) and an upgrade request ends with ` HTTP/1.1` (RFC 6455 §4.1),
+and no SIP method is an HTTP method — so this is an exact classification, not a
+guess. Via and Contact generation, flow capture, MT routing and the outbound
+path all see the transport the connection turned out to speak, so a UE
+registering over the shared port is reached over WSS and a trunk over TLS,
+exactly as with separate ports. The cost is one classification per *connection*;
+nothing changes on the per-message path.
+
+A peer that connects and sends nothing (holding a connection open for reuse,
+RFC 5923) is taken to be raw SIP after two seconds, which is what such a peer
+is. A WebSocket client always sends its upgrade immediately.
+
+Only these two pairings can share a socket. Plaintext and TLS cannot (a
+ClientHello is not a SIP message), so `tcp` + `tls`, `tcp` + `wss`, `tls` + `ws`
+and `ws` + `wss` on one address are rejected at startup rather than silently
+half-working:
+
+```
+listen.tcp and listen.tls are both configured on 0.0.0.0:5060, which cannot
+share one socket. Only tcp+ws and tls+wss can be multiplexed on the same port.
+```
+
+UDP is a separate socket type and never conflicts — `udp` and `tcp` on
+`0.0.0.0:5060` is the normal SIP setup, not a shared socket.
+
 ### Per-domain certificates (inbound SNI)
 
 One listener can serve a different certificate per server name, selected from

@@ -14,7 +14,6 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_rustls::rustls::server::{ClientHello, ResolvesServerCert};
 use tokio_rustls::rustls::sign::CertifiedKey;
@@ -22,10 +21,11 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{TlsMethod, TlsServerConfig};
-use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, StreamConnections, Transport, CONNECTION_IDLE_TIMEOUT, configure_tcp_socket, next_connection_id};
+use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, StreamConnections, Transport, configure_tcp_socket, next_connection_id};
 use crate::transport::acl::TransportAcl;
-use crate::transport::crlf_keepalive::{drain_leading_crlf_keepalives, CrlfPongTracker};
+use crate::transport::crlf_keepalive::CrlfPongTracker;
 use crate::transport::pool::ConnectionPool;
+use crate::transport::stream::{bind_tcp_listener, serve_sip_stream, spawn_outbound_distributor, StreamContext};
 
 /// Live-swappable TLS acceptor — read by every accept loop, replaced
 /// atomically by the file watcher when the cert or key on disk changes.
@@ -35,7 +35,7 @@ pub type SharedTlsAcceptor = Arc<ArcSwap<TlsAcceptor>>;
 /// default, so without this a peer that connects and then stalls mid-handshake
 /// (slowloris) would pin a task + socket until the OS killed it. Generous
 /// enough for slow mobile clients, short enough to bound half-open handshakes.
-const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The crypto provider used to parse private keys outside a `ServerConfig`
 /// builder. `server.rs` installs ring as the process default before any
@@ -510,94 +510,18 @@ pub async fn listen(
         std::process::exit(1);
     });
 
-    // Spawn a task that distributes outbound messages to per-connection senders.
-    // When no existing connection matches, fall back to the connection pool to
-    // create a new outbound TLS connection (needed for registrant, probes, etc.).
-    let connection_map_clone = connection_map.clone();
-    tokio::spawn(async move {
-        while let Ok(outbound) = outbound_rx.recv_async().await {
-            if let Some(sender) = connection_map_clone.get(&outbound.connection_id) {
-                // Non-blocking: NEVER park in `send().await` here (see tcp.rs for
-                // the full rationale). This single outbound distributor holds the
-                // `connection_map` shard read guard across this `if let`; an
-                // awaiting send to a non-reading peer's full bounded channel would
-                // park here, stalling outbound for every connection and blocking
-                // accept's `insert` on the same shard — the wedge. `try_send`
-                // sheds for a backed-up (stuck) peer instead.
-                let connection_id = outbound.connection_id;
-                // Frames of one message keep their relative order — same
-                // per-connection channel, single distributor task.
-                for frame in outbound.into_frames() {
-                    match sender.try_send(frame) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            warn!("TLS outbound dropped: connection {:?} send buffer full (slow/stuck peer)", connection_id);
-                            break;
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            warn!("TLS outbound dropped: connection {:?} closed", connection_id);
-                            break;
-                        }
-                    }
-                }
-            } else if let Some(ref pool) = pool {
-                // No existing connection — create outbound TLS via pool
-                let destination = outbound.destination;
-                let server_name = outbound.server_name.clone();
-                for frame in outbound.into_frames() {
-                    match pool.send_tls(destination, server_name.as_deref(), frame).await {
-                        Ok(connection_id) => {
-                            debug!(
-                                destination = %destination,
-                                connection_id = ?connection_id,
-                                "TLS outbound: sent via pool"
-                            );
-                        }
-                        Err(error) => {
-                            warn!(
-                                destination = %destination,
-                                "TLS outbound pool connect failed: {error}"
-                            );
-                            break;
-                        }
-                    }
-                }
-            } else {
-                debug!("TLS outbound: connection {:?} not found (may have closed)", outbound.connection_id);
-            }
-        }
-    });
+    // Distribute outbound messages to per-connection senders. When no existing
+    // connection matches, the distributor falls back to the connection pool to
+    // create a new outbound TLS connection (registrant, probes, etc.).
+    spawn_outbound_distributor(outbound_rx, connection_map.clone(), Transport::Tls, pool);
 
     tokio::spawn(async move {
-        // Use TcpSocket so we can set TOS/DSCP before binding.
-        let socket = if local_addr.is_ipv6() {
-            match tokio::net::TcpSocket::new_v6() {
-                Ok(socket) => socket,
-                Err(error) => { error!("failed to create TLS socket: {error}"); return; }
-            }
-        } else {
-            match tokio::net::TcpSocket::new_v4() {
-                Ok(socket) => socket,
-                Err(error) => { error!("failed to create TLS socket: {error}"); return; }
-            }
-        };
-        if let Err(error) = socket.set_reuseaddr(true) {
-            error!("failed to set SO_REUSEADDR on TLS socket: {error}"); return;
-        }
-        #[cfg(unix)]
-        if let Err(error) = socket.set_reuseport(true) {
-            error!("failed to set SO_REUSEPORT on TLS socket: {error}"); return;
-        }
-        // DSCP / DiffServ marking (RFC 4594) — family-aware, best-effort.
-        if let Some(tos) = tos {
-            super::apply_tos(&socket2::SockRef::from(&socket), tos);
-        }
-        if let Err(error) = socket.bind(local_addr) {
-            error!("failed to bind TLS listener on {local_addr}: {error}"); return;
-        }
-        let listener = match socket.listen(1024) {
+        let listener = match bind_tcp_listener(local_addr, tos) {
             Ok(listener) => listener,
-            Err(error) => { error!("failed to listen on TLS socket: {error}"); return; }
+            Err(error) => {
+                error!("failed to bind TLS listener on {local_addr}: {error}");
+                return;
+            }
         };
         info!("TLS listener on {}", local_addr);
 
@@ -646,106 +570,24 @@ pub async fn listen(
                         debug!("TLS accepted {} as {:?}", remote_addr, connection_id);
 
                         let local_addr = tls_stream.get_ref().0.local_addr().unwrap_or(local_addr);
-                        let (mut reader, mut writer) = tokio::io::split(tls_stream);
-
-                        // Per-connection outbound channel.  Cloned for the read
-                        // task so it can write RFC 5626 §4.4.1 pong (`\r\n`)
-                        // responses back over the same connection.
-                        let (outbound_tx, mut outbound_rx) = mpsc::channel::<Bytes>(64);
-                        connection_map.insert(connection_id, outbound_tx.clone());
-                        stream_connections.register(remote_addr, Transport::Tls, connection_id);
-                        let keepalive_writer = outbound_tx;
-
-                        // Read task with idle timeout and SIP stream framing (RFC 3261 §18.3)
-                        let inbound_tx_clone = inbound_tx.clone();
-                        let read_task = tokio::spawn(async move {
-                            let mut accumulator = BytesMut::with_capacity(65536);
-                            let mut read_buf = [0u8; 8192];
-                            loop {
-                                match tokio::time::timeout(CONNECTION_IDLE_TIMEOUT, reader.read(&mut read_buf)).await {
-                                    Ok(Ok(0)) => {
-                                        info!("TLS connection {:?} closed by peer", connection_id);
-                                        break;
-                                    }
-                                    Ok(Ok(size)) => {
-                                        accumulator.extend_from_slice(&read_buf[..size]);
-
-                                        // Extract all complete SIP messages from the buffer
-                                        loop {
-                                            // RFC 5626 §4.4.1 keepalive handling + RFC 3261 §7.5
-                                            // stray-CRLF stripping in one pass.
-                                            drain_leading_crlf_keepalives(
-                                                &mut accumulator,
-                                                connection_id,
-                                                &keepalive_writer,
-                                                crlf_pong_tracker.as_ref(),
-                                            );
-                                            if accumulator.is_empty() {
-                                                break;
-                                            }
-                                            let message_len = match crate::transport::tcp::extract_sip_message_length(&accumulator) {
-                                                Some(len) if len <= accumulator.len() => len,
-                                                Some(_) => break, // header block complete, body still arriving — wait
-                                                None => match crate::transport::tcp::classify_incomplete_stream(&accumulator) {
-                                                    crate::transport::tcp::StreamVerdict::MaybeSip => break, // SIP still arriving — need more data
-                                                    crate::transport::tcp::StreamVerdict::Garbage => {
-                                                        warn!("non-SIP bytes from {} on TLS {:?}; dropping connection", remote_addr, connection_id);
-                                                        crate::security::record_malformed_message(remote_addr.ip(), "TLS");
-                                                        return; // close the connection
-                                                    }
-                                                },
-                                            };
-                                            let data = accumulator.split_to(message_len).freeze();
-                                            let message = InboundMessage {
-                                                connection_id,
-                                                transport: Transport::Tls,
-                                                local_addr,
-                                                remote_addr,
-                                                data,
-                                            };
-                                            if let Err(error) = inbound_tx_clone.send_async(message).await {
-                                                error!("TLS inbound enqueue failed: {}", error);
-                                                return;
-                                            }
-                                        }
-                                    }
-                                    Ok(Err(error)) => {
-                                        warn!("TLS read error on {:?} from {}: {}", connection_id, remote_addr, error);
-                                        break;
-                                    }
-                                    Err(_) => {
-                                        info!("TLS connection {:?} idle timeout ({}s)", connection_id, CONNECTION_IDLE_TIMEOUT.as_secs());
-                                        break;
-                                    }
-                                }
-                            }
-                        });
-
-                        // Write task
-                        let write_task = tokio::spawn(async move {
-                            while let Some(data) = outbound_rx.recv().await {
-                                if let Err(error) = writer.write_all(&data).await {
-                                    warn!("TLS write error on {:?}: {}", connection_id, error);
-                                    break;
-                                }
-                            }
-                        });
-
-                        // Wait for either half to close, then clean up.
-                        tokio::select! {
-                            _ = read_task => {}
-                            _ = write_task => {}
-                        }
-
-                        connection_map.remove(&connection_id);
-                        stream_connections.unregister(&remote_addr);
-                        // RFC 5626 §4.2.2 flow failure: notify the registrar so
-                        // it can deregister any binding that arrived on this
-                        // connection.  Best-effort.
-                        if let Some(close_tx) = &close_tx {
-                            let _ = close_tx.send(connection_id.0);
-                        }
-                        debug!("TLS connection {:?} cleaned up", connection_id);
+                        let (reader, writer) = tokio::io::split(tls_stream);
+                        serve_sip_stream(
+                            reader,
+                            writer,
+                            StreamContext {
+                                transport: Transport::Tls,
+                                connection_id,
+                                local_addr,
+                                remote_addr,
+                            },
+                            BytesMut::new(),
+                            inbound_tx,
+                            connection_map,
+                            Some(stream_connections),
+                            crlf_pong_tracker,
+                            close_tx,
+                        )
+                        .await;
                     });
                 }
                 Err(error) => {
@@ -759,6 +601,7 @@ pub async fn listen(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
     use std::sync::Arc;
 
     fn test_acl() -> Arc<TransportAcl> {
