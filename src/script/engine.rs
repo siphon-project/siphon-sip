@@ -2873,6 +2873,178 @@ assert probe_ns.answer() == 42
 
         crate::script::api::clear_user_namespaces();
     }
+
+    // -----------------------------------------------------------------
+    // Host-registered module extensions
+    // -----------------------------------------------------------------
+    //
+    // The seam an addon whose surface is more than one attribute uses:
+    // siphon-sigtran mounts four namespaces (`ss7` / `gsm_map` / `gsm_cap` /
+    // `inap`) plus shared types, an exception and module functions in one
+    // `register(py, parent)` call.
+
+    #[pyclass]
+    struct ModuleExtensionProbe;
+
+    #[pymethods]
+    impl ModuleExtensionProbe {
+        #[new]
+        fn new() -> Self {
+            ModuleExtensionProbe
+        }
+
+        fn answer(&self) -> i64 {
+            7
+        }
+    }
+
+    #[test]
+    fn module_extension_mounts_several_attributes() {
+        let _guard = USER_NS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Python::initialize();
+        crate::script::api::clear_module_extensions();
+
+        crate::script::api::set_module_extension(
+            "probe_ext",
+            Box::new(|python: Python<'_>, parent: &Bound<'_, PyModule>| {
+                // Two namespace singletons + a shared type, all in one hook —
+                // the thing register_namespace_with cannot express.
+                parent.setattr("ext_alpha", Bound::new(python, ModuleExtensionProbe)?)?;
+                parent.setattr("ext_beta", Bound::new(python, ModuleExtensionProbe)?)?;
+                parent.add_class::<ModuleExtensionProbe>()?;
+                Ok(())
+            }),
+        )
+        .unwrap();
+
+        let source = r#"
+from siphon import ext_alpha, ext_beta, ModuleExtensionProbe
+
+assert ext_alpha.answer() == 7
+assert ext_beta.answer() == 7
+assert ModuleExtensionProbe().answer() == 7
+"#;
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(source.as_bytes()).unwrap();
+        file.flush().unwrap();
+
+        ScriptEngine::compile_script(file.path(), &[]).unwrap();
+
+        crate::script::api::clear_module_extensions();
+    }
+
+    #[test]
+    fn module_extension_replays_on_every_install() {
+        // install_siphon_module() rebuilds the module on every script load and
+        // reload, so a hook that only fired once would leave a reloaded script
+        // importing a module without the extension on it.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _guard = USER_NS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Python::initialize();
+        crate::script::api::clear_module_extensions();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        crate::script::api::set_module_extension(
+            "replay_ext",
+            Box::new(move |python: Python<'_>, parent: &Bound<'_, PyModule>| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                parent.setattr("replay_probe", Bound::new(python, ModuleExtensionProbe)?)?;
+                Ok(())
+            }),
+        )
+        .unwrap();
+
+        let source = r#"
+from siphon import replay_probe
+
+assert replay_probe.answer() == 7
+"#;
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(source.as_bytes()).unwrap();
+        file.flush().unwrap();
+
+        ScriptEngine::compile_script(file.path(), &[]).unwrap();
+        let after_first = calls.load(Ordering::SeqCst);
+        assert!(after_first >= 1, "hook never ran");
+
+        // A reload re-installs the module; the hook must run again.
+        ScriptEngine::compile_script(file.path(), &[]).unwrap();
+        assert!(
+            calls.load(Ordering::SeqCst) > after_first,
+            "hook did not replay on reload"
+        );
+
+        crate::script::api::clear_module_extensions();
+    }
+
+    #[test]
+    fn module_extension_duplicate_name_errors() {
+        let _guard = USER_NS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Python::initialize();
+        crate::script::api::clear_module_extensions();
+
+        crate::script::api::set_module_extension("dup_ext", Box::new(|_python, _parent| Ok(())))
+            .unwrap();
+        let result =
+            crate::script::api::set_module_extension("dup_ext", Box::new(|_python, _parent| Ok(())));
+        assert!(result.is_err());
+        let error = format!("{}", result.unwrap_err());
+        assert!(
+            error.contains("already registered"),
+            "unexpected error: {error}"
+        );
+
+        crate::script::api::clear_module_extensions();
+    }
+
+    #[test]
+    fn module_extension_failure_is_surfaced_not_swallowed() {
+        let _guard = USER_NS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Python::initialize();
+        crate::script::api::clear_module_extensions();
+
+        // The extension registry is process-global and install_siphon_module()
+        // runs on whichever thread compiles a script, so an unconditionally
+        // failing hook would break every *other* test compiling a script in
+        // parallel. Fail only for compiles driven from this test's own thread.
+        let owner = std::thread::current().id();
+        crate::script::api::set_module_extension(
+            "failing_ext",
+            Box::new(move |_python, _parent| {
+                if std::thread::current().id() == owner {
+                    Err(pyo3::exceptions::PyRuntimeError::new_err(
+                        "extension mount blew up",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }),
+        )
+        .unwrap();
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"pass\n").unwrap();
+        file.flush().unwrap();
+
+        let result = ScriptEngine::compile_script(file.path(), &[]);
+        crate::script::api::clear_module_extensions();
+
+        let error = format!("{}", result.expect_err("mount failure must not be swallowed"));
+        assert!(
+            error.contains("failing_ext") && error.contains("extension mount blew up"),
+            "unexpected error: {error}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

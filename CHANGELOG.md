@@ -7,6 +7,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **`SiphonServer::register_module_extension(name, hook)`** — embedding API for
+  an extension whose surface is more than one attribute. The hook is handed the
+  `siphon` package module itself and mounts its own namespaces, shared types,
+  exception and module functions, so `from siphon import a, b, SomeError` all
+  resolve; it re-runs on every script load and reload. `register_namespace` /
+  `register_namespace_with` remain the right call for the common
+  "expose one namespace object" case and keep their built-in-name collision
+  check — a module extension picks its own attribute names and is not
+  collision-checked.
 - **`auth.require_proxy_digest()` / `require_www_digest()` / `require_digest()` /
   `verify_digest()` now take a B2BUA `Call` as well as a proxy `Request`, so a
   B2BUA can challenge its own caller.** Registering any `@b2bua.*` handler makes

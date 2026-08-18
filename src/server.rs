@@ -23,6 +23,10 @@ use crate::{dispatcher, shutdown};
 /// type and we need to type-erase it for storage on the builder.
 type UserNamespaceFactory = Box<dyn FnOnce(Python<'_>) -> PyResult<Py<PyAny>> + Send>;
 
+/// Deferred hook that mounts an extension's contents onto the `siphon` package
+/// module itself, rather than into a single named attribute.
+type ModuleExtension = crate::script::api::ModuleExtension;
+
 /// Deferred extension task — invoked after the script engine has been
 /// initialised, with a [`ScriptHandle`] cloned for the task's exclusive
 /// use. The closure typically calls `tokio_handle().spawn(...)` to
@@ -54,6 +58,7 @@ pub struct SiphonServer {
     product_name: Option<&'static str>,
     product_version: Option<&'static str>,
     user_namespaces: Vec<(String, UserNamespaceFactory)>,
+    module_extensions: Vec<(String, ModuleExtension)>,
     extension_tasks: Vec<ExtensionTask>,
     control_adapters: Vec<ControlAdapterHandle>,
 }
@@ -70,6 +75,7 @@ impl SiphonServer {
             product_name: None,
             product_version: None,
             user_namespaces: Vec::new(),
+            module_extensions: Vec::new(),
             extension_tasks: Vec::new(),
             control_adapters: Vec::new(),
         }
@@ -184,6 +190,46 @@ impl SiphonServer {
     {
         self.user_namespaces
             .push((name.to_owned(), Box::new(factory)));
+        self
+    }
+
+    /// Register a host-provided hook that mounts its contents onto the `siphon`
+    /// package module itself.
+    ///
+    /// Use this when an extension's surface is more than one attribute — several
+    /// namespaces, plus shared `#[pyclass]` types, an exception type, or
+    /// module-level functions — so that `from siphon import a, b, SomeError`
+    /// all resolve. For the common "expose one namespace object" case, prefer
+    /// [`register_namespace`](Self::register_namespace) /
+    /// [`register_namespace_with`](Self::register_namespace_with), which get
+    /// collision-checked against the built-in namespace names.
+    ///
+    /// `name` identifies the extension for diagnostics and duplicate rejection;
+    /// it is not itself turned into an attribute. The hook chooses its own
+    /// attribute names, so it is *not* protected from shadowing a built-in
+    /// namespace — that responsibility sits with the extension.
+    ///
+    /// The hook runs after every other namespace and singleton has been
+    /// installed, and re-runs on each script load and reload (hence `Fn`, not
+    /// `FnOnce`).
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use siphon::SiphonServer;
+    ///
+    /// SiphonServer::builder()
+    ///     .config_path("siphon.yaml")
+    ///     // mounts `ss7` / `gsm_map` / `gsm_cap` / `inap` + shared types
+    ///     .register_module_extension("sigtran", siphon_sigtran::python::register)
+    ///     .run();
+    /// ```
+    pub fn register_module_extension<F>(mut self, name: &str, hook: F) -> Self
+    where
+        F: Fn(Python<'_>, &Bound<'_, PyModule>) -> PyResult<()> + Send + Sync + 'static,
+    {
+        self.module_extensions
+            .push((name.to_owned(), Box::new(hook)));
         self
     }
 
@@ -757,6 +803,18 @@ impl SiphonServer {
                     info!(name = %name, "user namespace registered for injection");
                 }
             });
+        }
+
+        // --- Host-registered module extensions ---
+        // Stored on the global registry the same way; install_siphon_module()
+        // replays them against the `siphon` module on every script load.
+        let module_extensions = std::mem::take(&mut self.module_extensions);
+        for (name, hook) in module_extensions {
+            if let Err(error) = crate::script::api::set_module_extension(&name, hook) {
+                eprintln!("Failed to register module extension '{name}': {error}");
+                std::process::exit(1);
+            }
+            info!(name = %name, "module extension registered for injection");
         }
 
         // --- IPsec SA manager + singleton ---

@@ -80,6 +80,22 @@ pub const BUILT_IN_NAMESPACE_NAMES: &[&str] = &[
 /// `install_siphon_module()` runs (i.e. on each script load / reload).
 static USER_NAMESPACES: Mutex<Vec<(String, Py<PyAny>)>> = Mutex::new(Vec::new());
 
+/// Hook that mounts an extension's own contents onto the `siphon` package
+/// module. Unlike a user namespace (one name, one object) this gets the module
+/// itself, so an extension whose surface is several namespaces plus shared
+/// types / exceptions / functions can install all of it in one pass.
+///
+/// `Fn` rather than `FnOnce` because `install_siphon_module()` rebuilds the
+/// module on every script load and reload — the hook must be replayable.
+pub type ModuleExtension =
+    Box<dyn Fn(Python<'_>, &Bound<'_, PyModule>) -> PyResult<()> + Send + Sync>;
+
+/// Host-registered module extensions, keyed by extension name (diagnostics +
+/// duplicate rejection only — the name is not itself an attribute). Populated
+/// by `SiphonServer` at startup, replayed every time `install_siphon_module()`
+/// runs.
+static MODULE_EXTENSIONS: Mutex<Vec<(String, ModuleExtension)>> = Mutex::new(Vec::new());
+
 /// Tuple of (auth, registrar, log, proxy_utils, cache) singletons.
 type SingletonTuple = (Py<PyAny>, Py<PyAny>, Py<PyAny>, Py<PyAny>, Py<PyAny>);
 
@@ -556,11 +572,42 @@ pub fn set_user_namespace(name: &str, py_obj: Py<PyAny>) -> Result<()> {
     Ok(())
 }
 
+/// Register a host-provided module extension under `name`.
+///
+/// The hook is handed the `siphon` package module itself on every
+/// `install_siphon_module()` (so, on every script load and reload) and mounts
+/// whatever the extension exposes: namespaces, shared types, exceptions,
+/// module-level functions. `name` is an identity for diagnostics and duplicate
+/// rejection — it is not turned into an attribute, and it is not checked
+/// against `BUILT_IN_NAMESPACE_NAMES` because the hook chooses its own
+/// attribute names.
+pub fn set_module_extension(name: &str, hook: ModuleExtension) -> Result<()> {
+    let mut guard = MODULE_EXTENSIONS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.iter().any(|(existing, _)| existing == name) {
+        return Err(SiphonError::Script(format!(
+            "module extension '{name}' is already registered"
+        )));
+    }
+    guard.push((name.to_owned(), hook));
+    Ok(())
+}
+
 /// Test-only: clear all host-registered namespaces. Lets each test exercise
 /// `set_user_namespace` from a known-empty state.
 #[cfg(test)]
 pub fn clear_user_namespaces() {
     let mut guard = USER_NAMESPACES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.clear();
+}
+
+/// Test-only: clear all host-registered module extensions.
+#[cfg(test)]
+pub fn clear_module_extensions() {
+    let mut guard = MODULE_EXTENSIONS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.clear();
@@ -854,6 +901,22 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
                 .map_err(|error| {
                     SiphonError::Script(format!("setattr {name} (user namespace): {error}"))
                 })?;
+        }
+    }
+
+    // Run host-registered module extensions. These get the module itself, not a
+    // single attribute slot, because an extension's surface can be several
+    // namespaces plus shared types and exceptions (siphon-sigtran mounts `ss7`
+    // / `gsm_map` / `gsm_cap` / `inap` + `SigtranError` + `configure` /
+    // `metrics`). Runs last so an extension sees a fully-populated module.
+    {
+        let guard = MODULE_EXTENSIONS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (name, hook) in guard.iter() {
+            hook(python, &module).map_err(|error| {
+                SiphonError::Script(format!("module extension '{name}': {error}"))
+            })?;
         }
     }
 
