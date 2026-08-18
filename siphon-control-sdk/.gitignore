@@ -2,6 +2,6 @@
 **/__pycache__/
 *.so
 *.pyd
-/dist
+dist/
 .pytest_cache/
 *.egg-info/

@@ -70,9 +70,24 @@ fi
 edge_received_invite() {
   "${COMPOSE[@]}" logs "$1" 2>/dev/null | grep -a "> INVITE" | grep -qE "INVITE +[1-9]"
 }
-edge_received_invite sipp-failover-reject \
+
+# `docker compose logs` is not synchronous with a container's stdout: a line the
+# container has already written can take a moment to reach the log driver, so
+# grepping once the instant a call returns is a race. Poll to a deadline for the
+# assertions that expect a line to BE there.
+wait_edge_received_invite() {
+  local deadline=$((SECONDS + 15))
+  while (( SECONDS < deadline )); do
+    if edge_received_invite "$1"; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+wait_edge_received_invite sipp-failover-reject \
   || fail "binding A's edge never received the INVITE — branch 0 was not routed by its Path"
-edge_received_invite sipp-failover-answer \
+wait_edge_received_invite sipp-failover-answer \
   || fail "binding B's edge never received the INVITE — the failover branch reused binding A's route set"
 
 "${COMPOSE[@]}" rm -sf sipp-failover-reject sipp-failover-answer >/dev/null 2>&1 || true
@@ -97,9 +112,9 @@ if [[ ${rc} -ne 0 ]]; then
   fail "the call was not answered (exit ${rc}) — on_failure did not re-target the relay"
 fi
 
-edge_received_invite sipp-failover-backend-primary \
+wait_edge_received_invite sipp-failover-backend-primary \
   || fail "the primary backend never received the INVITE"
-edge_received_invite sipp-failover-backend-backup \
+wait_edge_received_invite sipp-failover-backend-backup \
   || fail "the backup backend never received the INVITE — on_failure's request.relay() did not re-send"
 
 echo "PASS: on_failure fired for a single-destination relay and its retry reached the backup"

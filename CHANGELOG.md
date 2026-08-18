@@ -241,6 +241,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   list is currently **empty** — all 50 fixtures are handled as the RFC requires.
 
 ### Fixed
+- **The extension binary picks up the SMPP bind-handshake fix.** `siphon-bin/`
+  moves its `siphon-smpp` pin to v1.5.1, which carries smpp34 1.4.1: both sides
+  read the bind handshake with a single `read()` and rejected the buffer when
+  anything the peer pipelined behind its bind PDU coalesced into the same
+  segment, so an SMSC with queued MT — which sends its first `deliver_sm` the
+  moment it accepts the bind — took the session down on arrival and the
+  supervisor reconnected into the same failure. The bump also brings the
+  listener-failure hooks from v1.5.0 (a refused connect no longer parks the
+  server task for the process lifetime), and moves `h2` to 0.4.16 for
+  RUSTSEC-2026-0258 (unbounded empty DATA frames), which reaches that graph
+  through the HTTP extension.
 - **The two excluded workspaces are now covered by the security audit.**
   `siphon-bin/` and `siphon-control-sdk/` are standalone workspaces with their
   own `Cargo.lock`, so the scheduled `cargo-deny` run — which resolves the
