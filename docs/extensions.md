@@ -1,7 +1,7 @@
-# Extensions (SMPP, HTTP)
+# Extensions (SMPP, HTTP, SIGTRAN)
 
-SIPhon's core speaks SIP. Protocol functionality **beyond SIP** — SMPP and HTTP
-today — is provided by **opt-in extension modules**. They
+SIPhon's core speaks SIP. Protocol functionality **beyond SIP** — SMPP, HTTP and
+SIGTRAN/SS7 today — is provided by **opt-in extension modules**. They
 are not part of the default binary: you enable a module at build time and
 configure it through the `extensions:` block in `siphon.yaml`. Each module adds
 a scriptable Python namespace your routing scripts can use, alongside the
@@ -21,6 +21,7 @@ built-in `proxy`, `registrar`, `cache`, and friends.
   ```yaml
   extensions:
     smpp: /etc/siphon/smpp.yaml
+    sigtran: /etc/siphon/sigtran.yaml
   ```
 
 - **Loud on mismatch.** If `extensions.smpp` is configured but the running
@@ -161,6 +162,104 @@ the **siphon-http** docs and repository:
 - 📖 Documentation: <https://http.siphon-sip.org/>
 - 💻 Source: <https://github.com/siphon-project/siphon-http>
 
+## SIGTRAN / SS7 (M3UA, M2PA, SUA)
+
+The SIGTRAN extension turns siphon into a scriptable SS7 signalling node. It
+carries MTP3 user traffic over kernel SCTP (M3UA per RFC 4666, M2PA per RFC 4165,
+SUA per RFC 3868), resolves MTP3 routes and SCCP Global Title Translation in
+Rust at line rate, and hands locally-addressed dialogues to your script for
+MAP / CAP / INAP termination. Your script decides policy and programs the routing
+tables; siphon owns the associations, the ASPSM/ASPTM handshake, link alignment,
+SSNM route state, and the TCAP transaction engine.
+
+Typical roles: STP (transit + screening), HLR / HSS front-end, terminating SMSC,
+CAMEL SCP, or an IN SCP terminating the SSF-SCF dialogue.
+
+### 1. Build with the feature
+
+`async-sctp` links `libsctp`, so unlike the other modules this one has a system
+dependency at **both** build and run time:
+
+```bash
+sudo apt-get install -y libsctp-dev          # libsctp1 at runtime
+cargo build -p siphon-bin --release --features sigtran
+```
+
+The container image installs both already — build it with
+`--build-arg FEATURES=sigtran` (or `full`), and run it with host networking so
+the SCTP associations see real addresses.
+
+### 2. Point siphon at the SIGTRAN config
+
+```yaml
+# siphon.yaml
+extensions:
+  sigtran: /etc/siphon/sigtran.yaml
+```
+
+The node — point code, associations, application servers, MTP3 routes, GTT rules,
+owned subsystems — is described in `sigtran.yaml`:
+
+```yaml
+# sigtran.yaml
+node:
+  point_code: 1000
+  variant: ITU
+
+associations:
+  - { id: msc-1, adaptation: m3ua, role: server, addrs: [10.1.0.10], port: 2905 }
+
+application_servers:
+  - { name: msc, traffic_mode: override, routing_context: 100, asps: [msc-1] }
+
+mtp3_routes:
+  - { dpc: 2000, as: msc, priority: 1 }
+
+sccp:
+  local_ssns: [8]        # SSNs we own; inbound traffic for them terminates locally
+```
+
+siphon reads this at startup and builds the node **before** your script loads, so
+the script's decorators register into the very node the live transport then
+drives.
+
+### 3. Route and terminate in your script
+
+```python
+from siphon import ss7, gsm_map
+
+# Program the Rust routing tables live (they stay in Rust on the hot path).
+ss7.routes.add(dpc=3000, as_="msc", priority=1)
+ss7.routes.cache("15550100", dpc=2000, ssn=6)   # GT translation, resolved in Rust
+
+@gsm_map.on_operation("mo-forward-sm")
+async def on_mo(dlg, arg):
+    # arg.sm_rp_oa / sm_rp_da / sm_rp_ui are the raw addresses + TPDU bytes.
+    dlg.reply(gsm_map.mo_forward_sm_res())   # returnResultLast in a closing End
+    dlg.end()
+```
+
+Scripts hot-reload like the SIP side; routing state lives in Rust, so a reload
+drops nothing in flight.
+
+!!! note "Four namespaces, not one"
+    SMPP and HTTP each expose a single namespace object. SIGTRAN mounts **four**
+    (`ss7`, `gsm_map`, `gsm_cap`, `inap`) plus the `SigtranError` exception,
+    `siphon.configure` / `siphon.metrics`, and the shared types — so it is
+    composed through `SiphonServer::register_module_extension` rather than
+    `register_namespace_with`. Nothing about that is visible to a script author;
+    it is simply `from siphon import …` for all of it.
+
+### Further reading
+
+The full `ss7` / `gsm_map` / `gsm_cap` / `inap` namespaces, every `sigtran.yaml`
+field, the loopback test seam (`siphon.configure(...)` → `node.deliver(...)`, which
+drives a handler with no live peer), and the STP / HLR / SMSC / SCP recipes live
+in the **siphon-sigtran** docs and repository:
+
+- 📖 Documentation: <https://sigtran.siphon-sip.org/>
+- 💻 Source: <https://github.com/siphon-project/siphon-sigtran>
+
 ## Testing extension scripts
 
 The [`siphon-sip` SDK](https://pypi.org/project/siphon-sip/) (`pip install
@@ -186,9 +285,20 @@ def test_healthz():
     assert h.request("GET", "/healthz").body == b"ok"
 ```
 
+SIGTRAN scripts are tested differently — there is no SDK mock for the `ss7` /
+`gsm_map` / `gsm_cap` / `inap` namespaces. Instead siphon-sigtran ships an
+in-process loopback seam: `siphon.configure("sigtran.yaml")` returns a node you
+can hand a genuine assembled `Begin` (real TCAP inside a real SCCP UDT) and read
+back the reply MSUs your handler produced, with no peer and no socket. See
+[Testing your handlers](https://sigtran.siphon-sip.org/script-api/#testing).
+
 ## Available modules
 
 | Module | Feature | Status | Namespace | Docs |
 | --- | --- | --- | --- | --- |
 | SMPP 3.4 | `smpp` | Available | `smpp` | [smpp.siphon-sip.org](https://smpp.siphon-sip.org/) |
 | HTTP / HTTPS | `http` | Available | `http` | [http.siphon-sip.org](https://http.siphon-sip.org/) |
+| SIGTRAN / SS7 | `sigtran` | Available | `ss7`, `gsm_map`, `gsm_cap`, `inap` | [sigtran.siphon-sip.org](https://sigtran.siphon-sip.org/) |
+
+Turn several on at once with `--features full`, or name them individually
+(`--features "smpp,sigtran"`).

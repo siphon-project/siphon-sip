@@ -90,6 +90,7 @@ nav:
       - Overview: extensions.md
       - SMPP addon docs ↗: https://smpp.siphon-sip.org/
       - HTTP addon docs ↗: https://http.siphon-sip.org/
+      - SIGTRAN addon docs ↗: https://sigtran.siphon-sip.org/
   - Commercial support: support.md
   - Internals:
       - Handler execution model: handler-execution-model.md

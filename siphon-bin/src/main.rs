@@ -31,7 +31,7 @@ siphon::install_allocator!();
 #[derive(Parser)]
 #[command(
     name = "siphon",
-    about = "SIPhon — SIP proxy/B2BUA/IMS with opt-in extension modules (SMPP, …)"
+    about = "SIPhon — SIP proxy/B2BUA/IMS with opt-in extension modules (SMPP, HTTP, SIGTRAN, …)"
 )]
 struct Cli {
     /// Path to the configuration file
