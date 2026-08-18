@@ -241,6 +241,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   list is currently **empty** — all 50 fixtures are handled as the RFC requires.
 
 ### Fixed
+- **The two excluded workspaces are now covered by the security audit.**
+  `siphon-bin/` and `siphon-control-sdk/` are standalone workspaces with their
+  own `Cargo.lock`, so the scheduled `cargo-deny` run — which resolves the
+  repo-root graph — never saw either of them. `siphon-bin/` had consequently
+  drifted onto a `crossbeam-epoch` carrying RUSTSEC-2026-0204 (the advisory the
+  server itself moved off in 1.2.1) and a yanked `spin`, and its `siphon-http`
+  extension pin pulled the unmaintained `rustls-pemfile` (RUSTSEC-2025-0134);
+  all three are cleared — `siphon-http` moves to v1.0.2, which loads TLS certs
+  and keys through `rustls-pki-types` instead. Each workspace also gains its
+  own `deny.toml`, and the audit's path filters now match nested manifests and
+  lockfiles rather than only the root ones. The policy is also split by how it
+  behaves over time: `bans` / `licenses` / `sources` are deterministic — they only move when the dependency set moves —
+  so they gate every pull request across all three workspaces, failing a GPL
+  dependency, an unexpected git source or a duplicate-crate blowup right where
+  it was introduced. `advisories` stays on the weekly schedule (plus `main`),
+  because a fresh RustSec advisory can land against an unchanged dependency and
+  must not turn a green pull request red on untouched code.
 - **A branch the proxy failed itself no longer outranks a real answer from a
   sibling branch.** Now that a transport error becomes a 503 and a timeout a
   408, straight class ordering (5xx beats 4xx) handed a branch that never left

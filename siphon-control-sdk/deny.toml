@@ -1,0 +1,59 @@
+# cargo-deny — dependency-graph security / license / source policy for the
+# control-plane client SDKs.
+#
+# siphon-control-sdk is a standalone, excluded workspace with its own Cargo.lock,
+# so the repo-root deny.toml does NOT cover it: `cargo deny check` at the root
+# resolves only the siphon-sip graph. Without this file the SDK graph would fall
+# back to the root config by directory walk-up — which works by accident and
+# silently changes if either tree moves. It is pinned here instead, and run by
+# its own job in .github/workflows/audit.yml.
+#
+# These crates PUBLISH (crates.io + PyPI), so an advisory here ships to third
+# parties embedding the SDK — this graph is gated at least as strictly as the
+# server's.
+#
+# Local: `cargo deny check` from this directory.
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+]
+all-features = true
+
+[advisories]
+# RustSec advisory database. A yanked crate or an open advisory fails the audit.
+version = 2
+yanked = "deny"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+
+[licenses]
+# The crates are MIT; keep dependencies OSI-permissive.
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+[sources]
+# Everything the SDKs depend on comes from crates.io — no git deps (unlike
+# siphon-bin, which composes first-party extension crates from GitHub).
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

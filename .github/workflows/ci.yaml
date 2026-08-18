@@ -108,15 +108,54 @@ jobs:
       - name: Compile benches (no run)
         run: PYO3_PYTHON=python3.14 cargo bench --no-run --all-features
 
-  # ── siphon-bin extension binary (opt-in SMPP) ───────────────────────────
+  # ── Dependency policy gate (cargo-deny) ─────────────────────────────────
+  # The DETERMINISTIC half of cargo-deny: bans (duplicate / wildcard crates),
+  # licenses, and sources. These only move when the dependency set moves, so
+  # they belong on every PR — a GPL dependency, a new git source, or a
+  # duplicate-crate blowup fails right where it was introduced.
+  #
+  # The time-varying half — `check advisories` — deliberately does NOT run
+  # here: a fresh RustSec advisory can land against a dependency that has not
+  # changed and would turn a green PR red on untouched code. That runs weekly
+  # and on main instead (.github/workflows/audit.yml).
+  #
+  # One matrix entry per workspace: siphon-bin/ and siphon-control-sdk/ are
+  # excluded standalone workspaces with their own Cargo.lock + deny.toml, so a
+  # `cargo deny` at the repo root resolves only the siphon-sip graph.
+  deny:
+    name: cargo-deny (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: siphon-sip
+            manifest: ./Cargo.toml
+          - name: siphon-bin
+            manifest: ./siphon-bin/Cargo.toml
+          - name: control-sdk
+            manifest: ./siphon-control-sdk/Cargo.toml
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: ${{ matrix.manifest }}
+          command: check bans licenses sources
+
+  # ── siphon-bin extension binary (opt-in extensions) ─────────────────────
   # The siphon-bin/ package is a SEPARATE, excluded standalone workspace that
   # git-deps the published siphon-sip lib + the extension crates, so the main
   # jobs above never build it. This job is the bit-rot guard for the
   # composition: it proves the `siphon` binary still compiles (and is
-  # clippy-clean) both WITHOUT and WITH the `smpp` feature. Because the deps are
-  # git `branch = "main"`, this builds against current siphon-sip/siphon-smpp
-  # main — i.e. it validates the composition against the latest published lib,
-  # not the in-tree lib of this checkout (the deliberate git-dep tradeoff).
+  # clippy-clean) with no extensions, with each extension on its own, and with
+  # every extension at once. Because the deps are git `branch = "main"`, this
+  # builds against current siphon-sip / extension mains — i.e. it validates the
+  # composition against the latest published lib, not the in-tree lib of this
+  # checkout (the deliberate git-dep tradeoff).
+  #
+  # Adding an extension module: give it its own build + clippy pair below. The
+  # combined leg rides on the `full` aggregate feature, so it picks the new
+  # module up from Cargo.toml without a workflow edit.
   siphon-bin:
     runs-on: ubuntu-latest
     defaults:
@@ -152,6 +191,24 @@ jobs:
 
       - name: Clippy (--features smpp)
         run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --features smpp -- -D warnings
+
+      # Same for siphon-http: inbound routes + the Rust-backed `http.Client`.
+      - name: Build (--features http)
+        run: PYO3_PYTHON=python3.14 cargo build --features http
+
+      - name: Clippy (--features http)
+        run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --features http -- -D warnings
+
+      # Every module at once — the real drop-in binary, and the only leg that
+      # catches cross-extension breakage: a version skew between two extension
+      # crates' siphon-sip pins, or two modules claiming the same namespace.
+      # `full` is the aggregate in Cargo.toml, so a new module joins this leg
+      # by being added there.
+      - name: Build (--features full)
+        run: PYO3_PYTHON=python3.14 cargo build --features full
+
+      - name: Clippy (--features full)
+        run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --features full -- -D warnings
 
   # ── Python SDK tests ──────────────────────────────────────────────────
   sdk-tests:

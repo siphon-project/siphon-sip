@@ -1,9 +1,18 @@
 name: Security audit
 
-# RustSec advisories are time-varying: a new advisory can land against an
-# unchanged dependency, so this runs on a schedule (and whenever the dependency
-# set changes) instead of gating every PR — a new advisory never turns a green
-# PR red on unchanged code, but it still surfaces here within a week.
+# The TIME-VARYING half of cargo-deny: RustSec advisories. A new advisory can
+# land against an unchanged dependency, so this runs on a schedule (and whenever
+# the dependency set changes) instead of gating every PR — a new advisory never
+# turns a green PR red on unchanged code, but it still surfaces here within a
+# week.
+#
+# The deterministic half — bans / licenses / sources — runs per-PR in the `deny`
+# job of ci.yaml, where a failure lands on the change that introduced it.
+#
+# One job per workspace: siphon-bin/ and siphon-control-sdk/ are excluded
+# standalone workspaces with their own Cargo.lock + deny.toml, so a `cargo deny`
+# at the repo root resolves only the siphon-sip graph and would leave both
+# unaudited.
 on:
   schedule:
     - cron: "0 6 * * 1" # Mondays 06:00 UTC
@@ -11,8 +20,8 @@ on:
     branches: [main]
     paths:
       - "**/Cargo.toml"
-      - "Cargo.lock"
-      - "deny.toml"
+      - "**/Cargo.lock"
+      - "**/deny.toml"
   workflow_dispatch:
 
 permissions:
@@ -20,10 +29,21 @@ permissions:
 
 jobs:
   advisories:
-    name: cargo-deny advisories
+    name: cargo-deny advisories (${{ matrix.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: siphon-sip
+            manifest: ./Cargo.toml
+          - name: siphon-bin
+            manifest: ./siphon-bin/Cargo.toml
+          - name: control-sdk
+            manifest: ./siphon-control-sdk/Cargo.toml
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
+          manifest-path: ${{ matrix.manifest }}
           command: check advisories
