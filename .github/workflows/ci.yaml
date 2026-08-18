@@ -553,6 +553,49 @@ jobs:
             rtpengine-real.log
             *.log
 
+  # ── B2BUA A-leg INVITE authentication ──────────────────────────────────
+  # siphon challenges the CALLER from @b2bua.on_invite. With a @b2bua handler
+  # registered the dispatcher routes INVITE to the B2BUA path and
+  # @proxy.on_request never sees it, so the challenge runs against the Call
+  # object (auth.require_proxy_digest(call, realm=...)).
+  #
+  # The UAC asserts siphon's own 407 carries a Proxy-Authenticate challenge and
+  # a UAS To-tag, then completes the authenticated re-INVITE end to end. The UAS
+  # runs with -m 1 and asserts no Proxy-Authorization crossed the B2BUA, so a
+  # build that cannot challenge (dialling the unauthenticated INVITE through)
+  # fails on the extra INVITE.
+  sipp-b2bua-invite-auth:
+    runs-on: ubuntu-latest
+    needs: rust-tests
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build siphon-b2bua-invite-auth image
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-invite-auth build siphon-b2bua-invite-auth
+
+      - name: Start siphon-b2bua-invite-auth
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-invite-auth up -d --wait siphon-b2bua-invite-auth
+
+      - name: B2BUA A-leg INVITE auth (407 from siphon, then the authenticated re-INVITE bridges)
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-invite-auth up --abort-on-container-exit --exit-code-from sipp-b2bua-invite-auth-uac sipp-b2bua-invite-auth-uac sipp-b2bua-invite-auth-uas
+
+      - name: Collect logs
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-invite-auth > siphon-b2bua-invite-auth.log 2>&1 || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-invite-auth down --remove-orphans
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-b2bua-invite-auth-logs
+          path: |
+            siphon-b2bua-invite-auth.log
+            *.log
+
   # ── rtpproxy functional test ───────────────────────────────────────────
   # Drives a real INVITE→200→ACK→BYE through siphon configured with
   # `media.backend: rtpproxy`, anchoring media via a mock rtpproxy. Proves the

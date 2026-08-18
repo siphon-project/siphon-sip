@@ -102,6 +102,9 @@ class Call:
         # (default a grant), and a record of each call for test assertions.
         self._ro_authorize_result: Optional[dict] = None
         self._ro_authorizations: list[dict] = []
+        # Username the A-leg authenticated as, set by
+        # ``auth.require_proxy_digest(call, realm)`` / ``require_www_digest``.
+        self._auth_user: Optional[str] = None
 
     # -- Properties ------------------------------------------------------------
 
@@ -126,6 +129,31 @@ class Call:
     def source_ip(self) -> str:
         """Source IP address of the A-leg caller."""
         return self._source_ip
+
+    @property
+    def auth_user(self) -> Optional[str]:
+        """Username the A-leg authenticated as, or ``None`` if never challenged.
+
+        The B2BUA twin of ``request.auth_user``.  Set by
+        ``auth.require_proxy_digest(call, realm)`` /
+        ``auth.require_www_digest(call, realm)`` in ``@b2bua.on_invite`` once
+        the caller answers the challenge correctly, and carried onto the call's
+        CDR as ``auth_user``.
+
+        Example::
+
+            @b2bua.on_invite
+            def new_call(call):
+                if not auth.require_proxy_digest(call, realm="example.com"):
+                    return          # 407 armed; siphon answers the A-leg
+                log.info(f"call from {call.auth_user}")
+                call.dial(call.ruri)
+        """
+        return self._auth_user
+
+    @auth_user.setter
+    def auth_user(self, value: Optional[str]) -> None:
+        self._auth_user = value
 
     def from_gateway(self, group_name: str) -> bool:
         """Check if the A-leg source IP is a member of a gateway group.

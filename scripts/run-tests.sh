@@ -36,6 +36,7 @@ RUN_VOICE_AI=false
 RUN_REINVITE=false
 RUN_B2BUA=false
 RUN_B2BUA_AUTH=false
+RUN_B2BUA_INVITE_AUTH=false
 RUN_GATEWAY=false
 RUN_AUTO100=false
 RUN_HTTP_AUTH=false
@@ -62,6 +63,7 @@ for arg in "$@"; do
     --reinvite)   RUN_REINVITE=true;   SELECTED_MODES+=("$arg") ;;
     --b2bua)      RUN_B2BUA=true;      SELECTED_MODES+=("$arg") ;;
     --b2bua-auth) RUN_B2BUA_AUTH=true; SELECTED_MODES+=("$arg") ;;
+    --b2bua-invite-auth) RUN_B2BUA_INVITE_AUTH=true; SELECTED_MODES+=("$arg") ;;
     --gateway)    RUN_GATEWAY=true;    SELECTED_MODES+=("$arg") ;;
     --auto100)    RUN_AUTO100=true;    SELECTED_MODES+=("$arg") ;;
     --http-auth)  RUN_HTTP_AUTH=true;  SELECTED_MODES+=("$arg") ;;
@@ -77,7 +79,8 @@ for arg in "$@"; do
       echo "Scenario modes (pick at most ONE per run):"
       echo "  --ipsec --charging --call --presence --rtpengine --rtpproxy --reinvite"
       echo "  --voice-ai"
-      echo "  --b2bua --b2bua-auth --gateway --auto100 --http-auth --wedge --banscan"
+      echo "  --b2bua --b2bua-auth --b2bua-invite-auth --gateway --auto100 --http-auth"
+      echo "  --wedge --banscan"
       echo "  --security --rfc4475 --webrtc"
       echo
       echo "  --skip-rust   skip the Rust test step (combines with any mode)"
@@ -293,6 +296,25 @@ if [[ "$RUN_B2BUA_AUTH" == true ]]; then
   echo "=== B2BUA auth-passthrough test (outbound call to a PBX that 407s; challenge relayed, no spurious 502) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-auth up --abort-on-container-exit --exit-code-from sipp-b2bua-auth-uac sipp-b2bua-auth-uac sipp-b2bua-auth-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua-auth rm -sf sipp-b2bua-auth-uac sipp-b2bua-auth-uas 2>/dev/null || true
+fi
+
+# ── Step 9c: B2BUA A-leg INVITE authentication test (optional) ──────────────
+# The mirror of 9b: siphon challenges the CALLER from @b2bua.on_invite. With a
+# @b2bua handler registered the INVITE never reaches @proxy.on_request, so the
+# challenge runs against the Call object. The UAC asserts the 407 + its
+# Proxy-Authenticate challenge and its UAS To-tag; the UAS asserts it sees
+# exactly one B-leg INVITE (a build that cannot challenge dials the
+# unauthenticated one through) carrying no leaked Proxy-Authorization.
+if [[ "$RUN_B2BUA_INVITE_AUTH" == true ]]; then
+  echo "=== Building siphon-b2bua-invite-auth image ==="
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-invite-auth build siphon-b2bua-invite-auth
+
+  echo "=== Starting siphon-b2bua-invite-auth ==="
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-invite-auth up -d --wait siphon-b2bua-invite-auth
+
+  echo "=== B2BUA A-leg INVITE auth test (siphon 407s the caller, then bridges the authenticated re-INVITE) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-invite-auth up --abort-on-container-exit --exit-code-from sipp-b2bua-invite-auth-uac sipp-b2bua-invite-auth-uac sipp-b2bua-invite-auth-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-invite-auth rm -sf sipp-b2bua-invite-auth-uac sipp-b2bua-invite-auth-uas 2>/dev/null || true
 fi
 
 # ── Step 10: Gateway routing tests (optional) ──────────────────────────────────

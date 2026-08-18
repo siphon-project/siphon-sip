@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA A-leg INVITE authentication UAC scenario (caller side).
+
+  siphon itself challenges the caller before dialling anything. This is the
+  opposite of b2bua_auth_uac.xml, where the challenge originates at the
+  downstream PBX and siphon only relays it (auth_passthrough).
+
+  Acceptance gate for "siphon cannot challenge an INVITE in b2bua mode": with a
+  @b2bua handler registered, the dispatcher routes INVITE to the B2BUA path and
+  @proxy.on_request never sees it, so the script has to authenticate against the
+  Call object (auth.require_proxy_digest(call, realm=...)).
+
+    1. INVITE (CSeq 1, no credentials) -> siphon answers 407 itself. Asserted
+       on the response:
+         - a Proxy-Authenticate challenge is present (without the multi-value
+           copy fix the response builder dropped every algorithm but the first;
+           without the Call-typed auth API there is no 407 at all, the call is
+           just dialled through unauthenticated),
+         - the To header carries a UAS tag (RFC 3261 §8.2.6.2).
+       b2bua_invite_auth_uas.xml asserts it receives exactly ONE INVITE, so a
+       build that lets the unauthenticated call through fails there.
+    2. ACK the 407.
+    3. Authenticated INVITE (CSeq 2) -> siphon verifies, strips the hop-by-hop
+       Proxy-Authorization, dials the B-leg -> 180 -> 200.
+    4. ACK, then BYE -> 200, call completes.
+
+  Run: sipp <siphon>:5060 -sf b2bua_invite_auth_uac.xml -au alice -ap secret -m 1
+-->
+<scenario name="B2BUA INVITE auth UAC">
+
+  <!-- Step 1: initial INVITE, no credentials -->
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/b2bua-invite-auth-test
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <!-- siphon's own 407. auth="true" primes [authentication] for the re-INVITE;
+       the eregs are the actual assertions. -->
+  <recv response="407" auth="true">
+    <action>
+      <ereg regexp="Digest.*realm=\"siphon\.test\""
+            search_in="hdr" header="Proxy-Authenticate:" check_it="true"
+            assign_to="challenge_ok" />
+      <ereg regexp=";tag="
+            search_in="hdr" header="To:" check_it="true"
+            assign_to="uas_tag_ok" />
+      <!-- Reference the vars so SIPp doesn't reject them as unused; check_it
+           on the eregs above is the pass/fail gate. -->
+      <log message="407 assertions: challenge=[$challenge_ok] to_tag=[$uas_tag_ok]" />
+    </action>
+  </recv>
+
+  <!-- Step 2: ACK the 407 (CSeq 1) -->
+  <send>
+    <![CDATA[
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- Step 3: authenticated INVITE (CSeq 2) -->
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 2 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+[authentication]
+Max-Forwards: 70
+User-Agent: SIPp/b2bua-invite-auth-test
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="180" optional="true" />
+
+  <!-- The authenticated call is bridged to the B-leg and answered. A second
+       407 here means the credentials were not accepted off the Call. -->
+  <recv response="200" rtd="true" />
+
+  <send>
+    <![CDATA[
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="200" />
+
+  <!-- Step 4: tear the call down -->
+  <send retrans="500">
+    <![CDATA[
+BYE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 3 BYE
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" crlf="true" />
+
+</scenario>

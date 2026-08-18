@@ -15,6 +15,41 @@ def route(request):
     request.relay()
 ```
 
+## Challenging in B2BUA mode
+
+The digest helpers take a `Request` **or** a `Call`. This matters: registering
+any `@b2bua.*` handler makes the dispatcher route INVITE straight to the B2BUA
+path, so `@proxy.on_request` never sees it and a proxy-style challenge would
+simply never run.
+
+```python
+from siphon import auth, b2bua, log
+
+@b2bua.on_invite
+def new_call(call):
+    if not auth.require_proxy_digest(call, realm="example.com"):
+        return                      # 407 armed; siphon answers the A-leg
+    log.info(f"call from {call.auth_user}")
+    call.dial(str(call.ruri))
+```
+
+Returning `False` arms the challenge as the call's deferred reject, the same one
+`call.reject()` produces — siphon answers the A-leg INVITE and drops the call
+actor, so **no B-leg is dialled** for an unauthenticated caller. On success the
+caller's `Proxy-Authorization` is stripped from the message the B-leg INVITE is
+built from, because it is hop-by-hop (RFC 3261 §22.3); forwarding it would only
+make the next hop challenge credentials that were minted for us. The verified
+username lands on `call.auth_user` and on the call's CDR.
+
+This is the opposite direction from `call.dial(auth_passthrough=True)`, where a
+*downstream* PBX issues the challenge and siphon relays it end-to-end for the
+caller to answer. Use `auth_passthrough` when the credentials live at the far
+end; challenge on the `Call` when siphon owns them.
+
+`require_ims_digest` and `require_aka_digest` take a `Request` only — IMS and
+AKA digest are REGISTER-time procedures, and REGISTER never reaches the B2BUA
+path.
+
 ## `auth` namespace
 
 ::: siphon_sdk.mock_module.MockAuth

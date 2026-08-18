@@ -63,6 +63,7 @@ them (see the framework-handles-automatically notes in the API reference).
 |---|---|
 | `www_authorize()` / `auth_check()` | `auth.require_www_digest(request, realm)` |
 | `proxy_authorize()` | `auth.require_proxy_digest(request, realm)` |
+| `proxy_authorize()` in a B2BUA route | `auth.require_proxy_digest(call, realm)` — same call, `Call` instead of `Request` (a `@b2bua.*` handler takes INVITE off the proxy path) |
 | `pv_www_authenticate()` w/ AKA | `auth.require_aka_digest()` / `auth.require_ims_digest()` |
 
 ## State, data & dispatch

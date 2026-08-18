@@ -13,6 +13,7 @@ use dashmap::DashMap;
 use pyo3::prelude::*;
 use tracing::{debug, warn};
 
+use super::call::PyCall;
 use super::request::PyRequest;
 use crate::config::{AkaCredential, AuthBackendType, HttpAuthConfig};
 use crate::diameter::DiameterManager;
@@ -56,6 +57,114 @@ static IMS_AUTH_STORE: OnceLock<Arc<DashMap<String, ImsAuthVector>>> = OnceLock:
 
 fn ims_auth_store() -> &'static Arc<DashMap<String, ImsAuthVector>> {
     IMS_AUTH_STORE.get_or_init(|| Arc::new(DashMap::new()))
+}
+
+/// A message object the digest helpers can authenticate: the proxy-mode
+/// [`PyRequest`] or the B2BUA-mode [`PyCall`].
+///
+/// Once a script registers any `@b2bua.*` handler the dispatcher routes INVITE
+/// straight to the B2BUA path, so `@proxy.on_request` never sees it and a
+/// B2BUA that wants to challenge its caller has only the `Call` object to work
+/// with.  Both objects already carry everything digest verification needs — the
+/// shared `Arc<Mutex<SipMessage>>` holding the INVITE, the source address and
+/// the transport — and both can carry a final response back to the caller.
+/// They only spell "reply" and "authenticated user" differently, which is what
+/// this enum normalises.
+pub enum AuthTarget<'a> {
+    /// Proxy-mode request (`@proxy.on_request`).
+    Request(&'a mut PyRequest),
+    /// B2BUA-mode call (`@b2bua.on_invite`).
+    Call(&'a mut PyCall),
+}
+
+/// The mutable Python borrow behind an [`AuthTarget`], held for the duration of
+/// one auth call.
+///
+/// Separate from `AuthTarget` itself so the Rust-side API (`challenge_www` and
+/// friends, used by the integration tests) can build an `AuthTarget` straight
+/// from a `&mut PyRequest` with no interpreter borrow in play.
+enum AuthTargetGuard<'py> {
+    Request(PyRefMut<'py, PyRequest>),
+    Call(PyRefMut<'py, PyCall>),
+}
+
+impl<'py> AuthTargetGuard<'py> {
+    /// Resolve a Python argument to a `Request` or a `Call`, mutably borrowed
+    /// for the duration of the auth call.
+    ///
+    /// Taken as `&Bound<PyAny>` rather than via `FromPyObject` so the type
+    /// error names both accepted types — a script that passes a `Reply` (the
+    /// obvious mistake when copying an `@proxy.on_reply` handler) gets told
+    /// what to pass instead.
+    fn extract(object: &Bound<'py, PyAny>) -> PyResult<Self> {
+        if let Ok(request) = object.cast::<PyRequest>() {
+            return Ok(AuthTargetGuard::Request(request.try_borrow_mut()?));
+        }
+        if let Ok(call) = object.cast::<PyCall>() {
+            return Ok(AuthTargetGuard::Call(call.try_borrow_mut()?));
+        }
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "auth digest methods take a Request (@proxy.on_request) or a Call \
+             (@b2bua.on_invite)",
+        ))
+    }
+
+    /// Borrow the guarded object as an [`AuthTarget`].
+    fn as_target(&mut self) -> AuthTarget<'_> {
+        match self {
+            AuthTargetGuard::Request(request) => AuthTarget::Request(request),
+            AuthTargetGuard::Call(call) => AuthTarget::Call(call),
+        }
+    }
+}
+
+impl AuthTarget<'_> {
+    /// The SIP message being authenticated — the inbound request for a
+    /// `Request`, the A-leg INVITE for a `Call`.
+    fn message(&self) -> Arc<std::sync::Mutex<crate::sip::message::SipMessage>> {
+        match self {
+            AuthTarget::Request(request) => request.message(),
+            AuthTarget::Call(call) => call.message(),
+        }
+    }
+
+    /// Record the verified username so it reaches `request.auth_user` /
+    /// `call.auth_user` and the CDR.
+    fn set_auth_user(&mut self, username: String) {
+        match self {
+            AuthTarget::Request(request) => request.set_auth_user(username),
+            AuthTarget::Call(call) => call.set_auth_user(username),
+        }
+    }
+
+    /// Arm the challenge response (401/407).  On a `Request` this is the same
+    /// deferred reply `request.reply()` sets; on a `Call` it is the same
+    /// deferred reject `call.reject()` sets, so the dispatcher answers the
+    /// INVITE and drops the call actor without ever dialling a B-leg.
+    fn set_challenge(&mut self, code: u16, reason: &str) {
+        match self {
+            AuthTarget::Request(request) => request.set_reply(code, reason.to_string()),
+            AuthTarget::Call(call) => call.set_reject(code, reason),
+        }
+    }
+
+    /// Source IP of the peer that sent the message (auto-ban bookkeeping).
+    fn source_ip_str(&self) -> &str {
+        match self {
+            AuthTarget::Request(request) => request.source_ip_str(),
+            AuthTarget::Call(call) => call.source_ip_str(),
+        }
+    }
+
+    /// Transport the message arrived on — decides whether a bad-credentials
+    /// attempt counts as a strong auto-ban signal (a spoofable UDP source
+    /// must not).
+    fn transport_name(&self) -> &str {
+        match self {
+            AuthTarget::Request(request) => request.transport_name(),
+            AuthTarget::Call(call) => call.transport_str(),
+        }
+    }
 }
 
 /// Python-visible auth namespace.
@@ -227,30 +336,44 @@ impl PyAuth {
 impl PyAuth {
     /// Challenge with 401 WWW-Authenticate if not yet authenticated.
     ///
-    /// If the request contains valid credentials, sets `request.auth_user`
-    /// and returns True. Otherwise, sends a 401 response with a nonce and
-    /// returns False.
-    #[pyo3(signature = (request, realm=None))]
-    fn require_www_digest(&self, request: &mut PyRequest, realm: Option<&str>) -> PyResult<bool> {
-        self.require_digest_inner(request, realm, 401, "WWW-Authenticate")
+    /// `target` is a `Request` (`@proxy.on_request`) or a `Call`
+    /// (`@b2bua.on_invite`) — see [`AuthTarget`].
+    ///
+    /// If the message carries valid credentials, sets `request.auth_user` /
+    /// `call.auth_user` and returns True. Otherwise arms a 401 response with a
+    /// nonce and returns False.
+    #[pyo3(signature = (target, realm=None))]
+    fn require_www_digest(
+        &self,
+        target: &Bound<'_, PyAny>,
+        realm: Option<&str>,
+    ) -> PyResult<bool> {
+        let mut guard = AuthTargetGuard::extract(target)?;
+        self.require_digest_inner(&mut guard.as_target(), realm, 401, "WWW-Authenticate")
     }
 
     /// Challenge with 407 Proxy-Authenticate if not yet authenticated.
     ///
-    /// Same as `require_www_digest` but uses 407 status code.
-    #[pyo3(signature = (request, realm=None))]
+    /// Same as `require_www_digest` but uses 407 status code. This is the
+    /// challenge an INVITE normally gets, including from a B2BUA authenticating
+    /// its own A-leg (`auth.require_proxy_digest(call, realm)` inside
+    /// `@b2bua.on_invite`): the caller's re-INVITE carries
+    /// `Proxy-Authorization`, which is stripped again before the B-leg is
+    /// dialled because it is hop-by-hop (RFC 3261 §22.3).
+    #[pyo3(signature = (target, realm=None))]
     fn require_proxy_digest(
         &self,
-        request: &mut PyRequest,
+        target: &Bound<'_, PyAny>,
         realm: Option<&str>,
     ) -> PyResult<bool> {
-        self.require_digest_inner(request, realm, 407, "Proxy-Authenticate")
+        let mut guard = AuthTargetGuard::extract(target)?;
+        self.require_digest_inner(&mut guard.as_target(), realm, 407, "Proxy-Authenticate")
     }
 
     /// Convenience alias: same as `require_www_digest`.
-    #[pyo3(signature = (request, realm=None))]
-    fn require_digest(&self, request: &mut PyRequest, realm: Option<&str>) -> PyResult<bool> {
-        self.require_www_digest(request, realm)
+    #[pyo3(signature = (target, realm=None))]
+    fn require_digest(&self, target: &Bound<'_, PyAny>, realm: Option<&str>) -> PyResult<bool> {
+        self.require_www_digest(target, realm)
     }
 
     /// IMS digest authentication via Diameter Cx MAR/MAA.
@@ -520,12 +643,16 @@ impl PyAuth {
 
     /// Verify credentials without sending a challenge.
     ///
-    /// Returns True if the request contains valid Authorization credentials
-    /// for the given realm. Does not send a 401/407 if invalid — just returns False.
-    #[pyo3(signature = (request, realm=None))]
-    fn verify_digest(&self, request: &PyRequest, realm: Option<&str>) -> PyResult<bool> {
+    /// `target` is a `Request` (`@proxy.on_request`) or a `Call`
+    /// (`@b2bua.on_invite`). Returns True if it carries valid
+    /// Authorization/Proxy-Authorization credentials for the given realm. Does
+    /// not arm a 401/407 if invalid — just returns False, and never touches
+    /// `auth_user`.
+    #[pyo3(signature = (target, realm=None))]
+    fn verify_digest(&self, target: &Bound<'_, PyAny>, realm: Option<&str>) -> PyResult<bool> {
+        let mut guard = AuthTargetGuard::extract(target)?;
         let realm = realm.unwrap_or(&self.default_realm);
-        let message = request.message();
+        let message = guard.as_target().message();
         let message = message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
@@ -555,12 +682,36 @@ impl PyAuth {
 impl PyAuth {
     /// Challenge with 401 WWW-Authenticate (Rust API).
     pub fn challenge_www(&self, request: &mut PyRequest, realm: Option<&str>) -> PyResult<bool> {
-        self.require_digest_inner(request, realm, 401, "WWW-Authenticate")
+        self.require_digest_inner(
+            &mut AuthTarget::Request(request),
+            realm,
+            401,
+            "WWW-Authenticate",
+        )
     }
 
     /// Challenge with 407 Proxy-Authenticate (Rust API).
     pub fn challenge_proxy(&self, request: &mut PyRequest, realm: Option<&str>) -> PyResult<bool> {
-        self.require_digest_inner(request, realm, 407, "Proxy-Authenticate")
+        self.require_digest_inner(
+            &mut AuthTarget::Request(request),
+            realm,
+            407,
+            "Proxy-Authenticate",
+        )
+    }
+
+    /// Challenge a B2BUA A-leg with 407 Proxy-Authenticate (Rust API).
+    ///
+    /// The `Call` twin of [`challenge_proxy`](Self::challenge_proxy) — the same
+    /// path `auth.require_proxy_digest(call, realm)` takes from
+    /// `@b2bua.on_invite`.
+    pub fn challenge_proxy_call(&self, call: &mut PyCall, realm: Option<&str>) -> PyResult<bool> {
+        self.require_digest_inner(&mut AuthTarget::Call(call), realm, 407, "Proxy-Authenticate")
+    }
+
+    /// Challenge a B2BUA A-leg with 401 WWW-Authenticate (Rust API).
+    pub fn challenge_www_call(&self, call: &mut PyCall, realm: Option<&str>) -> PyResult<bool> {
+        self.require_digest_inner(&mut AuthTarget::Call(call), realm, 401, "WWW-Authenticate")
     }
 
     /// Verify credentials without sending a challenge (Rust API).
@@ -592,14 +743,14 @@ impl PyAuth {
 impl PyAuth {
     fn require_digest_inner(
         &self,
-        request: &mut PyRequest,
+        target: &mut AuthTarget<'_>,
         realm: Option<&str>,
         challenge_code: u16,
         _header_name: &str,
     ) -> PyResult<bool> {
         let realm = realm.unwrap_or(&self.default_realm);
 
-        let message = request.message();
+        let message = target.message();
         let message_guard = message.lock().map_err(|error| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
         })?;
@@ -611,19 +762,15 @@ impl PyAuth {
             .or_else(|| message_guard.headers.get("Proxy-Authorization"))
             .cloned();
 
-        drop(message_guard);
-
-        // Extract the SIP method for digest HA2 computation
-        let method = {
-            let msg = request.message();
-            let guard = msg.lock().map_err(|e| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {e}"))
-            })?;
-            match &guard.start_line {
-                crate::sip::message::StartLine::Request(rl) => rl.method.as_str().to_string(),
-                _ => "REGISTER".to_string(),
-            }
+        // Extract the SIP method for digest HA2 computation. On a B2BUA `Call`
+        // this is the A-leg INVITE, so the HA2 the caller computed over
+        // "INVITE:<uri>" is what we verify against.
+        let method = match &message_guard.start_line {
+            crate::sip::message::StartLine::Request(rl) => rl.method.as_str().to_string(),
+            _ => "REGISTER".to_string(),
         };
+
+        drop(message_guard);
 
         // Distinguish a credential-less first leg (the legitimate opening of
         // challenge-response, or a toll-fraud probe — weight 1) from a present-
@@ -635,13 +782,15 @@ impl PyAuth {
             Some(value) if self.validate_credentials(&value, realm, &method) => {
                 // Extract username from the Authorization header
                 if let Some(username) = extract_username(&value) {
-                    request.set_auth_user(username);
+                    target.set_auth_user(username);
                 }
 
                 // Strip Authorization/Proxy-Authorization after successful verification.
                 // These are hop-by-hop credentials — forwarding them downstream causes
                 // the next hop to attempt (and fail) its own validation (e.g. 407).
-                let message = request.message();
+                // On a B2BUA `Call` this is what keeps the caller's credentials off
+                // the B-leg INVITE built from this same message.
+                let message = target.message();
                 let mut guard = message.lock().map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {e}"))
                 })?;
@@ -652,7 +801,7 @@ impl PyAuth {
                 // Valid credentials — clear any accrued auto-ban failure count so
                 // a legit client that challenges-then-succeeds never accumulates.
                 if let Some(ban) = crate::security::auto_ban() {
-                    if let Ok(source) = request.source_ip_str().parse::<std::net::IpAddr>() {
+                    if let Ok(source) = target.source_ip_str().parse::<std::net::IpAddr>() {
                         ban.record_success(source);
                     }
                 }
@@ -673,10 +822,10 @@ impl PyAuth {
                 //    a heavier weight would amplify a reflected ban. Over UDP it
                 //    falls back to weight 1 (today's behaviour, unchanged).
                 // trusted_cidrs are exempt inside the store.
-                let source_validated = request.transport_name() != "udp";
+                let source_validated = target.transport_name() != "udp";
                 let strong = credentials_present && source_validated;
                 if let Some(ban) = crate::security::auto_ban() {
-                    if let Ok(source) = request.source_ip_str().parse::<std::net::IpAddr>() {
+                    if let Ok(source) = target.source_ip_str().parse::<std::net::IpAddr>() {
                         let newly_banned = if strong {
                             ban.record_strong_failure(source)
                         } else {
@@ -699,13 +848,17 @@ impl PyAuth {
                     }
                 }
 
-                // Send challenge
+                // Arm the challenge response. On a `Request` this is the same
+                // deferred reply `request.reply()` produces; on a B2BUA `Call`
+                // it is the same deferred reject `call.reject()` produces, so
+                // the dispatcher answers the A-leg INVITE and drops the call
+                // actor without ever dialling a B-leg.
                 let reason = if challenge_code == 401 {
                     "Unauthorized"
                 } else {
                     "Proxy Authentication Required"
                 };
-                request.set_reply(challenge_code, reason.to_string());
+                target.set_challenge(challenge_code, reason);
 
                 // RFC 7616 §3.7: a server that supports multiple algorithms
                 // SHOULD include one challenge per algorithm, weakest first.
@@ -725,12 +878,15 @@ impl PyAuth {
                     format!("Digest realm=\"{realm}\", nonce=\"{nonce}\", algorithm=SHA-512-256, qop=\"auth\""),
                 ];
 
-                let message = request.message();
+                let message = target.message();
                 let mut message_guard = message.lock().map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
                 })?;
 
                 // Store the challenge headers so the response builder can pick them up.
+                // Cleared first so a handler that challenges twice (a retry loop, or
+                // 401-then-407) emits one set of algorithms, not two stacked ones.
+                message_guard.headers.remove(header_name);
                 for value in &header_values {
                     message_guard.headers.add(header_name, value.clone());
                 }
@@ -1624,7 +1780,7 @@ mod tests {
         let auth = make_auth();
         let mut request = make_register_request();
 
-        let result = auth.require_www_digest(&mut request, None).unwrap();
+        let result = auth.challenge_www(&mut request, None).unwrap();
         assert!(!result);
         assert_eq!(
             *request.action(),
@@ -1641,7 +1797,7 @@ mod tests {
         let auth = make_auth();
         let mut request = make_register_request();
 
-        let result = auth.require_proxy_digest(&mut request, None).unwrap();
+        let result = auth.challenge_proxy(&mut request, None).unwrap();
         assert!(!result);
         assert_eq!(
             *request.action(),
@@ -1658,7 +1814,7 @@ mod tests {
         let auth = make_auth();
         let mut request = make_request_with_auth("alice");
 
-        let result = auth.require_www_digest(&mut request, None).unwrap();
+        let result = auth.challenge_www(&mut request, None).unwrap();
         assert!(result);
         assert_eq!(request.get_auth_user(), Some("alice"));
         // Action should remain None (no reply sent)
@@ -1677,7 +1833,7 @@ mod tests {
             assert!(guard.headers.get("Authorization").is_some());
         }
 
-        let result = auth.require_www_digest(&mut request, None).unwrap();
+        let result = auth.challenge_www(&mut request, None).unwrap();
         assert!(result);
 
         // After successful auth, Authorization must be stripped
@@ -1694,7 +1850,7 @@ mod tests {
         let auth = make_auth();
         let mut request = make_request_with_auth("eve"); // unknown user
 
-        let result = auth.require_www_digest(&mut request, None).unwrap();
+        let result = auth.challenge_www(&mut request, None).unwrap();
         assert!(!result);
 
         // On failure, the original request headers are not stripped (challenge is sent instead)
@@ -1709,7 +1865,7 @@ mod tests {
         let auth = make_auth();
         let mut request = make_request_with_auth("eve");
 
-        let result = auth.require_www_digest(&mut request, None).unwrap();
+        let result = auth.challenge_www(&mut request, None).unwrap();
         assert!(!result);
         assert_eq!(
             *request.action(),
@@ -1725,10 +1881,211 @@ mod tests {
     fn verify_digest_without_sending_challenge() {
         let auth = make_auth();
         let request_no_auth = make_register_request();
-        assert!(!auth.verify_digest(&request_no_auth, None).unwrap());
+        assert!(!auth.check_credentials(&request_no_auth, None).unwrap());
 
         let request_with_auth = make_request_with_auth("alice");
-        assert!(auth.verify_digest(&request_with_auth, None).unwrap());
+        assert!(auth.check_credentials(&request_with_auth, None).unwrap());
+    }
+
+    // -----------------------------------------------------------------------
+    // B2BUA `Call` targets — a script with any `@b2bua.*` handler never sees
+    // the INVITE through `@proxy.on_request`, so the digest helpers have to
+    // work off the `Call` object for a B2BUA to authenticate its caller.
+    // -----------------------------------------------------------------------
+
+    /// Build an A-leg INVITE, optionally carrying a `Proxy-Authorization`
+    /// digest response computed for `credentials_for` over `hash_method`.
+    ///
+    /// `hash_method` is separate from the on-wire method so a test can prove
+    /// HA2 is hashed over the message's real method (INVITE) rather than the
+    /// REGISTER default.
+    fn make_invite_call(
+        credentials_for: Option<&str>,
+        hash_method: &str,
+    ) -> super::super::call::PyCall {
+        let realm = "example.com";
+        let digest_uri = "sip:bob@example.com";
+        let mut builder = SipMessageBuilder::new()
+            .request(
+                Method::Invite,
+                SipUri::new("example.com".to_string()).with_user("bob".to_string()),
+            )
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-b2bua-auth".to_string())
+            .from("<sip:alice@example.com>;tag=a-leg-tag".to_string())
+            .to("<sip:bob@example.com>".to_string())
+            .call_id("b2bua-auth-call@host".to_string())
+            .cseq("1 INVITE".to_string());
+
+        if let Some(username) = credentials_for {
+            let password = match username {
+                "alice" => "pass123",
+                "bob" => "secret",
+                _ => "wrong",
+            };
+            let nonce = format!("{:016x}.test", now_unix_secs());
+            let ha1 = md5_hex(&format!("{username}:{realm}:{password}"));
+            let ha2 = md5_hex(&format!("{hash_method}:{digest_uri}"));
+            let response = md5_hex(&format!("{ha1}:{nonce}:{ha2}"));
+            builder = builder.header(
+                "Proxy-Authorization",
+                format!(
+                    "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", \
+                     uri=\"{digest_uri}\", response=\"{response}\""
+                ),
+            );
+        }
+
+        let message = builder.content_length(0).build().unwrap();
+        super::super::call::PyCall::new(
+            "b2bua-auth-test".to_string(),
+            Arc::new(Mutex::new(message)),
+            "10.0.0.1".to_string(),
+            "udp".to_string(),
+        )
+    }
+
+    /// All values of `name` on the call's A-leg INVITE.
+    fn call_header_values(call: &super::super::call::PyCall, name: &str) -> Vec<String> {
+        let message = call.message();
+        let guard = message.lock().unwrap();
+        guard.headers.get_all(name).cloned().unwrap_or_default()
+    }
+
+    #[test]
+    fn require_proxy_digest_on_call_arms_407_reject() {
+        use super::super::call::CallAction;
+
+        let auth = make_auth();
+        let mut call = make_invite_call(None, "INVITE");
+
+        let authenticated = auth.challenge_proxy_call(&mut call, None).unwrap();
+        assert!(!authenticated);
+
+        // The deferred reject the dispatcher turns into the 407 on the wire —
+        // the B-leg is never dialled.
+        assert_eq!(
+            *call.action(),
+            CallAction::Reject {
+                code: 407,
+                reason: "Proxy Authentication Required".to_string(),
+            }
+        );
+        assert_eq!(call.get_auth_user(), None);
+
+        // RFC 7616 §3.7: one challenge per supported algorithm, weakest first.
+        let challenges = call_header_values(&call, "Proxy-Authenticate");
+        assert_eq!(challenges.len(), 3, "got {challenges:?}");
+        assert!(challenges[0].contains("algorithm=MD5"));
+        assert!(challenges[1].contains("algorithm=SHA-256"));
+        assert!(challenges[2].contains("algorithm=SHA-512-256"));
+        assert!(challenges
+            .iter()
+            .all(|value| value.contains("realm=\"example.com\"")));
+        // A 407 must not carry the 401 header (RFC 3261 §22.3).
+        assert!(call_header_values(&call, "WWW-Authenticate").is_empty());
+    }
+
+    #[test]
+    fn require_www_digest_on_call_arms_401_reject() {
+        use super::super::call::CallAction;
+
+        let auth = make_auth();
+        let mut call = make_invite_call(None, "INVITE");
+
+        assert!(!auth.challenge_www_call(&mut call, None).unwrap());
+        assert_eq!(
+            *call.action(),
+            CallAction::Reject {
+                code: 401,
+                reason: "Unauthorized".to_string(),
+            }
+        );
+        assert_eq!(call_header_values(&call, "WWW-Authenticate").len(), 3);
+        assert!(call_header_values(&call, "Proxy-Authenticate").is_empty());
+    }
+
+    #[test]
+    fn require_proxy_digest_on_call_accepts_valid_user() {
+        use super::super::call::CallAction;
+
+        let auth = make_auth();
+        let mut call = make_invite_call(Some("alice"), "INVITE");
+        assert!(!call_header_values(&call, "Proxy-Authorization").is_empty());
+
+        let authenticated = auth.challenge_proxy_call(&mut call, None).unwrap();
+        assert!(authenticated);
+        assert_eq!(call.get_auth_user(), Some("alice"));
+        // No action armed — the handler is free to dial the B-leg.
+        assert_eq!(*call.action(), CallAction::None);
+        assert!(call_header_values(&call, "Proxy-Authenticate").is_empty());
+
+        // Proxy-Authorization is hop-by-hop (RFC 3261 §22.3) and must not
+        // survive onto the B-leg INVITE, which is built from this same message.
+        assert!(call_header_values(&call, "Proxy-Authorization").is_empty());
+        assert!(call_header_values(&call, "Authorization").is_empty());
+    }
+
+    #[test]
+    fn call_challenge_hashes_ha2_over_the_invite_method() {
+        // The credentials are cryptographically well-formed but hashed over
+        // REGISTER, so they must NOT authenticate an INVITE — proof that HA2
+        // comes from the message's own start line and not the REGISTER default
+        // the helper falls back to for non-request messages.
+        let auth = make_auth();
+        let mut wrong_method = make_invite_call(Some("alice"), "REGISTER");
+        assert!(!auth.challenge_proxy_call(&mut wrong_method, None).unwrap());
+        assert_eq!(wrong_method.get_auth_user(), None);
+
+        let mut right_method = make_invite_call(Some("alice"), "INVITE");
+        assert!(auth.challenge_proxy_call(&mut right_method, None).unwrap());
+    }
+
+    #[test]
+    fn repeated_call_challenge_emits_one_algorithm_set() {
+        // A handler that challenges twice (a retry path, or 401-then-407) must
+        // not stack two sets of algorithms onto the same response.
+        let auth = make_auth();
+        let mut call = make_invite_call(None, "INVITE");
+
+        assert!(!auth.challenge_proxy_call(&mut call, None).unwrap());
+        assert!(!auth.challenge_proxy_call(&mut call, None).unwrap());
+
+        assert_eq!(call_header_values(&call, "Proxy-Authenticate").len(), 3);
+    }
+
+    #[test]
+    fn digest_methods_accept_request_and_call_and_reject_others() {
+        pyo3::Python::initialize();
+        pyo3::Python::attach(|python| {
+            let auth = make_auth();
+
+            // A proxy Request still works (unchanged behaviour).
+            let request_obj = pyo3::Py::new(python, make_register_request()).unwrap();
+            let challenged = auth
+                .require_www_digest(request_obj.bind(python).as_any(), None)
+                .unwrap();
+            assert!(!challenged);
+
+            // A B2BUA Call is accepted — this is the case that used to raise
+            // "'Call' object cannot be converted to 'Request'".
+            let call_obj = pyo3::Py::new(python, make_invite_call(None, "INVITE")).unwrap();
+            let challenged = auth
+                .require_proxy_digest(call_obj.bind(python).as_any(), None)
+                .unwrap();
+            assert!(!challenged);
+            assert!(auth
+                .verify_digest(call_obj.bind(python).as_any(), None)
+                .is_ok());
+
+            // Anything else is a clear TypeError naming both accepted types,
+            // not a silent pass.
+            let bogus = pyo3::types::PyString::new(python, "not a request or call");
+            let error = auth.require_proxy_digest(bogus.as_any(), None).unwrap_err();
+            assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(python));
+            assert!(auth.require_www_digest(bogus.as_any(), None).is_err());
+            assert!(auth.require_digest(bogus.as_any(), None).is_err());
+            assert!(auth.verify_digest(bogus.as_any(), None).is_err());
+        });
     }
 
     #[test]
@@ -1754,7 +2111,7 @@ mod tests {
         let auth = make_auth();
         let mut request = make_register_request();
 
-        auth.require_www_digest(&mut request, None).unwrap();
+        auth.challenge_www(&mut request, None).unwrap();
 
         // The WWW-Authenticate header should be set on the message
         let message = request.message();
@@ -1771,7 +2128,7 @@ mod tests {
         let auth = make_auth();
         let mut request = make_register_request();
 
-        auth.require_www_digest(&mut request, Some("custom.realm")).unwrap();
+        auth.challenge_www(&mut request, Some("custom.realm")).unwrap();
 
         let message = request.message();
         let message = message.lock().unwrap();
@@ -1784,7 +2141,7 @@ mod tests {
         let auth = PyAuth::empty();
         let mut request = make_request_with_auth("alice");
 
-        let result = auth.require_www_digest(&mut request, None).unwrap();
+        let result = auth.challenge_www(&mut request, None).unwrap();
         assert!(!result);
     }
 

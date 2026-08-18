@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use siphon::script::api::auth::PyAuth;
+use siphon::script::api::call::{CallAction, PyCall};
 use siphon::script::api::request::{PyRequest, RequestAction};
 use siphon::sip::builder::SipMessageBuilder;
 use siphon::sip::message::Method;
@@ -214,4 +215,215 @@ fn multi_realm_users() {
         "Digest username=\"dave\", realm=\"realm1.com\", nonce=\"abc\", uri=\"sip:realm1.com\", response=\"xyz\""
     ));
     assert!(!auth.check_credentials(&request, Some("realm1.com")).unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// B2BUA A-leg challenge — the digest cycle against a `Call` instead of a
+// `Request`.
+//
+// A script with any `@b2bua.*` handler never sees the INVITE through
+// `@proxy.on_request` (the dispatcher routes it straight to the B2BUA path),
+// so authenticating the caller has to work off the `Call` object.
+// ---------------------------------------------------------------------------
+
+/// Build an A-leg INVITE `Call`, optionally carrying a `Proxy-Authorization`.
+fn make_invite_call(proxy_auth: Option<&str>) -> PyCall {
+    let mut builder = SipMessageBuilder::new()
+        .request(
+            Method::Invite,
+            SipUri::new("atlanta.com".to_string()).with_user("bob".to_string()),
+        )
+        .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-b2bua-auth".to_string())
+        .to("Bob <sip:bob@atlanta.com>".to_string())
+        .from("Alice <sip:alice@atlanta.com>;tag=a-leg-tag".to_string())
+        .call_id("b2bua-auth-call@10.0.0.1".to_string())
+        .cseq("1 INVITE".to_string())
+        .max_forwards(70)
+        .content_length(0);
+
+    if let Some(header) = proxy_auth {
+        builder = builder.header("Proxy-Authorization", header.to_string());
+    }
+
+    PyCall::new(
+        "b2bua-auth-integration".to_string(),
+        Arc::new(Mutex::new(builder.build().unwrap())),
+        "10.0.0.1".to_string(),
+        "udp".to_string(),
+    )
+}
+
+/// All values of `name` on the call's A-leg INVITE.
+fn call_headers(call: &PyCall, name: &str) -> Vec<String> {
+    let message = call.message();
+    let guard = message.lock().unwrap();
+    guard.headers.get_all(name).cloned().unwrap_or_default()
+}
+
+/// Pull the `nonce="…"` out of a challenge header value.
+fn nonce_of(challenge: &str) -> String {
+    challenge
+        .split_once("nonce=\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(nonce, _)| nonce.to_string())
+        .expect("challenge carries a nonce")
+}
+
+#[test]
+fn b2bua_invite_challenge_arms_a_407_reject_on_the_call() {
+    let auth = make_auth("atlanta.com", &[("alice", "secret123")]);
+    let mut call = make_invite_call(None);
+
+    let authenticated = auth
+        .challenge_proxy_call(&mut call, Some("atlanta.com"))
+        .unwrap();
+    assert!(!authenticated, "no credentials — must not authenticate");
+
+    // The deferred reject the dispatcher turns into the 407 on the wire. The
+    // B-leg is never dialled, and the call actor is dropped with it.
+    assert_eq!(
+        *call.action(),
+        CallAction::Reject {
+            code: 407,
+            reason: "Proxy Authentication Required".to_string(),
+        }
+    );
+
+    // The challenge is parked on the A-leg INVITE, which is where the
+    // dispatcher's response builder reads it from when it answers the caller.
+    let challenges = call_headers(&call, "Proxy-Authenticate");
+    assert_eq!(challenges.len(), 3, "one per algorithm: {challenges:?}");
+    for challenge in &challenges {
+        assert!(challenge.starts_with("Digest "), "{challenge}");
+        assert!(challenge.contains("realm=\"atlanta.com\""), "{challenge}");
+        assert!(challenge.contains("qop=\"auth\""), "{challenge}");
+    }
+}
+
+#[test]
+fn b2bua_invite_challenge_then_authenticated_reinvite() {
+    // The full device-driven cycle a caller drives against a B2BUA:
+    //   INVITE (no creds) -> 407 + nonce -> INVITE (creds) -> authenticated.
+    let auth = make_auth("atlanta.com", &[("alice", "secret123")]);
+
+    // 1. Challenge.
+    let mut first = make_invite_call(None);
+    assert!(!auth
+        .challenge_proxy_call(&mut first, Some("atlanta.com"))
+        .unwrap());
+    let nonce = nonce_of(&call_headers(&first, "Proxy-Authenticate")[0]);
+
+    // 2. The caller answers with credentials hashed over INVITE (not REGISTER)
+    //    and the nonce we just minted.
+    let credentials = digest_header(
+        "alice",
+        "secret123",
+        "atlanta.com",
+        &nonce,
+        "sip:bob@atlanta.com",
+        "INVITE",
+    );
+    let mut second = make_invite_call(Some(&credentials));
+
+    let authenticated = auth
+        .challenge_proxy_call(&mut second, Some("atlanta.com"))
+        .unwrap();
+    assert!(authenticated, "valid credentials must authenticate");
+    assert_eq!(second.get_auth_user(), Some("alice"));
+
+    // No action armed — the handler goes on to dial the B-leg normally.
+    assert_eq!(*second.action(), CallAction::None);
+    assert!(call_headers(&second, "Proxy-Authenticate").is_empty());
+
+    // Proxy-Authorization is hop-by-hop (RFC 3261 §22.3). The B-leg INVITE is
+    // built from this same message, so it must be gone by the time the handler
+    // returns — otherwise the next hop challenges credentials minted for us.
+    assert!(
+        call_headers(&second, "Proxy-Authorization").is_empty(),
+        "hop-by-hop credentials leaked toward the B-leg"
+    );
+}
+
+#[test]
+fn b2bua_invite_challenge_rejects_wrong_password() {
+    let auth = make_auth("atlanta.com", &[("alice", "secret123")]);
+
+    let mut first = make_invite_call(None);
+    assert!(!auth
+        .challenge_proxy_call(&mut first, Some("atlanta.com"))
+        .unwrap());
+    let nonce = nonce_of(&call_headers(&first, "Proxy-Authenticate")[0]);
+
+    let credentials = digest_header(
+        "alice",
+        "wrong-password",
+        "atlanta.com",
+        &nonce,
+        "sip:bob@atlanta.com",
+        "INVITE",
+    );
+    let mut second = make_invite_call(Some(&credentials));
+
+    assert!(!auth
+        .challenge_proxy_call(&mut second, Some("atlanta.com"))
+        .unwrap());
+    assert_eq!(second.get_auth_user(), None);
+    // Re-challenged rather than let through.
+    assert_eq!(
+        *second.action(),
+        CallAction::Reject {
+            code: 407,
+            reason: "Proxy Authentication Required".to_string(),
+        }
+    );
+}
+
+#[test]
+fn b2bua_invite_challenge_rejects_credentials_hashed_over_another_method() {
+    // A captured REGISTER credential replayed onto an INVITE must not pass:
+    // HA2 is hashed over the message's own method.
+    let auth = make_auth("atlanta.com", &[("alice", "secret123")]);
+
+    let mut first = make_invite_call(None);
+    assert!(!auth
+        .challenge_proxy_call(&mut first, Some("atlanta.com"))
+        .unwrap());
+    let nonce = nonce_of(&call_headers(&first, "Proxy-Authenticate")[0]);
+
+    let register_credentials = digest_header(
+        "alice",
+        "secret123",
+        "atlanta.com",
+        &nonce,
+        "sip:bob@atlanta.com",
+        "REGISTER",
+    );
+    let mut second = make_invite_call(Some(&register_credentials));
+
+    assert!(!auth
+        .challenge_proxy_call(&mut second, Some("atlanta.com"))
+        .unwrap());
+    assert_eq!(second.get_auth_user(), None);
+}
+
+#[test]
+fn b2bua_invite_www_challenge_arms_a_401_reject() {
+    // A B2BUA is a UAS, so 401/WWW-Authenticate is available too (RFC 3261
+    // §22.2) for deployments that authenticate as an endpoint rather than a
+    // proxy.
+    let auth = make_auth("atlanta.com", &[("alice", "secret123")]);
+    let mut call = make_invite_call(None);
+
+    assert!(!auth
+        .challenge_www_call(&mut call, Some("atlanta.com"))
+        .unwrap());
+    assert_eq!(
+        *call.action(),
+        CallAction::Reject {
+            code: 401,
+            reason: "Unauthorized".to_string(),
+        }
+    );
+    assert_eq!(call_headers(&call, "WWW-Authenticate").len(), 3);
+    assert!(call_headers(&call, "Proxy-Authenticate").is_empty());
 }

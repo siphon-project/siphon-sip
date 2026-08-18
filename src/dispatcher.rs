@@ -7128,6 +7128,25 @@ fn is_coroutine(python: Python<'_>, obj: &Bound<'_, pyo3::PyAny>) -> PyResult<bo
     result.is_truthy()
 }
 
+/// Stamp the UAS To-tag of a B2BUA A-leg dialog onto a locally-generated
+/// response.
+///
+/// RFC 3261 §8.2.6.2: a UAS MUST put a tag in the To header of every response
+/// but 100, and siphon is the UAS on the A-leg. [`build_response`] copies the
+/// request's To verbatim, which for a dialog-forming INVITE has no tag yet, so
+/// any response siphon answers itself has to add the tag the A-leg dialog was
+/// created with — the same one the caller saw on our provisionals, so a final
+/// response terminates the dialog it belongs to.
+///
+/// No-op when the To header already carries a tag (an in-dialog request) or is
+/// absent.
+fn stamp_uas_to_tag(response: &mut SipMessage, local_tag: &str) {
+    if let Some(to) = response.headers.to() {
+        let tagged = crate::b2bua::actor::ensure_tag(to, Some(local_tag));
+        response.headers.set("To", tagged);
+    }
+}
+
 /// Build a SIP response from a request, copying mandatory headers.
 fn build_response(
     request: &SipMessage,
@@ -7162,12 +7181,19 @@ fn build_response(
         builder = builder.cseq(cseq.clone());
     }
 
-    // Copy any auth challenge headers the script may have set
-    if let Some(www_auth) = request.headers.get("WWW-Authenticate") {
-        builder = builder.header("WWW-Authenticate", www_auth.clone());
-    }
-    if let Some(proxy_auth) = request.headers.get("Proxy-Authenticate") {
-        builder = builder.header("Proxy-Authenticate", proxy_auth.clone());
+    // Copy any auth challenge headers the script may have set.
+    //
+    // ALL values, not just the first: `auth.require_*_digest` stacks one
+    // challenge per algorithm (MD5 + SHA-256 + SHA-512-256, RFC 7616 §3.7) so a
+    // single 401/407 serves both RFC 2617 and RFC 7616 clients. Copying only
+    // `get()` put the weakest one on the wire and silently dropped the rest,
+    // which no client could then negotiate up from.
+    for name in ["WWW-Authenticate", "Proxy-Authenticate"] {
+        if let Some(values) = request.headers.get_all(name) {
+            for value in values {
+                builder = builder.header(name, value.clone());
+            }
+        }
     }
 
 
@@ -11385,11 +11411,7 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
                 build_response(&invite, 408, "Request Timeout", state.server_header.as_deref(), &[]);
             // Carry the UAS To-tag we assigned the A-leg dialog (the A-leg saw it
             // on our 1xx) so the final response terminates the same dialog.
-            if let Some(to) = response.headers.to() {
-                let to_with_tag =
-                    crate::b2bua::actor::ensure_tag(to, Some(&a_leg.dialog.local_tag));
-                response.headers.set("To", to_with_tag);
-            }
+            stamp_uas_to_tag(&mut response, &a_leg.dialog.local_tag);
             // Pin the A-leg's arrival socket so the 408 leaves the port the caller
             // sent the INVITE to (multi-homed UDP symmetric signalling).
             send_message_from(
@@ -11675,12 +11697,13 @@ fn handle_b2bua_invite(
         contact_user_override,
         contact_override,
         auth_passthrough,
+        auth_user,
     ) = Python::attach(|python| {
         let call_obj = match Py::new(python, py_call) {
             Ok(obj) => obj,
             Err(error) => {
                 error!("failed to create PyCall: {error}");
-                return (CallAction::None, None, None, false, false, None, None, None, None, None, false);
+                return (CallAction::None, None, None, false, false, None, None, None, None, None, false, None);
             }
         };
 
@@ -11694,7 +11717,7 @@ fn handle_b2bua_invite(
                             return (CallAction::Reject {
                                 code: 500,
                                 reason: "Script Error".to_string(),
-                            }, None, None, false, false, None, None, None, None, None, false);
+                            }, None, None, false, false, None, None, None, None, None, false, None);
                         }
                     }
                 }
@@ -11703,7 +11726,7 @@ fn handle_b2bua_invite(
                     return (CallAction::Reject {
                         code: 500,
                         reason: "Script Error".to_string(),
-                    }, None, None, false, false, None, None, None, None, None, false);
+                    }, None, None, false, false, None, None, None, None, None, false, None);
                 }
             }
         }
@@ -11720,11 +11743,22 @@ fn handle_b2bua_invite(
         let contact_user_ovr = borrowed.contact_user_override().map(String::from);
         let contact_ovr = borrowed.contact_override().map(String::from);
         let auth_passthrough = borrowed.auth_passthrough();
-        (action, timer_override, credentials, li_record, preserve_cid, policy_input, from_host_ovr, to_host_ovr, contact_user_ovr, contact_ovr, auth_passthrough)
+        let auth_user = borrowed.get_auth_user().map(String::from);
+        (action, timer_override, credentials, li_record, preserve_cid, policy_input, from_host_ovr, to_host_ovr, contact_user_ovr, contact_ovr, auth_passthrough, auth_user)
     });
 
     // Store the A-leg INVITE for later use by on_answer/on_failure/on_bye handlers
     state.call_actors.set_a_leg_invite(&call_id, Arc::clone(&message_arc));
+
+    // A caller that answered a digest challenge inside `@b2bua.on_invite`
+    // (`auth.require_proxy_digest(call, …)`) authenticated after
+    // `cdr_track_b2bua_start` already opened the CDR session, so stamp the
+    // username on now — the proxy path gets it at session-build time.
+    if let Some(ref auth_user) = auth_user {
+        if let Some(mut session) = state.cdr_sessions.get_mut(&call_id) {
+            session.set_auth_user(auth_user.clone());
+        }
+    }
 
     // Resolve script-side header policy input into a per-call ResolvedPolicy.
     // Done outside the call_actors lock so the registry lookup + delta
@@ -11833,7 +11867,20 @@ fn handle_b2bua_invite(
         }
         CallAction::Reject { code, reason } => {
             debug!(call_id = %call_id, code, "B2BUA: rejecting call");
-            let response = build_response(&message_guard, code, &reason, state.server_header.as_deref(), &[]);
+            let mut response = build_response(&message_guard, code, &reason, state.server_header.as_deref(), &[]);
+            // siphon is the UAS on the A-leg, so this locally-generated final
+            // response needs the dialog's UAS To-tag (RFC 3261 §8.2.6.2) — same
+            // as the 408-timeout path. Load-bearing for a digest challenge:
+            // the caller matches our 407 to its transaction and echoes the tag
+            // on its ACK (RFC 3261 §17.1.1.3) before re-INVITEing with
+            // credentials.
+            if let Some(local_tag) = state
+                .call_actors
+                .get_call(&call_id)
+                .map(|call| call.a_leg.dialog.local_tag.clone())
+            {
+                stamp_uas_to_tag(&mut response, &local_tag);
+            }
             send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
             state.call_actors.remove_call(&call_id);
             state.call_event_receivers.remove(&call_id);
@@ -22169,6 +22216,98 @@ mod tests {
         assert!(
             response.headers.get("Expires").is_none(),
             "Expires should not appear in response when not set on request"
+        );
+    }
+
+    #[test]
+    fn build_response_copies_every_auth_challenge_algorithm() {
+        // `auth.require_*_digest` stacks one challenge per algorithm (RFC 7616
+        // §3.7) so a single 401/407 serves RFC 2617 and RFC 7616 clients alike.
+        // Copying only the first value put MD5 on the wire and silently dropped
+        // the stronger two, leaving nothing for a client to negotiate up to.
+        let mut request = sample_invite();
+        for algorithm in ["MD5", "SHA-256", "SHA-512-256"] {
+            request.headers.add(
+                "Proxy-Authenticate",
+                format!(
+                    "Digest realm=\"example.com\", nonce=\"abc\", algorithm={algorithm}, qop=\"auth\""
+                ),
+            );
+            request.headers.add(
+                "WWW-Authenticate",
+                format!(
+                    "Digest realm=\"example.com\", nonce=\"abc\", algorithm={algorithm}, qop=\"auth\""
+                ),
+            );
+        }
+
+        let response = build_response(
+            &request,
+            407,
+            "Proxy Authentication Required",
+            None,
+            &[],
+        );
+
+        for name in ["Proxy-Authenticate", "WWW-Authenticate"] {
+            let values = response.headers.get_all(name).unwrap();
+            assert_eq!(values.len(), 3, "{name} lost algorithms: {values:?}");
+            assert!(values[0].contains("algorithm=MD5"));
+            assert!(values[1].contains("algorithm=SHA-256"));
+            assert!(values[2].contains("algorithm=SHA-512-256"));
+        }
+
+        // And all three reach the wire as separate header lines.
+        let text = String::from_utf8(response.to_bytes()).unwrap();
+        assert_eq!(text.matches("Proxy-Authenticate:").count(), 3);
+    }
+
+    #[test]
+    fn build_response_omits_auth_challenge_when_request_has_none() {
+        let request = sample_invite();
+        let response = build_response(&request, 200, "OK", None, &[]);
+        assert!(response.headers.get("Proxy-Authenticate").is_none());
+        assert!(response.headers.get("WWW-Authenticate").is_none());
+    }
+
+    #[test]
+    fn stamp_uas_to_tag_adds_the_dialog_tag_to_a_tagless_response() {
+        // The shape every locally-generated B2BUA final response has: the
+        // INVITE's To is tagless, so build_response copies a tagless To and the
+        // UAS tag has to be added (RFC 3261 §8.2.6.2). A 407 challenge without
+        // it leaves the caller unable to key our response to its dialog.
+        let request = sample_invite();
+        let mut response = build_response(
+            &request,
+            407,
+            "Proxy Authentication Required",
+            None,
+            &[],
+        );
+        assert!(!response.headers.to().unwrap().contains(";tag="));
+
+        stamp_uas_to_tag(&mut response, "a-leg-uas-tag");
+        assert!(response
+            .headers
+            .to()
+            .unwrap()
+            .ends_with(";tag=a-leg-uas-tag"));
+    }
+
+    #[test]
+    fn stamp_uas_to_tag_leaves_an_existing_tag_alone() {
+        // An in-dialog request already carries the tag we assigned; re-stamping
+        // would corrupt the dialog identifier.
+        let mut request = sample_invite();
+        request
+            .headers
+            .set("To", "<sip:bob@example.com>;tag=already-here".to_string());
+        let mut response = build_response(&request, 481, "Call/Transaction Does Not Exist", None, &[]);
+
+        stamp_uas_to_tag(&mut response, "a-different-tag");
+        assert_eq!(
+            response.headers.to().unwrap(),
+            "<sip:bob@example.com>;tag=already-here"
         );
     }
 

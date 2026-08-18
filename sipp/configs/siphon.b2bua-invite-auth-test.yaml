@@ -1,0 +1,46 @@
+# siphon.b2bua-invite-auth-test.yaml — B2BUA A-leg INVITE authentication config
+#
+# Used with: sipp/docker-compose.yaml (b2bua-invite-auth profile)
+# Script:    scripts/b2bua_invite_auth.py
+# Tests:     siphon challenges the CALLER's INVITE from @b2bua.on_invite
+#            (auth.require_proxy_digest(call, realm=...)) — with a @b2bua
+#            handler registered the INVITE never reaches @proxy.on_request, so
+#            the challenge has to work off the Call object. The unauthenticated
+#            INVITE must be answered 407 without a B-leg being dialled, and the
+#            authenticated re-INVITE must bridge normally with the caller's
+#            hop-by-hop Proxy-Authorization stripped.
+#
+# Contrast with siphon.b2bua-auth-test.yaml, where the DOWNSTREAM PBX issues the
+# challenge and siphon relays it (auth_passthrough).
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.100"
+    - "127.0.0.1"
+
+script:
+  path: "scripts/b2bua_invite_auth.py"
+  reload: auto
+
+advertised_address: "172.20.0.100"
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+log:
+  level: debug
+  format: pretty

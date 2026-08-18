@@ -84,6 +84,8 @@ This document tracks the maturity of every SIPhon feature across three readiness
 |---------|-----------|--------|-------|
 | Digest auth — 401 (UAS) | **Production** | `auth.require_digest()` | REGISTER challenges |
 | Digest auth — 407 (proxy) | **Production** | `auth.require_proxy_digest()` | INVITE challenges |
+| Digest auth — B2BUA A-leg | Implemented | `auth.require_proxy_digest(call, …)` | Challenge the caller from `@b2bua.on_invite`. With a `@b2bua.*` handler registered the INVITE never reaches `@proxy.on_request`, so the digest helpers take the `Call` too; the 407 is armed as the call's deferred reject, so no B-leg is dialled, and the caller's hop-by-hop `Proxy-Authorization` is stripped before it could reach one. Verified username on `call.auth_user` and on the CDR. Gated by `scripts/run-tests.sh --b2bua-invite-auth`. |
+| Multi-algorithm challenge (RFC 7616 §3.7) | Implemented | | One `WWW-Authenticate`/`Proxy-Authenticate` per algorithm (MD5, SHA-256, SHA-512-256) on a single 401/407, so RFC 2617 and RFC 7616 clients both negotiate. Wire shape validated against the Wireshark dissector. |
 | HTTP backend (HA1 lookup) | **Production** | `auth.backend: http` | REST credential lookup; optional per-username TTL cache (`auth.http.cache_ttl_secs`) flattens registration storms so repeat REGISTERs skip the blocking fetch |
 | Static users backend | Implemented | `auth.backend: static` | Inline config credentials |
 | Diameter Cx backend (HSS) | **Production** | `auth.backend: diameter_cx` | 3GPP TS 29.228 |

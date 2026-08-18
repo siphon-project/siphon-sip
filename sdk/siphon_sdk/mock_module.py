@@ -1567,14 +1567,36 @@ class MockAuth:
         """
         self._credentials.setdefault(realm, {})[username] = password
 
-    def require_www_digest(self, request: Any, realm: Optional[str] = None) -> bool:
+    @staticmethod
+    def _challenge(target: Any, code: int, reason: str) -> None:
+        """Arm the challenge response on whichever object was passed.
+
+        A ``Request`` replies; a B2BUA ``Call`` has no ``reply()`` — its
+        deferred reject is what the dispatcher turns into the 401/407 on the
+        A-leg, so the caller never reaches a B-leg.
+        """
+        reply = getattr(target, "reply", None)
+        if callable(reply):
+            reply(code, reason)
+            return
+        reject = getattr(target, "reject", None)
+        if callable(reject):
+            reject(code, reason)
+            return
+        raise TypeError(
+            "auth digest methods take a Request (@proxy.on_request) or a Call "
+            "(@b2bua.on_invite)"
+        )
+
+    def require_www_digest(self, target: Any, realm: Optional[str] = None) -> bool:
         """Challenge with 401 WWW-Authenticate, or verify existing credentials.
 
-        If credentials are valid: sets ``request.auth_user``, returns ``True``.
-        Otherwise: sends 401 response, returns ``False``.
+        If credentials are valid: sets ``target.auth_user``, returns ``True``.
+        Otherwise: arms a 401 response, returns ``False``.
 
         Args:
-            request: The SIP request.
+            target: The SIP ``Request`` (``@proxy.on_request``) or B2BUA
+                ``Call`` (``@b2bua.on_invite``).
             realm: Auth realm (e.g. ``"example.com"``).
 
         Returns:
@@ -1582,42 +1604,50 @@ class MockAuth:
         """
         if self._allow:
             # Derive auth_user from From URI when auto-allowing.
-            user = getattr(request.from_uri, "user", None) if request.from_uri else None
-            request.auth_user = user or "mock_user"
+            user = getattr(target.from_uri, "user", None) if target.from_uri else None
+            target.auth_user = user or "mock_user"
             return True
-        # Check if request has Authorization header
-        auth_header = request.get_header("Authorization")
+        # Check if the message carries an Authorization header
+        auth_header = target.get_header("Authorization")
         if auth_header and self._check_auth(auth_header, realm):
-            request.auth_user = self._extract_username(auth_header)
+            target.auth_user = self._extract_username(auth_header)
             return True
-        request.reply(401, "Unauthorized")
+        self._challenge(target, 401, "Unauthorized")
         return False
 
-    def require_proxy_digest(self, request: Any,
+    def require_proxy_digest(self, target: Any,
                              realm: Optional[str] = None) -> bool:
         """Challenge with 407 Proxy-Authenticate.
 
-        Same as :meth:`require_www_digest` but uses 407.
+        Same as :meth:`require_www_digest` but uses 407.  This is the challenge
+        an INVITE normally gets, including from a B2BUA authenticating its own
+        A-leg::
+
+            @b2bua.on_invite
+            def new_call(call):
+                if not auth.require_proxy_digest(call, realm="example.com"):
+                    return          # 407 armed; siphon answers the A-leg
+                call.dial(call.ruri)
 
         Args:
-            request: The SIP request.
+            target: The SIP ``Request`` or B2BUA ``Call``.
             realm: Auth realm.
         """
         if self._allow:
-            user = getattr(request.from_uri, "user", None) if request.from_uri else None
-            request.auth_user = user or "mock_user"
+            user = getattr(target.from_uri, "user", None) if target.from_uri else None
+            target.auth_user = user or "mock_user"
             return True
-        auth_header = request.get_header("Proxy-Authorization")
+        auth_header = target.get_header("Proxy-Authorization")
         if auth_header and self._check_auth(auth_header, realm):
-            request.auth_user = self._extract_username(auth_header)
+            target.auth_user = self._extract_username(auth_header)
             return True
-        request.reply(407, "Proxy Authentication Required")
+        self._challenge(target, 407, "Proxy Authentication Required")
         return False
 
-    def require_digest(self, request: Any,
+    def require_digest(self, target: Any,
                        realm: Optional[str] = None) -> bool:
         """Convenience alias for :meth:`require_www_digest`."""
-        return self.require_www_digest(request, realm=realm)
+        return self.require_www_digest(target, realm=realm)
 
     def require_ims_digest(self, request: Any,
                           realm: Optional[str] = None) -> bool:
@@ -1626,9 +1656,15 @@ class MockAuth:
         Sends a Multimedia-Auth-Request to the HSS and uses the returned
         authentication vector to challenge or verify the UE.
 
+        Takes a ``Request`` only — unlike :meth:`require_www_digest` /
+        :meth:`require_proxy_digest`, IMS and AKA digest are REGISTER-time
+        procedures and REGISTER never reaches the B2BUA path, so the engine
+        does not accept a ``Call`` here either.
+
         Returns:
             ``True`` if credentials are valid, ``False`` if a 401 challenge was sent.
         """
+        self._reject_call_target(request, "require_ims_digest")
         return self.require_www_digest(request, realm=realm)
 
     def require_aka_digest(self, request: Any,
@@ -1646,21 +1682,47 @@ class MockAuth:
                 log.info("sent 401 AKA challenge")
                 return
 
+        Takes a ``Request`` only, for the same reason as
+        :meth:`require_ims_digest`.
+
         Returns:
             ``True`` if credentials are valid, ``False`` if a 401 challenge was sent.
         """
+        self._reject_call_target(request, "require_aka_digest")
         return self.require_www_digest(request, realm=realm)
 
-    def verify_digest(self, request: Any,
+    @staticmethod
+    def _reject_call_target(target: Any, method: str) -> None:
+        """Raise if a B2BUA ``Call`` is passed to a REGISTER-only helper.
+
+        Mirrors the engine, which types these two on ``Request`` — without this
+        the mock would silently accept a ``Call`` and a script that passes one
+        would only fail in production.
+        """
+        if hasattr(target, "dial") and not hasattr(target, "reply"):
+            raise TypeError(
+                f"auth.{method}() takes a Request; IMS/AKA digest is a "
+                "REGISTER-time procedure and REGISTER never reaches the B2BUA "
+                "path"
+            )
+
+    def verify_digest(self, target: Any,
                       realm: Optional[str] = None) -> bool:
         """Verify credentials without sending a challenge.
+
+        Args:
+            target: The SIP ``Request`` or B2BUA ``Call``.
+            realm: Auth realm.
 
         Returns:
             ``True`` if valid credentials are present.
         """
         if self._allow:
             return True
-        auth_header = request.get_header("Authorization")
+        auth_header = (
+            target.get_header("Authorization")
+            or target.get_header("Proxy-Authorization")
+        )
         return auth_header is not None and self._check_auth(auth_header, realm)
 
     def _check_auth(self, auth_header: str, realm: Optional[str]) -> bool:
@@ -1668,13 +1730,23 @@ class MockAuth:
         return self._allow
 
     def _extract_username(self, auth_header: str) -> str:
-        """Extract username from Authorization header."""
-        # Parse: Digest username="alice", ...
-        for part in auth_header.split(","):
-            part = part.strip()
-            if part.lower().startswith("username="):
-                return part.split("=", 1)[1].strip('"')
-        return "unknown"
+        """Extract username from an Authorization/Proxy-Authorization header.
+
+        Mirrors the engine's ``extract_username``: scan for ``username=``
+        anywhere in the value, case-insensitively.  Splitting on ``,`` and
+        matching the start of each part misses the very common
+        ``Digest username="alice", realm=…`` because the first part carries the
+        ``Digest`` scheme token.
+        """
+        lowered = auth_header.lower()
+        position = lowered.find("username=")
+        if position < 0:
+            return "unknown"
+        rest = auth_header[position + len("username="):]
+        if rest.startswith('"'):
+            end = rest.find('"', 1)
+            return rest[1:end] if end > 0 else "unknown"
+        return rest.split(",", 1)[0].strip()
 
 
 # ---------------------------------------------------------------------------

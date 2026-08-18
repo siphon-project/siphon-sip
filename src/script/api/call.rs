@@ -331,6 +331,12 @@ pub struct PyCall {
     /// `route_sequence.active`. Read by scripts via `call.active_route` to stamp
     /// the winning carrier onto a CDR / charging record.
     active_route: Option<crate::lcr::Route>,
+    /// Username verified by `auth.require_proxy_digest(call, …)` /
+    /// `require_www_digest` on the A-leg INVITE. `None` until a challenge is
+    /// answered correctly. The B2BUA twin of `request.auth_user`; the
+    /// dispatcher stamps it onto the call's CDR session after `on_invite`
+    /// returns.
+    auth_user: Option<String>,
 }
 
 /// Per-call header policy input from `call.dial(header_policy=…, copy=…, strip=…, translate=…)`.
@@ -422,7 +428,33 @@ impl PyCall {
             header_policy_input: None,
             auth_passthrough_flag: false,
             active_route: None,
+            auth_user: None,
         }
+    }
+
+    /// Source IP of the A-leg caller (Rust-side accessor — the `source_ip`
+    /// getter lives in `#[pymethods]`). Used by the digest helpers for
+    /// auto-ban bookkeeping.
+    pub fn source_ip_str(&self) -> &str {
+        &self.source_ip
+    }
+
+    /// Transport the A-leg INVITE arrived on (Rust-side accessor). Used by the
+    /// digest helpers to decide whether a bad-credentials attempt is a strong
+    /// auto-ban signal (it is not over spoofable UDP).
+    pub fn transport_str(&self) -> &str {
+        &self.transport_name
+    }
+
+    /// Record the username verified by `auth.require_*_digest(call, …)`.
+    pub fn set_auth_user(&mut self, username: String) {
+        self.auth_user = Some(username);
+    }
+
+    /// The verified username, if the A-leg answered a digest challenge
+    /// (Rust-side accessor behind the `auth_user` getter).
+    pub fn get_auth_user(&self) -> Option<&str> {
+        self.auth_user.as_deref()
     }
 
     /// Attach the winning carrier route (from the call actor's
@@ -924,6 +956,18 @@ impl PyCall {
     #[getter]
     fn source_ip(&self) -> &str {
         &self.source_ip
+    }
+
+    /// Username the A-leg authenticated as, or `None` if it was never
+    /// challenged (the B2BUA twin of `request.auth_user`).
+    ///
+    /// Set by `auth.require_proxy_digest(call, realm)` /
+    /// `auth.require_www_digest(call, realm)` in `@b2bua.on_invite` once the
+    /// caller answers the challenge correctly. Carried onto the call's CDR as
+    /// `auth_user`.
+    #[getter]
+    fn auth_user(&self) -> Option<&str> {
+        self.auth_user.as_deref()
     }
 
     /// True when the A-leg source IP is a member of the resolved addresses
@@ -2086,6 +2130,42 @@ mod tests {
         assert_eq!(call.id, "test-id");
         assert_eq!(call.state, "calling");
         assert_eq!(call.action(), &CallAction::None);
+    }
+
+    #[test]
+    fn call_auth_user_starts_unset_and_records_the_verified_username() {
+        // The B2BUA twin of request.auth_user, set by
+        // auth.require_proxy_digest(call, …) once the caller answers a
+        // challenge, and read back by the dispatcher for the call's CDR.
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new(
+            "test-id".to_string(),
+            message,
+            "10.0.0.1".to_string(),
+            "udp".to_string(),
+        );
+        assert_eq!(call.get_auth_user(), None);
+        assert_eq!(call.auth_user(), None);
+
+        call.set_auth_user("alice".to_string());
+        assert_eq!(call.get_auth_user(), Some("alice"));
+        assert_eq!(call.auth_user(), Some("alice"));
+    }
+
+    #[test]
+    fn call_exposes_source_ip_and_transport_to_rust_callers() {
+        // The digest helpers read both off the Call for auto-ban bookkeeping
+        // (a bad-credentials attempt is only a strong signal over a
+        // handshake-validated transport).
+        let message = Arc::new(Mutex::new(make_invite()));
+        let call = PyCall::new(
+            "test-id".to_string(),
+            message,
+            "203.0.113.9".to_string(),
+            "tls".to_string(),
+        );
+        assert_eq!(call.source_ip_str(), "203.0.113.9");
+        assert_eq!(call.transport_str(), "tls");
     }
 
     #[test]
