@@ -6,6 +6,30 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **Cold transfer off a call siphon answered itself.** A voice-AI or IVR call has
+  no B leg, so the only way to hand the caller on is an in-dialog REFER on the A
+  dialog via the imperative `b2bua.refer(call_id, target)` — `call.refer()` is a
+  no-op from `@b2bua.on_invite` (the dialog is not confirmed yet) and
+  `@b2bua.on_answer` never fires without a B leg. Now covered end to end by a
+  functional scenario, wired into `examples/voice_ai_b2bua.py` as "press 0 for an
+  agent", and documented in `docs/cookbook/voice-ai.md`.
+
+### Fixed
+- **A challenged REFER was never retried, and its response was dropped
+  entirely.** A REFER siphon originates on one of its own legs is allocated a
+  fresh Via branch that belongs to no leg, and responses are matched to a call by
+  branch — so the 202 was ignored and a 401/407 equally so. A carrier that
+  challenges an in-dialog REFER therefore
+  killed the transfer silently, with the script still waiting on sipfrag NOTIFYs
+  that could never arrive. Such a REFER is now tracked so its response can be
+  matched, and a challenge is retried with the credentials from
+  `call.set_credentials()` — a new transaction on the same dialog (RFC 3261
+  §22.2), capped so a trunk that always challenges cannot loop, and with no ACK
+  (REFER is a non-INVITE transaction; §17.1.2). A REFER that cannot be retried
+  now clears its subscription and logs at WARN instead of leaving the transfer
+  pending forever.
+
 ### Fixed
 - **A relative `script.path` now resolves against the config file's directory,
   so siphon starts under a supervisor.** It was resolved against the process

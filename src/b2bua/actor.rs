@@ -561,6 +561,37 @@ pub struct LegRegistry {
     by_call_id: DashMap<String, String>,
     /// Via branch → internal call ID (for matching responses).
     by_branch: DashMap<String, String>,
+    /// Via branch → the siphon-originated REFER that branch belongs to.
+    ///
+    /// Kept apart from [`Self::by_branch`], which maps a branch to a *leg* whose
+    /// responses run the INVITE/B-leg machinery in `handle_b2bua_response`. An
+    /// in-dialog REFER siphon originates is a non-INVITE transaction on an
+    /// existing leg, so it needs the call for a credentialed retry but none of
+    /// that machinery. Registering it in `by_branch` would send its 401 down the
+    /// B-leg path, which ACKs (wrong for a non-INVITE, RFC 3261 §17.1.2) and
+    /// reasons about legs that do not exist on a single-leg call.
+    originated_refers: DashMap<String, OriginatedRefer>,
+}
+
+/// A REFER siphon sent on one of its own legs, awaiting a response.
+///
+/// Tracked so a 401/407 can be retried with the call's credentials
+/// (`call.set_credentials()`); without this the challenge matches no branch at
+/// all and the transfer fails silently.
+#[derive(Debug, Clone)]
+pub struct OriginatedRefer {
+    /// Internal call id the REFER was sent on.
+    pub call_id: String,
+    /// Which leg it went out on (`true` = A-leg, the connected caller).
+    pub on_a_leg: bool,
+    /// Request-URI the REFER was addressed to — the digest `uri` parameter of
+    /// any credentialed retry must match it (RFC 7616 §3.4.6).
+    pub target_uri: String,
+    /// The `Refer-To` this REFER carried, so a retry reproduces it exactly.
+    pub refer_to: crate::sip::headers::refer::ReferTo,
+    /// Credentialed retries already sent for this REFER, capped so a peer that
+    /// challenges unconditionally cannot drive an unbounded loop.
+    pub auth_retries: u32,
 }
 
 impl LegRegistry {
@@ -568,7 +599,30 @@ impl LegRegistry {
         Self {
             by_call_id: DashMap::new(),
             by_branch: DashMap::new(),
+            originated_refers: DashMap::new(),
         }
+    }
+
+    /// Record a siphon-originated REFER so its response can be matched.
+    pub fn register_originated_refer(&self, branch: &str, refer: OriginatedRefer) {
+        self.originated_refers.insert(branch.to_string(), refer);
+    }
+
+    /// Look up (without removing) the originated REFER a branch belongs to.
+    pub fn lookup_originated_refer(&self, branch: &str) -> Option<OriginatedRefer> {
+        self.originated_refers.get(branch).map(|entry| entry.clone())
+    }
+
+    /// Remove and return the originated REFER a branch belongs to — the final
+    /// response for a non-INVITE transaction ends it, so the entry goes with it.
+    pub fn take_originated_refer(&self, branch: &str) -> Option<OriginatedRefer> {
+        self.originated_refers.remove(branch).map(|(_, refer)| refer)
+    }
+
+    /// Drop every originated REFER belonging to a call.
+    pub fn clear_originated_refers(&self, internal_id: &str) {
+        self.originated_refers
+            .retain(|_, refer| refer.call_id.as_str() != internal_id);
     }
 
     /// Register a SIP Call-ID → internal call ID mapping.
@@ -607,6 +661,11 @@ impl LegRegistry {
         self.by_call_id.retain(|_, v| v.as_str() != internal_id);
         // Remove all branch mappings for this call
         self.by_branch.retain(|_, v| v.as_str() != internal_id);
+        // ...including any REFER siphon originated on it and is still awaiting a
+        // response. A call that is gone cannot be transferred, and leaving the
+        // entry would leak one per abandoned transfer.
+        self.originated_refers
+            .retain(|_, refer| refer.call_id.as_str() != internal_id);
     }
 
     /// Number of registered calls (unique internal IDs in Call-ID map).
@@ -1700,6 +1759,26 @@ impl CallActorStore {
         self.registry.lookup_branch(branch)
     }
 
+    /// Record a siphon-originated REFER awaiting its response.
+    pub fn register_originated_refer(&self, branch: &str, refer: OriginatedRefer) {
+        self.registry.register_originated_refer(branch, refer);
+    }
+
+    /// Peek at the originated REFER a branch belongs to.
+    pub fn lookup_originated_refer(&self, branch: &str) -> Option<OriginatedRefer> {
+        self.registry.lookup_originated_refer(branch)
+    }
+
+    /// Take the originated REFER a branch belongs to, ending its transaction.
+    pub fn take_originated_refer(&self, branch: &str) -> Option<OriginatedRefer> {
+        self.registry.take_originated_refer(branch)
+    }
+
+    /// Drop any originated REFER still awaiting a response on this call.
+    pub fn clear_originated_refers(&self, call_id: &str) {
+        self.registry.clear_originated_refers(call_id);
+    }
+
     /// Get a call by internal ID.
     pub fn get_call(&self, call_id: &str) -> Option<dashmap::mapref::one::Ref<'_, String, CallActor>> {
         self.calls.get(call_id)
@@ -2064,6 +2143,10 @@ impl CallActorStore {
         if let Some((_, call)) = self.calls.remove(call_id) {
             // Shutdown any active B-leg actors
             call.shutdown_actors();
+            // Any REFER siphon originated on this call is now moot — the call it
+            // would transfer is gone. Cleared here rather than left to age out,
+            // so an abandoned transfer does not leak an entry per call.
+            self.registry.clear_originated_refers(call_id);
             // Clean up A-leg registry entries
             self.registry.remove_call_id(&call.a_leg.dialog.call_id);
             self.registry.remove_branch(&call.a_leg.branch);
@@ -3448,6 +3531,59 @@ mod tests {
     }
 
     // --- LegRegistry tests ---
+
+    fn originated_refer(call_id: &str) -> OriginatedRefer {
+        OriginatedRefer {
+            call_id: call_id.to_string(),
+            on_a_leg: true,
+            target_uri: "sip:caller@198.51.100.10:5060".to_string(),
+            refer_to: crate::sip::headers::refer::ReferTo {
+                uri: "sip:agent@pbx.example.com".to_string(),
+                replaces: None,
+            },
+            auth_retries: 0,
+        }
+    }
+
+    #[test]
+    fn originated_refer_is_matched_by_branch_and_taken_once() {
+        // A REFER siphon originates carries a branch belonging to no leg, so it
+        // is tracked separately; its final response ends the transaction and
+        // must consume the entry (a non-INVITE transaction has exactly one).
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        store.register_originated_refer("z9hG4bK-refer-1", originated_refer(&call_id));
+
+        assert!(store.lookup_originated_refer("z9hG4bK-refer-1").is_some());
+        let taken = store.take_originated_refer("z9hG4bK-refer-1").unwrap();
+        assert_eq!(taken.call_id, call_id);
+        assert!(taken.on_a_leg);
+        assert_eq!(taken.refer_to.uri, "sip:agent@pbx.example.com");
+        // Gone: a retransmitted final must not drive a second retry.
+        assert!(store.take_originated_refer("z9hG4bK-refer-1").is_none());
+    }
+
+    #[test]
+    fn originated_refer_does_not_leak_into_the_leg_branch_index() {
+        // Registering it in `by_branch` would send the REFER's 401 down the
+        // INVITE/B-leg response path, which ACKs a non-2xx — wrong for a
+        // non-INVITE transaction (RFC 3261 §17.1.2).
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        store.register_originated_refer("z9hG4bK-refer-2", originated_refer(&call_id));
+        assert!(store.call_id_for_branch("z9hG4bK-refer-2").is_none());
+    }
+
+    #[test]
+    fn originated_refer_is_dropped_when_its_call_goes_away() {
+        // A call that is gone cannot be transferred; leaving the entry would
+        // leak one per abandoned transfer.
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        store.register_originated_refer("z9hG4bK-refer-3", originated_refer(&call_id));
+        store.remove_call(&call_id);
+        assert!(store.lookup_originated_refer("z9hG4bK-refer-3").is_none());
+    }
 
     #[test]
     fn registry_basic() {

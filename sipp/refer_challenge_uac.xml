@@ -1,0 +1,171 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  A challenged cold transfer — the case where the trunk demands digest:
+  INVITE → 200 → ACK → [REFER] → 407 → [REFER w/ Proxy-Authorization] → 202
+         → [NOTIFY] → 200 → BYE → 200
+
+  A carrier that challenges an in-dialog REFER gets a credentialed retry from
+  siphon (call.set_credentials). Before that path existed the challenge matched
+  no branch at all — siphon had allocated a fresh branch for the REFER that
+  belonged to no leg — so the response was dropped and the transfer failed in
+  silence, with the script still waiting on sipfrag NOTIFYs.
+
+  The retry must also be a NEW transaction on the same dialog (RFC 3261 §22.2),
+  so its CSeq is asserted to differ from the challenged one.
+-->
+<scenario name="Challenged cold transfer UAC">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:ai@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550001@carrier.example>;tag=[pid]SIPpTag00[call_number]
+To: <sip:ai@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/refer-challenge-uac
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0
+a=rtpmap:0 PCMU/8000
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="200" rtd="true" crlf="true" rrs="true" />
+
+  <send>
+    <![CDATA[
+ACK [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550001@carrier.example>;tag=[pid]SIPpTag00[call_number]
+To: <sip:ai@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- First REFER: capture its CSeq so the retry can be shown to be a new
+       transaction rather than a re-send of the same one. -->
+  <recv request="REFER" crlf="true">
+    <action>
+      <!-- siphon's own CSeq space on this leg starts at 1, so the first REFER
+           is CSeq 1 and the credentialed retry must be 2 (RFC 3261 §22.2 — a
+           retry is a new transaction, not a re-send). -->
+      <ereg regexp="CSeq:[ ]*1 REFER"
+            search_in="msg"
+            check_it="true"
+            assign_to="first_refer_cseq" />
+      <log message="REFER #1 [$first_refer_cseq], challenging with 407" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 407 Proxy Authentication Required
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Proxy-Authenticate: Digest realm="carrier.example", nonce="4f4e2b3a9c1d5e6f", algorithm=MD5, qop="auth"
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- The credentialed retry. Assert it carries Proxy-Authorization for the
+       realm we challenged with, the username the script configured, and a CSeq
+       that is not the one we just rejected. -->
+  <recv request="REFER" crlf="true">
+    <action>
+      <ereg regexp="Proxy-Authorization:[^\r\n]*realm=&quot;carrier\.example&quot;"
+            search_in="msg"
+            check_it="true"
+            assign_to="retry_realm" />
+      <log message="retry carries Proxy-Authorization: [$retry_realm]" />
+      <ereg regexp="Proxy-Authorization:[^\r\n]*username=&quot;siphon&quot;"
+            search_in="msg"
+            check_it="true"
+            assign_to="retry_user" />
+      <log message="retry username ok: [$retry_user]" />
+      <ereg regexp="Refer-To:[^\r\n]*sip:agent@pbx\.example\.com"
+            search_in="msg"
+            check_it="true"
+            assign_to="retry_refer_to" />
+      <log message="retry preserved Refer-To: [$retry_refer_to]" />
+      <ereg regexp="CSeq:[ ]*2 REFER"
+            search_in="msg"
+            check_it="true"
+            assign_to="retry_cseq" />
+      <log message="retry is a new transaction: [$retry_cseq]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 202 Accepted
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <send retrans="500">
+    <![CDATA[
+NOTIFY [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550001@carrier.example>;tag=[pid]SIPpTag00[call_number]
+To: <sip:ai@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 NOTIFY
+[routes]
+Event: refer
+Subscription-State: terminated;reason=noresource
+Max-Forwards: 70
+Content-Type: message/sipfrag;version=2.0
+Content-Length: [len]
+
+SIP/2.0 200 OK
+]]>
+  </send>
+
+  <recv response="200" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550001@carrier.example>;tag=[pid]SIPpTag00[call_number]
+To: <sip:ai@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 3 BYE
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+</scenario>

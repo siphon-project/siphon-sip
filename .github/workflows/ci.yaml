@@ -697,6 +697,47 @@ jobs:
             siphon-voice-ai.log
             mock-siphon-rtp.log
 
+  # ── Cold transfer off a single-leg answered call ───────────────────────
+  sipp-refer-single-leg:
+    runs-on: ubuntu-latest
+    needs: rust-tests
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build siphon-refer image
+        run: docker compose -f sipp/docker-compose.yaml --profile refer-single-leg build siphon-refer
+
+      - name: Start mock siphon-rtp + siphon-refer
+        run: docker compose -f sipp/docker-compose.yaml --profile refer-single-leg up -d --wait mock-siphon-rtp-refer siphon-refer
+
+      - name: Cold transfer (answer_local → in-dialog REFER → 202 → NOTIFY)
+        run: docker compose -f sipp/docker-compose.yaml --profile refer-single-leg up --abort-on-container-exit --exit-code-from sipp-refer-single-leg-uac sipp-refer-single-leg-uac
+
+      - name: Challenged REFER (407 → credentialed retry)
+        # The retry only exists because a REFER siphon originates carries a
+        # branch belonging to no leg; without tracking it, the 407 matched
+        # nothing and the transfer failed silently.
+        run: docker compose -f sipp/docker-compose.yaml --profile refer-single-leg up --abort-on-container-exit --exit-code-from sipp-refer-challenge-uac sipp-refer-challenge-uac
+
+      - name: Collect logs
+        if: always()
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs siphon-refer > siphon-refer.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs mock-siphon-rtp-refer > mock-siphon-rtp-refer.log 2>&1 || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile refer-single-leg down --remove-orphans
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-refer-single-leg-logs
+          path: |
+            siphon-refer.log
+            mock-siphon-rtp-refer.log
+
   # ── Fuzz testing (nightly) ─────────────────────────────────────────────
   fuzz:
     runs-on: ubuntu-latest
