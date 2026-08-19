@@ -34,7 +34,7 @@ use crate::diameter::peer::DiameterPeer;
 use crate::diameter::rf::{
     self, termination_cause, AccountingAnswer, AccountingParams, AccountingRecordType,
 };
-use crate::diameter::ro::{ImsChargingData, NodeFunctionality, NodeRole};
+use crate::diameter::ro::{ImsChargingData, NodeFunctionality, NodeRole, SubscriberId};
 use crate::diameter::DiameterManager;
 
 /// State held per active accounting session.
@@ -161,6 +161,38 @@ impl RfChargingService {
         won
     }
 
+    /// Release an accounting session whose dialog the caller has given up on,
+    /// without emitting a wire ACR-STOP.
+    ///
+    /// Used by the dispatcher's orphan sweep: dropping the `rf_sessions` entry
+    /// alone leaves the session's ACR-INTERIM timer running and its
+    /// `siphon_rf_sessions` slot held until the charging layer's own 24h
+    /// backstop notices, so an abandoned record keeps billing INTERIMs against
+    /// a call nobody is tracking any more. No STOP is sent because there is no
+    /// trustworthy stop time to report — the CDF's own partial-record handling
+    /// (TS 32.299 §6.5) covers the gap better than an invented one.
+    pub fn release_abandoned(&self, session: &RfChargingSession) {
+        if self.claim_stop(session) {
+            // `claim_stop` is what actually stops the timer: its loop tests the
+            // `stopped` flag at the top of every tick and breaks. Aborting the
+            // handle just saves the wait, so a contended lock (this runs from a
+            // sync sweep) is not worth blocking for.
+            let handle = session
+                .inner
+                .interim_handle
+                .try_lock()
+                .ok()
+                .and_then(|mut handle| handle.take());
+            if let Some(handle) = handle {
+                handle.abort();
+            }
+            warn!(
+                session_id = %session.inner.session_id,
+                "rf: accounting session abandoned by its dialog, released without STOP"
+            );
+        }
+    }
+
     pub fn node_functionality(&self) -> Option<NodeFunctionality> {
         self.node_functionality
     }
@@ -207,8 +239,10 @@ impl RfChargingService {
             return None;
         }
         let peer = self.pick_peer()?;
+        let subscription_ids = subscription_ids_for(&ims_data);
         let mut params = AccountingParams::new(AccountingRecordType::StartRecord);
         params.user_name = user_name.as_deref();
+        params.subscription_ids = &subscription_ids;
         params.ims_data = Some(&ims_data);
         params.event_timestamp = Some(SystemTime::now());
         params.service_context_id = Some(self.config.service_context_id.as_str());
@@ -275,8 +309,10 @@ impl RfChargingService {
             return None;
         }
         let peer = self.pick_peer()?;
+        let subscription_ids = subscription_ids_for(&ims_data);
         let mut params = AccountingParams::new(AccountingRecordType::EventRecord);
         params.user_name = user_name.as_deref();
+        params.subscription_ids = &subscription_ids;
         params.ims_data = Some(&ims_data);
         params.event_timestamp = Some(SystemTime::now());
         params.service_context_id = Some(self.config.service_context_id.as_str());
@@ -319,10 +355,12 @@ impl RfChargingService {
             ims_data.node_functionality = self.node_functionality;
         }
         let record_number = session.next_record_number();
+        let subscription_ids = subscription_ids_for(&ims_data);
         let mut params = AccountingParams::new(AccountingRecordType::InterimRecord);
         params.session_id = Some(&session.inner.session_id);
         params.record_number = record_number;
         params.user_name = user_name.as_deref();
+        params.subscription_ids = &subscription_ids;
         params.ims_data = Some(&ims_data);
         params.event_timestamp = Some(SystemTime::now());
         params.service_context_id = Some(self.config.service_context_id.as_str());
@@ -378,11 +416,13 @@ impl RfChargingService {
             ims_data.node_functionality = self.node_functionality;
         }
         let record_number = session.next_record_number();
+        let subscription_ids = subscription_ids_for(&ims_data);
         let mut params = AccountingParams::new(AccountingRecordType::StopRecord);
         params.session_id = Some(&session.inner.session_id);
         params.record_number = record_number;
         params.termination_cause = Some(termination_cause_value);
         params.user_name = user_name.as_deref();
+        params.subscription_ids = &subscription_ids;
         params.ims_data = Some(&ims_data);
         params.event_timestamp = Some(SystemTime::now());
         params.service_context_id = Some(self.config.service_context_id.as_str());
@@ -680,6 +720,33 @@ pub fn lookup_rf_for_dialog(dialog_key: &str) -> Option<(String, Option<u32>)> {
     RF_LOOKUP.get().and_then(|f| f(dialog_key))
 }
 
+/// Identities of the party this record is *about*, per TS 32.260 §5.1: the
+/// calling party on an originating record, the called party on a terminating
+/// one.  A B2BUA record covers a call the node itself controls, so it keeps
+/// the calling party.
+///
+/// This is what `User-Name` and `Subscription-Id` must carry — a terminating
+/// record that names the caller identifies the wrong subscriber, and the CDR
+/// gets billed to whoever placed the call rather than whoever received it.
+pub fn served_party_identities(ims_data: &ImsChargingData) -> Vec<String> {
+    match ims_data.role_of_node {
+        Some(NodeRole::TerminatingRole) => {
+            ims_data.called_party.iter().cloned().collect()
+        }
+        _ => ims_data.calling_party.clone(),
+    }
+}
+
+/// `Subscription-Id` AVPs for the served party, typed by URI scheme
+/// (RFC 4006 §8.47).  Empty when the record carries no identity for its own
+/// role — better an absent AVP than one naming the other party.
+pub fn subscription_ids_for(ims_data: &ImsChargingData) -> Vec<SubscriberId> {
+    served_party_identities(ims_data)
+        .iter()
+        .map(|identity| SubscriberId::from_identity(identity))
+        .collect()
+}
+
 /// Convenience: derive the [`Termination-Cause`](termination_cause)
 /// value from a SIP teardown reason string ("bye" / "session_timer" /
 /// "admin" / "error").  Falls back to `DIAMETER_LOGOUT(1)`.
@@ -689,6 +756,102 @@ pub fn termination_cause_for_reason(reason: &str) -> u32 {
         "admin" | "administrative" | "shutdown" => termination_cause::DIAMETER_ADMINISTRATIVE,
         "error" | "transport" => termination_cause::DIAMETER_LINK_BROKEN,
         _ => termination_cause::DIAMETER_LOGOUT,
+    }
+}
+
+/// The two instants the `Time-Stamps` grouped AVP carries (TS 32.299
+/// §7.2.183): when the trigger SIP request was received, and when its
+/// response was.  An ACR-START is emitted on the **200 OK** (TS 32.260
+/// §5.2.2), so both instants are in the past by the time the record is built
+/// and neither may be sampled at build time — carrying them explicitly is what
+/// lets a CDF derive ring time (`response - request`) and answered duration
+/// (`STOP.Event-Timestamp - START.Event-Timestamp`).
+#[derive(Debug, Clone, Copy)]
+pub struct SipTimestamps {
+    /// `SIP-Request-Timestamp` — when the trigger request (the INVITE for a
+    /// session record) reached this node.
+    pub request: SystemTime,
+    /// `SIP-Response-Timestamp` — when its final response did.  `None` for a
+    /// record built before any response exists.
+    pub response: Option<SystemTime>,
+}
+
+impl SipTimestamps {
+    /// Recover the wall-clock instant a request arrived from the monotonic
+    /// `Instant` the session recorded at the time, anchored on the current
+    /// wall clock.
+    ///
+    /// Deriving rather than storing a `SystemTime` at request time is
+    /// deliberate: if the wall clock steps between the INVITE and the answer,
+    /// a stored pair would report a ring time that never happened (or a
+    /// negative one).  Anchoring both ends on one `now` keeps the interval
+    /// equal to the monotonic elapsed time whatever the clock did.
+    pub fn from_request_instant(request_received: std::time::Instant) -> Self {
+        let now = SystemTime::now();
+        Self {
+            request: now
+                .checked_sub(request_received.elapsed())
+                .unwrap_or(now),
+            response: Some(now),
+        }
+    }
+
+    /// Both instants at `now` — for one-shot records (REGISTER, MESSAGE)
+    /// where the request and its disposition are the same event.
+    pub fn now() -> Self {
+        let now = SystemTime::now();
+        Self {
+            request: now,
+            response: None,
+        }
+    }
+}
+
+/// Split a `P-Asserted-Identity` header value into its individual identities.
+///
+/// RFC 3325 §9.1 allows up to two PAI values on one header line, and IMS
+/// deployments routinely assert more (`sip:` IMPU, `tel:` alias, IMSI-derived
+/// IMPU).  Splitting has to respect angle brackets and quoted display names,
+/// because both may legally contain a comma:
+///
+/// ```text
+/// P-Asserted-Identity: "Doe, John" <sip:john@example.net>, <tel:+31612345678>
+/// ```
+///
+/// Each identity is reduced to its bare URI (display name, angle brackets and
+/// header parameters removed).
+pub fn asserted_identities(header_value: &str) -> Vec<String> {
+    let mut identities = Vec::new();
+    let mut start = 0usize;
+    let mut in_angle = false;
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for (index, byte) in header_value.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' if in_quotes => escaped = true,
+            b'"' => in_quotes = !in_quotes,
+            b'<' if !in_quotes => in_angle = true,
+            b'>' if !in_quotes => in_angle = false,
+            b',' if !in_quotes && !in_angle => {
+                push_identity(&mut identities, &header_value[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    push_identity(&mut identities, &header_value[start..]);
+    identities
+}
+
+fn push_identity(into: &mut Vec<String>, raw: &str) {
+    let uri = extract_uri(raw);
+    if !uri.is_empty() {
+        into.push(uri.to_string());
     }
 }
 
@@ -704,21 +867,39 @@ pub fn termination_cause_for_reason(reason: &str) -> u32 {
 ///
 /// `node_functionality` comes from `RfConfig.node_functionality` so the
 /// caller can configure once per deployment role (S-CSCF / P-CSCF / AS).
+///
+/// `timestamps` carries the two instants the CDF needs to separate ring time
+/// from answered time (TS 32.299 §7.2.183).  They are supplied by the caller
+/// rather than sampled here: the ACR is built at the *answer*, so a
+/// `SystemTime::now()` taken at build time would stamp the answer instant into
+/// `SIP-Request-Timestamp` and make every record look like it was triggered by
+/// the INVITE.
 pub fn ims_data_from_request<F>(
     message: &crate::sip::SipMessage,
     node_functionality: Option<NodeFunctionality>,
     is_local_uri: F,
+    timestamps: SipTimestamps,
 ) -> ImsChargingData
 where
     F: Fn(&str) -> bool,
 {
     use crate::sip::headers::charging::{ChargingVector, ServedUser};
 
+    // P-Asserted-Identity is a comma-separated list (RFC 3325 §9.1): a
+    // subscriber commonly asserts a `sip:` IMPU plus its `tel:` alias, and
+    // TS 32.299 models that as a repeated Calling-Party-Address.
     let calling_party = message
         .headers
         .get("P-Asserted-Identity")
-        .map(|s| strip_uri_brackets(s).to_string())
-        .or_else(|| message.headers.get("From").map(|s| extract_uri(s).to_string()));
+        .map(|s| asserted_identities(s))
+        .filter(|list| !list.is_empty())
+        .or_else(|| {
+            message
+                .headers
+                .get("From")
+                .map(|s| vec![extract_uri(s).to_string()])
+        })
+        .unwrap_or_default();
     let called_party = message
         .headers
         .get("To")
@@ -773,8 +954,8 @@ where
         ims_charging_identifier: charging_vector.icid,
         cause_code: None,
         user_session_id,
-        request_timestamp: Some(SystemTime::now()),
-        response_timestamp: None,
+        request_timestamp: Some(timestamps.request),
+        response_timestamp: timestamps.response,
         application_provided_called_party_address: None,
         incoming_trunk_group_id: None,
         outgoing_trunk_group_id: None,
@@ -785,18 +966,22 @@ where
     }
 }
 
-fn strip_uri_brackets(s: &str) -> &str {
-    let trimmed = s.trim();
+/// Reduce one `name-addr` / `addr-spec` (RFC 3261 §20) to its bare URI.
+///
+/// Brackets are resolved before parameters are dropped.  Doing it the other
+/// way round truncates a bracketed URI that carries its own parameters
+/// (`<sip:+31612345678@ims.example.net;user=phone>` would keep an unbalanced
+/// `<sip:+31612345678@ims.example.net`), so inside-bracket content is taken
+/// verbatim — those parameters belong to the URI — and only an unbracketed
+/// addr-spec has its trailing header parameters stripped.
+fn extract_uri(name_addr: &str) -> &str {
+    let trimmed = name_addr.trim();
     if let (Some(open), Some(close)) = (trimmed.find('<'), trimmed.rfind('>')) {
         if open < close {
             return trimmed[open + 1..close].trim();
         }
     }
-    trimmed
-}
-
-fn extract_uri(name_addr: &str) -> &str {
-    strip_uri_brackets(name_addr.split(';').next().unwrap_or(name_addr))
+    trimmed.split(';').next().unwrap_or(trimmed).trim()
 }
 
 #[cfg(test)]
@@ -1014,7 +1199,7 @@ mod tests {
             "\r\n",
         );
         let msg = parse_test_sip(raw);
-        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |_| false);
+        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |_| false, SipTimestamps::now());
 
         assert_eq!(ims.ims_charging_identifier.as_deref(), Some("icid-test-001"));
         assert_eq!(ims.originating_ioi.as_deref(), Some("home1.net"));
@@ -1039,7 +1224,7 @@ mod tests {
             "\r\n",
         );
         let msg = parse_test_sip(raw);
-        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |_| false);
+        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |_| false, SipTimestamps::now());
         assert_eq!(ims.role_of_node, Some(NodeRole::TerminatingRole));
     }
 
@@ -1058,15 +1243,21 @@ mod tests {
         );
         let msg = parse_test_sip(raw);
         // Predicate: "home.example.com" caller is local → originating role
-        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |uri| {
-            uri.contains("home.example.com")
-        });
+        let ims = ims_data_from_request(
+            &msg,
+            Some(NodeFunctionality::SCscf),
+            |uri| uri.contains("home.example.com"),
+            SipTimestamps::now(),
+        );
         assert_eq!(ims.role_of_node, Some(NodeRole::OriginatingRole));
 
         // With opposite predicate → terminating
-        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |uri| {
-            uri.contains("other.example.com")
-        });
+        let ims = ims_data_from_request(
+            &msg,
+            Some(NodeFunctionality::SCscf),
+            |uri| uri.contains("other.example.com"),
+            SipTimestamps::now(),
+        );
         assert_eq!(ims.role_of_node, Some(NodeRole::TerminatingRole));
     }
 
@@ -1085,7 +1276,7 @@ mod tests {
             "\r\n",
         );
         let msg = parse_test_sip(raw);
-        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::PCscf), |_| true);
+        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::PCscf), |_| true, SipTimestamps::now());
         assert_eq!(ims.visited_network_id.as_deref(), Some("visited.example.com"));
     }
 
@@ -1103,8 +1294,8 @@ mod tests {
             "\r\n",
         );
         let msg = parse_test_sip(raw);
-        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |_| false);
-        assert_eq!(ims.calling_party.as_deref(), Some("sip:alice@example.com"));
+        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |_| false, SipTimestamps::now());
+        assert_eq!(ims.calling_party, vec!["sip:alice@example.com".to_string()]);
         assert_eq!(ims.called_party.as_deref(), Some("sip:bob@example.com"));
     }
 
@@ -1123,11 +1314,222 @@ mod tests {
             "\r\n",
         );
         let msg = parse_test_sip(raw);
-        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |_| false);
+        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |_| false, SipTimestamps::now());
         assert_eq!(
-            ims.calling_party.as_deref(),
-            Some("sip:alice@home.example.com"),
+            ims.calling_party,
+            vec!["sip:alice@home.example.com".to_string()],
             "P-Asserted-Identity should override From for Calling-Party-Address"
+        );
+    }
+
+
+    // ── P-Asserted-Identity list handling (RFC 3325 §9.1) ───────────────
+
+    /// The exact header shape an IMS core asserts for a subscriber with a
+    /// short code, a tel alias and an IMSI-derived IMPU.  Collapsing it into a
+    /// single value produced an unbalanced string ("…org>, <tel:3001>, <sip:…")
+    /// that no consumer can split back apart safely.
+    #[test]
+    fn asserted_identities_splits_a_multi_valued_pai() {
+        let header = "<sip:3001@ims.mnc001.mcc001.3gppnetwork.org>, <tel:3001>, \
+                      <sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>";
+        assert_eq!(
+            asserted_identities(header),
+            vec![
+                "sip:3001@ims.mnc001.mcc001.3gppnetwork.org",
+                "tel:3001",
+                "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org",
+            ]
+        );
+    }
+
+    #[test]
+    fn asserted_identities_keeps_a_comma_inside_a_display_name() {
+        let header = "\"Doe, John\" <sip:john@example.net>, <tel:+31612345678>";
+        assert_eq!(
+            asserted_identities(header),
+            vec!["sip:john@example.net", "tel:+31612345678"]
+        );
+    }
+
+    #[test]
+    fn asserted_identities_handles_a_single_bare_uri() {
+        assert_eq!(
+            asserted_identities("sip:alice@example.com"),
+            vec!["sip:alice@example.com"]
+        );
+    }
+
+    /// Regression: parameters live *inside* the angle brackets, so stripping
+    /// them before resolving the brackets truncated the URI mid-way and left
+    /// an unbalanced "<sip:…" on the wire.
+    #[test]
+    fn asserted_identities_keeps_uri_parameters_inside_brackets() {
+        assert_eq!(
+            asserted_identities("<sip:+31612345678@ims.example.net;user=phone>"),
+            vec!["sip:+31612345678@ims.example.net;user=phone"]
+        );
+    }
+
+    #[test]
+    fn ims_data_splits_pai_into_repeated_calling_party() {
+        let raw = concat!(
+            "INVITE sip:3002@ims.mnc001.mcc001.3gppnetwork.org SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP host;branch=z9hG4bK1\r\n",
+            "From: <sip:3001@ims.mnc001.mcc001.3gppnetwork.org>;tag=a\r\n",
+            "To: <sip:3002@ims.mnc001.mcc001.3gppnetwork.org>\r\n",
+            "P-Asserted-Identity: <sip:3001@ims.mnc001.mcc001.3gppnetwork.org>, <tel:3001>\r\n",
+            "Call-ID: c\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        let msg = parse_test_sip(raw);
+        let ims = ims_data_from_request(
+            &msg,
+            Some(NodeFunctionality::SCscf),
+            |_| true,
+            SipTimestamps::now(),
+        );
+        assert_eq!(
+            ims.calling_party,
+            vec![
+                "sip:3001@ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+                "tel:3001".to_string(),
+            ]
+        );
+    }
+
+    // ── Time-Stamps (TS 32.299 §7.2.183) ────────────────────────────────
+
+    /// The record is built at the answer, so both instants have to come from
+    /// the caller.  Sampling the clock inside the builder stamped the answer
+    /// time into SIP-Request-Timestamp and left the CDF unable to tell ring
+    /// time from talk time.
+    #[test]
+    fn ims_data_carries_the_supplied_timestamps() {
+        let raw = concat!(
+            "INVITE sip:bob@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP host;branch=z9hG4bK1\r\n",
+            "From: <sip:alice@example.com>;tag=a\r\n",
+            "To: <sip:bob@example.com>\r\n",
+            "Call-ID: c\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        let msg = parse_test_sip(raw);
+        let invite_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_787_059_616);
+        let answer_at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_787_059_622);
+        let ims = ims_data_from_request(
+            &msg,
+            Some(NodeFunctionality::SCscf),
+            |_| true,
+            SipTimestamps {
+                request: invite_at,
+                response: Some(answer_at),
+            },
+        );
+        assert_eq!(ims.request_timestamp, Some(invite_at));
+        assert_eq!(ims.response_timestamp, Some(answer_at));
+    }
+
+    /// Six seconds of alerting must survive as six seconds between the two
+    /// instants, recovered from the monotonic clock rather than two
+    /// independent wall-clock samples.
+    #[test]
+    fn timestamps_from_request_instant_preserve_the_elapsed_interval() {
+        let ring = std::time::Duration::from_millis(120);
+        let request_received = std::time::Instant::now() - ring;
+        let stamps = SipTimestamps::from_request_instant(request_received);
+        let response = stamps.response.expect("response instant");
+        let measured = response
+            .duration_since(stamps.request)
+            .expect("response must not precede the request");
+        assert!(
+            measured >= ring,
+            "interval {measured:?} lost the elapsed alerting time {ring:?}"
+        );
+        assert!(
+            measured < ring + std::time::Duration::from_secs(1),
+            "interval {measured:?} is implausibly longer than {ring:?}"
+        );
+    }
+
+    #[test]
+    fn timestamps_now_has_no_response_instant() {
+        assert!(SipTimestamps::now().response.is_none());
+    }
+
+    // ── Served party (TS 32.260 §5.1) ───────────────────────────────────
+
+    fn ims_with_role(role: NodeRole) -> ImsChargingData {
+        ImsChargingData {
+            calling_party: vec![
+                "sip:3001@ims.mnc001.mcc001.3gppnetwork.org".into(),
+                "tel:3001".into(),
+            ],
+            called_party: Some("sip:3002@ims.mnc001.mcc001.3gppnetwork.org".into()),
+            role_of_node: Some(role),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn served_party_is_the_caller_on_an_originating_record() {
+        assert_eq!(
+            served_party_identities(&ims_with_role(NodeRole::OriginatingRole)),
+            vec![
+                "sip:3001@ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+                "tel:3001".to_string(),
+            ]
+        );
+    }
+
+    /// Regression: the terminating record used to name the caller, so the
+    /// callee's own CDR identified the wrong subscriber.
+    #[test]
+    fn served_party_is_the_callee_on_a_terminating_record() {
+        assert_eq!(
+            served_party_identities(&ims_with_role(NodeRole::TerminatingRole)),
+            vec!["sip:3002@ims.mnc001.mcc001.3gppnetwork.org".to_string()]
+        );
+    }
+
+    #[test]
+    fn subscription_ids_are_typed_by_uri_scheme() {
+        let ids = subscription_ids_for(&ims_with_role(NodeRole::OriginatingRole));
+        use crate::diameter::ro::SubscriberIdKind;
+        let rendered: Vec<(SubscriberIdKind, String)> = ids
+            .into_iter()
+            .map(|id| (id.kind, id.data))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                (
+                    SubscriberIdKind::EndUserSipUri,
+                    "sip:3001@ims.mnc001.mcc001.3gppnetwork.org".to_string()
+                ),
+                // The tel: scheme is dropped — a CDF bills on the number.
+                (SubscriberIdKind::EndUserE164, "3001".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn subscription_ids_are_empty_when_the_record_has_no_identity_for_its_role() {
+        let ims = ImsChargingData {
+            calling_party: vec!["sip:3001@ims.mnc001.mcc001.3gppnetwork.org".into()],
+            called_party: None,
+            role_of_node: Some(NodeRole::TerminatingRole),
+            ..Default::default()
+        };
+        assert!(
+            subscription_ids_for(&ims).is_empty(),
+            "better no Subscription-Id than one naming the other party"
         );
     }
 

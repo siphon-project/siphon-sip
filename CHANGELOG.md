@@ -216,6 +216,65 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   WebSocket handshake, with no error logged anywhere. That configuration now
   does what it reads like (see the multiplexed listener above), and the pairings
   that genuinely cannot share a socket are rejected at startup.
+- **Rf ACR-START reported no answer instant, so a CDF could not compute billable
+  duration.** `Time-Stamps` (TS 32.299 §7.2.183) is what separates alerting from
+  talk time, and the auto-emit path filled neither half correctly: it sampled
+  `SIP-Request-Timestamp` at the moment the ACR was built — which for a START is
+  the 200 OK, not the INVITE — and never set `SIP-Response-Timestamp` at all.
+  Every START therefore carried one timestamp equal to its own `Event-Timestamp`,
+  indistinguishable from a record triggered by the INVITE, and a collector
+  reading INVITE-to-BYE over-charged every call by its ring time. Both instants
+  are now carried from the session that measured them, derived from its monotonic
+  clock so a wall-clock step mid-call cannot invent (or negate) ring time.
+- **ACR-STOP timestamped the INVITE while reporting the BYE.** `Time-Stamps`
+  describes the record's own trigger request, so a STOP whose `Event-Type` says
+  BYE must timestamp the BYE — it carried the INVITE instant forward from the
+  START instead, leaving the two AVPs describing different events minutes apart.
+- **A failed call produced no Rf record whatsoever.** No accounting session is
+  opened for an INVITE that never gets a 2xx, and nothing else was emitted
+  either, so an unanswered or rejected call was simply absent from the stream —
+  and since `Cause-Code` was hard-set to 0 on every STOP, no record anywhere
+  distinguished a successful call from a failed one. Unsuccessful session
+  establishment now emits ACR-EVENT per TS 32.260 §5.2.2.1, carrying the ICID and
+  the SIP status as a negative `Cause-Code` (TS 32.299 §7.2.35). 401/407 are
+  excluded — the UA re-sends against a challenge and the retry is the same call
+  attempt — while 487 is included, a caller who hung up during alerting being a
+  real unsuccessful setup.
+- **No IMS ACR carried a `Subscription-Id`**, so every CDR landed with no billable
+  subscriber on it and the collector had to resolve the IMPU out-of-band, which
+  only works for subscribers it has provisioned. Records now carry one typed
+  `Subscription-Id` per served-party identity (RFC 4006 §8.47: `tel:` and bare
+  `+E.164` → END_USER_E164, IMPUs → END_USER_SIP_URI), and `rf_acr_*` gained
+  `subscription_id` / `subscription_id_type` kwargs — each accepting one value or
+  a list — for scripts that hold an IMSI the SIP layer cannot derive.
+- **A multi-valued `P-Asserted-Identity` was concatenated into one
+  `Calling-Party-Address`.** The whole header value was reduced by taking its
+  first `<` and last `>`, so a subscriber asserting an IMPU, a `tel:` alias and an
+  IMSI-derived IMPU produced a single unbalanced string
+  (`sip:…org>, <tel:…>, <sip:…`) that no consumer can split back apart, and that
+  breaks outright on an identity containing a comma. `Calling-Party-Address` is
+  0..n (TS 32.299 §7.2.33) and now repeats once per identity, with the list split
+  on commas outside angle brackets and quoted display names. The same parse fixes
+  a bracketed URI carrying its own parameters, which used to be truncated at the
+  first `;`.
+- **The served party on a terminating record was the caller.** `User-Name` was
+  taken from the calling party regardless of role, so the callee's own record
+  identified whoever placed the call. It now follows `Role-Of-Node` per
+  TS 32.260 §5.1 — caller on originating, callee on terminating.
+- **An intra-node call opened two terminating accounting records and only ever
+  stopped one.** `rf_sessions` gains its entry after the CDF answers ACR-START,
+  but the dedupe gate ran before the spawn, and the two legs of such a call are
+  answered milliseconds apart — so the originating leg's speculative dual-ACR
+  terminating record and the terminating leg's own record both passed an empty
+  map and opened separate sessions on one ICID. Only one is reachable from the
+  BYE; the other never got an ACR-STOP and emitted an ACR-INTERIM every cadence
+  tick until the 24h backstop, ~288 junk records per affected call. The key is
+  now reserved synchronously for the duration of the round-trip, and released on
+  every exit path so a CDF rejection cannot wedge it.
+- **The orphan sweep dropped an Rf session's map entry without releasing the
+  session.** Its ACR-INTERIM timer and its `siphon_rf_sessions` slot both
+  outlived the entry, so a reaped record kept emitting INTERIMs against a call
+  nothing was tracking any more. The sweep now claims the stop as it goes.
 - **A UAS-mode B2BUA answer carried no `Contact`, so no in-dialog request could
   be addressed to it.** RFC 3261 §12.1.1 / §13.3.1.4 require a dialog-establishing
   response to carry the Contact the UAC builds its remote target from. The

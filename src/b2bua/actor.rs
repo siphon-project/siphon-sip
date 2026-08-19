@@ -1832,6 +1832,13 @@ impl CallActorStore {
         self.calls.get(call_id).and_then(|call| call.best_route_error())
     }
 
+    /// When the call was created — i.e. when its A-leg INVITE arrived.  Rf
+    /// charging needs it to stamp `SIP-Request-Timestamp` on a record built at
+    /// answer time (TS 32.299 §7.2.183).
+    pub fn created_at(&self, call_id: &str) -> Option<std::time::Instant> {
+        self.calls.get(call_id).map(|call| call.created_at)
+    }
+
     /// The carrier route currently in flight / that won, cloned.
     pub fn active_route(&self, call_id: &str) -> Option<crate::lcr::Route> {
         self.calls

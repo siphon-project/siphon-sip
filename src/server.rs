@@ -2808,7 +2808,7 @@ fn spawn_rf_register_emitter(
                 RegistrationEvent::Expired { aor } => (aor.clone(), -487),
             };
             let ims_data = ImsChargingData {
-                calling_party: Some(aor.clone()),
+                calling_party: vec![aor.clone()],
                 sip_method: Some("REGISTER".to_string()),
                 role_of_node: Some(NodeRole::OriginatingRole),
                 node_functionality: service.node_functionality(),

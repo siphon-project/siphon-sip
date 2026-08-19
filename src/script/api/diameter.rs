@@ -571,7 +571,13 @@ fn build_ims_data(
         None => None,
     };
     Ok(Some(ImsChargingData {
-        calling_party: calling_party.map(str::to_owned),
+        // Calling-Party-Address is 0..n; a script passing a single identity
+        // gets a single AVP, and one passing a comma-separated
+        // P-Asserted-Identity value gets one AVP per identity rather than the
+        // whole header line concatenated into one.
+        calling_party: calling_party
+            .map(crate::diameter::rf_service::asserted_identities)
+            .unwrap_or_default(),
         called_party: called_party.map(str::to_owned),
         sip_method: sip_method.map(str::to_owned),
         event: None,
@@ -725,6 +731,61 @@ fn accounting_answer_to_dict<'py>(
     dict.set_item("record_number", answer.record_number)?;
     dict.set_item("interim_interval", answer.interim_interval)?;
     Ok(dict)
+}
+
+/// A kwarg that accepts either one value or a list of them, so
+/// `subscription_id="+31612345678"` and
+/// `subscription_id=["+31612345678", "001010000000001"]` both work.
+#[derive(FromPyObject)]
+pub enum StringOrList {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StringOrList {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            StringOrList::One(value) => vec![value],
+            StringOrList::Many(values) => values,
+        }
+    }
+}
+
+/// Build the `Subscription-Id` AVPs for an Rf record (RFC 4006 §8.46, 0..n).
+///
+/// `types` is positional against `ids`. An id with no matching type is
+/// classified exactly as the Rf auto-emit path classifies the identities it
+/// lifts off a SIP message — `tel:` and bare `+E.164` become END_USER_E164
+/// (scheme stripped, since a CDR bills on the number), anything else
+/// END_USER_SIP_URI — so a hand-written record and an auto-emitted one
+/// describe the same subscriber the same way. Ro keeps its own inference
+/// ([`build_subscriber`]), whose untyped mapping is part of an existing OCS
+/// contract.
+///
+/// Nothing can recognise a bare IMSI from its digits alone; pass
+/// `subscription_id_type="imsi"` for those.
+fn build_subscribers(
+    ids: Option<StringOrList>,
+    types: Option<StringOrList>,
+) -> PyResult<Vec<SubscriberId>> {
+    let Some(ids) = ids.map(StringOrList::into_vec) else {
+        return Ok(Vec::new());
+    };
+    let types = types.map(StringOrList::into_vec).unwrap_or_default();
+    if types.len() > ids.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "subscription_id_type has {} entries but subscription_id has {}",
+            types.len(),
+            ids.len()
+        )));
+    }
+    ids.iter()
+        .enumerate()
+        .map(|(index, id)| match types.get(index) {
+            Some(id_type) => build_subscriber(id, Some(id_type.as_str())),
+            None => Ok(SubscriberId::from_identity(id)),
+        })
+        .collect()
 }
 
 /// Build a `SubscriberId` from a Python `(id, type)` pair. `id_type` accepts
@@ -2087,7 +2148,8 @@ impl PyDiameter {
         sm_protocol_id=None, sm_status=None,
         application_port_identifier=None, external_identifier=None,
         sm_device_trigger_indicator=None, mtc_iwf_address=None,
-        user_name=None, cause_code=None,
+        user_name=None, subscription_id=None, subscription_id_type=None,
+        cause_code=None,
         service_context_id=None, peer=None,
     ))]
     fn rf_acr_start<'py>(
@@ -2128,6 +2190,8 @@ impl PyDiameter {
         sm_device_trigger_indicator: Option<u32>,
         mtc_iwf_address: Option<&str>,
         user_name: Option<&str>,
+        subscription_id: Option<StringOrList>,
+        subscription_id_type: Option<StringOrList>,
         cause_code: Option<i32>,
         service_context_id: Option<&str>,
         peer: Option<&str>,
@@ -2163,6 +2227,8 @@ impl PyDiameter {
 
         let mut params = AccountingParams::new(AccountingRecordType::StartRecord);
         params.user_name = user_name;
+        let subscription_ids = build_subscribers(subscription_id, subscription_id_type)?;
+        params.subscription_ids = &subscription_ids;
         params.ims_data = ims_data.as_ref();
         params.sms_data = sms_data.as_ref();
         params.service_context_id = service_context_id;
@@ -2202,7 +2268,8 @@ impl PyDiameter {
         sm_protocol_id=None, sm_status=None,
         application_port_identifier=None, external_identifier=None,
         sm_device_trigger_indicator=None, mtc_iwf_address=None,
-        user_name=None, cause_code=None,
+        user_name=None, subscription_id=None, subscription_id_type=None,
+        cause_code=None,
         service_context_id=None, peer=None,
     ))]
     fn rf_acr_interim<'py>(
@@ -2245,6 +2312,8 @@ impl PyDiameter {
         sm_device_trigger_indicator: Option<u32>,
         mtc_iwf_address: Option<&str>,
         user_name: Option<&str>,
+        subscription_id: Option<StringOrList>,
+        subscription_id_type: Option<StringOrList>,
         cause_code: Option<i32>,
         service_context_id: Option<&str>,
         peer: Option<&str>,
@@ -2282,6 +2351,8 @@ impl PyDiameter {
         params.record_number = record_number;
         params.session_id = Some(session_id);
         params.user_name = user_name;
+        let subscription_ids = build_subscribers(subscription_id, subscription_id_type)?;
+        params.subscription_ids = &subscription_ids;
         params.ims_data = ims_data.as_ref();
         params.sms_data = sms_data.as_ref();
         params.service_context_id = service_context_id;
@@ -2329,7 +2400,8 @@ impl PyDiameter {
         sm_protocol_id=None, sm_status=None,
         application_port_identifier=None, external_identifier=None,
         sm_device_trigger_indicator=None, mtc_iwf_address=None,
-        user_name=None, cause_code=None,
+        user_name=None, subscription_id=None, subscription_id_type=None,
+        cause_code=None,
         service_context_id=None, peer=None,
     ))]
     fn rf_acr_stop<'py>(
@@ -2373,6 +2445,8 @@ impl PyDiameter {
         sm_device_trigger_indicator: Option<u32>,
         mtc_iwf_address: Option<&str>,
         user_name: Option<&str>,
+        subscription_id: Option<StringOrList>,
+        subscription_id_type: Option<StringOrList>,
         cause_code: Option<i32>,
         service_context_id: Option<&str>,
         peer: Option<&str>,
@@ -2410,6 +2484,8 @@ impl PyDiameter {
         params.record_number = record_number;
         params.session_id = Some(session_id);
         params.user_name = user_name;
+        let subscription_ids = build_subscribers(subscription_id, subscription_id_type)?;
+        params.subscription_ids = &subscription_ids;
         params.ims_data = ims_data.as_ref();
         params.sms_data = sms_data.as_ref();
         params.service_context_id = service_context_id;
@@ -2453,7 +2529,8 @@ impl PyDiameter {
         sm_protocol_id=None, sm_status=None,
         application_port_identifier=None, external_identifier=None,
         sm_device_trigger_indicator=None, mtc_iwf_address=None,
-        user_name=None, cause_code=None,
+        user_name=None, subscription_id=None, subscription_id_type=None,
+        cause_code=None,
         service_context_id=None, peer=None,
     ))]
     fn rf_acr_event<'py>(
@@ -2494,6 +2571,8 @@ impl PyDiameter {
         sm_device_trigger_indicator: Option<u32>,
         mtc_iwf_address: Option<&str>,
         user_name: Option<&str>,
+        subscription_id: Option<StringOrList>,
+        subscription_id_type: Option<StringOrList>,
         cause_code: Option<i32>,
         service_context_id: Option<&str>,
         peer: Option<&str>,
@@ -2529,6 +2608,8 @@ impl PyDiameter {
 
         let mut params = AccountingParams::new(AccountingRecordType::EventRecord);
         params.user_name = user_name;
+        let subscription_ids = build_subscribers(subscription_id, subscription_id_type)?;
+        params.subscription_ids = &subscription_ids;
         params.ims_data = ims_data.as_ref();
         params.sms_data = sms_data.as_ref();
         params.service_context_id = service_context_id;
