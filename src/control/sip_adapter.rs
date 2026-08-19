@@ -68,6 +68,7 @@ impl ControlAdapter for SipControlAdapter {
                 "StasisEnd".to_string(),
                 "ChannelStateChange".to_string(),
                 "ChannelHangupRequest".to_string(),
+                "ChannelDtmfReceived".to_string(),
             ],
         }
     }
@@ -791,6 +792,16 @@ mod tests {
             "stream_stop",
         ] {
             assert!(verbs.contains(&expected), "missing verb {expected}");
+        }
+        let events: Vec<&str> = schema.events.iter().map(String::as_str).collect();
+        for expected in [
+            "StasisStart",
+            "StasisEnd",
+            "ChannelStateChange",
+            "ChannelHangupRequest",
+            "ChannelDtmfReceived",
+        ] {
+            assert!(events.contains(&expected), "missing event {expected}");
         }
     }
 

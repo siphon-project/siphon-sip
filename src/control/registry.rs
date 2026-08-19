@@ -740,6 +740,66 @@ impl ControlBus {
         debug!(%channel_id, %sip_call_id, reason, "control plane: StasisEnd + channel removed");
     }
 
+    /// Forward an in-band DTMF digit (detected by the media engine on a
+    /// controlled call's leg) to the owning control connection as a
+    /// `ChannelDtmfReceived` event, so an external IVR / AI app collects digits
+    /// from the event stream. **Additive** — this runs alongside, never in place
+    /// of, the in-process `@rtpengine.on_dtmf` dispatch; a controlled channel
+    /// gets the event *in addition*.
+    ///
+    /// `sip_call_id` is the media call-id the DTMF event carries. For every
+    /// control-anchored call that is byte-identical to the SIP Call-ID the
+    /// channel is keyed on: the ordinary anchored path records the media session
+    /// with `rtpengine_call_id == call_id == SIP Call-ID`, and the answer-first
+    /// (AI-park) path anchors on the INVITE's Call-ID for both the media session
+    /// and the channel. The only path that decouples the media call-id from the
+    /// SIP Call-ID is a siphon-terminated REFER re-anchor, which never applies to
+    /// a control-owned channel. So the direct
+    /// [`channel_id_for_sip_call_id`](Self::channel_id_for_sip_call_id) lookup is
+    /// correct for every controlled call.
+    ///
+    /// Idempotent no-op — never panics — when the call is uncontrolled (the
+    /// common case), the channel is orphaned, or the owning connection is gone.
+    /// Adds and removes **no** per-call state (a channel scan + an
+    /// [`EventFrame`] push), so it needs no leak coverage of its own. Returns
+    /// whether an event was pushed to a connection.
+    pub fn forward_dtmf(
+        &self,
+        sip_call_id: &str,
+        digit: &str,
+        duration_ms: u32,
+        volume: i32,
+        from_tag: &str,
+    ) -> bool {
+        let Some(channel_id) = self.channel_id_for_sip_call_id(sip_call_id) else {
+            return false;
+        };
+        let (app, call_actor_id) = match self.channels.get(&channel_id) {
+            Some(entry) => (entry.app.clone(), entry.call_actor_id.clone()),
+            None => return false,
+        };
+        let pushed = self.publish_to_channel(
+            &channel_id,
+            EventFrame::new(
+                "ChannelDtmfReceived",
+                &channel_id,
+                &app,
+                &call_actor_id,
+                sip_call_id,
+                serde_json::json!({
+                    "digit": digit,
+                    "duration_ms": duration_ms,
+                    "volume": volume,
+                    "from_tag": from_tag,
+                }),
+            ),
+        );
+        if pushed {
+            debug!(%channel_id, %sip_call_id, digit, "control plane: ChannelDtmfReceived forwarded");
+        }
+        pushed
+    }
+
     /// Offer a handed-over call to an app: assign a persistent owner (round
     /// robin) and push `StasisStart`, or launch a per-call-connect dial. Returns
     /// the outcome so the dispatcher knows whether to arm the handoff deadline
@@ -1165,6 +1225,59 @@ mod tests {
             assert_eq!(bus.app_count(), 0, "apps leaked on cycle {cycle}");
             assert!(bus.app_calls.is_empty(), "app_calls index leaked on cycle {cycle}");
         }
+    }
+
+    #[tokio::test]
+    async fn forward_dtmf_pushes_event_to_owning_connection() {
+        // An in-band DTMF digit on a controlled call reaches the owning
+        // connection as a ChannelDtmfReceived event carrying the digit + tag,
+        // additive to (never in place of) the @rtpengine.on_dtmf dispatch.
+        let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
+        let conn = bus.register_connection("ivr-app");
+        bus.offer_channel(
+            "ivr-app",
+            "ch1",
+            "call-uuid",
+            "sipcid@h",
+            "hangup",
+            HashMap::new(),
+            serde_json::json!({}),
+        );
+        assert_eq!(bus.channel_count(), 1);
+
+        // The media call-id equals the SIP Call-ID for a control-anchored call.
+        assert!(bus.forward_dtmf("sipcid@h", "5", 120, -8, "ftag-a"));
+
+        let frames = conn.events.recv_many().await;
+        let dtmf = frames
+            .iter()
+            .find_map(|frame| match frame {
+                OutboundFrame::Event(event) if event.event == "ChannelDtmfReceived" => Some(event),
+                _ => None,
+            })
+            .expect("owning app must receive ChannelDtmfReceived");
+        assert_eq!(dtmf.channel.as_deref(), Some("ch1"));
+        assert_eq!(dtmf.call_id.as_deref(), Some("call-uuid"));
+        assert_eq!(dtmf.sip_call_id.as_deref(), Some("sipcid@h"));
+        assert_eq!(dtmf.payload["digit"], "5");
+        assert_eq!(dtmf.payload["duration_ms"], 120);
+        assert_eq!(dtmf.payload["volume"], -8);
+        assert_eq!(dtmf.payload["from_tag"], "ftag-a");
+
+        // Additive: forwarding neither creates nor removes per-call state.
+        assert_eq!(bus.channel_count(), 1, "forward_dtmf must not touch channel state");
+        assert_eq!(bus.owned_channels("ivr-app").len(), 1);
+    }
+
+    #[test]
+    fn forward_dtmf_on_uncontrolled_call_is_clean_noop() {
+        // A DTMF event for a call no control app owns must be a silent no-op —
+        // no panic, no state change, nothing pushed.
+        let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
+        let conn = bus.register_connection("ivr-app");
+        assert!(!bus.forward_dtmf("unknown-cid", "1", 100, 0, "ftag"));
+        assert_eq!(conn.events.depth(), 0, "no event for an uncontrolled call");
+        assert_eq!(bus.channel_count(), 0);
     }
 
     #[test]
