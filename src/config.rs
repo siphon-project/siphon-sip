@@ -3496,11 +3496,60 @@ pub enum LogFormat {
 
 impl Config {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-        let content = std::fs::read_to_string(path.as_ref()).map_err(|e| {
+        let path = path.as_ref();
+        let content = std::fs::read_to_string(path).map_err(|e| {
             SiphonError::Config(format!("cannot read siphon.yaml: {e}"))
         })?;
         let expanded = expand_env_vars(&content);
-        Self::from_str_raw(&expanded)
+        let mut config = Self::from_str_raw(&expanded)?;
+        config.anchor_script_paths(path);
+        Ok(config)
+    }
+
+    /// Re-anchor a relative `script.path` / `script.include_paths` on the
+    /// directory holding the config file.
+    ///
+    /// Both are resolved against the process working directory
+    /// (`ScriptEngine::new` does `PathBuf::from(&config.path)`), which is fine
+    /// when siphon is started from its config directory and wrong under any
+    /// supervisor. systemd hands a unit `/` as its working directory, so the
+    /// packaged `script.path: "scripts/proxy_default.py"` resolves to
+    /// `/scripts/proxy_default.py`, the script load fails, and the service
+    /// restart-loops — while the identical config starts by hand from
+    /// `/etc/siphon`. Same trap for a container `WORKDIR` and for an embedding
+    /// binary that chdirs.
+    ///
+    /// A relative entry therefore now prefers the config-relative location, the
+    /// way nginx and Kamailio resolve a relative include. The rewrite only
+    /// happens when the candidate actually exists, so a config that relies on
+    /// the working directory keeps resolving exactly as before — this can make
+    /// a previously-failing config start, never the reverse.
+    ///
+    /// Only applies to `from_file`: `from_str` has no file to anchor on.
+    fn anchor_script_paths(&mut self, config_path: &Path) {
+        let Some(config_dir) = config_path.parent() else {
+            return;
+        };
+        // A bare `siphon.yaml` yields an empty parent, which would turn every
+        // relative path into itself — nothing to anchor on.
+        if config_dir.as_os_str().is_empty() {
+            return;
+        }
+
+        let anchor = |value: &mut String| {
+            if Path::new(&*value).is_absolute() {
+                return;
+            }
+            let candidate = config_dir.join(&*value);
+            if candidate.exists() {
+                *value = candidate.to_string_lossy().into_owned();
+            }
+        };
+
+        anchor(&mut self.script.path);
+        for include_path in &mut self.script.include_paths {
+            anchor(include_path);
+        }
     }
 
     #[allow(clippy::should_implement_trait)]
@@ -3996,6 +4045,167 @@ tls:
         assert!(config.registrant.is_none());
         assert!(config.lawful_intercept.is_none());
         assert!(config.diameter.is_none());
+    }
+
+    // --- script path anchoring (Config::from_file) ---
+
+    /// Build a config dir holding `siphon.yaml` plus a `scripts/main.py`, and
+    /// return `(tempdir, config_path)`.
+    fn config_dir_with_script(script_body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("scripts")).unwrap();
+        std::fs::write(dir.path().join("scripts/main.py"), script_body).unwrap();
+        let config_path = dir.path().join("siphon.yaml");
+        std::fs::write(
+            &config_path,
+            r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/main.py"
+  include_paths:
+    - "lib"
+    - "/etc/siphon/shared"
+auth:
+  realm: "example.com"
+"#,
+        )
+        .unwrap();
+        (dir, config_path)
+    }
+
+    /// The systemd case: the working directory is not the config directory, so
+    /// a relative `script.path` must still resolve.
+    #[test]
+    fn relative_script_path_anchors_on_config_dir() {
+        let (dir, config_path) = config_dir_with_script("# script\n");
+
+        let config = Config::from_file(&config_path).unwrap();
+
+        assert_eq!(
+            config.script.path,
+            dir.path().join("scripts/main.py").to_string_lossy()
+        );
+        assert!(std::path::Path::new(&config.script.path).exists());
+    }
+
+    #[test]
+    fn relative_include_paths_anchor_on_config_dir() {
+        let (dir, config_path) = config_dir_with_script("# script\n");
+        std::fs::create_dir(dir.path().join("lib")).unwrap();
+
+        let config = Config::from_file(&config_path).unwrap();
+
+        assert_eq!(
+            config.script.include_paths,
+            vec![
+                dir.path().join("lib").to_string_lossy().into_owned(),
+                // Absolute entries are never touched.
+                "/etc/siphon/shared".to_string(),
+            ]
+        );
+    }
+
+    /// Anchoring must not change a config that already worked: when there is no
+    /// config-relative candidate, the value is left alone so the process
+    /// working directory still resolves it (and the same "script not found"
+    /// error still names what the operator wrote).
+    #[test]
+    fn missing_config_relative_candidate_leaves_path_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("siphon.yaml");
+        std::fs::write(
+            &config_path,
+            r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/absent.py"
+  include_paths:
+    - "absent-lib"
+auth:
+  realm: "example.com"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::from_file(&config_path).unwrap();
+
+        assert_eq!(config.script.path, "scripts/absent.py");
+        assert_eq!(config.script.include_paths, vec!["absent-lib".to_string()]);
+    }
+
+    /// An absolute `script.path` is never rewritten, even when a same-named
+    /// file sits beside the config.
+    #[test]
+    fn absolute_script_path_is_not_anchored() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere.py");
+        std::fs::write(&elsewhere, "# script\n").unwrap();
+        let config_path = dir.path().join("siphon.yaml");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "{}"
+auth:
+  realm: "example.com"
+"#,
+                elsewhere.display()
+            ),
+        )
+        .unwrap();
+
+        let config = Config::from_file(&config_path).unwrap();
+
+        assert_eq!(config.script.path, elsewhere.to_string_lossy());
+    }
+
+    /// `from_str` has no file to anchor on and must stay byte-for-byte what the
+    /// caller wrote (embedding / `--config-string` path).
+    #[test]
+    fn from_str_does_not_anchor_script_path() {
+        let yaml = r#"
+listen:
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/main.py"
+auth:
+  realm: "example.com"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert_eq!(config.script.path, "scripts/main.py");
+    }
+
+    /// A bare filename config (`siphon --config siphon.yaml`) has an empty
+    /// parent — anchoring is a no-op rather than a self-join.
+    #[test]
+    fn bare_config_filename_anchors_nothing() {
+        let mut config = Config::from_str(minimal_yaml()).unwrap();
+        config.script.path = "scripts/main.py".to_string();
+
+        config.anchor_script_paths(std::path::Path::new("siphon.yaml"));
+
+        assert_eq!(config.script.path, "scripts/main.py");
     }
 
     #[test]

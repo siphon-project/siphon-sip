@@ -6,6 +6,30 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Fixed
+- **A relative `script.path` now resolves against the config file's directory,
+  so siphon starts under a supervisor.** It was resolved against the process
+  working directory, which is the config directory when you run siphon by hand
+  and `/` under systemd. The packaged `siphon.yaml` ships
+  `script.path: "scripts/proxy_default.py"`, so the packaged unit looked for
+  `/scripts/proxy_default.py`, failed the script load, exited non-zero and
+  restart-looped — while the same config started fine from `/etc/siphon`. A
+  container `WORKDIR` or an embedding binary that chdirs hit the same trap.
+  `script.include_paths` is anchored the same way. The rewrite only applies
+  when the config-relative file exists, so a config that relies on the working
+  directory keeps resolving as before; this can only make a previously-failing
+  config start. `Config::from_str` is unchanged (no file to anchor on), and the
+  startup log line prints the resolved path.
+- **The packaged systemd unit can write its state and log directories.**
+  `ProtectSystem=strict` was paired with `ReadWritePaths=/var/lib/siphon` only,
+  while every default write path (`cdr.file.path` at `/var/log/siphon/cdr.jsonl`,
+  `lawful_intercept.audit_log`, the `log.file` example) lives under `/var/log`,
+  which was read-only and never created. The unit now declares
+  `StateDirectory=siphon` and `LogsDirectory=siphon`, so systemd creates both
+  owned by the service user, and pins `WorkingDirectory=/etc/siphon`. It also
+  documents, as commented lines, the `CAP_NET_ADMIN` + `AF_NETLINK` an IMS
+  P-CSCF needs for `ipsec:` sec-agree.
+
 ### Added
 - **SIGTRAN/SS7 extension module.** `siphon-bin` gains a `sigtran` feature that
   composes [siphon-sigtran](https://github.com/siphon-project/siphon-sigtran)

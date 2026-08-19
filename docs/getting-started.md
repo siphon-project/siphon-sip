@@ -145,6 +145,21 @@ install — you enable it explicitly. Building the packages yourself, and the
 from-source path, are covered in the
 [README](https://github.com/siphon-project/siphon-sip#installation).
 
+If the unit does not come up, `journalctl -u siphon -n 50` has the reason: siphon
+exits non-zero on a config or script error, so `Restart=on-failure` turns any
+such error into a restart loop rather than a running-but-broken proxy. Two
+things the sandboxed unit imposes that a manual run does not:
+
+- **Writable paths.** `ProtectSystem=strict` leaves the filesystem read-only
+  apart from `/var/lib/siphon` and `/var/log/siphon`. Point `log.file`,
+  `cdr.file.path`, registrar persistence and recordings inside those.
+- **Capabilities.** The unit grants `CAP_NET_BIND_SERVICE` only. An IMS P-CSCF
+  using the `ipsec:` sec-agree block also needs `CAP_NET_ADMIN` and `AF_NETLINK`
+  — the unit ships both as commented lines.
+
+Override either with `systemctl edit siphon` rather than editing the packaged
+unit, which an upgrade replaces.
+
 ### Running a native binary directly
 
 ```bash

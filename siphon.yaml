@@ -1221,7 +1221,10 @@ auth:
 log:
   level: info      # debug | info | warn | error
   format: pretty   # pretty (human-readable) | json (structured, for log aggregators)
-  # file: /var/log/siphon.log   # optional: also write logs to file (for logrotate)
+  # Optional: also write logs to a file (for logrotate). The packaged systemd
+  # unit runs with ProtectSystem=strict, so only /var/log/siphon and
+  # /var/lib/siphon are writable — keep this and cdr.file.path inside them.
+  # file: /var/log/siphon/siphon.log
 
 # External remote-control plane (ARI/ESL-class). A management plane — OFF by
 # default. An out-of-process app drives calls a Python @b2bua.on_invite handler
