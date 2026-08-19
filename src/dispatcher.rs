@@ -20823,6 +20823,56 @@ mod tests {
         assert_eq!(cdr.extra.get("media_reason").map(String::as_str), Some("media_timeout"));
     }
 
+    #[test]
+    fn media_summary_to_cdr_handles_a_single_leg_call() {
+        use crate::rtpengine::events::{CallLegSummary, CallSummary};
+
+        // A single-leg call (`answer_local` — IVR, announcement, and every
+        // voice-AI call where the engine itself is the far side) has exactly one
+        // media party, and `siphon-rtp` reports it as one leg. Everything the
+        // caller sent must land under `near_`, and no `far_` key may be
+        // synthesised for a party that does not exist — a media CDR showing a
+        // far leg on a call that never had one is worse than one showing none.
+        let leg = CallLegSummary {
+            tag: "caller".to_string(),
+            codec: Some("PCMU".to_string()),
+            packets_in: 60,
+            bytes_in: 10_320,
+            packets_out: 64,
+            bytes_out: 11_008,
+            packets_dropped: 0,
+            ssrc: Some(0x0000_2222),
+            packets_lost: Some(0),
+            loss_percent: Some(0.0),
+            jitter_ms: Some(19.25),
+            rtt_ms: None,
+            mos_average: None,
+            mos_min: None,
+            mos_max: None,
+            mos_basis: Some("loss+jitter".to_string()),
+        };
+        let summary = CallSummary {
+            call_id: "voice-ai-1".to_string(),
+            reason: "delete".to_string(),
+            duration_ms: 1_000,
+            legs: vec![leg],
+        };
+
+        let cdr = media_summary_to_cdr(&summary);
+        assert_eq!(cdr.extra.get("near_tag").map(String::as_str), Some("caller"));
+        assert_eq!(cdr.extra.get("near_packets_in").map(String::as_str), Some("60"));
+        assert_eq!(cdr.extra.get("near_packets_out").map(String::as_str), Some("64"));
+        assert_eq!(cdr.extra.get("near_codec").map(String::as_str), Some("PCMU"));
+        // Quality belongs to the same leg as the counters, not a separate one.
+        assert_eq!(cdr.extra.get("near_jitter_ms").map(String::as_str), Some("19.25"));
+        // No second party.
+        assert!(
+            !cdr.extra.keys().any(|key| key.starts_with("far_")),
+            "single-leg summary must not synthesise a far leg: {:?}",
+            cdr.extra.keys().collect::<Vec<_>>()
+        );
+    }
+
     // -----------------------------------------------------------------------
     // A-leg advertised port (multi-homed Contact / reply-socket anchoring)
     // -----------------------------------------------------------------------
