@@ -4119,6 +4119,11 @@ services:
   # ── Voice-AI B2BUA (single-leg answer + WebSocket bridge) ─────────────────
   # Requires the "voice-ai" profile.
   #
+  # IP assignments:
+  #   172.20.0.103 — mock siphon-rtp control server
+  #   172.20.0.104 — siphon (B2BUA)
+  #   172.20.0.105 — carrier UAC
+  #
   # Flow: UAC → siphon B2BUA (rtpengine.answer_local with ws_uri) → 200 OK
   # There is no UAS: siphon answers the call itself with the SDP the engine
   # synthesised, so the test asserts the answer is anchored on the engine's
@@ -4145,7 +4150,7 @@ services:
       MOCK_MEDIA_PORT: "30000"
     networks:
       sipnet:
-        ipv4_address: 172.20.0.50
+        ipv4_address: 172.20.0.103
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import socket,struct,json; s=socket.create_connection(('127.0.0.1',8080),2); b=json.dumps({'id':1,'command':'ping'}).encode(); s.sendall(struct.pack('!I',len(b))+b); h=s.recv(4); n=struct.unpack('!I',h)[0]; d=s.recv(n); s.close(); exit(0 if b'pong' in d else 1)\""]
       interval: 2s
@@ -4169,7 +4174,7 @@ services:
       - ../examples:/etc/siphon/examples:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.51
+        ipv4_address: 172.20.0.104
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
       interval: 3s
@@ -4189,10 +4194,10 @@ services:
       - .:/sipp/scenarios:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.52
+        ipv4_address: 172.20.0.105
     entrypoint:
       - sipp
-      - "172.20.0.51:5060"
+      - "172.20.0.104:5060"
       - -sf
       - /sipp/scenarios/voice_ai_uac.xml
       - -m
