@@ -657,6 +657,46 @@ jobs:
             mock-rtpproxy.log
             *.log
 
+  # ── Voice-AI B2BUA (single-leg answer + WebSocket bridge) ──────────────
+  sipp-voice-ai:
+    runs-on: ubuntu-latest
+    needs: rust-tests
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build siphon-voice-ai image
+        run: docker compose -f sipp/docker-compose.yaml --profile voice-ai build siphon-voice-ai
+
+      - name: Start mock siphon-rtp + siphon-voice-ai
+        run: docker compose -f sipp/docker-compose.yaml --profile voice-ai up -d --wait mock-siphon-rtp siphon-voice-ai
+
+      - name: Voice-AI call (INVITE → answer_local → 200 → BYE)
+        # No UAS and no register: siphon answers the call itself as a single-leg
+        # UAS, so the UAC is the only party. The scenario asserts the answer SDP
+        # is anchored on the engine's media address and that the 2xx carries a
+        # Contact (RFC 3261 §12.1.1) — without one the UAC has no remote target
+        # and the BYE goes out with an empty Request-URI.
+        run: docker compose -f sipp/docker-compose.yaml --profile voice-ai up --abort-on-container-exit --exit-code-from sipp-voice-ai-uac sipp-voice-ai-uac
+
+      - name: Collect logs
+        if: always()
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs siphon-voice-ai > siphon-voice-ai.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs mock-siphon-rtp > mock-siphon-rtp.log 2>&1 || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile voice-ai down --remove-orphans
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-voice-ai-logs
+          path: |
+            siphon-voice-ai.log
+            mock-siphon-rtp.log
+
   # ── Fuzz testing (nightly) ─────────────────────────────────────────────
   fuzz:
     runs-on: ubuntu-latest
