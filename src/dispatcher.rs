@@ -1102,6 +1102,13 @@ pub async fn run(
             while let Some(event) = events_rx.recv().await {
                 match event {
                     crate::rtpengine::events::RtpEngineEvent::Dtmf(dtmf) => {
+                        // Additive control-plane forward: a controlled channel
+                        // gets the digit as a ChannelDtmfReceived event too, so an
+                        // external IVR / AI app collects digits from the event
+                        // stream. Runs before the Python-handler short-circuit so
+                        // it fires whether or not @rtpengine.on_dtmf is registered.
+                        control_forward_dtmf(&dtmf);
+
                         let engine_state = state_for_events.engine.state();
                         let handlers = engine_state.dtmf_handlers(&dtmf.call_id, &dtmf.from_tag);
                         if handlers.is_empty() {
@@ -17118,6 +17125,28 @@ fn b2bua_terminate_call_inner(
 fn control_notify_terminated(sip_call_id: &str, reason: &str) {
     if let Some(bus) = crate::control::ControlBus::global() {
         bus.on_call_terminated(sip_call_id, reason);
+    }
+}
+
+/// Forward an in-band DTMF digit the media engine detected on a controlled
+/// B2BUA call's leg to the owning control connection as a `ChannelDtmfReceived`
+/// event, so an external IVR / AI app collects digits off the event stream.
+///
+/// **Additive** — this runs *next to*, never in place of, the Python
+/// `@rtpengine.on_dtmf` dispatch, and fires independently of whether any Python
+/// handler is registered. A no-op when the control plane isn't configured or the
+/// call isn't controlled. `dtmf.call_id` is the media call-id, which equals the
+/// SIP Call-ID the control bus keys the channel on for every control-anchored
+/// call (see [`crate::control::ControlBus::forward_dtmf`]).
+fn control_forward_dtmf(dtmf: &crate::rtpengine::events::DtmfEvent) {
+    if let Some(bus) = crate::control::ControlBus::global() {
+        bus.forward_dtmf(
+            &dtmf.call_id,
+            &dtmf.digit,
+            dtmf.duration_ms,
+            dtmf.volume,
+            &dtmf.from_tag,
+        );
     }
 }
 

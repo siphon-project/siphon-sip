@@ -260,6 +260,15 @@ same way every other verb does — never a hang:
   cannot perform the op answers `unsupported_verb`; any other backend failure
   answers `unavailable`.
 
+Inbound in-band DTMF on a controlled call is pushed to the owning connection as
+a `ChannelDtmfReceived` event, payload `{digit, duration_ms, volume, from_tag}`
+(`from_tag` identifies which party pressed), so an IVR / AI app **collects digits
+off the event stream** rather than through a blocking verb — there is
+deliberately no server-side `collect_dtmf` (it would park an I/O worker). This is
+additive to the in-process `@rtpengine.on_dtmf` dispatch: the digit fires both,
+and it needs no extra configuration beyond the DTMF-log wiring the media engine
+already uses.
+
 `bridge` / `originate` verbs arrive in later phases over the same envelope. The
 client SDK facade methods for the media verbs land alongside them (until then,
 reach the verbs through the generic `command(verb, args)` escape hatch).

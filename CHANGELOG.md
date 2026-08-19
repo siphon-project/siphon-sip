@@ -31,6 +31,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   P-CSCF needs for `ipsec:` sec-agree.
 
 ### Added
+- **In-band DTMF on a controlled call is forwarded to the control plane as a
+  `ChannelDtmfReceived` event.** When the media engine detects a DTMF digit on a
+  B2BUA call that was handed over to a control app, siphon pushes a
+  `ChannelDtmfReceived` event (payload `{digit, duration_ms, volume, from_tag}`)
+  to the owning control connection, so an external IVR / AI app collects digits
+  from the event stream (there is deliberately no blocking server-side
+  `collect_dtmf` verb). This is additive: the in-process `@rtpengine.on_dtmf`
+  dispatch still fires unchanged, and it is emitted whether or not any Python
+  handler is registered. The event carries the stable id triple
+  `{channel, call_id, sip_call_id}` like every other control event, and the SIP
+  adapter's `describe` now lists `ChannelDtmfReceived`.
 - **SIGTRAN/SS7 extension module.** `siphon-bin` gains a `sigtran` feature that
   composes [siphon-sigtran](https://github.com/siphon-project/siphon-sigtran)
   v1.0.0 into the drop-in `siphon` binary, alongside the existing `smpp` and
