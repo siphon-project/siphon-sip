@@ -5246,6 +5246,14 @@ fn handle_response(
         }
     };
 
+    // A response to a REFER siphon originated on one of its own legs. Checked
+    // before the leg-branch lookup because this is a non-INVITE transaction that
+    // must not run the INVITE/B-leg response machinery below.
+    if state.call_actors.lookup_originated_refer(&branch).is_some() {
+        handle_originated_refer_response(&branch, &message, status_code, state);
+        return;
+    }
+
     // Check if this response belongs to a B2BUA call
     if let Some(call_id) = state.call_actors.call_id_for_branch(&branch) {
         handle_b2bua_response(&call_id, &branch, &mut message, status_code, inbound.remote_addr, state);
@@ -17271,6 +17279,198 @@ pub fn b2bua_terminate_call(sip_call_id: &str, reason: Option<&str>) -> bool {
 /// referee's `message/sipfrag` NOTIFYs are absorbed (200 OK'd + read) by
 /// [`handle_b2bua_notify`] rather than bridged. Returns `false` if the call or
 /// leg is gone.
+/// Handle the response to a REFER siphon originated on one of its own legs.
+///
+/// A cold transfer off a call siphon answered itself (`call.refer()` /
+/// `b2bua.refer()`) is an in-dialog REFER on a leg that already exists, so the
+/// peer may challenge it, which trunks commonly do. This is the
+/// only place that challenge can be answered: the REFER's branch belongs to no
+/// leg, so nothing else matches its response.
+///
+/// Differences from the B-leg INVITE retry that this deliberately does NOT copy:
+///
+/// * **No ACK.** REFER is a non-INVITE transaction — only an INVITE client
+///   transaction ACKs a non-2xx final (RFC 3261 §17.1.2). ACKing here would put
+///   a stray ACK on the dialog.
+/// * **A fresh CSeq, not a fresh branch on the same one.** §22.2 wants the
+///   credentialed retry to be a new transaction in the dialog.
+fn handle_originated_refer_response(
+    branch: &str,
+    message: &SipMessage,
+    status_code: u16,
+    state: &DispatcherState,
+) {
+    // Provisionals do not end the transaction; keep waiting for the final.
+    if (100..200).contains(&status_code) {
+        return;
+    }
+
+    let Some(pending) = state.call_actors.take_originated_refer(branch) else {
+        return;
+    };
+
+    if (200..300).contains(&status_code) {
+        debug!(
+            call_id = %pending.call_id,
+            status = status_code,
+            "B2BUA: siphon-originated REFER accepted"
+        );
+        return;
+    }
+
+    let challenged = status_code == 401 || status_code == 407;
+    if challenged
+        && pending.auth_retries < MAX_B2BUA_AUTH_RETRIES
+        && retry_originated_refer_with_credentials(&pending, message, status_code, state)
+    {
+        return;
+    }
+
+    // Nothing more to try: no credentials configured, an unparseable challenge,
+    // the retry cap reached, or a plain rejection. Drop the pending subscription
+    // rather than leaving the script waiting on sipfrag NOTIFYs that will never
+    // arrive — a transfer that failed should look failed.
+    if challenged {
+        warn!(
+            call_id = %pending.call_id,
+            status = status_code,
+            retries = pending.auth_retries,
+            "B2BUA: siphon-originated REFER challenged and not retried \
+             (no call.set_credentials(), unparseable challenge, or retry cap reached)"
+        );
+    } else {
+        warn!(
+            call_id = %pending.call_id,
+            status = status_code,
+            "B2BUA: siphon-originated REFER rejected by the peer"
+        );
+    }
+    state
+        .call_actors
+        .clear_refer_subscriptions_on_leg(&pending.call_id, pending.on_a_leg);
+}
+
+/// Re-send a challenged REFER carrying digest credentials. Returns `false` when
+/// the retry could not be built, so the caller can report the failure.
+fn retry_originated_refer_with_credentials(
+    pending: &crate::b2bua::actor::OriginatedRefer,
+    message: &SipMessage,
+    status_code: u16,
+    state: &DispatcherState,
+) -> bool {
+    let Some((username, password)) = state
+        .call_actors
+        .get_call(&pending.call_id)
+        .and_then(|call| call.outbound_credentials.clone())
+    else {
+        return false;
+    };
+
+    let challenge_header = if status_code == 401 {
+        message.headers.get("WWW-Authenticate")
+    } else {
+        message.headers.get("Proxy-Authenticate")
+    };
+    let Some(challenge) = challenge_header.and_then(|value| crate::auth::parse_challenge(value))
+    else {
+        return false;
+    };
+
+    let Some(cseq) = state
+        .call_actors
+        .reserve_leg_cseq(&pending.call_id, pending.on_a_leg)
+    else {
+        return false;
+    };
+    let Some(leg) = state
+        .call_actors
+        .clone_leg(&pending.call_id, pending.on_a_leg)
+    else {
+        return false;
+    };
+
+    // RFC 7616 §3.3: nc starts at 1 for a fresh nonce and increments on reuse.
+    // The per-call counter resets itself when the nonce changes, so this is
+    // right for both a first challenge and a stale-nonce re-challenge.
+    let nc = state
+        .call_actors
+        .get_call(&pending.call_id)
+        .map(|call| call.digest_nc.next_for(&challenge.nonce))
+        .unwrap_or(1);
+
+    let credentials = crate::auth::DigestCredentials { username, password };
+    let auth_value = crate::auth::format_authorization_header(
+        &challenge,
+        &credentials,
+        Method::Refer.as_str(),
+        &pending.target_uri,
+        Some(nc),
+        None,
+    );
+    let auth_header_name = if status_code == 401 {
+        "Authorization"
+    } else {
+        "Proxy-Authorization"
+    };
+
+    let extra_headers = [
+        ("Refer-To", pending.refer_to.to_string()),
+        (auth_header_name, auth_value),
+    ];
+    let Some(retry) = build_b2bua_in_dialog_request(
+        &leg,
+        state,
+        Method::Refer,
+        cseq,
+        &extra_headers,
+        None,
+    ) else {
+        return false;
+    };
+
+    let (destination, transport) = resolve_in_dialog_destination(
+        &leg.dialog.route_set,
+        state,
+        leg.transport.remote_addr,
+        leg.transport.transport,
+    );
+
+    // Track the retry's own branch — a peer may challenge again with a stale
+    // nonce, and the cap is what stops that becoming a loop.
+    if let Some(retry_branch) = retry
+        .headers
+        .get("Via")
+        .and_then(|raw| Via::parse_multi(raw).ok())
+        .and_then(|vias| vias.first().and_then(|via| via.branch.clone()))
+    {
+        state.call_actors.register_originated_refer(
+            &retry_branch,
+            crate::b2bua::actor::OriginatedRefer {
+                auth_retries: pending.auth_retries + 1,
+                ..pending.clone()
+            },
+        );
+    }
+
+    info!(
+        call_id = %pending.call_id,
+        status = status_code,
+        realm = %challenge.realm,
+        attempt = pending.auth_retries + 1,
+        "B2BUA: siphon-originated REFER challenged, retrying with credentials"
+    );
+
+    send_message_from(
+        retry,
+        transport,
+        destination,
+        leg.transport.connection_id,
+        leg.transport.local_addr,
+        state,
+    );
+    true
+}
+
 fn b2bua_send_outbound_refer(
     state: &DispatcherState,
     internal_call_id: &str,
@@ -17304,6 +17504,32 @@ fn b2bua_send_outbound_refer(
         leg.transport.remote_addr,
         leg.transport.transport,
     );
+
+    // Record the transaction before it goes out, so its response can be matched.
+    // Only the A-leg and B-legs are in the branch registry; an in-dialog request
+    // siphon originates carries a fresh branch that belongs to no leg, so without
+    // this its 401/407 matches nothing and the transfer fails in silence.
+    if let Some(branch) = refer
+        .headers
+        .get("Via")
+        .and_then(|raw| Via::parse_multi(raw).ok())
+        .and_then(|vias| vias.first().and_then(|via| via.branch.clone()))
+    {
+        state.call_actors.register_originated_refer(
+            &branch,
+            crate::b2bua::actor::OriginatedRefer {
+                call_id: internal_call_id.to_string(),
+                on_a_leg,
+                target_uri: refer
+                    .request_uri()
+                    .map(|uri| uri.to_string())
+                    .unwrap_or_default(),
+                refer_to: refer_to.clone(),
+                auth_retries: 0,
+            },
+        );
+    }
+
     send_message_from(
         refer,
         transport,

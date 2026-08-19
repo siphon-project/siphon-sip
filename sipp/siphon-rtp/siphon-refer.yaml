@@ -1,0 +1,37 @@
+# siphon config for the single-leg cold-transfer tests
+# (sipp/refer_single_leg_uac.xml, sipp/refer_challenge_uac.xml).
+#
+# Same single-leg media shape as the voice-AI test — answer_local against the
+# mock siphon-rtp control server — but the script then transfers the caller away
+# with the imperative b2bua.refer(). See sipp/siphon-rtp/refer_single_leg.py.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "ai.example.com"
+
+advertised_address: "172.20.0.107"
+
+script:
+  path: "/etc/siphon/scripts/refer_single_leg.py"
+
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "172.20.0.106:8080"
+    timeout_ms: 2000
+
+  profiles:
+    voice_ai:
+      offer: &voice_ai_flags
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin"]
+      answer: *voice_ai_flags
+
+log:
+  level: info

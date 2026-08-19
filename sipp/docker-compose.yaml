@@ -4211,6 +4211,115 @@ services:
     profiles:
       - voice-ai
 
+  # ── Cold transfer off a single-leg answered call ──────────────────────────
+  # Requires the "refer-single-leg" profile.
+  #
+  # siphon answers the call itself (no B leg) and then transfers the caller away
+  # with an in-dialog REFER. Two UACs share the stack: one accepts the REFER,
+  # one challenges it with 407 and asserts the credentialed retry.
+  #
+  # IP assignments:
+  #   172.20.0.106 — mock siphon-rtp control server
+  #   172.20.0.107 — siphon (B2BUA)
+  #   172.20.0.108 — carrier UAC (plain + challenge)
+
+  mock-siphon-rtp-refer:
+    image: python:3.12-slim
+    container_name: mock-siphon-rtp-refer
+    volumes:
+      - ./siphon-rtp:/app:ro
+    working_dir: /app
+    command: ["python3", "mock_siphon_rtp.py"]
+    environment:
+      SIPHON_RTP_PORT: "8080"
+      MOCK_MEDIA_IP: "203.0.113.1"
+      MOCK_MEDIA_PORT: "30000"
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.106
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket,struct,json; s=socket.create_connection(('127.0.0.1',8080),2); b=json.dumps({'id':1,'command':'ping'}).encode(); s.sendall(struct.pack('!I',len(b))+b); h=s.recv(4); n=struct.unpack('!I',h)[0]; d=s.recv(n); s.close(); exit(0 if b'pong' in d else 1)\""]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    profiles:
+      - refer-single-leg
+
+  siphon-refer:
+    build:
+      context: ..
+    container_name: siphon-refer-test
+    depends_on:
+      mock-siphon-rtp-refer:
+        condition: service_healthy
+    volumes:
+      - ./siphon-rtp/siphon-refer.yaml:/etc/siphon/siphon.yaml:ro
+      - ./siphon-rtp/refer_single_leg.py:/etc/siphon/scripts/refer_single_leg.py:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.107
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - refer-single-leg
+
+  # Accepts the REFER (202) and reports the outcome with a sipfrag NOTIFY.
+  sipp-refer-single-leg-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-refer:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.108
+    entrypoint:
+      - sipp
+      - "172.20.0.107:5060"
+      - -sf
+      - /sipp/scenarios/refer_single_leg_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - refer-single-leg
+
+  # Challenges the REFER with 407 and asserts the credentialed retry.
+  sipp-refer-challenge-uac:
+    image: ctaloi/sipp:latest
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.108
+    entrypoint:
+      - sipp
+      - "172.20.0.107:5060"
+      - -sf
+      - /sipp/scenarios/refer_challenge_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - refer-single-leg
+
 # ── Network ────────────────────────────────────────────────────────────────
 networks:
   sipnet:

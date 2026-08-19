@@ -33,6 +33,9 @@ See docs/cookbook/voice-ai.md for the full run-book.
 """
 from siphon import b2bua, proxy, rtpengine, log
 
+# Where "press 0" sends the caller.
+AGENT_URI = "sip:agent@pbx.example.com"
+
 
 @proxy.on_request("OPTIONS")
 def health(request):
@@ -83,6 +86,18 @@ def on_digit(call_id, from_tag, digit, duration_ms, volume):
     # An IVR would accumulate these; the AI usually just wants the digit.
     log.info(f"[{call_id}] DTMF {digit} ({duration_ms}ms)")
 
+    # "Press 0 for a human" — cold-transfer the caller off the AI.
+    #
+    # This is the imperative verb, not call.refer(), and that is not a style
+    # choice: a call siphon answered itself never fires @b2bua.on_answer (that
+    # hook is a B leg's 2xx arriving), and call.refer() is a no-op from
+    # @b2bua.on_invite because the dialog is not confirmed until the 2xx is out.
+    # On a single-leg call the imperative b2bua.refer() from an event context is
+    # the only path. It keys on the SIP Call-ID, which is what on_dtmf hands us.
+    if digit == "0":
+        log.info(f"[{call_id}] caller asked for an agent — transferring")
+        b2bua.refer(call_id, AGENT_URI)
+
 
 @rtpengine.on_ws_tee_ended
 def on_tee_ended(call_id, from_tag, stream_id, reason, frames_sent, frames_dropped):
@@ -93,7 +108,12 @@ def on_tee_ended(call_id, from_tag, stream_id, reason, frames_sent, frames_dropp
         log.warn(f"[{call_id}] tee {stream_id} died: {reason}")
 
 
-# Handing the caller off to a human is a REFER on the A dialog —
-# call.refer("sip:agent@pbx.example.com"). Not wired here: this example is the
-# answer-and-stream path, and a carrier that challenges an in-dialog REFER needs
-# credentials on the retry, which is a separate concern from the media bridge.
+# A carrier that challenges the in-dialog REFER gets a credentialed retry,
+# using whatever call.set_credentials() was given.
+# Set it before the transfer can fire — the retry reads the credentials off the
+# call:
+#
+#     call.set_credentials("trunk-user", "trunk-secret")
+#
+# Without credentials a challenged REFER is logged at WARN and the transfer
+# fails; it will not retry blind.

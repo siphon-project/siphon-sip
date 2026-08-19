@@ -148,6 +148,47 @@ The bridge needs `siphon-rtp` **0.1.5 or later** on both sides: siphon's pinned
 `siphon-rtp-proto`, and the running engine. Earlier engine builds accept
 `ws_uri` on `answer_local` and silently never dial it.
 
+## Handing the caller to a human
+
+A cold transfer is an in-dialog REFER on the A dialog. On a call siphon answered
+itself there is one way to send it:
+
+```python
+@rtpengine.on_dtmf
+def on_digit(call_id, from_tag, digit, duration_ms, volume):
+    if digit == "0":
+        b2bua.refer(call_id, "sip:agent@pbx.example.com")
+```
+
+**Use the imperative `b2bua.refer(call_id, ...)`, not `call.refer()`.** That is
+not a style preference:
+
+- `@b2bua.on_answer` never fires for a call siphon answered itself — that hook is
+  a *B leg's* 2xx arriving, and there is no B leg.
+- `call.refer()` is deliberately a no-op from `@b2bua.on_invite`, because the
+  dialog is not confirmed until the 2xx has gone out.
+
+So on a single-leg call the transfer has to come from an event context — DTMF, a
+timer, an external controller — and those only have the SIP Call-ID, which is
+exactly what the imperative verb takes.
+
+### When the carrier challenges the REFER
+
+Plenty of trunks answer an in-dialog REFER with a 407.
+Give the call credentials and siphon retries with digest:
+
+```python
+@b2bua.on_invite
+async def answer_with_ai(call):
+    call.set_credentials("trunk-user", "trunk-secret")
+    ...
+```
+
+Set them before the transfer can fire — the retry reads them off the call. The
+retry is a new transaction on the same dialog (RFC 3261 §22.2) and is capped, so
+a trunk that challenges unconditionally cannot loop. Without credentials the
+challenge is logged at WARN and the transfer fails rather than retrying blind.
+
 ## Where the policy lives
 
 The example above keeps everything in the in-process script. To drive the same

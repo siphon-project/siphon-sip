@@ -33,6 +33,7 @@ RUN_PRESENCE=false
 RUN_RTPENGINE=false
 RUN_RTPPROXY=false
 RUN_VOICE_AI=false
+RUN_REFER_SINGLE_LEG=false
 RUN_REINVITE=false
 RUN_B2BUA=false
 RUN_B2BUA_AUTH=false
@@ -60,6 +61,7 @@ for arg in "$@"; do
     --rtpengine)  RUN_RTPENGINE=true;  SELECTED_MODES+=("$arg") ;;
     --rtpproxy)   RUN_RTPPROXY=true;   SELECTED_MODES+=("$arg") ;;
     --voice-ai)   RUN_VOICE_AI=true;   SELECTED_MODES+=("$arg") ;;
+    --refer-single-leg) RUN_REFER_SINGLE_LEG=true; SELECTED_MODES+=("$arg") ;;
     --reinvite)   RUN_REINVITE=true;   SELECTED_MODES+=("$arg") ;;
     --b2bua)      RUN_B2BUA=true;      SELECTED_MODES+=("$arg") ;;
     --b2bua-auth) RUN_B2BUA_AUTH=true; SELECTED_MODES+=("$arg") ;;
@@ -78,7 +80,7 @@ for arg in "$@"; do
       echo
       echo "Scenario modes (pick at most ONE per run):"
       echo "  --ipsec --charging --call --presence --rtpengine --rtpproxy --reinvite"
-      echo "  --voice-ai"
+      echo "  --voice-ai --refer-single-leg"
       echo "  --b2bua --b2bua-auth --b2bua-invite-auth --gateway --auto100 --http-auth"
       echo "  --wedge --banscan"
       echo "  --security --rfc4475 --webrtc"
@@ -189,6 +191,19 @@ if [[ "$RUN_VOICE_AI" == true ]]; then
   run_sipp docker compose -f "$COMPOSE_FILE" --profile voice-ai up \
     --abort-on-container-exit --exit-code-from sipp-voice-ai-uac sipp-voice-ai-uac
   docker compose -f "$COMPOSE_FILE" --profile voice-ai rm -sf sipp-voice-ai-uac 2>/dev/null || true
+fi
+
+# ── Step 7a2: Single-leg cold transfer (optional) ─────────────────────────
+if [[ "$RUN_REFER_SINGLE_LEG" == true ]]; then
+  echo "=== SIPp cold-transfer test (single-leg answer -> in-dialog REFER) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile refer-single-leg up \
+    --abort-on-container-exit --exit-code-from sipp-refer-single-leg-uac sipp-refer-single-leg-uac
+  docker compose -f "$COMPOSE_FILE" --profile refer-single-leg rm -sf sipp-refer-single-leg-uac 2>/dev/null || true
+
+  echo "=== SIPp challenged-REFER test (407 -> credentialed retry) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile refer-single-leg up \
+    --abort-on-container-exit --exit-code-from sipp-refer-challenge-uac sipp-refer-challenge-uac
+  docker compose -f "$COMPOSE_FILE" --profile refer-single-leg rm -sf sipp-refer-challenge-uac 2>/dev/null || true
 fi
 
 # ── Step 7b: Classic rtpproxy proxy test (optional) ───────────────────────
