@@ -1,11 +1,17 @@
 [Unit]
 Description=SIPhon SIP Proxy and B2BUA
-Documentation=https://github.com/siphon-project/siphon
+Documentation=https://siphon-sip.org/
+Documentation=https://github.com/siphon-project/siphon-sip
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
+# A relative script.path in siphon.yaml is resolved against the config
+# file's directory, but anything else relative in the config (and any
+# relative path a script itself opens) still follows the working
+# directory, so pin it to where the config lives.
+WorkingDirectory=/etc/siphon
 ExecStart=/usr/bin/siphon --config /etc/siphon/siphon.yaml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
@@ -19,15 +25,26 @@ Group=siphon
 # File system
 ProtectSystem=strict
 ProtectHome=yes
-ReadWritePaths=/var/lib/siphon
 ReadOnlyPaths=/etc/siphon
 PrivateTmp=yes
+
+# Writable state and logs. ProtectSystem=strict leaves the whole of /var
+# read-only, so these are what make registrar persistence, recordings,
+# CDR files and log.file work at all — they create the directories owned
+# by the service user and add them to the writable set.
+StateDirectory=siphon
+LogsDirectory=siphon
 
 # Capabilities — SIP typically needs to bind to privileged ports (5060)
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
-# Network
+# Network. AF_NETLINK is deliberately absent — add it, together with
+# CAP_NET_ADMIN, only for an IMS P-CSCF using the ipsec: sec-agree block,
+# which installs kernel XFRM state:
+#   RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+#   CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 # Misc hardening
