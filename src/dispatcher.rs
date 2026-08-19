@@ -17477,6 +17477,39 @@ pub fn b2bua_route_call(
     Ok(true)
 }
 
+/// Resolve the A-leg media session of a controlled B2BUA call into the tuple the
+/// [`crate::rtpengine::MediaBackend`] keys on — `(backend, media_call_id, from_tag)`
+/// — for the SIP control adapter's media verbs (`play` / `stop` / `dtmf` /
+/// `hold` / `unhold` / `stream_start` / `stream_stop`).
+///
+/// The media backend does **not** key on the SIP Call-ID: it keys on the media
+/// call-id ([`crate::rtpengine::session::MediaSession::rtpengine_id`], which a
+/// siphon-terminated transfer can re-anchor to a fresh id) plus the A-leg SIP
+/// From-tag. The control adapter only holds the SIP Call-ID
+/// (`ChannelRef.sip_call_id`), so this reuses the exact resolution the dispatcher
+/// itself uses for re-INVITE / SIPREC media rewriting:
+/// `rtpengine_sessions.get(sip_call_id)` (the store is keyed by the A-leg SIP
+/// Call-ID) → `session.rtpengine_id()` + `session.from_tag`.
+///
+/// Returns `None` — mapped by the adapter to a typed `not_found`, never a
+/// fabricated call-id — when the dispatcher is not running, no media backend is
+/// configured, or the call has no anchored media session (already torn down, or
+/// never anchored). The accessor is **stateless** (a `OnceLock` read + a
+/// `DashMap` get + an `Arc` clone): it adds no per-call store of its own, so it
+/// needs no co-located leak test.
+pub fn b2bua_media_target(
+    sip_call_id: &str,
+) -> Option<(Arc<crate::rtpengine::MediaBackend>, String, String)> {
+    let control = B2BUA_CONTROL.get()?;
+    let backend = control.state.rtpengine_set.clone()?;
+    let session = control.state.rtpengine_sessions.as_ref()?.get(sip_call_id)?;
+    Some((
+        backend,
+        session.rtpengine_id().to_string(),
+        session.from_tag.clone(),
+    ))
+}
+
 /// Build and send a UAS response (final 2xx or provisional 1xx) for a B2BUA call
 /// from an imperative `call.answer()` / `call.progress()`.
 ///
@@ -20621,6 +20654,14 @@ mod tests {
     use crate::sip::parser::parse_sip_message;
     use crate::sip::uri::SipUri;
     use crate::sip::builder::SipMessageBuilder;
+
+    #[test]
+    fn b2bua_media_target_is_none_without_dispatcher() {
+        // No B2BUA_CONTROL installed in a unit-test binary → the media-target
+        // accessor resolves to None (the SIP control adapter maps that to a typed
+        // not_found), never a fabricated call-id and never a panic.
+        assert!(b2bua_media_target("sip-call-id@host").is_none());
+    }
 
     // -----------------------------------------------------------------------
     // Transport failure / timeout must become a response (RFC 3261 §16.7, §16.9)

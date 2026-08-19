@@ -582,11 +582,17 @@ fn generate_cookie() -> String {
 }
 
 /// Error for the rtpengine-only verbs that rtpproxy cannot serve.
-fn unsupported(operation: &str) -> RtpEngineError {
-    RtpEngineError::EngineError(format!(
-        "rtpproxy backend does not support '{operation}' \
-         (use the rtpengine or siphon-rtp backend)"
-    ))
+///
+/// Uses the typed [`RtpEngineError::Unsupported`] variant (not a generic
+/// `EngineError`) so callers — the Python `rtpengine` namespace and the SIP
+/// control adapter's media verbs — can map "this backend has no way to do it" to
+/// a stable outcome (`unsupported_verb`) rather than a misleading transient
+/// `unavailable`. `operation` is always a static string literal at the call site.
+fn unsupported(operation: &'static str) -> RtpEngineError {
+    RtpEngineError::Unsupported {
+        operation,
+        backend: "rtpproxy",
+    }
 }
 
 /// Build the modifier suffix for a `U`/`L` command from the profile flags and
@@ -1245,7 +1251,10 @@ mod tests {
         let address = spawn_mock_rtpproxy("203.0.113.1", 30000).await;
         let set = RtpProxyClientSet::new(vec![(address, 1000, 1)], 1).await.unwrap();
         let error = set.silence_media("c1", "ft").await.unwrap_err();
-        assert!(matches!(error, RtpEngineError::EngineError(_)));
-        assert!(error.to_string().contains("does not support"));
+        assert!(matches!(
+            error,
+            RtpEngineError::Unsupported { operation: "silence_media", backend: "rtpproxy" }
+        ));
+        assert!(error.to_string().contains("not supported"));
     }
 }

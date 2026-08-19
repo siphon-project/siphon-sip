@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use siphon::rtpengine::profile::NgFlags;
-use siphon::rtpengine::{MediaBackend, RtpProxyClientSet};
+use siphon::rtpengine::{MediaBackend, RtpEngineError, RtpProxyClientSet};
 use siphon::sip::parser::parse_sip_message;
 
 use bytes::BytesMut;
@@ -108,9 +108,12 @@ async fn media_backend_rtpproxy_unsupported_op_errors_cleanly() {
     let set = RtpProxyClientSet::new(vec![(address, 1000, 1)], 2).await.unwrap();
     let backend = MediaBackend::RtpProxy(set);
 
-    // rtpengine-only verbs must surface a clear error, not panic or hang.
+    // rtpengine-only verbs must surface a clear typed error, not panic or hang.
     let error = backend.silence_media("c1", "ft").await.unwrap_err();
-    assert!(error.to_string().contains("does not support"), "{error}");
+    assert!(
+        matches!(error, RtpEngineError::Unsupported { backend: "rtpproxy", .. }),
+        "{error}"
+    );
 }
 
 #[tokio::test]

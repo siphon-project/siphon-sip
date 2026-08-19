@@ -74,6 +74,27 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   "expose one namespace object" case and keep their built-in-name collision
   check — a module extension picks its own attribute names and is not
   collision-checked.
+- **Control-plane header-remove + media-control verbs on the SIP adapter.** The
+  `siphon-control.v1` `sip` module gains `remove_header` (remove a header from
+  the stored A-leg INVITE, the mirror of `set_header`) plus the media verbs
+  `play` / `stop` / `dtmf` / `hold` / `unhold` / `stream_start` / `stream_stop`,
+  each bound to the configured media backend and applied against the controlled
+  A-leg's anchored media session. `play` is fire-and-forget — the reply confirms
+  the backend accepted the command, it does not block on prompt completion — with
+  the source as exactly one of `file` / `db_id` / `blob` (base64 over the JSON
+  wire). `hold`/`unhold` map to the engine's silence/unsilence (a gentle hold
+  that keeps the path up; packet drop stays a future gate verb). `stream_start`/
+  `stream_stop` attach/detach an additive WebSocket audio tee (a copy of the live
+  audio for transcription / agent-assist / compliance, not a media takeover);
+  this is a `siphon-rtp`-backend feature, so on rtpengine/rtpproxy it answers
+  `unsupported_verb` rather than a hollow success. Errors are typed, never a
+  hang: a call with no anchored media session → `not_found`, a backend that
+  cannot perform the op → `unsupported_verb`, any other backend failure →
+  `unavailable`. The media call-id + from-tag are resolved from the call's SIP
+  Call-ID through the same media-session mapping the dispatcher uses for
+  re-INVITE / SIPREC, so a re-anchored transfer is addressed on its real media
+  id. Server-side only — the client SDK facade methods are a follow-up (reach the
+  verbs meanwhile through the generic `command(verb, args)` escape hatch).
 - **`auth.require_proxy_digest()` / `require_www_digest()` / `require_digest()` /
   `verify_digest()` now take a B2BUA `Call` as well as a proxy `Request`, so a
   B2BUA can challenge its own caller.** Registering any `@b2bua.*` handler makes

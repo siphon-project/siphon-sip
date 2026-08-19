@@ -212,7 +212,13 @@ chunk, so logs join Homer and billing with no mapping table.
 | `hangup` | sip | `{reason?}` | BYE an answered call, or reject an unanswered one |
 | `refer` | sip | `{to, replaces?}` | in-dialog REFER on the A-leg |
 | `route` | sip | `{targets, strategy?, headers?}` | return control to siphon: un-park the call and dial the B-leg via LCR sequential failover |
-| `set_header` / `get_header` | sip | `{name, value?}` | on the stored A-leg INVITE |
+| `set_header` / `remove_header` / `get_header` | sip | `{name, value?}` | on the stored A-leg INVITE |
+| `play` | sip | `{file\|db_id\|blob, repeat?, start_ms?, duration_ms?, to_tag?}` | play an announcement on the A-leg media (fire-and-forget) |
+| `stop` | sip | — | stop the announcement currently playing |
+| `dtmf` | sip | `{digits, duration_ms?, volume_dbm0?, pause_ms?, to_tag?}` | inject DTMF digits toward the A-leg |
+| `hold` / `unhold` | sip | — | media hold via silence |
+| `stream_start` | sip | `{ws_uri, direction?, channels?}` | attach a WebSocket audio tee (siphon-rtp backend only) |
+| `stream_stop` | sip | — | detach the WebSocket audio tee |
 | `set_var` / `get_var` | — | `{key, value?}` | per-call variables (drain with the call) |
 | `resync` | — | — | re-attach + enumerate this app's owned calls |
 | `describe` | — | — | list the registered adapters + their verb/event schema |
@@ -232,8 +238,31 @@ failover. `continue` (bare hand-back, siphon re-decides routing through the
 script's `@b2bua.on_*` handlers) is a follow-up, pending the control-loss
 `fallback` re-dispatch path.
 
-`play` / `dtmf` / `bridge` / `originate` / media-stream verbs arrive in later
-phases over the same envelope.
+The media verbs (`play` / `stop` / `dtmf` / `hold` / `unhold` / `stream_start` /
+`stream_stop`) act on the controlled A-leg's anchored media session. They are
+resolved against the configured media backend and answer with a typed reply the
+same way every other verb does — never a hang:
+
+- `play` is **fire-and-forget**: the reply confirms the backend *accepted* the
+  command (`{state: "playing"}`), it does not wait for the prompt to finish. The
+  source is exactly one of `file` (a path on the media host), `db_id` (a prompt
+  in the engine's DB), or `blob` (base64-encoded audio, since the wire is JSON).
+- `hold` maps to the engine's *silence* (comfort-noise) mode and `unhold`
+  restores it — a gentle hold that keeps the media path up. Dropping packets
+  outright (`block`/`unblock`) is a separate future gate verb.
+- `stream_start` / `stream_stop` attach and detach a **WebSocket audio tee** —
+  an *additive* copy of the live call's audio for transcription / agent-assist /
+  compliance, not a takeover of the media path. This is a `siphon-rtp`-backend
+  feature: on rtpengine / rtpproxy it answers `unsupported_verb` rather than a
+  hollow success. `direction` is `both` (default) / `caller` / `callee`, and
+  `channels` is `1` (mixed mono) or `2` (caller/callee stereo).
+- A call with no anchored media session answers `not_found`; a backend that
+  cannot perform the op answers `unsupported_verb`; any other backend failure
+  answers `unavailable`.
+
+`bridge` / `originate` verbs arrive in later phases over the same envelope. The
+client SDK facade methods for the media verbs land alongside them (until then,
+reach the verbs through the generic `command(verb, args)` escape hatch).
 
 The complete wire reference, both connection modes end to end, and two
 low-level example clients (one Python, one TypeScript) that drive calls with no

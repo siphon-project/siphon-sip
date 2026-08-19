@@ -31,7 +31,15 @@ impl ControlAdapter for SipControlAdapter {
     }
 
     fn apply<'a>(&'a self, command: AdapterCommand) -> BoxFuture<'a, ControlResult> {
-        Box::pin(async move { apply_sip(command) })
+        // Media verbs bind to the async MediaBackend, so they run on the async
+        // path; every other verb is a synchronous decision over the B2BUA rail.
+        Box::pin(async move {
+            if is_media_verb(&command.verb) {
+                apply_media_verb(command).await
+            } else {
+                apply_sip(command)
+            }
+        })
     }
 
     fn describe(&self) -> AdapterSchema {
@@ -45,7 +53,15 @@ impl ControlAdapter for SipControlAdapter {
                 verb("refer", "Send an in-dialog REFER on the A-leg (args: to, replaces)"),
                 verb("route", "Return control to siphon with a routing decision: un-park the call and dial the B-leg via LCR sequential failover (args: targets, strategy, headers)"),
                 verb("set_header", "Set a header on the stored A-leg INVITE (args: name, value)"),
+                verb("remove_header", "Remove a header from the stored A-leg INVITE (args: name)"),
                 verb("get_header", "Read a header from the stored A-leg INVITE (args: name)"),
+                verb("play", "Play an announcement on the A-leg media, fire-and-forget (args: one of file|db_id|blob, repeat, start_ms, duration_ms, to_tag)"),
+                verb("stop", "Stop the announcement currently playing on the A-leg media"),
+                verb("dtmf", "Inject DTMF digits toward the A-leg (args: digits, duration_ms, volume_dbm0, pause_ms, to_tag)"),
+                verb("hold", "Hold the A-leg media via silence"),
+                verb("unhold", "Resume the A-leg media after a hold"),
+                verb("stream_start", "Attach a WebSocket audio tee — siphon-rtp backend only (args: ws_uri, direction, channels)"),
+                verb("stream_stop", "Detach the WebSocket audio tee"),
             ],
             events: vec![
                 "StasisStart".to_string(),
@@ -64,25 +80,45 @@ fn verb(name: &str, summary: &str) -> VerbSchema {
     }
 }
 
-/// Dispatch one SIP verb. Synchronous (the imperative rail is non-blocking) —
-/// returns the local result immediately.
-fn apply_sip(command: AdapterCommand) -> ControlResult {
-    // All SIP verbs act on a channel.
+/// The media-control verbs the SIP adapter dispatches asynchronously against the
+/// configured [`crate::rtpengine::MediaBackend`] (rather than the synchronous
+/// B2BUA rail). Kept in one place so `apply` and the tests agree on the split.
+fn is_media_verb(verb: &str) -> bool {
+    matches!(
+        verb,
+        "play" | "stop" | "dtmf" | "hold" | "unhold" | "stream_start" | "stream_stop"
+    )
+}
+
+/// Resolve the command's channel target and mark the controller as having acted
+/// (clearing the answer-timeout handoff default). Shared by the synchronous SIP
+/// verbs and the asynchronous media verbs. Returns the typed error result to
+/// send back when the command carries no channel target.
+fn controlled_channel(command: &AdapterCommand) -> Result<ChannelRef, ControlResult> {
     let channel = match &command.target {
         ResolvedTarget::Channel(channel) => channel.clone(),
         ResolvedTarget::None => {
-            return ControlResult::error(
+            return Err(ControlResult::error(
                 ControlErrorCode::BadRequest,
                 format!("verb '{}' requires a channel target", command.verb),
-            );
+            ));
         }
     };
-
     // The controller has acted: clear the handoff deadline so the answer-timeout
     // sweep no longer applies the parked default action to this call.
     if let Some(store) = crate::b2bua::actor::global_call_store() {
         store.mark_controller_acted(&channel.call_actor_id);
     }
+    Ok(channel)
+}
+
+/// Dispatch one synchronous SIP verb (the imperative B2BUA rail is non-blocking)
+/// — returns the local result immediately.
+fn apply_sip(command: AdapterCommand) -> ControlResult {
+    let channel = match controlled_channel(&command) {
+        Ok(channel) => channel,
+        Err(result) => return result,
+    };
 
     match command.verb.as_str() {
         "answer" => answer(&channel, &command.args, true),
@@ -92,13 +128,308 @@ fn apply_sip(command: AdapterCommand) -> ControlResult {
         "refer" => refer(&channel, &command.args),
         "route" => route(&channel, &command.args),
         "set_header" => set_header(&channel, &command.args),
+        "remove_header" => remove_header(&channel, &command.args),
         "get_header" => get_header(&channel, &command.args),
-        // Media verbs (play/stop/dtmf/collect_dtmf) bind to MediaBackend and land
-        // with the AI-park mode — a typed error, never a hang.
         other => ControlResult::error(
             ControlErrorCode::UnsupportedVerb,
             format!("sip adapter does not implement verb '{other}' in this build"),
         ),
+    }
+}
+
+/// Dispatch one media verb asynchronously against the configured MediaBackend.
+///
+/// The `(media_call_id, from_tag)` tuple is resolved from the channel's SIP
+/// Call-ID via [`crate::dispatcher::b2bua_media_target`] (the stateless
+/// media-session accessor). A call with no anchored media session returns a typed
+/// `not_found` — never a hang, never a fabricated call-id. The verb `.await`s
+/// only the backend's *accept* of the command, not the far-end media outcome
+/// (playback completion, tee liveness), which arrives later as events.
+async fn apply_media_verb(command: AdapterCommand) -> ControlResult {
+    let channel = match controlled_channel(&command) {
+        Ok(channel) => channel,
+        Err(result) => return result,
+    };
+
+    match command.verb.as_str() {
+        "play" => play(&channel, &command.args).await,
+        "stop" => stop(&channel).await,
+        "dtmf" => dtmf(&channel, &command.args).await,
+        "hold" => hold(&channel, true).await,
+        "unhold" => hold(&channel, false).await,
+        "stream_start" => stream_start(&channel, &command.args).await,
+        "stream_stop" => stream_stop(&channel).await,
+        other => ControlResult::error(
+            ControlErrorCode::UnsupportedVerb,
+            format!("sip adapter does not implement verb '{other}' in this build"),
+        ),
+    }
+}
+
+/// Resolve the MediaBackend + media `(call_id, from_tag)` for a controlled call,
+/// or the typed `not_found` result to return when no media session is anchored.
+fn media_target(
+    channel: &ChannelRef,
+) -> Result<(std::sync::Arc<crate::rtpengine::MediaBackend>, String, String), ControlResult> {
+    crate::dispatcher::b2bua_media_target(&channel.sip_call_id).ok_or_else(|| {
+        ControlResult::error(
+            ControlErrorCode::NotFound,
+            "call has no anchored media session",
+        )
+    })
+}
+
+/// Map a [`crate::rtpengine::error::RtpEngineError`] to a typed control result —
+/// every media command answers, even on error, never a hang.
+///   - the engine has no such call → `not_found` (the media session is gone),
+///   - the backend can't do it (rtpproxy media / non-siphon-rtp ws_tee) →
+///     `unsupported_verb`,
+///   - anything else (transport, timeout, engine error) → `unavailable`.
+fn media_error(error: crate::rtpengine::error::RtpEngineError) -> ControlResult {
+    use crate::rtpengine::error::RtpEngineError;
+    if error.is_call_not_found() {
+        ControlResult::error(ControlErrorCode::NotFound, "media session is gone")
+    } else if matches!(error, RtpEngineError::Unsupported { .. }) {
+        ControlResult::error(ControlErrorCode::UnsupportedVerb, error.to_string())
+    } else {
+        ControlResult::error(ControlErrorCode::Unavailable, error.to_string())
+    }
+}
+
+/// Parse the `play` source args into a [`crate::rtpengine::client::PlayMediaSource`]:
+/// exactly one of `file` (path string), `db_id` (integer), or `blob` (base64
+/// string). Mirrors the script API's `resolve_play_media_source` (file/blob/db_id
+/// are mutually exclusive), with `blob` carried as base64 since the control wire
+/// is JSON text.
+fn parse_play_source(
+    args: &serde_json::Value,
+) -> Result<crate::rtpengine::client::PlayMediaSource, String> {
+    use crate::rtpengine::client::PlayMediaSource;
+    let file = args.get("file").and_then(|value| value.as_str());
+    let db_id = args.get("db_id").and_then(|value| value.as_u64());
+    let blob = args.get("blob").and_then(|value| value.as_str());
+    let count = [file.is_some(), db_id.is_some(), blob.is_some()]
+        .iter()
+        .filter(|present| **present)
+        .count();
+    if count != 1 {
+        return Err(
+            "play requires exactly one of args.file (path), args.db_id (int), or args.blob (base64)"
+                .to_string(),
+        );
+    }
+    if let Some(path) = file {
+        return Ok(PlayMediaSource::File(path.to_string()));
+    }
+    if let Some(id) = db_id {
+        return Ok(PlayMediaSource::DbId(id));
+    }
+    if let Some(encoded) = blob {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|error| format!("play args.blob is not valid base64: {error}"))?;
+        return Ok(PlayMediaSource::Blob(bytes));
+    }
+    // Unreachable given count == 1, but return a typed error rather than panic.
+    Err("play requires a media source".to_string())
+}
+
+/// Parse an optional `channels` arg for `stream_start` (1 = mixed mono, 2 =
+/// caller/callee stereo). Absent → engine default (`None`).
+fn parse_stream_channels(value: Option<&serde_json::Value>) -> Result<Option<u8>, String> {
+    match value {
+        None => Ok(None),
+        Some(value) if value.is_null() => Ok(None),
+        Some(value) => match value.as_u64() {
+            Some(1) => Ok(Some(1)),
+            Some(2) => Ok(Some(2)),
+            _ => Err("stream_start args.channels must be 1 (mono) or 2 (stereo)".to_string()),
+        },
+    }
+}
+
+/// `play` — start an announcement on the A-leg's media. Fire-and-forget: `wait`
+/// is false, so this returns on the backend's *accept*, never blocking on
+/// playback completion (the far-end result is not the command reply).
+async fn play(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
+    let source = match parse_play_source(args) {
+        Ok(source) => source,
+        Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
+    };
+    let repeat = args.get("repeat").and_then(|value| value.as_u64());
+    let start_ms = args.get("start_ms").and_then(|value| value.as_u64());
+    let duration_ms = args.get("duration_ms").and_then(|value| value.as_u64());
+    let to_tag = args
+        .get("to_tag")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+
+    let (backend, call_id, from_tag) = match media_target(channel) {
+        Ok(target) => target,
+        Err(result) => return result,
+    };
+    match backend
+        .play_media(
+            &call_id,
+            &from_tag,
+            &source,
+            repeat,
+            start_ms,
+            duration_ms,
+            to_tag.as_deref(),
+            false,
+        )
+        .await
+    {
+        Ok(_) => ControlResult::Ok(
+            serde_json::json!({ "channel": channel.channel_id, "state": "playing" }),
+        ),
+        Err(error) => media_error(error),
+    }
+}
+
+/// `stop` — stop any prompt currently playing on the A-leg's media.
+async fn stop(channel: &ChannelRef) -> ControlResult {
+    let (backend, call_id, from_tag) = match media_target(channel) {
+        Ok(target) => target,
+        Err(result) => return result,
+    };
+    match backend.stop_media(&call_id, &from_tag).await {
+        Ok(()) => ControlResult::Ok(
+            serde_json::json!({ "channel": channel.channel_id, "state": "stopped" }),
+        ),
+        Err(error) => media_error(error),
+    }
+}
+
+/// `dtmf` — inject DTMF digits toward the A-leg (fire-and-forget).
+async fn dtmf(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
+    let digits = match args
+        .get("digits")
+        .or_else(|| args.get("code"))
+        .and_then(|value| value.as_str())
+    {
+        Some(digits) if !digits.is_empty() => digits.to_string(),
+        Some(_) => {
+            return ControlResult::error(
+                ControlErrorCode::BadRequest,
+                "dtmf args.digits must be a non-empty string",
+            );
+        }
+        None => {
+            return ControlResult::error(ControlErrorCode::BadRequest, "dtmf requires args.digits");
+        }
+    };
+    let duration_ms = args.get("duration_ms").and_then(|value| value.as_u64());
+    let volume_dbm0 = args.get("volume_dbm0").and_then(|value| value.as_i64());
+    let pause_ms = args.get("pause_ms").and_then(|value| value.as_u64());
+    let to_tag = args
+        .get("to_tag")
+        .and_then(|value| value.as_str())
+        .map(|value| value.to_string());
+
+    let (backend, call_id, from_tag) = match media_target(channel) {
+        Ok(target) => target,
+        Err(result) => return result,
+    };
+    match backend
+        .play_dtmf(
+            &call_id,
+            &from_tag,
+            &digits,
+            duration_ms,
+            volume_dbm0,
+            pause_ms,
+            to_tag.as_deref(),
+        )
+        .await
+    {
+        Ok(()) => ControlResult::Ok(
+            serde_json::json!({ "channel": channel.channel_id, "state": "playing", "digits": digits }),
+        ),
+        Err(error) => media_error(error),
+    }
+}
+
+/// `hold` / `unhold` — gentle media hold via silence. `hold` → `silence_media`,
+/// `unhold` → `unsilence_media` (drop/undrop of packets, `block_media`, is a
+/// separate future gate verb — deliberately not exposed here).
+async fn hold(channel: &ChannelRef, engage: bool) -> ControlResult {
+    let (backend, call_id, from_tag) = match media_target(channel) {
+        Ok(target) => target,
+        Err(result) => return result,
+    };
+    let outcome = if engage {
+        backend.silence_media(&call_id, &from_tag).await
+    } else {
+        backend.unsilence_media(&call_id, &from_tag).await
+    };
+    match outcome {
+        Ok(()) => {
+            let state = if engage { "held" } else { "unheld" };
+            ControlResult::Ok(serde_json::json!({ "channel": channel.channel_id, "state": state }))
+        }
+        Err(error) => media_error(error),
+    }
+}
+
+/// `stream_start` — attach a WebSocket audio tee streaming a copy of the call's
+/// decoded audio to `ws_uri` while the call keeps relaying. siphon-rtp backend
+/// only: rtpengine / rtpproxy return `unsupported_verb` (a hollow success would
+/// read as "the tee is attached" while nothing reaches the consumer).
+async fn stream_start(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
+    let Some(ws_uri) = args.get("ws_uri").and_then(|value| value.as_str()) else {
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "stream_start requires args.ws_uri",
+        );
+    };
+    let ws_uri = ws_uri.to_string();
+    let direction = match args.get("direction").and_then(|value| value.as_str()) {
+        None => crate::rtpengine::profile::WsTeeDirection::Both,
+        Some(value) => match crate::rtpengine::profile::WsTeeDirection::parse(value) {
+            Some(direction) => direction,
+            None => {
+                return ControlResult::error(
+                    ControlErrorCode::BadRequest,
+                    format!("stream_start args.direction must be one of both/caller/callee, got '{value}'"),
+                );
+            }
+        },
+    };
+    let channels = match parse_stream_channels(args.get("channels")) {
+        Ok(channels) => channels,
+        Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
+    };
+
+    let (backend, call_id, from_tag) = match media_target(channel) {
+        Ok(target) => target,
+        Err(result) => return result,
+    };
+    match backend
+        .attach_ws_tee(&call_id, &from_tag, &ws_uri, direction, channels)
+        .await
+    {
+        Ok(()) => ControlResult::Ok(
+            serde_json::json!({ "channel": channel.channel_id, "state": "streaming" }),
+        ),
+        Err(error) => media_error(error),
+    }
+}
+
+/// `stream_stop` — detach the WebSocket audio tee (idempotent on siphon-rtp;
+/// `unsupported_verb` on the other backends, same reason as `stream_start`).
+async fn stream_stop(channel: &ChannelRef) -> ControlResult {
+    let (backend, call_id, from_tag) = match media_target(channel) {
+        Ok(target) => target,
+        Err(result) => return result,
+    };
+    match backend.detach_ws_tee(&call_id, &from_tag).await {
+        Ok(()) => ControlResult::Ok(
+            serde_json::json!({ "channel": channel.channel_id, "state": "detached" }),
+        ),
+        Err(error) => media_error(error),
     }
 }
 
@@ -384,6 +715,26 @@ fn set_header(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
     ControlResult::Ok(serde_json::json!({ "channel": channel.channel_id, "header": name }))
 }
 
+/// Remove a header from the stored A-leg INVITE (mirror of [`set_header`], using
+/// the `Headers::remove` API). `removed` reports whether the header was present.
+fn remove_header(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
+    let Some(name) = args.get("name").and_then(|v| v.as_str()) else {
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "remove_header requires args.name",
+        );
+    };
+    let Some(invite_arc) = stored_invite(&channel.call_actor_id) else {
+        return ControlResult::error(ControlErrorCode::NotFound, "call is gone");
+    };
+    let Ok(mut invite) = invite_arc.lock() else {
+        return ControlResult::error(ControlErrorCode::Unavailable, "call invite lock poisoned");
+    };
+    let was_present = invite.headers.has(name);
+    invite.headers.remove(name);
+    ControlResult::Ok(serde_json::json!({ "channel": channel.channel_id, "header": name, "removed": was_present }))
+}
+
 fn get_header(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
     let Some(name) = args.get("name").and_then(|v| v.as_str()) else {
         return ControlResult::error(ControlErrorCode::BadRequest, "get_header requires args.name");
@@ -421,7 +772,24 @@ mod tests {
         let schema = SipControlAdapter::new().describe();
         assert_eq!(schema.module, "sip");
         let verbs: Vec<&str> = schema.verbs.iter().map(|v| v.verb.as_str()).collect();
-        for expected in ["answer", "progress", "reject", "hangup", "refer", "route"] {
+        for expected in [
+            "answer",
+            "progress",
+            "reject",
+            "hangup",
+            "refer",
+            "route",
+            "set_header",
+            "remove_header",
+            "get_header",
+            "play",
+            "stop",
+            "dtmf",
+            "hold",
+            "unhold",
+            "stream_start",
+            "stream_stop",
+        ] {
             assert!(verbs.contains(&expected), "missing verb {expected}");
         }
     }
@@ -453,18 +821,259 @@ mod tests {
     }
 
     #[test]
-    fn media_verb_is_unsupported_not_a_hang() {
-        for verb in ["play", "stop", "dtmf", "collect_dtmf"] {
-            let result = apply_sip(AdapterCommand {
-                verb: verb.to_string(),
-                args: serde_json::json!({}),
-                target: ResolvedTarget::Channel(channel()),
-            });
+    fn is_media_verb_splits_media_from_sip() {
+        for verb in ["play", "stop", "dtmf", "hold", "unhold", "stream_start", "stream_stop"] {
+            assert!(is_media_verb(verb), "{verb} should route to the async media path");
+        }
+        for verb in ["answer", "progress", "reject", "hangup", "refer", "route", "set_header", "remove_header", "get_header", "collect_dtmf", "teleport"] {
+            assert!(!is_media_verb(verb), "{verb} should NOT route to the async media path");
+        }
+    }
+
+    #[tokio::test]
+    async fn media_verbs_without_dispatcher_are_not_found_not_a_hang() {
+        // The media verbs now EXIST (they no longer fall to unsupported_verb).
+        // With no B2BUA_CONTROL installed, b2bua_media_target() is None, so each
+        // resolves to a typed not_found and returns immediately — never a hang,
+        // never a fabricated call-id. Args are well-formed so resolution is
+        // reached (not short-circuited on a bad_request).
+        let cases = [
+            ("play", serde_json::json!({ "file": "/prompts/welcome.wav" })),
+            ("stop", serde_json::json!({})),
+            ("dtmf", serde_json::json!({ "digits": "123#" })),
+            ("hold", serde_json::json!({})),
+            ("unhold", serde_json::json!({})),
+            ("stream_start", serde_json::json!({ "ws_uri": "ws://ai:9000/stream" })),
+            ("stream_stop", serde_json::json!({})),
+        ];
+        let adapter = SipControlAdapter::new();
+        for (verb, args) in cases {
+            let result = adapter
+                .apply(AdapterCommand {
+                    verb: verb.to_string(),
+                    args,
+                    target: ResolvedTarget::Channel(channel()),
+                })
+                .await;
             assert!(
-                matches!(result, ControlResult::Error { code: ControlErrorCode::UnsupportedVerb, .. }),
-                "verb {verb} should be a typed unsupported error"
+                matches!(result, ControlResult::Error { code: ControlErrorCode::NotFound, .. }),
+                "media verb {verb} without a dispatcher should be not_found, got {result:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn play_without_a_source_is_bad_request() {
+        // Parsed before media-target resolution, so it holds with no dispatcher.
+        let result = play(&channel(), &serde_json::json!({})).await;
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn play_with_two_sources_is_bad_request() {
+        let result = play(
+            &channel(),
+            &serde_json::json!({ "file": "/a.wav", "db_id": 7 }),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn dtmf_without_digits_is_bad_request() {
+        let missing = dtmf(&channel(), &serde_json::json!({})).await;
+        assert!(matches!(
+            missing,
+            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+        ));
+        let empty = dtmf(&channel(), &serde_json::json!({ "digits": "" })).await;
+        assert!(matches!(
+            empty,
+            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_start_without_ws_uri_is_bad_request() {
+        let result = stream_start(&channel(), &serde_json::json!({})).await;
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_start_with_bad_direction_is_bad_request() {
+        let result = stream_start(
+            &channel(),
+            &serde_json::json!({ "ws_uri": "ws://ai:9000", "direction": "sideways" }),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn stream_start_with_bad_channels_is_bad_request() {
+        let result = stream_start(
+            &channel(),
+            &serde_json::json!({ "ws_uri": "ws://ai:9000", "channels": 3 }),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+        ));
+    }
+
+    #[test]
+    fn parse_play_source_variants() {
+        use crate::rtpengine::client::PlayMediaSource;
+        // file
+        assert!(matches!(
+            parse_play_source(&serde_json::json!({ "file": "/p.wav" })),
+            Ok(PlayMediaSource::File(path)) if path == "/p.wav"
+        ));
+        // db_id
+        assert!(matches!(
+            parse_play_source(&serde_json::json!({ "db_id": 42 })),
+            Ok(PlayMediaSource::DbId(42))
+        ));
+        // blob (base64 of "hi")
+        assert!(matches!(
+            parse_play_source(&serde_json::json!({ "blob": "aGk=" })),
+            Ok(PlayMediaSource::Blob(bytes)) if bytes == b"hi"
+        ));
+        // none / two → error
+        assert!(parse_play_source(&serde_json::json!({})).is_err());
+        assert!(parse_play_source(&serde_json::json!({ "file": "/a", "db_id": 1 })).is_err());
+        // invalid base64 → error
+        assert!(parse_play_source(&serde_json::json!({ "blob": "not base64!!" })).is_err());
+    }
+
+    #[test]
+    fn parse_stream_channels_bounds() {
+        assert_eq!(parse_stream_channels(None), Ok(None));
+        assert_eq!(parse_stream_channels(Some(&serde_json::Value::Null)), Ok(None));
+        assert_eq!(parse_stream_channels(Some(&serde_json::json!(1))), Ok(Some(1)));
+        assert_eq!(parse_stream_channels(Some(&serde_json::json!(2))), Ok(Some(2)));
+        assert!(parse_stream_channels(Some(&serde_json::json!(3))).is_err());
+        assert!(parse_stream_channels(Some(&serde_json::json!(0))).is_err());
+    }
+
+    #[test]
+    fn media_error_maps_each_backend_error() {
+        use crate::rtpengine::error::RtpEngineError;
+        // Engine has no such call → not_found.
+        assert!(matches!(
+            media_error(RtpEngineError::EngineError("Unknown call-id".to_string())),
+            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+        ));
+        // Backend can't do it → unsupported_verb.
+        assert!(matches!(
+            media_error(RtpEngineError::Unsupported { operation: "attach_ws_tee", backend: "rtpengine" }),
+            ControlResult::Error { code: ControlErrorCode::UnsupportedVerb, .. }
+        ));
+        // Anything else → unavailable.
+        assert!(matches!(
+            media_error(RtpEngineError::Timeout { timeout_ms: 1000 }),
+            ControlResult::Error { code: ControlErrorCode::Unavailable, .. }
+        ));
+    }
+
+    #[test]
+    fn remove_header_without_name_is_bad_request() {
+        let result = remove_header(&channel(), &serde_json::json!({}));
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+        ));
+    }
+
+    #[test]
+    fn remove_header_dispatches_through_apply_sip() {
+        // Prove the "remove_header" arm is wired in apply_sip: with a name but no
+        // stored invite (no call store for this call), it reaches remove_header and
+        // returns not_found — not the unsupported_verb catch-all.
+        let result = apply_sip(AdapterCommand {
+            verb: "remove_header".to_string(),
+            args: serde_json::json!({ "name": "X-Foo" }),
+            target: ResolvedTarget::Channel(channel()),
+        });
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+        ));
+    }
+
+    #[test]
+    fn remove_header_removes_from_the_stored_invite() {
+        use crate::b2bua::actor::{CallActorStore, Leg, TransportInfo};
+        use crate::transport::{ConnectionId, Transport};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::{Arc, Mutex};
+
+        // Build an A-leg INVITE carrying an X-Remove-Me header, park it in a fresh
+        // call store, and install that store globally (unique call-actor-id so it
+        // never collides with other tests that expect their own call absent).
+        let raw = concat!(
+            "INVITE sip:bob@biloxi.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP pc33.atlanta.com;branch=z9hG4bK-rm1\r\n",
+            "From: <sip:alice@atlanta.com>;tag=rmtag\r\n",
+            "To: <sip:bob@biloxi.com>\r\n",
+            "Call-ID: remove-header-call@atlanta.com\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "X-Remove-Me: please\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        let invite = crate::sip::parser::parse_sip_message_bytes(raw.as_bytes()).unwrap();
+        assert!(invite.headers.has("X-Remove-Me"));
+        let invite_arc = Arc::new(Mutex::new(invite));
+
+        let store = Arc::new(CallActorStore::new());
+        let transport = TransportInfo {
+            remote_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 5060),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+            local_addr: None,
+        };
+        let a_leg = Leg::new_a_leg(
+            "remove-header-call@atlanta.com".to_string(),
+            "rmtag".to_string(),
+            "z9hG4bK-rm1".to_string(),
+            transport,
+        );
+        let internal_call_id = store.create_call(a_leg);
+        store.set_a_leg_invite(&internal_call_id, Arc::clone(&invite_arc));
+        crate::b2bua::actor::set_global_call_store(Arc::clone(&store));
+
+        let controlled = ChannelRef {
+            channel_id: "ch-rm".to_string(),
+            call_actor_id: internal_call_id,
+            sip_call_id: "remove-header-call@atlanta.com".to_string(),
+            app: "ivr-app".to_string(),
+        };
+
+        let result = remove_header(&controlled, &serde_json::json!({ "name": "X-Remove-Me" }));
+        // was_present = true → removed: true.
+        match result {
+            ControlResult::Ok(value) => {
+                assert_eq!(value.get("removed").and_then(|v| v.as_bool()), Some(true));
+            }
+            other => panic!("expected Ok, got {other:?}"),
+        }
+        // The header is really gone from the stored invite.
+        let invite = invite_arc.lock().unwrap();
+        assert!(!invite.headers.has("X-Remove-Me"));
     }
 
     #[test]
