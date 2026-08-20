@@ -7,6 +7,27 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Fixed
+- **A proxied in-dialog request whose Request-URI addresses the proxy itself is
+  now forwarded to the dialog's established peer instead of failing as a
+  routing loop.** RFC 3261 §12.2.1.1 has the UAC build a mid-dialog request
+  from the remote target (the peer's Contact) plus the route set, but a common
+  class of UAC keeps the proxy's address in the R-URI — so after the proxy
+  consumed its own Route (§16.4) the computed next hop was the proxy itself,
+  and the request was answered `482 Loop Detected` (re-INVITE/UPDATE/BYE) or
+  silently dropped (the end-to-end 2xx ACK, leaving the UAS retransmitting its
+  200 until Timer H). On a hold/resume pair the resume re-INVITE was the
+  visible casualty: the caller never got its 200 and the call hung. Both paths
+  now fall back to the dialog session's established downstream branch when the
+  resolved next hop is one of our own listeners, and only a session whose
+  branch *also* points at us still draws the loop answer. A completed
+  re-INVITE's per-transaction session teardown also no longer evicts the
+  dialog-establishing INVITE's dialog-key entry (the removal twin of the
+  insert-side first-writer-wins guard), so the *second* and later in-dialog
+  requests of a call still find the dialog. The `--reinvite` SIPp mode now
+  actually gates on this: the runner propagates the UAC's exit code, the UAC
+  fails on the global timeout, and each re-INVITE's 200 is asserted by CSeq so
+  a retransmitted initial-INVITE 200 can no longer mask a lost re-INVITE.
+
 - **`cdr.file.rotate_size_mb` actually rotates.** The value was documented,
   parsed and carried into the file backend, then dropped at the write site — so
   a CDR file configured with `rotate_size_mb: 100` grew without bound. It now
