@@ -11946,6 +11946,25 @@ fn b2bua_advance_route(
             .filter(|value| !value.is_empty());
         let extra_headers = lcr_injectable_headers(&route, call_id);
         let timeout = route.timeout_secs.unwrap_or(30);
+        // An unparseable presentation must not silently become "allowed": a
+        // withheld call going out with the caller's real number is the failure
+        // that matters here, so refuse the value loudly and present nothing
+        // rather than guess.
+        let caller_id_presentation = match route.caller_id_presentation.as_deref() {
+            None => None,
+            Some(value) => match crate::sip::privacy::CallerIdPresentation::parse(value) {
+                Some(parsed) => Some(parsed),
+                None => {
+                    warn!(
+                        call_id = %call_id,
+                        carrier = %route.carrier_id,
+                        caller_id_presentation = %value,
+                        "LCR: unknown caller_id_presentation, treating the call as restricted",
+                    );
+                    Some(crate::sip::privacy::CallerIdPresentation::Restricted)
+                }
+            },
+        };
         debug!(
             call_id = %call_id,
             carrier = %route.carrier_id,
@@ -11964,6 +11983,8 @@ fn b2bua_advance_route(
             original_request,
             route.number_policy.as_deref(),
             retarget.as_deref(),
+            route.caller_id.as_deref(),
+            caller_id_presentation,
             &extra_headers,
             state,
         );
@@ -12630,6 +12651,8 @@ fn handle_b2bua_invite(
                 &message_guard,
                 None,
                 None,
+                None,
+                None,
                 &[],
                 state,
             );
@@ -12657,6 +12680,8 @@ fn handle_b2bua_invite(
                     send_socket.as_ref(),
                     None,
                     &message_guard,
+                    None,
+                    None,
                     None,
                     None,
                     &[],
@@ -13163,6 +13188,12 @@ fn b2bua_send_b_leg_invite(
     // policy and the number policy. Callers must not put a dialog-defining
     // header in here — see [`lcr_injectable_headers`], which is where the one
     // caller with externally-supplied headers filters them.
+    // Presented CLI for this carrier (LCR `caller_id`), substituted before the
+    // number policy reshapes its format.
+    caller_id: Option<&str>,
+    // Whether the calling identity may be presented to this carrier (LCR
+    // `caller_id_presentation`). Applied last, after the number policy.
+    caller_id_presentation: Option<crate::sip::privacy::CallerIdPresentation>,
     extra_headers: &[(String, String)],
     state: &DispatcherState,
 ) {
@@ -13513,6 +13544,15 @@ fn b2bua_send_b_leg_invite(
         crate::b2bua::header_policy::apply_to_request(&mut b_leg_invite, &policy, &ctx);
     }
 
+    // Per-carrier (LCR) presented CLI: substitute the calling number before the
+    // number policy reshapes its format, through the tag-preserving path so the
+    // B-leg's From tag survives. `set_header("From", ...)` cannot do this — the
+    // host is rewritten after the script runs, and a From written without a tag
+    // drops the mandatory dialog tag (RFC 3261 §8.1.1.3).
+    if let Some(caller_id) = caller_id.filter(|value| !value.is_empty()) {
+        crate::sip::privacy::set_calling_number(&mut b_leg_invite, caller_id);
+    }
+
     // Per-carrier (LCR) number policy: reshape this B-leg's identity headers
     // (From / To / P-Asserted-Identity / P-Preferred-Identity) to the carrier's
     // format. The R-URI is owned by tech_prefix / ruri, so it is left untouched.
@@ -13528,6 +13568,14 @@ fn b2bua_send_b_leg_invite(
                 "LCR: unknown number_policy on route, skipping identity reshape"
             ),
         }
+    }
+
+    // Per-carrier (LCR) CLIR: withhold the calling identity from this carrier
+    // (RFC 3323 §4.1 / TS 24.607). Deliberately *after* the number policy —
+    // anonymisation is the last identity step, or the policy would try to
+    // reshape "anonymous" as a number.
+    if caller_id_presentation == Some(crate::sip::privacy::CallerIdPresentation::Restricted) {
+        crate::sip::privacy::restrict_calling_identity(&mut b_leg_invite);
     }
 
     // Inject per-carrier (LCR) headers after the header policy, so a carrier's
@@ -20281,8 +20329,20 @@ fn b2bua_refer_accept(
             };
             let dialed = if let Some(template) = dial_template {
                 b2bua_send_b_leg_invite(
-                    call_id, target_uri, next_hop, None, &[], None, forced_cid, &template, None,
-                    None, &[], state,
+                    call_id,
+                    target_uri,
+                    next_hop,
+                    None,
+                    &[],
+                    None,
+                    forced_cid,
+                    &template,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    state,
                 );
                 true
             } else {

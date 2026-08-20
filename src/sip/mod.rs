@@ -7,6 +7,7 @@ pub mod uri;
 pub mod headers;
 pub mod codec;
 pub mod validate;
+pub mod privacy;
 
 pub use message::*;
 pub use parser::parse_sip_message;

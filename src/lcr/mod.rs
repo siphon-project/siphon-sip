@@ -218,6 +218,34 @@ pub struct Route {
     /// Per-attempt ring timeout in seconds (else the call-level default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u32>,
+    /// Calling number this carrier should see (the presented CLI), or `None` to
+    /// keep the caller's own.
+    ///
+    /// Applied through the same tag-preserving path that reshapes identity
+    /// headers, so the B-leg's `From` tag survives — which is why this is a
+    /// field rather than something to put in `headers`, where a `From` is
+    /// refused precisely because it would take the dialog tag with it.
+    /// `number_policy` reshapes the *format* of whatever number is present; this
+    /// substitutes a different one, which `number_policy` cannot do.
+    ///
+    /// Also applied to `P-Asserted-Identity` / `P-Preferred-Identity` when the
+    /// message carries them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_id: Option<String>,
+    /// Whether the calling identity may be presented to this carrier:
+    /// `"allowed"` (default) or `"restricted"` (CLIR).
+    ///
+    /// `restricted` applies RFC 3323 §4.1 / TS 24.607: the `From` becomes
+    /// `"Anonymous" <sip:anonymous@anonymous.invalid>` with its tag intact,
+    /// `Privacy: id` is asserted, `P-Preferred-Identity` is dropped, and
+    /// `P-Asserted-Identity` keeps the real identity for the trusted next hop
+    /// (RFC 3325 §7).
+    ///
+    /// Asserting `Privacy: id` without anonymising the `From` leaks the number
+    /// to every carrier that renders `From` rather than PAI, which defeats CLIR
+    /// while looking like it works — so the two always move together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_id_presentation: Option<String>,
     /// Named `number_policies:` preset applied to *this carrier's* B-leg identity
     /// headers (From / To / P-Asserted-Identity / P-Preferred-Identity) — so the
     /// From/To shape can differ per carrier and a failover to a second carrier
@@ -761,6 +789,28 @@ mod tests {
     }
 
     #[test]
+    fn caller_id_and_presentation_round_trip_through_the_api_json() {
+        let json = r#"{
+            "routes": [
+                {"carrier_id": "a", "gateway_group": "carriers",
+                 "caller_id": "+12025550111"},
+                {"carrier_id": "b", "gateway_group": "carriers",
+                 "caller_id": "+12025550122",
+                 "caller_id_presentation": "restricted"}
+            ]
+        }"#;
+        let response: LcrResponse = serde_json::from_str(json).expect("parses");
+
+        assert_eq!(response.routes[0].caller_id.as_deref(), Some("+12025550111"));
+        assert!(response.routes[0].caller_id_presentation.is_none());
+        assert_eq!(response.routes[1].caller_id.as_deref(), Some("+12025550122"));
+        assert_eq!(
+            response.routes[1].caller_id_presentation.as_deref(),
+            Some("restricted")
+        );
+    }
+
+    #[test]
     fn a_destination_alone_does_not_make_a_route_routable() {
         // It says who to reach, never how — such a route has nowhere to send
         // the INVITE and must still be skipped.
@@ -770,5 +820,40 @@ mod tests {
             ..Default::default()
         };
         assert!(!route.is_routable());
+    }
+
+    #[test]
+    fn two_carriers_in_one_answer_can_present_different_clis() {
+        // The per-call, per-carrier decision the contract could not express:
+        // `number_policy` reshapes a number's format but cannot substitute a
+        // different one, and `headers` refuses `From` because it would take the
+        // dialog tag with it.
+        let response: LcrResponse = serde_json::from_str(
+            r#"{"routes":[
+                {"carrier_id":"a","gateway_group":"g","caller_id":"+12025550111"},
+                {"carrier_id":"b","gateway_group":"g","caller_id":"+442071838750"}
+            ]}"#,
+        )
+        .expect("parses");
+
+        let presented: Vec<_> = response
+            .routes
+            .iter()
+            .map(|route| route.caller_id.as_deref())
+            .collect();
+        assert_eq!(presented, vec![Some("+12025550111"), Some("+442071838750")]);
+    }
+
+    #[test]
+    fn caller_id_fields_are_absent_from_the_wire_when_unset() {
+        // Additive: an API that never sets them sees no change.
+        let route = Route {
+            carrier_id: "a".into(),
+            gateway_group: Some("g".into()),
+            ..Default::default()
+        };
+        let wire = serde_json::to_string(&route).expect("serializes");
+        assert!(!wire.contains("caller_id"), "{wire}");
+        assert!(!wire.contains("caller_id_presentation"), "{wire}");
     }
 }
