@@ -43,6 +43,21 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   an internally-originated call, which is distinguishable from a flow that did
   not match.
 
+- **`password=` / `ha1=` on the digest helpers** (`auth.verify_digest`,
+  `require_digest`, `require_www_digest`, `require_proxy_digest`, on a `Request`
+  or a `Call`). Verifies the digest response against a credential the script
+  supplies, short-circuiting the configured backend — so a deployment that can
+  derive credentials in-process needs no credential source configured at all,
+  instead of standing up an HTTP endpoint for siphon to fetch a value the script
+  already has. `password=` takes the plaintext and answers MD5, SHA-256 and
+  SHA-512-256 alike, since H(A1) is derived with whatever algorithm the client
+  used (RFC 7616 §3.4.3); `ha1=` takes an already-computed H(A1) so the
+  deployment never holds plaintext, at the cost of being bound to the one
+  algorithm it was computed for. Passing both raises `ValueError` rather than
+  silently preferring one. Everything else is unchanged: the anti-replay nonce
+  check still runs, a rejection still arms the 401/407, still counts toward
+  `failed_auth_ban`, and still increments `siphon_credential_failures_total`.
+
 ### Fixed
 - **A proxied in-dialog request whose Request-URI addresses the proxy itself is
   now forwarded to the dialog's established peer instead of failing as a

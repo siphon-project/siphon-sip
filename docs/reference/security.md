@@ -123,6 +123,43 @@ Validating the nonce is what bounds replay. Without it a captured
 / `require_*_digest` paths always check it — this pair is for scripts that do
 not go through them.
 
+### Verifying against a credential you hold
+
+By default the digest helpers verify against the configured credential source
+(`auth.backend`). Pass `password=` or `ha1=` (not both) to verify against a
+credential the script supplies instead, which short-circuits the backend lookup
+entirely — a deployment that derives credentials in-process then needs no
+credential source configured at all, rather than standing up an HTTP endpoint
+for siphon to fetch a value the script already has.
+
+```python
+@proxy.on_request("REGISTER")
+async def register(request):
+    secret = await cache.fetch("secrets", derive_key(request))
+    if secret is None or not auth.verify_digest(request, realm, password=secret):
+        auth.require_www_digest(request, realm)
+        return
+    registrar.save(request)
+```
+
+Accepted by `verify_digest`, `require_digest`, `require_www_digest` and
+`require_proxy_digest`, on a `Request` or a `Call` alike.
+
+| kwarg | Holds | Trade-off |
+|---|---|---|
+| `password=` | the plaintext secret | One secret answers MD5, SHA-256 and SHA-512-256, because H(A1) is derived with whatever algorithm the client actually used (RFC 7616 §3.4.3). |
+| `ha1=` | an already-computed H(A1) | The deployment never stores plaintext, but the hash is bound to the one algorithm it was computed for — a client answering with another will not verify. |
+
+Passing both raises `ValueError`: one of them would be silently ignored and the
+script author could not tell which.
+
+Everything else is unchanged by a supplied credential. The anti-replay nonce
+check still runs, so a captured `Authorization` cannot be replayed (RFC 7616
+§3.3). A rejection still arms the 401/407 rather than returning a silent
+`False`, still counts toward `failed_auth_ban`, and still increments
+`siphon_credential_failures_total` — a path that authenticates without counting
+would be a blind spot for anyone alerting on brute force.
+
 ::: siphon_sdk.mock_module.MockAuth
 
 ## `ipsec` namespace
