@@ -41,6 +41,35 @@ const DIAMETER_CREDIT_LIMIT_REACHED: u32 = 4012;
 /// Final-Unit-Action TERMINATE (RFC 8506 §8.35).
 const FINAL_UNIT_ACTION_TERMINATE: u32 = 0;
 
+/// When the chargeable clock starts (`ro.charge_from`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChargeFrom {
+    /// From the 200 OK. TS 32.260 §5: chargeable duration is the answered
+    /// duration, so a call that rings and is never answered has none.
+    Answer,
+    /// From the CCR-INITIAL — the reservation, before any carrier was dialled —
+    /// so ring time is billed. The behaviour before `charge_from` existed.
+    Invite,
+}
+
+impl ChargeFrom {
+    /// Parse the config string. Anything unrecognised falls back to `Answer`
+    /// with a warning rather than silently billing ring time.
+    fn from_config(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "invite" => ChargeFrom::Invite,
+            "answer" => ChargeFrom::Answer,
+            other => {
+                warn!(
+                    charge_from = %other,
+                    "ro: unknown charge_from, using \"answer\""
+                );
+                ChargeFrom::Answer
+            }
+        }
+    }
+}
+
 /// IMS-Information `Cause-Code` (TS 32.299 §7.2.35) for a call siphon cut
 /// because the OCS refused further credit.
 ///
@@ -120,7 +149,19 @@ struct CcSessionInner {
     /// A `std::sync::Mutex` rather than a `tokio` one: it is only ever held to
     /// clone the value out, never across an await.
     ims_data: std::sync::Mutex<ImsChargingData>,
+    /// Where the chargeable clock starts for this session.
+    charge_from: ChargeFrom,
+    /// When the reservation was made (CCR-INITIAL). Always the session's own
+    /// age, whatever `charge_from` says — the max-lifetime backstop measures
+    /// from here, because an abandoned reservation has to be released whether
+    /// or not the call was ever answered.
     started_at: Instant,
+    /// Wall-clock instant of the same moment, for `SIP-Request-Timestamp`
+    /// (TS 32.299 §7.2.183) — `Instant` is monotonic and cannot be formatted
+    /// as a date.
+    requested_at: std::time::SystemTime,
+    /// Set once when the call is answered. `None` while it is still ringing.
+    answered_at: std::sync::Mutex<Option<Instant>>,
     /// The OCS's first-grant CC-Time (seconds) — surfaced to the script gate as
     /// `granted_time` so it can log / decide on the reserved quota.
     initial_grant: u32,
@@ -177,6 +218,71 @@ impl CcCreditSession {
         Some(data)
     }
 
+    /// Seconds of *chargeable* time elapsed so far.
+    ///
+    /// Under `charge_from: answer` this is zero until the call is answered and
+    /// counts from the 200 OK thereafter — so ring time is never billed, and a
+    /// call that is never answered reports nothing. Under `charge_from: invite`
+    /// it is the whole session age, the pre-`charge_from` behaviour.
+    fn chargeable_secs(&self) -> u32 {
+        match self.inner.charge_from {
+            ChargeFrom::Invite => self.inner.started_at.elapsed().as_secs() as u32,
+            ChargeFrom::Answer => match self.answered_at() {
+                Some(answered_at) => answered_at.elapsed().as_secs() as u32,
+                None => 0,
+            },
+        }
+    }
+
+    fn answered_at(&self) -> Option<Instant> {
+        match self.inner.answered_at.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    /// Usage not yet reported to the OCS, and therefore what the next
+    /// Used-Service-Unit must carry (RFC 8506 §5.6).
+    ///
+    /// Reporting the delta rather than the interval just slept also means a
+    /// CCR-UPDATE that fails leaves its seconds unreported, so the next
+    /// successful report — or the CCR-TERMINATION — still covers them exactly
+    /// once.
+    fn unreported_secs(&self) -> u32 {
+        self.chargeable_secs()
+            .saturating_sub(self.inner.reported_secs.load(Ordering::Relaxed))
+    }
+
+    /// Mark the call answered, starting the chargeable clock under
+    /// `charge_from: answer`. Idempotent — a retransmitted 200 OK must not
+    /// restart it.
+    fn mark_answered(&self) -> bool {
+        let mut guard = match self.inner.answered_at.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.is_some() {
+            return false;
+        }
+        *guard = Some(Instant::now());
+        true
+    }
+
+    /// The `ImsChargingData` for the answer-time CCR-UPDATE, carrying the real
+    /// `Time-Stamps` pair: the INVITE that triggered the reservation, and the
+    /// answer now.
+    fn answer_charging_data(&self) -> Option<ImsChargingData> {
+        let mut data = match self.inner.ims_data.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        data.sip_method = Some("INVITE".to_string());
+        data.cause_code = None;
+        data.request_timestamp = Some(self.inner.requested_at);
+        data.response_timestamp = Some(std::time::SystemTime::now());
+        Some(data)
+    }
+
     /// Record the carrier that actually carried the call, as
     /// `Outgoing-Trunk-Group-Id` (TS 32.299 §7.2.71).
     ///
@@ -204,6 +310,9 @@ pub struct RoChargingService {
     manager: Arc<DiameterManager>,
     config: RoConfig,
     node_functionality: Option<NodeFunctionality>,
+    /// Resolved `ro.charge_from`, parsed once at construction rather than per
+    /// call.
+    charge_from: ChargeFrom,
     active_sessions: Arc<AtomicUsize>,
     teardown_hook: StdMutex<Option<RoTeardownHook>>,
 }
@@ -217,10 +326,12 @@ impl RoChargingService {
                 "ro: unrecognized node_functionality, will be omitted from CCRs"
             );
         }
+        let charge_from = ChargeFrom::from_config(&config.charge_from);
         Arc::new(Self {
             manager,
             config,
             node_functionality,
+            charge_from,
             active_sessions: Arc::new(AtomicUsize::new(0)),
             teardown_hook: StdMutex::new(None),
         })
@@ -391,7 +502,10 @@ impl RoChargingService {
                 service_identifier: self.config.service_identifier,
                 requested_seconds: self.config.requested_seconds,
                 ims_data: std::sync::Mutex::new(ims_data),
+                charge_from: self.charge_from,
                 started_at: Instant::now(),
+                requested_at: std::time::SystemTime::now(),
+                answered_at: std::sync::Mutex::new(None),
                 initial_grant: grant_secs,
                 reported_secs: AtomicU32::new(0),
             }),
@@ -465,6 +579,87 @@ impl RoChargingService {
         }
     }
 
+    /// Report that the call was answered: start the chargeable clock (under
+    /// `charge_from: answer`) and tell the OCS, with a CCR-UPDATE carrying
+    /// `Time-Stamps` (TS 32.299 §7.2.97).
+    ///
+    /// Without this there was no credit-control request at the 200 OK at all,
+    /// so an OCS could not tell when charging actually started and a
+    /// Diameter-to-HTTP bridge had nothing to translate into a connect event.
+    /// TS 32.299 has the place for it already: `SIP-Request-Timestamp` (834) is
+    /// when the INVITE triggered the reservation and `SIP-Response-Timestamp`
+    /// (835) is the answer — `ImsChargingData.response_timestamp` existed and
+    /// was never set, because at CCR-INITIAL there is no answer yet.
+    ///
+    /// Idempotent: a retransmitted 200 OK does not restart the clock or send a
+    /// second request. A no-op on a session already stopped.
+    pub async fn report_answer(&self, session: &CcCreditSession) {
+        if session.inner.stopped.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        if !session.mark_answered() {
+            return;
+        }
+
+        // Whatever is chargeable at this instant — zero under
+        // `charge_from: answer` (the clock has only just started), the ring
+        // time under `charge_from: invite`.
+        let unreported = session.unreported_secs();
+        let used = ServiceUnit {
+            time_seconds: Some(unreported),
+            ..Default::default()
+        };
+        let requested = (session.inner.requested_seconds > 0).then(|| ServiceUnit {
+            time_seconds: Some(session.inner.requested_seconds),
+            ..Default::default()
+        });
+        let ims_data = session.answer_charging_data();
+        let record_number = session.next_cc_request_number();
+        let params = CreditControlParams {
+            request_type: CcRequestType::Update,
+            request_number: record_number,
+            subscriber: &session.inner.subscriber,
+            service_context_id: &session.inner.service_context_id,
+            session_id: Some(&session.inner.session_id),
+            ims_data: ims_data.as_ref(),
+            sms_data: None,
+            requested_units: requested.as_ref(),
+            used_units: Some(&used),
+            rating_group: session.inner.rating_group,
+            service_identifier: session.inner.service_identifier,
+            requested_action: None,
+            multiple_services_indicator: false,
+        };
+
+        match ro::send_ccr(&session.inner.peer, &params).await {
+            Ok(answer) => {
+                session
+                    .inner
+                    .last_result_code
+                    .store(answer.result_code, Ordering::Relaxed);
+                if unreported > 0 {
+                    session
+                        .inner
+                        .reported_secs
+                        .fetch_add(unreported, Ordering::Relaxed);
+                }
+                info!(
+                    session_id = %session.inner.session_id,
+                    result_code = answer.result_code,
+                    "ro: CCR-UPDATE sent at answer, charging clock started"
+                );
+            }
+            // The clock has already started locally, so a failed report costs
+            // one record, not the call's chargeable duration — the seconds stay
+            // unreported and the next CCR covers them.
+            Err(error) => warn!(
+                session_id = %session.inner.session_id,
+                error = %error,
+                "ro: CCR-UPDATE at answer failed"
+            ),
+        }
+    }
+
     /// Send CCR-TERMINATION for a session (BYE path). Idempotent — a session
     /// already stopped by the enforced-teardown path is a no-op.
     /// `cause_code` is the IMS-Information `Cause-Code` for the record
@@ -487,10 +682,8 @@ impl RoChargingService {
     /// (`elapsed - already-reported`, RFC 8506 §5.6). Does not touch the stopped
     /// flag (callers use `claim_stop` first).
     async fn send_terminate(&self, session: &CcCreditSession, cause_code: Option<i32>) {
-        let elapsed = session.inner.started_at.elapsed().as_secs() as u32;
-        let reported = session.inner.reported_secs.load(Ordering::Relaxed);
         let used = ServiceUnit {
-            time_seconds: Some(elapsed.saturating_sub(reported)),
+            time_seconds: Some(session.unreported_secs()),
             ..Default::default()
         };
         let record_number = session.next_cc_request_number();
@@ -587,8 +780,12 @@ impl RoChargingService {
                 return;
             }
 
+            // Report what is chargeable and not yet reported, not the interval
+            // just slept: under `charge_from: answer` the intervals before the
+            // 200 OK are ring time and carry zero.
+            let unreported = session.unreported_secs();
             let used = ServiceUnit {
-                time_seconds: Some(sleep_secs),
+                time_seconds: Some(unreported),
                 ..Default::default()
             };
             let requested = (session.inner.requested_seconds > 0).then(|| ServiceUnit {
@@ -618,13 +815,13 @@ impl RoChargingService {
 
             let result = ro::send_ccr(&session.inner.peer, &params).await;
             if result.is_ok() {
-                // The Used-Service-Unit for this interval was answered by the
-                // OCS, so it's now reported — the eventual CCR-TERMINATION
-                // reports only what happened after it (avoids double-counting).
+                // The Used-Service-Unit was answered by the OCS, so it is now
+                // reported — the eventual CCR-TERMINATION reports only what
+                // happened after it (avoids double-counting).
                 session
                     .inner
                     .reported_secs
-                    .fetch_add(sleep_secs, Ordering::Relaxed);
+                    .fetch_add(unreported, Ordering::Relaxed);
             }
             match result {
                 Ok(answer) if answer.is_success() => {
@@ -1336,5 +1533,233 @@ mod tests {
         // `None` means "no cause to report" and must not be encoded as a 0 that
         // claims the call ended normally.
         assert_eq!(cause_code_on_the_wire(None).await, None);
+    }
+    // -----------------------------------------------------------------------
+    // charge_from: the chargeable clock, and the answer-time CCR-UPDATE
+    // -----------------------------------------------------------------------
+
+    fn config_charging_from(charge_from: &str) -> RoConfig {
+        RoConfig {
+            charge_from: charge_from.to_string(),
+            ..enabled_config()
+        }
+    }
+
+    async fn granted_session(
+        service: &Arc<RoChargingService>,
+    ) -> CcCreditSession {
+        match service
+            .authorize_call(
+                SubscriberId::msisdn("+310000000001"),
+                call_charging_data(),
+                "c1".to_string(),
+            )
+            .await
+        {
+            ChargeDecision::Granted(Some(session)) => session,
+            other => panic!("expected Granted, got {}", decision_label(&other)),
+        }
+    }
+
+    #[test]
+    fn charge_from_parses_and_defaults_to_answer() {
+        assert_eq!(ChargeFrom::from_config("answer"), ChargeFrom::Answer);
+        assert_eq!(ChargeFrom::from_config("invite"), ChargeFrom::Invite);
+        assert_eq!(ChargeFrom::from_config("ANSWER"), ChargeFrom::Answer);
+        assert_eq!(ChargeFrom::from_config(" invite "), ChargeFrom::Invite);
+        // An unrecognised value must not silently start billing ring time.
+        assert_eq!(ChargeFrom::from_config("nonsense"), ChargeFrom::Answer);
+        assert_eq!(ChargeFrom::from_config(""), ChargeFrom::Answer);
+        // And the config default is the spec-correct one.
+        assert_eq!(
+            ChargeFrom::from_config(&RoConfig::default().charge_from),
+            ChargeFrom::Answer
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_that_rings_and_is_never_answered_reports_zero_usage() {
+        // The defect this closes: `started_at` was stamped at the reservation,
+        // before any carrier was dialled, and every reported figure was
+        // `started_at.elapsed()`. With two carriers at timeout_secs: 12, 24
+        // seconds of a 30-second grant could be gone before the callee picked
+        // up — and an unanswered call could report a full grant of used time.
+        let (manager, _rx, captured) = mock_ocs_manager(2001, Some(30), 2001, None).await;
+        let service = RoChargingService::new(manager, config_charging_from("answer"));
+        let session = granted_session(&service).await;
+
+        // Ring for a while. `report_answer` is never called.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(session.chargeable_secs(), 0, "ring time is not chargeable");
+
+        service.terminate_call(&session, Some(0)).await;
+
+        let terminate = ccr_of_type(&captured.lock().unwrap().clone(), 3);
+        assert_eq!(
+            terminate
+                .get("Multiple-Services-Credit-Control")
+                .and_then(|m| m.get("Used-Service-Unit"))
+                .and_then(|u| u.get("CC-Time"))
+                .and_then(|v| v.as_u64()),
+            Some(0),
+            "an unanswered call has no chargeable duration",
+        );
+    }
+
+    #[tokio::test]
+    async fn charge_from_answer_counts_from_the_answer_not_the_reservation() {
+        let (manager, _rx, captured) = mock_ocs_manager(2001, Some(30), 2001, None).await;
+        let service = RoChargingService::new(manager, config_charging_from("answer"));
+        let session = granted_session(&service).await;
+
+        // Ring, then answer, then talk.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        service.report_answer(&session).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let chargeable = session.chargeable_secs();
+        assert!(
+            chargeable <= 1,
+            "only the answered span is chargeable, got {chargeable}s after 2s ringing + 1s talking",
+        );
+
+        service.terminate_call(&session, Some(0)).await;
+        let terminate = ccr_of_type(&captured.lock().unwrap().clone(), 3);
+        let reported = terminate
+            .get("Multiple-Services-Credit-Control")
+            .and_then(|m| m.get("Used-Service-Unit"))
+            .and_then(|u| u.get("CC-Time"))
+            .and_then(|v| v.as_u64())
+            .expect("CCR-T reports a CC-Time");
+        assert!(reported <= 1, "reported {reported}s, expected only the talk time");
+    }
+
+    #[tokio::test]
+    async fn charge_from_invite_preserves_the_previous_behaviour() {
+        let (manager, _rx, _captured) = mock_ocs_manager(2001, Some(30), 2001, None).await;
+        let service = RoChargingService::new(manager, config_charging_from("invite"));
+        let session = granted_session(&service).await;
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            session.chargeable_secs() >= 2,
+            "charge_from: invite bills from the reservation, ring time included",
+        );
+
+        service.terminate_call(&session, Some(0)).await;
+    }
+
+    #[tokio::test]
+    async fn answer_sends_a_ccr_update_carrying_both_timestamps() {
+        // TS 32.299 §7.2.97: Time-Stamps with SIP-Request-Timestamp (the
+        // INVITE) and SIP-Response-Timestamp (the answer). Without a request at
+        // the 200 OK an OCS cannot tell when charging started at all.
+        let (manager, _rx, captured) = mock_ocs_manager(2001, Some(300), 2001, None).await;
+        let service = RoChargingService::new(manager, config_charging_from("answer"));
+        let session = granted_session(&service).await;
+
+        service.report_answer(&session).await;
+
+        let ccrs = captured.lock().unwrap().clone();
+        let update = ccr_of_type(&ccrs, 2);
+        let timestamps = ims_information(&update)
+            .and_then(|i| i.get("Time-Stamps"))
+            .expect("the answer CCR-UPDATE must carry Time-Stamps");
+
+        assert!(
+            timestamps.get("SIP-Request-Timestamp").is_some(),
+            "SIP-Request-Timestamp missing: {timestamps}",
+        );
+        assert!(
+            timestamps.get("SIP-Response-Timestamp").is_some(),
+            "SIP-Response-Timestamp missing: {timestamps}",
+        );
+
+        service.terminate_call(&session, Some(0)).await;
+    }
+
+    #[tokio::test]
+    async fn a_retransmitted_answer_neither_restarts_the_clock_nor_resends() {
+        let (manager, _rx, captured) = mock_ocs_manager(2001, Some(300), 2001, None).await;
+        let service = RoChargingService::new(manager, config_charging_from("answer"));
+        let session = granted_session(&service).await;
+
+        service.report_answer(&session).await;
+        let first = session.answered_at();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        service.report_answer(&session).await;
+        service.report_answer(&session).await;
+
+        assert_eq!(
+            session.answered_at(),
+            first,
+            "a retransmitted 200 OK must not restart the chargeable clock",
+        );
+        let updates = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.get("CC-Request-Type").and_then(|v| v.as_u64()) == Some(2))
+            .count();
+        assert_eq!(updates, 1, "exactly one answer CCR-UPDATE, got {updates}");
+
+        service.terminate_call(&session, Some(0)).await;
+    }
+
+    #[tokio::test]
+    async fn answer_on_an_already_stopped_session_is_a_no_op() {
+        // A 2xx racing a teardown must not reopen charging on a closed session.
+        let (manager, _rx, captured) = mock_ocs_manager(2001, Some(300), 2001, None).await;
+        let service = RoChargingService::new(manager, config_charging_from("answer"));
+        let session = granted_session(&service).await;
+
+        service.terminate_call(&session, Some(0)).await;
+        service.report_answer(&session).await;
+
+        let updates = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.get("CC-Request-Type").and_then(|v| v.as_u64()) == Some(2))
+            .count();
+        assert_eq!(updates, 0, "no CCR-UPDATE after the session was stopped");
+    }
+
+    #[tokio::test]
+    async fn reported_usage_is_never_double_counted_across_update_and_terminate() {
+        // Usage is reported as a delta against what the OCS has already
+        // acknowledged, so an interval reported by a CCR-UPDATE must not appear
+        // again in the CCR-TERMINATION.
+        let (manager, _rx, captured) = mock_ocs_manager(2001, Some(1), 2001, None).await;
+        let service = RoChargingService::new(manager, config_charging_from("answer"));
+        let session = granted_session(&service).await;
+        service.report_answer(&session).await;
+
+        // Past one re-auth interval (floored at MIN_REAUTH_SECS).
+        tokio::time::sleep(Duration::from_secs(MIN_REAUTH_SECS as u64 + 2)).await;
+        let total_chargeable = session.chargeable_secs();
+        service.terminate_call(&session, Some(0)).await;
+
+        let ccrs = captured.lock().unwrap().clone();
+        let sum: u64 = ccrs
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.get("CC-Request-Type").and_then(|v| v.as_u64()),
+                    Some(2) | Some(3)
+                )
+            })
+            .filter_map(|c| {
+                c.get("Multiple-Services-Credit-Control")
+                    .and_then(|m| m.get("Used-Service-Unit"))
+                    .and_then(|u| u.get("CC-Time"))
+                    .and_then(|v| v.as_u64())
+            })
+            .sum();
+
+        assert!(
+            sum <= total_chargeable as u64 + 1,
+            "reported {sum}s across all records but only {total_chargeable}s was chargeable",
+        );
     }
 }
