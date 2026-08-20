@@ -1,0 +1,59 @@
+# siphon config for the voice-AI test against the REAL siphon-rtp engine.
+#
+# The twin of siphon-voice-ai.yaml, which runs the same script against the
+# control-plane mock. The mock never dials `ws_uri`, so that run proves siphon
+# composed the right command and stops there. Here the engine really connects
+# to the AI server (sipp/siphon-rtp/mock_ai_ws.py), really decodes the caller's
+# G.711 to L16, and really re-encodes the AI's reply — so the WebSocket bridge
+# is exercised rather than described.
+#
+# Used with: sipp/docker-compose.yaml (voice-ai-real profile)
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "ai.example.com"
+
+advertised_address: "172.20.0.138"
+
+script:
+  path: "/etc/siphon/scripts/voice_ai_real.py"
+
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "172.20.0.130:8080"
+    timeout_ms: 2000
+
+  profiles:
+    voice_ai:
+      offer: &voice_ai_flags
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin"]
+        # ws_vad emits speech_started / speech_stopped on the caller's speech
+        # edges. The AI server records which control frames arrived, so leaving
+        # this on means the SIPp audio also exercises the VAD path rather than
+        # just the raw bridge.
+        ws_vad: true
+        ws_barge_in: true
+        ws_vad_hangover_ms: 300
+      answer: *voice_ai_flags
+
+# The UAC's address, so call.from_gateway("carriers") passes and the script
+# answers instead of rejecting 403.
+gateway:
+  groups:
+    - name: "carriers"
+      probe:
+        enabled: false
+      destinations:
+        - uri: "sip:uac.test:5060"
+          address: "172.20.0.139:5060"
+
+log:
+  level: info

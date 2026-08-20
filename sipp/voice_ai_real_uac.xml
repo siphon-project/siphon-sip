@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Voice-AI UAC against the REAL siphon-rtp engine, with real audio.
+
+  INVITE (SDP) -> 100 -> 200 OK (anchored SDP) -> ACK -> [RTP] -> BYE -> 200
+
+  The difference from voice_ai_uac.xml (which runs against the control-plane
+  mock) is that this scenario actually sends media: play_pcap_audio streams
+  SIPp's bundled G.711 A-law sample at the engine's media address for the life
+  of the call. That audio is what the engine decodes to L16 and pushes up the
+  WebSocket to the AI server, and it is the only reason the AI server can tell a
+  working bridge from a bridge that merely connected.
+
+  The SIP-level assertion here is anchoring. The audio-level assertions live in
+  sipp/siphon-rtp/mock_ai_ws.py (uplink arrived, correct frame geometry, not
+  silence) and in the engine's own Prometheus counters, because neither is
+  observable from the UAC.
+
+  A-law (payload 8) is offered rather than PCMU because the pcap SIPp ships is
+  A-law; offering a codec the media does not match would put the wrong bytes on
+  the wire and the energy assertion downstream would be meaningless. ptime is 30
+  for the same reason: g711a.pcap carries 240-byte payloads (30 ms), and
+  declaring 20 would advertise a packetisation the media does not use, which the
+  AI server then sees as a frame-geometry mismatch on the WebSocket uplink.
+-->
+<scenario name="Voice-AI UAC (real engine, real audio)">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:ai@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550001@carrier.example>;tag=[pid]SIPpTag00[call_number]
+To: <sip:ai@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/voice-ai-real-uac
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 8 101
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=ptime:30
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <!-- 200 OK carrying the engine's synthesised answer, anchored on the engine's
+       own relay address (--relay-bind-ip). If the engine were left on its
+       loopback default the c= line would read 127.0.0.1, the RTP below would go
+       nowhere, and this regexp is what catches that before the silent-audio
+       assertion has to. -->
+  <recv response="200" rtd="true" crlf="true" rrs="true">
+    <action>
+      <ereg regexp="c=IN IP4 172\.20\.0\.130"
+            search_in="body"
+            check_it="true"
+            assign_to="anchored" />
+      <log message="answer SDP anchored on the real engine: [$anchored]" />
+      <ereg regexp="Contact:[^\r\n]*sip:"
+            search_in="msg"
+            check_it="true"
+            assign_to="contact_present" />
+      <log message="2xx Contact present: [$contact_present]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550001@carrier.example>;tag=[pid]SIPpTag00[call_number]
+To: <sip:ai@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- The actual media. SIPp streams the A-law sample from its own media port
+       to the address the engine advertised in the answer. -->
+  <nop>
+    <action>
+      <exec play_pcap_audio="/sipp/g711a.pcap" />
+    </action>
+  </nop>
+
+  <!-- Hold well past the AI server's minimum-frame threshold so the uplink,
+       the VAD edges and the synthesized downlink all have time to happen. At
+       20 ms per frame this is ~150 frames each way. -->
+  <pause milliseconds="3000" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550001@carrier.example>;tag=[pid]SIPpTag00[call_number]
+To: <sip:ai@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 BYE
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+</scenario>

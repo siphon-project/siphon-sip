@@ -357,10 +357,14 @@ async fn media_backend_siphon_rtp_is_send_sync() {
 
 // ---------------------------------------------------------------------------
 // End-to-end smoke test against a REAL siphon-rtp daemon. `#[ignore]`d and
-// gated on the `SIPHON_RTP_BIN` env var (path to a built `siphon-rtp` binary),
-// since CI does not build the engine. Run with:
+// gated on the `SIPHON_RTP_BIN` env var (path to a `siphon-rtp` binary), so a
+// plain `cargo test` stays hermetic. Run locally with:
 //   SIPHON_RTP_BIN=../siphon-rtp/target/debug/siphon-rtp \
 //     cargo test --test integration_tests -- --ignored siphon_rtp
+//
+// CI runs it too (the `siphon-rtp-engine-smoke` job) without building the
+// engine: the published image is distroless around a *static musl* binary, so
+// the job copies /usr/local/bin/siphon-rtp out of it and runs that directly.
 // ---------------------------------------------------------------------------
 
 /// A spawned siphon-rtp process, killed on drop.
