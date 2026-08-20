@@ -115,6 +115,39 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   agent", and documented in `docs/cookbook/voice-ai.md`.
 
 ### Fixed
+- **A re-INVITE or UPDATE on a `siphon-rtp`-anchored call replaced its media
+  session instead of renegotiating it.** siphon has only ever had one verb for
+  an SDP offer, and on rtpengine that is correct — a repeat `offer` on a live
+  call-id *is* a re-offer, which is how `rtpengine_manage()` has always done
+  hold and codec renegotiation. siphon-rtp draws the line differently: a repeat
+  `offer` there is a **replacement**, so the engine freed the call and allocated
+  fresh ports. The visible damage was not the ports (siphon answers with the
+  rewritten SDP either way) but everything attached to them — the WebSocket
+  bridge, any `ws_tee`, and any SIPREC subscription were torn down with the old
+  call. So putting a voice-AI call on hold, or any mid-dialog renegotiation,
+  silently killed the audio path to the AI while the call itself carried on,
+  and left a spurious media CDR with reason `replaced` behind. A call this
+  process has already anchored now renegotiates with `siphon-rtp-proto` 0.2.0's
+  `reoffer`, which keeps the ports, the pipeline and the attachments, and
+  carries an RFC 8445 §9 ICE restart when the peer offers new credentials.
+  Covers the framework's re-INVITE and UPDATE paths and the script-facing
+  `rtpengine.offer()`; rtpengine and rtpproxy still send a plain offer, so their
+  wire is byte-identical to before.
+- **A re-offer is addressed by the media session's own engine call-id.**
+  `rtpengine.offer()` used the SIP Call-ID, but a siphon-terminated transfer
+  deliberately re-anchors the surviving pair on a *fresh* engine call-id while
+  the store key stays the SIP one — so a re-INVITE after a transfer addressed a
+  call-id the engine had never heard of. It now uses `rtpengine_id()`, as every
+  other post-offer verb already did, and no longer re-inserts the media session
+  on a re-offer (which reset that id and cleared the `to_tag` the answer set).
+- **The one case a re-offer cannot serve falls back explicitly.** The engine
+  refuses a re-offer that changes the negotiated codec — that needs a pipeline
+  rebuild it will not do on a live call — and its error says to replace the call
+  instead. That refusal, and only that refusal, is retried as a replacement
+  `offer`, which is exactly the behaviour such a re-INVITE had before. It is
+  logged at WARN naming the consequence (ports re-allocated, bridge/tee/SIPREC
+  dropped) rather than performed silently, and the match is deliberately narrow
+  so no other engine error can acquire a call-replacing retry.
 - **A challenged REFER was never retried, and its response was dropped
   entirely.** A REFER siphon originates on one of its own legs is allocated a
   fresh Via branch that belongs to no leg, and responses are matched to a call by
