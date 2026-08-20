@@ -4559,7 +4559,7 @@ services:
         condition: service_completed_successfully
     volumes:
       - ./siphon-rtp/siphon-rtp-native.yaml:/etc/siphon/siphon.yaml:ro
-      - ../scripts:/etc/siphon/scripts:ro
+      - ./siphon-rtp/proxy_rtp_passthrough.py:/etc/siphon/scripts/proxy_rtp_passthrough.py:ro
       - ../examples:/etc/siphon/examples:ro
     networks:
       sipnet:
@@ -4663,7 +4663,7 @@ services:
         condition: service_completed_successfully
     volumes:
       - ./siphon-rtp/siphon-rtp-ng.yaml:/etc/siphon/siphon.yaml:ro
-      - ../scripts:/etc/siphon/scripts:ro
+      - ./siphon-rtp/proxy_rtp_passthrough.py:/etc/siphon/scripts/proxy_rtp_passthrough.py:ro
       - ../examples:/etc/siphon/examples:ro
     networks:
       sipnet:
