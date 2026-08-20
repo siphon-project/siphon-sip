@@ -294,7 +294,11 @@ impl PyAuth {
     /// an HMAC-SHA256 over the timestamp (when a secret is configured) or a
     /// random value otherwise. The embedded timestamp lets any instance reject
     /// a stale (replayed) nonce without shared state.
-    fn generate_nonce(&self) -> String {
+    ///
+    /// Also reachable from Python — see the `#[pymethods]` wrapper below, which
+    /// is what a script issuing its own challenge uses so the nonce it hands
+    /// out is one this engine will accept back.
+    pub(crate) fn generate_nonce(&self) -> String {
         let timestamp_hex = format!("{:016x}", now_unix_secs());
         let tag = match &self.nonce_secret {
             Some(secret) => hmac_sha256_hex(secret, timestamp_hex.as_bytes()),
@@ -308,7 +312,7 @@ impl PyAuth {
     /// implausibly far in the future), and — when a secret is configured — carry
     /// a matching HMAC tag. This is what turns digest auth from "replayable
     /// forever" into "replayable for at most `nonce_ttl_secs`".
-    fn validate_nonce(&self, nonce: &str) -> bool {
+    pub(crate) fn validate_nonce(&self, nonce: &str) -> bool {
         let Some((timestamp_hex, tag)) = nonce.split_once('.') else {
             return false;
         };
@@ -339,6 +343,54 @@ impl PyAuth {
     /// `target` is a `Request` (`@proxy.on_request`) or a `Call`
     /// (`@b2bua.on_invite`) — see [`AuthTarget`].
     ///
+    /// Mint a digest challenge nonce.
+    ///
+    /// Shape is `{unix_seconds:016x}.{tag}`, where `tag` is an HMAC-SHA256 over
+    /// the timestamp when `auth.nonce_secret` is configured, and a random value
+    /// otherwise. The timestamp is embedded rather than stored, so any instance
+    /// in a fleet can reject a stale nonce without shared state.
+    ///
+    /// This is the nonce `require_www_digest` / `require_proxy_digest` issue.
+    /// A script that builds its own `WWW-Authenticate` / `Proxy-Authenticate`
+    /// header — because it verifies credentials itself rather than through a
+    /// configured backend — must mint the nonce here, or it hands out a value
+    /// this engine has no way to recognise on the way back:
+    ///
+    /// ```python
+    /// nonce = auth.generate_nonce()
+    /// request.set_reply_header(
+    ///     "WWW-Authenticate",
+    ///     f'Digest realm="{realm}", nonce="{nonce}", algorithm=MD5, qop="auth"',
+    /// )
+    /// request.reply(401, "Unauthorized")
+    /// ```
+    #[pyo3(name = "generate_nonce")]
+    fn py_generate_nonce(&self) -> String {
+        self.generate_nonce()
+    }
+
+    /// Whether `nonce` is one this engine minted and still accepts.
+    ///
+    /// True only for a well-formed `{timestamp}.{tag}` that is no older than
+    /// `auth.nonce_ttl_secs`, not implausibly future-dated (60 s of clock skew
+    /// allowed), and — when a secret is configured — carries a matching HMAC
+    /// tag. This is what turns a script-side digest check from "replayable
+    /// forever" into "replayable for at most the TTL", so a script verifying
+    /// credentials itself should call it *before* trusting the response:
+    ///
+    /// ```python
+    /// if not auth.validate_nonce(nonce_from_the_header):
+    ///     auth.require_www_digest(request, realm)   # stale — re-challenge
+    ///     return
+    /// ```
+    ///
+    /// The built-in `verify_digest` / `require_*_digest` paths already do this
+    /// internally; this is for a script that does not go through them.
+    #[pyo3(name = "validate_nonce")]
+    fn py_validate_nonce(&self, nonce: &str) -> bool {
+        self.validate_nonce(nonce)
+    }
+
     /// If the message carries valid credentials, sets `request.auth_user` /
     /// `call.auth_user` and returns True. Otherwise arms a 401 response with a
     /// nonce and returns False.
@@ -1717,6 +1769,59 @@ mod tests {
             "10.0.0.1".to_string(),
             5060,
         )
+    }
+
+    #[test]
+    fn nonce_primitives_are_reachable_from_python() {
+        // They existed as Rust-internal helpers in a plain `impl PyAuth`, so a
+        // script could not reach them at all — which left a script that issues
+        // its own challenge with no way to mint a nonce this engine would
+        // recognise on the way back, or to reject a replayed one.
+        Python::initialize();
+        Python::attach(|python| {
+            let auth = Py::new(python, PyAuth::empty()).expect("auth into Python");
+            let bound = auth.bind(python);
+
+            let nonce: String = bound
+                .call_method0("generate_nonce")
+                .and_then(|value| value.extract())
+                .expect("auth.generate_nonce() must be callable from Python");
+            assert!(nonce.contains('.'), "nonce shape is {{ts}}.{{tag}}: {nonce}");
+
+            // A freshly minted nonce validates through the Python surface.
+            let fresh: bool = bound
+                .call_method1("validate_nonce", (nonce.as_str(),))
+                .and_then(|value| value.extract())
+                .expect("auth.validate_nonce() must be callable from Python");
+            assert!(fresh, "a nonce we just minted must validate");
+
+            // And a forged one does not.
+            let forged: bool = bound
+                .call_method1("validate_nonce", ("not-a-nonce",))
+                .and_then(|value| value.extract())
+                .expect("validate_nonce runs");
+            assert!(!forged);
+        });
+    }
+
+    #[test]
+    fn a_replayed_nonce_is_rejected_through_the_python_surface() {
+        // The property that makes the primitive worth exposing: a script doing
+        // its own digest check can bound replay to the TTL.
+        Python::initialize();
+        Python::attach(|python| {
+            let auth = Py::new(python, PyAuth::empty()).expect("auth into Python");
+            let stale = format!(
+                "{:016x}.x",
+                now_unix_secs().saturating_sub(DEFAULT_NONCE_TTL_SECS + 60)
+            );
+            let valid: bool = auth
+                .bind(python)
+                .call_method1("validate_nonce", (stale.as_str(),))
+                .and_then(|value| value.extract())
+                .expect("validate_nonce runs");
+            assert!(!valid, "a stale nonce must not validate");
+        });
     }
 
     #[test]

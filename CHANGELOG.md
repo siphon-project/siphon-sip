@@ -7,6 +7,14 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **`auth.generate_nonce()` and `auth.validate_nonce(nonce)` are reachable from
+  scripts.** Both existed, but in a plain `impl` rather than a `#[pymethods]`
+  block, so neither the engine nor the SDK exposed them. A script that verifies
+  credentials itself — rather than through a configured `auth.backend` — has to
+  build its own `WWW-Authenticate` header, and had no way to mint a nonce this
+  engine would recognise coming back, or to reject a replayed one. Validating
+  the nonce is what bounds replay of a captured `Authorization`; without it a
+  script-side digest check is replayable forever.
 - **CI covers re-INVITE renegotiation on the `siphon-rtp` backend** (`--reoffer`).
   The existing `--reinvite` mode runs the same hold/resume flow against
   rtpengine, where a repeat `offer` on a live call-id *is* the re-offer — so it

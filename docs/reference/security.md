@@ -52,6 +52,43 @@ path.
 
 ## `auth` namespace
 
+### Issuing your own challenge
+
+`require_www_digest` / `require_proxy_digest` build the challenge for you. A
+script that verifies credentials itself — rather than through a configured
+`auth.backend` — builds its own `WWW-Authenticate` header instead, and needs the
+engine's nonce for it:
+
+```python
+@proxy.on_request("REGISTER")
+def register(request):
+    header = request.get_header("Authorization")
+    if header is None:
+        nonce = auth.generate_nonce()
+        request.set_reply_header(
+            "WWW-Authenticate",
+            f'Digest realm="{realm}", nonce="{nonce}", algorithm=MD5, qop="auth"',
+        )
+        request.reply(401, "Unauthorized")
+        return
+
+    if not auth.validate_nonce(nonce_of(header)):
+        return challenge(request)        # stale — re-challenge, do not trust it
+    ...
+```
+
+`auth.generate_nonce()` mints `{unix_seconds:016x}.{tag}` — the timestamp is
+embedded rather than stored, so any instance in a fleet can reject a stale nonce
+without shared state. `auth.validate_nonce(nonce)` returns True only for a nonce
+this engine minted, no older than `auth.nonce_ttl_secs`, not future-dated beyond
+60 s of clock skew, and carrying a matching HMAC tag when `auth.nonce_secret` is
+configured.
+
+Validating the nonce is what bounds replay. Without it a captured
+`Authorization` is replayable forever, which is why the built-in `verify_digest`
+/ `require_*_digest` paths always check it — this pair is for scripts that do
+not go through them.
+
 ::: siphon_sdk.mock_module.MockAuth
 
 ## `ipsec` namespace
