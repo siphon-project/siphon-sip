@@ -35,6 +35,7 @@ RUN_RTPPROXY=false
 RUN_VOICE_AI=false
 RUN_REFER_SINGLE_LEG=false
 RUN_REINVITE=false
+RUN_REOFFER=false
 RUN_B2BUA=false
 RUN_B2BUA_AUTH=false
 RUN_B2BUA_INVITE_AUTH=false
@@ -63,6 +64,7 @@ for arg in "$@"; do
     --voice-ai)   RUN_VOICE_AI=true;   SELECTED_MODES+=("$arg") ;;
     --refer-single-leg) RUN_REFER_SINGLE_LEG=true; SELECTED_MODES+=("$arg") ;;
     --reinvite)   RUN_REINVITE=true;   SELECTED_MODES+=("$arg") ;;
+    --reoffer)    RUN_REOFFER=true;    SELECTED_MODES+=("$arg") ;;
     --b2bua)      RUN_B2BUA=true;      SELECTED_MODES+=("$arg") ;;
     --b2bua-auth) RUN_B2BUA_AUTH=true; SELECTED_MODES+=("$arg") ;;
     --b2bua-invite-auth) RUN_B2BUA_INVITE_AUTH=true; SELECTED_MODES+=("$arg") ;;
@@ -80,7 +82,7 @@ for arg in "$@"; do
       echo
       echo "Scenario modes (pick at most ONE per run):"
       echo "  --ipsec --charging --call --presence --rtpengine --rtpproxy --reinvite"
-      echo "  --voice-ai --refer-single-leg"
+      echo "  --voice-ai --refer-single-leg --reoffer"
       echo "  --b2bua --b2bua-auth --b2bua-invite-auth --gateway --auto100 --http-auth"
       echo "  --wedge --banscan"
       echo "  --security --rfc4475 --webrtc"
@@ -224,6 +226,40 @@ if [[ "$RUN_REINVITE" == true ]]; then
   # re-INVITE never completed.
   run_sipp docker compose -f "$COMPOSE_FILE" --profile reinvite --profile rtpengine up --abort-on-container-exit --exit-code-from sipp-reinvite-uac sipp-reinvite-uac sipp-reinvite-uas
   docker compose -f "$COMPOSE_FILE" --profile reinvite --profile rtpengine rm -sf sipp-reinvite-uac sipp-reinvite-uas 2>/dev/null || true
+fi
+
+# ── Step 8b: Re-INVITE renegotiation on the siphon-rtp backend (optional) ──
+if [[ "$RUN_REOFFER" == true ]]; then
+  echo "=== SIPp re-offer test (hold/resume renegotiates in place on siphon-rtp) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile reoffer run --rm sipp-reoffer-register
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile reoffer up \
+    --abort-on-container-exit --exit-code-from sipp-reoffer-uac sipp-reoffer-uac sipp-reoffer-uas
+
+  # The SIPp side alone cannot tell a renegotiation from a replacement — both
+  # answer the re-INVITE with a 200. What separates them is the verb siphon put
+  # on the control channel, so assert on what the engine actually received.
+  echo "--- asserting the control verbs the engine saw ---"
+  verbs="$(docker compose -f "$COMPOSE_FILE" --profile reoffer logs --no-log-prefix mock-siphon-rtp-reoffer 2>/dev/null \
+    | grep -oE '"command": ?"[a-z_]+"' | sed -E 's/"command": ?"//; s/"//' | grep -E '^(offer|reoffer)$' || true)"
+  offers="$(printf '%s\n' "$verbs" | grep -c '^offer$' || true)"
+  reoffers="$(printf '%s\n' "$verbs" | grep -c '^reoffer$' || true)"
+  echo "control verbs: offer=$offers reoffer=$reoffers"
+
+  if [[ "$offers" -ne 1 ]]; then
+    echo "FAIL: expected exactly 1 offer (the initial INVITE), got $offers." >&2
+    echo "      A second offer means a re-INVITE replaced the media session:" >&2
+    echo "      fresh ports, and any WebSocket bridge, tee or SIPREC fork gone." >&2
+    docker compose -f "$COMPOSE_FILE" --profile reoffer logs --no-log-prefix mock-siphon-rtp-reoffer >&2 || true
+    exit 1
+  fi
+  if [[ "$reoffers" -lt 2 ]]; then
+    echo "FAIL: expected at least 2 reoffers (hold + resume), got $reoffers." >&2
+    docker compose -f "$COMPOSE_FILE" --profile reoffer logs --no-log-prefix mock-siphon-rtp-reoffer >&2 || true
+    exit 1
+  fi
+  echo "OK: the re-INVITEs renegotiated in place; the media session was never replaced."
+
+  docker compose -f "$COMPOSE_FILE" --profile reoffer rm -sf sipp-reoffer-uac sipp-reoffer-uas 2>/dev/null || true
 fi
 
 # ── Step 9: B2BUA tests (optional) ──────────────────────────────────────────

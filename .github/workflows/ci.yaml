@@ -697,6 +697,59 @@ jobs:
             siphon-voice-ai.log
             mock-siphon-rtp.log
 
+  # ── Re-INVITE renegotiation on the siphon-rtp backend ──────────────────
+  sipp-reoffer:
+    runs-on: ubuntu-latest
+    needs: rust-tests
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build siphon-reoffer image
+        run: docker compose -f sipp/docker-compose.yaml --profile reoffer build siphon-reoffer
+
+      - name: Start mock siphon-rtp + siphon
+        run: docker compose -f sipp/docker-compose.yaml --profile reoffer up -d --wait mock-siphon-rtp-reoffer siphon-reoffer
+
+      - name: Register bob
+        run: docker compose -f sipp/docker-compose.yaml --profile reoffer run --rm sipp-reoffer-register
+
+      - name: Call, hold, resume, hang up
+        run: docker compose -f sipp/docker-compose.yaml --profile reoffer up --abort-on-container-exit --exit-code-from sipp-reoffer-uac sipp-reoffer-uac sipp-reoffer-uas
+
+      - name: Assert the re-INVITEs renegotiated in place
+        # SIPp cannot tell the two apart — a replacement answers the re-INVITE
+        # with a 200 just as a renegotiation does. The difference is the verb on
+        # the control channel, and a second `offer` means the media session was
+        # replaced: fresh ports, and any WebSocket bridge, tee or SIPREC fork on
+        # it torn down while the call carried on.
+        run: |
+          verbs="$(docker compose -f sipp/docker-compose.yaml --profile reoffer logs --no-log-prefix mock-siphon-rtp-reoffer \
+            | grep -oE '"command": ?"[a-z_]+"' | sed -E 's/"command": ?"//; s/"//' | grep -E '^(offer|reoffer)$' || true)"
+          offers="$(printf '%s\n' "$verbs" | grep -c '^offer$' || true)"
+          reoffers="$(printf '%s\n' "$verbs" | grep -c '^reoffer$' || true)"
+          echo "control verbs: offer=$offers reoffer=$reoffers"
+          test "$offers" -eq 1 || { echo "::error::expected 1 offer, got $offers — a re-INVITE replaced the media session"; exit 1; }
+          test "$reoffers" -ge 2 || { echo "::error::expected >=2 reoffers (hold + resume), got $reoffers"; exit 1; }
+
+      - name: Collect logs
+        if: always()
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs siphon-reoffer > siphon-reoffer.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs mock-siphon-rtp-reoffer > mock-siphon-rtp-reoffer.log 2>&1 || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile reoffer down --remove-orphans
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-reoffer-logs
+          path: |
+            siphon-reoffer.log
+            mock-siphon-rtp-reoffer.log
+
   # ── Cold transfer off a single-leg answered call ───────────────────────
   sipp-refer-single-leg:
     runs-on: ubuntu-latest
