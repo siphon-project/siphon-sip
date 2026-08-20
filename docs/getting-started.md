@@ -146,12 +146,14 @@ from-source path, are covered in the
 [README](https://github.com/siphon-project/siphon-sip#installation).
 
 If the unit does not come up, `journalctl -u siphon -n 50` has the reason: siphon
-exits non-zero on a config or script error, so `Restart=on-failure` turns any
-such error into a restart loop rather than a running-but-broken proxy. Two
-things the sandboxed unit imposes that a manual run does not:
+exits non-zero on a config or script error rather than running broken, and the
+unit gives up after about a minute of failed restarts, so `systemctl status
+siphon` reports `failed` instead of restarting forever. Two things the sandboxed unit
+imposes that a manual run does not:
 
 - **Writable paths.** `ProtectSystem=strict` leaves the filesystem read-only
-  apart from `/var/lib/siphon` and `/var/log/siphon`. Point `log.file`,
+  apart from `/var/lib/siphon` and `/var/log/siphon`, which the unit creates
+  itself through `StateDirectory=` / `LogsDirectory=`. Point `log.file`,
   `cdr.file.path`, registrar persistence and recordings inside those.
 - **Capabilities.** The unit grants `CAP_NET_BIND_SERVICE` only. An IMS P-CSCF
   using the `ipsec:` sec-agree block also needs `CAP_NET_ADMIN` and `AF_NETLINK`
@@ -159,6 +161,11 @@ things the sandboxed unit imposes that a manual run does not:
 
 Override either with `systemctl edit siphon` rather than editing the packaged
 unit, which an upgrade replaces.
+
+The packages also install `/etc/logrotate.d/siphon`, which rotates everything
+siphon writes under `/var/log/siphon` — daily, 14 rotations for log files and 30
+for `cdr.jsonl`. Nothing to enable; adjust the retention there if your policy
+differs.
 
 ### Running a native binary directly
 

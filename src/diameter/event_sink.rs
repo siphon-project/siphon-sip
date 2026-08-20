@@ -35,11 +35,7 @@ struct FileWriter {
 impl EventSinkWriter for FileWriter {
     fn write_batch(&self, rows: &[String]) {
         use std::io::Write;
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
+        match crate::file_sink::open_append(&self.path) {
             Ok(mut file) => {
                 for row in rows {
                     if let Err(error) = writeln!(file, "{row}") {

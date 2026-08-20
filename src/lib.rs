@@ -30,6 +30,7 @@ pub mod uac;
 pub mod metrics;
 pub mod admin;
 pub mod cdr;
+pub mod file_sink;
 pub mod shutdown;
 pub mod media;
 pub mod ifc;

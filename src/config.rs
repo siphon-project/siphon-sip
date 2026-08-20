@@ -3459,8 +3459,10 @@ fn default_srs_rtpengine_profile() -> String { "srs_recording".to_string() }
 pub struct LogConfig {
     pub level: LogLevel,
     pub format: LogFormat,
-    /// Optional path to a log file (e.g. `/var/log/siphon.log`).
-    /// When set, logs are written to both stderr and the file.
+    /// Optional path to a log file (e.g. `/var/log/siphon/siphon.log`).
+    /// When set, logs are written to both stderr and the file. A missing
+    /// parent directory is created; the packaged logrotate config rotates
+    /// anything named `*.log` under `/var/log/siphon`.
     pub file: Option<String>,
 }
 

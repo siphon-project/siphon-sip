@@ -1,4 +1,13 @@
-/var/log/siphon.log {
+# Rotation for the files siphon writes under /var/log/siphon — `log.file`,
+# `lawful_intercept.audit_log` and `cdr.file.path` in /etc/siphon/siphon.yaml.
+# The packaged systemd unit creates that directory, owned by the siphon user,
+# through LogsDirectory=.
+
+# Files siphon holds open for the lifetime of the process (log.file, the LI
+# audit log). copytruncate is load-bearing here: ExecReload sends SIGHUP, which
+# reloads the Python script and not the log file, so a rename-based rotation
+# would leave siphon writing to the unlinked inode until the next restart.
+/var/log/siphon/*.log {
     daily
     rotate 14
     compress
@@ -6,4 +15,20 @@
     missingok
     notifempty
     copytruncate
+    su siphon siphon
+}
+
+# CDRs are appended with a fresh open per record, so they rotate the ordinary
+# way. Deliberately NOT copytruncate: that copies and then truncates, and any
+# record written in between is lost — acceptable for a log line, not for a
+# billing record.
+/var/log/siphon/cdr.jsonl {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 siphon siphon
+    su siphon siphon
 }

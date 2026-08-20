@@ -11,7 +11,11 @@ if ! getent passwd siphon >/dev/null; then
         --no-create-home --gecos "SIPhon SIP proxy" siphon
 fi
 
-mkdir -p /var/lib/siphon
-chown siphon:siphon /var/lib/siphon
+# systemd creates and owns these through StateDirectory=/LogsDirectory= when
+# the unit starts, but the shipped config points log.file, cdr.file.path and
+# the LI audit log inside them, so create them here too for anyone running the
+# binary by hand before the first `systemctl start`.
+mkdir -p /var/lib/siphon /var/log/siphon
+chown siphon:siphon /var/lib/siphon /var/log/siphon
 
 #DEBHELPER#

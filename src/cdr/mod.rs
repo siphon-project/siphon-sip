@@ -506,12 +506,7 @@ async fn write_file_cdr(cdr: &Cdr, path: &str) {
     };
 
     use tokio::io::AsyncWriteExt;
-    match tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await
-    {
+    match crate::file_sink::open_append_async(path).await {
         Ok(mut file) => {
             let line = format!("{json}\n");
             if let Err(error) = file.write_all(line.as_bytes()).await {
