@@ -2365,6 +2365,70 @@ mod tests {
         assert!(!py_reg.lookup_str("sip:victim@example.com").is_empty());
     }
 
+    #[test]
+    fn auth_aor_match_reads_the_username_a_script_normalised() {
+        // A deployment whose authentication identity is not its subscriber
+        // identity (an IMS private identity, or a username carrying a validity
+        // prefix or tenant qualifier) reduces it via `request.auth_user = ...`
+        // after verification. The AoR comparison must see the reduced value —
+        // otherwise every such REGISTER is answered 403 and the only way to
+        // deploy is to turn the anti-hijack check off entirely.
+        let registrar = Arc::new(Registrar::new(RegistrarConfig {
+            enforce_auth_aor_match: true,
+            ..Default::default()
+        }));
+        let py_reg = PyRegistrar::new(Arc::clone(&registrar));
+
+        let build_register = |to_user: &str| {
+            let uri = SipUri::new("example.com".to_string());
+            let message = SipMessageBuilder::new()
+                .request(Method::Register, uri)
+                .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK".to_string())
+                .to(format!("<sip:{to_user}@example.com>"))
+                .from(format!("<sip:{to_user}@example.com>;tag=t"))
+                .call_id("c@h".to_string())
+                .cseq("1 REGISTER".to_string())
+                .header("Contact", "<sip:x@10.0.0.2:5060>".to_string())
+                .content_length(0)
+                .build()
+                .unwrap();
+            PyRequest::new(
+                Arc::new(Mutex::new(message)),
+                "udp".to_string(),
+                "10.0.0.2".to_string(),
+                5060,
+            )
+        };
+
+        // The credential as it arrived on the wire does not equal the AoR
+        // userpart, so unreduced it is refused.
+        let mut unreduced = build_register("alice");
+        unreduced.set_auth_user("qualifier:alice".to_string());
+        assert!(matches!(
+            py_reg.save(&mut unreduced, true, vec![], None),
+            Ok(false)
+        ));
+        assert!(py_reg.lookup_str("sip:alice@example.com").is_empty());
+
+        // Reduced to the subscriber identity by the script, it binds.
+        let mut reduced = build_register("alice");
+        reduced.set_auth_user("qualifier:alice".to_string());
+        reduced.py_set_auth_user(Some("alice".to_string()));
+        assert!(matches!(py_reg.save(&mut reduced, true, vec![], None), Ok(true)));
+        assert!(!py_reg.lookup_str("sip:alice@example.com").is_empty());
+
+        // Reducing to somebody *else's* identity is still refused — the setter
+        // relocates the comparison, it does not remove it.
+        let mut hijack = build_register("victim");
+        hijack.set_auth_user("qualifier:alice".to_string());
+        hijack.py_set_auth_user(Some("alice".to_string()));
+        assert!(matches!(
+            py_reg.save(&mut hijack, true, vec![], None),
+            Ok(false)
+        ));
+        assert!(py_reg.lookup_str("sip:victim@example.com").is_empty());
+    }
+
     // -----------------------------------------------------------------------
     // Phase 2 — Path-token MT routing: Python surface
     // -----------------------------------------------------------------------
