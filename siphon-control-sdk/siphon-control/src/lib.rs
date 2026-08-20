@@ -60,7 +60,9 @@ use pyo3::types::PyList;
 use pyo3_async_runtimes::TaskLocals;
 
 use siphon_control_client::proto::ControlErrorCode;
-use siphon_control_client::sip::{Call as RustCall, RouteTarget, SipClient, SipServer};
+use siphon_control_client::sip::{
+    Call as RustCall, DtmfOptions, PlayOptions, PlaySource, RouteTarget, SipClient, SipServer,
+};
 use siphon_control_client::{ClientConfig, ControlError as ClientError, ServerConfig};
 
 pyo3::create_exception!(
@@ -147,6 +149,23 @@ fn extract_route_target(item: &Bound<'_, PyAny>) -> PyResult<RouteTarget> {
         headers,
         timeout_secs,
     })
+}
+
+/// Build a [`PlaySource`] from the mutually-exclusive `file` / `db_id` / `blob`
+/// kwargs (exactly one must be set — mirrors the in-process `play_media`).
+fn build_play_source(
+    file: Option<String>,
+    db_id: Option<u64>,
+    blob: Option<Vec<u8>>,
+) -> PyResult<PlaySource> {
+    match (file, db_id, blob) {
+        (Some(file), None, None) => Ok(PlaySource::file(file)),
+        (None, Some(db_id), None) => Ok(PlaySource::db_id(db_id)),
+        (None, None, Some(blob)) => Ok(PlaySource::blob(blob)),
+        _ => Err(PyValueError::new_err(
+            "play requires exactly one of file (str), db_id (int), or blob (bytes)",
+        )),
+    }
 }
 
 /// Extract a `{name: value}` header dict into ordered string pairs.
@@ -271,6 +290,41 @@ impl Call {
         self.refer(py, to)
     }
 
+    /// Accept a pending inbound REFER (surfaced as a `TransferRequested` event)
+    /// and run the transfer. `target` overrides the Refer-To URI, `next_hop`
+    /// steers egress, and `mode` is `"terminate"` / `"transparent"`. No pending
+    /// REFER raises `ControlError` with `code == "not_found"`.
+    #[pyo3(signature = (target=None, next_hop=None, mode=None))]
+    fn accept_refer<'py>(
+        &self,
+        py: Python<'py>,
+        target: Option<String>,
+        next_hop: Option<String>,
+        mode: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.accept_refer(target.as_deref(), next_hop.as_deref(), mode.as_deref())
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Reject a pending inbound REFER with a final non-2xx (default
+    /// `603 Decline`). No pending REFER raises `code == "not_found"`.
+    #[pyo3(signature = (code, reason=None))]
+    fn reject_refer<'py>(
+        &self,
+        py: Python<'py>,
+        code: u16,
+        reason: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.reject_refer(code, reason.as_deref()).await.map_err(to_pyerr)
+        })
+    }
+
     /// Un-park this controlled call and dial the B-leg via siphon's LCR
     /// sequential-failover engine, returning control to siphon.
     ///
@@ -328,6 +382,14 @@ impl Call {
         })
     }
 
+    /// Remove a header from the stored A-leg INVITE.
+    fn remove_header<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.remove_header(&name).await.map_err(to_pyerr)
+        })
+    }
+
     fn set_var<'py>(
         &self,
         py: Python<'py>,
@@ -347,8 +409,37 @@ impl Call {
         })
     }
 
-    /// Play an announcement — raises `ControlError` (`code == "unsupported_verb"`)
-    /// until the server implements media.
+    /// Play an announcement on the A-leg media (fire-and-forget). Pass exactly one
+    /// of `file` (str), `db_id` (int), or `blob` (bytes, base64-encoded on the
+    /// wire); the rest shape playback. A call with no anchored media session
+    /// raises `ControlError` with `code == "not_found"`.
+    #[pyo3(signature = (file=None, db_id=None, blob=None, repeat=None, start_ms=None, duration_ms=None, to_tag=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn play<'py>(
+        &self,
+        py: Python<'py>,
+        file: Option<String>,
+        db_id: Option<u64>,
+        blob: Option<Vec<u8>>,
+        repeat: Option<u64>,
+        start_ms: Option<u64>,
+        duration_ms: Option<u64>,
+        to_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let source = build_play_source(file, db_id, blob)?;
+        let options = PlayOptions {
+            repeat,
+            start_ms,
+            duration_ms,
+            to_tag,
+        };
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.play(source, options).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Convenience for `play(file=...)` with default options.
     fn play_file<'py>(&self, py: Python<'py>, file: String) -> PyResult<Bound<'py, PyAny>> {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -356,11 +447,79 @@ impl Call {
         })
     }
 
-    /// Send DTMF — raises `ControlError` (`code == "unsupported_verb"`) today.
-    fn dtmf<'py>(&self, py: Python<'py>, digits: String) -> PyResult<Bound<'py, PyAny>> {
+    /// Stop the announcement currently playing on the A-leg media.
+    fn stop<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            call.dtmf(&digits).await.map_err(to_pyerr)
+            call.stop().await.map_err(to_pyerr)
+        })
+    }
+
+    /// Inject DTMF digits toward the A-leg (fire-and-forget). The optional
+    /// `duration_ms` / `volume_dbm0` / `pause_ms` / `to_tag` shape the tones.
+    #[pyo3(signature = (digits, duration_ms=None, volume_dbm0=None, pause_ms=None, to_tag=None))]
+    fn dtmf<'py>(
+        &self,
+        py: Python<'py>,
+        digits: String,
+        duration_ms: Option<u64>,
+        volume_dbm0: Option<i64>,
+        pause_ms: Option<u64>,
+        to_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let options = DtmfOptions {
+            duration_ms,
+            volume_dbm0,
+            pause_ms,
+            to_tag,
+        };
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.dtmf(&digits, options).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Hold the A-leg media via silence.
+    fn hold<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.hold().await.map_err(to_pyerr)
+        })
+    }
+
+    /// Resume the A-leg media after a `hold`.
+    fn unhold<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.unhold().await.map_err(to_pyerr)
+        })
+    }
+
+    /// Attach a WebSocket audio tee streaming a copy of the call's audio to
+    /// `ws_uri`. `direction` is `"both"` (default) / `"caller"` / `"callee"`;
+    /// `channels` is `1` (mono) or `2` (stereo). siphon-rtp backend only:
+    /// rtpengine / rtpproxy raise `ControlError` (`code == "unsupported_verb"`).
+    #[pyo3(signature = (ws_uri, direction=None, channels=None))]
+    fn stream_start<'py>(
+        &self,
+        py: Python<'py>,
+        ws_uri: String,
+        direction: Option<String>,
+        channels: Option<u8>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.stream_start(&ws_uri, direction.as_deref(), channels)
+                .await
+                .map_err(to_pyerr)
+        })
+    }
+
+    /// Detach the WebSocket audio tee (idempotent on siphon-rtp).
+    fn stream_stop<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            call.stream_stop().await.map_err(to_pyerr)
         })
     }
 

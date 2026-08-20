@@ -13,6 +13,7 @@ readme = "README.md"
 
 [dependencies]
 siphon-control-proto = { path = "../siphon-control-proto", version = "0.1.1" }
+base64 = "0.22"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

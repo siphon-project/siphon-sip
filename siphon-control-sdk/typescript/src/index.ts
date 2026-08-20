@@ -39,9 +39,10 @@
  * ## Errors
  *
  * A `status:"error"` reply throws a {@link ControlError} carrying the stable
- * {@link ControlErrorCode} in `.code`. Media verbs ({@link Call.playFile} /
- * {@link Call.dtmf}) throw `code === "unsupported_verb"` until the server
- * implements them (`error.isUnsupportedVerb()`).
+ * {@link ControlErrorCode} in `.code`. The WebSocket-tee verbs
+ * ({@link Call.streamStart} / {@link Call.streamStop}) are siphon-rtp-only, so a
+ * non-siphon-rtp backend throws `code === "unsupported_verb"`
+ * (`error.isUnsupportedVerb()`).
  */
 
 export { ControlError } from "./errors";
@@ -75,6 +76,9 @@ export type {
   ResyncResult,
   SipVerbToken,
   SipEventKind,
+  ChannelDtmfPayload,
+  TransferReplaces,
+  TransferRequestedPayload,
 } from "./protocol";
 
 export { ControlClient, EventStream } from "./client";
@@ -94,4 +98,8 @@ export type {
   AcceptReferOptions,
   RouteTarget,
   RouteTargetObject,
+  PlaySource,
+  PlayOptions,
+  DtmfOptions,
+  StreamOptions,
 } from "./sip";

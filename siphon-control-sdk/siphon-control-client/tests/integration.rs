@@ -135,13 +135,14 @@ async fn drive_stub(mut socket: WebSocket, stub: Arc<Stub>) {
                 let _ = socket.send(Message::Text(event.to_string().into())).await;
                 send_ok(&mut socket, &id, serde_json::json!({})).await;
             }
-            // Media verbs the server does not implement yet.
-            "play" | "dtmf" => {
+            // The WebSocket-tee verbs are siphon-rtp-only; a non-siphon-rtp
+            // backend answers unsupported_verb (the stub plays that backend).
+            "stream_start" | "stream_stop" => {
                 send_error(
                     &mut socket,
                     &id,
                     "unsupported_verb",
-                    "sip adapter does not implement this verb in this build",
+                    "ws_tee is only supported by the siphon-rtp backend",
                 )
                 .await;
             }
@@ -258,10 +259,11 @@ async fn stasis_start_dispatches_a_call_and_verbs_round_trip() {
     assert_eq!(call.get_header("P-Asserted-Identity").await.unwrap().as_deref(), Some("203.0.113.7"));
     call.transfer("sip:agent@pbx").await.expect("refer ok");
 
-    // A media verb surfaces the server's unsupported_verb as a typed error.
-    match call.dtmf("123#").await {
+    // A backend-gated verb (ws_tee is siphon-rtp-only) surfaces the server's
+    // unsupported_verb as a typed error.
+    match call.stream_start("ws://ai:9000/stream", None, None).await {
         Err(error) => assert!(error.is_unsupported_verb(), "expected unsupported_verb, got {error:?}"),
-        Ok(()) => panic!("dtmf should be unsupported today"),
+        Ok(()) => panic!("stream_start should be unsupported on a non-siphon-rtp backend"),
     }
 }
 

@@ -63,6 +63,28 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   including redundancy repair and unrecoverable-loss markers. Absent, not
   zeroed, on a call with no observed text stream — `text_packets=0` would read
   as a text stream that carried nothing, which is a different claim.
+
+- **Media / header / REFER verbs + the two events on the control-plane SDK's
+  `sip` facade — all three bindings.** Wraps the SIP-adapter verbs that shipped
+  server-side, mirroring the `route()` facade: `play` (one of `file` / `db_id` /
+  `blob`, the blob base64-encoded on the wire, plus `repeat` / `start_ms` /
+  `duration_ms` / `to_tag`), `stop`, `dtmf` (`digits` plus `duration_ms` /
+  `volume_dbm0` / `pause_ms` / `to_tag`), `hold` / `unhold`, `stream_start`
+  (`ws_uri`, `direction` ∈ `both` / `caller` / `callee`, `channels` — siphon-rtp
+  only, so other backends answer `unsupported_verb`) / `stream_stop`,
+  `remove_header`, and `accept_refer` (`{target?, next_hop?, mode?}`) /
+  `reject_refer` (`{code, reason?}`). The inbound `ChannelDtmfReceived`
+  (`{digit, duration_ms, volume, from_tag}`) and `TransferRequested`
+  (`{refer_to, replaces?, from_tag}`) events are added to the client event enums
+  with typed payload views so a consumer can match and decode them. Method names
+  follow the verbs (`play` / `stop` / `dtmf` / `hold` / `unhold` /
+  `streamStart`/`stream_start` / `streamStop`/`stream_stop` /
+  `removeHeader`/`remove_header` / `acceptRefer`/`accept_refer` /
+  `rejectRefer`/`reject_refer`), idiomatically cased per language. Errors surface
+  as the same typed `unsupported_verb` / `bad_request` / `not_found` as the
+  sibling verbs. The control SDK version is unchanged (its own `control-sdk-v*`
+  train cuts the release).
+
 - **Cold transfer off a call siphon answered itself.** A voice-AI or IVR call has
   no B leg, so the only way to hand the caller on is an in-dialog REFER on the A
   dialog via the imperative `b2bua.refer(call_id, target)` — `call.refer()` is a

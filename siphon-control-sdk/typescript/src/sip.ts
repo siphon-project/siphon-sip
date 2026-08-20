@@ -36,7 +36,10 @@ import type { CommandTransport } from "./session";
 // ---------------------------------------------------------------------------
 
 /** One event delivered to a call's stream (`ChannelStateChange`,
- * `ChannelHangupRequest`, `StasisEnd`, …). */
+ * `ChannelHangupRequest`, `ChannelDtmfReceived`, `TransferRequested`,
+ * `StasisEnd`, …). Cast `payload` to
+ * {@link import("./protocol").ChannelDtmfPayload} /
+ * {@link import("./protocol").TransferRequestedPayload} by `kind`. */
 export interface CallEvent {
   /** The parsed event kind. */
   kind: SipEventKind;
@@ -133,6 +136,93 @@ function stringValue(result: unknown): string | null {
     }
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// play() / dtmf() / streamStart() args
+// ---------------------------------------------------------------------------
+
+/**
+ * The audio source for {@link Call.play}: exactly one of a server-side file
+ * path, an rtpengine media-DB id, or an inline blob. A blob is base64-encoded on
+ * the wire (the control rail is JSON text).
+ */
+export type PlaySource =
+  | { file: string }
+  | { dbId: number }
+  | { blob: Uint8Array };
+
+/** Optional shaping for {@link Call.play}. */
+export interface PlayOptions {
+  /** Repeat the prompt this many times (0/undefined → play once). */
+  repeat?: number;
+  /** Start playback at this offset into the source, in milliseconds. */
+  startMs?: number;
+  /** Cap playback to this duration, in milliseconds. */
+  durationMs?: number;
+  /** Scope the prompt to one peer of an MPTY bridge (its To-tag). */
+  toTag?: string;
+}
+
+/** Optional shaping for {@link Call.dtmf}. */
+export interface DtmfOptions {
+  /** Per-digit tone duration, in milliseconds. */
+  durationMs?: number;
+  /** Tone volume in dBm0 (negative). */
+  volumeDbm0?: number;
+  /** Inter-digit pause, in milliseconds. */
+  pauseMs?: number;
+  /** Scope the tones to one peer of an MPTY bridge (its To-tag). */
+  toTag?: string;
+}
+
+/** Options for {@link Call.streamStart} (the WebSocket audio tee). */
+export interface StreamOptions {
+  /** Which leg(s) to tee — `"both"` (default), `"caller"`, or `"callee"`. */
+  direction?: "both" | "caller" | "callee";
+  /** `1` = mixed mono, `2` = caller/callee stereo (only with `"both"`). */
+  channels?: 1 | 2;
+}
+
+function playArgs(source: PlaySource, options?: PlayOptions): Record<string, unknown> {
+  const args: Record<string, unknown> = {};
+  if ("file" in source) {
+    args.file = source.file;
+  } else if ("dbId" in source) {
+    args.db_id = source.dbId;
+  } else {
+    args.blob = Buffer.from(source.blob).toString("base64");
+  }
+  if (options?.repeat !== undefined) {
+    args.repeat = options.repeat;
+  }
+  if (options?.startMs !== undefined) {
+    args.start_ms = options.startMs;
+  }
+  if (options?.durationMs !== undefined) {
+    args.duration_ms = options.durationMs;
+  }
+  if (options?.toTag !== undefined) {
+    args.to_tag = options.toTag;
+  }
+  return args;
+}
+
+function dtmfArgs(digits: string, options?: DtmfOptions): Record<string, unknown> {
+  const args: Record<string, unknown> = { digits };
+  if (options?.durationMs !== undefined) {
+    args.duration_ms = options.durationMs;
+  }
+  if (options?.volumeDbm0 !== undefined) {
+    args.volume_dbm0 = options.volumeDbm0;
+  }
+  if (options?.pauseMs !== undefined) {
+    args.pause_ms = options.pauseMs;
+  }
+  if (options?.toTag !== undefined) {
+    args.to_tag = options.toTag;
+  }
+  return args;
 }
 
 /**
@@ -257,9 +347,11 @@ export class Call {
   }
 
   /**
-   * Accept an inbound REFER on this tracked call. **Not implemented server-side
-   * in Phase 1** — resolves to a {@link ControlError} with `code ===
-   * "unsupported_verb"` until the server adds it.
+   * Accept a *pending inbound* REFER (surfaced as a `TransferRequested` event)
+   * and run the transfer. `target` overrides the Refer-To URI, `nextHop` steers
+   * egress, and `mode` (`"terminate"` / `"transparent"`) overrides
+   * `b2bua.default_refer_mode`. No pending REFER (already decided, timed out, or
+   * the call is gone) rejects with `code === "not_found"`.
    */
   async acceptRefer(options?: AcceptReferOptions): Promise<void> {
     const args: Record<string, unknown> = {};
@@ -276,8 +368,8 @@ export class Call {
   }
 
   /**
-   * Reject an inbound REFER on this tracked call. **Not implemented server-side
-   * in Phase 1** — see {@link Call.acceptRefer}.
+   * Reject a *pending inbound* REFER with a final non-2xx (default
+   * `603 Decline`). No pending REFER rejects with `code === "not_found"`.
    */
   async rejectRefer(code: number, reason?: string): Promise<void> {
     const args: Record<string, unknown> = { code };
@@ -298,11 +390,7 @@ export class Call {
     return stringValue(result);
   }
 
-  /**
-   * Remove a header from the stored A-leg INVITE. **Not implemented server-side
-   * in Phase 1** — resolves to a {@link ControlError} with `code ===
-   * "unsupported_verb"` until the server adds it.
-   */
+  /** Remove a header from the stored A-leg INVITE. */
   async removeHeader(name: string): Promise<void> {
     await this.sip(SipVerb.RemoveHeader, { name });
   }
@@ -320,20 +408,65 @@ export class Call {
     return stringValue(result);
   }
 
-  // --- media (server answers `unsupported_verb` today) -------------------
+  // --- media -------------------------------------------------------------
 
   /**
-   * Play an announcement. **Not yet implemented server-side** — resolves to a
-   * {@link ControlError} with `code === "unsupported_verb"` until the media
-   * backend lands.
+   * Play an announcement on the A-leg media (fire-and-forget). `source` is a
+   * {@link PlaySource} (a blob is base64-encoded on the wire); `options` shapes
+   * playback. A call with no anchored media session rejects with
+   * `code === "not_found"`.
    */
-  async playFile(file: string): Promise<void> {
-    await this.sip(SipVerb.Play, { file });
+  async play(source: PlaySource, options?: PlayOptions): Promise<void> {
+    await this.sip(SipVerb.Play, playArgs(source, options));
   }
 
-  /** Send DTMF. **Not yet implemented server-side** — see {@link Call.playFile}. */
-  async dtmf(digits: string): Promise<void> {
-    await this.sip(SipVerb.Dtmf, { digits });
+  /** Convenience for {@link Call.play} of a server-side file with default options. */
+  async playFile(file: string): Promise<void> {
+    await this.play({ file });
+  }
+
+  /** Stop the announcement currently playing on the A-leg media. */
+  async stop(): Promise<void> {
+    await this.sip(SipVerb.Stop, {});
+  }
+
+  /**
+   * Inject DTMF digits toward the A-leg (fire-and-forget). `options` carries the
+   * optional `durationMs` / `volumeDbm0` / `pauseMs` / `toTag` shaping.
+   */
+  async dtmf(digits: string, options?: DtmfOptions): Promise<void> {
+    await this.sip(SipVerb.Dtmf, dtmfArgs(digits, options));
+  }
+
+  /** Hold the A-leg media via silence. */
+  async hold(): Promise<void> {
+    await this.sip(SipVerb.Hold, {});
+  }
+
+  /** Resume the A-leg media after a {@link Call.hold}. */
+  async unhold(): Promise<void> {
+    await this.sip(SipVerb.Unhold, {});
+  }
+
+  /**
+   * Attach a WebSocket audio tee — stream a copy of the call's decoded audio to
+   * `wsUri` while the call keeps relaying. siphon-rtp backend only: rtpengine /
+   * rtpproxy reject with `code === "unsupported_verb"` (`error.isUnsupportedVerb()`).
+   */
+  async streamStart(wsUri: string, options?: StreamOptions): Promise<void> {
+    const args: Record<string, unknown> = { ws_uri: wsUri };
+    if (options?.direction !== undefined) {
+      args.direction = options.direction;
+    }
+    if (options?.channels !== undefined) {
+      args.channels = options.channels;
+    }
+    await this.sip(SipVerb.StreamStart, args);
+  }
+
+  /** Detach the WebSocket audio tee (idempotent on siphon-rtp). */
+  async streamStop(): Promise<void> {
+    await this.sip(SipVerb.StreamStop, {});
   }
 
   // --- escape hatch + events --------------------------------------------
