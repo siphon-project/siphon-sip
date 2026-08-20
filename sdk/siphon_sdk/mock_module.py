@@ -1684,7 +1684,9 @@ class MockAuth:
             "(@b2bua.on_invite)"
         )
 
-    def require_www_digest(self, target: Any, realm: Optional[str] = None) -> bool:
+    def require_www_digest(self, target: Any, realm: Optional[str] = None,
+                           password: Optional[str] = None,
+                           ha1: Optional[str] = None) -> bool:
         """Challenge with 401 WWW-Authenticate, or verify existing credentials.
 
         If credentials are valid: sets ``target.auth_user``, returns ``True``.
@@ -1694,10 +1696,15 @@ class MockAuth:
             target: The SIP ``Request`` (``@proxy.on_request``) or B2BUA
                 ``Call`` (``@b2bua.on_invite``).
             realm: Auth realm (e.g. ``"example.com"``).
+            password: Verify against this plaintext secret instead of the
+                configured backend.  Mutually exclusive with ``ha1``.
+            ha1: Verify against this already-computed H(A1) instead of the
+                configured backend.  Mutually exclusive with ``password``.
 
         Returns:
             ``True`` if authenticated, ``False`` if challenge was sent.
         """
+        self._resolve_supplied(password, ha1)
         if self._allow:
             # Derive auth_user from From URI when auto-allowing.
             user = getattr(target.from_uri, "user", None) if target.from_uri else None
@@ -1712,7 +1719,9 @@ class MockAuth:
         return False
 
     def require_proxy_digest(self, target: Any,
-                             realm: Optional[str] = None) -> bool:
+                             realm: Optional[str] = None,
+                             password: Optional[str] = None,
+                             ha1: Optional[str] = None) -> bool:
         """Challenge with 407 Proxy-Authenticate.
 
         Same as :meth:`require_www_digest` but uses 407.  This is the challenge
@@ -1728,7 +1737,12 @@ class MockAuth:
         Args:
             target: The SIP ``Request`` or B2BUA ``Call``.
             realm: Auth realm.
+            password: Verify against this plaintext secret instead of the
+                configured backend.  Mutually exclusive with ``ha1``.
+            ha1: Verify against this already-computed H(A1) instead of the
+                configured backend.  Mutually exclusive with ``password``.
         """
+        self._resolve_supplied(password, ha1)
         if self._allow:
             user = getattr(target.from_uri, "user", None) if target.from_uri else None
             target.auth_user = user or "mock_user"
@@ -1741,9 +1755,11 @@ class MockAuth:
         return False
 
     def require_digest(self, target: Any,
-                       realm: Optional[str] = None) -> bool:
+                       realm: Optional[str] = None,
+                       password: Optional[str] = None,
+                       ha1: Optional[str] = None) -> bool:
         """Convenience alias for :meth:`require_www_digest`."""
-        return self.require_www_digest(target, realm=realm)
+        return self.require_www_digest(target, realm=realm, password=password, ha1=ha1)
 
     def require_ims_digest(self, request: Any,
                           realm: Optional[str] = None) -> bool:
@@ -1803,16 +1819,48 @@ class MockAuth:
             )
 
     def verify_digest(self, target: Any,
-                      realm: Optional[str] = None) -> bool:
+                      realm: Optional[str] = None,
+                      password: Optional[str] = None,
+                      ha1: Optional[str] = None) -> bool:
         """Verify credentials without sending a challenge.
+
+        By default the credential comes from the configured backend.  Pass
+        ``password=`` or ``ha1=`` (not both) to verify against a credential the
+        script supplies instead, which short-circuits the backend lookup
+        entirely — a deployment that derives credentials in-process then needs
+        no credential source configured at all::
+
+            secret = await cache.fetch("secrets", request.auth_user)
+            if not auth.verify_digest(request, realm, password=secret):
+                auth.require_www_digest(request, realm)
+                return
+
+        ``ha1=`` takes an already-computed H(A1) verbatim, so a deployment can
+        hold the hash rather than the plaintext.  It is algorithm-specific by
+        construction: a client answering with an algorithm other than the one
+        the hash was computed for will not verify, where ``password=`` covers
+        MD5, SHA-256 and SHA-512-256 from one secret, because H(A1) is derived
+        with whatever algorithm the client actually used (RFC 7616 §3.4.3).
+
+        The anti-replay nonce check runs either way: a supplied credential
+        changes where the secret comes from, never whether a captured
+        ``Authorization`` may be replayed.
 
         Args:
             target: The SIP ``Request`` or B2BUA ``Call``.
             realm: Auth realm.
+            password: Plaintext secret to verify against.  Mutually exclusive
+                with ``ha1``.
+            ha1: Already-computed H(A1) to verify against.  Mutually exclusive
+                with ``password``.
 
         Returns:
             ``True`` if valid credentials are present.
+
+        Raises:
+            ValueError: if both ``password`` and ``ha1`` are given.
         """
+        self._resolve_supplied(password, ha1)
         if self._allow:
             return True
         auth_header = (
@@ -1820,6 +1868,17 @@ class MockAuth:
             or target.get_header("Proxy-Authorization")
         )
         return auth_header is not None and self._check_auth(auth_header, realm)
+
+    @staticmethod
+    def _resolve_supplied(password: Optional[str], ha1: Optional[str]) -> None:
+        """Mirror the engine's rejection of both credential kwargs at once.
+
+        Supplying both is a script bug, not a fallback chain — one of them is
+        being silently ignored and the author cannot tell which — so the engine
+        raises rather than picking, and so does the mock.
+        """
+        if password is not None and ha1 is not None:
+            raise ValueError("pass either password= or ha1=, not both")
 
     def _check_auth(self, auth_header: str, realm: Optional[str]) -> bool:
         """Simple mock auth check."""

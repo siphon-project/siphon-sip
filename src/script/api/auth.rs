@@ -59,6 +59,41 @@ fn ims_auth_store() -> &'static Arc<DashMap<String, ImsAuthVector>> {
     IMS_AUTH_STORE.get_or_init(|| Arc::new(DashMap::new()))
 }
 
+/// A credential the script handed to a digest helper, in place of the
+/// configured backend.
+///
+/// Exists for deployments that can derive the credential in-process and would
+/// otherwise have to stand up an HTTP endpoint for siphon to fetch a value the
+/// script already has. Both forms carry the same authority; they differ only in
+/// what the deployment is willing to hold.
+enum SuppliedSecret<'a> {
+    /// The plaintext password. Hashed into H(A1) with whatever algorithm the
+    /// client used, so one secret answers MD5, SHA-256 and SHA-512-256 alike.
+    Password(&'a str),
+    /// An already-computed H(A1), used verbatim. Lets a deployment store the
+    /// hash rather than the plaintext, at the cost of being bound to the one
+    /// algorithm it was computed for.
+    Ha1(&'a str),
+}
+
+impl<'a> SuppliedSecret<'a> {
+    /// Resolve the `password=` / `ha1=` kwarg pair into at most one secret.
+    ///
+    /// Supplying both is a script bug, not a fallback chain — one of them is
+    /// being silently ignored and the author cannot tell which — so it raises
+    /// rather than picking.
+    fn from_kwargs(password: Option<&'a str>, ha1: Option<&'a str>) -> PyResult<Option<Self>> {
+        match (password, ha1) {
+            (Some(_), Some(_)) => Err(pyo3::exceptions::PyValueError::new_err(
+                "pass either password= or ha1=, not both",
+            )),
+            (Some(password), None) => Ok(Some(SuppliedSecret::Password(password))),
+            (None, Some(ha1)) => Ok(Some(SuppliedSecret::Ha1(ha1))),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
 /// A message object the digest helpers can authenticate: the proxy-mode
 /// [`PyRequest`] or the B2BUA-mode [`PyCall`].
 ///
@@ -394,14 +429,29 @@ impl PyAuth {
     /// If the message carries valid credentials, sets `request.auth_user` /
     /// `call.auth_user` and returns True. Otherwise arms a 401 response with a
     /// nonce and returns False.
-    #[pyo3(signature = (target, realm=None))]
+    ///
+    /// `password=` / `ha1=` verify against a credential the script supplies
+    /// instead of the configured backend — see [`verify_digest`](Self::verify_digest)
+    /// for when that is the right tool. The challenge, the anti-replay nonce
+    /// check, the auto-ban accounting and the failure metrics are identical
+    /// either way; only the source of the secret differs.
+    #[pyo3(signature = (target, realm=None, password=None, ha1=None))]
     fn require_www_digest(
         &self,
         target: &Bound<'_, PyAny>,
         realm: Option<&str>,
+        password: Option<&str>,
+        ha1: Option<&str>,
     ) -> PyResult<bool> {
+        let supplied = SuppliedSecret::from_kwargs(password, ha1)?;
         let mut guard = AuthTargetGuard::extract(target)?;
-        self.require_digest_inner(&mut guard.as_target(), realm, 401, "WWW-Authenticate")
+        self.require_digest_inner(
+            &mut guard.as_target(),
+            realm,
+            401,
+            "WWW-Authenticate",
+            supplied.as_ref(),
+        )
     }
 
     /// Challenge with 407 Proxy-Authenticate if not yet authenticated.
@@ -412,20 +462,35 @@ impl PyAuth {
     /// `@b2bua.on_invite`): the caller's re-INVITE carries
     /// `Proxy-Authorization`, which is stripped again before the B-leg is
     /// dialled because it is hop-by-hop (RFC 3261 §22.3).
-    #[pyo3(signature = (target, realm=None))]
+    #[pyo3(signature = (target, realm=None, password=None, ha1=None))]
     fn require_proxy_digest(
         &self,
         target: &Bound<'_, PyAny>,
         realm: Option<&str>,
+        password: Option<&str>,
+        ha1: Option<&str>,
     ) -> PyResult<bool> {
+        let supplied = SuppliedSecret::from_kwargs(password, ha1)?;
         let mut guard = AuthTargetGuard::extract(target)?;
-        self.require_digest_inner(&mut guard.as_target(), realm, 407, "Proxy-Authenticate")
+        self.require_digest_inner(
+            &mut guard.as_target(),
+            realm,
+            407,
+            "Proxy-Authenticate",
+            supplied.as_ref(),
+        )
     }
 
     /// Convenience alias: same as `require_www_digest`.
-    #[pyo3(signature = (target, realm=None))]
-    fn require_digest(&self, target: &Bound<'_, PyAny>, realm: Option<&str>) -> PyResult<bool> {
-        self.require_www_digest(target, realm)
+    #[pyo3(signature = (target, realm=None, password=None, ha1=None))]
+    fn require_digest(
+        &self,
+        target: &Bound<'_, PyAny>,
+        realm: Option<&str>,
+        password: Option<&str>,
+        ha1: Option<&str>,
+    ) -> PyResult<bool> {
+        self.require_www_digest(target, realm, password, ha1)
     }
 
     /// IMS digest authentication via Diameter Cx MAR/MAA.
@@ -700,8 +765,40 @@ impl PyAuth {
     /// Authorization/Proxy-Authorization credentials for the given realm. Does
     /// not arm a 401/407 if invalid — just returns False, and never touches
     /// `auth_user`.
-    #[pyo3(signature = (target, realm=None))]
-    fn verify_digest(&self, target: &Bound<'_, PyAny>, realm: Option<&str>) -> PyResult<bool> {
+    ///
+    /// By default the credential comes from the configured backend. Pass
+    /// `password=` or `ha1=` (not both) to verify against a credential the
+    /// script supplies instead, which short-circuits the backend lookup
+    /// entirely — a deployment that derives credentials in-process then needs
+    /// no credential source configured at all, rather than standing up an HTTP
+    /// endpoint for siphon to fetch a value the script already has:
+    ///
+    /// ```python
+    /// secret = await cache.fetch("secrets", request.auth_user)
+    /// if not auth.verify_digest(request, realm, password=secret):
+    ///     auth.require_www_digest(request, realm)
+    ///     return
+    /// ```
+    ///
+    /// `ha1=` takes an already-computed H(A1) verbatim, so a deployment can
+    /// hold the hash rather than the plaintext. It is algorithm-specific by
+    /// construction: a client answering with an algorithm other than the one
+    /// the hash was computed for will not verify, where `password=` covers MD5,
+    /// SHA-256 and SHA-512-256 from one secret because H(A1) is derived with
+    /// whatever algorithm the client actually used (RFC 7616 §3.4.3).
+    ///
+    /// The anti-replay nonce check runs either way: a supplied credential
+    /// changes where the secret comes from, never whether a captured
+    /// `Authorization` may be replayed.
+    #[pyo3(signature = (target, realm=None, password=None, ha1=None))]
+    fn verify_digest(
+        &self,
+        target: &Bound<'_, PyAny>,
+        realm: Option<&str>,
+        password: Option<&str>,
+        ha1: Option<&str>,
+    ) -> PyResult<bool> {
+        let supplied = SuppliedSecret::from_kwargs(password, ha1)?;
         let mut guard = AuthTargetGuard::extract(target)?;
         let realm = realm.unwrap_or(&self.default_realm);
         let message = guard.as_target().message();
@@ -721,7 +818,7 @@ impl PyAuth {
             .or_else(|| message.headers.get("Proxy-Authorization"));
 
         match auth_header {
-            Some(value) => Ok(self.validate_credentials(value, realm, &method)),
+            Some(value) => Ok(self.validate_credentials_with(value, realm, &method, supplied.as_ref())),
             None => Ok(false),
         }
     }
@@ -739,6 +836,7 @@ impl PyAuth {
             realm,
             401,
             "WWW-Authenticate",
+            None,
         )
     }
 
@@ -749,6 +847,7 @@ impl PyAuth {
             realm,
             407,
             "Proxy-Authenticate",
+            None,
         )
     }
 
@@ -758,12 +857,18 @@ impl PyAuth {
     /// path `auth.require_proxy_digest(call, realm)` takes from
     /// `@b2bua.on_invite`.
     pub fn challenge_proxy_call(&self, call: &mut PyCall, realm: Option<&str>) -> PyResult<bool> {
-        self.require_digest_inner(&mut AuthTarget::Call(call), realm, 407, "Proxy-Authenticate")
+        self.require_digest_inner(
+            &mut AuthTarget::Call(call),
+            realm,
+            407,
+            "Proxy-Authenticate",
+            None,
+        )
     }
 
     /// Challenge a B2BUA A-leg with 401 WWW-Authenticate (Rust API).
     pub fn challenge_www_call(&self, call: &mut PyCall, realm: Option<&str>) -> PyResult<bool> {
-        self.require_digest_inner(&mut AuthTarget::Call(call), realm, 401, "WWW-Authenticate")
+        self.require_digest_inner(&mut AuthTarget::Call(call), realm, 401, "WWW-Authenticate", None)
     }
 
     /// Verify credentials without sending a challenge (Rust API).
@@ -799,6 +904,7 @@ impl PyAuth {
         realm: Option<&str>,
         challenge_code: u16,
         _header_name: &str,
+        supplied: Option<&SuppliedSecret<'_>>,
     ) -> PyResult<bool> {
         let realm = realm.unwrap_or(&self.default_realm);
 
@@ -831,7 +937,7 @@ impl PyAuth {
         let credentials_present = auth_header.is_some();
 
         match auth_header {
-            Some(value) if self.validate_credentials(&value, realm, &method) => {
+            Some(value) if self.validate_credentials_with(&value, realm, &method, supplied) => {
                 // Extract username from the Authorization header
                 if let Some(username) = extract_username(&value) {
                     target.set_auth_user(username);
@@ -1068,6 +1174,22 @@ impl PyAuth {
 
     /// Validate credentials by dispatching to the configured backend.
     fn validate_credentials(&self, auth_value: &str, realm: &str, method: &str) -> bool {
+        self.validate_credentials_with(auth_value, realm, method, None)
+    }
+
+    /// [`Self::validate_credentials`], optionally against a credential the
+    /// script supplied instead of the configured backend.
+    ///
+    /// The anti-replay nonce check runs either way: a supplied credential
+    /// changes where the secret comes from, never whether the response is
+    /// allowed to be a replay.
+    fn validate_credentials_with(
+        &self,
+        auth_value: &str,
+        realm: &str,
+        method: &str,
+        supplied: Option<&SuppliedSecret<'_>>,
+    ) -> bool {
         // Anti-replay: reject a stale or forged nonce before any backend lookup
         // (RFC 7616 §3.3). Without this, a captured `Authorization` replays
         // forever. Applies to the static + HTTP backends; the IMS/AKA paths use
@@ -1079,6 +1201,13 @@ impl PyAuth {
                 return false;
             }
         }
+        // A script-supplied secret short-circuits the backend entirely, so a
+        // deployment that can derive the credential in-process needs no
+        // credential source configured at all.
+        if let Some(secret) = supplied {
+            return self.validate_supplied(auth_value, realm, method, secret);
+        }
+
         match self.backend_type {
             AuthBackendType::Static => self.validate_static(auth_value, realm, method),
             AuthBackendType::Http => self.validate_http(auth_value, realm, method),
@@ -1087,6 +1216,38 @@ impl PyAuth {
                 false
             }
         }
+    }
+
+    /// Verify the digest response against a credential the script supplied.
+    ///
+    /// `password` is hashed into H(A1) with the same algorithm the client used
+    /// in its `Authorization` header, which RFC 7616 §3.4.3 requires H(A1),
+    /// H(A2) and the response to share. `ha1` is taken as an already-computed
+    /// H(A1) and used verbatim, so a deployment can hold the hash rather than
+    /// the plaintext — but it is then algorithm-specific by construction, and a
+    /// client answering with a different algorithm than the hash was computed
+    /// for simply will not verify.
+    fn validate_supplied(
+        &self,
+        auth_value: &str,
+        realm: &str,
+        method: &str,
+        secret: &SuppliedSecret<'_>,
+    ) -> bool {
+        let fields = match DigestFields::parse(auth_value) {
+            Some(fields) => fields,
+            None => return false,
+        };
+
+        let ha1 = match secret {
+            SuppliedSecret::Password(password) => crate::auth::hash_hex_public(
+                fields.algorithm,
+                format!("{}:{}:{}", fields.username, realm, password).as_bytes(),
+            ),
+            SuppliedSecret::Ha1(ha1) => (*ha1).to_string(),
+        };
+
+        fields.verify(&ha1, method)
     }
 
     /// Static backend: look up plaintext password from config, compute digest.
@@ -1771,6 +1932,356 @@ mod tests {
         )
     }
 
+    // -----------------------------------------------------------------------
+    // Verifying against a credential the script supplies (password= / ha1=)
+    // -----------------------------------------------------------------------
+
+    /// A REGISTER carrying a valid digest for `username`/`password`, in the
+    /// caller's choice of algorithm. Nothing about it depends on a configured
+    /// backend — that is the point.
+    fn register_signed_with(
+        username: &str,
+        password: &str,
+        algorithm: crate::auth::DigestAlgorithm,
+    ) -> PyRequest {
+        let realm = "example.com";
+        let nonce = format!("{:016x}.test", now_unix_secs());
+        let digest_uri = "sip:example.com";
+        let hash = |input: String| crate::auth::hash_hex_public(algorithm, input.as_bytes());
+
+        let ha1 = hash(format!("{username}:{realm}:{password}"));
+        let ha2 = hash(format!("REGISTER:{digest_uri}"));
+        let response = hash(format!("{ha1}:{nonce}:{ha2}"));
+        let algorithm_param = match algorithm {
+            crate::auth::DigestAlgorithm::Md5 => String::new(),
+            other => format!(", algorithm={other}"),
+        };
+
+        let message = SipMessageBuilder::new()
+            .request(Method::Register, SipUri::new(realm.to_string()))
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-supplied".to_string())
+            .to(format!("<sip:{username}@{realm}>"))
+            .from(format!("<sip:{username}@{realm}>;tag=supplied"))
+            .call_id("supplied@host".to_string())
+            .cseq("1 REGISTER".to_string())
+            .header(
+                "Authorization",
+                format!(
+                    "Digest username=\"{username}\", realm=\"{realm}\", nonce=\"{nonce}\", \
+                     uri=\"{digest_uri}\", response=\"{response}\"{algorithm_param}"
+                ),
+            )
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        PyRequest::new(
+            Arc::new(Mutex::new(message)),
+            "udp".to_string(),
+            "10.0.0.1".to_string(),
+            5060,
+        )
+    }
+
+    /// H(A1) for the given credential, as a deployment holding hashes would
+    /// have stored it.
+    fn ha1_for(
+        username: &str,
+        password: &str,
+        algorithm: crate::auth::DigestAlgorithm,
+    ) -> String {
+        crate::auth::hash_hex_public(
+            algorithm,
+            format!("{username}:example.com:{password}").as_bytes(),
+        )
+    }
+
+    #[test]
+    fn supplied_password_verifies_with_no_backend_configured() {
+        // PyAuth::empty() has no static users and no HTTP backend, so this can
+        // only pass if the supplied secret short-circuits the backend lookup.
+        let auth = PyAuth::empty();
+        let request = register_signed_with("carol", "s3cret", crate::auth::DigestAlgorithm::Md5);
+
+        assert!(auth
+            .check_credentials(&request, Some("example.com"))
+            .expect("backend path runs")
+            .eq(&false));
+
+        Python::initialize();
+        Python::attach(|python| {
+            let object = Py::new(python, request).expect("request into Python");
+            assert!(auth
+                .verify_digest(
+                    object.bind(python).as_any(),
+                    Some("example.com"),
+                    Some("s3cret"),
+                    None
+                )
+                .expect("verify runs"));
+        });
+    }
+
+    #[test]
+    fn supplied_password_rejects_the_wrong_secret() {
+        let auth = PyAuth::empty();
+        let request = register_signed_with("carol", "s3cret", crate::auth::DigestAlgorithm::Md5);
+
+        Python::initialize();
+        Python::attach(|python| {
+            let object = Py::new(python, request).expect("request into Python");
+            assert!(!auth
+                .verify_digest(
+                    object.bind(python).as_any(),
+                    Some("example.com"),
+                    Some("not-the-secret"),
+                    None
+                )
+                .expect("verify runs"));
+        });
+    }
+
+    #[test]
+    fn supplied_ha1_verifies_without_holding_the_plaintext() {
+        let auth = PyAuth::empty();
+        let request = register_signed_with("carol", "s3cret", crate::auth::DigestAlgorithm::Md5);
+        let stored = ha1_for("carol", "s3cret", crate::auth::DigestAlgorithm::Md5);
+
+        Python::initialize();
+        Python::attach(|python| {
+            let object = Py::new(python, request).expect("request into Python");
+            assert!(auth
+                .verify_digest(
+                    object.bind(python).as_any(),
+                    Some("example.com"),
+                    None,
+                    Some(&stored)
+                )
+                .expect("verify runs"));
+        });
+    }
+
+    #[test]
+    fn supplied_password_covers_every_algorithm_the_client_may_pick() {
+        // RFC 7616 §3.4.3: H(A1), H(A2) and the response share one hash
+        // function. Deriving H(A1) with whatever the client used means one
+        // plaintext secret answers all three challenges siphon offers.
+        let auth = PyAuth::empty();
+        Python::initialize();
+
+        for algorithm in [
+            crate::auth::DigestAlgorithm::Md5,
+            crate::auth::DigestAlgorithm::Sha256,
+            crate::auth::DigestAlgorithm::Sha512_256,
+        ] {
+            let request = register_signed_with("carol", "s3cret", algorithm);
+            Python::attach(|python| {
+                let object = Py::new(python, request).expect("request into Python");
+                assert!(
+                    auth.verify_digest(
+                        object.bind(python).as_any(),
+                        Some("example.com"),
+                        Some("s3cret"),
+                        None
+                    )
+                    .expect("verify runs"),
+                    "password= must verify a {algorithm:?} response",
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn supplied_ha1_is_bound_to_the_algorithm_it_was_computed_for() {
+        // The documented trade-off of holding a hash instead of a secret: a
+        // client that answers with a different algorithm cannot verify, because
+        // H(A1) was fixed at storage time.
+        let auth = PyAuth::empty();
+        let md5_ha1 = ha1_for("carol", "s3cret", crate::auth::DigestAlgorithm::Md5);
+        let request = register_signed_with("carol", "s3cret", crate::auth::DigestAlgorithm::Sha256);
+
+        Python::initialize();
+        Python::attach(|python| {
+            let object = Py::new(python, request).expect("request into Python");
+            assert!(!auth
+                .verify_digest(
+                    object.bind(python).as_any(),
+                    Some("example.com"),
+                    None,
+                    Some(&md5_ha1)
+                )
+                .expect("verify runs"));
+        });
+    }
+
+    #[test]
+    fn supplying_both_password_and_ha1_is_an_error_not_a_silent_preference() {
+        let auth = PyAuth::empty();
+        let request = register_signed_with("carol", "s3cret", crate::auth::DigestAlgorithm::Md5);
+
+        Python::initialize();
+        Python::attach(|python| {
+            let object = Py::new(python, request).expect("request into Python");
+            let error = auth
+                .verify_digest(
+                    object.bind(python).as_any(),
+                    Some("example.com"),
+                    Some("s3cret"),
+                    Some("deadbeef"),
+                )
+                .expect_err("both kwargs must raise");
+            assert!(error.to_string().contains("not both"), "{error}");
+        });
+    }
+
+    #[test]
+    fn supplied_credential_still_rejects_a_stale_nonce_replay() {
+        // A supplied secret changes where the credential comes from, never
+        // whether a captured Authorization may be replayed. Without this the
+        // short-circuit would quietly drop the anti-replay guard (RFC 7616 §3.3).
+        let auth = PyAuth::empty();
+        let realm = "example.com";
+        let stale = format!(
+            "{:016x}.test",
+            now_unix_secs().saturating_sub(DEFAULT_NONCE_TTL_SECS + 60)
+        );
+        let digest_uri = "sip:example.com";
+        let ha1 = md5_hex(&format!("carol:{realm}:s3cret"));
+        let ha2 = md5_hex(&format!("REGISTER:{digest_uri}"));
+        let response = md5_hex(&format!("{ha1}:{stale}:{ha2}"));
+
+        let message = SipMessageBuilder::new()
+            .request(Method::Register, SipUri::new(realm.to_string()))
+            .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-replay".to_string())
+            .to("<sip:carol@example.com>".to_string())
+            .from("<sip:carol@example.com>;tag=replay".to_string())
+            .call_id("replay@host".to_string())
+            .cseq("1 REGISTER".to_string())
+            .header(
+                "Authorization",
+                format!(
+                    "Digest username=\"carol\", realm=\"{realm}\", nonce=\"{stale}\", \
+                     uri=\"{digest_uri}\", response=\"{response}\""
+                ),
+            )
+            .content_length(0)
+            .build()
+            .unwrap();
+        let request = PyRequest::new(
+            Arc::new(Mutex::new(message)),
+            "udp".to_string(),
+            "10.0.0.1".to_string(),
+            5060,
+        );
+
+        Python::initialize();
+        Python::attach(|python| {
+            let object = Py::new(python, request).expect("request into Python");
+            assert!(
+                !auth
+                    .verify_digest(
+                        object.bind(python).as_any(),
+                        Some(realm),
+                        Some("s3cret"),
+                        None
+                    )
+                    .expect("verify runs"),
+                "a cryptographically valid response on a stale nonce is still a replay",
+            );
+        });
+    }
+
+    #[test]
+    fn require_digest_with_a_supplied_password_accepts_and_stamps_auth_user() {
+        let auth = PyAuth::empty();
+        let request = register_signed_with("carol", "s3cret", crate::auth::DigestAlgorithm::Md5);
+
+        Python::initialize();
+        Python::attach(|python| {
+            let object = Py::new(python, request).expect("request into Python");
+            assert!(auth
+                .require_www_digest(
+                    object.bind(python).as_any(),
+                    Some("example.com"),
+                    Some("s3cret"),
+                    None
+                )
+                .expect("require runs"));
+
+            let borrowed = object.borrow(python);
+            assert_eq!(borrowed.get_auth_user(), Some("carol"));
+            // Nothing armed — the request proceeds.
+            assert_eq!(*borrowed.action(), RequestAction::None);
+        });
+    }
+
+    #[test]
+    fn require_digest_with_a_supplied_password_challenges_on_rejection() {
+        // The rejection path has to behave exactly like the backend one: arm
+        // the 401 rather than silently returning False.
+        let auth = PyAuth::empty();
+        let request = register_signed_with("carol", "s3cret", crate::auth::DigestAlgorithm::Md5);
+
+        Python::initialize();
+        Python::attach(|python| {
+            let object = Py::new(python, request).expect("request into Python");
+            assert!(!auth
+                .require_www_digest(
+                    object.bind(python).as_any(),
+                    Some("example.com"),
+                    Some("wrong-secret"),
+                    None
+                )
+                .expect("require runs"));
+
+            let borrowed = object.borrow(python);
+            assert!(borrowed.get_auth_user().is_none());
+            assert!(
+                matches!(borrowed.action(), RequestAction::Reply { code: 401, .. }),
+                "a supplied-credential rejection must still arm the challenge, got {:?}",
+                borrowed.action(),
+            );
+        });
+    }
+
+    #[test]
+    fn supplied_credential_rejection_still_counts_toward_the_failure_metric() {
+        // A deployment that verifies against its own secret must stay just as
+        // observable as one using a configured backend: the operator alerting
+        // on siphon_credential_failures_total is watching for brute force, and
+        // a path that authenticates without counting is a blind spot.
+        let _ = crate::metrics::init();
+        let Some(metrics) = crate::metrics::try_metrics() else {
+            // Metrics unavailable in this binary — nothing to assert.
+            return;
+        };
+        let before = metrics.credential_failures_total.get();
+
+        let auth = PyAuth::empty();
+        let request = register_signed_with("carol", "s3cret", crate::auth::DigestAlgorithm::Md5);
+
+        Python::initialize();
+        Python::attach(|python| {
+            let object = Py::new(python, request).expect("request into Python");
+            assert!(!auth
+                .require_www_digest(
+                    object.bind(python).as_any(),
+                    Some("example.com"),
+                    Some("wrong-secret"),
+                    None
+                )
+                .expect("require runs"));
+        });
+
+        // `>` rather than `== before + 1`: the counter is process-global and
+        // other tests in this binary drive the same path concurrently, so the
+        // delta is only ever a lower bound.
+        assert!(
+            metrics.credential_failures_total.get() > before,
+            "a present-but-invalid credential must count, whatever verified it",
+        );
+    }
+
     #[test]
     fn nonce_primitives_are_reachable_from_python() {
         // They existed as Rust-internal helpers in a plain `impl PyAuth`, so a
@@ -2167,7 +2678,7 @@ mod tests {
             // A proxy Request still works (unchanged behaviour).
             let request_obj = pyo3::Py::new(python, make_register_request()).unwrap();
             let challenged = auth
-                .require_www_digest(request_obj.bind(python).as_any(), None)
+                .require_www_digest(request_obj.bind(python).as_any(), None, None, None)
                 .unwrap();
             assert!(!challenged);
 
@@ -2175,21 +2686,21 @@ mod tests {
             // "'Call' object cannot be converted to 'Request'".
             let call_obj = pyo3::Py::new(python, make_invite_call(None, "INVITE")).unwrap();
             let challenged = auth
-                .require_proxy_digest(call_obj.bind(python).as_any(), None)
+                .require_proxy_digest(call_obj.bind(python).as_any(), None, None, None)
                 .unwrap();
             assert!(!challenged);
             assert!(auth
-                .verify_digest(call_obj.bind(python).as_any(), None)
+                .verify_digest(call_obj.bind(python).as_any(), None, None, None)
                 .is_ok());
 
             // Anything else is a clear TypeError naming both accepted types,
             // not a silent pass.
             let bogus = pyo3::types::PyString::new(python, "not a request or call");
-            let error = auth.require_proxy_digest(bogus.as_any(), None).unwrap_err();
+            let error = auth.require_proxy_digest(bogus.as_any(), None, None, None).unwrap_err();
             assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(python));
-            assert!(auth.require_www_digest(bogus.as_any(), None).is_err());
-            assert!(auth.require_digest(bogus.as_any(), None).is_err());
-            assert!(auth.verify_digest(bogus.as_any(), None).is_err());
+            assert!(auth.require_www_digest(bogus.as_any(), None, None, None).is_err());
+            assert!(auth.require_digest(bogus.as_any(), None, None, None).is_err());
+            assert!(auth.verify_digest(bogus.as_any(), None, None, None).is_err());
         });
     }
 
