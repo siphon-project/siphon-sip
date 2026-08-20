@@ -177,6 +177,15 @@ pub struct Route {
     /// Headers to inject on this carrier's B-leg INVITE (e.g. a carrier account
     /// token or routing tag). Applied after the header policy, so they always
     /// land on the wire.
+    ///
+    /// Dialog-defining headers are refused and logged: `Via`, `Call-ID`,
+    /// `CSeq`, `Max-Forwards`, `Content-Length`, `From`, `To`, `Contact`,
+    /// `Record-Route`, `Route`. siphon owns those on the B-leg, and overwriting
+    /// one — `From`, say, which carries the dialog tag — doesn't fail visibly:
+    /// the INVITE goes out and the damage surfaces later as ACKs and BYEs that
+    /// no longer match. Use `number_policy` (per-carrier identity reshaping) for
+    /// the From/To shape. `Proxy-Authorization` is *not* refused, so a
+    /// per-carrier trunk credential still works.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
     /// Fields siphon auto-stamps onto the CDR when this carrier wins — the API

@@ -75,7 +75,7 @@ one of `gateway_group` / `next_hop` / `ruri`.
 | `billing_increment` | int? | Seconds (60 = per-minute, 1 = per-second). |
 | `min_duration` | int? | Minimum billable seconds. |
 | `timeout_secs` | int? | Per-attempt ring timeout (else the call-level default). |
-| `headers` | object? | Headers to inject on this carrier's B-leg INVITE (applied after the header policy). |
+| `headers` | object? | Headers to inject on this carrier's B-leg INVITE (applied after the header policy). Dialog headers are refused — see below. |
 | `cdr_fields` | object? | Fields siphon auto-stamps onto the CDR when this carrier wins (no per-field script). |
 | `reroute_causes` | int[]? | SIP codes from this carrier that fail over to the next (overrides per-gateway + global). |
 
@@ -100,6 +100,16 @@ Top-level:
   `gateway.groups[].reroute_causes` > global `lcr.reroute_causes`, default
   `[408, 500, 502, 503, 504]`). A definitive response (486, 603) is forwarded to
   the caller.
+- **`headers` cannot forge a dialog header** — siphon owns the B-leg dialog, so
+  `Via`, `Call-ID`, `CSeq`, `Max-Forwards`, `Content-Length`, `From`, `To`,
+  `Contact`, `Record-Route` and `Route` are refused from a route's `headers` and
+  logged at warn naming the carrier and the header. This is the same set no
+  header policy may touch. Overwriting one would not fail visibly — a `From`
+  from a route replaces the header *including its dialog tag*, the INVITE still
+  goes out, and the breakage surfaces later as ACKs and BYEs that no longer
+  match. Use `number_policy` to reshape the From/To identity per carrier.
+  `Proxy-Authorization` is **not** refused, so a per-carrier trunk credential
+  still works.
 - **Forward-compatibility** — unknown response fields are ignored; new optional
   fields can be added without a version bump. Bump `version` only on a breaking
   change.
