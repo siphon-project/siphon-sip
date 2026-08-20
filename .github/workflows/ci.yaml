@@ -738,6 +738,218 @@ jobs:
             siphon-refer.log
             mock-siphon-rtp-refer.log
 
+
+  # ── Real siphon-rtp: control-plane smoke (both front-ends) ─────────────
+  # Runs the end-to-end test that was previously #[ignore]d behind
+  # SIPHON_RTP_BIN with the note "CI does not build the engine". It still does
+  # not: the published image is distroless with a *static musl* binary, so the
+  # binary is copied out and run bare on the runner. That covers both control
+  # planes (RtpEngineSet → --ng, SiphonRtpClient → --control) in ~2s with no
+  # container networking and no Rust build of the engine.
+  siphon-rtp-engine-smoke:
+    runs-on: ubuntu-latest
+    needs: rust-tests
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Python 3.14 (free-threaded)
+        uses: deadsnakes/action@v3.2.0
+        with:
+          python-version: "3.14-dev"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Extract the siphon-rtp binary from the published image
+        # Pinned to the release siphon pins siphon-rtp-proto to, so this proves
+        # a known-good pairing rather than whatever shipped most recently.
+        run: |
+          docker create --name rtp-extract ghcr.io/siphon-project/siphon-rtp:0.2.0
+          docker cp rtp-extract:/usr/local/bin/siphon-rtp ./siphon-rtp
+          docker rm rtp-extract
+          chmod +x ./siphon-rtp
+          ./siphon-rtp --help > /dev/null
+
+      - name: Smoke test against the real engine (NG + native control)
+        run: |
+          SIPHON_RTP_BIN="$PWD/siphon-rtp" PYO3_PYTHON=python3.14 \
+            cargo test --test integration_tests -- --ignored --exact \
+            siphon_rtp_tests::smoke_test_against_real_siphon_rtp --nocapture
+
+  # ── Real siphon-rtp: native JSON control plane ─────────────────────────
+  # The media-anchoring analogue of sipp-rtpproxy, but against the real engine
+  # instead of a mock: INVITE → offer → 200 → answer → BYE → delete, driven
+  # through `media.backend: siphon-rtp`.
+  #
+  # The mock profiles (voice-ai, refer-single-leg) stay as they are. They assert
+  # on what siphon *sent*, which the real engine cannot report; this asserts the
+  # complementary half, that a real engine accepts it.
+  sipp-siphon-rtp-native:
+    runs-on: ubuntu-latest
+    needs: rust-tests
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build siphon-rtp-native image
+        run: docker compose -f sipp/docker-compose.yaml --profile siphon-rtp-native build siphon-rtp-native
+
+      - name: Start the real engine + siphon
+        run: docker compose -f sipp/docker-compose.yaml --profile siphon-rtp-native up -d --wait siphon-rtp-engine siphon-rtp-native
+
+      - name: Register bob
+        run: docker compose -f sipp/docker-compose.yaml --profile siphon-rtp-native run --rm sipp-rtp-native-register
+
+      - name: Anchored call (INVITE → offer → 200 → answer → BYE → delete)
+        run: docker compose -f sipp/docker-compose.yaml --profile siphon-rtp-native up --abort-on-container-exit --exit-code-from sipp-rtp-native-uac sipp-rtp-native-uac sipp-rtp-native-uas
+
+      - name: Assert the engine accepted every command
+        # The independent oracle. A green call flow only proves siphon liked the
+        # answers it got; control_errors_total proves the engine did not reject
+        # anything on the way. That distinction caught a real profile mismatch
+        # (an SRTP offer answered in plain RTP) that the SIP leg reported as a
+        # perfectly successful call.
+        run: |
+          docker run --rm --network sipp_sipnet -v "$PWD/sipp/siphon-rtp:/app:ro" python:3.12-slim \
+            python3 /app/assert_engine.py metrics \
+              --url http://172.20.0.110:9091/metrics \
+              --min-offers 1 --min-answers 1 --min-deletes 1 \
+              --max-control-errors 0 --max-sessions 0
+
+      - name: Collect logs
+        if: always()
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs siphon-rtp-native > siphon-rtp-native.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs siphon-rtp-engine > siphon-rtp-engine.log 2>&1 || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile siphon-rtp-native down --remove-orphans
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-siphon-rtp-native-logs
+          path: |
+            siphon-rtp-native.log
+            siphon-rtp-engine.log
+            *.log
+
+  # ── Real siphon-rtp: rtpengine NG shim (drop-in replacement) ───────────
+  # Same script, same scenarios, same assertions as sipp-siphon-rtp-native —
+  # only the media backend differs. siphon's stock rtpengine client drives
+  # siphon-rtp's --ng listener, with a config block an operator could lift
+  # straight from an existing rtpengine deployment.
+  sipp-siphon-rtp-ng:
+    runs-on: ubuntu-latest
+    needs: rust-tests
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build siphon-rtp-ng image
+        run: docker compose -f sipp/docker-compose.yaml --profile siphon-rtp-ng build siphon-rtp-ng
+
+      - name: Start the real engine + siphon
+        run: docker compose -f sipp/docker-compose.yaml --profile siphon-rtp-ng up -d --wait siphon-rtp-engine siphon-rtp-ng
+
+      - name: Register bob
+        run: docker compose -f sipp/docker-compose.yaml --profile siphon-rtp-ng run --rm sipp-rtp-ng-register
+
+      - name: Anchored call over the NG shim
+        run: docker compose -f sipp/docker-compose.yaml --profile siphon-rtp-ng up --abort-on-container-exit --exit-code-from sipp-rtp-ng-uac sipp-rtp-ng-uac sipp-rtp-ng-uas
+
+      - name: Assert the engine accepted every command
+        run: |
+          docker run --rm --network sipp_sipnet -v "$PWD/sipp/siphon-rtp:/app:ro" python:3.12-slim \
+            python3 /app/assert_engine.py metrics \
+              --url http://172.20.0.110:9091/metrics \
+              --min-offers 1 --min-answers 1 --min-deletes 1 \
+              --max-control-errors 0 --max-sessions 0
+
+      - name: Collect logs
+        if: always()
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs siphon-rtp-ng > siphon-rtp-ng.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs siphon-rtp-engine > siphon-rtp-engine-ng.log 2>&1 || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile siphon-rtp-ng down --remove-orphans
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-siphon-rtp-ng-logs
+          path: |
+            siphon-rtp-ng.log
+            siphon-rtp-engine-ng.log
+            *.log
+
+  # ── Real siphon-rtp: voice-AI WebSocket bridge, with real audio ────────
+  # The one path the control-plane mock can never cover. The mock never dials
+  # ws_uri, so the existing sipp-voice-ai job proves siphon composed the right
+  # command and stops there. Here the engine really connects to an AI server,
+  # SIPp really sends G.711, and the AI server asserts the audio arrived —
+  # correct frame geometry for the negotiated ptime, and not digital silence.
+  # A bridge that connects and passes zeros is indistinguishable from a working
+  # one until you measure the samples, which is what mock_ai_ws.py does.
+  sipp-voice-ai-real:
+    runs-on: ubuntu-latest
+    needs: rust-tests
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build siphon-voice-ai-real image
+        run: docker compose -f sipp/docker-compose.yaml --profile voice-ai-real build siphon-voice-ai-real
+
+      - name: Start the real engine + AI server + siphon
+        run: docker compose -f sipp/docker-compose.yaml --profile voice-ai-real up -d --wait siphon-rtp-engine mock-ai-ws siphon-voice-ai-real
+
+      - name: Voice-AI call with real RTP (answer_local → WS bridge → audio)
+        run: docker compose -f sipp/docker-compose.yaml --profile voice-ai-real up --abort-on-container-exit --exit-code-from sipp-voice-ai-real-uac sipp-voice-ai-real-uac
+
+      - name: Assert audio crossed the bridge in both directions
+        # Reads the AI server's AI-WS-VERDICT line. A verdict that never appears
+        # is a failure too — that is what a bridge which was never dialled looks
+        # like, and it would otherwise pass by absence.
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs mock-ai-ws > mock-ai-ws.log 2>&1
+          docker run --rm -i -v "$PWD/sipp/siphon-rtp:/app:ro" python:3.12-slim \
+            python3 /app/assert_engine.py ws --min-sessions 1 --min-downlink 1 < mock-ai-ws.log
+
+      - name: Assert the engine tore the call down cleanly
+        # answer_local bumps no offer/answer counter, so only the delete and the
+        # error/session floors are meaningful for this flow.
+        run: |
+          docker run --rm --network sipp_sipnet -v "$PWD/sipp/siphon-rtp:/app:ro" python:3.12-slim \
+            python3 /app/assert_engine.py metrics \
+              --url http://172.20.0.110:9091/metrics \
+              --min-deletes 1 --max-control-errors 0 --max-sessions 0
+
+      - name: Collect logs
+        if: always()
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs siphon-voice-ai-real > siphon-voice-ai-real.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs siphon-rtp-engine > siphon-rtp-engine-voice-ai.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs mock-ai-ws > mock-ai-ws.log 2>&1 || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile voice-ai-real down --remove-orphans
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-voice-ai-real-logs
+          path: |
+            siphon-voice-ai-real.log
+            siphon-rtp-engine-voice-ai.log
+            mock-ai-ws.log
+            *.log
+
   # ── Fuzz testing (nightly) ─────────────────────────────────────────────
   fuzz:
     runs-on: ubuntu-latest

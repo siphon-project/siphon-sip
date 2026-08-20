@@ -9,10 +9,15 @@ rtpengine NG/bencode protocol.
 
 What it proves is the *composition*: that siphon identifies the carrier, issues
 the right control verb with the right profile, and answers the call with the SDP
-the engine handed back. It deliberately does not move audio. Proving the audio
-path needs the real engine plus a WebSocket media server; that run is gated on
-SIPHON_RTP_BIN (see tests/integration/siphon_rtp_tests.rs) because CI does not
-build the engine.
+the engine handed back. It deliberately does not move audio.
+
+The real engine covers the other half, and both halves are kept: this mock can
+report what siphon *sent* (see the stdout echo below), which a real engine
+cannot, while the real engine can reject what siphon sent and can move audio,
+which this cannot. See the siphon-rtp-native / siphon-rtp-ng / voice-ai-real
+compose profiles, which run the published engine image, and
+sipp/siphon-rtp/mock_ai_ws.py, which asserts audio actually crosses the
+WebSocket bridge.
 
 For offer / answer / answer_local it returns SDP with the c-line rewritten to
 MOCK_MEDIA_IP and the audio port to MOCK_MEDIA_PORT, simulating anchoring.

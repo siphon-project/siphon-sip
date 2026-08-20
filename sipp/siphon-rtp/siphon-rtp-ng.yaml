@@ -1,0 +1,54 @@
+# siphon config driving the REAL siphon-rtp engine through its rtpengine
+# NG/bencode shim (`--ng`), using siphon's stock rtpengine client unchanged.
+#
+# This is the drop-in-replacement proof. Nothing here knows it is talking to
+# siphon-rtp: the `media.rtpengine:` block is the same one a deployment would
+# point at a real rtpengine, and the SIPp scenarios (rtpengine_uac.xml /
+# rtpengine_uas.xml) are the ones the rtpengine profile already uses, verbatim.
+# If this passes, an operator can repoint an existing rtpengine deployment at
+# siphon-rtp without touching their config or their scripts.
+#
+# The twin file siphon-rtp-native.yaml runs the identical setup over the native
+# JSON control plane; the two differ only in the `media:` block.
+#
+# Used with: sipp/docker-compose.yaml (siphon-rtp-ng profile)
+# Script:    sipp/siphon-rtp/proxy_rtp_passthrough.py
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+advertised_address: "172.20.0.115"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.115"
+    - "127.0.0.1"
+
+script:
+  path: "/etc/siphon/scripts/proxy_rtp_passthrough.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+media:
+  # No `backend:` key — this is the default rtpengine backend, pointed at the
+  # engine's NG listener instead of at rtpengine itself.
+  rtpengine:
+    address: "172.20.0.110:22222"
+    timeout_ms: 2000
+
+log:
+  level: debug
+  format: pretty

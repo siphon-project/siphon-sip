@@ -4320,6 +4320,371 @@ services:
     profiles:
       - refer-single-leg
 
+
+  # ── REAL siphon-rtp engine ────────────────────────────────────────────────
+  # The published engine image, standing in for the Python control-plane mocks
+  # (sipp/siphon-rtp/mock_siphon_rtp.py) the way rtpengine-real stands in for
+  # sipp/rtpengine/mock_rtpengine.py. The mocks stay: they echo every command
+  # they receive so a scenario can assert on what siphon *sent*, which a real
+  # engine cannot do. These profiles assert the complementary half — that a
+  # real engine accepts it and moves real audio.
+  #
+  # One service serves all three profiles because it opens both control planes
+  # at once: --control (native JSON-over-TCP) and --ng (rtpengine bencode).
+  #
+  # The tag is pinned to the same release siphon pins `siphon-rtp-proto` to, so
+  # this tests a known-good pairing. Floating :latest would turn an unrelated
+  # engine release into a red CI run here.
+  #
+  # Usage:
+  #   docker compose -f sipp/docker-compose.yaml --profile siphon-rtp-native \
+  #     up --abort-on-container-exit sipp-rtp-native-uac
+  siphon-rtp-engine:
+    image: ghcr.io/siphon-project/siphon-rtp:0.2.0
+    container_name: siphon-rtp-engine
+    command:
+      - "--control"
+      - "0.0.0.0:8080"
+      - "--ng"
+      - "0.0.0.0:22222"
+      # Load-bearing. The UDP backend binds loopback by default (a NIC-free dev
+      # convenience), so without this the engine answers with c=IN IP4 127.0.0.1
+      # and no RTP on this network can ever reach it. The scenarios assert on
+      # this address precisely so that regression fails loudly.
+      - "--relay-bind-ip"
+      - "172.20.0.110"
+      - "--port-min"
+      - "30000"
+      - "--port-max"
+      - "30200"
+      - "--metrics-addr"
+      - "0.0.0.0:9091"
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.110
+    # No healthcheck: the image is distroless (no shell, no python), so a
+    # CMD-SHELL probe cannot run inside it. Readiness is gated by the
+    # siphon-rtp-engine-ready one-shot below, which probes /readyz from outside.
+    profiles:
+      - siphon-rtp-native
+      - siphon-rtp-ng
+      - voice-ai-real
+
+  # Readiness gate for the distroless engine: exits 0 once /readyz answers.
+  siphon-rtp-engine-ready:
+    image: python:3.12-slim
+    container_name: siphon-rtp-engine-ready
+    depends_on:
+      siphon-rtp-engine:
+        condition: service_started
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.120
+    command:
+      - python3
+      - -c
+      - |
+        import sys, time, urllib.request
+        for _ in range(60):
+            try:
+                with urllib.request.urlopen("http://172.20.0.110:9091/readyz", timeout=2) as r:
+                    if r.status == 200:
+                        print("engine ready"); sys.exit(0)
+            except Exception:
+                pass
+            time.sleep(1)
+        sys.exit("engine never became ready")
+    profiles:
+      - siphon-rtp-native
+      - siphon-rtp-ng
+      - voice-ai-real
+
+  # ── Native JSON control plane (media.backend: siphon-rtp) ─────────────────
+  siphon-rtp-native:
+    build:
+      context: ..
+    container_name: siphon-rtp-native-test
+    depends_on:
+      siphon-rtp-engine-ready:
+        condition: service_completed_successfully
+    volumes:
+      - ./siphon-rtp/siphon-rtp-native.yaml:/etc/siphon/siphon.yaml:ro
+      - ./siphon-rtp/proxy_rtp_passthrough.py:/etc/siphon/scripts/proxy_rtp_passthrough.py:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.112
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - siphon-rtp-native
+
+  sipp-rtp-native-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-rtp-native:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.113
+    entrypoint:
+      - sipp
+      - "172.20.0.112:5060"
+      - -sf
+      - /sipp/scenarios/register.xml
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - siphon-rtp-native
+
+  sipp-rtp-native-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-rtp-native-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.113
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/rtpengine_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - siphon-rtp-native
+
+  sipp-rtp-native-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-rtp-native:
+        condition: service_healthy
+      sipp-rtp-native-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.114
+    entrypoint:
+      - sipp
+      - "172.20.0.112:5060"
+      - -sf
+      - /sipp/scenarios/rtpengine_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - siphon-rtp-native
+
+  # ── rtpengine NG shim (drop-in replacement proof) ─────────────────────────
+  # Identical to the native stack above except for the media backend, and it
+  # runs the same scenarios the rtpengine profile uses, unmodified.
+  siphon-rtp-ng:
+    build:
+      context: ..
+    container_name: siphon-rtp-ng-test
+    depends_on:
+      siphon-rtp-engine-ready:
+        condition: service_completed_successfully
+    volumes:
+      - ./siphon-rtp/siphon-rtp-ng.yaml:/etc/siphon/siphon.yaml:ro
+      - ./siphon-rtp/proxy_rtp_passthrough.py:/etc/siphon/scripts/proxy_rtp_passthrough.py:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.115
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - siphon-rtp-ng
+
+  sipp-rtp-ng-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-rtp-ng:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.116
+    entrypoint:
+      - sipp
+      - "172.20.0.115:5060"
+      - -sf
+      - /sipp/scenarios/register.xml
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - siphon-rtp-ng
+
+  sipp-rtp-ng-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-rtp-ng-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.116
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/rtpengine_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - siphon-rtp-ng
+
+  sipp-rtp-ng-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-rtp-ng:
+        condition: service_healthy
+      sipp-rtp-ng-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.117
+    entrypoint:
+      - sipp
+      - "172.20.0.115:5060"
+      - -sf
+      - /sipp/scenarios/rtpengine_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - siphon-rtp-ng
+
+  # ── Voice-AI over a real WebSocket bridge, with real audio ────────────────
+  # The mock control server never dials ws_uri, so until now nothing proved
+  # audio crosses the bridge. Here the engine really connects to the AI server,
+  # decodes the caller's G.711 to L16, and re-encodes the reply.
+  mock-ai-ws:
+    image: python:3.12-slim
+    container_name: mock-ai-ws
+    volumes:
+      - ./siphon-rtp:/app:ro
+    working_dir: /app
+    # websockets is not in the base image; install then serve.
+    command: ["sh", "-c", "pip install --quiet --no-cache-dir websockets && exec python3 mock_ai_ws.py"]
+    environment:
+      AI_WS_PORT: "9001"
+      AI_WS_MIN_FRAMES: "10"
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.111
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; socket.create_connection(('127.0.0.1',9001),2).close()\""]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+    profiles:
+      - voice-ai-real
+
+  siphon-voice-ai-real:
+    build:
+      context: ..
+    container_name: siphon-voice-ai-real-test
+    depends_on:
+      siphon-rtp-engine-ready:
+        condition: service_completed_successfully
+      mock-ai-ws:
+        condition: service_healthy
+    volumes:
+      - ./siphon-rtp/siphon-voice-ai-real.yaml:/etc/siphon/siphon.yaml:ro
+      - ./siphon-rtp/voice_ai_real.py:/etc/siphon/scripts/voice_ai_real.py:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.118
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - voice-ai-real
+
+  # Carrier UAC that actually sends RTP (play_pcap_audio), so the bridge has
+  # audio to carry rather than just a socket to open.
+  sipp-voice-ai-real-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-voice-ai-real:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.119
+    entrypoint:
+      - sipp
+      - "172.20.0.118:5060"
+      - -sf
+      - /sipp/scenarios/voice_ai_real_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "40"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - voice-ai-real
+
 # ── Network ────────────────────────────────────────────────────────────────
 networks:
   sipnet:

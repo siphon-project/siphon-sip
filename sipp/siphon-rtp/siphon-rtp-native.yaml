@@ -1,0 +1,52 @@
+# siphon config for the REAL siphon-rtp engine over the native JSON control plane.
+#
+# Deliberately a byte-for-byte twin of siphon-rtp-ng.yaml except for the
+# `media:` block — same script, same scenarios, same assertions. The pair is an
+# A/B over the two control planes the engine serves: this file drives it with
+# `media.backend: siphon-rtp` (JSON-over-TCP, port 8080), the other with the
+# stock rtpengine client (NG/bencode, port 22222). A behavioural difference
+# between the two runs is therefore a control-plane bug, not a media bug.
+#
+# Used with: sipp/docker-compose.yaml (siphon-rtp-native profile)
+# Script:    sipp/siphon-rtp/proxy_rtp_passthrough.py — the stock proxy example
+#            with a plain-RTP profile (see that file for why srtp_to_rtp is
+#            wrong here). The `rtpengine` script namespace is backend-agnostic,
+#            which is itself part of what these two profiles assert.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+advertised_address: "172.20.0.112"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.112"
+    - "127.0.0.1"
+
+script:
+  path: "/etc/siphon/scripts/proxy_rtp_passthrough.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "172.20.0.110:8080"
+    timeout_ms: 2000
+
+log:
+  level: debug
+  format: pretty
