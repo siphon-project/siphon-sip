@@ -1498,6 +1498,68 @@ def make_decorator(call_id, from_tag):
         }
     }
 
+    /// Register a handler for **RFC 4103 real-time text** (T.140) increments.
+    ///
+    /// Fires once per increment the engine's text processor recovers on the
+    /// call's ``m=text`` stream, carrying the UTF-8 text that packet newly
+    /// delivered.  Only non-empty increments are reported — a duplicate, a
+    /// reordered packet or an idle keepalive produces no event — so the handler
+    /// firing always means new characters arrived.  A ``\ufffd`` in the text is
+    /// a gap RED redundancy could not repair (RFC 4103 §5.3), left in place so a
+    /// consumer sees where loss occurred rather than silently reading a shorter
+    /// message.
+    ///
+    /// Requires the call's media profile to set ``text_events``, and a call that
+    /// actually negotiated a plaintext text stream.  Delivered by the native
+    /// **siphon-rtp** backend only.
+    ///
+    /// ```python,ignore
+    /// @rtpengine.on_text
+    /// def transcript(call_id, from_tag, to_tag, text, direction):
+    ///     log.info(f"[{call_id}] {direction}: {text}")
+    /// ```
+    ///
+    /// Args:
+    ///     func_or_none: When applied directly (``@rtpengine.on_text``) this is
+    ///         the function.  When called with keyword filters the return value
+    ///         is a decorator.
+    ///     call_id: Optional engine call-id filter.
+    ///     from_tag: Optional from-tag filter — the leg that *sent* the text.
+    #[pyo3(signature = (func_or_none=None, *, call_id=None, from_tag=None))]
+    fn on_text<'py>(
+        &self,
+        python: Python<'py>,
+        func_or_none: Option<Py<PyAny>>,
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let code = r#"
+def make_decorator(call_id, from_tag):
+    import asyncio
+    import _siphon_registry
+    def decorator(fn):
+        is_async = asyncio.iscoroutinefunction(fn)
+        metadata = {"call_id": call_id, "from_tag": from_tag}
+        _siphon_registry.register("rtpengine.on_text", None, fn, is_async, metadata)
+        return fn
+    return decorator
+"#;
+        let globals = PyDict::new(python);
+        python.run(&std::ffi::CString::new(code).map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("on_text decorator source: {error}"))
+        })?, Some(&globals), None)?;
+        let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("failed to build on_text decorator")
+        })?;
+        let decorator = make_decorator.call1((call_id, from_tag))?;
+
+        // Support both `@on_text` (bare) and `@on_text(call_id=...)` forms.
+        match func_or_none {
+            Some(func) => decorator.call1((func.bind(python),)),
+            None => Ok(decorator),
+        }
+    }
+
     /// Register a handler for **WebSocket tee started** events.
     ///
     /// Fires once the engine has dialled the tee's WebSocket server, sent its

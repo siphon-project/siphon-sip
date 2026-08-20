@@ -1247,6 +1247,59 @@ pub async fn run(
                             crate::cdr::write(media_summary_to_cdr(&summary));
                         }
                     }
+                    crate::rtpengine::events::RtpEngineEvent::Text(text_event) => {
+                        tracing::debug!(
+                            call_id = %text_event.call_id,
+                            from_tag = %text_event.from_tag,
+                            direction = text_event.direction.as_deref().unwrap_or("-"),
+                            characters = text_event.text.chars().count(),
+                            "media engine recovered a real-time text increment"
+                        );
+                        let engine_state = state_for_events.engine.state();
+                        let handlers = engine_state
+                            .text_handlers(&text_event.call_id, &text_event.from_tag);
+                        if handlers.is_empty() {
+                            continue;
+                        }
+                        let state_ref = Arc::clone(&state_for_events);
+                        let text_clone = text_event.clone();
+                        let _ = crate::script::py_executor::try_run(move || {
+                            let engine_state = state_ref.engine.state();
+                            let handlers = engine_state
+                                .text_handlers(&text_clone.call_id, &text_clone.from_tag);
+                            pyo3::Python::attach(|python| {
+                                for handler in handlers {
+                                    let callable = handler.callable.bind(python);
+                                    let result = callable.call1((
+                                        text_clone.call_id.as_str(),
+                                        text_clone.from_tag.as_str(),
+                                        text_clone.to_tag.as_deref(),
+                                        text_clone.text.as_str(),
+                                        text_clone.direction.as_deref(),
+                                    ));
+                                    match result {
+                                        Ok(ret) => {
+                                            if handler.is_async {
+                                                if let Err(error) = run_coroutine(python, &ret) {
+                                                    tracing::error!(
+                                                        %error,
+                                                        "async rtpengine.on_text handler error"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                %error,
+                                                "rtpengine.on_text handler failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        })
+                        .await;
+                    }
                     crate::rtpengine::events::RtpEngineEvent::WsTeeStarted(tee) => {
                         tracing::debug!(
                             call_id = %tee.call_id,
@@ -9398,6 +9451,15 @@ fn media_summary_to_cdr(summary: &crate::rtpengine::events::CallSummary) -> crat
         put("packets_dropped", leg.packets_dropped.to_string());
         if let Some(ssrc) = leg.ssrc {
             put("ssrc", ssrc.to_string());
+        }
+        if let Some(text) = &leg.text {
+            put("text_packets", text.packets.to_string());
+            put("text_characters", text.characters.to_string());
+            put("text_missing_markers", text.missing_markers.to_string());
+            put(
+                "text_recovered_from_redundancy",
+                text.recovered_from_redundancy.to_string(),
+            );
         }
         if let Some(packets_lost) = leg.packets_lost {
             put("packets_lost", packets_lost.to_string());
@@ -21242,6 +21304,7 @@ mod tests {
                 mos_min: Some(3.9),
                 mos_max: Some(4.3),
                 mos_basis: Some("full".to_string()),
+                text: None,
             }
         }
 
@@ -21264,6 +21327,7 @@ mod tests {
             mos_min: None,
             mos_max: None,
             mos_basis: None,
+            text: None,
         };
 
         let summary = CallSummary {
@@ -21325,6 +21389,7 @@ mod tests {
                 mos_min: None,
                 mos_max: None,
                 mos_basis: None,
+                text: None,
             }
         }
 
@@ -21369,6 +21434,7 @@ mod tests {
             mos_min: None,
             mos_max: None,
             mos_basis: Some("loss+jitter".to_string()),
+            text: None,
         };
         let summary = CallSummary {
             call_id: "voice-ai-1".to_string(),

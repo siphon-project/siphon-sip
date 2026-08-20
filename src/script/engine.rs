@@ -126,6 +126,15 @@ pub enum HandlerKind {
         call_id: Option<String>,
         from_tag: Option<String>,
     },
+    /// `@rtpengine.on_text` — an RFC 4103 real-time text (T.140) increment was
+    /// recovered on a call's text stream. Fires only for a call whose media
+    /// profile set `text_events`, and only for non-empty increments.
+    ///
+    /// ``call_id`` and ``from_tag`` are optional filters.
+    RtpEngineOnText {
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    },
     /// `@rtpengine.on_ws_tee_started` — a WebSocket tee began streaming a
     /// call's audio. The handler receives the negotiated wire shape so it can
     /// correlate the control event with the media stream.
@@ -252,6 +261,21 @@ impl ScriptState {
             .iter()
             .filter(|h| match &h.kind {
                 HandlerKind::RtpEngineOnMediaTimeout { call_id: filter_cid, from_tag: filter_ftag } => {
+                    filter_cid.as_deref().map_or(true, |v| v == call_id)
+                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// Return all `RtpEngineOnText` handlers whose optional call-id/from-tag
+    /// filters match the event.  `None` filters match everything.
+    pub fn text_handlers(&self, call_id: &str, from_tag: &str) -> Vec<&HandlerEntry> {
+        self.handlers
+            .iter()
+            .filter(|h| match &h.kind {
+                HandlerKind::RtpEngineOnText { call_id: filter_cid, from_tag: filter_ftag } => {
                     filter_cid.as_deref().map_or(true, |v| v == call_id)
                         && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
                 }
@@ -1161,6 +1185,17 @@ fn extract_handlers(
                     .and_then(|v| v.extract().ok());
                 HandlerKind::RtpEngineOnWsTeeStarted { call_id, from_tag }
             }
+            "rtpengine.on_text" => {
+                let call_id: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("call_id").ok())
+                    .and_then(|v| v.extract().ok());
+                let from_tag: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("from_tag").ok())
+                    .and_then(|v| v.extract().ok());
+                HandlerKind::RtpEngineOnText { call_id, from_tag }
+            }
             "rtpengine.on_ws_tee_ended" => {
                 let call_id: Option<String> = metadata
                     .as_ref()
@@ -1831,6 +1866,43 @@ async def specific_timeout(call_id, from_tag):
                 HandlerKind::RtpEngineOnMediaTimeout { call_id: Some(c), .. } if c == "abc"
             ))
             .expect("filtered media-timeout handler registered");
+        assert!(specific.is_async);
+    }
+
+    #[test]
+    fn rtpengine_on_text_decorator_registers_and_filters() {
+        // Same (call_id, from_tag) filter shape as the sibling rtpengine hooks;
+        // the from-tag names the leg that *sent* the text.
+        let source = r#"
+from siphon import rtpengine
+
+@rtpengine.on_text
+def any_text(call_id, from_tag, to_tag, text, direction):
+    pass
+
+@rtpengine.on_text(call_id="abc", from_tag="ftag1")
+async def specific_text(call_id, from_tag, to_tag, text, direction):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 2);
+
+        // Catch-all everywhere, plus the filtered one on an exact match only.
+        assert_eq!(state.text_handlers("xyz", "other").len(), 1);
+        assert_eq!(state.text_handlers("abc", "ftag1").len(), 2);
+        assert_eq!(state.text_handlers("abc", "wrong").len(), 1);
+
+        // A text handler is not picked up by the other rtpengine hooks.
+        assert_eq!(state.ws_tee_started_handlers("abc", "ftag1").len(), 0);
+
+        let specific = state
+            .handlers
+            .iter()
+            .find(|h| matches!(
+                &h.kind,
+                HandlerKind::RtpEngineOnText { call_id: Some(c), .. } if c == "abc"
+            ))
+            .expect("filtered text handler registered");
         assert!(specific.is_async);
     }
 

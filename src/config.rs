@@ -2042,6 +2042,9 @@ impl MediaBackendKind {
             if flags.ws_tee_channels.is_some() {
                 unsupported.push("ws_tee_channels");
             }
+            if flags.text_events {
+                unsupported.push("text_events");
+            }
         }
 
         if matches!(self, Self::Rtpproxy) {
@@ -2505,6 +2508,12 @@ pub struct NgFlagsConfig {
     /// (RFC 5761).  Empty mirrors the offer.  Not honoured by `rtpproxy`.
     #[serde(default, deserialize_with = "deserialize_rtcp_mux")]
     pub rtcp_mux: Vec<String>,
+    /// Observe RFC 4103 real-time text on this call, delivering each recovered
+    /// T.140 increment to `@rtpengine.on_text` and per-leg reception counters in
+    /// the media CDR.  Promotes only the `m=text` stream, never audio, and is
+    /// inert on a call that negotiated no text.  `siphon-rtp` only.
+    #[serde(default)]
+    pub text_events: bool,
 }
 
 /// One or more RTPEngine instances.
@@ -5768,6 +5777,33 @@ script:
                 backend.as_str()
             );
         }
+    }
+
+    /// `text_events` drives the engine's RFC 4103 text processor, which only
+    /// siphon-rtp has.  It must be a hard config error on the other two rather
+    /// than a silent no-op: a script waiting on `@rtpengine.on_text` for events
+    /// that can never arrive looks identical to a caller who typed nothing.
+    #[test]
+    fn unsupported_profile_fields_rejects_text_events_off_siphon_rtp() {
+        let flags = NgFlagsConfig {
+            text_events: true,
+            ..NgFlagsConfig::default()
+        };
+        for backend in [MediaBackendKind::Rtpengine, MediaBackendKind::Rtpproxy] {
+            assert!(
+                backend
+                    .unsupported_profile_fields(&flags)
+                    .contains(&"text_events"),
+                "{} accepted text_events it cannot honour",
+                backend.as_str()
+            );
+        }
+        assert!(
+            MediaBackendKind::SiphonRtp
+                .unsupported_profile_fields(&flags)
+                .is_empty(),
+            "siphon-rtp rejected text_events it supports"
+        );
     }
 
     #[test]

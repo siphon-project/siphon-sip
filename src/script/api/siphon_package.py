@@ -467,6 +467,37 @@ class _RtpEngineNamespace:
             return decorator(func_or_none)
         return decorator
 
+    def on_text(self, func_or_none=None, *, call_id=None, from_tag=None):
+        """Register a handler for RFC 4103 real-time text (T.140) increments.
+
+        Fires once per increment the engine recovers on the call's ``m=text``
+        stream, carrying the text that packet newly delivered.  Only non-empty
+        increments are reported, so the handler firing always means new
+        characters arrived.  A ``\ufffd`` in the text marks a gap RED redundancy
+        could not repair (RFC 4103 §5.3) — it is left in so a consumer sees
+        where loss occurred instead of silently reading a shorter message.
+
+        Requires the call's media profile to set ``text_events``, and the
+        ``siphon-rtp`` media backend.
+
+        Usage:
+            @rtpengine.on_text
+            def handle_any(call_id, from_tag, to_tag, text, direction):
+                ...
+
+            @rtpengine.on_text(call_id="abc")
+            def handle_specific(call_id, from_tag, to_tag, text, direction):
+                ...
+        """
+        def decorator(fn):
+            is_async = _asyncio.iscoroutinefunction(fn)
+            metadata = {"call_id": call_id, "from_tag": from_tag}
+            _registry.register("rtpengine.on_text", None, fn, is_async, metadata)
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
     def on_ws_tee_started(self, func_or_none=None, *, call_id=None, from_tag=None):
         """Register a handler for WebSocket tee started events.
 

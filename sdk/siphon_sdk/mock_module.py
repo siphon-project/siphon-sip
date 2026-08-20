@@ -2057,6 +2057,7 @@ class MockRtpEngine:
         self._media_timeout_handlers: list[dict[str, Any]] = []
         self._ws_tee_started_handlers: list[dict[str, Any]] = []
         self._ws_tee_ended_handlers: list[dict[str, Any]] = []
+        self._text_handlers: list[dict[str, Any]] = []
 
     @property
     def active_sessions(self) -> int:
@@ -2754,6 +2755,59 @@ class MockRtpEngine:
             fired += 1
         return fired
 
+    def on_text(self, func_or_none: Any = None, *,
+                call_id: Optional[str] = None,
+                from_tag: Optional[str] = None) -> Any:
+        """Register a handler for **RFC 4103 real-time text** (T.140) increments.
+
+        Fires once per increment the engine's text processor recovers on the
+        call's ``m=text`` stream, carrying the UTF-8 text that packet newly
+        delivered. Only non-empty increments are reported — a duplicate, a
+        reordered packet or an idle keepalive produces no event — so the handler
+        firing always means new characters arrived. A ``\ufffd`` in the text is
+        a gap RED redundancy could not repair (RFC 4103 §5.3), left in place so
+        a consumer sees where loss occurred rather than silently reading a
+        shorter message.
+
+        Requires the call's media profile to set ``text_events``. Delivered by
+        the native **siphon-rtp** backend only.
+
+        Usage::
+
+            @rtpengine.on_text
+            def transcript(call_id, from_tag, to_tag, text, direction):
+                log.info(f"[{call_id}] {direction}: {text}")
+
+            @rtpengine.on_text(call_id="abc", from_tag="ftag1")
+            def transcript_specific(call_id, from_tag, to_tag, text, direction):
+                ...
+        """
+        def decorator(fn: Any) -> Any:
+            self._text_handlers.append({
+                "fn": fn,
+                "call_id": call_id,
+                "from_tag": from_tag,
+            })
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def fire_text(self, call_id: str, from_tag: str, text: str,
+                  to_tag: Optional[str] = None,
+                  direction: Optional[str] = "a_to_b") -> int:
+        """Test helper: fire a real-time text event.  Returns the number of
+        handlers that matched (and were invoked)."""
+        fired = 0
+        for entry in self._text_handlers:
+            if entry["call_id"] is not None and entry["call_id"] != call_id:
+                continue
+            if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
+                continue
+            entry["fn"](call_id, from_tag, to_tag, text, direction)
+            fired += 1
+        return fired
+
     def on_ws_tee_started(self, func_or_none: Any = None, *,
                           call_id: Optional[str] = None,
                           from_tag: Optional[str] = None) -> Any:
@@ -2889,6 +2943,7 @@ class MockRtpEngine:
         self._media_timeout_handlers.clear()
         self._ws_tee_started_handlers.clear()
         self._ws_tee_ended_handlers.clear()
+        self._text_handlers.clear()
         self._answer_local_no_codec = False
 
 

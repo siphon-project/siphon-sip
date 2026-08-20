@@ -44,6 +44,12 @@ pub enum RtpEngineEvent {
     /// scraping logs.  Emitted by the `siphon-rtp` native backend only; the
     /// rtpengine NG backend does not surface it.
     CallSummary(CallSummary),
+    /// Newly-recovered RFC 4103 real-time text (T.140) on a call's `m=text`
+    /// stream.  Emitted per recovered increment by the engine's userspace text
+    /// processor, which only runs when the profile set `text_events` and the
+    /// call actually negotiated a plaintext text stream.  `siphon-rtp` native
+    /// backend only.
+    Text(TextEvent),
     /// A WebSocket tee started streaming — the engine dialled the server, sent
     /// `start`, and the call's decoded audio is now flowing.  Emitted by the
     /// `siphon-rtp` native backend only.
@@ -133,6 +139,51 @@ pub struct CallLegSummary {
     /// `"full"` (MOS includes the G.107 delay term) or `"loss+jitter"` — how the
     /// MOS was derived.
     pub mos_basis: Option<String>,
+    /// RFC 4103 reception counters for this leg's inbound text stream, present
+    /// only when the call negotiated a plaintext `m=text` stream *and* a text
+    /// observability feature (recording, or `text_events`) promoted it.
+    pub text: Option<TextStreamStats>,
+}
+
+/// One increment of RFC 4103 real-time text (T.140), carried by
+/// [`RtpEngineEvent::Text`].
+///
+/// The engine emits only *non-empty* increments — a duplicate, a reordered
+/// packet or an idle keepalive produces no event — so a handler firing always
+/// means new characters arrived.  Any U+FFFD marker is left in `text` so a
+/// consumer sees where loss occurred (RFC 4103 §5.3) rather than silently
+/// receiving a shorter message.
+#[derive(Debug, Clone)]
+pub struct TextEvent {
+    /// SIP Call-ID the media session is keyed on.
+    pub call_id: String,
+    /// The leg that *sent* the text.
+    pub from_tag: String,
+    /// The peer leg's tag, when the engine reported one.
+    pub to_tag: Option<String>,
+    /// The UTF-8 increment this packet newly delivered.
+    pub text: String,
+    /// The observed direction, `"a_to_b"` or `"b_to_a"`, when reported.
+    pub direction: Option<String>,
+}
+
+/// RFC 4103 reception counters for one leg's inbound T.140 stream, measured by
+/// the engine's userspace text processor.  A content-level QoS surface distinct
+/// from the datapath's packet/byte counters: it reports what the receiver
+/// actually recovered, including redundancy repair and unrecoverable-loss
+/// markers.  `None` on a call with no observed text stream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TextStreamStats {
+    /// RTP packets accepted on this leg's inbound text stream.
+    pub packets: u64,
+    /// UTF-8 characters delivered after reassembly, including those recovered
+    /// from RED redundancy and the U+FFFD markers.
+    pub characters: u64,
+    /// U+FFFD markers inserted for gaps redundancy could not recover.
+    pub missing_markers: u64,
+    /// Generations recovered from RFC 2198 RED redundancy — loss the redundant
+    /// copies repaired before it reached the receiver.
+    pub recovered_from_redundancy: u64,
 }
 
 /// A WebSocket tee started streaming, carried by
