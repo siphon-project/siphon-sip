@@ -46,6 +46,40 @@ This is the opposite direction from `call.dial(auth_passthrough=True)`, where a
 caller to answer. Use `auth_passthrough` when the credentials live at the far
 end; challenge on the `Call` when siphon owns them.
 
+### When the credential is not the subscriber identity
+
+`request.auth_user` / `call.auth_user` hold the username exactly as it appeared
+in the `Authorization` / `Proxy-Authorization` header, because that is the
+string the digest response was computed over — siphon must not guess at its
+structure.
+
+Deployments where the authentication identity is not the subscriber identity
+need to say so. IMS is the standard case: a private identity `user@realm`
+authenticates a public identity. Any scheme carrying a validity prefix or a
+tenant qualifier in the username has the same shape. Both properties are
+writable, so the script reduces the credential **after** verification:
+
+```python
+@proxy.on_request("REGISTER")
+def register(request):
+    if not auth.verify_digest(request, realm="example.com"):
+        auth.require_www_digest(request, realm="example.com")
+        return
+    request.auth_user = request.auth_user.split(":", 1)[1]
+    registrar.save(request)
+```
+
+Everything keyed on the authenticated identity reads the new value:
+`registrar.enforce_auth_aor_match`, which compares it to the AoR userpart, and
+the CDR's `auth_user` field. That AoR check is exactly why the reduction has to
+happen — an unreduced credential never equals the AoR userpart, so every
+REGISTER is answered `403` and the only way to deploy is to turn the anti-hijack
+check off entirely.
+
+Assigning it *before* verifying defeats that comparison. It is an assertion
+about an identity already proven, not a way to prove one — so set it only on the
+success path.
+
 `require_ims_digest` and `require_aka_digest` take a `Request` only — IMS and
 AKA digest are REGISTER-time procedures, and REGISTER never reaches the B2BUA
 path.

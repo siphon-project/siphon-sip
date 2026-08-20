@@ -970,6 +970,32 @@ impl PyCall {
         self.auth_user.as_deref()
     }
 
+    /// Overwrite the username the A-leg authenticated as (the B2BUA twin of
+    /// `request.auth_user`'s setter).
+    ///
+    /// The digest helpers set this to the username exactly as it appeared in
+    /// the `Proxy-Authorization` header, because that is the string the
+    /// response was computed over. A deployment whose authentication identity
+    /// is not its subscriber identity — an IMS private identity authenticating
+    /// a public one, or any username carrying a validity prefix or tenant
+    /// qualifier — reduces it here, after verification:
+    ///
+    /// ```python
+    /// @b2bua.on_invite
+    /// def on_invite(call):
+    ///     if not auth.require_proxy_digest(call, "example.com"):
+    ///         return
+    ///     call.auth_user = normalise(call.auth_user)
+    /// ```
+    ///
+    /// The value is carried onto the call's CDR as `auth_user`. Setting it
+    /// before the challenge is answered asserts an identity that was never
+    /// proven, so assign it only on the success path.
+    #[setter(auth_user)]
+    fn py_set_auth_user(&mut self, username: Option<String>) {
+        self.auth_user = username;
+    }
+
     /// True when the A-leg source IP is a member of the resolved addresses
     /// of the gateway group named `group_name`.
     ///
@@ -2150,6 +2176,62 @@ mod tests {
         call.set_auth_user("alice".to_string());
         assert_eq!(call.get_auth_user(), Some("alice"));
         assert_eq!(call.auth_user(), Some("alice"));
+    }
+
+    #[test]
+    fn call_auth_user_can_be_overwritten_and_cleared_from_a_script() {
+        // Same mock-versus-runtime parity gap as request.auth_user: the SDK
+        // mock exposed a writable property, the binding had only a getter.
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new(
+            "test-id".to_string(),
+            message,
+            "10.0.0.1".to_string(),
+            "udp".to_string(),
+        );
+        call.set_auth_user("qualifier:alice".to_string());
+
+        call.py_set_auth_user(Some("alice".to_string()));
+        assert_eq!(call.auth_user(), Some("alice"));
+        // The accessor the dispatcher reads for the call's CDR agrees.
+        assert_eq!(call.get_auth_user(), Some("alice"));
+
+        call.py_set_auth_user(None);
+        assert_eq!(call.auth_user(), None);
+        assert_eq!(call.get_auth_user(), None);
+    }
+
+    #[test]
+    fn call_auth_user_is_writable_from_python_not_just_from_rust() {
+        // Same reasoning as the Request twin: the gap this closes is a
+        // mock-versus-runtime one, so the assertion that matters is that the
+        // Python attribute accepts an assignment.
+        Python::initialize();
+        Python::attach(|py| {
+            let message = Arc::new(Mutex::new(make_invite()));
+            let mut call = PyCall::new(
+                "test-id".to_string(),
+                message,
+                "10.0.0.1".to_string(),
+                "udp".to_string(),
+            );
+            call.set_auth_user("qualifier:alice".to_string());
+            let object = Py::new(py, call).expect("PyCall into Python");
+
+            let bound = object.bind(py);
+            bound
+                .setattr("auth_user", "alice")
+                .expect("auth_user must be assignable from Python");
+
+            let read_back: Option<String> = bound
+                .getattr("auth_user")
+                .and_then(|value| value.extract())
+                .expect("auth_user readable");
+            assert_eq!(read_back.as_deref(), Some("alice"));
+
+            // The accessor the dispatcher reads for the call's CDR agrees.
+            assert_eq!(object.borrow(py).get_auth_user(), Some("alice"));
+        });
     }
 
     #[test]

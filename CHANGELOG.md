@@ -71,6 +71,24 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   naming the carrier and the header. `Proxy-Authorization` stays injectable — a
   per-carrier trunk credential is a legitimate use of it. Use `number_policy` to
   reshape identity headers per carrier.
+- **`request.auth_user` and `call.auth_user` are writable.** They hold the
+  username exactly as it appeared in the `Authorization` / `Proxy-Authorization`
+  header, since that is the string the digest response was computed over.
+  Deployments where the authentication identity is not the subscriber identity —
+  IMS (a private identity authenticating a public one), or any scheme carrying a
+  validity prefix or tenant qualifier in the username — can now reduce it after
+  verification, and everything keyed on the authenticated identity reads the new
+  value: `registrar.enforce_auth_aor_match` and the CDR's `auth_user`. Without
+  this, an unreduced credential never equalled the AoR userpart, so every such
+  REGISTER was answered `403` and the only way to deploy was to turn the
+  anti-hijack check off entirely. Assign it only on the success path: it asserts
+  an identity already proven, it does not prove one.
+
+### Fixed
+- **`auth_user` no longer raises `AttributeError` on a real node.** The SDK mock
+  exposed `Request.auth_user` as a writable property while the binding had only
+  a getter, so a script assigning it passed pytest and failed at runtime. Mock
+  and runtime now agree, on `Call` as well as `Request`.
 - **`cdr.file.rotate_size_mb` actually rotates.** The value was documented,
   parsed and carried into the file backend, then dropped at the write site — so
   a CDR file configured with `rotate_size_mb: 100` grew without bound. It now

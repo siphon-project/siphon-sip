@@ -235,7 +235,28 @@ class Request:
 
     @property
     def auth_user(self) -> Optional[str]:
-        """Authenticated username (set after digest auth succeeds)."""
+        """Authenticated username (set after digest auth succeeds).
+
+        Writable.  The digest helpers set this to the username exactly as it
+        appeared in the ``Authorization`` / ``Proxy-Authorization`` header,
+        because that is the string the response was computed over.  A
+        deployment whose authentication identity is not its subscriber
+        identity — an IMS private identity authenticating a public one, or any
+        username carrying a validity prefix or tenant qualifier — reduces it
+        here, **after** verification::
+
+            if not auth.verify_digest(request, realm):
+                auth.require_www_digest(request, realm)
+                return
+            request.auth_user = normalise(request.auth_user)
+            registrar.save(request)
+
+        Everything keyed on the authenticated identity reads the new value:
+        ``registrar.enforce_auth_aor_match``, which compares it to the AoR
+        userpart, and the CDR's ``auth_user`` field.  Assigning it *before*
+        verifying therefore defeats that comparison — it is an assertion about
+        an identity already proven, not a way to prove one.
+        """
         return self._auth_user
 
     @auth_user.setter

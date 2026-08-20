@@ -148,8 +148,26 @@ class Call:
                     return          # 407 armed; siphon answers the A-leg
                 log.info(f"call from {call.auth_user}")
                 call.dial(call.ruri)
+
+        Writable, like ``request.auth_user``.  A deployment whose
+        authentication identity is not its subscriber identity reduces the
+        credential to the identity it wants downstream, **after** the challenge
+        has been answered::
+
+            @b2bua.on_invite
+            def new_call(call):
+                if not auth.require_proxy_digest(call, realm="example.com"):
+                    return
+                call.auth_user = normalise(call.auth_user)
+
+        Assigning it before the challenge is answered asserts an identity that
+        was never proven, so set it only on the success path.
         """
         return self._auth_user
+
+    @auth_user.setter
+    def auth_user(self, value: Optional[str]) -> None:
+        self._auth_user = value
 
     @auth_user.setter
     def auth_user(self, value: Optional[str]) -> None:

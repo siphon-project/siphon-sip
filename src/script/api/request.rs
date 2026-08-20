@@ -795,6 +795,38 @@ impl PyRequest {
         self.auth_user.clone()
     }
 
+    /// Overwrite the authenticated username.
+    ///
+    /// The digest helpers set this to the username exactly as it appeared in
+    /// the `Authorization` / `Proxy-Authorization` header, because that is the
+    /// string the response was computed over and siphon must not guess at its
+    /// structure. Deployments where the authentication identity is not the
+    /// subscriber identity need to say so themselves — IMS is the standard
+    /// case (a private identity `user@realm` authenticating a public identity),
+    /// and any scheme that carries a validity prefix or a tenant qualifier in
+    /// the username is the same shape.
+    ///
+    /// Assign it after verification, once the script has reduced the
+    /// credential to the identity it wants downstream:
+    ///
+    /// ```python
+    /// if not auth.verify_digest(request, realm):
+    ///     auth.require_www_digest(request, realm)
+    ///     return
+    /// request.auth_user = normalise(request.auth_user)
+    /// registrar.save(request)
+    /// ```
+    ///
+    /// Everything keyed on the authenticated identity reads the new value:
+    /// `registrar.enforce_auth_aor_match`, which compares it to the AoR
+    /// userpart, and the CDR's `auth_user` field. Setting it *before*
+    /// verifying therefore defeats that comparison — it is an assertion about
+    /// an identity already proven, not a way to prove one.
+    #[setter(auth_user)]
+    pub(crate) fn py_set_auth_user(&mut self, username: Option<String>) {
+        self.auth_user = username;
+    }
+
     /// Contact expires value — from the Contact header `expires` parameter,
     /// or the `Expires` header, or `None` if neither is present.
     ///
@@ -2553,6 +2585,66 @@ mod tests {
         let mut request = make_request();
         request.set_auth_user("alice".to_string());
         assert_eq!(request.auth_user(), Some("alice".to_string()));
+    }
+
+    #[test]
+    fn script_can_overwrite_the_authenticated_username() {
+        // The SDK mock has always exposed `request.auth_user` as writable while
+        // the binding was getter-only, so a script that normalised the identity
+        // passed pytest and raised AttributeError on a node.
+        let mut request = make_request();
+        request.set_auth_user("qualifier:alice".to_string());
+
+        request.py_set_auth_user(Some("alice".to_string()));
+        assert_eq!(request.auth_user(), Some("alice".to_string()));
+        // The Rust-side accessor the registrar and CDR read agrees.
+        assert_eq!(request.get_auth_user(), Some("alice"));
+    }
+
+    #[test]
+    fn auth_user_is_writable_from_python_not_just_from_rust() {
+        // The bug being fixed is precisely a mock-versus-runtime parity gap, so
+        // asserting the Rust setter alone would repeat it: what has to hold is
+        // that the *Python attribute* accepts an assignment. Drive the real
+        // pyclass through the interpreter.
+        Python::initialize();
+        Python::attach(|py| {
+            let mut request = make_request();
+            request.set_auth_user("qualifier:alice".to_string());
+            let object = Py::new(py, request).expect("PyRequest into Python");
+
+            let bound = object.bind(py);
+            bound
+                .setattr("auth_user", "alice")
+                .expect("auth_user must be assignable from Python");
+
+            let read_back: Option<String> = bound
+                .getattr("auth_user")
+                .and_then(|value| value.extract())
+                .expect("auth_user readable");
+            assert_eq!(read_back.as_deref(), Some("alice"));
+
+            // And the Rust-side accessor the registrar / CDR read agrees, so
+            // the assignment reaches the same field, not a Python shadow.
+            assert_eq!(
+                object.borrow(py).get_auth_user(),
+                Some("alice"),
+                "the Python assignment must land on the field Rust reads",
+            );
+
+            bound.setattr("auth_user", py.None()).expect("clearable");
+            assert!(object.borrow(py).get_auth_user().is_none());
+        });
+    }
+
+    #[test]
+    fn script_can_clear_the_authenticated_username() {
+        let mut request = make_request();
+        request.set_auth_user("alice".to_string());
+
+        request.py_set_auth_user(None);
+        assert!(request.auth_user().is_none());
+        assert!(request.get_auth_user().is_none());
     }
 
     #[test]
