@@ -444,12 +444,22 @@ impl ProxySessionStore {
     /// Remove a session by its server key, cleaning up all indices.
     pub fn remove_by_server_key(&self, server_key: &TransactionKey) {
         if let Some((_, client_keys)) = self.server_to_clients.remove(server_key) {
-            // Remove dialog key index entry via the session's original request
+            // Remove the dialog-key index entry via the session's original
+            // request — but only when the entry actually points at *this*
+            // session.  A mid-dialog re-INVITE's per-transaction session
+            // computes the SAME dialog key `(Call-ID, From-tag)` as the
+            // dialog-establishing INVITE, and `insert` deliberately does not
+            // let it displace the INVITE's entry (`or_insert_with`); removing
+            // unconditionally here would be the missing twin of that guard —
+            // a failed re-INVITE torn down through this path would erase the
+            // dialog entry the original INVITE still needs for 2xx-ACK routing
+            // and the in-dialog self-next-hop rescue.
             if let Some(first) = client_keys.first() {
                 if let Some(session_ref) = self.by_client_key.get(first) {
                     if let Ok(session) = session_ref.value().read() {
                         if let Some(dk) = Self::invite_dialog_key(&session.original_request) {
-                            self.by_dialog_key.remove(&dk);
+                            self.by_dialog_key
+                                .remove_if(&dk, |_, entry| Arc::ptr_eq(entry, session_ref.value()));
                         }
                     }
                 }
@@ -860,6 +870,48 @@ mod tests {
         assert!(store.get_client_keys_for_server(&server_key()).is_none());
         assert_eq!(store.session_count(), 0);
         assert_eq!(store.client_key_count(), 0);
+    }
+
+    #[test]
+    fn store_remove_by_server_key_keeps_dialog_entry_of_another_session() {
+        // A mid-dialog re-INVITE's per-transaction session shares the dialog
+        // key (Call-ID, From-tag) with the dialog-establishing INVITE, and
+        // insert() deliberately keeps the INVITE's entry (`or_insert_with`).
+        // Tearing the re-INVITE's session down by server key must not rip the
+        // INVITE's dialog entry out from under the live call — that entry
+        // routes the 2xx ACK and the in-dialog self-next-hop rescue for every
+        // LATER mid-dialog request (the resume of a hold/resume pair).
+        let store = ProxySessionStore::new();
+        let invite_arc = store.insert(make_session());
+
+        // Re-INVITE: same Call-ID + From-tag (dummy_request), its own keys.
+        let reinvite_server_key = TransactionKey::new(
+            "z9hG4bK-reinvite".to_string(),
+            Method::Invite,
+            "10.0.0.1:5060".to_string(),
+        );
+        let mut reinvite_session = ProxySession::new(
+            reinvite_server_key.clone(),
+            source_addr(),
+            local_addr(),
+            ConnectionId::default(),
+            Transport::Udp,
+            dummy_request(),
+            false,
+        );
+        reinvite_session.add_client_key(client_key("reinvite"));
+        store.insert(reinvite_session);
+
+        store.remove_by_server_key(&reinvite_server_key);
+
+        let survivor = store
+            .get_by_dialog_key("session-test", "abc")
+            .expect("the INVITE's dialog entry must survive the re-INVITE session's teardown");
+        assert!(Arc::ptr_eq(&survivor, &invite_arc));
+
+        // Removing the INVITE's own server key still cleans its dialog entry.
+        store.remove_by_server_key(&server_key());
+        assert!(store.get_by_dialog_key("session-test", "abc").is_none());
     }
 
     #[test]

@@ -219,7 +219,11 @@ if [[ "$RUN_REINVITE" == true ]]; then
   echo "=== SIPp re-INVITE test (hold/resume with RTPEngine media renegotiation) ==="
   # Re-uses the rtpengine profile for siphon-rtpengine + mock-rtpengine + register
   run_sipp docker compose -f "$COMPOSE_FILE" --profile reinvite --profile rtpengine run --rm sipp-rtpengine-register
-  run_sipp docker compose -f "$COMPOSE_FILE" --profile reinvite --profile rtpengine up --abort-on-container-exit sipp-reinvite-uac sipp-reinvite-uas
+  # --exit-code-from is load-bearing: without it the step passed on the compose
+  # exit status regardless of sipp's, and the mode was green while the resume
+  # re-INVITE never completed.
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile reinvite --profile rtpengine up --abort-on-container-exit --exit-code-from sipp-reinvite-uac sipp-reinvite-uac sipp-reinvite-uas
+  docker compose -f "$COMPOSE_FILE" --profile reinvite --profile rtpengine rm -sf sipp-reinvite-uac sipp-reinvite-uas 2>/dev/null || true
 fi
 
 # ── Step 9: B2BUA tests (optional) ──────────────────────────────────────────

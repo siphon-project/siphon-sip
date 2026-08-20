@@ -815,6 +815,10 @@ services:
       - "1"
       - -timeout
       - "30"
+      # An incomplete call must FAIL the run: without this, sipp exits 0 on the
+      # global timeout with "Successful call 0 / Failed call 0" and the mode
+      # passes vacuously while the resume re-INVITE never completes.
+      - -timeout_error
       - -trace_err
     profiles:
       - reinvite

@@ -46,8 +46,15 @@ a=sendrecv
   <label id="1" />
   <recv response="180" optional="true" next="1" />
 
-  <!-- 200 OK for initial INVITE -->
-  <recv response="200" rtd="true" crlf="true" />
+  <!-- 200 OK for initial INVITE — assert it answers CSeq 1, so a
+       retransmitted / stale 200 can never satisfy a later recv. -->
+  <recv response="200" rtd="true" crlf="true">
+    <action>
+      <ereg regexp="1 INVITE" search_in="hdr" header="CSeq:" check_it="true"
+            assign_to="invite_cseq_ok" />
+      <log message="initial 200 CSeq assertion: [$invite_cseq_ok]" />
+    </action>
+  </recv>
 
   <!-- ACK for initial INVITE -->
   <send>
@@ -99,8 +106,20 @@ a=sendonly
 ]]>
   </send>
 
-  <!-- 200 OK for hold re-INVITE -->
-  <recv response="200" rtd="true" crlf="true" />
+  <!-- The proxy answers a relayed INVITE with its own 100 Trying
+       (RFC 3261 §16.2) — absorb it. -->
+  <recv response="100" optional="true" />
+
+  <!-- 200 OK for hold re-INVITE — MUST answer CSeq 2.  Without this check a
+       retransmitted 200 for the initial INVITE (CSeq 1) satisfied this recv
+       and masked a hold re-INVITE that never reached the callee. -->
+  <recv response="200" rtd="true" crlf="true">
+    <action>
+      <ereg regexp="2 INVITE" search_in="hdr" header="CSeq:" check_it="true"
+            assign_to="hold_cseq_ok" />
+      <log message="hold 200 CSeq assertion: [$hold_cseq_ok]" />
+    </action>
+  </recv>
 
   <!-- ACK for hold re-INVITE -->
   <send>
@@ -152,8 +171,20 @@ a=sendrecv
 ]]>
   </send>
 
-  <!-- 200 OK for resume re-INVITE -->
-  <recv response="200" rtd="true" crlf="true" />
+  <!-- The proxy answers a relayed INVITE with its own 100 Trying
+       (RFC 3261 §16.2) — absorb it. -->
+  <recv response="100" optional="true" />
+
+  <!-- 200 OK for resume re-INVITE — MUST answer CSeq 3.  This is the recv
+       that catches the relay-to-self loop: the resume re-INVITE was 482'd
+       instead of being forwarded, so no CSeq-3 200 ever arrives. -->
+  <recv response="200" rtd="true" crlf="true">
+    <action>
+      <ereg regexp="3 INVITE" search_in="hdr" header="CSeq:" check_it="true"
+            assign_to="resume_cseq_ok" />
+      <log message="resume 200 CSeq assertion: [$resume_cseq_ok]" />
+    </action>
+  </recv>
 
   <!-- ACK for resume re-INVITE -->
   <send>
