@@ -11805,17 +11805,40 @@ fn b2bua_carrier_ruri(
     next_hop: Option<&str>,
 ) -> String {
     let base = route.ruri.as_deref().unwrap_or(a_leg_ruri);
+    // Per-route destination beats the answer-level one; either replaces the
+    // dialled number before anything else touches the R-URI.
+    // The answer-level default was already resolved onto each route by
+    // `LcrResponse::resolved_routes`, so per-route is the only level here.
+    let destination = route
+        .destination
+        .as_deref()
+        .map(lcr_destination_userpart)
+        .filter(|value| !value.is_empty());
+
     let mut uri = match parse_uri_standalone(base) {
         Ok(uri) => uri,
         Err(_) => {
-            // Unparseable base — best-effort string prefix so the prefix is
-            // never silently dropped.
+            // Unparseable base — best-effort string prefix so neither the
+            // retarget nor the prefix is silently dropped.
+            let base = match destination.as_deref() {
+                Some(destination) => destination,
+                None => base,
+            };
             return match route.tech_prefix.as_deref().filter(|p| !p.is_empty()) {
                 Some(prefix) => format!("{prefix}{base}"),
                 None => base.to_string(),
             };
         }
     };
+
+    // Retarget first (RFC 3261 §16.5), so tech_prefix prepends to the *new*
+    // number and gateway-group selection is untouched — the whole point of
+    // having this alongside `ruri`, which replaces the host too and so bypasses
+    // member selection and health checking.
+    if let Some(destination) = destination {
+        uri.user = Some(destination);
+    }
+
     if let Some(prefix) = route.tech_prefix.as_deref().filter(|p| !p.is_empty()) {
         let user = uri.user.clone().unwrap_or_default();
         uri.user = Some(format!("{prefix}{user}"));
@@ -11827,6 +11850,20 @@ fn b2bua_carrier_ruri(
         }
     }
     uri.to_string()
+}
+
+/// The number out of an LCR `destination`, which may be given as a bare number
+/// (`"+12025550123"`) or as a full URI whose userpart is the number
+/// (`"sip:+12025550123@carrier.net"`).
+///
+/// Only the userpart is ever taken: the host is siphon's to decide, from the
+/// gateway group or the next-hop, so that a retarget can never route the call
+/// somewhere the operator did not configure.
+fn lcr_destination_userpart(destination: &str) -> String {
+    match parse_uri_standalone(destination) {
+        Ok(uri) => uri.user.unwrap_or_else(|| destination.to_string()),
+        Err(_) => destination.to_string(),
+    }
 }
 
 /// Dial the next routable carrier in a call's sequential-failover queue (LCR
@@ -21497,6 +21534,19 @@ mod tests {
         }
     }
 
+
+    // -----------------------------------------------------------------------
+    // LCR destination retarget (RFC 3261 §16.5)
+    // -----------------------------------------------------------------------
+
+    fn route_to(destination: Option<&str>) -> crate::lcr::Route {
+        crate::lcr::Route {
+            carrier_id: "carrier-a".to_string(),
+            destination: destination.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
     fn injected_names(route: &crate::lcr::Route) -> Vec<String> {
         let mut names: Vec<String> = lcr_injectable_headers(route, "call-id@host")
             .into_iter()
@@ -21644,6 +21694,107 @@ mod tests {
              username — a proxy CDR's auth_user would silently go back to \
              always being empty. Arguments were:{arguments}"
         );
+    }
+
+    const ACCESS_NUMBER: &str = "sip:+12025550100@siphon.example.com";
+    const CARRIER: &str = "sip:10.0.0.1:5060";
+
+    #[test]
+    fn no_destination_keeps_the_dialled_number() {
+        let target = b2bua_carrier_ruri(&route_to(None), ACCESS_NUMBER, Some(CARRIER));
+        assert!(target.contains("+12025550100"), "{target}");
+    }
+
+    #[test]
+    fn a_destination_replaces_the_dialled_number_and_keeps_the_carrier_host() {
+        // The shape this exists for: an inbound call addressed to a local
+        // access number is retargeted at the real destination, and still goes
+        // out through the gateway-group member siphon selected.
+        let target = b2bua_carrier_ruri(&route_to(Some("+12025550199")), ACCESS_NUMBER, Some(CARRIER));
+
+        assert!(target.contains("+12025550199"), "{target}");
+        assert!(
+            !target.contains("+12025550100"),
+            "the access number must not be on the wire: {target}",
+        );
+        assert!(target.contains("10.0.0.1"), "host still comes from the carrier: {target}");
+    }
+
+    #[test]
+    fn a_destination_given_as_a_uri_contributes_only_its_userpart() {
+        // The host is siphon's to decide, from the gateway group or next-hop, so
+        // a retarget can never route the call somewhere unconfigured.
+        let target = b2bua_carrier_ruri(
+            &route_to(Some("sip:+12025550199@somewhere-else.example.net")),
+            ACCESS_NUMBER,
+            Some(CARRIER),
+        );
+
+        assert!(target.contains("+12025550199"), "{target}");
+        assert!(
+            !target.contains("somewhere-else"),
+            "a destination must not redirect the call: {target}",
+        );
+        assert!(target.contains("10.0.0.1"), "{target}");
+    }
+
+    #[test]
+    fn tech_prefix_applies_on_top_of_the_retargeted_number() {
+        // Retarget happens first, so the carrier's prefix lands in front of the
+        // *new* number — not the access number.
+        let route = crate::lcr::Route {
+            carrier_id: "carrier-a".to_string(),
+            destination: Some("+12025550199".to_string()),
+            tech_prefix: Some("1010288".to_string()),
+            ..Default::default()
+        };
+        let target = b2bua_carrier_ruri(&route, ACCESS_NUMBER, Some(CARRIER));
+
+        assert!(target.contains("1010288+12025550199"), "{target}");
+    }
+
+    #[test]
+    fn an_explicit_ruri_still_gets_retargeted_but_keeps_its_own_host() {
+        // `ruri` owns the host; `destination` owns the number. Both can be set.
+        let route = crate::lcr::Route {
+            carrier_id: "carrier-a".to_string(),
+            ruri: Some("sip:+12025550100@carrier-a.net".to_string()),
+            destination: Some("+12025550199".to_string()),
+            ..Default::default()
+        };
+        let target = b2bua_carrier_ruri(&route, ACCESS_NUMBER, Some(CARRIER));
+
+        assert!(target.contains("+12025550199"), "{target}");
+        assert!(target.contains("carrier-a.net"), "an explicit ruri keeps its host: {target}");
+    }
+
+    #[test]
+    fn an_empty_destination_is_ignored_rather_than_blanking_the_number() {
+        let target = b2bua_carrier_ruri(&route_to(Some("")), ACCESS_NUMBER, Some(CARRIER));
+        assert!(target.contains("+12025550100"), "{target}");
+    }
+
+    #[test]
+    fn a_retarget_survives_an_unparseable_base_uri() {
+        // The degenerate path must not silently drop the retarget.
+        let route = crate::lcr::Route {
+            carrier_id: "carrier-a".to_string(),
+            destination: Some("+12025550199".to_string()),
+            tech_prefix: Some("99".to_string()),
+            ..Default::default()
+        };
+        let target = b2bua_carrier_ruri(&route, "not a uri", Some(CARRIER));
+        assert_eq!(target, "99+12025550199");
+    }
+
+    #[test]
+    fn destination_userpart_accepts_a_bare_number_or_a_uri() {
+        assert_eq!(lcr_destination_userpart("+12025550199"), "+12025550199");
+        assert_eq!(
+            lcr_destination_userpart("sip:+12025550199@carrier.net"),
+            "+12025550199"
+        );
+        assert_eq!(lcr_destination_userpart("tel:+12025550199"), "+12025550199");
     }
 
     #[test]

@@ -26,7 +26,7 @@ Python reserved words).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional
 
 CONTRACT_VERSION = "1"
@@ -136,7 +136,25 @@ class Route:
 
     ruri: Optional[str] = None
     """Request-URI override for this carrier (else the dialed number is kept).
-    Full control over the number shape the carrier sees."""
+
+    Replaces the *whole* Request-URI, host included, so the API has to compose
+    the carrier's URI itself — which bypasses gateway-group member selection and
+    health checking.  Prefer :attr:`destination` when only the number needs to
+    change."""
+
+    destination: Optional[str] = None
+    """Retarget this carrier's attempt at a different destination number,
+    overriding the answer-level ``destination`` (RFC 3261 §16.5).
+
+    Replaces the dialled number *before* the ordinary dial path runs, so
+    :attr:`tech_prefix`, :attr:`number_policy` and gateway-group member
+    selection all still apply on top.  Accepts a bare number
+    (``"+12025550123"``) or a full URI, of which only the userpart is taken —
+    the host is siphon's to decide, so a retarget can never route the call
+    somewhere the operator did not configure.
+
+    A ``destination`` alone does not make a route routable: it says *who* to
+    reach, never *how*."""
 
     tech_prefix: Optional[str] = None
     """Tech-prefix / dial-prefix prepended to the B-leg R-URI userpart for this
@@ -186,6 +204,7 @@ class Route:
             "gateway_group",
             "next_hop",
             "ruri",
+            "destination",
             "tech_prefix",
             "rate",
             "currency",
@@ -212,6 +231,7 @@ class Route:
             gateway_group=data.get("gateway_group"),
             next_hop=data.get("next_hop"),
             ruri=data.get("ruri"),
+            destination=data.get("destination"),
             tech_prefix=data.get("tech_prefix"),
             rate=data.get("rate"),
             currency=data.get("currency"),
@@ -259,12 +279,22 @@ class LcrResponse:
     """When set, siphon rejects the call with this code/reason instead of
     dialing (an API-side block)."""
 
+    destination: Optional[str] = None
+    """Retarget the call at a different destination number before routing
+    (RFC 3261 §16.5).  Applies to every route that does not override it with its
+    own :attr:`Route.destination`.
+
+    ``tech_prefix``, ``number_policy`` and gateway-group member selection all
+    apply on top of it, unchanged."""
+
     def to_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {"routes": [route.to_dict() for route in self.routes]}
         if self.cache_ttl_secs is not None:
             out["cache_ttl_secs"] = self.cache_ttl_secs
         if self.reject is not None:
             out["reject"] = self.reject.to_dict()
+        if self.destination is not None:
+            out["destination"] = self.destination
         return out
 
     @classmethod
@@ -274,7 +304,22 @@ class LcrResponse:
             routes=[Route.from_dict(route) for route in data.get("routes", [])],
             cache_ttl_secs=data.get("cache_ttl_secs"),
             reject=LcrReject.from_dict(reject) if reject else None,
+            destination=data.get("destination"),
         )
+
+    def resolved_routes(self) -> List[Route]:
+        """Routes with the answer-level :attr:`destination` resolved onto every
+        route that does not carry its own.
+
+        Mirrors what siphon does before dialing, so a test can assert the
+        destination each carrier will actually be asked to reach.
+        """
+        resolved = []
+        for route in self.routes:
+            if route.destination is None and self.destination is not None:
+                route = replace(route, destination=self.destination)
+            resolved.append(route)
+        return resolved
 
 
 __all__ = [

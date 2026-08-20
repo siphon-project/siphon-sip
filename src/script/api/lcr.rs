@@ -67,6 +67,22 @@ impl PyRoute {
         self.inner.tech_prefix.as_deref()
     }
 
+    /// Destination number this carrier's attempt is retargeted at
+    /// (RFC 3261 §16.5), or `None` to keep the dialled number.
+    ///
+    /// Replaces the number *before* the ordinary dial path runs, so
+    /// `tech_prefix`, `number_policy` and gateway-group member selection all
+    /// still apply on top — unlike `ruri`, which replaces the whole
+    /// Request-URI including the host and so bypasses member selection and
+    /// health checking.
+    ///
+    /// An answer-level `destination` is already resolved onto routes that do
+    /// not carry their own, so this reads the effective value.
+    #[getter]
+    fn destination(&self) -> Option<&str> {
+        self.inner.destination.as_deref()
+    }
+
     /// Named number policy applied to this carrier's B-leg identity headers.
     #[getter]
     fn number_policy(&self) -> Option<&str> {
@@ -150,12 +166,15 @@ impl PyLcrDecision {
 #[pymethods]
 impl PyLcrDecision {
     /// Ordered carriers, cheapest/most-preferred first. Hand to `call.route()`.
+    ///
+    /// An answer-level `destination` is resolved onto every route that does not
+    /// carry its own, so a script passing these to `call.route()` gets the
+    /// retarget without having to merge the two levels itself.
     #[getter]
     fn routes(&self) -> Vec<PyRoute> {
         self.inner
-            .routes
-            .iter()
-            .cloned()
+            .resolved_routes()
+            .into_iter()
             .map(PyRoute::from_route)
             .collect()
     }
