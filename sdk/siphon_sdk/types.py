@@ -70,16 +70,34 @@ class SipUri:
         return f"SipUri({self})"
 
 
-@dataclass
+@dataclass(frozen=True)
 class Flow:
     """Opaque view of an inbound flow captured at REGISTER time.
 
-    Returned by :attr:`Contact.flow` and :attr:`Request.flow`.  Pass back
-    to :meth:`Request.relay` (``flow=`` kwarg) to send a request over the
-    same listener that received the REGISTER — bypassing DNS resolution
-    of the Request-URI.  Used by P-CSCF MT routing (RFC 3327 §5 /
-    TS 24.229 §5.2.7.2) where the UE's Contact URI is unreachable
-    (NAT, IPSec) and the only path back is the captured flow.
+    Returned by :attr:`Contact.flow`, :attr:`Request.flow` and
+    :attr:`Call.flow`.  Pass back to :meth:`Request.relay` (``flow=`` kwarg)
+    to send a request over the same listener that received the REGISTER —
+    bypassing DNS resolution of the Request-URI.  Used by P-CSCF MT routing
+    (RFC 3327 §5 / TS 24.229 §5.2.7.2) where the UE's Contact URI is
+    unreachable (NAT, IPSec) and the only path back is the captured flow.
+
+    Flows compare by value and hash, so the RFC 5626 connection-reuse test
+    is written directly::
+
+        @b2bua.on_invite
+        def on_invite(call):
+            bindings = registrar.lookup(str(call.from_uri))
+            if any(c.flow == call.flow for c in bindings):
+                call.dial(str(call.ruri))     # same connection as the REGISTER
+            else:
+                call.reject(403, "Forbidden")
+
+    Equality covers the transport, both addresses and the connection id
+    together.  On a stream transport that makes it an exact match on one
+    accepted socket, which is a far stronger signal than a source-address
+    check — worthless behind carrier NAT, where every subscriber on the
+    network shares an address.  On UDP there is no connection, so the flow
+    carries no more assurance than the address does.
 
     Treat as opaque: scripts read :attr:`is_alive` for defensive checks
     but should not depend on the internal field shapes.
@@ -96,6 +114,21 @@ class Flow:
     """String form of the captured listener local address — load-bearing
     for IPSec sec-agree where the protected port pair must be preserved
     (3GPP TS 33.203 §7.4)."""
+
+    connection_id: int = 0
+    """Identifier of the accepted inbound connection this flow was captured
+    on.
+
+    For a stream transport (TCP/TLS/WS/WSS) this identifies one accepted
+    socket, so it is what distinguishes a UE still on the connection its
+    REGISTER arrived on from one that reconnected.  For UDP it is a
+    deterministic hash of ``(local_addr, remote_addr)`` — there is no
+    connection to speak of.
+
+    Prefer comparing whole flows over reading this: equality covers the
+    transport and both addresses as well, and a connection id is only
+    meaningful alongside them.
+    """
 
     @property
     def is_alive(self) -> bool:

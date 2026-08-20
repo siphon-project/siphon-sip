@@ -11449,6 +11449,7 @@ fn handle_b2bua_cancel(
     let cancel_a_leg_invite = call.a_leg_invite.clone();
     let cancel_a_leg_source_ip = call.a_leg.transport.remote_addr.ip().to_string();
     let cancel_a_leg_transport = format!("{}", call.a_leg.transport.transport).to_lowercase();
+    let cancel_a_leg_flow = py_flow_from_leg(&call.a_leg.transport);
     drop(call);
 
     // Emit the prepared CANCELs after dropping the call lock so the
@@ -11480,6 +11481,7 @@ fn handle_b2bua_cancel(
         cancel_a_leg_invite,
         cancel_a_leg_source_ip,
         cancel_a_leg_transport,
+        cancel_a_leg_flow,
         state,
     );
 
@@ -11524,6 +11526,7 @@ fn run_b2bua_cancel_handlers(
     a_leg_invite: Option<Arc<std::sync::Mutex<SipMessage>>>,
     a_leg_source_ip: String,
     a_leg_transport: String,
+    a_leg_flow: Option<crate::script::api::registrar::PyFlow>,
     state: &DispatcherState,
 ) {
     let engine_state = state.engine.state();
@@ -11540,7 +11543,8 @@ fn run_b2bua_cancel_handlers(
         }
     };
 
-    let py_call = PyCall::new(call_id.to_string(), invite_arc, a_leg_source_ip, a_leg_transport);
+    let py_call = PyCall::new(call_id.to_string(), invite_arc, a_leg_source_ip, a_leg_transport)
+        .with_flow(a_leg_flow);
 
     Python::attach(|python| {
         let call_obj = match Py::new(python, py_call) {
@@ -11697,6 +11701,41 @@ fn lcr_injectable_headers(route: &crate::lcr::Route, call_id: &str) -> Vec<(Stri
         })
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
+}
+
+/// The inbound flow an INVITE arrived on, for `call.flow`.
+///
+/// Built straight off the transport frame, so the connection id is the accepted
+/// socket the INVITE came in on — which is what makes `call.flow ==
+/// contact.flow` an RFC 5626 connection-reuse test on a stream transport rather
+/// than an address comparison.
+fn py_flow_from_inbound(
+    inbound: &crate::transport::InboundMessage,
+) -> Option<crate::script::api::registrar::PyFlow> {
+    Some(crate::script::api::registrar::PyFlow {
+        transport: format!("{}", inbound.transport).to_ascii_lowercase(),
+        source_addr: inbound.remote_addr,
+        local_addr: inbound.local_addr,
+        connection_id: inbound.connection_id.0,
+    })
+}
+
+/// The same flow, recovered from a leg's stored transport binding for the
+/// handlers that run after the INVITE frame is gone (`on_answer`, `on_bye`,
+/// `on_failure`, `on_cancel`, `on_refer`).
+///
+/// `local_addr` is only recorded for A-legs, so this yields `None` for a B-leg
+/// — which is correct: `call.flow` describes how the caller reached siphon, and
+/// a B-leg has no inbound flow to describe.
+fn py_flow_from_leg(
+    transport: &crate::b2bua::actor::TransportInfo,
+) -> Option<crate::script::api::registrar::PyFlow> {
+    Some(crate::script::api::registrar::PyFlow {
+        transport: format!("{}", transport.transport).to_ascii_lowercase(),
+        source_addr: transport.remote_addr,
+        local_addr: transport.local_addr?,
+        connection_id: transport.connection_id.0,
+    })
 }
 
 /// Build the B-leg R-URI for a carrier route: base is the route's `ruri` (else
@@ -11939,7 +11978,8 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
                 Arc::clone(invite_arc),
                 a_leg.transport.remote_addr.ip().to_string(),
                 format!("{}", a_leg.transport.transport).to_lowercase(),
-            );
+            )
+            .with_flow(py_flow_from_leg(&a_leg.transport));
             Python::attach(|python| {
                 let call_obj = match Py::new(python, py_call) {
                     Ok(obj) => obj,
@@ -12243,7 +12283,8 @@ fn handle_b2bua_invite(
         Arc::clone(&message_arc),
         inbound.remote_addr.ip().to_string(),
         format!("{}", inbound.transport).to_lowercase(),
-    );
+    )
+    .with_flow(py_flow_from_inbound(&inbound));
 
     let engine_state = state.engine.state();
     let handlers = engine_state.handlers_for(&HandlerKind::B2buaInvite);
@@ -15179,7 +15220,8 @@ fn handle_b2bua_response(
                     Arc::clone(invite_arc),
                     a_leg.transport.remote_addr.ip().to_string(),
                     format!("{}", a_leg.transport.transport).to_lowercase(),
-                );
+                )
+                .with_flow(py_flow_from_leg(&a_leg.transport));
                 // LCR: surface the carrier that won as `call.active_route` so the
                 // script can stamp it onto a CDR / charging record.
                 if let Some(route) = state.call_actors.active_route(call_id) {
@@ -15705,7 +15747,8 @@ fn handle_b2bua_response(
                         Arc::clone(invite_arc),
                         a_leg.transport.remote_addr.ip().to_string(),
                         format!("{}", a_leg.transport.transport).to_lowercase(),
-                    );
+                    )
+                    .with_flow(py_flow_from_leg(&a_leg.transport));
                     let py_reply = PyReply::new(Arc::clone(&response_arc))
                         .with_a_leg(Arc::clone(invite_arc))
                         .with_response_source(
@@ -16381,7 +16424,8 @@ fn handle_b2bua_response(
                     Arc::clone(invite_arc),
                     a_leg.transport.remote_addr.ip().to_string(),
                     format!("{}", a_leg.transport.transport).to_lowercase(),
-                );
+                )
+                .with_flow(py_flow_from_leg(&a_leg.transport));
 
                 Python::attach(|python| {
                     let call_obj = match Py::new(python, py_call) {
@@ -16725,13 +16769,14 @@ fn handle_b2bua_bye(
     };
 
     // Extract the rest from the DashMap ref and drop it before entering Python
-    let (a_leg_invite, a_leg_source_ip, a_leg_transport, a_leg_call_id) =
+    let (a_leg_invite, a_leg_source_ip, a_leg_transport, a_leg_call_id, a_leg_flow) =
         match state.call_actors.get_call(&call_id) {
             Some(call) => (
                 call.a_leg_invite.clone(),
                 call.a_leg.transport.remote_addr.ip().to_string(),
                 format!("{}", call.a_leg.transport.transport).to_lowercase(),
                 call.a_leg.dialog.call_id.clone(),
+                py_flow_from_leg(&call.a_leg.transport),
             ),
             None => return,
         };
@@ -16753,7 +16798,8 @@ fn handle_b2bua_bye(
                 Arc::clone(invite_arc),
                 a_leg_source_ip,
                 a_leg_transport,
-            );
+            )
+            .with_flow(a_leg_flow);
             let initiator = PyByeInitiator { side };
 
             Python::attach(|python| {
@@ -19698,7 +19744,8 @@ fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &Disp
         Arc::new(std::sync::Mutex::new(message.clone())),
         inbound.remote_addr.ip().to_string(),
         format!("{}", inbound.transport).to_lowercase(),
-    );
+    )
+    .with_flow(py_flow_from_inbound(&inbound));
     py_call.set_refer_to(refer_to.uri.clone(), refer_to.replaces.clone());
 
     let action = Python::attach(|python| {

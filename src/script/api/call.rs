@@ -280,6 +280,10 @@ pub struct PyCall {
     message: Arc<Mutex<SipMessage>>,
     /// Source IP of the A-leg.
     source_ip: String,
+    /// The inbound flow the A-leg INVITE arrived on, when the dispatcher had
+    /// the A-leg's transport binding to build it from. `None` for a `Call`
+    /// constructed without one (tests, internally-originated calls).
+    flow: Option<super::registrar::PyFlow>,
     /// Transport the A-leg arrived on ("udp"/"tcp"/"tls"/"ws"/"wss"), for CDRs.
     transport_name: String,
     /// Current call state.
@@ -411,6 +415,7 @@ impl PyCall {
             id,
             message,
             source_ip,
+            flow: None,
             transport_name,
             state: "calling".to_string(),
             action: CallAction::None,
@@ -447,6 +452,13 @@ impl PyCall {
     }
 
     /// Record the username verified by `auth.require_*_digest(call, …)`.
+    /// Attach the inbound flow the A-leg INVITE arrived on. Called by the
+    /// dispatcher, which builds it from the A-leg's `TransportInfo`.
+    pub fn with_flow(mut self, flow: Option<super::registrar::PyFlow>) -> Self {
+        self.flow = flow;
+        self
+    }
+
     pub fn set_auth_user(&mut self, username: String) {
         self.auth_user = Some(username);
     }
@@ -956,6 +968,41 @@ impl PyCall {
     #[getter]
     fn source_ip(&self) -> &str {
         &self.source_ip
+    }
+
+    /// The inbound flow this call's INVITE arrived on — the B2BUA twin of
+    /// `request.flow`.
+    ///
+    /// `None` when the dispatcher had no transport binding to build it from
+    /// (an internally-originated call, or a `Call` constructed in a test).
+    ///
+    /// The point of it is RFC 5626 connection reuse: a `Contact` saved at
+    /// REGISTER time carries the flow the registration arrived on, so a call
+    /// can be authorised by matching the two rather than by challenging every
+    /// INVITE with a 407:
+    ///
+    /// ```python
+    /// @b2bua.on_invite
+    /// def on_invite(call):
+    ///     bindings = registrar.lookup(str(call.from_uri))
+    ///     if any(c.flow == call.flow for c in bindings):
+    ///         call.dial(str(call.ruri))      # same connection as the REGISTER
+    ///     else:
+    ///         call.reject(403, "Forbidden")
+    /// ```
+    ///
+    /// On a stream transport (TCP/TLS/WS/WSS) that comparison is an exact match
+    /// on one accepted socket, which is why it is worth doing: a source-address
+    /// check is worthless behind carrier NAT, where every subscriber on the
+    /// network shares an address. On UDP there is no connection, so the flow is
+    /// derived from the address pair and carries no more assurance than the
+    /// address does.
+    ///
+    /// The match survives the UE reusing the connection across many calls —
+    /// the connection id identifies the socket, not the transaction.
+    #[getter]
+    fn flow(&self) -> Option<super::registrar::PyFlow> {
+        self.flow.clone()
     }
 
     /// Username the A-leg authenticated as, or `None` if it was never
@@ -2147,6 +2194,123 @@ mod tests {
             .content_length(0)
             .build()
             .unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // call.flow — RFC 5626 connection reuse
+    // -----------------------------------------------------------------------
+
+    fn test_flow(
+        transport: &str,
+        source: &str,
+        local: &str,
+        connection_id: u64,
+    ) -> super::super::registrar::PyFlow {
+        super::super::registrar::PyFlow {
+            transport: transport.to_string(),
+            source_addr: source.parse().expect("test source addr"),
+            local_addr: local.parse().expect("test local addr"),
+            connection_id,
+        }
+    }
+
+    fn call_on(flow: Option<super::super::registrar::PyFlow>) -> PyCall {
+        PyCall::new(
+            "test-id".to_string(),
+            Arc::new(Mutex::new(make_invite())),
+            "192.0.2.10".to_string(),
+            "tls".to_string(),
+        )
+        .with_flow(flow)
+    }
+
+    #[test]
+    fn call_flow_is_none_when_no_transport_binding_was_captured() {
+        // An internally-originated call has no inbound flow to describe, and a
+        // script must be able to tell that apart from a flow that didn't match.
+        assert!(call_on(None).flow().is_none());
+    }
+
+    #[test]
+    fn call_flow_exposes_the_captured_inbound_flow() {
+        let flow = test_flow("tls", "192.0.2.10:41234", "198.51.100.1:5061", 0xc0ffee);
+        let call = call_on(Some(flow));
+
+        let exposed = call.flow().expect("flow present");
+        assert_eq!(exposed.transport(), "tls");
+        assert_eq!(exposed.remote_addr(), "192.0.2.10:41234");
+        assert_eq!(exposed.local_addr(), "198.51.100.1:5061");
+        assert_eq!(exposed.connection_id(), 0xc0ffee);
+    }
+
+    #[test]
+    fn a_call_on_the_registered_connection_matches_that_binding_flow() {
+        // The authorisation this exists for: the INVITE arrived on the same
+        // accepted socket the REGISTER did, so it is the registered UE.
+        let registered = test_flow("tls", "192.0.2.10:41234", "198.51.100.1:5061", 0xc0ffee);
+        let call = call_on(Some(registered.clone()));
+
+        assert_eq!(call.flow(), Some(registered));
+    }
+
+    #[test]
+    fn a_call_from_the_same_address_on_a_new_connection_does_not_match() {
+        // This is the whole point over a source-address check. Behind carrier
+        // NAT every subscriber shares an address, so the address matching says
+        // nothing; the accepted connection is what carries the assurance.
+        let registered = test_flow("tls", "192.0.2.10:41234", "198.51.100.1:5061", 0xc0ffee);
+        let reconnected = test_flow("tls", "192.0.2.10:41234", "198.51.100.1:5061", 0xbeef);
+
+        assert_ne!(call_on(Some(reconnected)).flow(), Some(registered));
+    }
+
+    #[test]
+    fn a_call_on_a_different_transport_does_not_match() {
+        let registered = test_flow("tls", "192.0.2.10:41234", "198.51.100.1:5061", 0xc0ffee);
+        let over_tcp = test_flow("tcp", "192.0.2.10:41234", "198.51.100.1:5061", 0xc0ffee);
+
+        assert_ne!(call_on(Some(over_tcp)).flow(), Some(registered));
+    }
+
+    #[test]
+    fn the_match_survives_the_ue_reusing_the_connection_across_calls() {
+        // The connection id identifies the socket, not the transaction, so a
+        // second and third call over the same connection still match.
+        let registered = test_flow("tls", "192.0.2.10:41234", "198.51.100.1:5061", 0xc0ffee);
+
+        for _ in 0..3 {
+            assert_eq!(call_on(Some(registered.clone())).flow(), Some(registered.clone()));
+        }
+    }
+
+    #[test]
+    fn call_flow_is_comparable_and_hashable_from_python() {
+        // `call.flow == contact.flow` has to work as an expression in a script,
+        // and a flow has to be usable as a dict key / set member. pyclass needs
+        // `eq` + `hash` for either; a Rust-only PartialEq gives neither.
+        Python::initialize();
+        Python::attach(|py| {
+            let flow = test_flow("tls", "192.0.2.10:41234", "198.51.100.1:5061", 0xc0ffee);
+            let other = test_flow("tls", "192.0.2.10:41234", "198.51.100.1:5061", 0xbeef);
+
+            let same_a = Py::new(py, flow.clone()).expect("flow into Python");
+            let same_b = Py::new(py, flow).expect("flow into Python");
+            let different = Py::new(py, other).expect("flow into Python");
+
+            assert!(same_a
+                .bind(py)
+                .eq(same_b.bind(py))
+                .expect("Flow must support =="));
+            assert!(!same_a
+                .bind(py)
+                .eq(different.bind(py))
+                .expect("Flow must support =="));
+
+            // Hashable, and equal flows hash equal, so a set/dict works.
+            let hash_a = same_a.bind(py).hash().expect("Flow must be hashable");
+            let hash_b = same_b.bind(py).hash().expect("Flow must be hashable");
+            assert_eq!(hash_a, hash_b);
+        });
     }
 
     #[test]

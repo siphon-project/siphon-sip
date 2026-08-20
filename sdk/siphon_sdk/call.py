@@ -70,12 +70,14 @@ class Call:
         refer_replaces: Optional[dict] = None,
         transport: str = "udp",
         active_route: Optional[Route] = None,
+        flow: Optional[Flow] = None,
     ) -> None:
         self._id = call_id or str(uuid.uuid4())
         self._from_uri = _parse_uri(from_uri)
         self._to_uri = _parse_uri(to_uri)
         self._ruri = _parse_uri(ruri)
         self._source_ip = source_ip
+        self._flow = flow
         self._state = state
         # Transport the A-leg arrived on.  Not a public property (the real
         # PyCall does not expose one either) — it exists so cdr.write(call)
@@ -129,6 +131,38 @@ class Call:
     def source_ip(self) -> str:
         """Source IP address of the A-leg caller."""
         return self._source_ip
+
+    @property
+    def flow(self) -> Optional[Flow]:
+        """The inbound flow this call's INVITE arrived on.
+
+        The B2BUA twin of :attr:`Request.flow`.  ``None`` when the dispatcher
+        had no transport binding to build one from (an internally-originated
+        call, or a ``Call`` constructed in a test without ``flow=``).
+
+        The point of it is RFC 5626 connection reuse: a :class:`Contact` saved
+        at REGISTER time carries the flow the registration arrived on, so a
+        call can be authorised by matching the two rather than by challenging
+        every INVITE with a 407::
+
+            @b2bua.on_invite
+            def on_invite(call):
+                bindings = registrar.lookup(str(call.from_uri))
+                if any(c.flow == call.flow for c in bindings):
+                    call.dial(str(call.ruri))
+                else:
+                    call.reject(403, "Forbidden")
+
+        On a stream transport (TCP/TLS/WS/WSS) that comparison is an exact
+        match on one accepted socket — far stronger than a source-address
+        check, which is worthless behind carrier NAT where every subscriber
+        shares an address.  On UDP there is no connection, so the flow carries
+        no more assurance than the address does.
+
+        The match survives the UE reusing the connection across many calls: the
+        connection id identifies the socket, not the transaction.
+        """
+        return self._flow
 
     @property
     def auth_user(self) -> Optional[str]:

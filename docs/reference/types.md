@@ -20,7 +20,31 @@ A registered contact binding returned by `registrar.lookup(...)`.
 ## `Flow`
 
 An opaque view of the inbound flow captured at REGISTER time, used for
-Path-token MT routing.
+Path-token MT routing and for RFC 5626 connection reuse.
+
+Flows compare by value and hash, so a call can be authorised by matching it
+against the connection the registration arrived on, rather than by challenging
+every INVITE with a 407:
+
+```python
+@b2bua.on_invite
+def on_invite(call):
+    bindings = registrar.lookup(str(call.from_uri))
+    if any(contact.flow == call.flow for contact in bindings):
+        call.dial(str(call.ruri))       # same connection as the REGISTER
+    else:
+        call.reject(403, "Forbidden")
+```
+
+Equality covers the transport, both addresses and the connection id together.
+On a stream transport (TCP/TLS/WS/WSS) that is an exact match on one accepted
+socket, which is why it is worth doing: a source-address check is worthless
+behind carrier NAT, where every subscriber on the network shares an address. On
+UDP there is no connection, so a flow carries no more assurance than the address
+does — treat it as a hint, not authorisation.
+
+The match survives the UE reusing the connection across many calls: the
+connection id identifies the socket, not the transaction.
 
 ::: siphon_sdk.types.Flow
 
