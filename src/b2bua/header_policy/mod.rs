@@ -238,7 +238,7 @@ pub struct PolicyContext<'a> {
 /// strips them by default (the spec-correct posture), but a script can
 /// opt in via `call.dial(copy=["Proxy-Authenticate"])` for the rare
 /// transparent-proxy B2BUA case.
-fn is_framework_auto(name: &str) -> bool {
+pub(crate) fn is_framework_auto(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
         "via"

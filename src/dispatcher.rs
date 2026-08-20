@@ -11648,6 +11648,45 @@ fn b2bua_status_reroutes(call_id: &str, status: u16, state: &DispatcherState) ->
     crate::lcr::global_reroute_contains(status)
 }
 
+/// The per-route `headers` from an LCR answer that may be injected onto the
+/// B-leg INVITE, with the dialog-defining headers filtered out.
+///
+/// The answer comes from an external routing backend, and the injection runs
+/// last — after the header policy and the number policy — so an unfiltered
+/// `From` in a route's `headers` overwrote the B-leg From *including its tag*.
+/// That doesn't fail visibly: the INVITE goes out, and the damage surfaces
+/// later as ACKs and BYEs that no longer match the dialog. `To`, `Call-ID`,
+/// `CSeq`, `Via` and `Contact` are exposed the same way.
+///
+/// The names filtered here are exactly
+/// [`crate::b2bua::header_policy::is_framework_auto`] — the set no header
+/// policy is allowed to touch either, for the same reason. `Proxy-Authorization`
+/// is deliberately *not* in that set and stays injectable, since a per-carrier
+/// trunk credential is a legitimate use of this field.
+///
+/// A refused header is logged at warn naming the carrier and the header, so a
+/// backend sending one finds out rather than debugging dropped mid-dialog
+/// requests.
+fn lcr_injectable_headers(route: &crate::lcr::Route, call_id: &str) -> Vec<(String, String)> {
+    route
+        .headers
+        .iter()
+        .filter(|(name, _)| {
+            if crate::b2bua::header_policy::is_framework_auto(name) {
+                warn!(
+                    call_id = %call_id,
+                    carrier = %route.carrier_id,
+                    header = %name,
+                    "LCR: refusing to inject a dialog header from a route, ignoring it",
+                );
+                return false;
+            }
+            true
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect()
+}
+
 /// Build the B-leg R-URI for a carrier route: base is the route's `ruri` (else
 /// the A-leg R-URI), with the carrier's tech-prefix prepended to the userpart.
 /// For a bare dialed-number route (no `ruri`) dialed via a carrier next-hop, the
@@ -11735,11 +11774,7 @@ fn b2bua_advance_route(
             continue;
         }
         let target = b2bua_carrier_ruri(&route, &a_leg_ruri, next_hop.as_deref());
-        let extra_headers: Vec<(String, String)> = route
-            .headers
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
+        let extra_headers = lcr_injectable_headers(&route, call_id);
         let timeout = route.timeout_secs.unwrap_or(30);
         debug!(
             call_id = %call_id,
@@ -12944,6 +12979,10 @@ fn b2bua_send_b_leg_invite(
     forced_call_id: Option<&str>,
     original_request: &SipMessage,
     number_policy: Option<&str>,
+    // Injected verbatim onto the B-leg INVITE, last, after both the header
+    // policy and the number policy. Callers must not put a dialog-defining
+    // header in here — see [`lcr_injectable_headers`], which is where the one
+    // caller with externally-supplied headers filters them.
     extra_headers: &[(String, String)],
     state: &DispatcherState,
 ) {
@@ -21308,6 +21347,94 @@ mod tests {
     use crate::sip::parser::parse_sip_message;
     use crate::sip::uri::SipUri;
     use crate::sip::builder::SipMessageBuilder;
+
+    // -----------------------------------------------------------------------
+    // LCR per-route header injection must not forge dialog headers
+    // -----------------------------------------------------------------------
+
+    /// A route carrying `headers`, everything else defaulted.
+    fn route_with_headers(pairs: &[(&str, &str)]) -> crate::lcr::Route {
+        crate::lcr::Route {
+            carrier_id: "carrier-a".to_string(),
+            headers: pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn injected_names(route: &crate::lcr::Route) -> Vec<String> {
+        let mut names: Vec<String> = lcr_injectable_headers(route, "call-id@host")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn lcr_headers_pass_through_an_ordinary_carrier_header() {
+        let route = route_with_headers(&[("X-Account", "42"), ("X-Route-Tag", "gold")]);
+        assert_eq!(injected_names(&route), vec!["X-Account", "X-Route-Tag"]);
+    }
+
+    #[test]
+    fn lcr_headers_refuse_from_so_the_dialog_tag_survives() {
+        // The bug this closes: an unfiltered `From` overwrote the B-leg From
+        // including its tag, which doesn't fail at INVITE time — it surfaces
+        // later as ACKs and BYEs that no longer match the dialog.
+        let route = route_with_headers(&[("From", "<sip:spoofed@example.net>"), ("X-Account", "42")]);
+        assert_eq!(injected_names(&route), vec!["X-Account"]);
+    }
+
+    #[test]
+    fn lcr_headers_refuse_every_dialog_header() {
+        for name in [
+            "Via",
+            "Call-ID",
+            "CSeq",
+            "Max-Forwards",
+            "Content-Length",
+            "From",
+            "To",
+            "Contact",
+            "Record-Route",
+            "Route",
+        ] {
+            let route = route_with_headers(&[(name, "forged"), ("X-Account", "42")]);
+            assert_eq!(
+                injected_names(&route),
+                vec!["X-Account"],
+                "{name} must not be injectable from an LCR route",
+            );
+        }
+    }
+
+    #[test]
+    fn lcr_headers_refuse_dialog_headers_case_insensitively() {
+        // RFC 3261 §7.3.1 makes field names case-insensitive, so a lower-cased
+        // or mixed-case spelling must not slip past the guard.
+        let route = route_with_headers(&[
+            ("from", "<sip:spoofed@example.net>"),
+            ("cAlL-Id", "forged@host"),
+            ("X-Account", "42"),
+        ]);
+        assert_eq!(injected_names(&route), vec!["X-Account"]);
+    }
+
+    #[test]
+    fn lcr_headers_still_allow_a_per_carrier_trunk_credential() {
+        // Proxy-Authorization is deliberately outside the framework-auto set:
+        // a per-carrier trunk credential is a legitimate use of this field.
+        let route = route_with_headers(&[("Proxy-Authorization", "Digest username=\"trunk\"")]);
+        assert_eq!(injected_names(&route), vec!["Proxy-Authorization"]);
+    }
+
+    #[test]
+    fn lcr_headers_on_a_route_with_none_inject_nothing() {
+        assert!(lcr_injectable_headers(&route_with_headers(&[]), "call-id@host").is_empty());
+    }
 
     #[test]
     fn b2bua_media_target_is_none_without_dispatcher() {

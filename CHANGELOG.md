@@ -43,6 +43,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   fails on the global timeout, and each re-INVITE's 200 is asserted by CSeq so
   a retransmitted initial-INVITE 200 can no longer mask a lost re-INVITE.
 
+- **An LCR route's `headers` can no longer forge a dialog header.** Per-route
+  `headers` from the routing answer were injected onto the B-leg INVITE
+  verbatim, last (after both the header policy and the number policy) and with
+  no guard on the name — so a backend naming `From` overwrote the header
+  *including its dialog tag*. That failed silently: the INVITE went out fine and
+  the breakage surfaced later as ACKs and BYEs that no longer matched the
+  dialog. `To`, `Call-ID`, `CSeq`, `Via`, `Contact`, `Route`, `Record-Route`,
+  `Max-Forwards` and `Content-Length` were exposed the same way. The injection
+  now skips exactly the set no header policy may touch either, and logs at warn
+  naming the carrier and the header. `Proxy-Authorization` stays injectable — a
+  per-carrier trunk credential is a legitimate use of it. Use `number_policy` to
+  reshape identity headers per carrier.
 - **`cdr.file.rotate_size_mb` actually rotates.** The value was documented,
   parsed and carried into the file backend, then dropped at the write site — so
   a CDR file configured with `rotate_size_mb: 100` grew without bound. It now
