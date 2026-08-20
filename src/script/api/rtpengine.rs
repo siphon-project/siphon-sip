@@ -496,15 +496,41 @@ impl PyRtpEngine {
         let sessions = Arc::clone(&self.sessions);
         let profile_str = profile_name.to_string();
 
+        // A call this process has already anchored is a *re*-offer — a re-INVITE
+        // or an UPDATE, the shape hold/unhold and an ICE restart arrive in. It
+        // has to keep the ports it already holds, so it goes out as `reoffer`;
+        // a plain `offer` on a live call-id replaces it on the siphon-rtp
+        // backend, taking its WebSocket bridge, tee and SIPREC subscription with
+        // it. Address the engine by the session's own id, not the SIP Call-ID:
+        // a siphon-terminated transfer re-anchors the surviving pair on a fresh
+        // engine call-id while the store key stays the SIP one.
+        let existing = sessions.get(&call_id);
+        let engine_call_id = existing
+            .as_ref()
+            .map(|session| session.rtpengine_id().to_string())
+            .unwrap_or_else(|| call_id.clone());
+        let is_reoffer = existing.is_some();
+
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            let rewritten_sdp = client
-                .offer(&call_id, &from_tag, &sdp, &flags)
-                .await
-                .map_err(|error| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "rtpengine.offer failed: {error}"
-                    ))
-                })?;
+            let rewritten_sdp = if is_reoffer {
+                client
+                    .reoffer(&engine_call_id, &from_tag, &sdp, &flags)
+                    .await
+                    .map_err(|error| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "rtpengine.offer failed (re-offer): {error}"
+                        ))
+                    })?
+            } else {
+                client
+                    .offer(&engine_call_id, &from_tag, &sdp, &flags)
+                    .await
+                    .map_err(|error| {
+                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                            "rtpengine.offer failed: {error}"
+                        ))
+                    })?
+            };
 
             debug!(
                 call_id = %call_id,
@@ -514,15 +540,22 @@ impl PyRtpEngine {
 
             replace_body(&message, &rewritten_sdp)?;
 
-            sessions.insert(MediaSession {
-                rtpengine_call_id: call_id.clone(),
-                call_id,
-                from_tag,
-                to_tag: None,
-                profile: profile_str,
-                ws_uri: resolved_ws_uri,
-                created_at: std::time::Instant::now(),
-            });
+            // Only an *initial* offer creates the session. Re-inserting on a
+            // re-offer would reset `rtpengine_call_id` to the SIP Call-ID —
+            // stranding a transfer-re-anchored call, whose engine id is
+            // deliberately different — and clear the `to_tag` the answer set,
+            // which is what every later `answer`/`delete` addresses the leg by.
+            if !is_reoffer {
+                sessions.insert(MediaSession {
+                    rtpengine_call_id: call_id.clone(),
+                    call_id,
+                    from_tag,
+                    to_tag: None,
+                    profile: profile_str,
+                    ws_uri: resolved_ws_uri,
+                    created_at: std::time::Instant::now(),
+                });
+            }
 
             Ok(true)
         })

@@ -358,6 +358,36 @@ impl MediaBackend {
         }
     }
 
+    /// Renegotiate a **live** call on the ports it already holds — what a SIP
+    /// re-INVITE or UPDATE maps to.
+    ///
+    /// The backends differ in what a repeated offer means, which is the whole
+    /// reason this verb exists:
+    ///
+    /// * **rtpengine / rtpproxy** — a repeat `offer` on a live call-id *is* a
+    ///   re-offer.  That is how `rtpengine_manage()` has always done hold and
+    ///   codec renegotiation, so these delegate to [`Self::offer`] and the wire
+    ///   is byte-identical to before.  Not a degraded path: it is the native
+    ///   semantics.
+    /// * **siphon-rtp** — a repeat `offer` is a *replacement*: the engine frees
+    ///   the old call and allocates fresh ports, which drops the WebSocket
+    ///   bridge, any tee and any SIPREC subscription riding on it, and answers
+    ///   with an address the peer was never told to expect.  So it gets the
+    ///   dedicated `reoffer` command.
+    pub async fn reoffer(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        sdp: &[u8],
+        flags: &NgFlags,
+    ) -> Result<Vec<u8>, RtpEngineError> {
+        match self {
+            Self::RtpEngine(set) => set.offer(call_id, from_tag, sdp, flags).await,
+            Self::SiphonRtp(client) => client.reoffer(call_id, from_tag, sdp, flags).await,
+            Self::RtpProxy(client) => client.offer(call_id, from_tag, sdp, flags).await,
+        }
+    }
+
     /// Complete a subscription's SDP negotiation.
     pub async fn subscribe_answer(
         &self,
@@ -540,6 +570,57 @@ mod tests {
         let error = backend.echo("call-1", "tag-a", true).await.unwrap_err();
         assert!(matches!(error, RtpEngineError::Protocol(_)));
         assert!(error.to_string().contains("siphon-rtp"));
+    }
+
+    /// rtpengine and rtpproxy must NOT reject a re-offer: a repeat offer is
+    /// their native re-offer, so the verb has to delegate rather than surface
+    /// an `Unsupported` the way the siphon-rtp-only verbs do.  Proven by
+    /// reaching the wire (a timeout against a dead address) instead of a
+    /// synchronous rejection.
+    #[tokio::test]
+    async fn reoffer_delegates_to_offer_on_rtpengine_and_rtpproxy() {
+        let rtpengine = MediaBackend::RtpEngine(Arc::new(
+            RtpEngineSet::new(vec![(dead_address(), 200, 1)]).await.unwrap(),
+        ));
+        let error = rtpengine
+            .reoffer("call-1", "tag-a", b"v=0\r\n", &NgFlags::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, RtpEngineError::Timeout { .. }),
+            "rtpengine must send a re-offer as a plain offer, got {error:?}"
+        );
+
+        let rtpproxy = MediaBackend::RtpProxy(
+            RtpProxyClientSet::new(vec![(dead_address(), 200, 1)], 0).await.unwrap(),
+        );
+        // rtpproxy's transport is UDP and it rewrites the SDP itself, so the
+        // delegated offer succeeds rather than timing out — success here is the
+        // same proof: the verb reached the offer path instead of being rejected.
+        assert!(
+            rtpproxy
+                .reoffer("call-1", "tag-a", b"v=0\r\n", &NgFlags::default())
+                .await
+                .is_ok(),
+            "rtpproxy must send a re-offer as a plain offer"
+        );
+    }
+
+    #[tokio::test]
+    async fn reoffer_routes_to_the_native_client_on_siphon_rtp() {
+        let (event_tx, _event_rx) = mpsc::channel::<RtpEngineEvent>(16);
+        let set =
+            SiphonRtpClientSet::new(vec![(dead_address(), 200, 1)], None, 5_000, event_tx).unwrap();
+        let backend = MediaBackend::SiphonRtp(set);
+
+        let error = backend
+            .reoffer("call-1", "tag-a", b"v=0\r\n", &NgFlags::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, RtpEngineError::Timeout { .. }),
+            "expected the native client path (Timeout), got {error:?}"
+        );
     }
 
     #[tokio::test]

@@ -18711,7 +18711,7 @@ fn handle_b2bua_reinvite(
                         let offer_flags = profile.offer.clone();
                         match tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(
-                                rtpengine_set.offer(session.rtpengine_id(), offer_tag, &forwarded.body, &offer_flags)
+                                rtpengine_set.reoffer(session.rtpengine_id(), offer_tag, &forwarded.body, &offer_flags)
                             )
                         }) {
                             Ok(rewritten_sdp) => {
@@ -19139,7 +19139,7 @@ fn handle_b2bua_update(
                         let offer_flags = profile.offer.clone();
                         match tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(
-                                rtpengine_set.offer(session.rtpengine_id(), offer_tag, &forwarded.body, &offer_flags)
+                                rtpengine_set.reoffer(session.rtpengine_id(), offer_tag, &forwarded.body, &offer_flags)
                             )
                         }) {
                             Ok(rewritten_sdp) => {
