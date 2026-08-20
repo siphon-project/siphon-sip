@@ -70,6 +70,33 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   owned by the service user, and pins `WorkingDirectory=/etc/siphon`. It also
   documents, as commented lines, the `CAP_NET_ADMIN` + `AF_NETLINK` an IMS
   P-CSCF needs for `ipsec:` sec-agree.
+- **A log, CDR, audit or event-sink file whose parent directory is missing now
+  creates it.** Opening with `create(true)` creates the file and never the
+  directory holding it, so every default path we ship — all of them inside
+  `/var/log/siphon` — worked only through the packaged unit, where
+  `LogsDirectory=` had already made the directory. Started any other way (a
+  tarball install, `cargo install`, a container, by hand) the same config took
+  `log.file` down with a process exit and logged an error per record for the CDR
+  file, the LI audit log and the Diameter event sink. The directory is created
+  only when the open actually fails with `NotFound`, so the happy path is
+  unchanged and a permission error still reads as a permission error.
+- **The shipped logrotate config is installed, and rotates the paths siphon
+  actually writes.** `etc/logrotate.d/siphon` still named `/var/log/siphon.log`
+  — a path that is not writable under `ProtectSystem=strict` — and was in no
+  package: not the `.deb`, not the `.rpm`, not the release tarball. It now
+  covers `/var/log/siphon/*.log` with `copytruncate` (siphon holds those open
+  for the process lifetime, and `ExecReload` reloads the Python script, not the
+  log file) and rotates `cdr.jsonl` separately *without* `copytruncate`, whose
+  copy-then-truncate race can drop a billing record. `.deb` and `.rpm` also
+  create `/var/log/siphon` at install time for a by-hand first run.
+- **The packaged unit stops restart-looping on a broken config.** siphon exits
+  non-zero on a config or script error, and `RestartSec=5s` puts only two starts
+  inside systemd's default 10 s window, so the default start limit never tripped
+  — a permanently broken config looped forever (a reported install reached
+  restart counter 279) instead of failing visibly. The unit now sets
+  `StartLimitIntervalSec=300` / `StartLimitBurst=10`, so roughly a minute of
+  failed restarts puts the unit in `failed` where `systemctl status` shows it —
+  generous enough that a slow-to-appear address still recovers on its own.
 
 ### Added
 - **In-band DTMF on a controlled call is forwarded to the control plane as a

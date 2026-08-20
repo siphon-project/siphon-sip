@@ -5,6 +5,16 @@ Documentation=https://github.com/siphon-project/siphon-sip
 After=network-online.target
 Wants=network-online.target
 
+# Give up instead of restarting forever. siphon exits non-zero on a config or
+# script error, and RestartSec=5s puts only two starts in systemd's default
+# 10 s window, so a permanently broken config never trips the default limit —
+# it just loops silently until someone reads the journal. The window here is
+# deliberately generous (roughly a minute of retrying before the unit fails):
+# long enough that a slow-to-appear address or a dependency still coming up
+# recovers on its own, short of the endless loop a bad config used to produce.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
 [Service]
 Type=simple
 # A relative script.path in siphon.yaml is resolved against the config

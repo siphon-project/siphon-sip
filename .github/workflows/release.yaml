@@ -94,7 +94,7 @@ jobs:
             -C target/${{ matrix.target }}/release siphon \
             --transform='s,^,siphon-${{ github.ref_name }}/,' \
             -C "${{ github.workspace }}" siphon.yaml scripts/proxy_default.py scripts/b2bua_default.py \
-            dist/siphon.service LICENSE README.md
+            dist/siphon.service etc/logrotate.d/siphon LICENSE README.md
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
       # Stage everything into one flat dir. v1.0.0 lost the deb/rpm because

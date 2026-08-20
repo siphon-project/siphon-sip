@@ -280,10 +280,11 @@ assets = [
     ["scripts/proxy_default.py", "etc/siphon/scripts/proxy_default.py", "644"],
     ["scripts/b2bua_default.py", "etc/siphon/scripts/b2bua_default.py", "644"],
     ["dist/siphon.service", "lib/systemd/system/siphon.service", "644"],
+    ["etc/logrotate.d/siphon", "etc/logrotate.d/siphon", "644"],
     ["README.md", "usr/share/doc/siphon/README.md", "644"],
     ["LICENSE", "usr/share/doc/siphon/LICENSE", "644"],
 ]
-conf-files = ["/etc/siphon/siphon.yaml"]
+conf-files = ["/etc/siphon/siphon.yaml", "/etc/logrotate.d/siphon"]
 maintainer-scripts = "dist/debian/"
 systemd-units = { unit-name = "siphon", enable = false, start = false }
 
@@ -295,6 +296,7 @@ assets = [
     { source = "scripts/proxy_default.py", dest = "/etc/siphon/scripts/proxy_default.py", mode = "644" },
     { source = "scripts/b2bua_default.py", dest = "/etc/siphon/scripts/b2bua_default.py", mode = "644" },
     { source = "dist/siphon.service", dest = "/usr/lib/systemd/system/siphon.service", mode = "644" },
+    { source = "etc/logrotate.d/siphon", dest = "/etc/logrotate.d/siphon", mode = "644", config = true },
     { source = "README.md", dest = "/usr/share/doc/siphon/README.md", mode = "644" },
     { source = "LICENSE", dest = "/usr/share/doc/siphon/LICENSE", mode = "644" },
 ]
@@ -307,8 +309,8 @@ python3 = ">= 3.12"
 pre_install_script = """
 getent group siphon >/dev/null || groupadd -r siphon
 getent passwd siphon >/dev/null || useradd -r -g siphon -d /var/lib/siphon -s /sbin/nologin -c "SIPhon SIP proxy" siphon
-mkdir -p /var/lib/siphon
-chown siphon:siphon /var/lib/siphon
+mkdir -p /var/lib/siphon /var/log/siphon
+chown siphon:siphon /var/lib/siphon /var/log/siphon
 """
 post_install_script = """
 systemctl daemon-reload

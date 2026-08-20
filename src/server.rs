@@ -2361,14 +2361,10 @@ fn init_logging(
     };
 
     let (file_layer, guard) = if let Some(ref path) = log_config.file {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .unwrap_or_else(|error| {
-                eprintln!("Failed to open log file {path}: {error}");
-                std::process::exit(1);
-            });
+        let file = crate::file_sink::open_append(path).unwrap_or_else(|error| {
+            eprintln!("Failed to open log file {path}: {error}");
+            std::process::exit(1);
+        });
         let (non_blocking, guard) = tracing_appender::non_blocking(file);
 
         let layer = if is_json {
@@ -3138,12 +3134,7 @@ fn spawn_li_tasks(
     tokio::spawn(async move {
         let mut receiver = audit_rx;
         let mut file = if let Some(ref path) = audit_log_path {
-            match tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .await
-            {
+            match crate::file_sink::open_append_async(path).await {
                 Ok(file) => Some(file),
                 Err(error) => {
                     error!("failed to open LI audit log {path}: {error}");

@@ -39,6 +39,9 @@ mod li_tests;
 #[path = "integration/admin_tests.rs"]
 mod admin_tests;
 
+#[path = "integration/packaging_tests.rs"]
+mod packaging_tests;
+
 #[path = "integration/nat_tests.rs"]
 mod nat_tests;
 
