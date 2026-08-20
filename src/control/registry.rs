@@ -800,6 +800,62 @@ impl ControlBus {
         pushed
     }
 
+    /// Surface an inbound REFER on a *controlled* call to the owning control
+    /// connection as a `TransferRequested` event, so the app owns the transfer
+    /// decision (`accept_refer` / `reject_refer`) instead of the in-process
+    /// `@b2bua.on_refer` path. The dispatcher holds the REFER un-answered until
+    /// the app decides or the decision deadline applies the 603 default — this
+    /// method only emits the event; the pending REFER (and its deadline) live in
+    /// the dispatcher's store, so this adds and removes **no** per-call state of
+    /// its own and needs no leak coverage here.
+    ///
+    /// `channel_id` is the caller-resolved owner
+    /// ([`channel_id_for_sip_call_id`](Self::channel_id_for_sip_call_id));
+    /// `from_tag` identifies the referring party. The payload is
+    /// `{refer_to, replaces?, from_tag}` alongside the stable id triple. Returns
+    /// whether the event was pushed (idempotent no-op / `false` when the channel
+    /// is unknown or its connection is gone).
+    pub fn forward_transfer_requested(
+        &self,
+        channel_id: &str,
+        sip_call_id: &str,
+        refer_to: &crate::sip::headers::refer::ReferTo,
+        from_tag: Option<&str>,
+    ) -> bool {
+        let (app, call_actor_id) = match self.channels.get(channel_id) {
+            Some(entry) => (entry.app.clone(), entry.call_actor_id.clone()),
+            None => return false,
+        };
+        let replaces = refer_to.replaces.as_ref().map(|replaces| {
+            serde_json::json!({
+                "call_id": replaces.call_id,
+                "from_tag": replaces.from_tag,
+                "to_tag": replaces.to_tag,
+                "early_only": replaces.early_only,
+            })
+        });
+        let payload = serde_json::json!({
+            "refer_to": refer_to.uri,
+            "replaces": replaces,
+            "from_tag": from_tag,
+        });
+        let pushed = self.publish_to_channel(
+            channel_id,
+            EventFrame::new(
+                "TransferRequested",
+                channel_id,
+                &app,
+                &call_actor_id,
+                sip_call_id,
+                payload,
+            ),
+        );
+        if pushed {
+            debug!(%channel_id, %sip_call_id, target = %refer_to.uri, "control plane: TransferRequested forwarded");
+        }
+        pushed
+    }
+
     /// Offer a handed-over call to an app: assign a persistent owner (round
     /// robin) and push `StasisStart`, or launch a per-call-connect dial. Returns
     /// the outcome so the dispatcher knows whether to arm the handoff deadline
@@ -1276,6 +1332,71 @@ mod tests {
         let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
         let conn = bus.register_connection("ivr-app");
         assert!(!bus.forward_dtmf("unknown-cid", "1", 100, 0, "ftag"));
+        assert_eq!(conn.events.depth(), 0, "no event for an uncontrolled call");
+        assert_eq!(bus.channel_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn forward_transfer_requested_pushes_event_to_owning_connection() {
+        // An inbound REFER on a controlled call reaches the owning connection as a
+        // TransferRequested event carrying the Refer-To target, embedded Replaces,
+        // and the referring party's from_tag — the app owns the decision.
+        let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
+        let conn = bus.register_connection("ivr-app");
+        bus.offer_channel(
+            "ivr-app",
+            "ch1",
+            "call-uuid",
+            "sipcid@h",
+            "hangup",
+            HashMap::new(),
+            serde_json::json!({}),
+        );
+
+        let refer_to = crate::sip::headers::refer::ReferTo {
+            uri: "sip:carol@example.com".to_string(),
+            replaces: Some(crate::sip::headers::refer::Replaces {
+                call_id: "xfer-dialog".to_string(),
+                from_tag: "peer-ft".to_string(),
+                to_tag: "peer-tt".to_string(),
+                early_only: false,
+            }),
+        };
+        assert!(bus.forward_transfer_requested("ch1", "sipcid@h", &refer_to, Some("alice-tag")));
+
+        let frames = conn.events.recv_many().await;
+        let transfer = frames
+            .iter()
+            .find_map(|frame| match frame {
+                OutboundFrame::Event(event) if event.event == "TransferRequested" => Some(event),
+                _ => None,
+            })
+            .expect("owning app must receive TransferRequested");
+        assert_eq!(transfer.channel.as_deref(), Some("ch1"));
+        assert_eq!(transfer.call_id.as_deref(), Some("call-uuid"));
+        assert_eq!(transfer.sip_call_id.as_deref(), Some("sipcid@h"));
+        assert_eq!(transfer.payload["refer_to"], "sip:carol@example.com");
+        assert_eq!(transfer.payload["from_tag"], "alice-tag");
+        assert_eq!(transfer.payload["replaces"]["call_id"], "xfer-dialog");
+        assert_eq!(transfer.payload["replaces"]["to_tag"], "peer-tt");
+        assert_eq!(transfer.payload["replaces"]["early_only"], false);
+
+        // Emitting the event neither creates nor removes per-call state (the
+        // pending REFER lives in the dispatcher's store, not here).
+        assert_eq!(bus.channel_count(), 1, "forward_transfer_requested must not touch channel state");
+    }
+
+    #[test]
+    fn forward_transfer_requested_on_uncontrolled_call_is_clean_noop() {
+        // A REFER for a call no control app owns is a silent no-op — nothing
+        // pushed, no state change (the dispatcher then runs the Python path).
+        let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
+        let conn = bus.register_connection("ivr-app");
+        let refer_to = crate::sip::headers::refer::ReferTo {
+            uri: "sip:carol@example.com".to_string(),
+            replaces: None,
+        };
+        assert!(!bus.forward_transfer_requested("unknown-ch", "unknown-cid", &refer_to, None));
         assert_eq!(conn.events.depth(), 0, "no event for an uncontrolled call");
         assert_eq!(bus.channel_count(), 0);
     }

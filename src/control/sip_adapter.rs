@@ -51,6 +51,8 @@ impl ControlAdapter for SipControlAdapter {
                 verb("reject", "Send a final non-2xx and tear the call down (args: code, reason)"),
                 verb("hangup", "BYE an answered call, or reject an unanswered one (args: reason)"),
                 verb("refer", "Send an in-dialog REFER on the A-leg (args: to, replaces)"),
+                verb("accept_refer", "Accept a pending inbound REFER (from a TransferRequested event) and run the transfer (args: target, next_hop, mode)"),
+                verb("reject_refer", "Reject a pending inbound REFER with a final non-2xx (args: code, reason)"),
                 verb("route", "Return control to siphon with a routing decision: un-park the call and dial the B-leg via LCR sequential failover (args: targets, strategy, headers)"),
                 verb("set_header", "Set a header on the stored A-leg INVITE (args: name, value)"),
                 verb("remove_header", "Remove a header from the stored A-leg INVITE (args: name)"),
@@ -69,6 +71,7 @@ impl ControlAdapter for SipControlAdapter {
                 "ChannelStateChange".to_string(),
                 "ChannelHangupRequest".to_string(),
                 "ChannelDtmfReceived".to_string(),
+                "TransferRequested".to_string(),
             ],
         }
     }
@@ -127,6 +130,8 @@ fn apply_sip(command: AdapterCommand) -> ControlResult {
         "reject" => reject(&channel, &command.args),
         "hangup" => hangup(&channel, &command.args),
         "refer" => refer(&channel, &command.args),
+        "accept_refer" => accept_refer(&channel, &command.args),
+        "reject_refer" => reject_refer(&channel, &command.args),
         "route" => route(&channel, &command.args),
         "set_header" => set_header(&channel, &command.args),
         "remove_header" => remove_header(&channel, &command.args),
@@ -569,6 +574,88 @@ fn refer(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
     }
 }
 
+/// `accept_refer` — accept a *controlled* call's pending inbound REFER (surfaced
+/// as a `TransferRequested` event). Drives siphon's shipped transfer machinery in
+/// the resolved mode. Optional `target` overrides the Refer-To URI, `next_hop`
+/// steers egress, and `mode` (`"terminate"` / `"transparent"`) overrides the
+/// configured `b2bua.default_refer_mode`. No pending REFER (already decided,
+/// timed out, or the call is gone) → `not_found`.
+fn accept_refer(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
+    let target = args.get("target").and_then(|v| v.as_str());
+    if let Some(target) = target {
+        if let Err(error) = crate::sip::parser::parse_uri_standalone(target) {
+            return ControlResult::error(
+                ControlErrorCode::BadRequest,
+                format!("invalid refer target: {error}"),
+            );
+        }
+    }
+    let next_hop = args.get("next_hop").and_then(|v| v.as_str());
+    if let Some(next_hop) = next_hop {
+        if let Err(error) = crate::sip::parser::parse_uri_standalone(next_hop) {
+            return ControlResult::error(
+                ControlErrorCode::BadRequest,
+                format!("invalid next_hop: {error}"),
+            );
+        }
+    }
+    let mode = match parse_refer_mode(args.get("mode")) {
+        Ok(mode) => mode,
+        Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
+    };
+
+    if crate::dispatcher::b2bua_accept_refer_call(
+        &channel.sip_call_id,
+        target.map(|s| s.to_string()),
+        next_hop.map(|s| s.to_string()),
+        mode,
+    ) {
+        ControlResult::Ok(
+            serde_json::json!({ "channel": channel.channel_id, "transfer": "accepted" }),
+        )
+    } else {
+        ControlResult::error(ControlErrorCode::NotFound, "no pending transfer for this call")
+    }
+}
+
+/// `reject_refer` — decline a *controlled* call's pending inbound REFER with a
+/// final non-2xx (default `603 Decline`). No pending REFER → `not_found`.
+fn reject_refer(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
+    let (code, reason, _, _) = response_args(args, 603, "Decline");
+    if !(300..700).contains(&code) {
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "reject_refer requires a 3xx-6xx code",
+        );
+    }
+    if crate::dispatcher::b2bua_reject_refer_call(&channel.sip_call_id, code, &reason) {
+        ControlResult::Ok(
+            serde_json::json!({ "channel": channel.channel_id, "transfer": "rejected", "code": code }),
+        )
+    } else {
+        ControlResult::error(ControlErrorCode::NotFound, "no pending transfer for this call")
+    }
+}
+
+/// Parse an optional `mode` arg for `accept_refer` into a
+/// [`crate::script::api::call::ReferMode`]. Absent / null → `None` (the rail then
+/// applies the configured `b2bua.default_refer_mode`); an unrecognized value is a
+/// typed `bad_request`, never a silent default.
+fn parse_refer_mode(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<crate::script::api::call::ReferMode>, String> {
+    use crate::script::api::call::ReferMode;
+    match value {
+        None => Ok(None),
+        Some(value) if value.is_null() => Ok(None),
+        Some(value) => match value.as_str() {
+            Some("terminate") => Ok(Some(ReferMode::Terminate)),
+            Some("transparent") => Ok(Some(ReferMode::Transparent)),
+            _ => Err("accept_refer args.mode must be \"terminate\" or \"transparent\"".to_string()),
+        },
+    }
+}
+
 /// Parse an optional `replaces` arg (`{call_id, from_tag, to_tag, early_only?}`).
 fn parse_replaces_arg(
     value: Option<&serde_json::Value>,
@@ -779,6 +866,8 @@ mod tests {
             "reject",
             "hangup",
             "refer",
+            "accept_refer",
+            "reject_refer",
             "route",
             "set_header",
             "remove_header",
@@ -800,6 +889,7 @@ mod tests {
             "ChannelStateChange",
             "ChannelHangupRequest",
             "ChannelDtmfReceived",
+            "TransferRequested",
         ] {
             assert!(events.contains(&expected), "missing event {expected}");
         }
@@ -836,7 +926,7 @@ mod tests {
         for verb in ["play", "stop", "dtmf", "hold", "unhold", "stream_start", "stream_stop"] {
             assert!(is_media_verb(verb), "{verb} should route to the async media path");
         }
-        for verb in ["answer", "progress", "reject", "hangup", "refer", "route", "set_header", "remove_header", "get_header", "collect_dtmf", "teleport"] {
+        for verb in ["answer", "progress", "reject", "hangup", "refer", "accept_refer", "reject_refer", "route", "set_header", "remove_header", "get_header", "collect_dtmf", "teleport"] {
             assert!(!is_media_verb(verb), "{verb} should NOT route to the async media path");
         }
     }
@@ -1233,5 +1323,99 @@ mod tests {
         assert!(replaces.early_only);
         assert!(parse_replaces_arg(None).unwrap().is_none());
         assert!(parse_replaces_arg(Some(&serde_json::Value::Null)).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_refer_mode_variants() {
+        use crate::script::api::call::ReferMode;
+        assert_eq!(parse_refer_mode(None), Ok(None));
+        assert_eq!(parse_refer_mode(Some(&serde_json::Value::Null)), Ok(None));
+        assert_eq!(
+            parse_refer_mode(Some(&serde_json::json!("terminate"))),
+            Ok(Some(ReferMode::Terminate))
+        );
+        assert_eq!(
+            parse_refer_mode(Some(&serde_json::json!("transparent"))),
+            Ok(Some(ReferMode::Transparent))
+        );
+        // An unrecognized mode is a typed error, never a silent default.
+        assert!(parse_refer_mode(Some(&serde_json::json!("sideways"))).is_err());
+        assert!(parse_refer_mode(Some(&serde_json::json!(42))).is_err());
+    }
+
+    #[test]
+    fn accept_refer_bad_mode_is_bad_request() {
+        // Parsed before touching the rail, so it holds with no dispatcher.
+        let result = accept_refer(&channel(), &serde_json::json!({ "mode": "sideways" }));
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+        ));
+    }
+
+    #[test]
+    fn accept_refer_bad_target_is_bad_request() {
+        let result = accept_refer(&channel(), &serde_json::json!({ "target": "not a uri" }));
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+        ));
+    }
+
+    #[test]
+    fn accept_refer_without_pending_is_not_found() {
+        // No B2BUA_CONTROL installed (unit context) → b2bua_accept_refer_call is
+        // false (no pending REFER), mapped to not_found — never a hang.
+        let result = accept_refer(&channel(), &serde_json::json!({}));
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+        ));
+    }
+
+    #[test]
+    fn accept_refer_dispatches_through_apply_sip() {
+        // Prove the "accept_refer" arm is wired in apply_sip (reaches the rail →
+        // not_found with no dispatcher, rather than the unsupported_verb catch-all).
+        let result = apply_sip(AdapterCommand {
+            verb: "accept_refer".to_string(),
+            args: serde_json::json!({}),
+            target: ResolvedTarget::Channel(channel()),
+        });
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+        ));
+    }
+
+    #[test]
+    fn reject_refer_bad_code_is_bad_request() {
+        let result = reject_refer(&channel(), &serde_json::json!({ "code": 200 }));
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+        ));
+    }
+
+    #[test]
+    fn reject_refer_without_pending_is_not_found() {
+        let result = reject_refer(&channel(), &serde_json::json!({ "code": 486, "reason": "Busy" }));
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+        ));
+    }
+
+    #[test]
+    fn reject_refer_dispatches_through_apply_sip() {
+        let result = apply_sip(AdapterCommand {
+            verb: "reject_refer".to_string(),
+            args: serde_json::json!({}),
+            target: ResolvedTarget::Channel(channel()),
+        });
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+        ));
     }
 }

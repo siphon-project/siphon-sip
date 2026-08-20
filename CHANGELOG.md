@@ -7,6 +7,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **Inbound REFER on a controlled call is surfaced to the control app as a
+  `TransferRequested` event.** When a B2BUA call has been handed to an external
+  control app, an in-dialog REFER on that call is no longer run through the
+  in-process `@b2bua.on_refer` path — the app owns the transfer decision. siphon
+  holds the REFER un-answered, emits `TransferRequested` (payload
+  `{refer_to, replaces?, from_tag}` plus the stable id triple) to the owning
+  connection, and waits for the app's decision via two new SIP-adapter verbs:
+  `accept_refer` (`{target?, next_hop?, mode?}`, `mode` ∈ `terminate` /
+  `transparent`) drives the same shipped transfer machinery the script accept path
+  uses, and `reject_refer` (`{code?, reason?}`) declines with a final non-2xx. If
+  the app never decides, a decision-deadline sweep answers `603 Decline` (the same
+  default as no `@b2bua.on_refer` handler) so a REFER is never left pending. An
+  uncontrolled call's REFER still runs the Python `@b2bua.on_refer` path unchanged.
+  Builds on the single-leg REFER machinery, so a terminate-mode accept on a
+  voice-AI / IVR call with no B leg re-dials the target off the A dialog. The SDK
+  client facades for the new verbs and event follow separately.
+
 - **Cold transfer off a call siphon answered itself.** A voice-AI or IVR call has
   no B leg, so the only way to hand the caller on is an in-dialog REFER on the A
   dialog via the imperative `b2bua.refer(call_id, target)` — `call.refer()` is a
