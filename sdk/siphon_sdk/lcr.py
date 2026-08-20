@@ -176,6 +176,34 @@ class Route:
     timeout_secs: Optional[int] = None
     """Per-attempt ring timeout in seconds (else the call-level default)."""
 
+    caller_id: Optional[str] = None
+    """Calling number this carrier should see (the presented CLI), or ``None``
+    to keep the caller's own.
+
+    Applied through the same tag-preserving path that reshapes identity headers,
+    so the B-leg's ``From`` tag survives — which is why this is a field rather
+    than something to put in :attr:`headers`, where a ``From`` is refused
+    precisely because it would take the dialog tag with it.
+    :attr:`number_policy` reshapes the *format* of whatever number is present;
+    this substitutes a different one, which a number policy cannot do.
+
+    Also applied to ``P-Asserted-Identity`` / ``P-Preferred-Identity`` when the
+    message carries them."""
+
+    caller_id_presentation: Optional[str] = None
+    """``"allowed"`` (default) or ``"restricted"`` — whether the calling
+    identity may be presented to this carrier (CLIR).
+
+    ``restricted`` applies RFC 3323 §4.1 / TS 24.607: the ``From`` becomes
+    ``"Anonymous" <sip:anonymous@anonymous.invalid>`` with its tag intact,
+    ``Privacy: id`` is asserted, ``P-Preferred-Identity`` is dropped, and
+    ``P-Asserted-Identity`` keeps the real identity for the trusted next hop
+    (RFC 3325 §7).
+
+    Asserting ``Privacy: id`` without anonymising the ``From`` leaks the number
+    to every carrier that renders ``From`` rather than PAI, which defeats CLIR
+    while looking like it works — so the two always move together."""
+
     number_policy: Optional[str] = None
     """Named ``number_policies:`` preset applied to this carrier's B-leg identity
     headers (From/To/PAI) so the From/To shape can differ per carrier. The R-URI
@@ -211,6 +239,8 @@ class Route:
             "billing_increment",
             "min_duration",
             "timeout_secs",
+            "caller_id",
+            "caller_id_presentation",
             "number_policy",
         ):
             value = getattr(self, name)
@@ -238,6 +268,8 @@ class Route:
             billing_increment=data.get("billing_increment"),
             min_duration=data.get("min_duration"),
             timeout_secs=data.get("timeout_secs"),
+            caller_id=data.get("caller_id"),
+            caller_id_presentation=data.get("caller_id_presentation"),
             number_policy=data.get("number_policy"),
             headers=dict(data.get("headers", {})),
             cdr_fields=dict(data.get("cdr_fields", {})),

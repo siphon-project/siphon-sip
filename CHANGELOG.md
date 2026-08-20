@@ -15,6 +15,26 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   engine would recognise coming back, or to reject a replayed one. Validating
   the nonce is what bounds replay of a captured `Authorization`; without it a
   script-side digest check is replayable forever.
+- **RFC 3323 caller-ID restriction (CLIR)** — `call.restrict_caller_id()`, and
+  `caller_id_presentation: "restricted"` on an LCR route. There was no RFC 3323
+  anonymisation anywhere in the tree, so a deployment asserting `Privacy: id`
+  left the subscriber's real number in the `From`, leaking it to every carrier
+  that renders `From` rather than `P-Asserted-Identity` — which defeats CLIR
+  while looking like it works. The two now move together: `From` becomes
+  `"Anonymous" <sip:anonymous@anonymous.invalid>` with its dialog tag intact,
+  `Privacy: id` is appended to any existing value, `P-Preferred-Identity` is
+  dropped (it is the UA's *request*, and forwarding it past a privacy boundary
+  re-leaks the number), and `P-Asserted-Identity` keeps the real identity for
+  the trusted next hop per RFC 3325 §7.
+- **Per-route presented CLI** — `caller_id` on an LCR route, and
+  `call.set_caller_id(number)`. The presented CLI is a per-call, per-carrier
+  decision the contract could not express: `number_policy` reshapes a number's
+  *format* but cannot substitute a different one, `call.set_from_user` is
+  tag-safe but identical for every carrier attempt, and a `From` in a route's
+  `headers` would take the dialog tag with it. Applied through the same
+  tag-preserving path the identity reshaping already uses, to `From` and to
+  `P-Asserted-Identity` / `P-Preferred-Identity` where present. Two carriers in
+  one answer can now present different CLIs on the same call.
 - **CI covers re-INVITE renegotiation on the `siphon-rtp` backend** (`--reoffer`).
   The existing `--reinvite` mode runs the same hold/resume flow against
   rtpengine, where a repeat `offer` on a live call-id *is* the re-offer — so it

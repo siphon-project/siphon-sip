@@ -71,6 +71,8 @@ one of `gateway_group` / `next_hop` / `ruri`.
 | `destination` | string? | Retarget this carrier at a different destination number (RFC 3261 §16.5). Overrides the answer-level `destination`. Bare number or a URI (userpart only). |
 | `tech_prefix` | string? | Dial/tech-prefix prepended to the R-URI userpart for this carrier (e.g. `"1010288"`). |
 | `number_policy` | string? | Named `number_policies:` preset applied to this carrier's B-leg From/To/PAI (per-carrier CLI/identity shape). R-URI stays controlled by `tech_prefix`/`ruri`. |
+| `caller_id` | string? | Calling number this carrier is presented (the CLI). Tag-preserving; also applied to PAI/PPI. |
+| `caller_id_presentation` | string? | `allowed` (default) or `restricted` — CLIR per RFC 3323 / TS 24.607. |
 | `rate` | number? | Per-minute rate (CDR/charging). |
 | `currency` | string? | ISO 4217. |
 | `billing_increment` | int? | Seconds (60 = per-minute, 1 = per-second). |
@@ -147,6 +149,38 @@ Top-level:
   dialled on never reaches the carrier. The **tech prefix is not** applied to
   `To`: it is a carrier routing artifact that belongs to the R-URI, not to the
   called-party identity. `number_policy` still owns `To`'s format on top.
+- **Presented CLI and CLIR** — `caller_id` substitutes the calling number this
+  carrier sees, on `From` and on `P-Asserted-Identity` / `P-Preferred-Identity`
+  where present. It goes through the tag-preserving identity path, which is why
+  it is a field rather than something for `headers`: a `From` written without
+  its dialog tag breaks every subsequent in-dialog request, and only surfaces
+  later, on the ACK. `number_policy` reshapes the *format* of whatever number is
+  present; `caller_id` substitutes a different one, which a policy cannot do.
+
+  `caller_id_presentation: "restricted"` withholds the identity (RFC 3323 §4.1,
+  3GPP TS 24.607):
+
+  - `From` becomes `"Anonymous" <sip:anonymous@anonymous.invalid>`, tag intact
+  - `Privacy: id` is asserted (RFC 3325 §7), appended to any existing value
+  - `P-Asserted-Identity` keeps the real identity for the trusted next hop —
+    that is how the network stays able to identify the caller for regulatory and
+    emergency purposes
+  - `P-Preferred-Identity` is removed: it is the UA's *request* for what to
+    assert, and forwarding it past a privacy boundary re-leaks the number
+
+  The two always move together. Asserting `Privacy: id` while leaving the real
+  number in `From` leaks it to every carrier that renders `From` rather than
+  PAI, which defeats CLIR while looking like it works.
+
+  Ordering is fixed: `caller_id` is substituted **before** `number_policy`
+  reshapes formats, and anonymisation runs **after** — so under `restricted` the
+  substituted number still reaches PAI, and no policy tries to reformat
+  `anonymous` as a number. An unrecognised `caller_id_presentation` is logged
+  and treated as `restricted`, because a withheld call going out with the real
+  number is the failure that matters.
+
+  The script-level twins are `call.set_caller_id(number)` and
+  `call.restrict_caller_id()`, for deployments not using the LCR API.
 
 - **Forward-compatibility** — unknown response fields are ignored; new optional
   fields can be added without a version bump. Bump `version` only on a breaking

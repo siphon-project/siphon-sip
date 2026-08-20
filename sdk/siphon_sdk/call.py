@@ -1054,6 +1054,82 @@ class Call:
         if self._ruri is not None:
             self._ruri.user = value
 
+    def restrict_caller_id(self) -> None:
+        """Withhold the calling party's identity on the B-leg (CLIR).
+
+        RFC 3323 §4.1 / 3GPP TS 24.607::
+
+            @b2bua.on_invite
+            def route(call):
+                if caller_withheld(call):
+                    call.restrict_caller_id()
+                call.dial(str(call.ruri))
+
+        - ``From`` becomes ``"Anonymous" <sip:anonymous@anonymous.invalid>``,
+          keeping its dialog tag.
+        - ``Privacy: id`` is asserted (RFC 3325 §7), appended to any existing
+          ``Privacy`` value rather than replacing it.
+        - ``P-Asserted-Identity`` is left intact, carrying the real identity to
+          the trusted next hop — that is how the network stays able to identify
+          the caller for regulatory and emergency purposes.
+        - ``P-Preferred-Identity`` is removed: it is the UA's *request* for what
+          to assert, and forwarding it past a privacy boundary re-leaks the
+          number.
+
+        Setting ``Privacy: id`` by hand while leaving the real number in
+        ``From`` leaks it to every carrier that renders ``From`` rather than
+        PAI — which defeats CLIR while looking like it works.  This moves both
+        together.
+
+        Call it *after* any identity reshaping: anonymisation is the last step,
+        or a number policy will try to reformat ``anonymous`` as a number.  The
+        LCR twin is a route's ``caller_id_presentation="restricted"``.
+        """
+        from_raw = self._headers.get("From")
+        tag = None
+        if from_raw and ";tag=" in from_raw:
+            tag = from_raw.split(";tag=", 1)[1].split(";")[0]
+        anonymous = '"Anonymous" <sip:anonymous@anonymous.invalid>'
+        if tag:
+            anonymous = f"{anonymous};tag={tag}"
+        self._headers["From"] = anonymous
+        self._headers.pop("P-Preferred-Identity", None)
+
+        existing = self._headers.get("Privacy", "")
+        tokens = [t.strip() for t in existing.split(";") if t.strip()]
+        if "id" not in [t.lower() for t in tokens]:
+            tokens.append("id")
+        self._headers["Privacy"] = ";".join(tokens)
+
+    def set_caller_id(self, number: str) -> bool:
+        """Present ``number`` as the calling party.
+
+        Applied to ``From`` and to ``P-Asserted-Identity`` /
+        ``P-Preferred-Identity`` where present, preserving the dialog tag —
+        which is why this exists rather than a ``set_header("From", ...)``: the
+        B-leg ``From`` host is rewritten after the script runs, and a ``From``
+        set without a tag drops the mandatory dialog tag (RFC 3261 §8.1.1.3), a
+        failure that only surfaces later on the ACK.
+
+        Unlike a number policy, which reshapes the *format* of whatever number
+        is already there, this substitutes a different one.  The LCR twin is a
+        route's ``caller_id``.
+
+        Returns ``True`` if anything was rewritten.
+        """
+        if not number:
+            return False
+        rewritten = False
+        for header in ("From", "P-Asserted-Identity", "P-Preferred-Identity"):
+            value = self._headers.get(header)
+            if not value or "@" not in value:
+                continue
+            before, _, after = value.partition("@")
+            scheme, _, _user = before.rpartition(":")
+            self._headers[header] = f"{scheme}:{number}@{after}"
+            rewritten = True
+        return rewritten
+
     def set_from_user(self, value: str) -> None:
         """Set the user part of the From header URI.
 

@@ -1833,6 +1833,63 @@ impl PyCall {
         Ok(super::numbers::apply_to_message(&mut message, &resolved))
     }
 
+    /// Withhold the calling party's identity on the B-leg (CLIR), per
+    /// RFC 3323 §4.1 and 3GPP TS 24.607.
+    ///
+    /// ```python
+    /// @b2bua.on_invite
+    /// def route(call):
+    ///     if caller_withheld(call):
+    ///         call.restrict_caller_id()
+    ///     call.dial(str(call.ruri))
+    /// ```
+    ///
+    /// - `From` becomes `"Anonymous" <sip:anonymous@anonymous.invalid>`,
+    ///   keeping its dialog tag.
+    /// - `Privacy: id` is asserted (RFC 3325 §7), appended to any existing
+    ///   `Privacy` value rather than replacing it.
+    /// - `P-Asserted-Identity` is left intact, carrying the real identity to
+    ///   the trusted next hop — that is how the network stays able to identify
+    ///   the caller for regulatory and emergency purposes.
+    /// - `P-Preferred-Identity` is removed: it is the UA's *request* for what
+    ///   to assert, and forwarding it past a privacy boundary re-leaks the
+    ///   number.
+    ///
+    /// Setting `Privacy: id` by hand while leaving the real number in `From`
+    /// leaks it to every carrier that renders `From` rather than
+    /// `P-Asserted-Identity` — which defeats CLIR while looking like it works.
+    /// This moves both together.
+    ///
+    /// Call it *after* any identity reshaping: anonymisation is the last step,
+    /// or a number policy will try to reformat `anonymous` as a number. The
+    /// LCR twin is a route's `caller_id_presentation: "restricted"`.
+    fn restrict_caller_id(&self) -> PyResult<()> {
+        let mut message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        crate::sip::privacy::restrict_calling_identity(&mut message);
+        Ok(())
+    }
+
+    /// Present `number` as the calling party, on `From` and on
+    /// `P-Asserted-Identity` / `P-Preferred-Identity` where present.
+    ///
+    /// The dialog tag is preserved, which is why this exists rather than a
+    /// `set_header("From", ...)`: the B-leg From host is rewritten after the
+    /// script runs, and a `From` set without a tag drops the mandatory dialog
+    /// tag (RFC 3261 §8.1.1.3) — a failure that only surfaces later, on the
+    /// ACK.
+    ///
+    /// Unlike a number policy, which reshapes the *format* of whatever number
+    /// is already there, this substitutes a different one. The LCR twin is a
+    /// route's `caller_id`.
+    fn set_caller_id(&self, number: &str) -> PyResult<bool> {
+        let mut message = self.message.lock().map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
+        })?;
+        Ok(crate::sip::privacy::set_calling_number(&mut message, number))
+    }
+
     /// Set the user part of the From header URI.
     ///
     /// Usage in Python:

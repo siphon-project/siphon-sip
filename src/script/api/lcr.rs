@@ -83,6 +83,20 @@ impl PyRoute {
         self.inner.destination.as_deref()
     }
 
+    /// Calling number this carrier is presented (the CLI), or `None` to keep
+    /// the caller's own.
+    #[getter]
+    fn caller_id(&self) -> Option<&str> {
+        self.inner.caller_id.as_deref()
+    }
+
+    /// `"allowed"` | `"restricted"` — whether the calling identity may be
+    /// presented to this carrier (CLIR, RFC 3323 / TS 24.607).
+    #[getter]
+    fn caller_id_presentation(&self) -> Option<&str> {
+        self.inner.caller_id_presentation.as_deref()
+    }
+
     /// Named number policy applied to this carrier's B-leg identity headers.
     #[getter]
     fn number_policy(&self) -> Option<&str> {
