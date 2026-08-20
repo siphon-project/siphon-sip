@@ -1455,10 +1455,23 @@ pub struct ApiBanConfig {
     /// Poll interval in seconds (default: 300).
     #[serde(default = "default_apiban_interval_secs")]
     pub interval_secs: u64,
+    /// How long a fetched entry stays blocked, in seconds (default: 604800, 7
+    /// days — the feed's own release policy). Applied as a per-element timeout
+    /// in the kernel set, so the kernel expires it without siphon acting.
+    ///
+    /// `0` disables expiry and restores the pre-TTL behaviour, where an entry
+    /// stayed blocked for the life of the process.
+    #[serde(default = "default_apiban_ban_ttl_secs")]
+    pub ban_ttl_secs: u64,
 }
 
 fn default_apiban_interval_secs() -> u64 {
     300
+}
+
+/// 7 days, matching the interval after which APIBAN itself releases an address.
+fn default_apiban_ban_ttl_secs() -> u64 {
+    604_800
 }
 
 #[derive(Debug, Deserialize, Clone)]

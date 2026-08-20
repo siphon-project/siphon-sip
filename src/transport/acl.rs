@@ -6,8 +6,9 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use dashmap::DashSet;
 use ipnet::IpNet;
+
+use crate::apiban::ApiBanStore;
 
 /// Transport-level ACL.
 ///
@@ -16,11 +17,13 @@ use ipnet::IpNet;
 /// If both are empty (and no APIBAN set), all traffic is allowed.
 ///
 /// When an APIBAN deny set is attached, IPs in that set are blocked before
-/// static deny/allow checks.
+/// static deny/allow checks. The store filters `security.trusted_cidrs` at
+/// insert and expires entries on its own TTL, so this check needs no trusted
+/// test of its own.
 pub struct TransportAcl {
     deny: Vec<IpNet>,
     allow: Vec<IpNet>,
-    apiban_deny: Option<Arc<DashSet<IpAddr>>>,
+    apiban_deny: Option<Arc<ApiBanStore>>,
 }
 
 impl TransportAcl {
@@ -44,7 +47,7 @@ impl TransportAcl {
     pub fn with_apiban(
         deny_cidrs: Vec<String>,
         allow_cidrs: Vec<String>,
-        apiban_deny: Arc<DashSet<IpAddr>>,
+        apiban_deny: Arc<ApiBanStore>,
     ) -> Self {
         let mut acl = Self::new(deny_cidrs, allow_cidrs);
         acl.apiban_deny = Some(apiban_deny);
@@ -172,13 +175,22 @@ mod tests {
         assert!(acl.is_allowed("8.8.8.8".parse().unwrap()));
     }
 
+    /// A store holding `addresses`, each with a long TTL so nothing expires
+    /// mid-test.
+    fn apiban_store(addresses: &[&str]) -> Arc<ApiBanStore> {
+        let store = ApiBanStore::new();
+        for address in addresses {
+            store.insert(
+                address.parse::<IpAddr>().unwrap(),
+                Some(std::time::Duration::from_secs(3600)),
+            );
+        }
+        Arc::new(store)
+    }
+
     #[test]
     fn apiban_blocks_listed_ips() {
-        let apiban_set = Arc::new(DashSet::new());
-        apiban_set.insert("1.2.3.4".parse::<IpAddr>().unwrap());
-        apiban_set.insert("5.6.7.8".parse::<IpAddr>().unwrap());
-
-        let acl = TransportAcl::with_apiban(vec![], vec![], apiban_set);
+        let acl = TransportAcl::with_apiban(vec![], vec![], apiban_store(&["1.2.3.4", "5.6.7.8"]));
 
         assert!(!acl.is_allowed("1.2.3.4".parse().unwrap()));
         assert!(!acl.is_allowed("5.6.7.8".parse().unwrap()));
@@ -188,8 +200,7 @@ mod tests {
 
     #[test]
     fn apiban_empty_set_allows_all() {
-        let apiban_set = Arc::new(DashSet::new());
-        let acl = TransportAcl::with_apiban(vec![], vec![], apiban_set);
+        let acl = TransportAcl::with_apiban(vec![], vec![], apiban_store(&[]));
 
         assert!(acl.is_allowed("1.2.3.4".parse().unwrap()));
         assert!(!acl.has_rules()); // empty set means no active rules
@@ -197,13 +208,10 @@ mod tests {
 
     #[test]
     fn apiban_combined_with_static_deny() {
-        let apiban_set = Arc::new(DashSet::new());
-        apiban_set.insert("1.2.3.4".parse::<IpAddr>().unwrap());
-
         let acl = TransportAcl::with_apiban(
             vec!["10.0.0.0/8".to_string()],
             vec![],
-            apiban_set,
+            apiban_store(&["1.2.3.4"]),
         );
 
         // Blocked by APIBAN
@@ -212,5 +220,22 @@ mod tests {
         assert!(!acl.is_allowed("10.0.0.1".parse().unwrap()));
         // Allowed (neither list)
         assert!(acl.is_allowed("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn apiban_entry_stops_blocking_once_its_ttl_passes() {
+        // The ACL reads through the store, so an entry past its deadline is
+        // allowed again without waiting for the poll loop's sweep.
+        let store = ApiBanStore::new();
+        store.insert(
+            "1.2.3.4".parse::<IpAddr>().unwrap(),
+            Some(std::time::Duration::from_millis(1)),
+        );
+        let acl = TransportAcl::with_apiban(vec![], vec![], Arc::new(store));
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(acl.is_allowed("1.2.3.4".parse().unwrap()));
+        // The entry is still held (nothing swept it), it just no longer matches.
+        assert!(acl.has_rules());
     }
 }

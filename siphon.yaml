@@ -421,6 +421,16 @@ auth:
 #   apiban:                     # APIBAN community blocklist (apiban.org)
 #     api_key: "your-api-key"   # get a free key at apiban.org
 #     interval_secs: 300        # poll interval (default: 300 = 5 min)
+#     ban_ttl_secs: 604800      # how long a fetched entry stays blocked
+#                               # (default: 604800 = 7 days, the interval after
+#                               # which apiban itself releases an address).
+#                               # Applied as a per-element kernel timeout, so
+#                               # the kernel expires it without siphon acting.
+#                               # 0 = never expire (pre-TTL behaviour).
+#                               # trusted_cidrs are dropped as the feed is
+#                               # ingested, so a listed trunk or management
+#                               # address reaches neither the ACL nor the
+#                               # kernel set.
 #
 #   firewall: {}                # kernel firewall: mirror bans (failed_auth_ban +
 #                               # apiban) into a kernel nf_tables set so banned
