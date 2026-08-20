@@ -474,8 +474,11 @@ pub async fn writer_task(mut receiver: mpsc::Receiver<Cdr>, config: CdrConfig) {
 
     while let Some(cdr) = receiver.recv().await {
         match &config.backend {
-            CdrBackendType::File { path, .. } => {
-                write_file_cdr(&cdr, path).await;
+            CdrBackendType::File {
+                path,
+                rotate_size_mb,
+            } => {
+                write_file_cdr(&cdr, path, *rotate_size_mb).await;
             }
             CdrBackendType::Syslog { target } => {
                 write_syslog_cdr(&cdr, target).await;
@@ -495,8 +498,9 @@ pub async fn writer_task(mut receiver: mpsc::Receiver<Cdr>, config: CdrConfig) {
 // File backend
 // ---------------------------------------------------------------------------
 
-/// Write a CDR as JSON to a file (append mode, one JSON object per line).
-async fn write_file_cdr(cdr: &Cdr, path: &str) {
+/// Write a CDR as JSON to a file (append mode, one JSON object per line),
+/// rotating the file once it reaches `rotate_size_mb` (0 disables rotation).
+async fn write_file_cdr(cdr: &Cdr, path: &str, rotate_size_mb: u64) {
     let json = match serde_json::to_string(cdr) {
         Ok(json) => json,
         Err(error) => {
@@ -511,9 +515,54 @@ async fn write_file_cdr(cdr: &Cdr, path: &str) {
             let line = format!("{json}\n");
             if let Err(error) = file.write_all(line.as_bytes()).await {
                 error!("CDR file write error: {error}");
+                return;
+            }
+            // Rotate *after* the write, never mid-record: a CDR split across
+            // two files is worse than a file a few hundred bytes over.
+            if rotate_size_mb > 0 {
+                match file.metadata().await {
+                    Ok(metadata) if metadata.len() >= rotate_size_mb * 1024 * 1024 => {
+                        rotate_file_cdr(path).await;
+                    }
+                    Ok(_) => {}
+                    Err(error) => error!("CDR file size check error: {error}"),
+                }
             }
         }
         Err(error) => error!("CDR file open error: {error}"),
+    }
+}
+
+/// Rename the CDR file out of the way so the next record starts a fresh one.
+///
+/// The writer task is the only writer of this path and opens it per record, so
+/// a plain rename is enough — nothing holds a descriptor that would keep
+/// writing into the rotated inode. Rotated files are never deleted: retention
+/// is the operator's (the packaged logrotate config, a shipper, a cron), and
+/// silently dropping billing records to enforce a size limit would be worse
+/// than the unbounded file this replaces.
+async fn rotate_file_cdr(path: &str) {
+    // Reuse the CDR timestamp so there is one date implementation, minus the
+    // separators that make a filename awkward: 2026-08-20T11:22:33.042Z
+    // becomes 20260820T112233042Z.
+    let stamp: String = format_timestamp(SystemTime::now())
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect();
+
+    let mut target = format!("{path}.{stamp}");
+    // A same-millisecond collision needs a full rotation between two records,
+    // which the size threshold makes all but impossible — but overwriting a
+    // file full of billing records is not a risk worth leaving open.
+    let mut attempt = 1;
+    while tokio::fs::try_exists(&target).await.unwrap_or(false) {
+        target = format!("{path}.{stamp}-{attempt}");
+        attempt += 1;
+    }
+
+    match tokio::fs::rename(path, &target).await {
+        Ok(()) => debug!("CDR file rotated: {path} -> {target}"),
+        Err(error) => error!("CDR file rotation error ({path} -> {target}): {error}"),
     }
 }
 
@@ -1032,5 +1081,98 @@ mod tests {
         assert_eq!(parsed["disconnect_initiator"], "caller");
         assert_eq!(parsed["billing_id"], "B-12345"); // flattened extra
         assert_eq!(parsed["transport"], "udp");
+    }
+
+    // --- file backend rotation (cdr.file.rotate_size_mb) ---
+
+    /// Sibling files the rotation left next to `path`.
+    fn rotated_siblings(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let directory = path.parent().unwrap();
+        let prefix = format!("{}.", path.file_name().unwrap().to_string_lossy());
+        let mut found: Vec<_> = std::fs::read_dir(directory)
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.unwrap().path();
+                let name = entry.file_name()?.to_string_lossy().into_owned();
+                name.starts_with(&prefix).then_some(entry)
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[tokio::test]
+    async fn file_backend_rotates_once_over_the_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cdr.jsonl");
+        let path_str = path.to_string_lossy().into_owned();
+        // One byte short of 1 MB, so the next record tips it over.
+        std::fs::write(&path, vec![b'x'; 1024 * 1024 - 1]).unwrap();
+
+        write_file_cdr(&sample_cdr(), &path_str, 1).await;
+
+        let siblings = rotated_siblings(&path);
+        assert_eq!(siblings.len(), 1, "expected exactly one rotated file");
+        let rotated = std::fs::read_to_string(&siblings[0]).unwrap();
+        assert!(
+            rotated.contains("a84b4c76e66710@192.168.1.100"),
+            "the record that tipped the limit belongs in the rotated file, not lost"
+        );
+        assert!(
+            !path.exists(),
+            "the live path is renamed away; the next record re-creates it"
+        );
+
+        // And the next record starts a fresh file rather than appending to the
+        // rotated one.
+        write_file_cdr(&sample_cdr(), &path_str, 1).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+        assert_eq!(rotated_siblings(&path).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn file_backend_does_not_rotate_below_the_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cdr.jsonl");
+        let path_str = path.to_string_lossy().into_owned();
+
+        write_file_cdr(&sample_cdr(), &path_str, 1).await;
+
+        assert!(rotated_siblings(&path).is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+    }
+
+    /// `rotate_size_mb: 0` is the documented "never rotate" setting.
+    #[tokio::test]
+    async fn zero_disables_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cdr.jsonl");
+        let path_str = path.to_string_lossy().into_owned();
+        std::fs::write(&path, vec![b'x'; 2 * 1024 * 1024]).unwrap();
+
+        write_file_cdr(&sample_cdr(), &path_str, 0).await;
+
+        assert!(rotated_siblings(&path).is_empty());
+        assert!(path.exists());
+    }
+
+    /// Two rotations in the same millisecond must not overwrite each other —
+    /// the first rotated file is full of billing records.
+    #[tokio::test]
+    async fn repeated_rotation_never_overwrites_a_rotated_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cdr.jsonl");
+        let path_str = path.to_string_lossy().into_owned();
+
+        for _ in 0..2 {
+            std::fs::write(&path, vec![b'x'; 1024 * 1024]).unwrap();
+            write_file_cdr(&sample_cdr(), &path_str, 1).await;
+        }
+
+        let siblings = rotated_siblings(&path);
+        assert_eq!(siblings.len(), 2, "second rotation clobbered the first");
+        for sibling in siblings {
+            assert!(std::fs::metadata(sibling).unwrap().len() > 1024 * 1024);
+        }
     }
 }

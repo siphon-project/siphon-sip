@@ -3025,7 +3025,11 @@ pub struct CdrFileConfig {
     /// Path to the JSON-lines CDR file.
     #[serde(default = "default_cdr_file_path")]
     pub path: String,
-    /// Rotate when file exceeds this size (MB). Default: 100.
+    /// Rename the file out of the way once it reaches this size, in MB, so
+    /// the next record starts a fresh one. Rotated files are named
+    /// `<path>.<UTC timestamp>` and are never deleted — retention belongs to
+    /// logrotate or whatever ships them. `0` disables rotation entirely.
+    /// Default: 100.
     #[serde(default = "default_cdr_rotate_size")]
     pub rotate_size_mb: u64,
 }
