@@ -41,8 +41,8 @@ use tracing::{debug, info, trace, warn};
 use super::client::PlayMediaSource;
 use super::error::RtpEngineError;
 use super::events::{
-    CallLegSummary, CallSummary, DtmfEvent, RtpEngineEvent, WsTeeEndReason, WsTeeStarted,
-    WsTeeEnded,
+    CallLegSummary, CallSummary, DtmfEvent, RtpEngineEvent, TextEvent, TextStreamStats,
+    WsTeeEndReason, WsTeeStarted, WsTeeEnded,
 };
 use super::profile::{NgFlags, WsTeeDirection};
 
@@ -93,6 +93,7 @@ pub(crate) fn profile_flags_from_ng(flags: &NgFlags) -> ProfileFlags {
         // opted-out profile leaves this `None` and serialises away.
         received_from: flags.received_from,
         rtcp_mux: flags.rtcp_mux.clone(),
+        text_events: flags.text_events,
     }
 }
 
@@ -1163,6 +1164,19 @@ fn convert_event(event: Event) -> RtpEngineEvent {
             duration_ms,
             legs: legs.into_iter().map(convert_leg_summary).collect(),
         }),
+        Event::Text {
+            call_id,
+            from_tag,
+            to_tag,
+            text,
+            direction,
+        } => RtpEngineEvent::Text(TextEvent {
+            call_id,
+            from_tag,
+            to_tag,
+            text,
+            direction,
+        }),
         Event::ActiveSpeaker {
             conference_id,
             from_tag,
@@ -1262,6 +1276,12 @@ fn convert_leg_summary(leg: ProtoLegSummary) -> CallLegSummary {
         mos_min: leg.mos_min,
         mos_max: leg.mos_max,
         mos_basis: leg.mos_basis,
+        text: leg.text.map(|stats| TextStreamStats {
+            packets: stats.packets,
+            characters: stats.characters,
+            missing_markers: stats.missing_markers,
+            recovered_from_redundancy: stats.recovered_from_redundancy,
+        }),
     }
 }
 
@@ -1817,6 +1837,74 @@ mod tests {
     /// tail.  Asserting the whole struct is what makes "every field" mean it —
     /// compare against a fully-populated expected value so a newly-added proto
     /// field cannot pass by being defaulted on both sides.
+    /// The text increment must reach the script byte-for-byte, U+FFFD markers
+    /// included — they are how a consumer sees where loss occurred (RFC 4103
+    /// §5.3), so a conversion that scrubbed them would hide the gap.
+    #[test]
+    fn convert_event_text_is_field_exact() {
+        let event = Event::Text {
+            call_id: "call-77".into(),
+            from_tag: "caller-tag".into(),
+            to_tag: Some("callee-tag".into()),
+            text: "hel\u{fffd}o".into(),
+            direction: Some("a_to_b".into()),
+        };
+        match convert_event(event) {
+            RtpEngineEvent::Text(text_event) => {
+                assert_eq!(text_event.call_id, "call-77");
+                assert_eq!(text_event.from_tag, "caller-tag");
+                assert_eq!(text_event.to_tag.as_deref(), Some("callee-tag"));
+                assert_eq!(text_event.text, "hel\u{fffd}o");
+                assert_eq!(text_event.direction.as_deref(), Some("a_to_b"));
+            }
+            other => panic!("expected a text event, got {other:?}"),
+        }
+    }
+
+    /// An engine that reported no text stream for the leg must leave the field
+    /// absent, not synthesise a zeroed one — a media CDR carrying
+    /// `text_packets=0` for an audio-only call reads as a text stream that
+    /// carried nothing, which is a different claim.
+    #[test]
+    fn convert_leg_summary_carries_text_stats_only_when_measured() {
+        let with_text = ProtoLegSummary {
+            tag: "near".into(),
+            codec: Some("PCMU".into()),
+            packets_in: 10,
+            bytes_in: 100,
+            packets_out: 10,
+            bytes_out: 100,
+            packets_dropped: 0,
+            ssrc: None,
+            packets_lost: None,
+            loss_percent: None,
+            jitter_ms: None,
+            rtt_ms: None,
+            mos_average: None,
+            mos_min: None,
+            mos_max: None,
+            mos_basis: None,
+            text: Some(siphon_rtp_proto::TextStreamStats {
+                packets: 12,
+                characters: 41,
+                missing_markers: 2,
+                recovered_from_redundancy: 3,
+            }),
+        };
+        let converted = convert_leg_summary(with_text.clone());
+        let stats = converted.text.expect("text stats carried");
+        assert_eq!(stats.packets, 12);
+        assert_eq!(stats.characters, 41);
+        assert_eq!(stats.missing_markers, 2);
+        assert_eq!(stats.recovered_from_redundancy, 3);
+
+        let audio_only = ProtoLegSummary {
+            text: None,
+            ..with_text
+        };
+        assert!(convert_leg_summary(audio_only).text.is_none());
+    }
+
     #[test]
     fn profile_flags_from_ng_maps_every_field() {
         let ng = NgFlags {
@@ -1842,6 +1930,7 @@ mod tests {
             carry_received_from: true,
             received_from: Some("198.51.100.7".parse().unwrap()),
             rtcp_mux: vec!["require".into()],
+            text_events: true,
         };
 
         let expected = ProfileFlags {
@@ -1866,6 +1955,7 @@ mod tests {
             ws_tee_channels: Some(1),
             received_from: Some("198.51.100.7".parse().unwrap()),
             rtcp_mux: vec!["require".into()],
+            text_events: true,
         };
 
         assert_eq!(profile_flags_from_ng(&ng), expected);
@@ -2017,6 +2107,7 @@ mod tests {
             mos_min: Some(3.9),
             mos_max: Some(4.3),
             mos_basis: Some("full".into()),
+            text: None,
         };
         let far = ProtoLegSummary {
             tag: "far-tag".into(),
@@ -2035,6 +2126,7 @@ mod tests {
             mos_min: None,
             mos_max: None,
             mos_basis: None,
+            text: None,
         };
         match convert_event(Event::CallSummary {
             call_id: "call-9".into(),

@@ -589,6 +589,41 @@ class TestWebSocketTee:
         assert harness.rtpengine.fire_ws_tee_ended("abc", "ftag1", "s-3") == 1
         assert hits == ["s-3"]
 
+    def test_text_handler_receives_the_increment_with_its_loss_markers(self, harness):
+        # U+FFFD is how a consumer sees where redundancy could not repair the
+        # stream (RFC 4103 §5.3) — scrubbing it would hide the gap.
+        seen = []
+
+        @harness.rtpengine.on_text
+        def transcript(call_id, from_tag, to_tag, text, direction):
+            seen.append((call_id, from_tag, to_tag, text, direction))
+
+        fired = harness.rtpengine.fire_text(
+            "c", "f", "hel\ufffdo", to_tag="t", direction="a_to_b",
+        )
+        assert fired == 1
+        assert seen == [("c", "f", "t", "hel\ufffdo", "a_to_b")]
+
+    def test_text_handler_filters_on_call_id_and_from_tag(self, harness):
+        hits = []
+
+        @harness.rtpengine.on_text(call_id="abc", from_tag="ftag1")
+        def transcript(call_id, from_tag, to_tag, text, direction):
+            hits.append(text)
+
+        assert harness.rtpengine.fire_text("other", "ftag1", "a") == 0
+        assert harness.rtpengine.fire_text("abc", "wrong", "b") == 0
+        assert harness.rtpengine.fire_text("abc", "ftag1", "c") == 1
+        assert hits == ["c"]
+
+    def test_clear_drops_registered_text_handlers(self, harness):
+        @harness.rtpengine.on_text
+        def transcript(*args):
+            pass
+
+        harness.rtpengine.clear()
+        assert harness.rtpengine.fire_text("c", "f", "x") == 0
+
     def test_clear_drops_registered_tee_handlers(self, harness):
         @harness.rtpengine.on_ws_tee_started
         def tee_up(*args):

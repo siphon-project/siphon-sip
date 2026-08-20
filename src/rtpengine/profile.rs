@@ -343,6 +343,15 @@ pub struct NgFlags {
     pub record_call: bool,
     /// Directory path for RTPEngine to write recording files.
     pub record_path: Option<String>,
+    /// Ask the engine to observe RFC 4103 real-time text on this call
+    /// (`siphon-rtp` only).  When the call negotiates a plaintext `m=text`
+    /// stream, the engine promotes *only* that low-rate stream to its userspace
+    /// text processor, which RED-depacketizes and reassembles it and reports each
+    /// recovered increment as an `@rtpengine.on_text` event plus per-leg counters
+    /// in the end-of-call media summary.  The audio relay/transcode path is
+    /// untouched — text observability never promotes audio — and the flag is
+    /// inert on an audio-only call.
+    pub text_events: bool,
     /// Single-channel noise suppression on this leg's decoded ingress audio,
     /// before it is relayed/transcoded toward the peer.  Engaged only on a
     /// userspace-transcoded leg whose ingress codec runs at 8 or 16 kHz, and
@@ -460,6 +469,7 @@ impl NgFlags {
             direction: config.direction.clone(),
             record_call: config.record_call,
             record_path: config.record_path.clone(),
+            text_events: config.text_events,
             noise_suppression: config.noise_suppression,
             echo_cancellation: config.echo_cancellation,
             ws_uri: config.ws_uri.clone(),

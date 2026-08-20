@@ -23,7 +23,34 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   Builds on the single-leg REFER machinery, so a terminate-mode accept on a
   voice-AI / IVR call with no B leg re-dials the target off the A dialog. The SDK
   client facades for the new verbs and event follow separately.
-
+- **RFC 4103 real-time text observability.** A call carrying a plaintext
+  `m=text` stream (RTT / T.140, the accessibility and emergency-calling text
+  channel, and what an NG112 deployment needs alongside audio) can now be
+  observed rather than only relayed. Set `text_events` on a media profile and
+  the engine promotes **only** that low-rate stream to its userspace text
+  processor, which RED-depacketizes (RFC 2198) and reassembles it and reports
+  each recovered increment to a new `@rtpengine.on_text` handler —
+  `fn(call_id, from_tag, to_tag, text, direction)`, with the same optional
+  `call_id` / `from_tag` filters as `@rtpengine.on_dtmf`. Only non-empty
+  increments are reported, so a handler firing always means new characters
+  arrived; a duplicate, a reordered packet or an idle keepalive produces
+  nothing. A `\ufffd` in the text marks a gap RED redundancy could not repair
+  (RFC 4103 §5.3) and is deliberately left in place — a consumer needs to see
+  where loss occurred rather than silently reading a shorter message. The audio
+  relay/transcode path is untouched (text observability never promotes audio),
+  and the flag is inert on a call that negotiated no text. Requires
+  `media.backend: siphon-rtp` (`siphon-rtp-proto` 0.2.0); rtpengine and rtpproxy
+  reject a `text_events` profile at config load rather than accepting a flag
+  they cannot honour and leaving a script waiting on events that can never
+  arrive.
+- **Per-leg text reception counters in the media CDR** — `text_packets`,
+  `text_characters`, `text_missing_markers` and
+  `text_recovered_from_redundancy`, prefixed per leg alongside the existing
+  loss/jitter/MOS fields. A content-level QoS surface distinct from the
+  datapath's packet counters: it reports what the receiver actually recovered,
+  including redundancy repair and unrecoverable-loss markers. Absent, not
+  zeroed, on a call with no observed text stream — `text_packets=0` would read
+  as a text stream that carried nothing, which is a different claim.
 - **Cold transfer off a call siphon answered itself.** A voice-AI or IVR call has
   no B leg, so the only way to hand the caller on is an in-dialog REFER on the A
   dialog via the imperative `b2bua.refer(call_id, target)` — `call.refer()` is a
@@ -262,6 +289,11 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   constructible in a test. Additive, defaulting to `None`.
 
 ### Changed
+- **`siphon-rtp-proto` pinned to 0.2.0** (from 0.1.5). A 0.x minor bump is a
+  semver-breaking range, so it is a deliberate move rather than something
+  `cargo update` performs: the pin is what makes the engine's newer control
+  surface reachable at all. Deployments on `media.backend: siphon-rtp` must run
+  a siphon-rtp built from that contract.
 - **`Contact.received` is a SIP URI, not a bare `host:port` — the doc-comment
   now says so.** The value has always been
   `sip:<ip>:<port>;transport=<proto>` (the OpenSIPS `received_avp` shape),
