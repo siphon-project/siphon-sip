@@ -9,12 +9,19 @@ built-in `proxy`, `registrar`, `cache`, and friends.
 
 ## How extensions work
 
-- **Off by default.** The standard `siphon` binary (`cargo install siphon-sip`
-  or the default container image) contains no extensions.
+- **Not in the standard binary.** `cargo install siphon-sip`, and the default
+  container image, contain no extensions at all.
 - **Enabled at build.** An extension-capable build is produced by the
   [`siphon-bin`](https://github.com/siphon-project/siphon-sip/tree/main/siphon-bin)
-  package with the module's cargo feature turned on (e.g. `--features smpp`). It
-  is a drop-in `siphon` binary — same CLI, same `siphon.yaml`, plus the module.
+  package. It is a drop-in `siphon` binary — same CLI, same `siphon.yaml`, plus
+  the modules.
+- **`http` is on by default there.** A bare `cargo build -p siphon-bin` gets you
+  the `http` namespace. It is the one module with no deployment prerequisite —
+  no libsctp, no upstream SMSC bind, nothing to provision — and the one most
+  scripts reach for. Every other module is opt-in (`--features smpp`,
+  `--features sigtran`, or `--features full` for all of them), and features are
+  additive, so `--features smpp` gives you http **and** smpp. Drop HTTP with
+  `--no-default-features`.
 - **Configured in `siphon.yaml`.** An `extensions:` map points each enabled
   module at its own config file:
 
@@ -38,11 +45,11 @@ siphon handles the wire protocol, sessions, timers, and windowing.
 ### 1. Build with the feature
 
 ```bash
-# Native binary
+# Native binary (http comes from the default feature set; smpp is additive)
 cargo build -p siphon-bin --release --features smpp
 
 # …or a container image (mount your config + script at runtime)
-docker build -f siphon-bin/Dockerfile -t siphon-smpp siphon-bin/
+docker build -f siphon-bin/Dockerfile --build-arg FEATURES=smpp -t siphon-smpp siphon-bin/
 ```
 
 ### 2. Point siphon at the SMPP config

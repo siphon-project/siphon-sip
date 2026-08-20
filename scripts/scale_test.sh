@@ -45,7 +45,7 @@ cleanup() {
 trap cleanup EXIT
 
 # --- Pick Python interpreter ---
-# CLAUDE.md baseline assumes free-threaded Python 3.14t. Without it we'd be
+# The published baseline assumes free-threaded Python 3.14t. Without it we'd be
 # benchmarking a GIL-serialized build, which silently ceiling-limits throughput
 # regardless of how many cores the box has. Resolution order:
 #   1. PYO3_PYTHON env var if explicitly set

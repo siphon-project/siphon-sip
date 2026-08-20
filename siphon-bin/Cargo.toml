@@ -20,10 +20,16 @@ name = "siphon"
 path = "src/main.rs"
 
 [features]
-default = []
-# Each extension module is opt-in and off by default. With a module's feature
-# disabled, an `extensions.<name>` block in siphon.yaml still parses and is
-# skipped with a loud warning (mirrors the siphon `sctp` feature contract).
+# HTTP is on by default. It is the one module with no deployment prerequisite —
+# no libsctp, no upstream SMSC bind, nothing to provision — and the one most
+# scripts reach for (webhooks in, `http.Client` out). A build of *this* package
+# with no extensions at all is just the plain `siphon` binary, which anyone can
+# get from `cargo install siphon-sip`, so an empty default made the package
+# pointless out of the box. Opt out with `--no-default-features`.
+default = ["http"]
+# Every other module is opt-in. With a module's feature disabled, an
+# `extensions.<name>` block in siphon.yaml still parses and is skipped with a
+# loud warning (mirrors the siphon `sctp` feature contract).
 smpp = ["dep:siphon-smpp"] # SMPP 3.4 — inbound/outbound binds, scriptable `smpp` namespace
 http = ["dep:siphon-http"] # HTTP/HTTPS — inbound routes + Rust-backed `http.Client`, scriptable `http` namespace
 # SIGTRAN/SS7 — M3UA/M2PA/SUA transport over SCTP, MTP3 routing, SCCP GTT,
