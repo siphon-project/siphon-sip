@@ -33,7 +33,7 @@ jobs:
             echo "::error::Cargo.toml version ($cargo_version) does not match tag ($tag_version) — bump Cargo.toml in the release commit (use scripts/cut-release.sh)."
             exit 1
           fi
-          # A release must document its version in CHANGELOG.md (CLAUDE.md rule).
+          # A release must document its version in CHANGELOG.md (project convention).
           ver_re="$(printf '%s' "$tag_version" | sed 's/\./\\./g')"
           if ! grep -qE "^## \[?${ver_re}\]?" CHANGELOG.md; then
             echo "::error::CHANGELOG.md has no '## [$tag_version]' section — add the release notes (scripts/cut-release.sh gates on this)."

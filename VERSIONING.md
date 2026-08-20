@@ -81,7 +81,7 @@ exact version.
 - **Security:** ship as a PATCH, expedited; backport to the supported line.
 - **Performance is not a version decision — it is a release gate.** Every
   release must re-run the 16-row README perf baseline with **0 Failed / 0
-  Retransmits** on every row (see `CLAUDE.md`). A perf *improvement* that raises
+  Retransmits** on every row (see the project's contributing conventions). A perf *improvement* that raises
   the floor → PATCH + update the README table.
 - **Lockstep cost:** a docs-only or SDK-only change still bumps everything
   (PATCH). Accepted — one number across the whole project is worth it.

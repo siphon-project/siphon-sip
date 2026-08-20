@@ -6,6 +6,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Changed
+- **`siphon-bin` enables the `http` extension by default.** The package exists
+  to compose extension modules, and its default feature set was empty — so a
+  bare `cargo build -p siphon-bin` produced a binary with no extensions at all,
+  which is just the plain `siphon` anyone can get from `cargo install
+  siphon-sip`. HTTP is the module with no deployment prerequisite (no libsctp,
+  no upstream SMSC bind, nothing to provision) and the one most scripts reach
+  for, so it is now what you get out of the box. Features are additive, so
+  `--features smpp` gives you http **and** smpp; `--no-default-features`
+  restores the empty build. This affects only the `siphon-bin` package —
+  `siphon-sip` itself is unchanged and still ships no extensions.
+
 ### Added
 - **`auth.generate_nonce()` and `auth.validate_nonce(nonce)` are reachable from
   scripts.** Both existed, but in a plain `impl` rather than a `#[pymethods]`

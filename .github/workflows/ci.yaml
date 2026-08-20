@@ -189,12 +189,22 @@ jobs:
       - name: Install libsctp
         run: sudo apt-get update && sudo apt-get install -y libsctp-dev
 
-      # Feature off: plain composition (an `extensions.smpp` block parses and is
-      # skipped with a loud warning — no siphon-smpp/smpp34 in the graph).
+      # Nothing at all: the plain composition, with every `extensions.<name>`
+      # block parsing and being skipped with a loud warning. `http` is a default
+      # feature now, so this leg needs --no-default-features to still cover the
+      # truly-empty build.
       - name: Build (no extensions)
-        run: PYO3_PYTHON=python3.14 cargo build
+        run: PYO3_PYTHON=python3.14 cargo build --no-default-features
 
       - name: Clippy (no extensions)
+        run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --no-default-features -- -D warnings
+
+      # The default build — `http` and nothing else. This is what a bare
+      # `cargo build -p siphon-bin` gets you, so it is worth its own leg.
+      - name: Build (defaults)
+        run: PYO3_PYTHON=python3.14 cargo build
+
+      - name: Clippy (defaults)
         run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin -- -D warnings
 
       # Feature on: pulls siphon-smpp + smpp34 and wires the `smpp` namespace.
@@ -204,12 +214,13 @@ jobs:
       - name: Clippy (--features smpp)
         run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --features smpp -- -D warnings
 
-      # Same for siphon-http: inbound routes + the Rust-backed `http.Client`.
-      - name: Build (--features http)
-        run: PYO3_PYTHON=python3.14 cargo build --features http
+      # siphon-http on its own, without the default pulling it in — proves the
+      # feature still stands alone if the default ever changes back.
+      - name: Build (--features http, no defaults)
+        run: PYO3_PYTHON=python3.14 cargo build --no-default-features --features http
 
-      - name: Clippy (--features http)
-        run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --features http -- -D warnings
+      - name: Clippy (--features http, no defaults)
+        run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --no-default-features --features http -- -D warnings
 
       # Same for siphon-sigtran: SIGTRAN/SS7 transport, routing and MAP/CAP/INAP
       # termination. This is the one module that mounts its surface through

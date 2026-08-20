@@ -1,19 +1,19 @@
 # SIPhon container image WITH opt-in extension modules (SMPP, HTTP, SIGTRAN).
 #
 # This builds the `siphon-bin` package — a drop-in `siphon` binary that composes
-# optional extension crates behind cargo features — with `--features smpp` by
-# default. It is SEPARATE from the root Dockerfile (which builds the plain
-# siphon-sip binary): siphon-bin git-deps the published siphon-sip lib + the
-# extension crates, so the build context is just this package directory (no root
-# tree needed).
+# optional extension crates behind cargo features. It is SEPARATE from the root
+# Dockerfile (which builds the plain siphon-sip binary): siphon-bin git-deps the
+# published siphon-sip lib + the extension crates, so the build context is just
+# this package directory (no root tree needed).
 #
-# Build (context = this directory):
-#   docker build -f siphon-bin/Dockerfile -t siphon-smpp siphon-bin/
+# Build (context = this directory). FEATURES defaults to the package's own
+# default feature set, so this gets you the `http` namespace:
+#   docker build -f siphon-bin/Dockerfile -t siphon-ext siphon-bin/
 #
-# Override the enabled modules with the FEATURES build-arg, e.g. HTTP only, or
-# every module at once via the `full` aggregate:
-#   docker build -f siphon-bin/Dockerfile --build-arg FEATURES=http -t siphon-http siphon-bin/
-#   docker build -f siphon-bin/Dockerfile --build-arg FEATURES=full -t siphon-ext  siphon-bin/
+# Add modules with the FEATURES build-arg — they are additive on top of the
+# default, so `FEATURES=smpp` gives you http + smpp:
+#   docker build -f siphon-bin/Dockerfile --build-arg FEATURES=smpp -t siphon-smpp siphon-bin/
+#   docker build -f siphon-bin/Dockerfile --build-arg FEATURES=full -t siphon-all  siphon-bin/
 #
 # The SIGTRAN module needs kernel SCTP: async-sctp links libsctp (hence
 # libsctp-dev in the builder and libsctp1 in the runtime below), and the
@@ -28,7 +28,8 @@
 # ── Builder ──────────────────────────────────────────────────────────────────
 FROM debian:trixie-slim AS builder
 
-ARG FEATURES=smpp
+# Empty = the package default (`http`). Anything here is additive on top of it.
+ARG FEATURES=
 
 # libsctp-dev is unconditional: the `sigtran` feature's async-sctp dep links
 # libsctp, and a build-arg-conditional apt step would fail only at link time,
@@ -64,7 +65,7 @@ WORKDIR /build
 # Copy the package (Cargo.lock pins the resolved git SHAs for reproducibility).
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
-RUN cargo build --release --features "${FEATURES}"
+RUN cargo build --release ${FEATURES:+--features "${FEATURES}"}
 
 # ── Runtime ──────────────────────────────────────────────────────────────────
 FROM debian:trixie-slim
