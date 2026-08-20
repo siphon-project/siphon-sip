@@ -15,6 +15,23 @@ built-in `proxy`, `registrar`, `cache`, and friends.
   [`siphon-bin`](https://github.com/siphon-project/siphon-sip/tree/main/siphon-bin)
   package with the module's cargo feature turned on (e.g. `--features smpp`). It
   is a drop-in `siphon` binary — same CLI, same `siphon.yaml`, plus the module.
+- **Or pull the published image.** `ghcr.io/siphon-project/siphon-sip-bin` is
+  released on the same tag cadence as the core image, built with **every**
+  module compiled in:
+
+  ```bash
+  docker pull ghcr.io/siphon-project/siphon-sip-bin:1.6.0
+  ```
+
+  One image rather than a tag per feature: the namespaces are inert until a
+  `siphon.yaml` configures them, so you enable what you need in config, not by
+  picking a different image. Its `siphon-sip` is pinned to the tag it is
+  published under, so `siphon-sip-bin:X.Y.Z` contains siphon-sip X.Y.Z.
+
+  | Image | Contains |
+  |---|---|
+  | `ghcr.io/siphon-project/siphon-sip` | siphon only |
+  | `ghcr.io/siphon-project/siphon-sip-bin` | siphon + `smpp`, `http`, `sigtran` |
 - **Configured in `siphon.yaml`.** An `extensions:` map points each enabled
   module at its own config file:
 
@@ -43,6 +60,9 @@ cargo build -p siphon-bin --release --features smpp
 
 # …or a container image (mount your config + script at runtime)
 docker build -f siphon-bin/Dockerfile -t siphon-smpp siphon-bin/
+
+# …or skip the build: the published image already has every module
+docker pull ghcr.io/siphon-project/siphon-sip-bin:latest
 ```
 
 ### 2. Point siphon at the SMPP config

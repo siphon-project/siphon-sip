@@ -103,6 +103,79 @@ fn every_support_file_ships_in_the_release_tarball() {
     }
 }
 
+/// The extensions image (`siphon-bin`) is published on the same tag cadence as
+/// the core image. Both halves have to be there — a build job with no merge job
+/// pushes untagged digests nobody can pull, which looks like success.
+#[test]
+fn the_release_publishes_the_extensions_image() {
+    let workflow = read(".github/workflows/release.yaml");
+
+    for job in ["docker-extensions:", "docker-extensions-merge:"] {
+        assert!(
+            workflow.contains(job),
+            "release.yaml no longer defines the {job} job — the extensions image \
+             would stop being published on release"
+        );
+    }
+    assert!(
+        workflow.contains("EXTENSIONS_IMAGE_NAME"),
+        "the extensions image name is no longer declared"
+    );
+    assert!(
+        workflow.contains("siphon-bin/Dockerfile"),
+        "the extensions image no longer builds from siphon-bin/Dockerfile"
+    );
+}
+
+/// The image is built with every module compiled in, so one artifact covers
+/// every extension. A narrower feature set would silently ship an image whose
+/// `http` / `smpp` / `sigtran` namespace does not exist.
+#[test]
+fn the_extensions_image_is_built_with_every_module() {
+    let workflow = read(".github/workflows/release.yaml");
+    assert!(
+        workflow.contains("FEATURES=full"),
+        "the extensions image is no longer built with --features full"
+    );
+
+    // `full` has to actually aggregate the modules, or the build-arg is a lie.
+    let manifest = read("siphon-bin/Cargo.toml");
+    let full = manifest
+        .lines()
+        .find(|line| line.trim_start().starts_with("full = "))
+        .expect("siphon-bin declares a `full` feature");
+    for module in ["smpp", "http", "sigtran"] {
+        assert!(
+            full.contains(module),
+            "the `full` feature no longer includes {module}: {full}"
+        );
+    }
+}
+
+/// `siphon-bin` git-deps siphon-sip from `main`, which is right for CI and
+/// wrong for a release: `siphon-bin:X.Y.Z` has to contain siphon-sip X.Y.Z.
+/// The release job repoints it at the tag, and this guards that step surviving.
+#[test]
+fn the_extensions_image_pins_siphon_sip_to_the_release_tag() {
+    let workflow = read(".github/workflows/release.yaml");
+    assert!(
+        workflow.contains("Pin siphon-sip to the release tag"),
+        "the extensions image no longer pins siphon-sip to the tag — it would \
+         publish an image built against whatever main happened to be"
+    );
+
+    // The step rewrites this exact declaration; if the manifest stops spelling
+    // it this way the rewrite silently matches nothing.
+    let manifest = read("siphon-bin/Cargo.toml");
+    assert!(
+        manifest
+            .lines()
+            .any(|line| line.starts_with("siphon-sip = { git = ") && line.contains("branch = \"main\"")),
+        "siphon-bin no longer declares siphon-sip as a `branch = \"main\"` git dep \
+         at line start — the release-time pin in release.yaml matches on that shape"
+    );
+}
+
 /// The sandboxed unit makes exactly one log directory writable. Rotation has
 /// to name that directory, or it rotates nothing siphon ever writes.
 #[test]

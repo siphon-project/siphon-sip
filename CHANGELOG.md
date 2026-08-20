@@ -7,6 +7,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **The extensions binary is published as a container image**,
+  `ghcr.io/siphon-project/siphon-sip-bin`, on the same tag cadence and with the
+  same multi-arch (amd64 + arm64) shape as the core image. `siphon-bin` is a
+  separate excluded workspace and was never published, so the only way to run a
+  build with the `smpp` / `http` / `sigtran` namespaces was to build it
+  yourself — `from siphon import http` could not work in any released artifact.
+  Built with `--features full`: the namespaces are inert until `siphon.yaml`
+  configures them, so one image beats a tag per feature. Its `siphon-sip` git
+  dep is repointed at the tag being released before the build, so
+  `siphon-sip-bin:X.Y.Z` genuinely contains siphon-sip X.Y.Z rather than
+  whatever `main` happened to be.
 - **CI covers re-INVITE renegotiation on the `siphon-rtp` backend** (`--reoffer`).
   The existing `--reinvite` mode runs the same hold/resume flow against
   rtpengine, where a repeat `offer` on a live call-id *is* the re-offer — so it
