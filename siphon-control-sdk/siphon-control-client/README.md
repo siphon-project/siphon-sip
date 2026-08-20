@@ -43,8 +43,9 @@ client
 ```
 
 A rejected command maps to `ControlError::Command` carrying the stable
-`ControlErrorCode`. Media verbs (`play_file`/`dtmf`) resolve to
-`unsupported_verb` until the server implements them.
+`ControlErrorCode`. The WebSocket-tee verbs (`stream_start`/`stream_stop`) are
+siphon-rtp-only, so a non-siphon-rtp backend answers `unsupported_verb`
+(`ControlError::is_unsupported_verb`).
 
 ## License
 

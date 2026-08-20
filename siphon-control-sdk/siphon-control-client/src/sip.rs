@@ -16,7 +16,9 @@ use serde_json::json;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tracing::{debug, warn};
 
-use siphon_control_proto::sip::{SipEvent, SipVerb};
+use siphon_control_proto::sip::{
+    ChannelDtmfPayload, SipEvent, SipVerb, TransferRequestedPayload,
+};
 use siphon_control_proto::verbs::MODULE_SIP;
 use siphon_control_proto::{ChannelSnapshot, EventFrame};
 
@@ -108,6 +110,120 @@ fn headers_to_json(headers: &[(String, String)]) -> serde_json::Value {
 }
 
 // ---------------------------------------------------------------------------
+// play() source + options
+// ---------------------------------------------------------------------------
+
+/// The audio source for [`Call::play`]: exactly one of a server-side file path,
+/// an rtpengine media-DB id, or an inline blob.
+///
+/// A `Blob` is base64-encoded on the wire (the control rail is JSON text), so the
+/// caller passes raw bytes and this handle does the encoding — mirroring the
+/// in-process `rtpengine.play_media(file=…|db_id=…|blob=…)` mutual exclusion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaySource {
+    /// A file path readable by the media engine.
+    File(String),
+    /// An id of a prompt in rtpengine's media DB.
+    DbId(u64),
+    /// Raw audio bytes played inline (base64-encoded on the wire).
+    Blob(Vec<u8>),
+}
+
+impl PlaySource {
+    /// Play a server-side file by path.
+    pub fn file(path: impl Into<String>) -> Self {
+        Self::File(path.into())
+    }
+
+    /// Play a prompt by its rtpengine media-DB id.
+    pub fn db_id(id: u64) -> Self {
+        Self::DbId(id)
+    }
+
+    /// Play raw audio bytes inline (base64-encoded on the wire).
+    pub fn blob(bytes: impl Into<Vec<u8>>) -> Self {
+        Self::Blob(bytes.into())
+    }
+
+    /// Insert the one source arg (`file` / `db_id` / `blob`) into a play args map.
+    fn insert_into(&self, args: &mut serde_json::Map<String, serde_json::Value>) {
+        match self {
+            PlaySource::File(path) => {
+                args.insert("file".to_string(), json!(path));
+            }
+            PlaySource::DbId(id) => {
+                args.insert("db_id".to_string(), json!(id));
+            }
+            PlaySource::Blob(bytes) => {
+                use base64::Engine as _;
+                let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+                args.insert("blob".to_string(), json!(encoded));
+            }
+        }
+    }
+}
+
+/// Optional shaping for [`Call::play`] (all default to the engine's behaviour).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlayOptions {
+    /// Repeat the prompt this many times (0/None → play once).
+    pub repeat: Option<u64>,
+    /// Start playback at this offset into the source, in milliseconds.
+    pub start_ms: Option<u64>,
+    /// Cap playback to this duration, in milliseconds.
+    pub duration_ms: Option<u64>,
+    /// Scope the prompt to one peer of an MPTY bridge (its To-tag).
+    pub to_tag: Option<String>,
+}
+
+impl PlayOptions {
+    fn insert_into(&self, args: &mut serde_json::Map<String, serde_json::Value>) {
+        if let Some(repeat) = self.repeat {
+            args.insert("repeat".to_string(), json!(repeat));
+        }
+        if let Some(start_ms) = self.start_ms {
+            args.insert("start_ms".to_string(), json!(start_ms));
+        }
+        if let Some(duration_ms) = self.duration_ms {
+            args.insert("duration_ms".to_string(), json!(duration_ms));
+        }
+        if let Some(to_tag) = &self.to_tag {
+            args.insert("to_tag".to_string(), json!(to_tag));
+        }
+    }
+}
+
+/// Optional shaping for [`Call::dtmf`] (all default to the engine's behaviour).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DtmfOptions {
+    /// Per-digit tone duration, in milliseconds.
+    pub duration_ms: Option<u64>,
+    /// Tone volume in dBm0 (negative).
+    pub volume_dbm0: Option<i64>,
+    /// Inter-digit pause, in milliseconds.
+    pub pause_ms: Option<u64>,
+    /// Scope the tones to one peer of an MPTY bridge (its To-tag).
+    pub to_tag: Option<String>,
+}
+
+impl DtmfOptions {
+    fn insert_into(&self, args: &mut serde_json::Map<String, serde_json::Value>) {
+        if let Some(duration_ms) = self.duration_ms {
+            args.insert("duration_ms".to_string(), json!(duration_ms));
+        }
+        if let Some(volume_dbm0) = self.volume_dbm0 {
+            args.insert("volume_dbm0".to_string(), json!(volume_dbm0));
+        }
+        if let Some(pause_ms) = self.pause_ms {
+            args.insert("pause_ms".to_string(), json!(pause_ms));
+        }
+        if let Some(to_tag) = &self.to_tag {
+            args.insert("to_tag".to_string(), json!(to_tag));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Call handle
 // ---------------------------------------------------------------------------
 
@@ -130,6 +246,24 @@ impl CallEvent {
             payload: frame.payload.clone(),
             frame,
         }
+    }
+
+    /// The typed [`ChannelDtmfPayload`] when this is a
+    /// [`SipEvent::ChannelDtmfReceived`] event, else `None`.
+    pub fn dtmf(&self) -> Option<ChannelDtmfPayload> {
+        if self.kind != SipEvent::ChannelDtmfReceived {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+
+    /// The typed [`TransferRequestedPayload`] when this is a
+    /// [`SipEvent::TransferRequested`] event, else `None`.
+    pub fn transfer_requested(&self) -> Option<TransferRequestedPayload> {
+        if self.kind != SipEvent::TransferRequested {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
     }
 }
 
@@ -318,6 +452,45 @@ impl Call {
         self.sip(SipVerb::Refer, args).await.map(drop)
     }
 
+    /// Accept a *pending inbound* REFER (surfaced as a
+    /// [`SipEvent::TransferRequested`] event) and run the transfer.
+    ///
+    /// `target` overrides the Refer-To URI (default: the event's target),
+    /// `next_hop` steers egress without changing the URI shape, and `mode`
+    /// (`"terminate"` / `"transparent"`) overrides `b2bua.default_refer_mode`.
+    /// No pending REFER (already decided, timed out, or the call is gone) →
+    /// [`ControlError`] with `code == "not_found"`.
+    pub async fn accept_refer(
+        &self,
+        target: Option<&str>,
+        next_hop: Option<&str>,
+        mode: Option<&str>,
+    ) -> Result<(), ControlError> {
+        let mut args = serde_json::Map::new();
+        if let Some(target) = target {
+            args.insert("target".to_string(), json!(target));
+        }
+        if let Some(next_hop) = next_hop {
+            args.insert("next_hop".to_string(), json!(next_hop));
+        }
+        if let Some(mode) = mode {
+            args.insert("mode".to_string(), json!(mode));
+        }
+        self.sip(SipVerb::AcceptRefer, serde_json::Value::Object(args))
+            .await
+            .map(drop)
+    }
+
+    /// Reject a *pending inbound* REFER with a final non-2xx (default
+    /// `603 Decline`). No pending REFER → `code == "not_found"`.
+    pub async fn reject_refer(&self, code: u16, reason: Option<&str>) -> Result<(), ControlError> {
+        let mut args = json!({ "code": code });
+        if let Some(reason) = reason {
+            args["reason"] = json!(reason);
+        }
+        self.sip(SipVerb::RejectRefer, args).await.map(drop)
+    }
+
     /// Un-park this controlled call and dial the B-leg via siphon's LCR
     /// sequential-failover engine, returning control to siphon.
     ///
@@ -365,6 +538,13 @@ impl Call {
         Ok(string_value(&result))
     }
 
+    /// Remove a header from the stored A-leg INVITE.
+    pub async fn remove_header(&self, name: &str) -> Result<(), ControlError> {
+        self.sip(SipVerb::RemoveHeader, json!({ "name": name }))
+            .await
+            .map(drop)
+    }
+
     // --- per-call variables (substrate verbs, no module) -------------------
 
     /// Set a per-call variable (survives a reconnect via `resync`).
@@ -386,17 +566,86 @@ impl Call {
         Ok(string_value(&result))
     }
 
-    // --- media (server answers `unsupported_verb` today) -------------------
+    // --- media -------------------------------------------------------------
 
-    /// Play an announcement. **Not yet implemented server-side** — resolves to
-    /// [`ControlError::is_unsupported_verb`] until the media backend lands.
-    pub async fn play_file(&self, file: &str) -> Result<(), ControlError> {
-        self.command("play", json!({ "file": file })).await.map(drop)
+    /// Play an announcement on the A-leg media (fire-and-forget).
+    ///
+    /// `source` is one of [`PlaySource::file`] / [`PlaySource::db_id`] /
+    /// [`PlaySource::blob`] (a blob is base64-encoded on the wire); `options`
+    /// carries the optional `repeat` / `start_ms` / `duration_ms` / `to_tag`
+    /// shaping. Resolves once the media backend *accepts* the command; the far-end
+    /// playback outcome is not the reply. A call with no anchored media session →
+    /// [`ControlError`] with `code == "not_found"`.
+    pub async fn play(
+        &self,
+        source: PlaySource,
+        options: PlayOptions,
+    ) -> Result<(), ControlError> {
+        let mut args = serde_json::Map::new();
+        source.insert_into(&mut args);
+        options.insert_into(&mut args);
+        self.sip(SipVerb::Play, serde_json::Value::Object(args))
+            .await
+            .map(drop)
     }
 
-    /// Send DTMF. **Not yet implemented server-side** — see [`Call::play_file`].
-    pub async fn dtmf(&self, digits: &str) -> Result<(), ControlError> {
-        self.command("dtmf", json!({ "digits": digits })).await.map(drop)
+    /// Convenience for [`Call::play`] of a server-side file with default options.
+    pub async fn play_file(&self, file: &str) -> Result<(), ControlError> {
+        self.play(PlaySource::file(file), PlayOptions::default()).await
+    }
+
+    /// Stop the announcement currently playing on the A-leg media.
+    pub async fn stop(&self) -> Result<(), ControlError> {
+        self.sip(SipVerb::Stop, json!({})).await.map(drop)
+    }
+
+    /// Inject DTMF digits toward the A-leg (fire-and-forget). `options` carries
+    /// the optional `duration_ms` / `volume_dbm0` / `pause_ms` / `to_tag` shaping.
+    pub async fn dtmf(&self, digits: &str, options: DtmfOptions) -> Result<(), ControlError> {
+        let mut args = serde_json::Map::new();
+        args.insert("digits".to_string(), json!(digits));
+        options.insert_into(&mut args);
+        self.sip(SipVerb::Dtmf, serde_json::Value::Object(args))
+            .await
+            .map(drop)
+    }
+
+    /// Hold the A-leg media via silence.
+    pub async fn hold(&self) -> Result<(), ControlError> {
+        self.sip(SipVerb::Hold, json!({})).await.map(drop)
+    }
+
+    /// Resume the A-leg media after a [`Call::hold`].
+    pub async fn unhold(&self) -> Result<(), ControlError> {
+        self.sip(SipVerb::Unhold, json!({})).await.map(drop)
+    }
+
+    /// Attach a WebSocket audio tee — stream a copy of the call's decoded audio
+    /// to `ws_uri` while the call keeps relaying.
+    ///
+    /// `direction` is one of `"both"` (default) / `"caller"` / `"callee"`;
+    /// `channels` is `1` (mixed mono) or `2` (caller/callee stereo, only
+    /// meaningful with `"both"`). siphon-rtp backend only: rtpengine / rtpproxy
+    /// answer [`ControlError::is_unsupported_verb`].
+    pub async fn stream_start(
+        &self,
+        ws_uri: &str,
+        direction: Option<&str>,
+        channels: Option<u8>,
+    ) -> Result<(), ControlError> {
+        let mut args = json!({ "ws_uri": ws_uri });
+        if let Some(direction) = direction {
+            args["direction"] = json!(direction);
+        }
+        if let Some(channels) = channels {
+            args["channels"] = json!(channels);
+        }
+        self.sip(SipVerb::StreamStart, args).await.map(drop)
+    }
+
+    /// Detach the WebSocket audio tee (idempotent on siphon-rtp).
+    pub async fn stream_stop(&self) -> Result<(), ControlError> {
+        self.sip(SipVerb::StreamStop, json!({})).await.map(drop)
     }
 
     // --- escape hatch + events --------------------------------------------
@@ -414,7 +663,9 @@ impl Call {
     }
 
     /// Await the next event for this call (`ChannelStateChange`,
-    /// `ChannelHangupRequest`, `StasisEnd`). `None` once the stream closes.
+    /// `ChannelHangupRequest`, `ChannelDtmfReceived`, `TransferRequested`,
+    /// `StasisEnd`). `None` once the stream closes. Use [`CallEvent::dtmf`] /
+    /// [`CallEvent::transfer_requested`] to decode the payload.
     pub async fn next_event(&self) -> Option<CallEvent> {
         self.inner.events.lock().await.recv().await
     }
@@ -867,5 +1118,128 @@ mod tests {
 
         let recorded = lock(&recorder.calls).clone();
         assert_eq!(recorded[0].args, json!({ "targets": ["sip:only@gw"] }));
+    }
+
+    #[tokio::test]
+    async fn media_verbs_emit_expected_frames() {
+        let recorder = Arc::new(RecordingTransport {
+            calls: Mutex::new(Vec::new()),
+            result: json!({ "channel": "ch1", "state": "playing" }),
+        });
+        let call = make_call(recorder.clone());
+
+        call.play(PlaySource::file("/prompts/welcome.wav"), PlayOptions::default())
+            .await
+            .expect("play file ok");
+        call.play(
+            PlaySource::blob(b"hi".to_vec()),
+            PlayOptions { repeat: Some(2), duration_ms: Some(10_000), ..Default::default() },
+        )
+        .await
+        .expect("play blob ok");
+        call.stop().await.expect("stop ok");
+        call.dtmf(
+            "123#",
+            DtmfOptions { duration_ms: Some(100), volume_dbm0: Some(-8), ..Default::default() },
+        )
+        .await
+        .expect("dtmf ok");
+        call.hold().await.expect("hold ok");
+        call.unhold().await.expect("unhold ok");
+        call.stream_start("ws://ai:9000/stream", Some("both"), Some(2))
+            .await
+            .expect("stream_start ok");
+        call.stream_stop().await.expect("stream_stop ok");
+
+        let recorded = lock(&recorder.calls).clone();
+        let by_verb = |verb: &str| -> serde_json::Value {
+            recorded.iter().find(|call| call.verb == verb).expect("verb recorded").args.clone()
+        };
+        // Every media verb rides the sip module against this channel.
+        for call in &recorded {
+            assert_eq!(call.module.as_deref(), Some("sip"));
+            assert_eq!(call.target, json!({ "channel": "ch1" }));
+        }
+        assert_eq!(by_verb("play").get("file").and_then(|v| v.as_str()), Some("/prompts/welcome.wav"));
+        // A blob is base64-encoded on the wire ("hi" → "aGk=").
+        let blob_args: Vec<&serde_json::Value> = recorded
+            .iter()
+            .filter(|call| call.verb == "play")
+            .map(|call| &call.args)
+            .collect();
+        assert_eq!(blob_args[1], &json!({ "blob": "aGk=", "repeat": 2, "duration_ms": 10_000 }));
+        assert_eq!(by_verb("stop"), json!({}));
+        assert_eq!(by_verb("dtmf"), json!({ "digits": "123#", "duration_ms": 100, "volume_dbm0": -8 }));
+        assert_eq!(by_verb("hold"), json!({}));
+        assert_eq!(by_verb("unhold"), json!({}));
+        assert_eq!(
+            by_verb("stream_start"),
+            json!({ "ws_uri": "ws://ai:9000/stream", "direction": "both", "channels": 2 })
+        );
+        assert_eq!(by_verb("stream_stop"), json!({}));
+    }
+
+    #[tokio::test]
+    async fn header_and_refer_verbs_emit_expected_frames() {
+        let recorder = Arc::new(RecordingTransport {
+            calls: Mutex::new(Vec::new()),
+            result: json!({ "channel": "ch1" }),
+        });
+        let call = make_call(recorder.clone());
+
+        call.remove_header("X-Foo").await.expect("remove_header ok");
+        call.accept_refer(Some("sip:c@pbx"), Some("sip:sbc"), Some("terminate"))
+            .await
+            .expect("accept_refer ok");
+        call.reject_refer(603, Some("Decline")).await.expect("reject_refer ok");
+
+        let recorded = lock(&recorder.calls).clone();
+        assert_eq!(recorded[0].verb, "remove_header");
+        assert_eq!(recorded[0].args, json!({ "name": "X-Foo" }));
+        assert_eq!(recorded[1].verb, "accept_refer");
+        assert_eq!(
+            recorded[1].args,
+            json!({ "target": "sip:c@pbx", "next_hop": "sip:sbc", "mode": "terminate" })
+        );
+        assert_eq!(recorded[2].verb, "reject_refer");
+        assert_eq!(recorded[2].args, json!({ "code": 603, "reason": "Decline" }));
+    }
+
+    #[test]
+    fn dtmf_and_transfer_events_parse_from_frames() {
+        let dtmf = CallEvent::from_frame(EventFrame::new(
+            "ChannelDtmfReceived",
+            "ch1",
+            "ivr-app",
+            "call-uuid",
+            "sip@host",
+            json!({ "digit": "5", "duration_ms": 100, "volume": -8, "from_tag": "alice-tag" }),
+        ));
+        assert_eq!(dtmf.kind, SipEvent::ChannelDtmfReceived);
+        let payload = dtmf.dtmf().expect("dtmf payload");
+        assert_eq!(payload.digit, "5");
+        assert_eq!(payload.volume, -8);
+        assert_eq!(payload.from_tag, "alice-tag");
+        // Wrong-kind accessor returns None.
+        assert!(dtmf.transfer_requested().is_none());
+
+        let transfer = CallEvent::from_frame(EventFrame::new(
+            "TransferRequested",
+            "ch1",
+            "ivr-app",
+            "call-uuid",
+            "sip@host",
+            json!({
+                "refer_to": "sip:carol@example.com",
+                "replaces": { "call_id": "abc", "from_tag": "ft", "to_tag": "tt", "early_only": false },
+                "from_tag": "referrer-tag"
+            }),
+        ));
+        assert_eq!(transfer.kind, SipEvent::TransferRequested);
+        let payload = transfer.transfer_requested().expect("transfer payload");
+        assert_eq!(payload.refer_to, "sip:carol@example.com");
+        assert_eq!(payload.replaces.expect("replaces").call_id, "abc");
+        assert_eq!(payload.from_tag.as_deref(), Some("referrer-tag"));
+        assert!(transfer.dtmf().is_none());
     }
 }

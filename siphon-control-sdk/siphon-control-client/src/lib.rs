@@ -62,7 +62,10 @@ pub use error::ControlError;
 pub use server::{ControlServer, ServerConfig};
 
 // Ergonomic top-level re-exports of the common SIP facade.
-pub use sip::{Call, CallEvent, CallStream, RouteTarget, SipClient, SipServer};
+pub use sip::{
+    Call, CallEvent, CallStream, DtmfOptions, PlayOptions, PlaySource, RouteTarget, SipClient,
+    SipServer,
+};
 
 // Re-export the wire contract so downstreams need only depend on this crate.
 pub use siphon_control_proto::{self as proto, ControlErrorCode};

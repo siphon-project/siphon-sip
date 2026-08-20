@@ -53,11 +53,18 @@ describe("SipVerb wire tokens + event names", () => {
     expect(SipVerb.AcceptRefer).toBe("accept_refer");
     expect(SipVerb.RejectRefer).toBe("reject_refer");
     expect(SipVerb.Play).toBe("play");
+    expect(SipVerb.Stop).toBe("stop");
     expect(SipVerb.Dtmf).toBe("dtmf");
+    expect(SipVerb.Hold).toBe("hold");
+    expect(SipVerb.Unhold).toBe("unhold");
+    expect(SipVerb.StreamStart).toBe("stream_start");
+    expect(SipVerb.StreamStop).toBe("stream_stop");
   });
 
-  it("passes unknown event names through (forward-compatible)", () => {
+  it("passes unknown + new event names through (forward-compatible)", () => {
     expect(sipEventKind("StasisStart")).toBe("StasisStart");
+    expect(sipEventKind("ChannelDtmfReceived")).toBe("ChannelDtmfReceived");
+    expect(sipEventKind("TransferRequested")).toBe("TransferRequested");
     expect(sipEventKind("SomethingNew")).toBe("SomethingNew");
   });
 });
@@ -206,13 +213,11 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
     ]);
   });
 
-  it("acceptRefer / rejectRefer / media verbs", async () => {
+  it("acceptRefer / rejectRefer", async () => {
     const transport = new RecordingTransport();
     const call = makeCall(transport);
     await call.acceptRefer({ target: "sip:c@pbx", nextHop: "sip:sbc", mode: "terminate" });
     await call.rejectRefer(603, "Decline");
-    await call.playFile("/prompts/welcome.wav");
-    await call.dtmf("123#");
     expect(transport.calls).toEqual([
       {
         module: MODULE_SIP,
@@ -221,8 +226,43 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
         args: { target: "sip:c@pbx", next_hop: "sip:sbc", mode: "terminate" },
       },
       { module: MODULE_SIP, verb: "reject_refer", target: { channel: "ch1" }, args: { code: 603, reason: "Decline" } },
-      { module: MODULE_SIP, verb: "play", target: { channel: "ch1" }, args: { file: "/prompts/welcome.wav" } },
-      { module: MODULE_SIP, verb: "dtmf", target: { channel: "ch1" }, args: { digits: "123#" } },
+    ]);
+  });
+
+  it("media verbs — play (file/dbId/blob), stop, dtmf, hold, unhold, stream", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.play({ file: "/prompts/welcome.wav" }, { repeat: 2 });
+    await call.play({ dbId: 42 });
+    // "hi" → base64 "aGk=".
+    await call.play({ blob: new Uint8Array([104, 105]) }, { durationMs: 5000 });
+    await call.playFile("/prompts/bye.wav");
+    await call.stop();
+    await call.dtmf("123#", { durationMs: 100, volumeDbm0: -8 });
+    await call.hold();
+    await call.unhold();
+    await call.streamStart("ws://ai:9000/stream", { direction: "both", channels: 2 });
+    await call.streamStop();
+    expect(transport.calls).toEqual([
+      { module: MODULE_SIP, verb: "play", target: { channel: "ch1" }, args: { file: "/prompts/welcome.wav", repeat: 2 } },
+      { module: MODULE_SIP, verb: "play", target: { channel: "ch1" }, args: { db_id: 42 } },
+      { module: MODULE_SIP, verb: "play", target: { channel: "ch1" }, args: { blob: "aGk=", duration_ms: 5000 } },
+      { module: MODULE_SIP, verb: "play", target: { channel: "ch1" }, args: { file: "/prompts/bye.wav" } },
+      { module: MODULE_SIP, verb: "stop", target: { channel: "ch1" }, args: {} },
+      { module: MODULE_SIP, verb: "dtmf", target: { channel: "ch1" }, args: { digits: "123#", duration_ms: 100, volume_dbm0: -8 } },
+      { module: MODULE_SIP, verb: "hold", target: { channel: "ch1" }, args: {} },
+      { module: MODULE_SIP, verb: "unhold", target: { channel: "ch1" }, args: {} },
+      { module: MODULE_SIP, verb: "stream_start", target: { channel: "ch1" }, args: { ws_uri: "ws://ai:9000/stream", direction: "both", channels: 2 } },
+      { module: MODULE_SIP, verb: "stream_stop", target: { channel: "ch1" }, args: {} },
+    ]);
+  });
+
+  it("removeHeader emits the remove_header verb", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.removeHeader("X-Foo");
+    expect(transport.calls).toEqual([
+      { module: MODULE_SIP, verb: "remove_header", target: { channel: "ch1" }, args: { name: "X-Foo" } },
     ]);
   });
 });

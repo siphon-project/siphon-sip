@@ -165,11 +165,10 @@ export function parseInboundFrame(text: string): ReplyFrame | EventFrame | null 
 /**
  * The verbs the built-in SIP adapter accepts (`module = "sip"`).
  *
- * These are the exact wire tokens. The server implements
- * `answer`/`progress`/`reject`/`hangup`/`refer`/`route`/`set_header`/`get_header`;
- * the rest (`remove_header`, `accept_refer`, `reject_refer`, `play`, `dtmf`)
- * are accepted names the server answers `unsupported_verb` until it implements
- * them.
+ * These are the exact wire tokens. The media verbs
+ * (`play`/`stop`/`dtmf`/`hold`/`unhold`/`stream_start`/`stream_stop`) dispatch
+ * against the configured media backend; the WebSocket-tee pair is
+ * siphon-rtp-only, so a non-siphon-rtp backend answers them `unsupported_verb`.
  */
 export const SipVerb = {
   Answer: "answer",
@@ -184,7 +183,12 @@ export const SipVerb = {
   AcceptRefer: "accept_refer",
   RejectRefer: "reject_refer",
   Play: "play",
+  Stop: "stop",
   Dtmf: "dtmf",
+  Hold: "hold",
+  Unhold: "unhold",
+  StreamStart: "stream_start",
+  StreamStop: "stream_stop",
 } as const;
 
 /** A value of {@link SipVerb}. */
@@ -196,9 +200,51 @@ export type SipEventKind =
   | "StasisEnd"
   | "ChannelStateChange"
   | "ChannelHangupRequest"
+  | "ChannelDtmfReceived"
+  | "TransferRequested"
   | (string & {});
 
 /** Parse a wire event name; unknown names pass through verbatim (forward-compatible). */
 export function sipEventKind(name: string): SipEventKind {
   return name as SipEventKind;
+}
+
+/**
+ * The `payload` of a `ChannelDtmfReceived` event — an in-band DTMF digit the
+ * media engine detected on a controlled call's leg. Cast a
+ * {@link import("./sip").CallEvent}'s `payload` to this when
+ * `kind === "ChannelDtmfReceived"`.
+ */
+export interface ChannelDtmfPayload {
+  /** The single detected digit (`0`–`9`, `*`, `#`, `A`–`D`). */
+  digit: string;
+  /** The tone duration in milliseconds. */
+  duration_ms: number;
+  /** The tone volume in dBm0 (negative). */
+  volume: number;
+  /** The From-tag of the leg the digit came from. */
+  from_tag: string;
+}
+
+/** The RFC 3891 `Replaces` triple embedded in a {@link TransferRequestedPayload}. */
+export interface TransferReplaces {
+  call_id: string;
+  from_tag: string;
+  to_tag: string;
+  early_only: boolean;
+}
+
+/**
+ * The `payload` of a `TransferRequested` event — an inbound REFER on a
+ * controlled call, handed to the app to accept / reject. Cast a
+ * {@link import("./sip").CallEvent}'s `payload` to this when
+ * `kind === "TransferRequested"`.
+ */
+export interface TransferRequestedPayload {
+  /** The Refer-To URI (the transfer target). */
+  refer_to: string;
+  /** The embedded `Replaces` triple for an attended transfer, if present. */
+  replaces?: TransferReplaces | null;
+  /** The From-tag of the referring party, if known. */
+  from_tag?: string | null;
 }
