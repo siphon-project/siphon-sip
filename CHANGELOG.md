@@ -91,7 +91,11 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the userpart is taken: the host stays siphon's to decide, so a retarget can
   never route a call somewhere the operator did not configure. A `destination`
   alone does not make a route routable — it says who to reach, never how. The
-  field is absent from the wire when unset, so the contract stays additive.
+  `To` userpart follows the retarget so the number the call was dialled on never
+  reaches the carrier; the tech prefix is deliberately not applied to `To`,
+  being a routing artifact of the R-URI rather than part of the called-party
+  identity. The field is absent from the wire when unset, so the contract stays
+  additive.
 
 ### Fixed
 - **Ro usage is reported as a delta, not per-interval.** A CCR-UPDATE that fails

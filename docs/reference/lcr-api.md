@@ -143,6 +143,11 @@ Top-level:
   Carrier `a` is dialled as `1010288+12025550199` through a healthy member of
   `carriers`; carrier `b` overrides the number with its own.
 
+  The `To` userpart follows the retarget, so the number the call was originally
+  dialled on never reaches the carrier. The **tech prefix is not** applied to
+  `To`: it is a carrier routing artifact that belongs to the R-URI, not to the
+  called-party identity. `number_policy` still owns `To`'s format on top.
+
 - **Forward-compatibility** — unknown response fields are ignored; new optional
   fields can be added without a version bump. Bump `version` only on a breaking
   change.

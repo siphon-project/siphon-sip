@@ -11852,6 +11852,23 @@ fn b2bua_carrier_ruri(
     uri.to_string()
 }
 
+/// Replace the userpart of the URI inside a `name-addr` (or of a bare URI),
+/// leaving the display name, the host, the port, every URI parameter and every
+/// header parameter alone.
+///
+/// Used to align a retargeted call's To with its new destination. Returns the
+/// input unchanged when it cannot be parsed, so a header siphon does not
+/// understand is never corrupted.
+fn rewrite_uri_userpart(value: &str, user: &str) -> String {
+    match crate::sip::headers::nameaddr::NameAddr::parse(value) {
+        Ok(mut entry) => {
+            entry.uri.user = Some(user.to_string());
+            entry.to_string()
+        }
+        Err(_) => value.to_string(),
+    }
+}
+
 /// The number out of an LCR `destination`, which may be given as a bare number
 /// (`"+12025550123"`) or as a full URI whose userpart is the number
 /// (`"sip:+12025550123@carrier.net"`).
@@ -11919,6 +11936,14 @@ fn b2bua_advance_route(
             continue;
         }
         let target = b2bua_carrier_ruri(&route, &a_leg_ruri, next_hop.as_deref());
+        // The same value b2bua_carrier_ruri put in the R-URI userpart, so the
+        // To can be aligned with it. Resolved here rather than re-derived from
+        // the target, which by then carries the tech prefix too.
+        let retarget = route
+            .destination
+            .as_deref()
+            .map(lcr_destination_userpart)
+            .filter(|value| !value.is_empty());
         let extra_headers = lcr_injectable_headers(&route, call_id);
         let timeout = route.timeout_secs.unwrap_or(30);
         debug!(
@@ -11938,6 +11963,7 @@ fn b2bua_advance_route(
             None,
             original_request,
             route.number_policy.as_deref(),
+            retarget.as_deref(),
             &extra_headers,
             state,
         );
@@ -12603,6 +12629,7 @@ fn handle_b2bua_invite(
                 None,
                 &message_guard,
                 None,
+                None,
                 &[],
                 state,
             );
@@ -12630,6 +12657,7 @@ fn handle_b2bua_invite(
                     send_socket.as_ref(),
                     None,
                     &message_guard,
+                    None,
                     None,
                     &[],
                     state,
@@ -13126,6 +13154,11 @@ fn b2bua_send_b_leg_invite(
     forced_call_id: Option<&str>,
     original_request: &SipMessage,
     number_policy: Option<&str>,
+    // Retargeted destination number (LCR `destination`), when the call was
+    // re-aimed. The To userpart follows it so the dialled-in access number
+    // never reaches the carrier. Named apart from the local `destination`
+    // (a resolved SocketAddr) further down this function.
+    retarget_number: Option<&str>,
     // Injected verbatim onto the B-leg INVITE, last, after both the header
     // policy and the number policy. Callers must not put a dialog-defining
     // header in here — see [`lcr_injectable_headers`], which is where the one
@@ -13441,6 +13474,20 @@ fn b2bua_send_b_leg_invite(
             new_to = crate::b2bua::actor::rewrite_uri_authority(&new_to, &target_authority);
         }
         // Unparseable target and no override — leave the To host untouched.
+
+        // A retargeted call must not carry the number it was originally
+        // addressed to. RFC 3261 §8.1.1.2 does not require To to track the
+        // R-URI, but a To still naming the access number both leaks it and
+        // reads as malformed to elements that expect the two to agree.
+        //
+        // The tech prefix is deliberately NOT applied here: it is a carrier
+        // routing artifact that `tech_prefix` documents as belonging to the
+        // R-URI, and the called-party identity is not the place for it.
+        // `number_policy` still owns To's format on top of this.
+        if let Some(retarget) = retarget_number.filter(|value| !value.is_empty()) {
+            new_to = rewrite_uri_userpart(&new_to, retarget);
+        }
+
         b_leg_invite.headers.set("To", new_to);
     }
 
@@ -20234,8 +20281,8 @@ fn b2bua_refer_accept(
             };
             let dialed = if let Some(template) = dial_template {
                 b2bua_send_b_leg_invite(
-                    call_id, target_uri, next_hop, None, &[], None, forced_cid, &template, None, &[],
-                    state,
+                    call_id, target_uri, next_hop, None, &[], None, forced_cid, &template, None,
+                    None, &[], state,
                 );
                 true
             } else {
@@ -21785,6 +21832,36 @@ mod tests {
         };
         let target = b2bua_carrier_ruri(&route, "not a uri", Some(CARRIER));
         assert_eq!(target, "99+12025550199");
+    }
+
+    #[test]
+    fn a_retarget_moves_the_to_userpart_off_the_access_number() {
+        // A retargeted call must not carry the number it was dialled on.
+        // RFC 3261 §8.1.1.2 does not require To to track the R-URI, but a To
+        // still naming the access number both leaks it and reads as malformed
+        // to elements that expect the two to agree.
+        let to = "<sip:+12025550100@siphon.example.com>";
+        let rewritten = rewrite_uri_userpart(to, "+12025550199");
+
+        assert!(rewritten.contains("+12025550199"), "{rewritten}");
+        assert!(!rewritten.contains("+12025550100"), "{rewritten}");
+        assert!(rewritten.contains("siphon.example.com"), "host is untouched: {rewritten}");
+    }
+
+    #[test]
+    fn rewriting_the_to_userpart_preserves_the_display_name_and_params() {
+        let to = "\"Support\" <sip:+12025550100@example.com:5070;transport=tcp>";
+        let rewritten = rewrite_uri_userpart(to, "+12025550199");
+
+        assert!(rewritten.contains("Support"), "{rewritten}");
+        assert!(rewritten.contains("+12025550199"), "{rewritten}");
+        assert!(rewritten.contains("5070"), "port survives: {rewritten}");
+        assert!(rewritten.contains("transport=tcp"), "uri params survive: {rewritten}");
+    }
+
+    #[test]
+    fn an_unparseable_header_is_left_alone_rather_than_corrupted() {
+        assert_eq!(rewrite_uri_userpart("not a name-addr", "+12025550199"), "not a name-addr");
     }
 
     #[test]
