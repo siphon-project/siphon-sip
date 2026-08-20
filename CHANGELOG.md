@@ -6,7 +6,35 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Changed
+- **Ro no longer bills ring time.** The usage clock was stamped at
+  CCR-INITIAL — which `call.ro_authorize()` fires *before* any carrier is
+  dialled — and every reported figure was measured from there, so ring time was
+  charged and a call that was never answered could report a full grant of used
+  seconds. With two carriers at `timeout_secs: 12`, 24 seconds of a 30-second
+  grant could be gone before the callee picked up, and it got worse the longer
+  the carrier list. The clock now starts at the 200 OK, which is what TS 32.260
+  §5 means by chargeable duration. **This changes billed duration on upgrade for
+  any existing Ro deployment**; set the new `ro.charge_from: invite` to keep the
+  previous behaviour. Only the clock moved — the reservation still happens at
+  INVITE, since reserve-before-connect is the point of the prepaid gate.
+
+### Added
+- **A CCR-UPDATE at answer, carrying `Time-Stamps`** (TS 32.299 §7.2.97). There
+  was no credit-control request at the 200 OK, so an OCS could not tell when
+  charging actually started and a Diameter-to-HTTP bridge had nothing to
+  translate into a connect event. `SIP-Request-Timestamp` is the INVITE that
+  triggered the reservation, `SIP-Response-Timestamp` is the answer;
+  `ImsChargingData.response_timestamp` already existed and was never set,
+  because at CCR-INITIAL there is no answer yet. Idempotent — a retransmitted
+  200 OK neither restarts the clock nor sends a second record.
+- **`ro.charge_from`** (`answer` | `invite`, default `answer`) — see above.
+
 ### Fixed
+- **Ro usage is reported as a delta, not per-interval.** A CCR-UPDATE that fails
+  now leaves its seconds unreported, so the next record — or the
+  CCR-TERMINATION — still covers them exactly once, instead of the interval
+  being lost.
 - **Ro CCR-UPDATE and CCR-TERMINATION now carry Service-Information.** Both were
   built with `ims_data: None`, so only the Session-Id, the subscriber and the
   units reached the OCS. Nothing after the initial request named the carrier,

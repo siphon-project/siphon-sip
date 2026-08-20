@@ -10415,6 +10415,31 @@ fn ro_stamp_winning_carrier(state: &DispatcherState, internal_call_id: &str, car
     }
 }
 
+/// Report the answer on a B2BUA call's Ro session: start the chargeable clock
+/// and send the answer-time CCR-UPDATE (`Time-Stamps`, TS 32.299 §7.2.97).
+///
+/// Fire-and-forget, like every other charging spawn — the SIP path must not
+/// wait on the OCS. No-op when Ro is off or the call holds no reservation, and
+/// idempotent on a retransmitted 200 OK.
+fn spawn_ro_b2bua_answer(state: &DispatcherState, internal_call_id: &str) {
+    if state.ro_charger.is_none() {
+        return;
+    }
+    let Some(charger) = state.ro_charger.as_ref().map(Arc::clone) else {
+        return;
+    };
+    let Some(session) = state
+        .ro_sessions
+        .get(&ro_b2bua_key(internal_call_id))
+        .map(|entry| entry.clone())
+    else {
+        return;
+    };
+    tokio::spawn(async move {
+        charger.report_answer(&session).await;
+    });
+}
+
 /// Send CCR-TERMINATION for a B2BUA call's Ro session on BYE / teardown.
 ///
 /// `cause_code` is the IMS-Information `Cause-Code` for the record
@@ -15147,10 +15172,14 @@ fn handle_b2bua_response(
         if let Some(invite_arc) = &a_leg_invite {
             spawn_rf_b2bua_start(state, call_id, invite_arc);
         }
-        // Ro is NOT started here: prepaid reserve-before-connect means the
-        // CCR-INITIAL already fired in `@b2bua.on_invite` via `call.ro_authorize()`
-        // (before the B-leg was dialed). The re-auth loop it armed keeps running;
-        // there is nothing to do on answer.
+        // Ro is not *started* here — prepaid reserve-before-connect means the
+        // CCR-INITIAL already fired in `@b2bua.on_invite` via
+        // `call.ro_authorize()`, before the B-leg was dialed, and the re-auth
+        // loop it armed keeps running. But the answer is what starts the
+        // chargeable clock (TS 32.260 §5), so report it: a CCR-UPDATE carrying
+        // Time-Stamps tells the OCS when charging actually began, and under
+        // `ro.charge_from: answer` it is also what stops ring time being billed.
+        spawn_ro_b2bua_answer(state, call_id);
 
         // Wrap the 200 OK in Arc<Mutex<>> so Python handlers can modify SDP in-place
         let response_arc = Arc::new(std::sync::Mutex::new(message.clone()));

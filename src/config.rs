@@ -2926,6 +2926,19 @@ pub struct RoConfig {
     /// Which party to charge: ``"orig"`` | ``"term"`` | ``"both"``. Default ``"orig"``.
     #[serde(default = "default_ro_charge")]
     pub charge: String,
+    /// When the chargeable clock starts: ``"answer"`` | ``"invite"``.
+    /// Default ``"answer"``.
+    ///
+    /// ``answer`` counts reported usage from the 200 OK, which is what
+    /// TS 32.260 means by chargeable duration. ``invite`` counts from the
+    /// CCR-INITIAL — i.e. from the reservation, before any carrier was dialled
+    /// — so ring time is billed. That was the only behaviour before this
+    /// setting existed; it is kept for anyone who depended on it.
+    ///
+    /// Only the clock moves. The reservation still happens at INVITE, because
+    /// reserve-before-connect is the entire point of the prepaid gate.
+    #[serde(default = "default_ro_charge_from")]
+    pub charge_from: String,
     /// One-shot IEC charging on SIP MESSAGE (SMS/RCS). Default: true.
     #[serde(default = "default_true")]
     pub charge_message: bool,
@@ -2956,6 +2969,7 @@ impl Default for RoConfig {
             service_context_id: default_rf_service_context_id(),
             sms_service_context_id: default_ro_sms_service_context_id(),
             charge: default_ro_charge(),
+            charge_from: default_ro_charge_from(),
             charge_message: true,
             on_ocs_failure: default_ro_ocs_failure(),
             credit_denied_status: default_ro_denied_status(),
@@ -2969,6 +2983,12 @@ impl Default for RoConfig {
 fn default_ro_interval() -> u32 { 30 }
 fn default_ro_node_functionality() -> String { "pcscf".to_string() }
 fn default_ro_sms_service_context_id() -> String { "32274@3gpp.org".to_string() }
+/// Chargeable duration runs from the answer (TS 32.260 §5): a call that rings
+/// and is never answered has no chargeable duration at all.
+fn default_ro_charge_from() -> String {
+    "answer".to_string()
+}
+
 fn default_ro_charge() -> String { "orig".to_string() }
 fn default_ro_ocs_failure() -> String { "terminate".to_string() }
 fn default_ro_denied_status() -> u16 { 402 }

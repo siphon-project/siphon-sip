@@ -54,6 +54,8 @@ ro:
   sms_service_context_id: "32274@3gpp.org"    # SMS / RCS
   node_functionality: as       # AS/MMTel-AS is the standard Ro trigger
   charge: orig                 # orig | term | both
+  charge_from: answer          # answer (default) | invite — where the chargeable
+                               # clock starts. See "What gets billed" below.
   on_ocs_failure: terminate    # fail-closed; `continue` = fail-open (allow, uncharged)
   credit_denied_status: 402    # SIP status a script returns when denied at setup
   rating_group: 100            # optional; its presence selects the MSCC (multi-service) shape
@@ -192,6 +194,38 @@ curl -s http://cgrates:2080/jsonrpc -d '{"method":"ApierV2.SetBalance",
   "params":[{"Tenant":"cgrates.org","Account":"sip:alice@ims.example.org",
   "BalanceType":"*voice","Value":30000000000}],"id":1}'
 ```
+
+## What gets billed
+
+`charge_from` decides where the chargeable clock starts.
+
+| | Clock starts | Ring time billed? |
+|---|---|---|
+| `answer` *(default)* | the 200 OK | no |
+| `invite` | the CCR-INITIAL | yes |
+
+`answer` is what TS 32.260 §5 means by chargeable duration: a call that rings
+and is never answered has none, and reports `0` used seconds.
+
+`invite` counts from the reservation — which happens *before* any carrier is
+dialled — so ring time is billed. With two carriers at `timeout_secs: 12`, 24
+seconds of a 30-second grant can be gone before the callee picks up, and it gets
+worse the longer the carrier list. This was the only behaviour before
+`charge_from` existed; it is kept for anyone who depended on it.
+
+Only the clock moves. The reservation still happens at INVITE either way,
+because reserve-before-connect is the whole point of the prepaid gate.
+
+When the call is answered siphon sends a CCR-UPDATE carrying `Time-Stamps`
+(TS 32.299 §7.2.97) — `SIP-Request-Timestamp` is the INVITE that triggered the
+reservation, `SIP-Response-Timestamp` is the answer — so the OCS can see when
+charging began, and a Diameter-to-HTTP bridge has a connect event to translate.
+It is idempotent: a retransmitted 200 OK neither restarts the clock nor sends a
+second record.
+
+Usage is reported as a delta against what the OCS has already acknowledged, so a
+CCR-UPDATE that fails leaves its seconds unreported and the next record — or the
+CCR-TERMINATION — still covers them exactly once.
 
 ## Why a call ended
 
