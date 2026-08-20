@@ -47,8 +47,17 @@ fn repin_protected_sa(request: &PyRequest, granted_expires: u32) {
 /// REGISTER.  Treat as opaque from Python: scripts pass it back to
 /// `request.relay(flow=)` and read `is_alive` to defend against dead
 /// stream connections.
-#[pyclass(name = "Flow", from_py_object)]
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Flows compare by value and hash, so the natural RFC 5626 test — did this
+/// request arrive on the same connection the registration did? — is written as
+/// `call.flow == contact.flow` (or `request.flow == contact.flow`), and a flow
+/// can be used as a dict key or put in a set.  Equality covers the transport,
+/// both addresses and the connection id together; on a stream transport that
+/// makes it an exact match on one accepted socket, which is a far stronger
+/// signal than a source-address check (worthless behind carrier NAT, where
+/// every subscriber shares an address).
+#[pyclass(name = "Flow", from_py_object, eq, hash, frozen)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PyFlow {
     /// Lowercase transport name ("udp", "tcp", "tls", "ws", "wss").
     pub transport: String,
@@ -68,20 +77,36 @@ pub struct PyFlow {
 impl PyFlow {
     /// Lowercase transport name ("udp", "tcp", "tls", "ws", "wss").
     #[getter]
-    fn transport(&self) -> &str {
+    pub(crate) fn transport(&self) -> &str {
         &self.transport
     }
 
     /// String form of the captured remote (UE) address.
     #[getter]
-    fn remote_addr(&self) -> String {
+    pub(crate) fn remote_addr(&self) -> String {
         self.source_addr.to_string()
     }
 
     /// String form of the captured listener local address.
     #[getter]
-    fn local_addr(&self) -> String {
+    pub(crate) fn local_addr(&self) -> String {
         self.local_addr.to_string()
+    }
+
+    /// Identifier of the accepted inbound connection this flow was captured on.
+    ///
+    /// For a stream transport (TCP/TLS/WS/WSS) this identifies one accepted
+    /// socket, so it is what distinguishes a UE that is still on the connection
+    /// its REGISTER arrived on from one that reconnected. For UDP it is a
+    /// deterministic hash of `(local_addr, remote_addr)`, since there is no
+    /// connection to speak of.
+    ///
+    /// Prefer comparing whole flows (`call.flow == contact.flow`) over reading
+    /// this: equality covers the transport and both addresses as well, and a
+    /// connection id is only meaningful alongside them.
+    #[getter]
+    pub(crate) fn connection_id(&self) -> u64 {
+        self.connection_id
     }
 
     /// Whether the flow is still usable.

@@ -28,6 +28,20 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   and a `reoffer` per re-INVITE. Verified against a reverted fix, where the mock
   sees three offers and no re-offers — while SIPp still exits 0, which is why
   the assertion is on the verbs and not on the call outcome.
+- **`call.flow`, `Flow.connection_id`, and `Flow` equality/hashing.** A B2BUA
+  `Call` exposed no inbound flow at all, so the RFC 5626 authorisation — accept
+  an INVITE that arrived on the connection a registration was made on, rather
+  than challenging every call with a 407 — could not be written, even though
+  `request.flow` and `Contact.flow` both existed. `Flow` also had no `__eq__`,
+  so `call.flow == contact.flow` would have compared object identity and
+  silently always been `False`; it now compares by value and hashes, so a flow
+  works as a dict key or set member too. On a stream transport the comparison is
+  an exact match on one accepted socket, which is what makes it stronger than a
+  source-address check — the latter is worthless behind carrier NAT, where every
+  subscriber shares an address. On UDP a flow is derived from the address pair
+  and carries no more assurance than the address does. `call.flow` is `None` for
+  an internally-originated call, which is distinguishable from a flow that did
+  not match.
 
 ### Fixed
 - **A proxied in-dialog request whose Request-URI addresses the proxy itself is

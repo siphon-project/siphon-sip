@@ -926,10 +926,17 @@ class MockRegistrar:
                 contact.flow_token = flow_token
                 # Reconstitute the Flow view from request context.
                 from siphon_sdk.types import Flow as _Flow
+                # Carry the connection id through as well: it is what makes
+                # `contact.flow == call.flow` an RFC 5626 connection-reuse test
+                # rather than an address comparison. A request that already
+                # carries a flow contributes its id, so a test can register and
+                # then call on the same (or a different) connection.
+                inbound = getattr(request, "_flow", None)
                 contact.flow = _Flow(
                     transport=request.transport,
                     remote_addr=f"{request.source_ip}:{request.source_port}",
                     local_addr=getattr(request, "_local_addr", "0.0.0.0:0"),
+                    connection_id=getattr(inbound, "connection_id", 0),
                 )
             contacts.append(contact)
             # Index for lookup_by_token.
