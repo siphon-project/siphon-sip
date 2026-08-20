@@ -6,6 +6,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Fixed
+- **`cdr.file.rotate_size_mb` actually rotates.** The value was documented,
+  parsed and carried into the file backend, then dropped at the write site — so
+  a CDR file configured with `rotate_size_mb: 100` grew without bound. It now
+  renames the file to `<path>.<UTC timestamp>` once a record takes it past the
+  limit, and the next record starts a fresh one; the rename happens after the
+  write, never mid-record. `0` disables rotation. Rotated files are kept, never
+  deleted: retention belongs to logrotate or whatever ships them, and dropping
+  billing records to enforce a size cap would be worse than the unbounded file
+  this replaces. The packaged logrotate config names `cdr.jsonl` only, so it
+  does not re-rotate the size-rotated siblings.
+
 ### Added
 - **Inbound REFER on a controlled call is surfaced to the control app as a
   `TransferRequested` event.** When a B2BUA call has been handed to an external

@@ -19,7 +19,10 @@
 }
 
 # CDRs are appended with a fresh open per record, so they rotate the ordinary
-# way. Deliberately NOT copytruncate: that copies and then truncates, and any
+# way. Only cdr.jsonl is named here, deliberately: siphon's own
+# cdr.file.rotate_size_mb renames oversized files to cdr.jsonl.<timestamp>, and
+# rotating an already-rotated file again would compress the same records twice.
+# Deliberately NOT copytruncate: that copies and then truncates, and any
 # record written in between is lost — acceptable for a log line, not for a
 # billing record.
 /var/log/siphon/cdr.jsonl {

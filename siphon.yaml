@@ -935,6 +935,11 @@ auth:
 #   backend: file
 #   file:
 #     path: "/var/log/siphon/cdr.jsonl"
+#     # Rename the file to <path>.<UTC timestamp> once it reaches this many MB,
+#     # so the next record starts a fresh one. Rotated files are kept, never
+#     # deleted — retention is logrotate's job (the packaged config rotates
+#     # cdr.jsonl daily and leaves the size-rotated siblings alone). Set 0 to
+#     # disable and let logrotate do all of it.
 #     rotate_size_mb: 100
 #
 # HTTP webhook (POST JSON to a collector):
