@@ -6,6 +6,21 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **CI covers re-INVITE renegotiation on the `siphon-rtp` backend** (`--reoffer`).
+  The existing `--reinvite` mode runs the same hold/resume flow against
+  rtpengine, where a repeat `offer` on a live call-id *is* the re-offer — so it
+  cannot tell a renegotiation from a replacement, which is why the media session
+  being replaced on every re-INVITE went unseen. The mock engine now models the
+  distinction (an `offer` on a new call-id allocates a port, a repeat `offer`
+  replaces the call and allocates a *new* one, a `reoffer` renegotiates in place
+  and keeps it, an unknown call-id errors rather than implicitly creating, and a
+  codec change is refused the way the real engine refuses it), and the job
+  asserts the control verbs the engine actually received: exactly one `offer`
+  and a `reoffer` per re-INVITE. Verified against a reverted fix, where the mock
+  sees three offers and no re-offers — while SIPp still exits 0, which is why
+  the assertion is on the verbs and not on the call outcome.
+
 ### Fixed
 - **A proxied in-dialog request whose Request-URI addresses the proxy itself is
   now forwarded to the dialog's established peer instead of failing as a

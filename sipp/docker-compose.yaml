@@ -4324,6 +4324,152 @@ services:
     profiles:
       - refer-single-leg
 
+  # ── Re-INVITE renegotiation on the siphon-rtp backend ─────────────────────
+  # Requires the "reoffer" profile.
+  #
+  # The same hold/resume flow the --reinvite mode runs, pointed at the native
+  # backend. That mode runs against rtpengine, where a repeat `offer` on a live
+  # call-id IS the re-offer — so it cannot tell a renegotiation from a
+  # replacement. siphon-rtp draws the line differently: a repeat offer frees the
+  # call and re-allocates, taking any WebSocket bridge, tee or SIPREC
+  # subscription with it. The mock models both, so a regression shows up twice:
+  # in the verb it logs and in the media port the caller is answered with.
+  #
+  # IP assignments:
+  #   172.20.0.109 — mock siphon-rtp control server
+  #   172.20.0.110 — siphon (proxy, media.backend: siphon-rtp)
+  #   172.20.0.112 — registration helper (bob), then the B-leg UAS
+  #   172.20.0.113 — A-leg UAC (INVITE, hold, resume, BYE)
+
+  mock-siphon-rtp-reoffer:
+    image: python:3.12-slim
+    container_name: mock-siphon-rtp-reoffer
+    volumes:
+      - ./siphon-rtp:/app:ro
+    working_dir: /app
+    command: ["python3", "mock_siphon_rtp.py"]
+    environment:
+      SIPHON_RTP_PORT: "8080"
+      MOCK_MEDIA_IP: "203.0.113.1"
+      MOCK_MEDIA_PORT: "30000"
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.109
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket,struct,json; s=socket.create_connection(('127.0.0.1',8080),2); b=json.dumps({'id':1,'command':'ping'}).encode(); s.sendall(struct.pack('!I',len(b))+b); h=s.recv(4); n=struct.unpack('!I',h)[0]; d=s.recv(n); s.close(); exit(0 if b'pong' in d else 1)\""]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    profiles:
+      - reoffer
+
+  siphon-reoffer:
+    build:
+      context: ..
+    container_name: siphon-reoffer-test
+    depends_on:
+      mock-siphon-rtp-reoffer:
+        condition: service_healthy
+    volumes:
+      - ./siphon-rtp/siphon-reoffer.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.110
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - reoffer
+
+  sipp-reoffer-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-reoffer:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        # Same address as the UAS below, and deliberately so: the registrar
+        # binds bob to the source address the REGISTER arrived from, so the
+        # contact only points at the UAS if they share an IP. They never run at
+        # the same time — the UAS waits for this to complete.
+        ipv4_address: 172.20.0.112
+    entrypoint:
+      - sipp
+      - "172.20.0.110:5060"
+      - -sf
+      - /sipp/scenarios/register.xml
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "20"
+      - -trace_err
+    profiles:
+      - reoffer
+
+  sipp-reoffer-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-reoffer-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.112
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/reinvite_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - reoffer
+
+  sipp-reoffer-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-reoffer:
+        condition: service_healthy
+      sipp-reoffer-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.113
+    entrypoint:
+      - sipp
+      - "172.20.0.110:5060"
+      - -sf
+      - /sipp/scenarios/reinvite_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - reoffer
+
 # ── Network ────────────────────────────────────────────────────────────────
 networks:
   sipnet:
