@@ -18,12 +18,12 @@ listen:
   udp:
     - "0.0.0.0:5060"
 
-advertised_address: "172.20.0.115"
+advertised_address: "172.20.0.135"
 
 domain:
   local:
     - "siphon.test"
-    - "172.20.0.115"
+    - "172.20.0.135"
     - "127.0.0.1"
 
 script:
@@ -46,7 +46,7 @@ media:
   # No `backend:` key — this is the default rtpengine backend, pointed at the
   # engine's NG listener instead of at rtpengine itself.
   rtpengine:
-    address: "172.20.0.110:22222"
+    address: "172.20.0.130:22222"
     timeout_ms: 2000
 
 log:

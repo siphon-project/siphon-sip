@@ -306,6 +306,38 @@ impl SiphonRtpClient {
         Ok(rewritten)
     }
 
+    /// Send a `reoffer` — renegotiate a **live** call on the ports it already
+    /// holds, returning the rewritten SDP.
+    ///
+    /// This is what a SIP re-INVITE or UPDATE maps to.  A repeated `offer` on a
+    /// live call-id is a *replacement*: the engine tears the old call down and
+    /// allocates fresh ports, which drops everything attached to it — the
+    /// WebSocket bridge, any tee, any SIPREC subscription — and hands the peer
+    /// an address it was never told about.  `reoffer` keeps the ports, the
+    /// pipeline and the attachments, and carries an RFC 8445 §9 ICE restart
+    /// when the peer sends new credentials.
+    ///
+    /// The engine refuses a re-offer that changes the negotiated codec (that
+    /// needs a pipeline rebuild) — see [`RtpEngineSet::reoffer`], which falls
+    /// back to a replacement for exactly that case.
+    pub async fn reoffer(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        sdp: &[u8],
+        flags: &NgFlags,
+    ) -> Result<Vec<u8>, RtpEngineError> {
+        let result = self
+            .request(Command::Reoffer {
+                call_id: call_id.to_string(),
+                from_tag: from_tag.to_string(),
+                sdp: String::from_utf8_lossy(sdp).into_owned(),
+                profile: profile_flags_from_ng(flags),
+            })
+            .await?;
+        expect_sdp(result)
+    }
+
     /// Send an `answer`, returning the rewritten SDP.
     pub async fn answer(
         &self,
@@ -841,6 +873,41 @@ impl SiphonRtpClientSet {
         Ok(result)
     }
 
+    /// Renegotiate a live call on the affinity-bound instance, keeping its ports
+    /// and everything attached to them.
+    ///
+    /// Falls back to a replacement `offer` for the one case the engine refuses:
+    /// a re-offer that changes the negotiated codec needs a pipeline rebuild the
+    /// engine does not do on a live call, and its own error says to replace the
+    /// call instead.  That fallback is today's behaviour for every re-INVITE, so
+    /// a codec-changing one is no worse than before — but it *does* re-allocate
+    /// ports and drop the call's bridge/tee/SIPREC attachments, so it is logged
+    /// rather than performed silently.
+    pub async fn reoffer(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        sdp: &[u8],
+        flags: &NgFlags,
+    ) -> Result<Vec<u8>, RtpEngineError> {
+        match self.select(call_id).reoffer(call_id, from_tag, sdp, flags).await {
+            Ok(rewritten) => Ok(rewritten),
+            Err(error) if is_codec_change_refusal(&error) => {
+                tracing::warn!(
+                    %call_id,
+                    %error,
+                    "re-offer changes the negotiated codec; replacing the media session — its \
+                     ports are re-allocated and any WebSocket bridge, tee or SIPREC subscription \
+                     on it is torn down"
+                );
+                let result = self.select(call_id).offer(call_id, from_tag, sdp, flags).await?;
+                self.bind_affinity(call_id);
+                Ok(result)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Send an `answer` to the affinity-bound instance.
     pub async fn answer(
         &self,
@@ -1068,6 +1135,19 @@ impl SiphonRtpClientSet {
     pub fn instance_addresses(&self) -> Vec<SocketAddr> {
         self.clients.iter().map(|client| client.address()).collect()
     }
+}
+
+/// Whether a `reoffer` failure is the engine's "this changes the codec" refusal
+/// (the one case that has to be retried as a replacement `offer`) rather than a
+/// transport failure, an unknown call, or anything else we must not paper over.
+///
+/// Matched on the reason text because the control protocol carries a string
+/// reason, not a typed error code, for a command-level refusal.  Deliberately
+/// narrow: only a refusal naming the codec qualifies, so a future engine error
+/// cannot silently acquire a call-replacing retry.
+fn is_codec_change_refusal(error: &RtpEngineError) -> bool {
+    let reason = error.to_string();
+    reason.contains("re-offer changes the negotiated codec")
 }
 
 /// Interpret a result that must carry rewritten SDP (offer/answer/subscribe req).
@@ -1628,7 +1708,7 @@ mod tests {
                     while let Some(request) = read_frame_opt::<Request, _>(&mut stream, &mut buffer).await {
                         let result = match request.command {
                             Command::Ping => CmdResult::Pong,
-                            Command::Offer { .. } | Command::Answer { .. } => CmdResult::Ok {
+                            Command::Offer { .. } | Command::Reoffer { .. } | Command::Answer { .. } => CmdResult::Ok {
                                 sdp: Some("v=0\r\nc=IN IP4 203.0.113.1\r\n".to_string()),
                                 duration_ms: None,
                                 to_tag: None,
@@ -1712,6 +1792,7 @@ mod tests {
                         let result = match request.command {
                             Command::Ping => CmdResult::Pong,
                             Command::Offer { .. }
+                            | Command::Reoffer { .. }
                             | Command::Answer { .. }
                             | Command::AnswerLocal { .. } => CmdResult::Ok {
                                 sdp: Some("v=0\r\nc=IN IP4 203.0.113.1\r\n".to_string()),
@@ -1746,6 +1827,121 @@ mod tests {
             .await
             .expect("offer");
         capture_rx.recv().await.expect("captured frame")
+    }
+
+    /// A fake engine that refuses a `reoffer` the way the real one refuses a
+    /// codec change, answers `offer` with SDP, and reports which commands it
+    /// saw — so the fallback can be proven to be a *retry as offer* and not a
+    /// swallowed error.
+    async fn spawn_codec_refusing_server() -> (SocketAddr, mpsc::UnboundedReceiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_tx, seen_rx) = mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let seen_tx = seen_tx.clone();
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    while let Some(request) =
+                        read_frame_opt::<Request, _>(&mut stream, &mut buffer).await
+                    {
+                        let result = match request.command {
+                            Command::Reoffer { .. } => {
+                                let _ = seen_tx.send("reoffer".to_string());
+                                CmdResult::Error {
+                                    reason: "re-offer changes the negotiated codec (PCMU → PCMA); \
+                                             not supported on a live call — replace it with a \
+                                             fresh offer instead"
+                                        .to_string(),
+                                }
+                            }
+                            Command::Offer { .. } => {
+                                let _ = seen_tx.send("offer".to_string());
+                                CmdResult::Ok {
+                                    sdp: Some("v=0\r\nc=IN IP4 203.0.113.9\r\n".to_string()),
+                                    duration_ms: None,
+                                    to_tag: None,
+                                    stats: None,
+                                    play_id: None,
+                                }
+                            }
+                            _ => CmdResult::Ok {
+                                sdp: None,
+                                duration_ms: None,
+                                to_tag: None,
+                                stats: None,
+                                play_id: None,
+                            },
+                        };
+                        write_frame(&mut stream, &Response { id: request.id, result }).await;
+                    }
+                });
+            }
+        });
+        (address, seen_rx)
+    }
+
+    /// The whole point of the verb: a re-INVITE must not go out as `offer`,
+    /// which on this backend frees the call's ports and takes its WebSocket
+    /// bridge, tee and SIPREC subscription with them.
+    #[tokio::test]
+    async fn reoffer_emits_the_reoffer_command_not_an_offer() {
+        let (address, mut capture_rx) = spawn_capturing_server().await;
+        let (event_tx, _event_rx) = channel();
+        let client = SiphonRtpClient::new(address, None, 2_000, 5_000, event_tx);
+        client
+            .reoffer("call-1", "tag-a", b"v=0\r\n", &NgFlags::default())
+            .await
+            .expect("reoffer");
+
+        let json = capture_rx.recv().await.expect("captured frame");
+        assert!(json.contains(r#""command":"reoffer""#), "wire frame was: {json}");
+        assert!(!json.contains(r#""command":"offer""#), "wire frame was: {json}");
+        assert!(json.contains(r#""call_id":"call-1""#), "wire frame was: {json}");
+    }
+
+    /// A re-offer that changes the codec is the one case the engine refuses, and
+    /// its own error says to replace the call.  Retrying as `offer` keeps that
+    /// re-INVITE working exactly as it did before this verb existed — but only
+    /// that case: any other failure must propagate, or a transport blip would
+    /// quietly re-allocate a live call's ports.
+    #[tokio::test]
+    async fn reoffer_retries_as_offer_only_on_the_codec_change_refusal() {
+        let (address, mut seen_rx) = spawn_codec_refusing_server().await;
+        let (event_tx, _event_rx) = channel();
+        let set = SiphonRtpClientSet::new(vec![(address, 2_000, 1)], None, 5_000, event_tx)
+            .expect("set");
+
+        let rewritten = set
+            .reoffer("call-1", "tag-a", b"v=0\r\n", &NgFlags::default())
+            .await
+            .expect("falls back to a replacement offer");
+        assert!(String::from_utf8_lossy(&rewritten).contains("203.0.113.9"));
+
+        assert_eq!(seen_rx.recv().await.as_deref(), Some("reoffer"));
+        assert_eq!(seen_rx.recv().await.as_deref(), Some("offer"));
+    }
+
+    /// Narrow by construction: only a refusal naming the codec earns the retry.
+    #[test]
+    fn only_the_codec_refusal_is_treated_as_retryable() {
+        assert!(is_codec_change_refusal(&RtpEngineError::Protocol(
+            "re-offer changes the negotiated codec (PCMU → PCMA)".to_string()
+        )));
+        for other in [
+            "unknown call-id",
+            "node is draining; not accepting new sessions",
+            "re-offer SDP parse failed: no m= line",
+        ] {
+            assert!(
+                !is_codec_change_refusal(&RtpEngineError::Protocol(other.to_string())),
+                "{other} must not earn a call-replacing retry"
+            );
+        }
     }
 
     /// The acceptance criterion for the WebSocket bridge: a profile carrying

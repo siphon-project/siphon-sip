@@ -17,7 +17,7 @@ from siphon import b2bua, proxy, rtpengine, log
 
 # The AI server's address on the compose network. Env-driven rather than
 # hardcoded so the compose file stays the single place IPs are assigned.
-AI_WS_URI = os.environ.get("AI_WS_URI", "ws://172.20.0.111:9001/stream?call={call_id}")
+AI_WS_URI = os.environ.get("AI_WS_URI", "ws://172.20.0.131:9001/stream?call={call_id}")
 
 
 @proxy.on_request("OPTIONS")

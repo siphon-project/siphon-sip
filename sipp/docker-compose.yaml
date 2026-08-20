@@ -815,6 +815,10 @@ services:
       - "1"
       - -timeout
       - "30"
+      # An incomplete call must FAIL the run: without this, sipp exits 0 on the
+      # global timeout with "Successful call 0 / Failed call 0" and the mode
+      # passes vacuously while the resume re-INVITE never completes.
+      - -timeout_error
       - -trace_err
     profiles:
       - reinvite
@@ -4320,6 +4324,152 @@ services:
     profiles:
       - refer-single-leg
 
+  # ── Re-INVITE renegotiation on the siphon-rtp backend ─────────────────────
+  # Requires the "reoffer" profile.
+  #
+  # The same hold/resume flow the --reinvite mode runs, pointed at the native
+  # backend. That mode runs against rtpengine, where a repeat `offer` on a live
+  # call-id IS the re-offer — so it cannot tell a renegotiation from a
+  # replacement. siphon-rtp draws the line differently: a repeat offer frees the
+  # call and re-allocates, taking any WebSocket bridge, tee or SIPREC
+  # subscription with it. The mock models both, so a regression shows up twice:
+  # in the verb it logs and in the media port the caller is answered with.
+  #
+  # IP assignments:
+  #   172.20.0.109 — mock siphon-rtp control server
+  #   172.20.0.110 — siphon (proxy, media.backend: siphon-rtp)
+  #   172.20.0.112 — registration helper (bob), then the B-leg UAS
+  #   172.20.0.113 — A-leg UAC (INVITE, hold, resume, BYE)
+
+  mock-siphon-rtp-reoffer:
+    image: python:3.12-slim
+    container_name: mock-siphon-rtp-reoffer
+    volumes:
+      - ./siphon-rtp:/app:ro
+    working_dir: /app
+    command: ["python3", "mock_siphon_rtp.py"]
+    environment:
+      SIPHON_RTP_PORT: "8080"
+      MOCK_MEDIA_IP: "203.0.113.1"
+      MOCK_MEDIA_PORT: "30000"
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.109
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket,struct,json; s=socket.create_connection(('127.0.0.1',8080),2); b=json.dumps({'id':1,'command':'ping'}).encode(); s.sendall(struct.pack('!I',len(b))+b); h=s.recv(4); n=struct.unpack('!I',h)[0]; d=s.recv(n); s.close(); exit(0 if b'pong' in d else 1)\""]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    profiles:
+      - reoffer
+
+  siphon-reoffer:
+    build:
+      context: ..
+    container_name: siphon-reoffer-test
+    depends_on:
+      mock-siphon-rtp-reoffer:
+        condition: service_healthy
+    volumes:
+      - ./siphon-rtp/siphon-reoffer.yaml:/etc/siphon/siphon.yaml:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.110
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - reoffer
+
+  sipp-reoffer-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-reoffer:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        # Same address as the UAS below, and deliberately so: the registrar
+        # binds bob to the source address the REGISTER arrived from, so the
+        # contact only points at the UAS if they share an IP. They never run at
+        # the same time — the UAS waits for this to complete.
+        ipv4_address: 172.20.0.112
+    entrypoint:
+      - sipp
+      - "172.20.0.110:5060"
+      - -sf
+      - /sipp/scenarios/register.xml
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "20"
+      - -trace_err
+    profiles:
+      - reoffer
+
+  sipp-reoffer-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-reoffer-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.112
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/reinvite_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - reoffer
+
+  sipp-reoffer-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-reoffer:
+        condition: service_healthy
+      sipp-reoffer-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.113
+    entrypoint:
+      - sipp
+      - "172.20.0.110:5060"
+      - -sf
+      - /sipp/scenarios/reinvite_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - reoffer
+
 
   # ── REAL siphon-rtp engine ────────────────────────────────────────────────
   # The published engine image, standing in for the Python control-plane mocks
@@ -4352,7 +4502,7 @@ services:
       # and no RTP on this network can ever reach it. The scenarios assert on
       # this address precisely so that regression fails loudly.
       - "--relay-bind-ip"
-      - "172.20.0.110"
+      - "172.20.0.130"
       - "--port-min"
       - "30000"
       - "--port-max"
@@ -4361,7 +4511,7 @@ services:
       - "0.0.0.0:9091"
     networks:
       sipnet:
-        ipv4_address: 172.20.0.110
+        ipv4_address: 172.20.0.130
     # No healthcheck: the image is distroless (no shell, no python), so a
     # CMD-SHELL probe cannot run inside it. Readiness is gated by the
     # siphon-rtp-engine-ready one-shot below, which probes /readyz from outside.
@@ -4379,7 +4529,7 @@ services:
         condition: service_started
     networks:
       sipnet:
-        ipv4_address: 172.20.0.120
+        ipv4_address: 172.20.0.140
     command:
       - python3
       - -c
@@ -4387,7 +4537,7 @@ services:
         import sys, time, urllib.request
         for _ in range(60):
             try:
-                with urllib.request.urlopen("http://172.20.0.110:9091/readyz", timeout=2) as r:
+                with urllib.request.urlopen("http://172.20.0.130:9091/readyz", timeout=2) as r:
                     if r.status == 200:
                         print("engine ready"); sys.exit(0)
             except Exception:
@@ -4409,11 +4559,11 @@ services:
         condition: service_completed_successfully
     volumes:
       - ./siphon-rtp/siphon-rtp-native.yaml:/etc/siphon/siphon.yaml:ro
-      - ./siphon-rtp/proxy_rtp_passthrough.py:/etc/siphon/scripts/proxy_rtp_passthrough.py:ro
+      - ../scripts:/etc/siphon/scripts:ro
       - ../examples:/etc/siphon/examples:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.112
+        ipv4_address: 172.20.0.132
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
       interval: 3s
@@ -4432,10 +4582,10 @@ services:
       - .:/sipp/scenarios:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.113
+        ipv4_address: 172.20.0.133
     entrypoint:
       - sipp
-      - "172.20.0.112:5060"
+      - "172.20.0.132:5060"
       - -sf
       - /sipp/scenarios/register.xml
       - -s
@@ -4458,7 +4608,7 @@ services:
       - .:/sipp/scenarios:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.113
+        ipv4_address: 172.20.0.133
     entrypoint:
       - sipp
       - -sf
@@ -4484,10 +4634,10 @@ services:
       - .:/sipp/scenarios:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.114
+        ipv4_address: 172.20.0.134
     entrypoint:
       - sipp
-      - "172.20.0.112:5060"
+      - "172.20.0.132:5060"
       - -sf
       - /sipp/scenarios/rtpengine_uac.xml
       - -m
@@ -4513,11 +4663,11 @@ services:
         condition: service_completed_successfully
     volumes:
       - ./siphon-rtp/siphon-rtp-ng.yaml:/etc/siphon/siphon.yaml:ro
-      - ./siphon-rtp/proxy_rtp_passthrough.py:/etc/siphon/scripts/proxy_rtp_passthrough.py:ro
+      - ../scripts:/etc/siphon/scripts:ro
       - ../examples:/etc/siphon/examples:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.115
+        ipv4_address: 172.20.0.135
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
       interval: 3s
@@ -4536,10 +4686,10 @@ services:
       - .:/sipp/scenarios:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.116
+        ipv4_address: 172.20.0.136
     entrypoint:
       - sipp
-      - "172.20.0.115:5060"
+      - "172.20.0.135:5060"
       - -sf
       - /sipp/scenarios/register.xml
       - -s
@@ -4562,7 +4712,7 @@ services:
       - .:/sipp/scenarios:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.116
+        ipv4_address: 172.20.0.136
     entrypoint:
       - sipp
       - -sf
@@ -4588,10 +4738,10 @@ services:
       - .:/sipp/scenarios:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.117
+        ipv4_address: 172.20.0.137
     entrypoint:
       - sipp
-      - "172.20.0.115:5060"
+      - "172.20.0.135:5060"
       - -sf
       - /sipp/scenarios/rtpengine_uac.xml
       - -m
@@ -4622,7 +4772,7 @@ services:
       AI_WS_MIN_FRAMES: "10"
     networks:
       sipnet:
-        ipv4_address: 172.20.0.111
+        ipv4_address: 172.20.0.131
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import socket; socket.create_connection(('127.0.0.1',9001),2).close()\""]
       interval: 2s
@@ -4647,7 +4797,7 @@ services:
       - ../examples:/etc/siphon/examples:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.118
+        ipv4_address: 172.20.0.138
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
       interval: 3s
@@ -4668,10 +4818,10 @@ services:
       - .:/sipp/scenarios:ro
     networks:
       sipnet:
-        ipv4_address: 172.20.0.119
+        ipv4_address: 172.20.0.139
     entrypoint:
       - sipp
-      - "172.20.0.118:5060"
+      - "172.20.0.138:5060"
       - -sf
       - /sipp/scenarios/voice_ai_real_uac.xml
       - -m

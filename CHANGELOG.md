@@ -6,7 +6,43 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **CI covers re-INVITE renegotiation on the `siphon-rtp` backend** (`--reoffer`).
+  The existing `--reinvite` mode runs the same hold/resume flow against
+  rtpengine, where a repeat `offer` on a live call-id *is* the re-offer — so it
+  cannot tell a renegotiation from a replacement, which is why the media session
+  being replaced on every re-INVITE went unseen. The mock engine now models the
+  distinction (an `offer` on a new call-id allocates a port, a repeat `offer`
+  replaces the call and allocates a *new* one, a `reoffer` renegotiates in place
+  and keeps it, an unknown call-id errors rather than implicitly creating, and a
+  codec change is refused the way the real engine refuses it), and the job
+  asserts the control verbs the engine actually received: exactly one `offer`
+  and a `reoffer` per re-INVITE. Verified against a reverted fix, where the mock
+  sees three offers and no re-offers — while SIPp still exits 0, which is why
+  the assertion is on the verbs and not on the call outcome.
+
 ### Fixed
+- **A proxied in-dialog request whose Request-URI addresses the proxy itself is
+  now forwarded to the dialog's established peer instead of failing as a
+  routing loop.** RFC 3261 §12.2.1.1 has the UAC build a mid-dialog request
+  from the remote target (the peer's Contact) plus the route set, but a common
+  class of UAC keeps the proxy's address in the R-URI — so after the proxy
+  consumed its own Route (§16.4) the computed next hop was the proxy itself,
+  and the request was answered `482 Loop Detected` (re-INVITE/UPDATE/BYE) or
+  silently dropped (the end-to-end 2xx ACK, leaving the UAS retransmitting its
+  200 until Timer H). On a hold/resume pair the resume re-INVITE was the
+  visible casualty: the caller never got its 200 and the call hung. Both paths
+  now fall back to the dialog session's established downstream branch when the
+  resolved next hop is one of our own listeners, and only a session whose
+  branch *also* points at us still draws the loop answer. A completed
+  re-INVITE's per-transaction session teardown also no longer evicts the
+  dialog-establishing INVITE's dialog-key entry (the removal twin of the
+  insert-side first-writer-wins guard), so the *second* and later in-dialog
+  requests of a call still find the dialog. The `--reinvite` SIPp mode now
+  actually gates on this: the runner propagates the UAC's exit code, the UAC
+  fails on the global timeout, and each re-INVITE's 200 is asserted by CSeq so
+  a retransmitted initial-INVITE 200 can no longer mask a lost re-INVITE.
+
 - **`cdr.file.rotate_size_mb` actually rotates.** The value was documented,
   parsed and carried into the file backend, then dropped at the write site — so
   a CDR file configured with `rotate_size_mb: 100` grew without bound. It now
@@ -94,6 +130,39 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   agent", and documented in `docs/cookbook/voice-ai.md`.
 
 ### Fixed
+- **A re-INVITE or UPDATE on a `siphon-rtp`-anchored call replaced its media
+  session instead of renegotiating it.** siphon has only ever had one verb for
+  an SDP offer, and on rtpengine that is correct — a repeat `offer` on a live
+  call-id *is* a re-offer, which is how `rtpengine_manage()` has always done
+  hold and codec renegotiation. siphon-rtp draws the line differently: a repeat
+  `offer` there is a **replacement**, so the engine freed the call and allocated
+  fresh ports. The visible damage was not the ports (siphon answers with the
+  rewritten SDP either way) but everything attached to them — the WebSocket
+  bridge, any `ws_tee`, and any SIPREC subscription were torn down with the old
+  call. So putting a voice-AI call on hold, or any mid-dialog renegotiation,
+  silently killed the audio path to the AI while the call itself carried on,
+  and left a spurious media CDR with reason `replaced` behind. A call this
+  process has already anchored now renegotiates with `siphon-rtp-proto` 0.2.0's
+  `reoffer`, which keeps the ports, the pipeline and the attachments, and
+  carries an RFC 8445 §9 ICE restart when the peer offers new credentials.
+  Covers the framework's re-INVITE and UPDATE paths and the script-facing
+  `rtpengine.offer()`; rtpengine and rtpproxy still send a plain offer, so their
+  wire is byte-identical to before.
+- **A re-offer is addressed by the media session's own engine call-id.**
+  `rtpengine.offer()` used the SIP Call-ID, but a siphon-terminated transfer
+  deliberately re-anchors the surviving pair on a *fresh* engine call-id while
+  the store key stays the SIP one — so a re-INVITE after a transfer addressed a
+  call-id the engine had never heard of. It now uses `rtpengine_id()`, as every
+  other post-offer verb already did, and no longer re-inserts the media session
+  on a re-offer (which reset that id and cleared the `to_tag` the answer set).
+- **The one case a re-offer cannot serve falls back explicitly.** The engine
+  refuses a re-offer that changes the negotiated codec — that needs a pipeline
+  rebuild it will not do on a live call — and its error says to replace the call
+  instead. That refusal, and only that refusal, is retried as a replacement
+  `offer`, which is exactly the behaviour such a re-INVITE had before. It is
+  logged at WARN naming the consequence (ports re-allocated, bridge/tee/SIPREC
+  dropped) rather than performed silently, and the match is deliberately narrow
+  so no other engine error can acquire a call-replacing retry.
 - **A challenged REFER was never retried, and its response was dropped
   entirely.** A REFER siphon originates on one of its own legs is allocated a
   fresh Via branch that belongs to no leg, and responses are matched to a call by

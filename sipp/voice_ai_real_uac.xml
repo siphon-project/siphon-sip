@@ -63,7 +63,7 @@ a=ptime:30
        assertion has to. -->
   <recv response="200" rtd="true" crlf="true" rrs="true">
     <action>
-      <ereg regexp="c=IN IP4 172\.20\.0\.110"
+      <ereg regexp="c=IN IP4 172\.20\.0\.130"
             search_in="body"
             check_it="true"
             assign_to="anchored" />

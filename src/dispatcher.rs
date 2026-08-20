@@ -3844,28 +3844,48 @@ fn relay_request(
         }
     }
 
-    // Prevent routing loops — don't relay to ourselves
+    // Prevent routing loops — don't relay to ourselves.  Before treating this
+    // as a loop, try the mid-dialog rescue: a UAC that keeps the proxy's
+    // address in the R-URI of its re-INVITE/UPDATE/BYE (instead of the remote
+    // target per RFC 3261 §12.2.1.1) computes a next hop that is us, but the
+    // dialog's session still knows the established downstream branch — forward
+    // there rather than failing a call we can route (§16.5).
     if state.is_own_address(&destination) {
-        // ACK to 2xx is end-to-end and should go to the UAS Contact, not the
-        // proxy. If the R-URI still points at us, silently drop rather than
-        // generating a response (ACK never gets a response per RFC 3261).
-        let is_ack = matches!(
-            &message.start_line,
-            StartLine::Request(rl) if rl.method == crate::sip::message::Method::Ack
-        );
-        if is_ack {
-            debug!(target = %target_uri_string, "ACK to self — silently dropping");
+        if let Some((established_destination, established_transport)) =
+            rescue_in_dialog_self_next_hop(message, &state.session_store, &|address| {
+                state.is_own_address(address)
+            })
+        {
+            debug!(
+                target = %target_uri_string,
+                resolved = %destination,
+                destination = %established_destination,
+                "in-dialog next hop resolves to ourselves — forwarding to the dialog's established branch (RFC 3261 §12.2.1.1)"
+            );
+            destination = established_destination;
+            outbound_transport = established_transport;
+        } else {
+            // ACK to 2xx is end-to-end and should go to the UAS Contact, not the
+            // proxy. If the R-URI still points at us, silently drop rather than
+            // generating a response (ACK never gets a response per RFC 3261).
+            let is_ack = matches!(
+                &message.start_line,
+                StartLine::Request(rl) if rl.method == crate::sip::message::Method::Ack
+            );
+            if is_ack {
+                debug!(target = %target_uri_string, "ACK to self — silently dropping");
+                return;
+            }
+
+            warn!(
+                target = %target_uri_string,
+                destination = %destination,
+                "relay loop detected — destination is ourselves"
+            );
+            let response = build_response(message, 482, "Loop Detected", state.server_header.as_deref(), &[]);
+            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
             return;
         }
-
-        warn!(
-            target = %target_uri_string,
-            destination = %destination,
-            "relay loop detected — destination is ourselves"
-        );
-        let response = build_response(message, 482, "Loop Detected", state.server_header.as_deref(), &[]);
-        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
-        return;
     }
 
     // Clone the message for modification
@@ -7580,13 +7600,83 @@ fn in_dialog_reuse_destination(
     message: &SipMessage,
     state: &DispatcherState,
 ) -> Option<(SocketAddr, Transport)> {
+    in_dialog_established_branch(message, &state.session_store)
+}
+
+/// Store-level core of [`in_dialog_reuse_destination`]: the dialog's
+/// established downstream branch, looked up by the dialog key
+/// `(Call-ID, From-tag)`.  Split from `DispatcherState` so the self-next-hop
+/// rescue below is unit-testable against a bare [`ProxySessionStore`].
+fn in_dialog_established_branch(
+    message: &SipMessage,
+    session_store: &ProxySessionStore,
+) -> Option<(SocketAddr, Transport)> {
     let call_id = message.headers.get("Call-ID")?;
     let from_tag = message.typed_from().ok().flatten().and_then(|na| na.tag)?;
-    let session_arc = state.session_store.get_by_dialog_key(call_id, &from_tag)?;
+    let session_arc = session_store.get_by_dialog_key(call_id, &from_tag)?;
     let session = session_arc.read().ok()?;
     let client_key = session.client_keys.first()?;
     let branch = session.get_client_branch(client_key)?;
     Some((branch.destination, branch.transport))
+}
+
+/// Rescue an in-dialog request whose computed next hop resolved to one of OUR
+/// OWN listeners.
+///
+/// RFC 3261 §12.2.1.1 has the UAC build a mid-dialog request from the remote
+/// target (the peer's Contact) and the route set (our Record-Route).  A
+/// non-compliant-but-common UAC instead keeps the proxy's address in the
+/// Request-URI — so after `loose_route()` consumed our Route (§16.4) the
+/// remaining next hop (the R-URI) *is us*, and blindly answering
+/// `482 Loop Detected` fails a request we hold the correct destination for:
+/// the dialog's established downstream branch.  §16.5 makes us responsible
+/// for a Request-URI in our own domain, and for a mid-dialog request the only
+/// consistent target is the dialog peer, so forward there.
+///
+/// Returns `None` — caller keeps its existing drop/482 behaviour — when the
+/// request is not mid-dialog (no To-tag, RFC 3261 §12.2), the dialog is not in
+/// the session store, or the established branch is (also) one of our own
+/// addresses (a genuine loop).
+fn rescue_in_dialog_self_next_hop(
+    message: &SipMessage,
+    session_store: &ProxySessionStore,
+    is_self: &dyn Fn(&SocketAddr) -> bool,
+) -> Option<(SocketAddr, Transport)> {
+    let has_to_tag = message
+        .typed_to()
+        .ok()
+        .flatten()
+        .and_then(|name_addr| name_addr.tag)
+        .is_some();
+    if !has_to_tag {
+        return None;
+    }
+    let (destination, transport) = in_dialog_established_branch(message, session_store)?;
+    if is_self(&destination) {
+        return None;
+    }
+    Some((destination, transport))
+}
+
+/// Decide the forward hop for an end-to-end 2xx ACK after dialog-route-set
+/// resolution: keep the resolved hop unless it is one of our own addresses, in
+/// which case fall back to the dialog's established branch (same
+/// RFC 3261 §12.2.1.1 rescue as [`rescue_in_dialog_self_next_hop`] — the UAC
+/// kept the proxy's address in the R-URI instead of the remote target).  `None`
+/// means both hops point back at us — a genuine loop, drop the ACK silently
+/// (RFC 3261 §17.1.1.3: an ACK never gets a response).
+fn ack_forward_hop(
+    resolved: (SocketAddr, Transport, ConnectionId),
+    established: (SocketAddr, Transport, ConnectionId),
+    is_self: &dyn Fn(&SocketAddr) -> bool,
+) -> Option<(SocketAddr, Transport, ConnectionId)> {
+    if !is_self(&resolved.0) {
+        return Some(resolved);
+    }
+    if is_self(&established.0) {
+        return None;
+    }
+    Some(established)
 }
 
 /// Pin the outbound transport to a matching IPsec SA's protocol
@@ -10919,21 +11009,45 @@ fn handle_ack_via_session(
             );
 
             // Loop guard (RFC 3261 §16.3): never forward an ACK back to one of
-            // our own listen addresses.  A stray/misrouted 2xx ACK whose route
-            // set or R-URI resolves to us (e.g. a non-compliant UAC ACKing a
-            // final whose R-URI is the proxy, matched here by `by_dialog_key`)
-            // would otherwise be re-received and re-relayed, stacking a Via each
-            // hop until the datagram exceeds the UDP recv buffer and is dropped
-            // on a parse error.  ACK gets no response (RFC 3261 §17.1.1.3), so
-            // drop silently — mirroring the relay-path guard in `relay_request`.
-            if state.is_own_address(&destination) {
-                debug!(
-                    client_key = %client_key,
-                    %destination,
-                    "ACK to self via dialog route set — dropping (loop guard)"
-                );
-                continue;
-            }
+            // our own listen addresses.  A next hop that resolves to us means
+            // the UAC kept the proxy's address in the ACK's R-URI instead of
+            // the dialog's remote target (RFC 3261 §12.2.1.1) — but the ACK is
+            // dialog-matched, and the session's established branch IS the
+            // remote target, so fall back to it rather than dropping an ACK we
+            // can deliver (a dropped 2xx ACK leaves the UAS retransmitting its
+            // 200 until Timer H and tearing the dialog down).  Only when the
+            // established branch is *also* one of our own addresses is this a
+            // genuine loop; ACK gets no response (RFC 3261 §17.1.1.3), so drop
+            // silently — mirroring the relay-path guard in `relay_request`.
+            let (destination, out_transport, ack_connection_id) = match ack_forward_hop(
+                (destination, out_transport, ack_connection_id),
+                (
+                    client_branch.destination,
+                    client_branch.transport,
+                    client_branch.connection_id,
+                ),
+                &|address| state.is_own_address(address),
+            ) {
+                Some(hop) => {
+                    if hop.0 != destination {
+                        debug!(
+                            client_key = %client_key,
+                            resolved = %destination,
+                            destination = %hop.0,
+                            "2xx ACK next hop resolves to ourselves — falling back to the dialog's established branch (RFC 3261 §12.2.1.1)"
+                        );
+                    }
+                    hop
+                }
+                None => {
+                    debug!(
+                        client_key = %client_key,
+                        %destination,
+                        "ACK to self via dialog route set — dropping (loop guard)"
+                    );
+                    continue;
+                }
+            };
 
             // Add our Via on top (preserving existing Vias), reflecting the
             // transport we will actually send over.
@@ -18597,7 +18711,7 @@ fn handle_b2bua_reinvite(
                         let offer_flags = profile.offer.clone();
                         match tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(
-                                rtpengine_set.offer(session.rtpengine_id(), offer_tag, &forwarded.body, &offer_flags)
+                                rtpengine_set.reoffer(session.rtpengine_id(), offer_tag, &forwarded.body, &offer_flags)
                             )
                         }) {
                             Ok(rewritten_sdp) => {
@@ -19025,7 +19139,7 @@ fn handle_b2bua_update(
                         let offer_flags = profile.offer.clone();
                         match tokio::task::block_in_place(|| {
                             tokio::runtime::Handle::current().block_on(
-                                rtpengine_set.offer(session.rtpengine_id(), offer_tag, &forwarded.body, &offer_flags)
+                                rtpengine_set.reoffer(session.rtpengine_id(), offer_tag, &forwarded.body, &offer_flags)
                             )
                         }) {
                             Ok(rewritten_sdp) => {
@@ -24089,6 +24203,276 @@ a=rtpmap:8 PCMA/8000\r\n";
             ConnectionId::default(),
             "fresh resolution must not reuse the established connection_id",
         );
+    }
+
+    // --- Mid-dialog self-next-hop rescue (RFC 3261 §12.2.1.1 / §16.5) ---
+    //
+    // The field case: a UAC keeps the proxy's address in the R-URI of its
+    // in-dialog re-INVITE/ACK ("sip:bob@<proxy>:5060") instead of the remote
+    // target from the 200's Contact.  After loose_route() consumed our Route
+    // the computed next hop resolves to ourselves; the old behaviour answered
+    // 482 Loop Detected (re-INVITE) / silently dropped (ACK), failing the
+    // hold/resume of a call whose correct destination sits in the dialog's
+    // session.  These tests pin the rescue: forward to the established branch.
+
+    const RESCUE_PROXY: &str = "192.0.2.1:5060";
+    const RESCUE_CALLEE: &str = "198.51.100.7:5060";
+
+    fn rescue_is_self(address: &SocketAddr) -> bool {
+        *address == RESCUE_PROXY.parse::<SocketAddr>().unwrap()
+    }
+
+    fn rescue_dialog_invite(call_id: &str) -> SipMessage {
+        // Dialog-establishing INVITE (no To-tag) — the session's original_request.
+        SipMessageBuilder::new()
+            .request(
+                Method::Invite,
+                SipUri::new("192.0.2.1".to_string()).with_user("bob".to_string()),
+            )
+            .via("SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bK-orig".to_string())
+            .to("<sip:bob@192.0.2.1>".to_string())
+            .from("<sip:alice@203.0.113.9>;tag=alice-tag".to_string())
+            .call_id(call_id.to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap()
+    }
+
+    fn rescue_in_dialog_message(method: Method, call_id: &str, cseq: u32, to_tag: bool) -> SipMessage {
+        let to = if to_tag {
+            "<sip:bob@192.0.2.1>;tag=bob-tag".to_string()
+        } else {
+            "<sip:bob@192.0.2.1>".to_string()
+        };
+        let cseq_header = format!("{cseq} {}", method.as_str());
+        SipMessageBuilder::new()
+            .request(
+                method,
+                SipUri::new("192.0.2.1".to_string()).with_user("bob".to_string()),
+            )
+            .via(format!("SIP/2.0/UDP 203.0.113.9:5060;branch=z9hG4bK-cseq{cseq}"))
+            .to(to)
+            .from("<sip:alice@203.0.113.9>;tag=alice-tag".to_string())
+            .call_id(call_id.to_string())
+            .cseq(cseq_header)
+            .content_length(0)
+            .build()
+            .unwrap()
+    }
+
+    fn rescue_store_with_dialog(call_id: &str) -> ProxySessionStore {
+        let store = ProxySessionStore::new();
+        let invite_client_key = TransactionKey::new(
+            "z9hG4bK-branch0".to_string(),
+            Method::Invite,
+            RESCUE_PROXY.to_string(),
+        );
+        let mut session = ProxySession::new(
+            TransactionKey::new(
+                "z9hG4bK-orig".to_string(),
+                Method::Invite,
+                "203.0.113.9:5060".to_string(),
+            ),
+            "203.0.113.9:5060".parse().unwrap(),
+            RESCUE_PROXY.parse().unwrap(),
+            ConnectionId::default(),
+            Transport::Udp,
+            rescue_dialog_invite(call_id),
+            true,
+        );
+        session.add_client_key(invite_client_key.clone());
+        session.set_client_branch(
+            invite_client_key,
+            ClientBranch {
+                destination: RESCUE_CALLEE.parse().unwrap(),
+                transport: Transport::Udp,
+                connection_id: ConnectionId::default(),
+            },
+        );
+        store.insert(session);
+        store
+    }
+
+    #[test]
+    fn reinvite_addressed_at_proxy_reroutes_to_established_branch() {
+        // The repro: hold re-INVITE with R-URI sip:bob@<proxy> — the computed
+        // next hop is us, but the dialog's established branch is the callee.
+        let store = rescue_store_with_dialog("rescue-1");
+        let reinvite = rescue_in_dialog_message(Method::Invite, "rescue-1", 2, true);
+        let rescued = rescue_in_dialog_self_next_hop(&reinvite, &store, &rescue_is_self);
+        assert_eq!(
+            rescued,
+            Some((RESCUE_CALLEE.parse().unwrap(), Transport::Udp)),
+            "in-dialog re-INVITE addressed at the proxy must forward to the dialog's established branch"
+        );
+    }
+
+    #[test]
+    fn resume_reinvite_still_reroutes_after_hold_transaction_cleanup() {
+        // The SECOND re-INVITE of a hold/resume pair: the hold's own
+        // per-transaction session was inserted (same dialog key — insert's
+        // or_insert_with keeps the INVITE's entry) and cleaned up when its
+        // transaction completed.  The resume must still find the dialog.
+        let store = rescue_store_with_dialog("rescue-2");
+
+        // Hold re-INVITE relayed: relay_request inserts a per-transaction session.
+        let hold_client_key = TransactionKey::new(
+            "z9hG4bK-hold-branch".to_string(),
+            Method::Invite,
+            RESCUE_PROXY.to_string(),
+        );
+        let mut hold_session = ProxySession::new(
+            TransactionKey::new(
+                "z9hG4bK-cseq2".to_string(),
+                Method::Invite,
+                "203.0.113.9:5060".to_string(),
+            ),
+            "203.0.113.9:5060".parse().unwrap(),
+            RESCUE_PROXY.parse().unwrap(),
+            ConnectionId::default(),
+            Transport::Udp,
+            rescue_in_dialog_message(Method::Invite, "rescue-2", 2, true),
+            false,
+        );
+        hold_session.add_client_key(hold_client_key.clone());
+        hold_session.set_client_branch(
+            hold_client_key.clone(),
+            ClientBranch {
+                destination: RESCUE_CALLEE.parse().unwrap(),
+                transport: Transport::Udp,
+                connection_id: ConnectionId::default(),
+            },
+        );
+        store.insert(hold_session);
+        // Hold's 200 forwarded → its client transaction is cleaned up.
+        store.remove_client_key(&hold_client_key);
+
+        let resume = rescue_in_dialog_message(Method::Invite, "rescue-2", 3, true);
+        let rescued = rescue_in_dialog_self_next_hop(&resume, &store, &rescue_is_self);
+        assert_eq!(
+            rescued,
+            Some((RESCUE_CALLEE.parse().unwrap(), Transport::Udp)),
+            "the resume re-INVITE must still reach the callee after the hold's transaction is cleaned up"
+        );
+    }
+
+    #[test]
+    fn out_of_dialog_request_is_not_rescued() {
+        // No To-tag → not mid-dialog (RFC 3261 §12.2): a genuinely misdirected
+        // initial request must keep drawing 482, never be steered by a session
+        // that happens to share (Call-ID, From-tag).
+        let store = rescue_store_with_dialog("rescue-3");
+        let initial = rescue_in_dialog_message(Method::Invite, "rescue-3", 1, false);
+        assert_eq!(
+            rescue_in_dialog_self_next_hop(&initial, &store, &rescue_is_self),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_dialog_is_not_rescued() {
+        let store = ProxySessionStore::new();
+        let reinvite = rescue_in_dialog_message(Method::Invite, "rescue-4", 2, true);
+        assert_eq!(
+            rescue_in_dialog_self_next_hop(&reinvite, &store, &rescue_is_self),
+            None
+        );
+    }
+
+    #[test]
+    fn rescue_declines_when_established_branch_is_also_ourselves() {
+        // Genuine loop: the session's branch ALSO points at us → keep the 482.
+        let store = ProxySessionStore::new();
+        let invite_client_key = TransactionKey::new(
+            "z9hG4bK-branch0".to_string(),
+            Method::Invite,
+            RESCUE_PROXY.to_string(),
+        );
+        let mut session = ProxySession::new(
+            TransactionKey::new(
+                "z9hG4bK-orig".to_string(),
+                Method::Invite,
+                "203.0.113.9:5060".to_string(),
+            ),
+            "203.0.113.9:5060".parse().unwrap(),
+            RESCUE_PROXY.parse().unwrap(),
+            ConnectionId::default(),
+            Transport::Udp,
+            rescue_dialog_invite("rescue-5"),
+            true,
+        );
+        session.add_client_key(invite_client_key.clone());
+        session.set_client_branch(
+            invite_client_key,
+            ClientBranch {
+                destination: RESCUE_PROXY.parse().unwrap(),
+                transport: Transport::Udp,
+                connection_id: ConnectionId::default(),
+            },
+        );
+        store.insert(session);
+
+        let reinvite = rescue_in_dialog_message(Method::Invite, "rescue-5", 2, true);
+        assert_eq!(
+            rescue_in_dialog_self_next_hop(&reinvite, &store, &rescue_is_self),
+            None
+        );
+    }
+
+    #[test]
+    fn ack_forward_hop_keeps_resolved_hop_when_not_self() {
+        let resolved = (
+            RESCUE_CALLEE.parse::<SocketAddr>().unwrap(),
+            Transport::Udp,
+            ConnectionId(3),
+        );
+        let established = (
+            "198.51.100.9:5060".parse::<SocketAddr>().unwrap(),
+            Transport::Tcp,
+            ConnectionId(4),
+        );
+        assert_eq!(
+            ack_forward_hop(resolved, established, &rescue_is_self),
+            Some(resolved)
+        );
+    }
+
+    #[test]
+    fn ack_forward_hop_falls_back_to_established_branch_when_resolved_is_self() {
+        // The 2xx ACK with R-URI sip:bob@<proxy>: the resolved hop is us, the
+        // established branch is the UAS that answered — deliver the ACK there
+        // instead of dropping it (a dropped 2xx ACK leaves the UAS
+        // retransmitting its 200 until Timer H).
+        let resolved = (
+            RESCUE_PROXY.parse::<SocketAddr>().unwrap(),
+            Transport::Udp,
+            ConnectionId(3),
+        );
+        let established = (
+            RESCUE_CALLEE.parse::<SocketAddr>().unwrap(),
+            Transport::Udp,
+            ConnectionId(4),
+        );
+        assert_eq!(
+            ack_forward_hop(resolved, established, &rescue_is_self),
+            Some(established)
+        );
+    }
+
+    #[test]
+    fn ack_forward_hop_drops_when_both_hops_are_self() {
+        let resolved = (
+            RESCUE_PROXY.parse::<SocketAddr>().unwrap(),
+            Transport::Udp,
+            ConnectionId(3),
+        );
+        let established = (
+            RESCUE_PROXY.parse::<SocketAddr>().unwrap(),
+            Transport::Udp,
+            ConnectionId(4),
+        );
+        assert_eq!(ack_forward_hop(resolved, established, &rescue_is_self), None);
     }
 
     // --- B2BUA 401/407/422 retry connection reuse (RFC 5923) ---

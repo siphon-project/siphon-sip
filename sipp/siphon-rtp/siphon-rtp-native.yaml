@@ -17,12 +17,12 @@ listen:
   udp:
     - "0.0.0.0:5060"
 
-advertised_address: "172.20.0.112"
+advertised_address: "172.20.0.132"
 
 domain:
   local:
     - "siphon.test"
-    - "172.20.0.112"
+    - "172.20.0.132"
     - "127.0.0.1"
 
 script:
@@ -44,7 +44,7 @@ auth:
 media:
   backend: siphon-rtp
   siphon_rtp:
-    address: "172.20.0.110:8080"
+    address: "172.20.0.130:8080"
     timeout_ms: 2000
 
 log:

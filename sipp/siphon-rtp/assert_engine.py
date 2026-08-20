@@ -16,7 +16,7 @@ Two independent oracles, neither of which the SIPp scenario can see:
              passing by absence.
 
 Usage:
-    assert_engine.py metrics --url http://172.20.0.110:9091/metrics \
+    assert_engine.py metrics --url http://172.20.0.130:9091/metrics \
         --min-offers 1 --min-deletes 1 --max-control-errors 0
     docker compose logs mock-ai-ws | assert_engine.py ws
 """
@@ -154,7 +154,7 @@ def main() -> int:
     sub = parser.add_subparsers(dest="mode", required=True)
 
     metrics = sub.add_parser("metrics", help="assert on the engine's Prometheus counters")
-    metrics.add_argument("--url", default="http://172.20.0.110:9091/metrics")
+    metrics.add_argument("--url", default="http://172.20.0.130:9091/metrics")
     metrics.add_argument("--timeout", type=float, default=5.0)
     metrics.add_argument("--min-offers", type=float, default=0)
     metrics.add_argument("--min-answers", type=float, default=0)

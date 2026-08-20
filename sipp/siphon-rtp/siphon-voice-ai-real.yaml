@@ -17,7 +17,7 @@ domain:
   local:
     - "ai.example.com"
 
-advertised_address: "172.20.0.118"
+advertised_address: "172.20.0.138"
 
 script:
   path: "/etc/siphon/scripts/voice_ai_real.py"
@@ -25,7 +25,7 @@ script:
 media:
   backend: siphon-rtp
   siphon_rtp:
-    address: "172.20.0.110:8080"
+    address: "172.20.0.130:8080"
     timeout_ms: 2000
 
   profiles:
@@ -53,7 +53,7 @@ gateway:
         enabled: false
       destinations:
         - uri: "sip:uac.test:5060"
-          address: "172.20.0.119:5060"
+          address: "172.20.0.139:5060"
 
 log:
   level: info
