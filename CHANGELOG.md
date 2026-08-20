@@ -6,6 +6,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-08-20
+
 ### Added
 - **`auth.generate_nonce()` and `auth.validate_nonce(nonce)` are reachable from
   scripts.** Both existed, but in a plain `impl` rather than a `#[pymethods]`
