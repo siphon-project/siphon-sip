@@ -29,7 +29,16 @@ security:
   apiban:                       # optional: APIBAN community blocklist
     api_key: "your-api-key"
     interval_secs: 300
+    ban_ttl_secs: 604800        # 7 days, matching the feed's own release
+                                # policy. 0 = never expire.
 ```
+
+`trusted_cidrs` covers the feed too: an address listed by APIBAN that matches a
+trusted CIDR is dropped as the feed is ingested, so it reaches neither the
+userspace ACL nor the kernel set. Put your own trunks, monitoring and management
+addresses there — a community blocklist has no way to know they're yours, and
+the kernel drop is port-agnostic, so a listed management address would cost you
+ssh along with the trunk.
 
 ### How the scoring works
 

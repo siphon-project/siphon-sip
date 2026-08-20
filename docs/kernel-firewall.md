@@ -18,9 +18,22 @@ The same sources SIPhon already bans, now enforced in the kernel:
   store. Each ban is pushed to the kernel with the **same TTL** as the in-memory
   ban, so both expire in lockstep.
 - **APIBAN** — every IP from the [APIBAN](https://apiban.org) community blocklist,
-  added permanently (the blocklist carries no per-IP lifetime).
+  added with the `apiban.ban_ttl_secs` TTL (default 7 days, matching the interval
+  after which the feed itself releases an address) as a per-element timeout, so
+  the kernel expires them without SIPhon acting. Set `ban_ttl_secs: 0` to add
+  them permanently instead.
 
-`trusted_cidrs` are never banned, so they're never in the set.
+`trusted_cidrs` are never banned, so they're never in the set. That applies to
+both sources: the auto-ban store exempts trusted sources before scoring, and
+APIBAN drops trusted addresses as the feed is ingested, before either the
+userspace ACL or the kernel set sees them. This matters more for the feed than
+it looks — the kernel drop is port-agnostic, so a management address that landed
+on a community blocklist would take ssh down with the trunk.
+
+Because the poll only fetches *forward* from the last seen id, an address whose
+TTL expires while it is still abusive returns to the set when the feed re-lists
+it, not immediately. That is how the feed publishes; it isn't a full
+re-synchronisation.
 
 ## Enable it
 
@@ -117,8 +130,9 @@ SIPhon only ever **creates** its objects — it never deletes a table or chain i
 finds, because it can't know the objects aren't yours. So if you rename `table`
 / `chain` in the config, flip `manage_rule` off, or remove `firewall:` entirely,
 the previously created table (and its drop rules) stays in the kernel and keeps
-dropping whatever is still in its sets — including permanent APIBAN entries that
-never expire. Remove it explicitly:
+dropping whatever is still in its sets until each element's timeout runs out —
+and indefinitely for any element added with `ban_ttl_secs: 0`. Remove it
+explicitly:
 
 ```bash
 nft delete table inet siphon

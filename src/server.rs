@@ -3169,7 +3169,10 @@ fn build_transport_acl(
 
     if let Some(ref sec) = config.security {
         let apiban_set = if let Some(ref apiban_config) = sec.apiban {
-            match crate::apiban::ApiBanClient::new(apiban_config) {
+            // trusted_cidrs is applied inside the client, at insert, so a
+            // trusted source reaches neither the userspace store nor the
+            // kernel set. Doing it here would only cover the former.
+            match crate::apiban::ApiBanClient::new(apiban_config, &sec.trusted_cidrs) {
                 Ok(client) => {
                     let client = client.with_firewall(firewall.clone());
                     let banned = client.banned();

@@ -42,6 +42,14 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   actually gates on this: the runner propagates the UAC's exit code, the UAC
   fails on the global timeout, and each re-INVITE's 200 is asserted by CSeq so
   a retransmitted initial-INVITE 200 can no longer mask a lost re-INVITE.
+- **`security.trusted_cidrs` now covers the APIBAN blocklist.** The transport
+  ACL consulted the fetched set directly, before the deny/allow lists and with
+  no trusted check, and the kernel-firewall path had none either — so a trusted
+  source that landed on the community feed was dropped anyway and no config
+  could save it. Since the kernel drop is port-agnostic, a listed management
+  address took ssh down with the trunk. Trusted addresses are now filtered as
+  the feed is ingested, ahead of both the userspace store and the kernel set,
+  which is what `docs/kernel-firewall.md` already claimed.
 
 - **`cdr.file.rotate_size_mb` actually rotates.** The value was documented,
   parsed and carried into the file backend, then dropped at the write site — so
@@ -55,6 +63,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   does not re-rotate the size-rotated siblings.
 
 ### Added
+- **`security.apiban.ban_ttl_secs` expires blocklist entries** (default `604800`,
+  7 days, matching the interval after which APIBAN itself releases an address).
+  Entries used to be inserted permanently and the poll only ever fetched
+  forward, so the set grew for the life of the process and a false positive
+  stayed blocked until a restart — which drops every registration — or until it
+  was lifted one address at a time. The TTL is applied as a per-element kernel
+  timeout, so nf_tables expires entries without siphon acting, and the userspace
+  store enforces the deadline on read as well as sweeping on the poll cycle.
+  `0` restores the previous never-expire behaviour. Note the poll still only
+  fetches forward from the last seen id: an address whose TTL expires while it
+  is still abusive returns when the feed re-lists it, not immediately.
 - **Inbound REFER on a controlled call is surfaced to the control app as a
   `TransferRequested` event.** When a B2BUA call has been handed to an external
   control app, an in-dialog REFER on that call is no longer run through the
