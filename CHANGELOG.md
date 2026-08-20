@@ -85,6 +85,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   an identity already proven, it does not prove one.
 
 ### Fixed
+- **A proxy-mode CDR now carries `auth_user`.** `cdr_session_from_invite` took
+  the authenticated username and both of its callers passed `None`, so the
+  `auth_user` field on a proxy CDR was always empty even when the script had
+  authenticated the caller — while the documentation on
+  `CdrSession::set_auth_user` claimed the proxy path supplied it at
+  session-build time. It is now read off the request after the handler has run,
+  so a script that authenticated the caller (or normalised the identity
+  afterwards) is what reaches the record. The B2BUA path was already correct: it
+  opens the CDR at INVITE time, before `@b2bua.on_invite` runs, and stamps the
+  username on once the handler returns.
 - **`auth_user` no longer raises `AttributeError` on a real node.** The SDK mock
   exposed `Request.auth_user` as a writable property while the binding had only
   a getter, so a script assigning it passed pytest and failed at runtime. Mock

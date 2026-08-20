@@ -3363,12 +3363,12 @@ fn handle_request(
     request.set_inbound_flow(inbound.local_addr, inbound.connection_id.0);
 
     // Call Python handlers
-    let (action, record_routed, on_reply_cb, on_failure_cb, send_via_transport, send_via_target, reply_headers, reply_body) = Python::attach(|python| {
+    let (action, record_routed, on_reply_cb, on_failure_cb, send_via_transport, send_via_target, reply_headers, reply_body, auth_user) = Python::attach(|python| {
         let py_request = match Py::new(python, request) {
             Ok(py) => py,
             Err(error) => {
                 error!("failed to create PyRequest: {error}");
-                return (RequestAction::None, false, None, None, None, None, vec![], None);
+                return (RequestAction::None, false, None, None, None, None, vec![], None, None);
             }
         };
 
@@ -3398,6 +3398,7 @@ fn handle_request(
                                 None,
                                 vec![],
                                 None,
+                                None,
                             );
                         }
                     }
@@ -3417,6 +3418,7 @@ fn handle_request(
                         None,
                         vec![],
                         None,
+                        None,
                     );
                 }
             }
@@ -3431,7 +3433,11 @@ fn handle_request(
         let send_via_target = borrowed.via_target_override().map(|s| s.to_string());
         let reply_headers = borrowed.take_reply_headers();
         let reply_body = borrowed.take_reply_body();
-        (action, record_routed, on_reply, on_failure, send_via_transport, send_via_target, reply_headers, reply_body)
+        // Read *after* the handler ran, so a script that authenticated the
+        // caller — or normalised the identity afterwards — is what reaches the
+        // CDR. Reading it before would always be empty.
+        let auth_user = borrowed.get_auth_user().map(String::from);
+        (action, record_routed, on_reply, on_failure, send_via_transport, send_via_target, reply_headers, reply_body, auth_user)
     });
 
     // Process the action
@@ -3716,6 +3722,7 @@ fn handle_request(
             &message_guard,
             &inbound.remote_addr.ip().to_string(),
             &format!("{}", inbound.transport).to_lowercase(),
+            auth_user.as_deref(),
         );
     }
 
@@ -9587,11 +9594,16 @@ fn cdr_track_proxy_start(
     invite: &SipMessage,
     source_ip: &str,
     transport: &str,
+    // Username the script authenticated the caller as, read after the handler
+    // ran. `None` when the call was never challenged.
+    auth_user: Option<&str>,
 ) {
     if !crate::cdr::auto_emit_enabled() {
         return;
     }
-    if let Some((key, session)) = cdr_session_from_invite(invite, source_ip, transport, None) {
+    if let Some((key, session)) =
+        cdr_session_from_invite(invite, source_ip, transport, auth_user.map(String::from))
+    {
         state.cdr_sessions.entry(key).or_insert(session);
     }
 }
@@ -21434,6 +21446,83 @@ mod tests {
     #[test]
     fn lcr_headers_on_a_route_with_none_inject_nothing() {
         assert!(lcr_injectable_headers(&route_with_headers(&[]), "call-id@host").is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // The authenticated identity has to reach the proxy-mode CDR
+    // -----------------------------------------------------------------------
+
+    fn invite_for_cdr() -> SipMessage {
+        let raw = concat!(
+            "INVITE sip:bob@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-cdr\r\n",
+            "From: <sip:alice@example.com>;tag=a-tag\r\n",
+            "To: <sip:bob@example.com>\r\n",
+            "Call-ID: cdr-auth@host\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        parse_sip_message(raw).expect("fixture parses").1
+    }
+
+    #[test]
+    fn a_proxy_cdr_carries_the_authenticated_username() {
+        // `cdr_session_from_invite` took an `auth_user` and both callers passed
+        // `None`, so a proxy-mode CDR's `auth_user` was always empty even when
+        // the script had authenticated the caller — while the doc on
+        // `CdrSession::set_auth_user` claimed the proxy path supplied it at
+        // session-build time.
+        let (_, session) = cdr_session_from_invite(
+            &invite_for_cdr(),
+            "10.0.0.1",
+            "udp",
+            Some("alice".to_string()),
+        )
+        .expect("session builds");
+
+        assert_eq!(
+            session.finalize("caller", None, None).auth_user.as_deref(),
+            Some("alice"),
+        );
+    }
+
+    #[test]
+    fn an_unauthenticated_proxy_call_leaves_the_cdr_username_empty() {
+        // `None` must stay absent rather than becoming an empty string that
+        // reads as "authenticated as nobody".
+        let (_, session) =
+            cdr_session_from_invite(&invite_for_cdr(), "10.0.0.1", "udp", None)
+                .expect("session builds");
+
+        assert!(session.finalize("caller", None, None).auth_user.is_none());
+    }
+
+    /// The dispatcher function that owns the proxy CDR start is not
+    /// constructible in a unit test (it needs a full `DispatcherState` and a
+    /// live Python handler), and no integration harness drives it — so the
+    /// behaviour test above proves `cdr_session_from_invite` *stores* the
+    /// identity, but not that the call site still *passes* it.
+    ///
+    /// That is the half that regressed: the parameter existed all along and
+    /// every caller passed `None`. Guard the wiring at the source level, the
+    /// same way the packaging tests guard workflow drift.
+    #[test]
+    fn the_proxy_cdr_start_is_still_wired_to_the_authenticated_identity() {
+        let source = include_str!("dispatcher.rs");
+
+        let call = source
+            .split("cdr_track_proxy_start(")
+            .nth(1)
+            .expect("the proxy CDR start is still called");
+        let arguments = call.split(");").next().unwrap_or_default();
+
+        assert!(
+            arguments.contains("auth_user"),
+            "cdr_track_proxy_start no longer receives the authenticated \
+             username — a proxy CDR's auth_user would silently go back to \
+             always being empty. Arguments were:{arguments}"
+        );
     }
 
     #[test]
