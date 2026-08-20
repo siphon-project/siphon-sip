@@ -6,18 +6,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
-### Changed
-- **`siphon-bin` enables the `http` extension by default.** The package exists
-  to compose extension modules, and its default feature set was empty — so a
-  bare `cargo build -p siphon-bin` produced a binary with no extensions at all,
-  which is just the plain `siphon` anyone can get from `cargo install
-  siphon-sip`. HTTP is the module with no deployment prerequisite (no libsctp,
-  no upstream SMSC bind, nothing to provision) and the one most scripts reach
-  for, so it is now what you get out of the box. Features are additive, so
-  `--features smpp` gives you http **and** smpp; `--no-default-features`
-  restores the empty build. This affects only the `siphon-bin` package —
-  `siphon-sip` itself is unchanged and still ships no extensions.
-
 ### Added
 - **`auth.generate_nonce()` and `auth.validate_nonce(nonce)` are reachable from
   scripts.** Both existed, but in a plain `impl` rather than a `#[pymethods]`
@@ -74,7 +62,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   and carries no more assurance than the address does. `call.flow` is `None` for
   an internally-originated call, which is distinguishable from a flow that did
   not match.
-
 - **`password=` / `ha1=` on the digest helpers** (`auth.verify_digest`,
   `require_digest`, `require_www_digest`, `require_proxy_digest`, on a `Request`
   or a `Call`). Verifies the digest response against a credential the script
@@ -89,20 +76,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   silently preferring one. Everything else is unchanged: the anti-replay nonce
   check still runs, a rejection still arms the 401/407, still counts toward
   `failed_auth_ban`, and still increments `siphon_credential_failures_total`.
-### Changed
-- **Ro no longer bills ring time.** The usage clock was stamped at
-  CCR-INITIAL — which `call.ro_authorize()` fires *before* any carrier is
-  dialled — and every reported figure was measured from there, so ring time was
-  charged and a call that was never answered could report a full grant of used
-  seconds. With two carriers at `timeout_secs: 12`, 24 seconds of a 30-second
-  grant could be gone before the callee picked up, and it got worse the longer
-  the carrier list. The clock now starts at the 200 OK, which is what TS 32.260
-  §5 means by chargeable duration. **This changes billed duration on upgrade for
-  any existing Ro deployment**; set the new `ro.charge_from: invite` to keep the
-  previous behaviour. Only the clock moved — the reservation still happens at
-  INVITE, since reserve-before-connect is the point of the prepaid gate.
-
-### Added
 - **A CCR-UPDATE at answer, carrying `Time-Stamps`** (TS 32.299 §7.2.97). There
   was no credit-control request at the 200 OK, so an OCS could not tell when
   charging actually started and a Diameter-to-HTTP bridge had nothing to
@@ -128,111 +101,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   being a routing artifact of the R-URI rather than part of the called-party
   identity. The field is absent from the wire when unset, so the contract stays
   additive.
-
-### Fixed
-- **Ro usage is reported as a delta, not per-interval.** A CCR-UPDATE that fails
-  now leaves its seconds unreported, so the next record — or the
-  CCR-TERMINATION — still covers them exactly once, instead of the interval
-  being lost.
-- **Ro CCR-UPDATE and CCR-TERMINATION now carry Service-Information.** Both were
-  built with `ims_data: None`, so only the Session-Id, the subscriber and the
-  units reached the OCS. Nothing after the initial request named the carrier,
-  the ICID or the calling/called party, which left a charging backend unable to
-  attribute mid-call usage or the final record — and under LCR failover the
-  carrier that matters is the one that actually carried the call, so it could
-  not be inferred from the CCR-INITIAL either. The `ImsChargingData` built at
-  CCR-INITIAL is now carried on the session, stamped with the winning carrier as
-  `Outgoing-Trunk-Group-Id` (TS 32.299 §7.2.71) when the call is answered, and
-  sent on every subsequent request in the session. Each record's `Time-Stamps`
-  describes its own trigger rather than repeating the INVITE's.
-- **Ro CCR-TERMINATION now carries `Cause-Code`** (TS 32.299 §7.2.35), so an OCS
-  can tell why a call ended. It is taken from the same disconnect cause Rf's
-  ACR-STOP already derives — the RFC 3326 `Reason` header, else the SIP status —
-  so the two interfaces never disagree. A normal hangup reports `0`, a busy
-  `-486`, a ring timeout `-408`; a siphon-initiated teardown reports `-402` when
-  the OCS refused further credit (the same status a denied setup answers with)
-  and `-408` when the max-session-lifetime backstop fired.
-- **A proxied in-dialog request whose Request-URI addresses the proxy itself is
-  now forwarded to the dialog's established peer instead of failing as a
-  routing loop.** RFC 3261 §12.2.1.1 has the UAC build a mid-dialog request
-  from the remote target (the peer's Contact) plus the route set, but a common
-  class of UAC keeps the proxy's address in the R-URI — so after the proxy
-  consumed its own Route (§16.4) the computed next hop was the proxy itself,
-  and the request was answered `482 Loop Detected` (re-INVITE/UPDATE/BYE) or
-  silently dropped (the end-to-end 2xx ACK, leaving the UAS retransmitting its
-  200 until Timer H). On a hold/resume pair the resume re-INVITE was the
-  visible casualty: the caller never got its 200 and the call hung. Both paths
-  now fall back to the dialog session's established downstream branch when the
-  resolved next hop is one of our own listeners, and only a session whose
-  branch *also* points at us still draws the loop answer. A completed
-  re-INVITE's per-transaction session teardown also no longer evicts the
-  dialog-establishing INVITE's dialog-key entry (the removal twin of the
-  insert-side first-writer-wins guard), so the *second* and later in-dialog
-  requests of a call still find the dialog. The `--reinvite` SIPp mode now
-  actually gates on this: the runner propagates the UAC's exit code, the UAC
-  fails on the global timeout, and each re-INVITE's 200 is asserted by CSeq so
-  a retransmitted initial-INVITE 200 can no longer mask a lost re-INVITE.
-- **`security.trusted_cidrs` now covers the APIBAN blocklist.** The transport
-  ACL consulted the fetched set directly, before the deny/allow lists and with
-  no trusted check, and the kernel-firewall path had none either — so a trusted
-  source that landed on the community feed was dropped anyway and no config
-  could save it. Since the kernel drop is port-agnostic, a listed management
-  address took ssh down with the trunk. Trusted addresses are now filtered as
-  the feed is ingested, ahead of both the userspace store and the kernel set,
-  which is what `docs/kernel-firewall.md` already claimed.
-
-- **An LCR route's `headers` can no longer forge a dialog header.** Per-route
-  `headers` from the routing answer were injected onto the B-leg INVITE
-  verbatim, last (after both the header policy and the number policy) and with
-  no guard on the name — so a backend naming `From` overwrote the header
-  *including its dialog tag*. That failed silently: the INVITE went out fine and
-  the breakage surfaced later as ACKs and BYEs that no longer matched the
-  dialog. `To`, `Call-ID`, `CSeq`, `Via`, `Contact`, `Route`, `Record-Route`,
-  `Max-Forwards` and `Content-Length` were exposed the same way. The injection
-  now skips exactly the set no header policy may touch either, and logs at warn
-  naming the carrier and the header. `Proxy-Authorization` stays injectable — a
-  per-carrier trunk credential is a legitimate use of it. Use `number_policy` to
-  reshape identity headers per carrier.
-- **`request.auth_user` and `call.auth_user` are writable.** They hold the
-  username exactly as it appeared in the `Authorization` / `Proxy-Authorization`
-  header, since that is the string the digest response was computed over.
-  Deployments where the authentication identity is not the subscriber identity —
-  IMS (a private identity authenticating a public one), or any scheme carrying a
-  validity prefix or tenant qualifier in the username — can now reduce it after
-  verification, and everything keyed on the authenticated identity reads the new
-  value: `registrar.enforce_auth_aor_match` and the CDR's `auth_user`. Without
-  this, an unreduced credential never equalled the AoR userpart, so every such
-  REGISTER was answered `403` and the only way to deploy was to turn the
-  anti-hijack check off entirely. Assign it only on the success path: it asserts
-  an identity already proven, it does not prove one.
-
-### Fixed
-- **A proxy-mode CDR now carries `auth_user`.** `cdr_session_from_invite` took
-  the authenticated username and both of its callers passed `None`, so the
-  `auth_user` field on a proxy CDR was always empty even when the script had
-  authenticated the caller — while the documentation on
-  `CdrSession::set_auth_user` claimed the proxy path supplied it at
-  session-build time. It is now read off the request after the handler has run,
-  so a script that authenticated the caller (or normalised the identity
-  afterwards) is what reaches the record. The B2BUA path was already correct: it
-  opens the CDR at INVITE time, before `@b2bua.on_invite` runs, and stamps the
-  username on once the handler returns.
-- **`auth_user` no longer raises `AttributeError` on a real node.** The SDK mock
-  exposed `Request.auth_user` as a writable property while the binding had only
-  a getter, so a script assigning it passed pytest and failed at runtime. Mock
-  and runtime now agree, on `Call` as well as `Request`.
-- **`cdr.file.rotate_size_mb` actually rotates.** The value was documented,
-  parsed and carried into the file backend, then dropped at the write site — so
-  a CDR file configured with `rotate_size_mb: 100` grew without bound. It now
-  renames the file to `<path>.<UTC timestamp>` once a record takes it past the
-  limit, and the next record starts a fresh one; the rename happens after the
-  write, never mid-record. `0` disables rotation. Rotated files are kept, never
-  deleted: retention belongs to logrotate or whatever ships them, and dropping
-  billing records to enforce a size cap would be worse than the unbounded file
-  this replaces. The packaged logrotate config names `cdr.jsonl` only, so it
-  does not re-rotate the size-rotated siblings.
-
-### Added
 - **`security.apiban.ban_ttl_secs` expires blocklist entries** (default `604800`,
   7 days, matching the interval after which APIBAN itself releases an address).
   Entries used to be inserted permanently and the poll only ever fetched
@@ -288,7 +156,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   including redundancy repair and unrecoverable-loss markers. Absent, not
   zeroed, on a call with no observed text stream — `text_packets=0` would read
   as a text stream that carried nothing, which is a different claim.
-
 - **Media / header / REFER verbs + the two events on the control-plane SDK's
   `sip` facade — all three bindings.** Wraps the SIP-adapter verbs that shipped
   server-side, mirroring the `route()` facade: `play` (one of `file` / `db_id` /
@@ -309,7 +176,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   as the same typed `unsupported_verb` / `bad_request` / `not_found` as the
   sibling verbs. The control SDK version is unchanged (its own `control-sdk-v*`
   train cuts the release).
-
 - **Cold transfer off a call siphon answered itself.** A voice-AI or IVR call has
   no B leg, so the only way to hand the caller on is an in-dialog REFER on the A
   dialog via the imperative `b2bua.refer(call_id, target)` — `call.refer()` is a
@@ -317,107 +183,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `@b2bua.on_answer` never fires without a B leg. Now covered end to end by a
   functional scenario, wired into `examples/voice_ai_b2bua.py` as "press 0 for an
   agent", and documented in `docs/cookbook/voice-ai.md`.
-
-### Fixed
-- **A re-INVITE or UPDATE on a `siphon-rtp`-anchored call replaced its media
-  session instead of renegotiating it.** siphon has only ever had one verb for
-  an SDP offer, and on rtpengine that is correct — a repeat `offer` on a live
-  call-id *is* a re-offer, which is how `rtpengine_manage()` has always done
-  hold and codec renegotiation. siphon-rtp draws the line differently: a repeat
-  `offer` there is a **replacement**, so the engine freed the call and allocated
-  fresh ports. The visible damage was not the ports (siphon answers with the
-  rewritten SDP either way) but everything attached to them — the WebSocket
-  bridge, any `ws_tee`, and any SIPREC subscription were torn down with the old
-  call. So putting a voice-AI call on hold, or any mid-dialog renegotiation,
-  silently killed the audio path to the AI while the call itself carried on,
-  and left a spurious media CDR with reason `replaced` behind. A call this
-  process has already anchored now renegotiates with `siphon-rtp-proto` 0.2.0's
-  `reoffer`, which keeps the ports, the pipeline and the attachments, and
-  carries an RFC 8445 §9 ICE restart when the peer offers new credentials.
-  Covers the framework's re-INVITE and UPDATE paths and the script-facing
-  `rtpengine.offer()`; rtpengine and rtpproxy still send a plain offer, so their
-  wire is byte-identical to before.
-- **A re-offer is addressed by the media session's own engine call-id.**
-  `rtpengine.offer()` used the SIP Call-ID, but a siphon-terminated transfer
-  deliberately re-anchors the surviving pair on a *fresh* engine call-id while
-  the store key stays the SIP one — so a re-INVITE after a transfer addressed a
-  call-id the engine had never heard of. It now uses `rtpengine_id()`, as every
-  other post-offer verb already did, and no longer re-inserts the media session
-  on a re-offer (which reset that id and cleared the `to_tag` the answer set).
-- **The one case a re-offer cannot serve falls back explicitly.** The engine
-  refuses a re-offer that changes the negotiated codec — that needs a pipeline
-  rebuild it will not do on a live call — and its error says to replace the call
-  instead. That refusal, and only that refusal, is retried as a replacement
-  `offer`, which is exactly the behaviour such a re-INVITE had before. It is
-  logged at WARN naming the consequence (ports re-allocated, bridge/tee/SIPREC
-  dropped) rather than performed silently, and the match is deliberately narrow
-  so no other engine error can acquire a call-replacing retry.
-- **A challenged REFER was never retried, and its response was dropped
-  entirely.** A REFER siphon originates on one of its own legs is allocated a
-  fresh Via branch that belongs to no leg, and responses are matched to a call by
-  branch — so the 202 was ignored and a 401/407 equally so. A carrier that
-  challenges an in-dialog REFER therefore
-  killed the transfer silently, with the script still waiting on sipfrag NOTIFYs
-  that could never arrive. Such a REFER is now tracked so its response can be
-  matched, and a challenge is retried with the credentials from
-  `call.set_credentials()` — a new transaction on the same dialog (RFC 3261
-  §22.2), capped so a trunk that always challenges cannot loop, and with no ACK
-  (REFER is a non-INVITE transaction; §17.1.2). A REFER that cannot be retried
-  now clears its subscription and logs at WARN instead of leaving the transfer
-  pending forever.
-
-### Fixed
-- **A relative `script.path` now resolves against the config file's directory,
-  so siphon starts under a supervisor.** It was resolved against the process
-  working directory, which is the config directory when you run siphon by hand
-  and `/` under systemd. The packaged `siphon.yaml` ships
-  `script.path: "scripts/proxy_default.py"`, so the packaged unit looked for
-  `/scripts/proxy_default.py`, failed the script load, exited non-zero and
-  restart-looped — while the same config started fine from `/etc/siphon`. A
-  container `WORKDIR` or an embedding binary that chdirs hit the same trap.
-  `script.include_paths` is anchored the same way. The rewrite only applies
-  when the config-relative file exists, so a config that relies on the working
-  directory keeps resolving as before; this can only make a previously-failing
-  config start. `Config::from_str` is unchanged (no file to anchor on), and the
-  startup log line prints the resolved path.
-- **The packaged systemd unit can write its state and log directories.**
-  `ProtectSystem=strict` was paired with `ReadWritePaths=/var/lib/siphon` only,
-  while every default write path (`cdr.file.path` at `/var/log/siphon/cdr.jsonl`,
-  `lawful_intercept.audit_log`, the `log.file` example) lives under `/var/log`,
-  which was read-only and never created. The unit now declares
-  `StateDirectory=siphon` and `LogsDirectory=siphon`, so systemd creates both
-  owned by the service user, and pins `WorkingDirectory=/etc/siphon`. It also
-  documents, as commented lines, the `CAP_NET_ADMIN` + `AF_NETLINK` an IMS
-  P-CSCF needs for `ipsec:` sec-agree.
-- **A log, CDR, audit or event-sink file whose parent directory is missing now
-  creates it.** Opening with `create(true)` creates the file and never the
-  directory holding it, so every default path we ship — all of them inside
-  `/var/log/siphon` — worked only through the packaged unit, where
-  `LogsDirectory=` had already made the directory. Started any other way (a
-  tarball install, `cargo install`, a container, by hand) the same config took
-  `log.file` down with a process exit and logged an error per record for the CDR
-  file, the LI audit log and the Diameter event sink. The directory is created
-  only when the open actually fails with `NotFound`, so the happy path is
-  unchanged and a permission error still reads as a permission error.
-- **The shipped logrotate config is installed, and rotates the paths siphon
-  actually writes.** `etc/logrotate.d/siphon` still named `/var/log/siphon.log`
-  — a path that is not writable under `ProtectSystem=strict` — and was in no
-  package: not the `.deb`, not the `.rpm`, not the release tarball. It now
-  covers `/var/log/siphon/*.log` with `copytruncate` (siphon holds those open
-  for the process lifetime, and `ExecReload` reloads the Python script, not the
-  log file) and rotates `cdr.jsonl` separately *without* `copytruncate`, whose
-  copy-then-truncate race can drop a billing record. `.deb` and `.rpm` also
-  create `/var/log/siphon` at install time for a by-hand first run.
-- **The packaged unit stops restart-looping on a broken config.** siphon exits
-  non-zero on a config or script error, and `RestartSec=5s` puts only two starts
-  inside systemd's default 10 s window, so the default start limit never tripped
-  — a permanently broken config looped forever (a reported install reached
-  restart counter 279) instead of failing visibly. The unit now sets
-  `StartLimitIntervalSec=300` / `StartLimitBurst=10`, so roughly a minute of
-  failed restarts puts the unit in `failed` where `systemctl status` shows it —
-  generous enough that a slow-to-appear address still recovers on its own.
-
-### Added
 - **In-band DTMF on a controlled call is forwarded to the control plane as a
   `ChannelDtmfReceived` event.** When the media engine detects a DTMF digit on a
   B2BUA call that was handed over to a control app, siphon pushes a
@@ -579,166 +344,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `add_contact()` carries an explicitly-built one through — so the NAT case the
   field exists for (private Contact URI, public source) is finally
   constructible in a test. Additive, defaulting to `None`.
-
-### Changed
-- **`siphon-rtp-proto` pinned to 0.2.0** (from 0.1.5). A 0.x minor bump is a
-  semver-breaking range, so it is a deliberate move rather than something
-  `cargo update` performs: the pin is what makes the engine's newer control
-  surface reachable at all. Deployments on `media.backend: siphon-rtp` must run
-  a siphon-rtp built from that contract.
-- **`Contact.received` is a SIP URI, not a bare `host:port` — the doc-comment
-  now says so.** The value has always been
-  `sip:<ip>:<port>;transport=<proto>` (the OpenSIPS `received_avp` shape),
-  which is what lets `request.fork([c.received or c.uri for c in contacts])`
-  work, but the getter's doc-comment described it as "source IP:port". Only
-  the comment changed.
-- **`request.fix_nated_register()` writes the observed source port into
-  `rport=`** instead of a hardcoded `5060`. SDK mock only; the engine already
-  used the real port.
-- **`tls.method` is now enforced — it used to be parsed and ignored.** The
-  setting was deserialized into the TLS config and never read: the acceptor was
-  built from a bare `rustls::ServerConfig::builder()`, so a config asking for
-  `TLSv1_3` still completed TLS 1.2 handshakes and the documented default
-  (`TLSv1_3`) described a floor nothing applied. It is now a **minimum**
-  version, applied to the `listen.tls` / `listen.wss` acceptor **and** to
-  outbound TLS from the connection pool: `TLSv1_2` negotiates 1.2 or 1.3,
-  `TLSv1_3` negotiates 1.3 only and refuses a TLS 1.2 peer in either direction.
-  The default is now `TLSv1_2`, which is exactly what siphon has always
-  negotiated, so an unset `method` changes nothing. **Anyone who explicitly set
-  `method: TLSv1_3` gets the tightening they asked for and will now refuse TLS
-  1.2 peers** — check both directions (subscriber clients and upstream trunks)
-  before upgrading, or set `TLSv1_2` to keep 1.2 available. Values are validated
-  at config load: `TLSv1_2` / `TLSv1_3` in the OpenSSL/Kamailio spellings
-  (`TLSv1.2`, `TLSv1.2+`, `1.2`), while TLS 1.0/1.1, SSL and typos are a startup
-  error instead of a silently-ignored string.
-
-### Fixed
-- **An HTTP probe on a SIP-only TCP/TLS listener was neither dropped nor
-  counted.** Stream framing (RFC 3261 §18.3) measures a message by finding
-  `\r\n\r\n` and reading `Content-Length` — which a well-formed HTTP request
-  also satisfies — so a vulnerability scanner's `GET /phpinfo.php HTTP/1.1` was
-  framed as a complete "message", queued to the dispatcher and rejected only by
-  the parser: the connection stayed open, the whole attacker-supplied buffer was
-  logged at `warn`, and nothing was recorded against the source, so
-  `security.failed_auth_ban` never fired no matter how long the scan ran. Only
-  an *incomplete* frame was ever classified. Dedicated `listen.tcp` /
-  `listen.tls` listeners now classify each connection from its first line —
-  the same check a `tcp+ws` / `tls+wss` mux already applied — and close it
-  before the framer runs when it is not SIP, counting a strong auto-ban signal
-  (a scanner is banned on its fourth probe at the default weights). An HTTP
-  request line is not SIP on a listener with no WebSocket half, so it is treated
-  like any other non-SIP bytes, and the probe is never answered. A peer that
-  connects and sends nothing still serves as raw SIP (connection reuse,
-  RFC 5923), and a connect-and-close L4 health check is still never counted as
-  abuse. The parse-error log line is now capped, so an unparseable message can
-  no longer decide how much it writes into the log, and a TLS peer that
-  disappears without `close_notify` — every scanner, and most browsers — logs at
-  `debug` instead of `warn`.
-- **Extension-module startup diagnostics were being swallowed.** `siphon-bin`
-  composes its extension modules at *builder* time, before `SiphonServer::run()`
-  installs the tracing subscriber, so every `tracing::error!` / `warn!` in that
-  layer went nowhere. A binary whose `extensions.smpp` (or `.http`) pointed at a
-  missing or unparseable file started up completely silent with the module
-  disabled, and the documented "loud on mismatch" warning for a config block
-  whose cargo feature was not compiled in never printed either. Those
-  diagnostics now go to stderr, where the rest of siphon's pre-subscriber
-  startup output goes, and name the offending path.
-- **Every digest challenge but the weakest was dropped on the wire.**
-  `auth.require_*_digest` builds one challenge per algorithm — MD5 + SHA-256 +
-  SHA-512-256, as RFC 7616 §3.7 asks for — so a single 401/407 serves RFC 2617
-  and RFC 7616 clients alike. The response builder copied only the first value,
-  so the wire carried MD5 alone and no client could negotiate up from it. All
-  values are now copied, as separate header lines.
-- **A locally-generated B2BUA final response carried no `To` tag.** RFC 3261
-  §8.2.6.2 requires a UAS to tag every response but 100, and siphon is the UAS
-  on the A-leg. The 408 ring-timeout path stamped the A-leg dialog's tag but
-  `call.reject()` did not, so every script-driven rejection answered a
-  dialog-forming INVITE with the request's tagless `To`. Both paths now share one
-  helper.
-- **The same address under two `listen:` protocols silently half-worked.** Every
-  stream listener binds with `SO_REUSEPORT`, so configuring one address under
-  both `listen.tls` and `listen.wss` (an entirely reasonable-looking way to ask
-  for both on one port) started two listeners that both bound successfully and
-  had the kernel distribute arriving connections between them — roughly half of
-  the WSS clients landed in the raw-SIP reader and half of the TLS peers in the
-  WebSocket handshake, with no error logged anywhere. That configuration now
-  does what it reads like (see the multiplexed listener above), and the pairings
-  that genuinely cannot share a socket are rejected at startup.
-- **Rf ACR-START reported no answer instant, so a CDF could not compute billable
-  duration.** `Time-Stamps` (TS 32.299 §7.2.183) is what separates alerting from
-  talk time, and the auto-emit path filled neither half correctly: it sampled
-  `SIP-Request-Timestamp` at the moment the ACR was built — which for a START is
-  the 200 OK, not the INVITE — and never set `SIP-Response-Timestamp` at all.
-  Every START therefore carried one timestamp equal to its own `Event-Timestamp`,
-  indistinguishable from a record triggered by the INVITE, and a collector
-  reading INVITE-to-BYE over-charged every call by its ring time. Both instants
-  are now carried from the session that measured them, derived from its monotonic
-  clock so a wall-clock step mid-call cannot invent (or negate) ring time.
-- **ACR-STOP timestamped the INVITE while reporting the BYE.** `Time-Stamps`
-  describes the record's own trigger request, so a STOP whose `Event-Type` says
-  BYE must timestamp the BYE — it carried the INVITE instant forward from the
-  START instead, leaving the two AVPs describing different events minutes apart.
-- **A failed call produced no Rf record whatsoever.** No accounting session is
-  opened for an INVITE that never gets a 2xx, and nothing else was emitted
-  either, so an unanswered or rejected call was simply absent from the stream —
-  and since `Cause-Code` was hard-set to 0 on every STOP, no record anywhere
-  distinguished a successful call from a failed one. Unsuccessful session
-  establishment now emits ACR-EVENT per TS 32.260 §5.2.2.1, carrying the ICID and
-  the SIP status as a negative `Cause-Code` (TS 32.299 §7.2.35). 401/407 are
-  excluded — the UA re-sends against a challenge and the retry is the same call
-  attempt — while 487 is included, a caller who hung up during alerting being a
-  real unsuccessful setup.
-- **No IMS ACR carried a `Subscription-Id`**, so every CDR landed with no billable
-  subscriber on it and the collector had to resolve the IMPU out-of-band, which
-  only works for subscribers it has provisioned. Records now carry one typed
-  `Subscription-Id` per served-party identity (RFC 4006 §8.47: `tel:` and bare
-  `+E.164` → END_USER_E164, IMPUs → END_USER_SIP_URI), and `rf_acr_*` gained
-  `subscription_id` / `subscription_id_type` kwargs — each accepting one value or
-  a list — for scripts that hold an IMSI the SIP layer cannot derive.
-- **A multi-valued `P-Asserted-Identity` was concatenated into one
-  `Calling-Party-Address`.** The whole header value was reduced by taking its
-  first `<` and last `>`, so a subscriber asserting an IMPU, a `tel:` alias and an
-  IMSI-derived IMPU produced a single unbalanced string
-  (`sip:…org>, <tel:…>, <sip:…`) that no consumer can split back apart, and that
-  breaks outright on an identity containing a comma. `Calling-Party-Address` is
-  0..n (TS 32.299 §7.2.33) and now repeats once per identity, with the list split
-  on commas outside angle brackets and quoted display names. The same parse fixes
-  a bracketed URI carrying its own parameters, which used to be truncated at the
-  first `;`.
-- **The served party on a terminating record was the caller.** `User-Name` was
-  taken from the calling party regardless of role, so the callee's own record
-  identified whoever placed the call. It now follows `Role-Of-Node` per
-  TS 32.260 §5.1 — caller on originating, callee on terminating.
-- **An intra-node call opened two terminating accounting records and only ever
-  stopped one.** `rf_sessions` gains its entry after the CDF answers ACR-START,
-  but the dedupe gate ran before the spawn, and the two legs of such a call are
-  answered milliseconds apart — so the originating leg's speculative dual-ACR
-  terminating record and the terminating leg's own record both passed an empty
-  map and opened separate sessions on one ICID. Only one is reachable from the
-  BYE; the other never got an ACR-STOP and emitted an ACR-INTERIM every cadence
-  tick until the 24h backstop, ~288 junk records per affected call. The key is
-  now reserved synchronously for the duration of the round-trip, and released on
-  every exit path so a CDF rejection cannot wedge it.
-- **The orphan sweep dropped an Rf session's map entry without releasing the
-  session.** Its ACR-INTERIM timer and its `siphon_rf_sessions` slot both
-  outlived the entry, so a reaped record kept emitting INTERIMs against a call
-  nothing was tracking any more. The sweep now claims the stop as it goes.
-- **A UAS-mode B2BUA answer carried no `Contact`, so no in-dialog request could
-  be addressed to it.** RFC 3261 §12.1.1 / §13.3.1.4 require a dialog-establishing
-  response to carry the Contact the UAC builds its remote target from. The
-  relayed path set one from the B-leg's 2xx, but `call.answer()` / `call.progress()`
-  — every single-leg answer, including every voice-AI call — had no B-leg to copy
-  from and set none at all. A well-behaved UAC therefore had nowhere to send ACK,
-  BYE, re-INVITE or PRACK: SIPp renders the empty target as `BYE  SIP/2.0`, which
-  arrives unparseable, and the call is only released when a timer fires. Host and
-  port now resolve exactly as the relayed path resolves them, so the Contact names
-  the listener the INVITE actually arrived on rather than the first-configured one.
-- **A SIPp scenario that timed out reported success.** `run_sipp` in
-  `scripts/run-tests.sh` exempted exit code 255, which is precisely what SIPp
-  returns when a scenario times out — including when an assertion fails and the
-  call never completes. Any hanging scenario was green.
-
-### Added
 - **`Contact.age_secs`** — seconds since a binding was created or last
   refreshed, for scripts that need their own recency rule (`[c for c in
   registrar.lookup(uri) if c.age_secs < 3600]`). Monotonic, and preserved
@@ -869,7 +474,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 - **`rtcp_mux` media-profile flag** — the RFC 5761 directive list (`offer`,
   `require`, `demux`, `accept`, `reject`, `remove`) overriding the mux decision
   the engine derives from the offered SDP.
-
 - **`sip::validate` — RFC 3261 validation of messages that parse but are still
   invalid.** A message can be perfectly parseable and yet have to be refused: an
   unsupported version, a CSeq that disagrees with the Request-Line, an
@@ -887,6 +491,57 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   whose Max-Forwards alone is out of range.
 
 ### Changed
+- **`siphon-bin` enables the `http` extension by default.** The package exists
+  to compose extension modules, and its default feature set was empty — so a
+  bare `cargo build -p siphon-bin` produced a binary with no extensions at all,
+  which is just the plain `siphon` anyone can get from `cargo install
+  siphon-sip`. HTTP is the module with no deployment prerequisite (no libsctp,
+  no upstream SMSC bind, nothing to provision) and the one most scripts reach
+  for, so it is now what you get out of the box. Features are additive, so
+  `--features smpp` gives you http **and** smpp; `--no-default-features`
+  restores the empty build. This affects only the `siphon-bin` package —
+  `siphon-sip` itself is unchanged and still ships no extensions.
+- **Ro no longer bills ring time.** The usage clock was stamped at
+  CCR-INITIAL — which `call.ro_authorize()` fires *before* any carrier is
+  dialled — and every reported figure was measured from there, so ring time was
+  charged and a call that was never answered could report a full grant of used
+  seconds. With two carriers at `timeout_secs: 12`, 24 seconds of a 30-second
+  grant could be gone before the callee picked up, and it got worse the longer
+  the carrier list. The clock now starts at the 200 OK, which is what TS 32.260
+  §5 means by chargeable duration. **This changes billed duration on upgrade for
+  any existing Ro deployment**; set the new `ro.charge_from: invite` to keep the
+  previous behaviour. Only the clock moved — the reservation still happens at
+  INVITE, since reserve-before-connect is the point of the prepaid gate.
+- **`siphon-rtp-proto` pinned to 0.2.0** (from 0.1.5). A 0.x minor bump is a
+  semver-breaking range, so it is a deliberate move rather than something
+  `cargo update` performs: the pin is what makes the engine's newer control
+  surface reachable at all. Deployments on `media.backend: siphon-rtp` must run
+  a siphon-rtp built from that contract.
+- **`Contact.received` is a SIP URI, not a bare `host:port` — the doc-comment
+  now says so.** The value has always been
+  `sip:<ip>:<port>;transport=<proto>` (the OpenSIPS `received_avp` shape),
+  which is what lets `request.fork([c.received or c.uri for c in contacts])`
+  work, but the getter's doc-comment described it as "source IP:port". Only
+  the comment changed.
+- **`request.fix_nated_register()` writes the observed source port into
+  `rport=`** instead of a hardcoded `5060`. SDK mock only; the engine already
+  used the real port.
+- **`tls.method` is now enforced — it used to be parsed and ignored.** The
+  setting was deserialized into the TLS config and never read: the acceptor was
+  built from a bare `rustls::ServerConfig::builder()`, so a config asking for
+  `TLSv1_3` still completed TLS 1.2 handshakes and the documented default
+  (`TLSv1_3`) described a floor nothing applied. It is now a **minimum**
+  version, applied to the `listen.tls` / `listen.wss` acceptor **and** to
+  outbound TLS from the connection pool: `TLSv1_2` negotiates 1.2 or 1.3,
+  `TLSv1_3` negotiates 1.3 only and refuses a TLS 1.2 peer in either direction.
+  The default is now `TLSv1_2`, which is exactly what siphon has always
+  negotiated, so an unset `method` changes nothing. **Anyone who explicitly set
+  `method: TLSv1_3` gets the tightening they asked for and will now refuse TLS
+  1.2 peers** — check both directions (subscriber clients and upstream trunks)
+  before upgrading, or set `TLSv1_2` to keep 1.2 available. Values are validated
+  at config load: `TLSv1_2` / `TLSv1_3` in the OpenSSL/Kamailio spellings
+  (`TLSv1.2`, `TLSv1.2+`, `1.2`), while TLS 1.0/1.1, SSL and typos are a startup
+  error instead of a silently-ignored string.
 - **TLS connection lifecycle logs moved from `info` to `debug`.** The four
   stream transports now share one per-connection reader/writer, and it logs
   "closed by peer", idle timeout and cleanup at `debug` — what the TCP listener
@@ -908,7 +563,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 - Invalid `ws_uri` schemes and `rtcp_mux` tokens fail the config load, matching
   the existing `address_family` treatment — the engines ignore an unknown value
   silently, which otherwise lands as a call quietly negotiated the wrong way.
-
 - **Bump the `siphon-bin` SMPP extension to siphon-smpp v1.4.0.** The pin was
   still on v1.3.0: the 1.5.1 entry announcing a move to v1.3.1 never reached
   `siphon-bin/Cargo.toml`, so the manifest and that entry disagreed and the
@@ -941,7 +595,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
   Only affects builds with `--features smpp`; the plain `siphon` binary is
   unaffected.
-
 - **Content-Length is now validated against the octets actually received.** A
   value that is not a non-negative integer, or that claims more octets than
   arrived, leaves the message unframeable and is rejected instead of being
@@ -961,6 +614,323 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   list is currently **empty** — all 50 fixtures are handled as the RFC requires.
 
 ### Fixed
+- **Ro usage is reported as a delta, not per-interval.** A CCR-UPDATE that fails
+  now leaves its seconds unreported, so the next record — or the
+  CCR-TERMINATION — still covers them exactly once, instead of the interval
+  being lost.
+- **Ro CCR-UPDATE and CCR-TERMINATION now carry Service-Information.** Both were
+  built with `ims_data: None`, so only the Session-Id, the subscriber and the
+  units reached the OCS. Nothing after the initial request named the carrier,
+  the ICID or the calling/called party, which left a charging backend unable to
+  attribute mid-call usage or the final record — and under LCR failover the
+  carrier that matters is the one that actually carried the call, so it could
+  not be inferred from the CCR-INITIAL either. The `ImsChargingData` built at
+  CCR-INITIAL is now carried on the session, stamped with the winning carrier as
+  `Outgoing-Trunk-Group-Id` (TS 32.299 §7.2.71) when the call is answered, and
+  sent on every subsequent request in the session. Each record's `Time-Stamps`
+  describes its own trigger rather than repeating the INVITE's.
+- **Ro CCR-TERMINATION now carries `Cause-Code`** (TS 32.299 §7.2.35), so an OCS
+  can tell why a call ended. It is taken from the same disconnect cause Rf's
+  ACR-STOP already derives — the RFC 3326 `Reason` header, else the SIP status —
+  so the two interfaces never disagree. A normal hangup reports `0`, a busy
+  `-486`, a ring timeout `-408`; a siphon-initiated teardown reports `-402` when
+  the OCS refused further credit (the same status a denied setup answers with)
+  and `-408` when the max-session-lifetime backstop fired.
+- **A proxied in-dialog request whose Request-URI addresses the proxy itself is
+  now forwarded to the dialog's established peer instead of failing as a
+  routing loop.** RFC 3261 §12.2.1.1 has the UAC build a mid-dialog request
+  from the remote target (the peer's Contact) plus the route set, but a common
+  class of UAC keeps the proxy's address in the R-URI — so after the proxy
+  consumed its own Route (§16.4) the computed next hop was the proxy itself,
+  and the request was answered `482 Loop Detected` (re-INVITE/UPDATE/BYE) or
+  silently dropped (the end-to-end 2xx ACK, leaving the UAS retransmitting its
+  200 until Timer H). On a hold/resume pair the resume re-INVITE was the
+  visible casualty: the caller never got its 200 and the call hung. Both paths
+  now fall back to the dialog session's established downstream branch when the
+  resolved next hop is one of our own listeners, and only a session whose
+  branch *also* points at us still draws the loop answer. A completed
+  re-INVITE's per-transaction session teardown also no longer evicts the
+  dialog-establishing INVITE's dialog-key entry (the removal twin of the
+  insert-side first-writer-wins guard), so the *second* and later in-dialog
+  requests of a call still find the dialog. The `--reinvite` SIPp mode now
+  actually gates on this: the runner propagates the UAC's exit code, the UAC
+  fails on the global timeout, and each re-INVITE's 200 is asserted by CSeq so
+  a retransmitted initial-INVITE 200 can no longer mask a lost re-INVITE.
+- **`security.trusted_cidrs` now covers the APIBAN blocklist.** The transport
+  ACL consulted the fetched set directly, before the deny/allow lists and with
+  no trusted check, and the kernel-firewall path had none either — so a trusted
+  source that landed on the community feed was dropped anyway and no config
+  could save it. Since the kernel drop is port-agnostic, a listed management
+  address took ssh down with the trunk. Trusted addresses are now filtered as
+  the feed is ingested, ahead of both the userspace store and the kernel set,
+  which is what `docs/kernel-firewall.md` already claimed.
+- **An LCR route's `headers` can no longer forge a dialog header.** Per-route
+  `headers` from the routing answer were injected onto the B-leg INVITE
+  verbatim, last (after both the header policy and the number policy) and with
+  no guard on the name — so a backend naming `From` overwrote the header
+  *including its dialog tag*. That failed silently: the INVITE went out fine and
+  the breakage surfaced later as ACKs and BYEs that no longer matched the
+  dialog. `To`, `Call-ID`, `CSeq`, `Via`, `Contact`, `Route`, `Record-Route`,
+  `Max-Forwards` and `Content-Length` were exposed the same way. The injection
+  now skips exactly the set no header policy may touch either, and logs at warn
+  naming the carrier and the header. `Proxy-Authorization` stays injectable — a
+  per-carrier trunk credential is a legitimate use of it. Use `number_policy` to
+  reshape identity headers per carrier.
+- **`request.auth_user` and `call.auth_user` are writable.** They hold the
+  username exactly as it appeared in the `Authorization` / `Proxy-Authorization`
+  header, since that is the string the digest response was computed over.
+  Deployments where the authentication identity is not the subscriber identity —
+  IMS (a private identity authenticating a public one), or any scheme carrying a
+  validity prefix or tenant qualifier in the username — can now reduce it after
+  verification, and everything keyed on the authenticated identity reads the new
+  value: `registrar.enforce_auth_aor_match` and the CDR's `auth_user`. Without
+  this, an unreduced credential never equalled the AoR userpart, so every such
+  REGISTER was answered `403` and the only way to deploy was to turn the
+  anti-hijack check off entirely. Assign it only on the success path: it asserts
+  an identity already proven, it does not prove one.
+- **A proxy-mode CDR now carries `auth_user`.** `cdr_session_from_invite` took
+  the authenticated username and both of its callers passed `None`, so the
+  `auth_user` field on a proxy CDR was always empty even when the script had
+  authenticated the caller — while the documentation on
+  `CdrSession::set_auth_user` claimed the proxy path supplied it at
+  session-build time. It is now read off the request after the handler has run,
+  so a script that authenticated the caller (or normalised the identity
+  afterwards) is what reaches the record. The B2BUA path was already correct: it
+  opens the CDR at INVITE time, before `@b2bua.on_invite` runs, and stamps the
+  username on once the handler returns.
+- **`auth_user` no longer raises `AttributeError` on a real node.** The SDK mock
+  exposed `Request.auth_user` as a writable property while the binding had only
+  a getter, so a script assigning it passed pytest and failed at runtime. Mock
+  and runtime now agree, on `Call` as well as `Request`.
+- **`cdr.file.rotate_size_mb` actually rotates.** The value was documented,
+  parsed and carried into the file backend, then dropped at the write site — so
+  a CDR file configured with `rotate_size_mb: 100` grew without bound. It now
+  renames the file to `<path>.<UTC timestamp>` once a record takes it past the
+  limit, and the next record starts a fresh one; the rename happens after the
+  write, never mid-record. `0` disables rotation. Rotated files are kept, never
+  deleted: retention belongs to logrotate or whatever ships them, and dropping
+  billing records to enforce a size cap would be worse than the unbounded file
+  this replaces. The packaged logrotate config names `cdr.jsonl` only, so it
+  does not re-rotate the size-rotated siblings.
+- **A re-INVITE or UPDATE on a `siphon-rtp`-anchored call replaced its media
+  session instead of renegotiating it.** siphon has only ever had one verb for
+  an SDP offer, and on rtpengine that is correct — a repeat `offer` on a live
+  call-id *is* a re-offer, which is how `rtpengine_manage()` has always done
+  hold and codec renegotiation. siphon-rtp draws the line differently: a repeat
+  `offer` there is a **replacement**, so the engine freed the call and allocated
+  fresh ports. The visible damage was not the ports (siphon answers with the
+  rewritten SDP either way) but everything attached to them — the WebSocket
+  bridge, any `ws_tee`, and any SIPREC subscription were torn down with the old
+  call. So putting a voice-AI call on hold, or any mid-dialog renegotiation,
+  silently killed the audio path to the AI while the call itself carried on,
+  and left a spurious media CDR with reason `replaced` behind. A call this
+  process has already anchored now renegotiates with `siphon-rtp-proto` 0.2.0's
+  `reoffer`, which keeps the ports, the pipeline and the attachments, and
+  carries an RFC 8445 §9 ICE restart when the peer offers new credentials.
+  Covers the framework's re-INVITE and UPDATE paths and the script-facing
+  `rtpengine.offer()`; rtpengine and rtpproxy still send a plain offer, so their
+  wire is byte-identical to before.
+- **A re-offer is addressed by the media session's own engine call-id.**
+  `rtpengine.offer()` used the SIP Call-ID, but a siphon-terminated transfer
+  deliberately re-anchors the surviving pair on a *fresh* engine call-id while
+  the store key stays the SIP one — so a re-INVITE after a transfer addressed a
+  call-id the engine had never heard of. It now uses `rtpengine_id()`, as every
+  other post-offer verb already did, and no longer re-inserts the media session
+  on a re-offer (which reset that id and cleared the `to_tag` the answer set).
+- **The one case a re-offer cannot serve falls back explicitly.** The engine
+  refuses a re-offer that changes the negotiated codec — that needs a pipeline
+  rebuild it will not do on a live call — and its error says to replace the call
+  instead. That refusal, and only that refusal, is retried as a replacement
+  `offer`, which is exactly the behaviour such a re-INVITE had before. It is
+  logged at WARN naming the consequence (ports re-allocated, bridge/tee/SIPREC
+  dropped) rather than performed silently, and the match is deliberately narrow
+  so no other engine error can acquire a call-replacing retry.
+- **A challenged REFER was never retried, and its response was dropped
+  entirely.** A REFER siphon originates on one of its own legs is allocated a
+  fresh Via branch that belongs to no leg, and responses are matched to a call by
+  branch — so the 202 was ignored and a 401/407 equally so. A carrier that
+  challenges an in-dialog REFER therefore
+  killed the transfer silently, with the script still waiting on sipfrag NOTIFYs
+  that could never arrive. Such a REFER is now tracked so its response can be
+  matched, and a challenge is retried with the credentials from
+  `call.set_credentials()` — a new transaction on the same dialog (RFC 3261
+  §22.2), capped so a trunk that always challenges cannot loop, and with no ACK
+  (REFER is a non-INVITE transaction; §17.1.2). A REFER that cannot be retried
+  now clears its subscription and logs at WARN instead of leaving the transfer
+  pending forever.
+- **A relative `script.path` now resolves against the config file's directory,
+  so siphon starts under a supervisor.** It was resolved against the process
+  working directory, which is the config directory when you run siphon by hand
+  and `/` under systemd. The packaged `siphon.yaml` ships
+  `script.path: "scripts/proxy_default.py"`, so the packaged unit looked for
+  `/scripts/proxy_default.py`, failed the script load, exited non-zero and
+  restart-looped — while the same config started fine from `/etc/siphon`. A
+  container `WORKDIR` or an embedding binary that chdirs hit the same trap.
+  `script.include_paths` is anchored the same way. The rewrite only applies
+  when the config-relative file exists, so a config that relies on the working
+  directory keeps resolving as before; this can only make a previously-failing
+  config start. `Config::from_str` is unchanged (no file to anchor on), and the
+  startup log line prints the resolved path.
+- **The packaged systemd unit can write its state and log directories.**
+  `ProtectSystem=strict` was paired with `ReadWritePaths=/var/lib/siphon` only,
+  while every default write path (`cdr.file.path` at `/var/log/siphon/cdr.jsonl`,
+  `lawful_intercept.audit_log`, the `log.file` example) lives under `/var/log`,
+  which was read-only and never created. The unit now declares
+  `StateDirectory=siphon` and `LogsDirectory=siphon`, so systemd creates both
+  owned by the service user, and pins `WorkingDirectory=/etc/siphon`. It also
+  documents, as commented lines, the `CAP_NET_ADMIN` + `AF_NETLINK` an IMS
+  P-CSCF needs for `ipsec:` sec-agree.
+- **A log, CDR, audit or event-sink file whose parent directory is missing now
+  creates it.** Opening with `create(true)` creates the file and never the
+  directory holding it, so every default path we ship — all of them inside
+  `/var/log/siphon` — worked only through the packaged unit, where
+  `LogsDirectory=` had already made the directory. Started any other way (a
+  tarball install, `cargo install`, a container, by hand) the same config took
+  `log.file` down with a process exit and logged an error per record for the CDR
+  file, the LI audit log and the Diameter event sink. The directory is created
+  only when the open actually fails with `NotFound`, so the happy path is
+  unchanged and a permission error still reads as a permission error.
+- **The shipped logrotate config is installed, and rotates the paths siphon
+  actually writes.** `etc/logrotate.d/siphon` still named `/var/log/siphon.log`
+  — a path that is not writable under `ProtectSystem=strict` — and was in no
+  package: not the `.deb`, not the `.rpm`, not the release tarball. It now
+  covers `/var/log/siphon/*.log` with `copytruncate` (siphon holds those open
+  for the process lifetime, and `ExecReload` reloads the Python script, not the
+  log file) and rotates `cdr.jsonl` separately *without* `copytruncate`, whose
+  copy-then-truncate race can drop a billing record. `.deb` and `.rpm` also
+  create `/var/log/siphon` at install time for a by-hand first run.
+- **The packaged unit stops restart-looping on a broken config.** siphon exits
+  non-zero on a config or script error, and `RestartSec=5s` puts only two starts
+  inside systemd's default 10 s window, so the default start limit never tripped
+  — a permanently broken config looped forever (a reported install reached
+  restart counter 279) instead of failing visibly. The unit now sets
+  `StartLimitIntervalSec=300` / `StartLimitBurst=10`, so roughly a minute of
+  failed restarts puts the unit in `failed` where `systemctl status` shows it —
+  generous enough that a slow-to-appear address still recovers on its own.
+- **An HTTP probe on a SIP-only TCP/TLS listener was neither dropped nor
+  counted.** Stream framing (RFC 3261 §18.3) measures a message by finding
+  `\r\n\r\n` and reading `Content-Length` — which a well-formed HTTP request
+  also satisfies — so a vulnerability scanner's `GET /phpinfo.php HTTP/1.1` was
+  framed as a complete "message", queued to the dispatcher and rejected only by
+  the parser: the connection stayed open, the whole attacker-supplied buffer was
+  logged at `warn`, and nothing was recorded against the source, so
+  `security.failed_auth_ban` never fired no matter how long the scan ran. Only
+  an *incomplete* frame was ever classified. Dedicated `listen.tcp` /
+  `listen.tls` listeners now classify each connection from its first line —
+  the same check a `tcp+ws` / `tls+wss` mux already applied — and close it
+  before the framer runs when it is not SIP, counting a strong auto-ban signal
+  (a scanner is banned on its fourth probe at the default weights). An HTTP
+  request line is not SIP on a listener with no WebSocket half, so it is treated
+  like any other non-SIP bytes, and the probe is never answered. A peer that
+  connects and sends nothing still serves as raw SIP (connection reuse,
+  RFC 5923), and a connect-and-close L4 health check is still never counted as
+  abuse. The parse-error log line is now capped, so an unparseable message can
+  no longer decide how much it writes into the log, and a TLS peer that
+  disappears without `close_notify` — every scanner, and most browsers — logs at
+  `debug` instead of `warn`.
+- **Extension-module startup diagnostics were being swallowed.** `siphon-bin`
+  composes its extension modules at *builder* time, before `SiphonServer::run()`
+  installs the tracing subscriber, so every `tracing::error!` / `warn!` in that
+  layer went nowhere. A binary whose `extensions.smpp` (or `.http`) pointed at a
+  missing or unparseable file started up completely silent with the module
+  disabled, and the documented "loud on mismatch" warning for a config block
+  whose cargo feature was not compiled in never printed either. Those
+  diagnostics now go to stderr, where the rest of siphon's pre-subscriber
+  startup output goes, and name the offending path.
+- **Every digest challenge but the weakest was dropped on the wire.**
+  `auth.require_*_digest` builds one challenge per algorithm — MD5 + SHA-256 +
+  SHA-512-256, as RFC 7616 §3.7 asks for — so a single 401/407 serves RFC 2617
+  and RFC 7616 clients alike. The response builder copied only the first value,
+  so the wire carried MD5 alone and no client could negotiate up from it. All
+  values are now copied, as separate header lines.
+- **A locally-generated B2BUA final response carried no `To` tag.** RFC 3261
+  §8.2.6.2 requires a UAS to tag every response but 100, and siphon is the UAS
+  on the A-leg. The 408 ring-timeout path stamped the A-leg dialog's tag but
+  `call.reject()` did not, so every script-driven rejection answered a
+  dialog-forming INVITE with the request's tagless `To`. Both paths now share one
+  helper.
+- **The same address under two `listen:` protocols silently half-worked.** Every
+  stream listener binds with `SO_REUSEPORT`, so configuring one address under
+  both `listen.tls` and `listen.wss` (an entirely reasonable-looking way to ask
+  for both on one port) started two listeners that both bound successfully and
+  had the kernel distribute arriving connections between them — roughly half of
+  the WSS clients landed in the raw-SIP reader and half of the TLS peers in the
+  WebSocket handshake, with no error logged anywhere. That configuration now
+  does what it reads like (see the multiplexed listener above), and the pairings
+  that genuinely cannot share a socket are rejected at startup.
+- **Rf ACR-START reported no answer instant, so a CDF could not compute billable
+  duration.** `Time-Stamps` (TS 32.299 §7.2.183) is what separates alerting from
+  talk time, and the auto-emit path filled neither half correctly: it sampled
+  `SIP-Request-Timestamp` at the moment the ACR was built — which for a START is
+  the 200 OK, not the INVITE — and never set `SIP-Response-Timestamp` at all.
+  Every START therefore carried one timestamp equal to its own `Event-Timestamp`,
+  indistinguishable from a record triggered by the INVITE, and a collector
+  reading INVITE-to-BYE over-charged every call by its ring time. Both instants
+  are now carried from the session that measured them, derived from its monotonic
+  clock so a wall-clock step mid-call cannot invent (or negate) ring time.
+- **ACR-STOP timestamped the INVITE while reporting the BYE.** `Time-Stamps`
+  describes the record's own trigger request, so a STOP whose `Event-Type` says
+  BYE must timestamp the BYE — it carried the INVITE instant forward from the
+  START instead, leaving the two AVPs describing different events minutes apart.
+- **A failed call produced no Rf record whatsoever.** No accounting session is
+  opened for an INVITE that never gets a 2xx, and nothing else was emitted
+  either, so an unanswered or rejected call was simply absent from the stream —
+  and since `Cause-Code` was hard-set to 0 on every STOP, no record anywhere
+  distinguished a successful call from a failed one. Unsuccessful session
+  establishment now emits ACR-EVENT per TS 32.260 §5.2.2.1, carrying the ICID and
+  the SIP status as a negative `Cause-Code` (TS 32.299 §7.2.35). 401/407 are
+  excluded — the UA re-sends against a challenge and the retry is the same call
+  attempt — while 487 is included, a caller who hung up during alerting being a
+  real unsuccessful setup.
+- **No IMS ACR carried a `Subscription-Id`**, so every CDR landed with no billable
+  subscriber on it and the collector had to resolve the IMPU out-of-band, which
+  only works for subscribers it has provisioned. Records now carry one typed
+  `Subscription-Id` per served-party identity (RFC 4006 §8.47: `tel:` and bare
+  `+E.164` → END_USER_E164, IMPUs → END_USER_SIP_URI), and `rf_acr_*` gained
+  `subscription_id` / `subscription_id_type` kwargs — each accepting one value or
+  a list — for scripts that hold an IMSI the SIP layer cannot derive.
+- **A multi-valued `P-Asserted-Identity` was concatenated into one
+  `Calling-Party-Address`.** The whole header value was reduced by taking its
+  first `<` and last `>`, so a subscriber asserting an IMPU, a `tel:` alias and an
+  IMSI-derived IMPU produced a single unbalanced string
+  (`sip:…org>, <tel:…>, <sip:…`) that no consumer can split back apart, and that
+  breaks outright on an identity containing a comma. `Calling-Party-Address` is
+  0..n (TS 32.299 §7.2.33) and now repeats once per identity, with the list split
+  on commas outside angle brackets and quoted display names. The same parse fixes
+  a bracketed URI carrying its own parameters, which used to be truncated at the
+  first `;`.
+- **The served party on a terminating record was the caller.** `User-Name` was
+  taken from the calling party regardless of role, so the callee's own record
+  identified whoever placed the call. It now follows `Role-Of-Node` per
+  TS 32.260 §5.1 — caller on originating, callee on terminating.
+- **An intra-node call opened two terminating accounting records and only ever
+  stopped one.** `rf_sessions` gains its entry after the CDF answers ACR-START,
+  but the dedupe gate ran before the spawn, and the two legs of such a call are
+  answered milliseconds apart — so the originating leg's speculative dual-ACR
+  terminating record and the terminating leg's own record both passed an empty
+  map and opened separate sessions on one ICID. Only one is reachable from the
+  BYE; the other never got an ACR-STOP and emitted an ACR-INTERIM every cadence
+  tick until the 24h backstop, ~288 junk records per affected call. The key is
+  now reserved synchronously for the duration of the round-trip, and released on
+  every exit path so a CDF rejection cannot wedge it.
+- **The orphan sweep dropped an Rf session's map entry without releasing the
+  session.** Its ACR-INTERIM timer and its `siphon_rf_sessions` slot both
+  outlived the entry, so a reaped record kept emitting INTERIMs against a call
+  nothing was tracking any more. The sweep now claims the stop as it goes.
+- **A UAS-mode B2BUA answer carried no `Contact`, so no in-dialog request could
+  be addressed to it.** RFC 3261 §12.1.1 / §13.3.1.4 require a dialog-establishing
+  response to carry the Contact the UAC builds its remote target from. The
+  relayed path set one from the B-leg's 2xx, but `call.answer()` / `call.progress()`
+  — every single-leg answer, including every voice-AI call — had no B-leg to copy
+  from and set none at all. A well-behaved UAC therefore had nowhere to send ACK,
+  BYE, re-INVITE or PRACK: SIPp renders the empty target as `BYE  SIP/2.0`, which
+  arrives unparseable, and the call is only released when a timer fires. Host and
+  port now resolve exactly as the relayed path resolves them, so the Contact names
+  the listener the INVITE actually arrived on rather than the first-configured one.
+- **A SIPp scenario that timed out reported success.** `run_sipp` in
+  `scripts/run-tests.sh` exempted exit code 255, which is precisely what SIPp
+  returns when a scenario times out — including when an assertion fails and the
+  call never completes. Any hanging scenario was green.
 - **The extension binary picks up the SMPP bind-handshake fix.** `siphon-bin/`
   moves its `siphon-smpp` pin to v1.5.1, which carries smpp34 1.4.1: both sides
   read the bind handshake with a single `read()` and rejected the buffer when
@@ -1176,7 +1146,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   what makes it work on a flow-dialled leg: the kernel XFRM selector matches only
   the protected client port, so a retry that fell back to the default listener
   would go out unprotected and be dropped (3GPP TS 33.203 §7.4).
-
 - **A `relay(flow=…)` INVITE's Timer A retransmits no longer leave the wrong
   socket.** The proxy relay and fork paths pinned `source_local_addr: None` on
   their client-transaction timer entries, so while the first send went out the
@@ -1185,7 +1154,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the IPsec SA on a multi-listener host. Retransmits now resolve the same egress
   socket the original send did (captured flow, then IPsec auto-source, then a
   script `send_socket=` pin).
-
 - **Flow-pinned sends are now visible.** A request sent over a captured flow
   (`call.dial(flow=…)` / `relay(flow=…)`) bypasses the normal egress helper, and
   with it that helper's HEP capture — so a flow-pinned B-leg INVITE was the one
@@ -1193,7 +1161,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   additionally logs its destination, source socket, transport and size at debug
   level. Nothing on that path logged before, which made an absent send line easy
   to misread as the request never having been handed to the transport.
-
 - **`docs/media-engines.md` claimed SIPREC/MPTY subscriptions were unimplemented
   on `siphon-rtp` and would surface an engine error.** They have been wired on
   all three backends since the native backend shipped; the page was steering
@@ -1220,7 +1187,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
     (`nobodyKnowsThisScheme:...`, `soap.beep://...`) is syntactically valid and
     §8.2.2 requires a 416 Unsupported URI Scheme — which could not be sent,
     because the message failed to parse first.
-
 - **An in-dialog request for a B2BUA call that was just torn down is answered
   `481 Call/Transaction Does Not Exist` instead of being silently dropped
   (RFC 3261 §12.2.2, §15.1.2).** Hang-up glare — both parties send BYE within a
