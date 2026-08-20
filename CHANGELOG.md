@@ -80,6 +80,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   because at CCR-INITIAL there is no answer yet. Idempotent — a retransmitted
   200 OK neither restarts the clock nor sends a second record.
 - **`ro.charge_from`** (`answer` | `invite`, default `answer`) — see above.
+- **`destination` on the LCR answer**, at the answer level and per route (the
+  route's own wins). Retargets the call at a different destination number
+  (RFC 3261 §16.5) *before* the ordinary dial path runs, so `tech_prefix`,
+  `number_policy` and gateway-group member selection all still apply on top.
+  Previously the only levers were `tech_prefix`, which can only prepend, and
+  `ruri`, which replaces the whole Request-URI and so forces the routing API to
+  compose each carrier's host by hand — bypassing gateway-group member selection
+  and health checks entirely. Accepts a bare number or a full URI, of which only
+  the userpart is taken: the host stays siphon's to decide, so a retarget can
+  never route a call somewhere the operator did not configure. A `destination`
+  alone does not make a route routable — it says who to reach, never how. The
+  `To` userpart follows the retarget so the number the call was dialled on never
+  reaches the carrier; the tech prefix is deliberately not applied to `To`,
+  being a routing artifact of the R-URI rather than part of the called-party
+  identity. The field is absent from the wire when unset, so the contract stays
+  additive.
 
 ### Fixed
 - **Ro usage is reported as a delta, not per-interval.** A CCR-UPDATE that fails

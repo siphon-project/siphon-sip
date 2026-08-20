@@ -68,6 +68,7 @@ one of `gateway_group` / `next_hop` / `ruri`.
 | `gateway_group` | string? | A `gateway:` pool — siphon dials a healthy member, skips the route if the pool is down. Preferred (health-probed). |
 | `next_hop` | string? | Explicit next-hop URI (when no group, or to pin the wire destination). |
 | `ruri` | string? | Full Request-URI override (carrier IMPU shape / number format). |
+| `destination` | string? | Retarget this carrier at a different destination number (RFC 3261 §16.5). Overrides the answer-level `destination`. Bare number or a URI (userpart only). |
 | `tech_prefix` | string? | Dial/tech-prefix prepended to the R-URI userpart for this carrier (e.g. `"1010288"`). |
 | `number_policy` | string? | Named `number_policies:` preset applied to this carrier's B-leg From/To/PAI (per-carrier CLI/identity shape). R-URI stays controlled by `tech_prefix`/`ruri`. |
 | `rate` | number? | Per-minute rate (CDR/charging). |
@@ -86,6 +87,7 @@ Top-level:
 | `routes` | array | Ordered carriers. Empty + `reject: null` = no route (script answers 4xx/5xx). |
 | `cache_ttl_secs` | int? | How long siphon may cache this decision. `0`/absent = do not cache. |
 | `reject` | object? | `{ "code": int, "reason": string }` — siphon rejects the call with this instead of routing (API-side block). |
+| `destination` | string? | Retarget the call at a different destination number before routing (RFC 3261 §16.5). Applies to every route that does not set its own. |
 
 ## Behavior notes
 
@@ -110,6 +112,42 @@ Top-level:
   match. Use `number_policy` to reshape the From/To identity per carrier.
   `Proxy-Authorization` is **not** refused, so a per-carrier trunk credential
   still works.
+- **Retargeting: `destination` vs `ruri`** — both change what the carrier is
+  asked to reach, but at different layers.
+
+  `destination` replaces the dialled **number** before the ordinary dial path
+  runs, so `tech_prefix`, `number_policy` and gateway-group member selection all
+  still apply on top. Given as a bare number (`"+12025550123"`) or a full URI, of
+  which only the userpart is taken — the host stays siphon's to decide, from the
+  group or the next-hop, so a retarget can never send the call somewhere the
+  operator did not configure.
+
+  `ruri` replaces the **whole Request-URI**, host included. That means composing
+  each carrier's URI by hand, which bypasses group member selection and health
+  checking. Reach for it only when the host genuinely has to differ per route.
+
+  Both can be set: `ruri` owns the host, `destination` owns the number. A
+  `destination` alone does **not** make a route routable — it says who to reach,
+  never how, so the route still needs a `gateway_group` or a `next_hop`.
+
+  ```json
+  {
+    "destination": "+12025550199",
+    "routes": [
+      { "carrier_id": "a", "gateway_group": "carriers", "tech_prefix": "1010288" },
+      { "carrier_id": "b", "gateway_group": "carriers", "destination": "+12025550188" }
+    ]
+  }
+  ```
+
+  Carrier `a` is dialled as `1010288+12025550199` through a healthy member of
+  `carriers`; carrier `b` overrides the number with its own.
+
+  The `To` userpart follows the retarget, so the number the call was originally
+  dialled on never reaches the carrier. The **tech prefix is not** applied to
+  `To`: it is a carrier routing artifact that belongs to the R-URI, not to the
+  called-party identity. `number_policy` still owns `To`'s format on top.
+
 - **Forward-compatibility** — unknown response fields are ignored; new optional
   fields can be added without a version bump. Bump `version` only on a breaking
   change.

@@ -117,6 +117,42 @@ pub struct LcrResponse {
     /// dialing (an API-side block, e.g. no route / fraud / balance).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reject: Option<LcrReject>,
+    /// Retarget the call at a different destination number before routing
+    /// (RFC 3261 §16.5). Applies to every route that does not override it with
+    /// its own `destination`.
+    ///
+    /// This is the number the carrier is asked to reach; `tech_prefix`,
+    /// `number_policy` and gateway-group member selection all apply **on top**
+    /// of it, unchanged. That is the difference from `ruri`, which replaces the
+    /// whole Request-URI including the host and so forces the API to compose
+    /// each carrier's URI by hand, bypassing group member selection and health
+    /// checks entirely.
+    ///
+    /// Accepts a bare number (`"+12025550123"`) or a full URI, of which only
+    /// the userpart is taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+}
+
+impl LcrResponse {
+    /// The answer's routes with the answer-level `destination` resolved onto
+    /// every route that does not carry its own.
+    ///
+    /// Applying the precedence once, here, keeps it out of the dial path — the
+    /// dispatcher only ever reads `Route::destination`, and there is one place
+    /// where "per-route wins" is decided.
+    pub fn resolved_routes(&self) -> Vec<Route> {
+        self.routes
+            .iter()
+            .map(|route| {
+                let mut route = route.clone();
+                if route.destination.is_none() {
+                    route.destination = self.destination.clone();
+                }
+                route
+            })
+            .collect()
+    }
 }
 
 /// An API-side instruction to reject the call.
@@ -145,8 +181,22 @@ pub struct Route {
     pub next_hop: Option<String>,
     /// R-URI override for this carrier (else the dialed number is kept). Full
     /// control over the number shape the carrier sees.
+    ///
+    /// Replaces the *whole* Request-URI, host included, so the API has to
+    /// compose the carrier's URI itself — which bypasses gateway-group member
+    /// selection and health checking. Prefer `destination` when only the
+    /// number needs to change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ruri: Option<String>,
+    /// Retarget this carrier's attempt at a different destination number,
+    /// overriding the answer-level `destination` (RFC 3261 §16.5).
+    ///
+    /// Replaces the dialled number *before* the ordinary dial path runs, so
+    /// `tech_prefix`, `number_policy` and gateway-group member selection still
+    /// apply on top. Accepts a bare number or a full URI, of which only the
+    /// userpart is taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
     /// Tech-prefix / dial-prefix prepended to the B-leg R-URI userpart for this
     /// carrier (e.g. `"1010288"` or `"#31#"`). Many carriers key routing/billing
     /// on a prefix in front of the E.164 number. Prepended to `ruri`'s userpart
@@ -205,6 +255,10 @@ pub struct Route {
 
 impl Route {
     /// A route is routable if it names either a gateway group or a next-hop.
+    ///
+    /// `destination` is deliberately not enough on its own: it says *who* to
+    /// reach, never *how*, so a route carrying only a destination has nowhere
+    /// to send the INVITE.
     pub fn is_routable(&self) -> bool {
         self.gateway_group.is_some() || self.next_hop.is_some() || self.ruri.is_some()
     }
@@ -285,6 +339,9 @@ impl LcrClient {
             }],
             cache_ttl_secs: None, // never cache a fallback
             reject: None,
+            // A fallback keeps the dialled number: siphon is standing in for an
+            // API that did not answer, so it must not invent a destination.
+            destination: None,
         })
     }
 
@@ -642,5 +699,76 @@ mod tests {
             client.route(&sample_request()).await,
             LcrOutcome::Unavailable
         );
+    }
+    #[test]
+    fn answer_level_destination_applies_to_routes_without_their_own() {
+        let response = LcrResponse {
+            destination: Some("+12025550199".to_string()),
+            routes: vec![
+                Route {
+                    carrier_id: "a".into(),
+                    ..Default::default()
+                },
+                Route {
+                    carrier_id: "b".into(),
+                    destination: Some("+12025550188".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let resolved = response.resolved_routes();
+        assert_eq!(resolved[0].destination.as_deref(), Some("+12025550199"));
+        assert_eq!(
+            resolved[1].destination.as_deref(),
+            Some("+12025550188"),
+            "a route's own destination wins over the answer-level one",
+        );
+    }
+
+    #[test]
+    fn no_answer_level_destination_leaves_routes_alone() {
+        let response = LcrResponse {
+            routes: vec![Route {
+                carrier_id: "a".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(response.resolved_routes()[0].destination.is_none());
+    }
+
+    #[test]
+    fn destination_round_trips_through_the_api_json() {
+        let json = r#"{
+            "destination": "+12025550199",
+            "routes": [
+                {"carrier_id": "a", "gateway_group": "carriers"},
+                {"carrier_id": "b", "gateway_group": "carriers", "destination": "+12025550188"}
+            ]
+        }"#;
+        let response: LcrResponse = serde_json::from_str(json).expect("parses");
+
+        assert_eq!(response.destination.as_deref(), Some("+12025550199"));
+        assert_eq!(response.routes[1].destination.as_deref(), Some("+12025550188"));
+
+        // Absent on the wire when unset, so the contract stays additive.
+        let minimal: LcrResponse =
+            serde_json::from_str(r#"{"routes":[{"carrier_id":"a"}]}"#).expect("parses");
+        assert!(minimal.destination.is_none());
+        assert!(!serde_json::to_string(&minimal).unwrap().contains("destination"));
+    }
+
+    #[test]
+    fn a_destination_alone_does_not_make_a_route_routable() {
+        // It says who to reach, never how — such a route has nowhere to send
+        // the INVITE and must still be skipped.
+        let route = Route {
+            carrier_id: "a".into(),
+            destination: Some("+12025550199".to_string()),
+            ..Default::default()
+        };
+        assert!(!route.is_routable());
     }
 }
