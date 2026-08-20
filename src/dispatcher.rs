@@ -282,6 +282,12 @@ struct DispatcherState {
     /// `cdr.auto_emit` is off; the orphan sweep reaps any entry whose teardown
     /// never reached the dispatcher.
     cdr_sessions: Arc<DashMap<String, crate::cdr::CdrSession>>,
+    /// Inbound REFERs on *controlled* B2BUA calls held un-answered while the
+    /// owning control app decides (`accept_refer` / `reject_refer`). Populated by
+    /// [`handle_b2bua_refer`] only when the call is controlled; drained on accept
+    /// / reject / the decision-deadline sweep. Empty and cheaply skipped when no
+    /// control plane is configured (no call is ever controlled).
+    pending_inbound_refer: Arc<PendingInboundReferStore>,
 }
 
 /// Bundle held in `DispatcherState::rf_sessions` so ACR-STOP can reuse
@@ -728,6 +734,7 @@ pub async fn run(
         ro_charger,
         ro_sessions: Arc::new(DashMap::new()),
         cdr_sessions: Arc::new(DashMap::new()),
+        pending_inbound_refer: Arc::new(PendingInboundReferStore::default()),
     });
 
     // Hand the freshly-constructed manager handles to the drain coordinator
@@ -826,6 +833,7 @@ pub async fn run(
                     }
                     _ = answer_timeout_interval.tick() => {
                         check_b2bua_answer_timeouts(&state);
+                        check_pending_inbound_refer_timeouts(&state);
                     }
                     _ = cleanup_interval.tick() => {
                         sweep_stale_entries(&state).await;
@@ -11401,6 +11409,26 @@ fn check_b2bua_answer_timeouts(state: &DispatcherState) {
     }
 }
 
+/// Answer every controlled call's inbound REFER whose decision deadline passed
+/// without the owning control app calling `accept_refer` / `reject_refer` — a
+/// `603 Decline`, matching the no-`@b2bua.on_refer`-handler default. Drains the
+/// pending entry so the store returns to baseline (a REFER held forever would
+/// strand the referrer). Modelled on [`check_b2bua_answer_timeouts`]; runs on the
+/// same fast dispatcher-loop interval.
+fn check_pending_inbound_refer_timeouts(state: &DispatcherState) {
+    let now = std::time::Instant::now();
+    for pending in state.pending_inbound_refer.take_expired(now) {
+        let sip_call_id = pending
+            .message
+            .headers
+            .get("Call-ID")
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        warn!(%sip_call_id, "control plane: inbound REFER decision deadline — no accept_refer/reject_refer, applying default (603 Decline)");
+        b2bua_refer_send_final(&pending.inbound, &pending.message, 603, "Decline", state);
+    }
+}
+
 /// Resolve a gateway group to a healthy member's next-hop URI (LCR carrier
 /// pools). `None` when the group is unknown or entirely down — the caller skips
 /// that carrier. The transport is baked into the URI so a TLS/TCP carrier pool
@@ -17579,6 +17607,81 @@ pub fn b2bua_refer_call(
     b2bua_send_outbound_refer(&control.state, &internal_call_id, /*on_a_leg=*/ true, &refer_to)
 }
 
+/// Accept a *controlled* call's pending inbound REFER — the control-plane
+/// `accept_refer` verb. Pops the REFER held by [`handle_b2bua_refer`] for a
+/// controlled call and drives the shipped [`b2bua_refer_accept`] transfer in the
+/// resolved mode (terminate = siphon-terminated 202 + NOTIFY + re-dial;
+/// transparent = forward on the far leg), reusing the exact same machinery the
+/// `@b2bua.on_refer` accept path uses — including #181's single-leg behaviour
+/// (a voice-ai / IVR call with no B leg re-dials the target off the A dialog,
+/// falling back to the referrer's SDP when there is no surviving leg to bridge).
+///
+/// `target` overrides the Refer-To URI, `next_hop` steers egress without
+/// reshaping the R-URI, and `mode` overrides the configured
+/// `b2bua.default_refer_mode`. Returns `false` (never panics) when no REFER is
+/// pending for this call (already decided, timed out, or the call is gone),
+/// which the adapter maps to `not_found`. Safe from any thread (enters the
+/// dispatcher runtime), mirroring [`b2bua_refer_call`].
+pub fn b2bua_accept_refer_call(
+    sip_call_id: &str,
+    target: Option<String>,
+    next_hop: Option<String>,
+    mode: Option<crate::script::api::call::ReferMode>,
+) -> bool {
+    let Some(control) = B2BUA_CONTROL.get() else {
+        return false;
+    };
+    let state = &control.state;
+    let Some(pending) = state.pending_inbound_refer.take(sip_call_id) else {
+        return false;
+    };
+    let Some(internal_call_id) = state.call_actors.find_by_sip_call_id(sip_call_id) else {
+        // The call vanished between the REFER and the decision — the referrer's
+        // transaction is gone too. The pending entry is already removed (no leak).
+        warn!(%sip_call_id, "b2bua_accept_refer_call: call gone before accept — dropping pending REFER");
+        return false;
+    };
+
+    // The send path re-anchors media (block_in_place) and may spawn (TCP/TLS
+    // connect); the caller may be on a non-tokio thread (control apply task) —
+    // establish the runtime, mirroring b2bua_route_call / b2bua_refer_call.
+    let _enter = control.runtime.enter();
+
+    let mode = mode.unwrap_or(state.default_refer_mode);
+    let target_uri = target.unwrap_or_else(|| pending.refer_to.uri.clone());
+    b2bua_refer_accept(
+        pending.inbound,
+        pending.message,
+        &internal_call_id,
+        pending.from_a_leg,
+        &target_uri,
+        next_hop.as_deref(),
+        pending.refer_to.replaces.clone(),
+        mode,
+        state,
+    );
+    true
+}
+
+/// Reject a *controlled* call's pending inbound REFER — the control-plane
+/// `reject_refer` verb. Pops the REFER held by [`handle_b2bua_refer`] and sends
+/// the given final non-2xx to the referrer on the flow it arrived on (the same
+/// builder the no-handler / deadline paths use, so the referrer is always
+/// answered per RFC 3515 §2.4.2). Returns `false` (mapped to `not_found` by the
+/// adapter) when no REFER is pending for this call. Safe from any thread.
+pub fn b2bua_reject_refer_call(sip_call_id: &str, code: u16, reason: &str) -> bool {
+    let Some(control) = B2BUA_CONTROL.get() else {
+        return false;
+    };
+    let state = &control.state;
+    let Some(pending) = state.pending_inbound_refer.take(sip_call_id) else {
+        return false;
+    };
+    let _enter = control.runtime.enter();
+    b2bua_refer_send_final(&pending.inbound, &pending.message, code, reason, state);
+    true
+}
+
 /// One routing target for [`b2bua_route_call`]. Built by the control adapter from
 /// the `route` verb's `targets[]` — a bare URI (`ruri` only) or an object
 /// carrying a per-target `next_hop` / `headers` / ring `timeout`.
@@ -19086,6 +19189,126 @@ fn build_b2bua_in_dialog_request(
     }
 }
 
+/// A REFER received on a *controlled* B2BUA call, held un-answered while the
+/// owning control app decides via `accept_refer` / `reject_refer`.
+///
+/// The inbound datagram + parsed message are owned here so the deferred decision
+/// can drive [`b2bua_refer_accept`] (accept) or build the final SIP response
+/// (reject / deadline) — both need the original request to route the answer back
+/// on the flow the REFER arrived on. The entry is removed on accept, reject, OR
+/// the decision deadline (a `603 Decline`, matching the no-`@b2bua.on_refer`
+/// -handler default). A REFER left pending forever would strand the referrer's
+/// transaction, so the deadline is a hard backstop, never optional.
+struct PendingInboundRefer {
+    /// The inbound datagram (transport + flow) the REFER arrived on.
+    inbound: InboundMessage,
+    /// The parsed REFER request.
+    message: SipMessage,
+    /// Parsed Refer-To — target URI + any embedded Replaces (attended transfer).
+    refer_to: crate::sip::headers::refer::ReferTo,
+    /// Whether the REFER arrived on the A-leg dialog (drives survivor selection in
+    /// terminate mode — see [`b2bua_refer_accept`]).
+    from_a_leg: bool,
+    /// When the decision deadline expires and the sweep applies the 603 default.
+    deadline: std::time::Instant,
+}
+
+/// Per-call store of inbound REFERs on *controlled* calls awaiting a control-app
+/// decision, keyed by the REFER's SIP Call-ID (byte-identical to the control
+/// channel's `sip_call_id` for a controlled single-`CallActor` call).
+///
+/// New per-call state: every entry is removed on accept, reject, or the decision
+/// deadline, so the store drains back to baseline under a completed workload (the
+/// classic never-evicted-per-call-entry leak). Covered by the co-located
+/// steady-state leak test `pending_inbound_refer_store_drains_to_baseline`.
+#[derive(Default)]
+struct PendingInboundReferStore {
+    entries: DashMap<String, PendingInboundRefer>,
+}
+
+impl PendingInboundReferStore {
+    /// Record a pending REFER. Returns `false` (dropping `pending`) when an entry
+    /// already exists for this call — a REFER retransmit is absorbed rather than
+    /// pushing a duplicate `TransferRequested` to the app or resetting the
+    /// deadline. Race-safe via the map entry API (the junction is not guaranteed
+    /// serialized per Call-ID across workers).
+    fn insert(&self, sip_call_id: &str, pending: PendingInboundRefer) -> bool {
+        use dashmap::mapref::entry::Entry;
+        match self.entries.entry(sip_call_id.to_string()) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                slot.insert(pending);
+                true
+            }
+        }
+    }
+
+    /// Remove + return the pending REFER for a call (accept / reject path). `None`
+    /// when nothing is pending (already decided, timed out, or never controlled).
+    fn take(&self, sip_call_id: &str) -> Option<PendingInboundRefer> {
+        self.entries.remove(sip_call_id).map(|(_, pending)| pending)
+    }
+
+    /// Drain every entry whose decision deadline has passed; the sweep applies the
+    /// 603 default to each drained REFER.
+    fn take_expired(&self, now: std::time::Instant) -> Vec<PendingInboundRefer> {
+        let expired: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|entry| entry.value().deadline <= now)
+            .map(|entry| entry.key().clone())
+            .collect();
+        expired
+            .into_iter()
+            .filter_map(|key| self.entries.remove(&key).map(|(_, pending)| pending))
+            .collect()
+    }
+
+    /// The number of pending REFERs (leak-test + observability accessor).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Send the final SIP response to an inbound REFER on the flow it arrived on.
+///
+/// The single builder every "answer the REFER now" path funnels through — the
+/// no-`@b2bua.on_refer`-handler and script-reject arms of [`handle_b2bua_refer`],
+/// the control-plane `reject_refer` verb, and the decision-deadline 603 default.
+/// RFC 3515 §2.4.2: a REFER is always answered, never silently dropped.
+fn b2bua_refer_send_final(
+    inbound: &InboundMessage,
+    message: &SipMessage,
+    code: u16,
+    reason: &str,
+    state: &DispatcherState,
+) {
+    let response = build_response(message, code, reason, state.server_header.as_deref(), &[]);
+    send_message_from(
+        response,
+        inbound.transport,
+        inbound.remote_addr,
+        inbound.connection_id,
+        Some(inbound.local_addr),
+        state,
+    );
+}
+
+/// The window a controlled call's inbound REFER waits for an `accept_refer` /
+/// `reject_refer` decision before the sweep applies the 603 default.
+///
+/// Reuses the control app's handoff-deadline knob (the same "how long to wait for
+/// the controller to act" budget), flooring a disabled (`0`) value at 30 s so the
+/// REFER is always answered inside the referrer's transaction (RFC 3261 Timer F =
+/// 64·T1 ≈ 32 s) — a REFER left pending forever would strand the referrer.
+fn refer_decision_deadline(bus: &crate::control::ControlBus) -> std::time::Duration {
+    match bus.handoff_deadline_ms() {
+        0 => std::time::Duration::from_secs(30),
+        ms => std::time::Duration::from_millis(ms),
+    }
+}
+
 /// Handle an in-dialog REFER (RFC 3515) belonging to a tracked B2BUA call.
 ///
 /// This is the intercept that stops the REFER loop: without it, an in-dialog
@@ -19095,12 +19318,19 @@ fn build_b2bua_in_dialog_request(
 ///
 /// Flow: resolve the dialog leg the REFER arrived on (by dialog identity, never
 /// source socket — Teams reconnects per transaction over TLS), parse Refer-To,
-/// fire `@b2bua.on_refer(call)`, then act on the deferred action:
-///   - no `@b2bua.on_refer` handler registered → local `603 Decline` (siphon
-///     *does* implement REFER, so `501 Not Implemented` would be untruthful),
-///   - `reject_refer(code, reason)` → that final response,
-///   - `accept_refer(...)` → run the transfer in the resolved mode
-///     (siphon-terminated by default, transparent forward when selected).
+/// then split on ownership:
+///   - **Controlled call** (handed to an external control app): hold the REFER
+///     un-answered, emit a `TransferRequested` event to the owning connection,
+///     and arm the decision deadline. The app decides via `accept_refer` /
+///     `reject_refer`; a missed deadline applies the 603 default. The in-process
+///     `@b2bua.on_refer` path does NOT run.
+///   - **Uncontrolled call**: fire `@b2bua.on_refer(call)`, then act on the
+///     deferred action:
+///     - no `@b2bua.on_refer` handler registered → local `603 Decline` (siphon
+///       *does* implement REFER, so `501 Not Implemented` would be untruthful),
+///     - `reject_refer(code, reason)` → that final response,
+///     - `accept_refer(...)` → run the transfer in the resolved mode
+///       (siphon-terminated by default, transparent forward when selected).
 ///
 /// Every path answers the REFER — never a silent drop, never a proxy relay.
 fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &DispatcherState) {
@@ -19177,24 +19407,54 @@ fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &Disp
         Some(Ok(refer_to)) => refer_to,
         _ => {
             warn!(call_id = %call_id, "B2BUA REFER: missing or malformed Refer-To — 400");
-            let response = build_response(
-                &message,
-                400,
-                "Bad Request",
-                state.server_header.as_deref(),
-                &[],
-            );
-            send_message_from(
-                response,
-                inbound.transport,
-                inbound.remote_addr,
-                inbound.connection_id,
-                Some(inbound.local_addr),
-                state,
-            );
+            b2bua_refer_send_final(&inbound, &message, 400, "Bad Request", state);
             return;
         }
     };
+
+    // Control-plane interception (RFC 3515 on a *controlled* call): when the call
+    // has been handed to an external control app, that app owns the transfer
+    // decision — NOT the in-process `@b2bua.on_refer` path. Hold the REFER
+    // un-answered, surface it as a `TransferRequested` event on the owning
+    // connection, and arm the decision deadline (603 Decline default on timeout,
+    // matching the no-handler default below). An UNCONTROLLED call falls through
+    // to the Python path unchanged — the control interception is only for
+    // controlled calls.
+    if let Some(bus) = crate::control::ControlBus::global() {
+        if let Some(channel_id) = bus.channel_id_for_sip_call_id(&sip_call_id) {
+            let emitted = state.pending_inbound_refer.insert(
+                &sip_call_id,
+                PendingInboundRefer {
+                    inbound,
+                    message,
+                    refer_to: refer_to.clone(),
+                    from_a_leg,
+                    deadline: std::time::Instant::now() + refer_decision_deadline(&bus),
+                },
+            );
+            if emitted {
+                bus.forward_transfer_requested(
+                    &channel_id,
+                    &sip_call_id,
+                    &refer_to,
+                    from_tag.as_deref(),
+                );
+                info!(
+                    call_id = %call_id,
+                    %sip_call_id,
+                    channel = %channel_id,
+                    target = %refer_to.uri,
+                    "B2BUA REFER: controlled call — TransferRequested, awaiting accept/reject"
+                );
+            } else {
+                // A REFER retransmit (non-INVITE over UDP retransmits to Timer F):
+                // a decision is already pending, so absorb it rather than emit a
+                // duplicate event or reset the deadline.
+                debug!(call_id = %call_id, %sip_call_id, "B2BUA REFER: retransmit for a pending controlled transfer — absorbed");
+            }
+            return;
+        }
+    }
 
     // Fire @b2bua.on_refer(call). No handler → local 603 Decline (loop killer for
     // scripts that don't handle REFER at all).
@@ -19202,21 +19462,7 @@ fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &Disp
     let handlers = engine_state.handlers_for(&HandlerKind::B2buaRefer);
     if handlers.is_empty() {
         debug!(call_id = %call_id, "B2BUA REFER: no @b2bua.on_refer handler — 603 Decline");
-        let response = build_response(
-            &message,
-            603,
-            "Decline",
-            state.server_header.as_deref(),
-            &[],
-        );
-        send_message_from(
-            response,
-            inbound.transport,
-            inbound.remote_addr,
-            inbound.connection_id,
-            Some(inbound.local_addr),
-            state,
-        );
+        b2bua_refer_send_final(&inbound, &message, 603, "Decline", state);
         return;
     }
 
@@ -19269,16 +19515,7 @@ fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &Disp
     match action {
         CallAction::RejectRefer { code, reason } => {
             debug!(call_id = %call_id, code, "B2BUA REFER: script rejected");
-            let response =
-                build_response(&message, code, &reason, state.server_header.as_deref(), &[]);
-            send_message_from(
-                response,
-                inbound.transport,
-                inbound.remote_addr,
-                inbound.connection_id,
-                Some(inbound.local_addr),
-                state,
-            );
+            b2bua_refer_send_final(&inbound, &message, code, &reason, state);
         }
         CallAction::AcceptRefer {
             target,
@@ -19304,21 +19541,7 @@ fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &Disp
         // fall through to a relay (RFC 3515 — the recipient must answer).
         other => {
             debug!(call_id = %call_id, ?other, "B2BUA REFER: handler took no accept/reject action — 603 Decline");
-            let response = build_response(
-                &message,
-                603,
-                "Decline",
-                state.server_header.as_deref(),
-                &[],
-            );
-            send_message_from(
-                response,
-                inbound.transport,
-                inbound.remote_addr,
-                inbound.connection_id,
-                Some(inbound.local_addr),
-                state,
-            );
+            b2bua_refer_send_final(&inbound, &message, 603, "Decline", state);
         }
     }
 }
@@ -25203,6 +25426,171 @@ a=rtpmap:8 PCMA/8000\r\n";
         assert!(
             rf_reserve_start(&pending, key).is_some(),
             "the key is claimable again once the in-flight START resolved"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pending-inbound-REFER store (controlled-call transfer decision)
+    // -----------------------------------------------------------------------
+
+    /// Build a parseable in-dialog REFER whose Refer-To targets `sip:carol@…`.
+    fn sample_refer() -> SipMessage {
+        let raw = concat!(
+            "REFER sip:proxy@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bKrefer\r\n",
+            "From: <sip:alice@example.com>;tag=alicetag\r\n",
+            "To: <sip:proxy@example.com>;tag=proxytag\r\n",
+            "Call-ID: refer-call@example.com\r\n",
+            "CSeq: 2 REFER\r\n",
+            "Refer-To: <sip:carol@example.com>\r\n",
+            "Max-Forwards: 70\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        );
+        parse_sip_message(raw).expect("REFER fixture must parse").1
+    }
+
+    /// Build a `PendingInboundRefer` with the given decision deadline. The
+    /// inbound flow is a minimal UDP datagram (the store just moves it around).
+    fn sample_pending_refer(deadline: std::time::Instant) -> PendingInboundRefer {
+        let addr: SocketAddr = "192.0.2.1:5060".parse().unwrap();
+        let local: SocketAddr = "192.0.2.100:5060".parse().unwrap();
+        PendingInboundRefer {
+            inbound: InboundMessage {
+                connection_id: ConnectionId::default(),
+                transport: Transport::Udp,
+                local_addr: local,
+                remote_addr: addr,
+                data: Bytes::new(),
+            },
+            message: sample_refer(),
+            refer_to: crate::sip::headers::refer::ReferTo {
+                uri: "sip:carol@example.com".to_string(),
+                replaces: None,
+            },
+            from_a_leg: true,
+            deadline,
+        }
+    }
+
+    #[test]
+    fn pending_inbound_refer_store_drains_to_baseline() {
+        // THE leak gate: N controlled calls each get a pending REFER, then each is
+        // drained via one of the three exit paths (accept → take, reject → take,
+        // deadline → take_expired). The store MUST return to its baseline len() —
+        // a per-call entry that is never evicted is the exact leak this catches.
+        let store = PendingInboundReferStore::default();
+        let baseline = store.len();
+        assert_eq!(baseline, 0);
+
+        let now = std::time::Instant::now();
+        let future = now + std::time::Duration::from_secs(30);
+        let past = now - std::time::Duration::from_secs(1);
+
+        for cycle in 0..64 {
+            let accept_key = format!("accept-{cycle}@host");
+            let reject_key = format!("reject-{cycle}@host");
+            let timeout_key = format!("timeout-{cycle}@host");
+
+            assert!(store.insert(&accept_key, sample_pending_refer(future)));
+            assert!(store.insert(&reject_key, sample_pending_refer(future)));
+            assert!(store.insert(&timeout_key, sample_pending_refer(past)));
+            assert_eq!(store.len(), baseline + 3);
+
+            // Accept path drains its entry.
+            assert!(store.take(&accept_key).is_some());
+            // Reject path drains its entry.
+            assert!(store.take(&reject_key).is_some());
+            // Deadline sweep drains the expired one (only the past-deadline entry).
+            let expired = store.take_expired(now);
+            assert_eq!(expired.len(), 1);
+
+            assert_eq!(
+                store.len(),
+                baseline,
+                "store must drain to baseline after cycle {cycle}"
+            );
+        }
+        assert_eq!(store.len(), baseline);
+    }
+
+    #[test]
+    fn pending_inbound_refer_absorbs_retransmit() {
+        // A second insert for the same call (a REFER retransmit) is absorbed —
+        // returns false and does not add a duplicate entry or reset the deadline.
+        let store = PendingInboundReferStore::default();
+        let now = std::time::Instant::now();
+        let future = now + std::time::Duration::from_secs(30);
+
+        assert!(store.insert("cid@host", sample_pending_refer(future)));
+        assert!(
+            !store.insert("cid@host", sample_pending_refer(future)),
+            "a retransmit must be absorbed, not duplicated"
+        );
+        assert_eq!(store.len(), 1);
+
+        assert!(store.take("cid@host").is_some());
+        assert_eq!(store.len(), 0);
+        // A decision after the entry is gone (raced timeout) is a clean no-op.
+        assert!(store.take("cid@host").is_none());
+    }
+
+    #[test]
+    fn pending_inbound_refer_take_expired_only_past_deadline() {
+        let store = PendingInboundReferStore::default();
+        let now = std::time::Instant::now();
+
+        assert!(store.insert(
+            "past@host",
+            sample_pending_refer(now - std::time::Duration::from_millis(1))
+        ));
+        assert!(store.insert(
+            "future@host",
+            sample_pending_refer(now + std::time::Duration::from_secs(30))
+        ));
+
+        let expired = store.take_expired(now);
+        assert_eq!(expired.len(), 1, "only the past-deadline entry is swept");
+        // The future entry survives the sweep.
+        assert_eq!(store.len(), 1);
+        assert!(store.take("future@host").is_some());
+    }
+
+    #[test]
+    fn pending_inbound_refer_preserves_accept_inputs() {
+        // The stored entry preserves exactly what the accept path feeds
+        // b2bua_refer_accept: the Refer-To target + the resolved leg direction.
+        let store = PendingInboundReferStore::default();
+        let now = std::time::Instant::now();
+        store.insert("cid@host", sample_pending_refer(now + std::time::Duration::from_secs(30)));
+
+        let pending = store.take("cid@host").expect("entry present");
+        assert_eq!(pending.refer_to.uri, "sip:carol@example.com");
+        assert!(pending.from_a_leg);
+    }
+
+    #[test]
+    fn expired_pending_refer_answers_603_decline() {
+        // On the decision deadline the sweep answers the referrer 603 Decline
+        // (matching the no-@b2bua.on_refer-handler default). Prove the drained
+        // entry's REFER maps to a well-formed 603 final response — the wire action
+        // the sweep applies via b2bua_refer_send_final.
+        let store = PendingInboundReferStore::default();
+        let now = std::time::Instant::now();
+        store.insert(
+            "cid@host",
+            sample_pending_refer(now - std::time::Duration::from_millis(1)),
+        );
+
+        let expired = store.take_expired(now);
+        assert_eq!(expired.len(), 1);
+        let response = build_response(&expired[0].message, 603, "Decline", None, &[]);
+        assert!(response.is_response());
+        assert_eq!(response.status_code(), Some(603));
+        // Answered on the referrer's dialog — the REFER's Via/From/To/Call-ID.
+        assert_eq!(
+            response.headers.call_id().unwrap(),
+            "refer-call@example.com"
         );
     }
 }

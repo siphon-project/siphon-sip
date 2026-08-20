@@ -211,6 +211,8 @@ chunk, so logs join Homer and billing with no mapping table.
 | `reject` | sip | `{code, reason?}` | final non-2xx + tear down |
 | `hangup` | sip | `{reason?}` | BYE an answered call, or reject an unanswered one |
 | `refer` | sip | `{to, replaces?}` | in-dialog REFER on the A-leg |
+| `accept_refer` | sip | `{target?, next_hop?, mode?}` | accept a pending inbound REFER (from a `TransferRequested` event) and run the transfer |
+| `reject_refer` | sip | `{code?, reason?}` | reject a pending inbound REFER with a final non-2xx (default `603 Decline`) |
 | `route` | sip | `{targets, strategy?, headers?}` | return control to siphon: un-park the call and dial the B-leg via LCR sequential failover |
 | `set_header` / `remove_header` / `get_header` | sip | `{name, value?}` | on the stored A-leg INVITE |
 | `play` | sip | `{file\|db_id\|blob, repeat?, start_ms?, duration_ms?, to_tag?}` | play an announcement on the A-leg media (fire-and-forget) |
@@ -269,9 +271,33 @@ additive to the in-process `@rtpengine.on_dtmf` dispatch: the digit fires both,
 and it needs no extra configuration beyond the DTMF-log wiring the media engine
 already uses.
 
+An **inbound REFER on a controlled call** (a party asking to be transferred) is
+handed to the owning app rather than the in-process `@b2bua.on_refer` path: siphon
+holds the REFER un-answered and pushes a `TransferRequested` event, payload
+`{refer_to, replaces?, from_tag}` (`replaces` present for an attended transfer;
+`from_tag` identifies the referring party). The app decides with:
+
+- `accept_refer` `{target?, next_hop?, mode?}` — run the transfer through siphon's
+  shipped machinery. `target` overrides the Refer-To URI, `next_hop` steers egress
+  without reshaping the R-URI, and `mode` is `terminate` (siphon-terminated: 202 +
+  sipfrag NOTIFYs + re-dial the target as a new leg — the default, from
+  `b2bua.default_refer_mode`) or `transparent` (forward the REFER on the far leg's
+  own dialog). On a single-leg call (a voice-AI / IVR call siphon answered itself,
+  no B leg) terminate mode re-dials the target off the A dialog.
+- `reject_refer` `{code?, reason?}` — decline with a final non-2xx (default
+  `603 Decline`).
+
+If the app never decides, a decision deadline answers `603 Decline` (the same
+default as when no `@b2bua.on_refer` handler is registered), so a REFER is never
+left pending — the referrer is always answered (RFC 3515 §2.4.2). A bad `mode`
+answers `bad_request`; a decision for a call with no pending REFER (already
+decided, timed out, or gone) answers `not_found`. A REFER on an **uncontrolled**
+call is unaffected — it still runs the Python `@b2bua.on_refer` path.
+
 `bridge` / `originate` verbs arrive in later phases over the same envelope. The
-client SDK facade methods for the media verbs land alongside them (until then,
-reach the verbs through the generic `command(verb, args)` escape hatch).
+client SDK facade methods for the media verbs and the transfer verbs land
+alongside them (until then, reach the verbs through the generic
+`command(verb, args)` escape hatch).
 
 The complete wire reference, both connection modes end to end, and two
 low-level example clients (one Python, one TypeScript) that drive calls with no
