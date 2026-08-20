@@ -1,0 +1,53 @@
+# siphon proxy config for the REAL rtpproxy functional test.
+#
+# The rtpproxy arm of the media-backend matrix, alongside
+# sipp/rtpengine/siphon-rtpengine-real.yaml and the two siphon-rtp configs.
+# Same script, same scenarios, same shape — only the engine differs.
+#
+# Unlike the rtpengine pair, this one needs no substitute script: the stock
+# examples/proxy_rtpproxy.py already uses `rtp_passthrough`, which is what a
+# plain RTP relay actually is (rtpproxy does no SRTP/DTLS). It is the rtpengine
+# example, asking for srtp_to_rtp against a UAS that answers plain RTP, that was
+# the odd one out.
+#
+# Used with: sipp/docker-compose.yaml (rtpproxy-real profile)
+# Script:    examples/proxy_rtpproxy.py (unmodified)
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+advertised_address: "172.20.0.145"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.145"
+    - "127.0.0.1"
+
+script:
+  path: "examples/proxy_rtpproxy.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+media:
+  backend: rtpproxy
+  rtpproxy:
+    address: "172.20.0.144:22222"
+    timeout_ms: 2000
+    retries: 2
+
+log:
+  level: debug
+  format: pretty

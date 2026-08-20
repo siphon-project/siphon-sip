@@ -1,0 +1,51 @@
+# siphon proxy config for the REAL rtpengine functional test.
+#
+# The rtpengine counterpart of sipp/siphon-rtp/siphon-rtp-native.yaml and
+# siphon-rtp-ng.yaml: same script, same SIPp scenarios, same assertions, only
+# the media engine differs. Together the three make the media-backend matrix
+# symmetric — every backend siphon ships is now driven by a real engine in CI,
+# not only by a mock that echoes SDP back.
+#
+# Points at the shared `rtpengine-real` container (drachtio/rtpengine), which
+# the b2bua-rtpengine-refer profile also uses.
+#
+# Used with: sipp/docker-compose.yaml (rtpengine-real profile)
+# Script:    sipp/siphon-rtp/proxy_rtp_passthrough.py — see that file for why
+#            the stock example's srtp_to_rtp profile is wrong for this flow.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+advertised_address: "172.20.0.141"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.141"
+    - "127.0.0.1"
+
+script:
+  path: "/etc/siphon/scripts/proxy_rtp_passthrough.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+media:
+  rtpengine:
+    address: "172.20.0.44:22222"
+    timeout_ms: 2000
+
+log:
+  level: debug
+  format: pretty

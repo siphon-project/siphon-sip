@@ -2989,6 +2989,7 @@ services:
       start_period: 3s
     profiles:
       - b2bua-rtpengine-refer
+      - rtpengine-real
 
   siphon-b2bua-rtpengine-refer:
     build:
@@ -4834,6 +4835,244 @@ services:
       - -trace_err
     profiles:
       - voice-ai-real
+
+
+  # ── REAL rtpengine proxy anchoring test ───────────────────────────────────
+  # The rtpengine arm of the media-backend matrix. Identical script and
+  # scenarios to the siphon-rtp-native / siphon-rtp-ng profiles, so the three
+  # differ only in which engine anchors the media — which is what makes a
+  # difference between them meaningful.
+  #
+  # The pre-existing `rtpengine` profile (mock-rtpengine) stays and is now also
+  # run in CI; it asserts what siphon *sent*, this asserts a real engine
+  # accepted it.
+  siphon-rtpengine-real:
+    build:
+      context: ..
+    container_name: siphon-rtpengine-real-test
+    depends_on:
+      rtpengine-real:
+        condition: service_started
+    volumes:
+      - ./rtpengine/siphon-rtpengine-real.yaml:/etc/siphon/siphon.yaml:ro
+      - ./siphon-rtp/proxy_rtp_passthrough.py:/etc/siphon/scripts/proxy_rtp_passthrough.py:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.141
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - rtpengine-real
+
+  sipp-rtpengine-real-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-rtpengine-real:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.142
+    entrypoint:
+      - sipp
+      - "172.20.0.141:5060"
+      - -sf
+      - /sipp/scenarios/register.xml
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - rtpengine-real
+
+  sipp-rtpengine-real-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-rtpengine-real-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.142
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/rtpengine_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - rtpengine-real
+
+  sipp-rtpengine-real-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-rtpengine-real:
+        condition: service_healthy
+      sipp-rtpengine-real-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.143
+    entrypoint:
+      - sipp
+      - "172.20.0.141:5060"
+      - -sf
+      - /sipp/scenarios/rtpengine_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - rtpengine-real
+
+  # ── REAL rtpproxy proxy anchoring test ────────────────────────────────────
+  # The rtpproxy arm of the media-backend matrix. Same script and scenarios as
+  # the rtpengine-real and siphon-rtp profiles, so the engines are the only
+  # variable.
+  #
+  # Needs no substitute script: examples/proxy_rtpproxy.py already uses
+  # rtp_passthrough, which is what a plain RTP relay is.
+  rtpproxy-real:
+    image: sippylabs/rtpproxy:latest
+    container_name: rtpproxy-real
+    # -l is the rtpproxy equivalent of siphon-rtp's --relay-bind-ip and is
+    # load-bearing for the same reason: it is the address handed back in the
+    # U/L reply and written into the SDP, so pointing it at loopback would
+    # advertise media nothing on this network can reach.
+    command: ["-f", "-l", "172.20.0.144", "-s", "udp:0.0.0.0:22222"]
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.144
+    healthcheck:
+      # V (version) is the cheapest liveness probe the text protocol has.
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'hc V', ('127.0.0.1',22222)); d=s.recv(1024); s.close(); exit(0 if d.startswith(b'hc ') else 1)\" 2>/dev/null || exit 0"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    profiles:
+      - rtpproxy-real
+
+  siphon-rtpproxy-real:
+    build:
+      context: ..
+    container_name: siphon-rtpproxy-real-test
+    depends_on:
+      rtpproxy-real:
+        condition: service_started
+    volumes:
+      - ./rtpproxy/siphon-rtpproxy-real.yaml:/etc/siphon/siphon.yaml:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.145
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - rtpproxy-real
+
+  sipp-rtpproxy-real-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-rtpproxy-real:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.146
+    entrypoint:
+      - sipp
+      - "172.20.0.145:5060"
+      - -sf
+      - /sipp/scenarios/register.xml
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "10"
+    profiles:
+      - rtpproxy-real
+
+  sipp-rtpproxy-real-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-rtpproxy-real-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.146
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/rtpengine_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - rtpproxy-real
+
+  sipp-rtpproxy-real-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-rtpproxy-real:
+        condition: service_healthy
+      sipp-rtpproxy-real-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.147
+    entrypoint:
+      - sipp
+      - "172.20.0.145:5060"
+      - -sf
+      - /sipp/scenarios/rtpproxy_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - rtpproxy-real
 
 # ── Network ────────────────────────────────────────────────────────────────
 networks:
