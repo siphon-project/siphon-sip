@@ -15,6 +15,7 @@ import asyncio
 import ipaddress
 import re
 import sys
+import time
 import uuid
 from types import ModuleType
 from typing import Any, Callable, Optional, Union
@@ -1585,6 +1586,65 @@ class MockAuth:
     def __init__(self) -> None:
         self._allow: bool = False
         self._credentials: dict[str, dict[str, str]] = {}
+        # Seconds a minted nonce stays valid, mirroring the engine's
+        # `auth.nonce_ttl_secs` default. Tests override it to exercise expiry
+        # without sleeping.
+        self._nonce_ttl_secs: int = 300
+
+    def generate_nonce(self) -> str:
+        """Mint a digest challenge nonce.
+
+        Shape is ``{unix_seconds:016x}.{tag}``, matching the engine, which
+        embeds the timestamp rather than storing it so any instance in a fleet
+        can reject a stale nonce without shared state.
+
+        A script that builds its own ``WWW-Authenticate`` /
+        ``Proxy-Authenticate`` header — because it verifies credentials itself
+        rather than through a configured backend — mints the nonce here::
+
+            nonce = auth.generate_nonce()
+            request.set_reply_header(
+                "WWW-Authenticate",
+                f'Digest realm="{realm}", nonce="{nonce}", algorithm=MD5, qop="auth"',
+            )
+            request.reply(401, "Unauthorized")
+
+        The mock uses a random tag (the engine does too when no
+        ``auth.nonce_secret`` is configured); it does not compute the HMAC
+        variant, so a mock-minted nonce is not interchangeable with a real one.
+        """
+        return f"{int(time.time()):016x}.{uuid.uuid4().hex}"
+
+    def validate_nonce(self, nonce: str) -> bool:
+        """Whether ``nonce`` is well-formed and still fresh.
+
+        Mirrors the engine's freshness rules: a well-formed
+        ``{timestamp}.{tag}``, no older than the TTL, and not implausibly
+        future-dated (60 s of clock skew allowed).  This is what bounds replay
+        of a captured ``Authorization`` for a script doing its own digest
+        check::
+
+            if not auth.validate_nonce(nonce_from_the_header):
+                auth.require_www_digest(request, realm)   # stale — re-challenge
+                return
+
+        The mock checks freshness only — it has no shared secret, so it cannot
+        verify the engine's HMAC tag.
+        """
+        timestamp_hex, separator, _tag = nonce.partition(".")
+        if not separator:
+            return False
+        try:
+            timestamp = int(timestamp_hex, 16)
+        except ValueError:
+            return False
+
+        now = int(time.time())
+        if now - timestamp > self._nonce_ttl_secs:
+            return False
+        if timestamp - now > 60:  # clock skew
+            return False
+        return True
 
     def add_user(self, realm: str, username: str, password: str) -> None:
         """Add credentials for testing (test helper).
