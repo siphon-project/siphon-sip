@@ -41,6 +41,20 @@ const DIAMETER_CREDIT_LIMIT_REACHED: u32 = 4012;
 /// Final-Unit-Action TERMINATE (RFC 8506 §8.35).
 const FINAL_UNIT_ACTION_TERMINATE: u32 = 0;
 
+/// IMS-Information `Cause-Code` (TS 32.299 §7.2.35) for a call siphon cut
+/// because the OCS refused further credit.
+///
+/// The convention is Rf's, shared via [`crate::diameter::rf::sip_status_to_cause_code`]:
+/// a successful end is `0`, anything else is the negated SIP status. `402
+/// Payment Required` is the status siphon already answers when the OCS denies
+/// at setup, so an out-of-credit teardown reports the same cause a denied setup
+/// does — the OCS sees one code for "no credit", whenever it ran out.
+const CAUSE_CODE_CREDIT_EXHAUSTED: i32 = -402;
+
+/// `Cause-Code` for a session released by the max-lifetime backstop: no BYE
+/// ever arrived, so this is a timeout, reported as `408 Request Timeout`.
+const CAUSE_CODE_SESSION_LIFETIME_EXCEEDED: i32 = -408;
+
 /// Never re-authorize faster than this, so a pathological small grant can't
 /// hot-loop the OCS.
 const MIN_REAUTH_SECS: u32 = 5;
@@ -93,6 +107,19 @@ struct CcSessionInner {
     rating_group: Option<u32>,
     service_identifier: Option<u32>,
     requested_seconds: u32,
+    /// The `ImsChargingData` built at CCR-INITIAL, carried on the session so
+    /// every later request in it can describe the same call.
+    ///
+    /// CCR-UPDATE and CCR-TERMINATION used to send `ims_data: None`, so only
+    /// the Session-Id, the subscriber and the units went down the pipe. A
+    /// charging backend could not attribute mid-call usage or the final record
+    /// to a carrier, an ICID or a calling/called party — and with LCR failover
+    /// the carrier on the record is the one that actually carried the call, so
+    /// it cannot be inferred from the INITIAL either.
+    ///
+    /// A `std::sync::Mutex` rather than a `tokio` one: it is only ever held to
+    /// clone the value out, never across an await.
+    ims_data: std::sync::Mutex<ImsChargingData>,
     started_at: Instant,
     /// The OCS's first-grant CC-Time (seconds) — surfaced to the script gate as
     /// `granted_time` so it can log / decide on the reserved quota.
@@ -122,6 +149,46 @@ impl CcCreditSession {
 
     fn next_cc_request_number(&self) -> u32 {
         self.inner.cc_request_number.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Snapshot the session's `ImsChargingData` for one outgoing request,
+    /// stamped with `cause_code` and this record's timestamp.
+    ///
+    /// `cause_code` is `None` on a CCR-UPDATE (the session has not ended, so
+    /// there is no cause to report) and `Some` on a CCR-TERMINATION.
+    fn charging_data_for(
+        &self,
+        sip_method: &str,
+        cause_code: Option<i32>,
+    ) -> Option<ImsChargingData> {
+        let mut data = match self.inner.ims_data.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        data.sip_method = Some(sip_method.to_string());
+        data.cause_code = cause_code;
+        // Time-Stamps describes *this* record's trigger, not the INVITE the
+        // INITIAL already reported (TS 32.299 §7.2.183) — carrying the setup
+        // instant forward would leave a record whose Event-Type says BYE and
+        // whose request timestamp is minutes older.
+        let now = std::time::SystemTime::now();
+        data.request_timestamp = Some(now);
+        data.response_timestamp = Some(now);
+        Some(data)
+    }
+
+    /// Record the carrier that actually carried the call, as
+    /// `Outgoing-Trunk-Group-Id` (TS 32.299 §7.2.71).
+    ///
+    /// Load-bearing under LCR failover: the carrier on the final record is the
+    /// one that answered, which is not necessarily the first one tried, so it
+    /// cannot be inferred from the CCR-INITIAL.
+    pub fn set_outgoing_trunk_group(&self, carrier_id: &str) {
+        let mut guard = match self.inner.ims_data.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.outgoing_trunk_group_id = Some(carrier_id.to_string());
     }
 }
 
@@ -323,6 +390,7 @@ impl RoChargingService {
                 rating_group: self.config.rating_group,
                 service_identifier: self.config.service_identifier,
                 requested_seconds: self.config.requested_seconds,
+                ims_data: std::sync::Mutex::new(ims_data),
                 started_at: Instant::now(),
                 initial_grant: grant_secs,
                 reported_secs: AtomicU32::new(0),
@@ -399,20 +467,26 @@ impl RoChargingService {
 
     /// Send CCR-TERMINATION for a session (BYE path). Idempotent — a session
     /// already stopped by the enforced-teardown path is a no-op.
-    pub async fn terminate_call(&self, session: &CcCreditSession) {
+    /// `cause_code` is the IMS-Information `Cause-Code` for the record
+    /// (TS 32.299 §7.2.35), in the same negative-SIP convention Rf's ACR-STOP
+    /// uses: `Some(0)` for a normal hangup, `Some(-486)` for a busy, and so on.
+    /// Derive it with [`crate::diameter::rf::sip_status_to_cause_code`] so the
+    /// two interfaces never disagree about why a call ended. `None` omits the
+    /// AVP, for a teardown with no cause to report.
+    pub async fn terminate_call(&self, session: &CcCreditSession, cause_code: Option<i32>) {
         if !self.claim_stop(session) {
             return;
         }
         if let Some(handle) = session.inner.reauth_handle.lock().await.take() {
             handle.abort();
         }
-        self.send_terminate(session).await;
+        self.send_terminate(session, cause_code).await;
     }
 
     /// Build + send a CCR-TERMINATION reporting the *unreported* usage
     /// (`elapsed - already-reported`, RFC 8506 §5.6). Does not touch the stopped
     /// flag (callers use `claim_stop` first).
-    async fn send_terminate(&self, session: &CcCreditSession) {
+    async fn send_terminate(&self, session: &CcCreditSession, cause_code: Option<i32>) {
         let elapsed = session.inner.started_at.elapsed().as_secs() as u32;
         let reported = session.inner.reported_secs.load(Ordering::Relaxed);
         let used = ServiceUnit {
@@ -420,13 +494,18 @@ impl RoChargingService {
             ..Default::default()
         };
         let record_number = session.next_cc_request_number();
+        // Describe the call on the final record too, not just on the INITIAL:
+        // without this the CCR-T carried only Session-Id, subscriber and units,
+        // so nothing downstream could attribute the record to a carrier, an
+        // ICID or a calling/called party.
+        let ims_data = session.charging_data_for("BYE", cause_code);
         let params = CreditControlParams {
             request_type: CcRequestType::Termination,
             request_number: record_number,
             subscriber: &session.inner.subscriber,
             service_context_id: &session.inner.service_context_id,
             session_id: Some(&session.inner.session_id),
-            ims_data: None,
+            ims_data: ims_data.as_ref(),
             sms_data: None,
             requested_units: None,
             used_units: Some(&used),
@@ -502,7 +581,8 @@ impl RoChargingService {
                     // Fail-closed: a session with no BYE must not run forever
                     // free of charge — disconnect it too, not just CCR-T.
                     self.fire_teardown(&session.inner.sip_call_id, "session lifetime exceeded");
-                    self.send_terminate(&session).await;
+                    self.send_terminate(&session, Some(CAUSE_CODE_SESSION_LIFETIME_EXCEEDED))
+                        .await;
                 }
                 return;
             }
@@ -516,13 +596,17 @@ impl RoChargingService {
                 ..Default::default()
             });
             let record_number = session.next_cc_request_number();
+            // Mid-call usage has to be attributable too — an OCS that cannot
+            // tell which carrier a re-authorization belongs to cannot rate it.
+            // No Cause-Code: the session has not ended, so there is no cause.
+            let ims_data = session.charging_data_for("INVITE", None);
             let params = CreditControlParams {
                 request_type: CcRequestType::Update,
                 request_number: record_number,
                 subscriber: &session.inner.subscriber,
                 service_context_id: &session.inner.service_context_id,
                 session_id: Some(&session.inner.session_id),
-                ims_data: None,
+                ims_data: ims_data.as_ref(),
                 sms_data: None,
                 requested_units: requested.as_ref(),
                 used_units: Some(&used),
@@ -603,7 +687,8 @@ impl RoChargingService {
             return;
         }
         self.fire_teardown(&session.inner.sip_call_id, reason);
-        self.send_terminate(session).await;
+        self.send_terminate(session, Some(CAUSE_CODE_CREDIT_EXHAUSTED))
+            .await;
     }
 }
 
@@ -784,7 +869,7 @@ mod tests {
                 other => panic!("expected Granted, got {}", decision_label(&other)),
             };
             assert!(service.active_session_count() > baseline);
-            service.terminate_call(&session).await;
+            service.terminate_call(&session, Some(0)).await;
         }
         assert_eq!(
             service.active_session_count(),
@@ -820,7 +905,7 @@ mod tests {
             "session_id must be populated for CCR-U/T continuity"
         );
         assert_eq!(session.last_result_code(), Some(2001));
-        service.terminate_call(&session).await;
+        service.terminate_call(&session, Some(0)).await;
         assert_eq!(service.active_session_count(), 0);
     }
 
@@ -980,7 +1065,7 @@ mod tests {
         assert_eq!(wire_ids.len(), 40, "on-the-wire CCR Session-Ids must be unique too");
 
         for s in &sessions {
-            service.terminate_call(s).await;
+            service.terminate_call(s, Some(0)).await;
         }
         assert_eq!(service.active_session_count(), 0, "all sessions must drain");
     }
@@ -1004,7 +1089,7 @@ mod tests {
                 panic!("cycle {i} not granted");
             };
             assert!(seen.insert(session.session_id().to_string()), "Session-Id reused at cycle {i}");
-            service.terminate_call(&session).await;
+            service.terminate_call(&session, Some(0)).await;
             assert_eq!(service.active_session_count(), 0, "must drain each cycle");
         }
     }
@@ -1027,7 +1112,7 @@ mod tests {
         };
         let sid = session.session_id().to_string();
         // Terminate immediately (before the 30s grant elapses → no CCR-UPDATE).
-        service.terminate_call(&session).await;
+        service.terminate_call(&session, Some(0)).await;
 
         let ccrs = captured.lock().unwrap().clone();
         let terminate = ccrs
@@ -1053,5 +1138,203 @@ mod tests {
                 .is_some(),
             "CCR-T must report a Used-Service-Unit CC-Time"
         );
+    }
+    // -----------------------------------------------------------------------
+    // Service-Information on CCR-UPDATE / CCR-TERMINATION, and Cause-Code
+    // -----------------------------------------------------------------------
+
+    /// The IMS-Information a real call's CCR-INITIAL is built with.
+    fn call_charging_data() -> ImsChargingData {
+        ImsChargingData {
+            calling_party: vec!["sip:+10000000001@ims.example.com".into()],
+            called_party: Some("sip:+10000000002@ims.example.com".into()),
+            sip_method: Some("INVITE".into()),
+            ims_charging_identifier: Some("icid-value-1".into()),
+            user_session_id: Some("call-1@ims.example.com".into()),
+            ..Default::default()
+        }
+    }
+
+    /// Pull the IMS-Information block out of a captured CCR, if it carries one.
+    fn ims_information(ccr: &serde_json::Value) -> Option<&serde_json::Value> {
+        ccr.get("Service-Information")?.get("IMS-Information")
+    }
+
+    fn ccr_of_type(ccrs: &[serde_json::Value], request_type: u64) -> serde_json::Value {
+        ccrs.iter()
+            .find(|c| c.get("CC-Request-Type").and_then(|v| v.as_u64()) == Some(request_type))
+            .unwrap_or_else(|| panic!("no CCR of type {request_type} was sent"))
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn terminate_carries_ims_information_describing_the_call() {
+        // CCR-TERMINATION used to go out with ims_data: None, so only the
+        // Session-Id, the subscriber and the units reached the OCS — nothing
+        // downstream could attribute the final record to an ICID or a party.
+        let (manager, _rx, captured) = mock_ocs_manager(2001, Some(30), 2001, None).await;
+        let service = RoChargingService::new(manager, enabled_config());
+        let ChargeDecision::Granted(Some(session)) = service
+            .authorize_call(
+                SubscriberId::msisdn("+310000000001"),
+                call_charging_data(),
+                "c1".to_string(),
+            )
+            .await
+        else {
+            panic!("not granted");
+        };
+        service.terminate_call(&session, Some(0)).await;
+
+        let ccrs = captured.lock().unwrap().clone();
+        let terminate = ccr_of_type(&ccrs, 3);
+        let ims = ims_information(&terminate).expect("CCR-T must carry IMS-Information");
+
+        assert_eq!(
+            ims.get("IMS-Charging-Identifier").and_then(|v| v.as_str()),
+            Some("icid-value-1"),
+        );
+        assert_eq!(
+            ims.get("User-Session-Id").and_then(|v| v.as_str()),
+            Some("call-1@ims.example.com"),
+        );
+        assert_eq!(
+            ims.get("Called-Party-Address").and_then(|v| v.as_str()),
+            Some("sip:+10000000002@ims.example.com"),
+        );
+    }
+
+    #[tokio::test]
+    async fn terminate_carries_the_carrier_that_actually_took_the_call() {
+        // Under LCR failover the winning carrier is not necessarily the one the
+        // CCR-INITIAL was built for, so it is stamped on the session at answer
+        // and has to reach the final record.
+        let (manager, _rx, captured) = mock_ocs_manager(2001, Some(30), 2001, None).await;
+        let service = RoChargingService::new(manager, enabled_config());
+        let ChargeDecision::Granted(Some(session)) = service
+            .authorize_call(
+                SubscriberId::msisdn("+310000000001"),
+                call_charging_data(),
+                "c1".to_string(),
+            )
+            .await
+        else {
+            panic!("not granted");
+        };
+
+        // The INITIAL went out before any carrier was chosen.
+        let initial = ccr_of_type(&captured.lock().unwrap().clone(), 1);
+        assert!(
+            ims_information(&initial).and_then(|i| i.get("Trunk-Group-Id")).is_none(),
+            "no carrier is known yet at CCR-INITIAL",
+        );
+
+        session.set_outgoing_trunk_group("carrier-b");
+        service.terminate_call(&session, Some(0)).await;
+
+        let terminate = ccr_of_type(&captured.lock().unwrap().clone(), 3);
+        // TS 32.299 §7.2.71 groups it under Trunk-Group-Id.
+        assert_eq!(
+            ims_information(&terminate)
+                .and_then(|i| i.get("Trunk-Group-Id"))
+                .and_then(|t| t.get("Outgoing-Trunk-Group-Id"))
+                .and_then(|v| v.as_str()),
+            Some("carrier-b"),
+            "the final record must name the carrier that carried the call",
+        );
+    }
+
+    #[tokio::test]
+    async fn update_carries_ims_information_so_midcall_usage_is_attributable() {
+        // A 5s grant so the re-auth loop fires an UPDATE quickly.
+        let (manager, _rx, captured) = mock_ocs_manager(2001, Some(1), 2001, None).await;
+        let service = RoChargingService::new(manager, enabled_config());
+        let ChargeDecision::Granted(Some(session)) = service
+            .authorize_call(
+                SubscriberId::msisdn("+310000000001"),
+                call_charging_data(),
+                "c1".to_string(),
+            )
+            .await
+        else {
+            panic!("not granted");
+        };
+        session.set_outgoing_trunk_group("carrier-b");
+
+        // MIN_REAUTH_SECS floors the grant at 5s; wait past one interval.
+        tokio::time::sleep(Duration::from_secs(MIN_REAUTH_SECS as u64 + 2)).await;
+
+        let ccrs = captured.lock().unwrap().clone();
+        let update = ccr_of_type(&ccrs, 2);
+        let ims = ims_information(&update).expect("CCR-U must carry IMS-Information");
+
+        assert_eq!(
+            ims.get("Trunk-Group-Id")
+                .and_then(|t| t.get("Outgoing-Trunk-Group-Id"))
+                .and_then(|v| v.as_str()),
+            Some("carrier-b"),
+        );
+        assert_eq!(
+            ims.get("IMS-Charging-Identifier").and_then(|v| v.as_str()),
+            Some("icid-value-1"),
+        );
+        // No Cause-Code: the session has not ended, so there is no cause.
+        assert!(
+            ims.get("Cause-Code").is_none(),
+            "a mid-call re-authorization has no termination cause to report",
+        );
+
+        service.terminate_call(&session, Some(0)).await;
+    }
+
+    /// Drive one call to CCR-TERMINATION with `cause` and read the Cause-Code
+    /// the OCS saw.
+    async fn cause_code_on_the_wire(cause: Option<i32>) -> Option<i64> {
+        let (manager, _rx, captured) = mock_ocs_manager(2001, Some(30), 2001, None).await;
+        let service = RoChargingService::new(manager, enabled_config());
+        let ChargeDecision::Granted(Some(session)) = service
+            .authorize_call(
+                SubscriberId::msisdn("+310000000001"),
+                call_charging_data(),
+                "c1".to_string(),
+            )
+            .await
+        else {
+            panic!("not granted");
+        };
+        service.terminate_call(&session, cause).await;
+
+        let terminate = ccr_of_type(&captured.lock().unwrap().clone(), 3);
+        ims_information(&terminate)
+            .and_then(|i| i.get("Cause-Code"))
+            .and_then(|v| v.as_i64())
+    }
+
+    #[tokio::test]
+    async fn a_hangup_a_busy_and_a_no_answer_are_distinguishable_on_the_wire() {
+        // The point of the AVP: an OCS must be able to tell why a call ended.
+        // The mapping is Rf's, so the two interfaces never disagree.
+        use crate::diameter::rf::sip_status_to_cause_code;
+
+        let normal = cause_code_on_the_wire(sip_status_to_cause_code(200)).await;
+        let busy = cause_code_on_the_wire(sip_status_to_cause_code(486)).await;
+        let no_answer = cause_code_on_the_wire(sip_status_to_cause_code(408)).await;
+        let exhausted = cause_code_on_the_wire(Some(CAUSE_CODE_CREDIT_EXHAUSTED)).await;
+
+        assert_eq!(normal, Some(0), "a normal hangup is cause 0");
+        assert_eq!(busy, Some(-486));
+        assert_eq!(no_answer, Some(-408));
+        assert_eq!(exhausted, Some(-402));
+
+        let all = [normal, busy, no_answer, exhausted];
+        let distinct: std::collections::HashSet<_> = all.iter().collect();
+        assert_eq!(distinct.len(), all.len(), "all four must be distinguishable");
+    }
+
+    #[tokio::test]
+    async fn a_terminate_with_no_cause_omits_the_avp() {
+        // `None` means "no cause to report" and must not be encoded as a 0 that
+        // claims the call ended normally.
+        assert_eq!(cause_code_on_the_wire(None).await, None);
     }
 }

@@ -7,6 +7,24 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Fixed
+- **Ro CCR-UPDATE and CCR-TERMINATION now carry Service-Information.** Both were
+  built with `ims_data: None`, so only the Session-Id, the subscriber and the
+  units reached the OCS. Nothing after the initial request named the carrier,
+  the ICID or the calling/called party, which left a charging backend unable to
+  attribute mid-call usage or the final record — and under LCR failover the
+  carrier that matters is the one that actually carried the call, so it could
+  not be inferred from the CCR-INITIAL either. The `ImsChargingData` built at
+  CCR-INITIAL is now carried on the session, stamped with the winning carrier as
+  `Outgoing-Trunk-Group-Id` (TS 32.299 §7.2.71) when the call is answered, and
+  sent on every subsequent request in the session. Each record's `Time-Stamps`
+  describes its own trigger rather than repeating the INVITE's.
+- **Ro CCR-TERMINATION now carries `Cause-Code`** (TS 32.299 §7.2.35), so an OCS
+  can tell why a call ended. It is taken from the same disconnect cause Rf's
+  ACR-STOP already derives — the RFC 3326 `Reason` header, else the SIP status —
+  so the two interfaces never disagree. A normal hangup reports `0`, a busy
+  `-486`, a ring timeout `-408`; a siphon-initiated teardown reports `-402` when
+  the OCS refused further credit (the same status a denied setup answers with)
+  and `-408` when the max-session-lifetime backstop fired.
 - **A proxied in-dialog request whose Request-URI addresses the proxy itself is
   now forwarded to the dialog's established peer instead of failing as a
   routing loop.** RFC 3261 §12.2.1.1 has the UAC build a mid-dialog request

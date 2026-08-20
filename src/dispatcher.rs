@@ -10401,8 +10401,33 @@ fn build_ro_subscriber(
     }
 }
 
+/// Record the carrier that answered on the call's Ro session, so its
+/// CCR-UPDATEs and CCR-TERMINATION carry `Outgoing-Trunk-Group-Id`
+/// (TS 32.299 §7.2.71).
+///
+/// No-op when Ro is off or the call holds no reservation.
+fn ro_stamp_winning_carrier(state: &DispatcherState, internal_call_id: &str, carrier_id: &str) {
+    if carrier_id.is_empty() {
+        return;
+    }
+    if let Some(session) = state.ro_sessions.get(&ro_b2bua_key(internal_call_id)) {
+        session.set_outgoing_trunk_group(carrier_id);
+    }
+}
+
 /// Send CCR-TERMINATION for a B2BUA call's Ro session on BYE / teardown.
-fn spawn_ro_b2bua_stop(state: &DispatcherState, internal_call_id: &str) {
+///
+/// `cause_code` is the IMS-Information `Cause-Code` for the record
+/// (TS 32.299 §7.2.35), in the same negative-SIP convention and from the same
+/// source as the Rf ACR-STOP one — the two interfaces must never disagree about
+/// why a call ended, so both take it from [`parse_reason_cause`] / the SIP
+/// status via [`crate::diameter::rf::sip_status_to_cause_code`]. `None` means a
+/// normal end and is reported as `0`.
+fn spawn_ro_b2bua_stop(
+    state: &DispatcherState,
+    internal_call_id: &str,
+    cause_code: Option<i32>,
+) {
     if state.ro_charger.is_none() {
         return;
     }
@@ -10415,7 +10440,9 @@ fn spawn_ro_b2bua_stop(state: &DispatcherState, internal_call_id: &str) {
         return;
     };
     tokio::spawn(async move {
-        charger.terminate_call(&session).await;
+        charger
+            .terminate_call(&session, Some(cause_code.unwrap_or(0)))
+            .await;
     });
 }
 
@@ -11483,8 +11510,13 @@ fn handle_b2bua_cancel(
 
     // Release any Ro reservation made by `call.ro_authorize()` — a
     // cancelled-before-answer call held a reservation with no BYE to close it
-    // (CCR-TERMINATION reports ~0 usage).
-    spawn_ro_b2bua_stop(state, &call_id);
+    // (CCR-TERMINATION reports ~0 usage). The caller gave up before answer, so
+    // the cause is the 487 the A-leg was answered with.
+    spawn_ro_b2bua_stop(
+        state,
+        &call_id,
+        crate::diameter::rf::sip_status_to_cause_code(487),
+    );
 
     state.call_actors.set_state(&call_id, CallState::Terminated);
     // remove_call_after_cancel sends Shutdown to remaining actors, cleans the
@@ -15100,9 +15132,14 @@ fn handle_b2bua_response(
         // CDR: stamp the answer time (cdr.auto_emit).
         cdr_mark_b2bua_answer(state, call_id, status_code);
 
-        // LCR: auto-stamp the winning carrier's cdr_fields onto the CDR.
+        // LCR: auto-stamp the winning carrier's cdr_fields onto the CDR, and
+        // record it on the Ro session so every later CCR in that session names
+        // the carrier that actually carried the call. Under sequential failover
+        // that is not necessarily the one the CCR-INITIAL was built for, so it
+        // cannot be inferred from the initial request.
         if let Some(route) = state.call_actors.active_route(call_id) {
             cdr_stamp_route_fields(state, call_id, &route.cdr_fields);
+            ro_stamp_winning_carrier(state, call_id, &route.carrier_id);
         }
 
         // Rf ACR-START on B2BUA call answer (TS 32.299 §6.2.2).
@@ -16456,7 +16493,14 @@ fn handle_b2bua_response(
         // CCR-TERMINATION reports ~0 usage. Skipped for a relayed auth challenge —
         // the call has not failed and the reservation must survive the re-INVITE.
         if !relay_challenge {
-            spawn_ro_b2bua_stop(state, call_id);
+            // The B-leg's own final status is the cause: a busy reports -486, a
+            // ring timeout -408, and so on, which is what makes an unanswered
+            // call distinguishable from a normal hangup on the OCS side.
+            spawn_ro_b2bua_stop(
+                state,
+                call_id,
+                crate::diameter::rf::sip_status_to_cause_code(status_code),
+            );
         }
 
         state.call_actors.remove_call(call_id);
@@ -16746,8 +16790,9 @@ fn handle_b2bua_bye(
     // 200 OK is sent so the accounting record reflects the moment the
     // proxy committed to tearing the call down; the SIP path is
     // unaffected (spawn is fire-and-forget per §6.5).
-    spawn_rf_b2bua_stop(state, &call_id, parse_reason_cause(&message));
-    spawn_ro_b2bua_stop(state, &call_id);
+    let disconnect_cause = parse_reason_cause(&message);
+    spawn_rf_b2bua_stop(state, &call_id, disconnect_cause);
+    spawn_ro_b2bua_stop(state, &call_id, disconnect_cause);
 
     // CDR: write the call record on BYE (cdr.auto_emit). `from_a_leg` gives the
     // disconnecting side (caller vs callee).
@@ -17250,7 +17295,7 @@ fn b2bua_terminate_call_inner(
     // Diameter "normal" cause (None → 0); the RFC 3326 Reason on the BYE is
     // informational only here (its Q.850 cause is not a SIP status).
     spawn_rf_b2bua_stop(state, internal_call_id, None);
-    spawn_ro_b2bua_stop(state, internal_call_id);
+    spawn_ro_b2bua_stop(state, internal_call_id, None);
 
     // CDR (cdr.auto_emit): write the record with the framework as the
     // disconnecting side and the Reason header as sip_reason.

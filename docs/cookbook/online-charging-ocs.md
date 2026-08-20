@@ -66,7 +66,15 @@ Reserve credit in `@b2bua.on_invite` **before** dialing the B-leg. A grant
 dials; a denial rejects and no B-leg is ever created. After a grant siphon runs
 the whole SCUR lifecycle itself — CCR-UPDATE on the OCS-granted cadence, mid-call
 disconnect on `4012 CREDIT_LIMIT_REACHED`, CCR-TERMINATION on BYE — so the
-handler is just the gate:
+handler is just the gate.
+
+Every request in the session carries Service-Information describing the call
+(calling and called party, ICID, `User-Session-Id`), not just the CCR-INITIAL,
+so an OCS can attribute mid-call usage and the final record. When the call was
+routed by LCR, the carrier that **answered** is stamped on the session at answer
+time as `Outgoing-Trunk-Group-Id` — under sequential failover that is not
+necessarily the carrier the CCR-INITIAL was built for, so it cannot be inferred
+from the initial request.
 
 ```python
 from siphon import b2bua, log
@@ -184,6 +192,27 @@ curl -s http://cgrates:2080/jsonrpc -d '{"method":"ApierV2.SetBalance",
   "params":[{"Tenant":"cgrates.org","Account":"sip:alice@ims.example.org",
   "BalanceType":"*voice","Value":30000000000}],"id":1}'
 ```
+
+## Why a call ended
+
+CCR-TERMINATION carries `Cause-Code` (TS 32.299 §7.2.35), from the same
+disconnect cause Rf's ACR-STOP derives — the RFC 3326 `Reason` header, else the
+SIP status — so the two interfaces never disagree about a call.
+
+| Ending | `Cause-Code` |
+|---|---|
+| Normal hangup (BYE) | `0` |
+| Busy | `-486` |
+| Ring timeout / no answer | `-408` |
+| Cancelled before answer | `-487` |
+| OCS refused further credit | `-402` |
+| Max-session-lifetime backstop | `-408` |
+
+Successful terminations map to `0` and failures pass through their negated SIP
+status, which is what TS 32.299 reserves the negative range for. The two
+siphon-initiated teardowns reuse the SIP status each corresponds to: `402
+Payment Required` is what a denied setup is already answered with, so an
+out-of-credit teardown reports the same cause whenever the balance ran out.
 
 ## Observability
 
