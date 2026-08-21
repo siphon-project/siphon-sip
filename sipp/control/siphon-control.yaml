@@ -1,0 +1,74 @@
+# siphon config for the control-plane (application rail) functional harness
+# (sipp/control/control_app.py + sipp/control/control_routes.py +
+# sipp/control_*_uac.xml).
+#
+# Two applications are registered on purpose, because the two connection modes
+# are different code paths in siphon and one app can only be in one of them:
+#
+#   edge-app — per-call-connect (the multi-pod default): siphon dials the app
+#              once per handed-over call and the accepting socket owns it.
+#   ivr-app  — persistent inbound: the app dials `control.listen` and siphon
+#              round-robins handed-over calls across its connections. This is
+#              the only mode where exactly-one-owner dispatch and `resync` are
+#              meaningful, so those cases run against it.
+#
+# The media backend is the mock siphon-rtp control server, which records every
+# command it is given. That is what lets the harness tell a media verb that was
+# *accepted* apart from one that was *performed* — a distinction SIPp cannot see.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "control.test"
+    - "172.20.0.160"
+
+advertised_address: "172.20.0.160"
+
+script:
+  path: "/etc/siphon/scripts/control_routes.py"
+
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "172.20.0.163:8080"
+    timeout_ms: 2000
+
+  profiles:
+    # Answer-first (`call.handover(answer=True)`) anchors on this profile, which
+    # is what gives the media-verb case an already-connected channel to act on.
+    voice_ai:
+      offer: &voice_ai_flags
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin"]
+      answer: *voice_ai_flags
+
+control:
+  listen: "0.0.0.0:9092"
+  apps:
+    - name: "edge-app"
+      token: "edge-app-token"
+      per_call_connect: true
+      connect_url: "ws://172.20.0.161:8090/siphon"
+      on_lost: "hangup"
+    - name: "ivr-app"
+      token: "ivr-app-token"
+      per_call_connect: false
+      on_lost: "hangup"
+  limits:
+    event_queue_depth: 256
+    slow_consumer: drop_oldest
+    # Long enough for the resync case to drop its socket, wait, reconnect and
+    # re-claim; short enough that a genuinely lost controller is still cleaned
+    # up inside a test run.
+    reattach_grace_secs: 10
+    # The `deadline@` case hands over WITHOUT an explicit deadline_ms, so this
+    # is the value under test. Every other case passes a generous explicit one.
+    handoff_deadline_ms: 2000
+
+log:
+  level: info

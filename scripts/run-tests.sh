@@ -8,6 +8,7 @@
 #   ./scripts/run-tests.sh --call       # Also run call scenarios (UAC+UAS)
 #   ./scripts/run-tests.sh --rtpengine  # Also run B2BUA + RTPEngine tests
 #   ./scripts/run-tests.sh --rtpproxy   # Also run classic rtpproxy media test
+#   ./scripts/run-tests.sh --control    # Also run the external control-plane (app rail) tests
 #   ./scripts/run-tests.sh --b2bua     # Also run B2BUA call/session-timer/cancel/failure tests
 set -euo pipefail
 
@@ -33,6 +34,7 @@ RUN_PRESENCE=false
 RUN_RTPENGINE=false
 RUN_RTPPROXY=false
 RUN_VOICE_AI=false
+RUN_CONTROL=false
 RUN_REFER_SINGLE_LEG=false
 RUN_REINVITE=false
 RUN_REOFFER=false
@@ -62,6 +64,7 @@ for arg in "$@"; do
     --rtpengine)  RUN_RTPENGINE=true;  SELECTED_MODES+=("$arg") ;;
     --rtpproxy)   RUN_RTPPROXY=true;   SELECTED_MODES+=("$arg") ;;
     --voice-ai)   RUN_VOICE_AI=true;   SELECTED_MODES+=("$arg") ;;
+    --control)    RUN_CONTROL=true;    SELECTED_MODES+=("$arg") ;;
     --refer-single-leg) RUN_REFER_SINGLE_LEG=true; SELECTED_MODES+=("$arg") ;;
     --reinvite)   RUN_REINVITE=true;   SELECTED_MODES+=("$arg") ;;
     --reoffer)    RUN_REOFFER=true;    SELECTED_MODES+=("$arg") ;;
@@ -82,7 +85,7 @@ for arg in "$@"; do
       echo
       echo "Scenario modes (pick at most ONE per run):"
       echo "  --ipsec --charging --call --presence --rtpengine --rtpproxy --reinvite"
-      echo "  --voice-ai --refer-single-leg --reoffer"
+      echo "  --voice-ai --refer-single-leg --reoffer --control"
       echo "  --b2bua --b2bua-auth --b2bua-invite-auth --gateway --auto100 --http-auth"
       echo "  --wedge --banscan"
       echo "  --security --rfc4475 --webrtc"
@@ -193,6 +196,106 @@ if [[ "$RUN_VOICE_AI" == true ]]; then
   run_sipp docker compose -f "$COMPOSE_FILE" --profile voice-ai up \
     --abort-on-container-exit --exit-code-from sipp-voice-ai-uac sipp-voice-ai-uac
   docker compose -f "$COMPOSE_FILE" --profile voice-ai rm -sf sipp-voice-ai-uac 2>/dev/null || true
+fi
+
+# ── Step 7a1: External control plane — the application rail (optional) ────
+# Five cases against one siphon, both connection modes at once. Each SIPp
+# scenario is the decider for its own step (--exit-code-from), and the parts the
+# SIP wire cannot show — which connection was given the call, whether a media
+# verb was performed or merely accepted, what `resync` handed back — are
+# asserted on the mock application's and mock media engine's recorded frames.
+if [[ "$RUN_CONTROL" == true ]]; then
+  CONTROL_LOG_DIR="$(mktemp -d)"
+
+  # NOTE on the greps below: the app and the engine both emit `json.dumps`
+  # output, which writes `"key": "value"` WITH a space after the colon. A pattern
+  # written without the space matches nothing and the assertion passes
+  # vacuously — which is the whole failure mode these asserts exist to avoid.
+  control_dump_logs() {
+    docker compose -f "$COMPOSE_FILE" logs control-app-edge > "$CONTROL_LOG_DIR/control-app-edge.log" 2>&1 || true
+    docker compose -f "$COMPOSE_FILE" logs control-app-ivr > "$CONTROL_LOG_DIR/control-app-ivr.log" 2>&1 || true
+    docker compose -f "$COMPOSE_FILE" logs mock-control-rtp > "$CONTROL_LOG_DIR/mock-control-rtp.log" 2>&1 || true
+    docker compose -f "$COMPOSE_FILE" logs siphon-control > "$CONTROL_LOG_DIR/siphon-control.log" 2>&1 || true
+  }
+
+  # A case that never ran prints no verdict at all, and that is a failure too —
+  # it is what catches an application that was never reached.
+  assert_control_verdict() {
+    local case="$1" log="$CONTROL_LOG_DIR/$2" line
+    line="$(grep 'CONTROL-VERDICT' "$log" 2>/dev/null | grep "\"case\": \"$case\"" || true)"
+    if [[ -z "$line" ]]; then
+      echo "FAILED: no CONTROL-VERDICT for case '$case' in $log — the control app never completed it"
+      exit 1
+    fi
+    if grep -q '"pass": false' <<<"$line"; then
+      echo "FAILED: control-plane case '$case':"
+      echo "$line"
+      exit 1
+    fi
+    echo "  ✓ control case '$case': $line"
+  }
+
+  # The difference between a media verb siphon *accepted* and one it *performed*
+  # is invisible to SIPp; the engine's own record is the only witness.
+  assert_engine_performed() {
+    local verb="$1" log="$CONTROL_LOG_DIR/mock-control-rtp.log"
+    if ! grep -q "\"command\": \"$verb\"" "$log"; then
+      echo "FAILED: the media engine never received '$verb' — the verb was accepted but never performed"
+      exit 1
+    fi
+    echo "  ✓ media engine performed '$verb'"
+  }
+
+  echo "=== SIPp control-plane tests (external application rail) ==="
+  # --force-recreate: the persistent app dials siphon once at start-up and holds
+  # its sockets for life, so a re-run that recreates siphon (a rebuilt image)
+  # while reusing a running app leaves that app connected to nothing. Recreating
+  # the set together keeps the stack coherent. The app's healthcheck catches the
+  # case too — it heartbeats only while it can actually take a call — but a
+  # loud "unhealthy" is still a re-run someone has to debug.
+  docker compose -f "$COMPOSE_FILE" --profile control up -d --force-recreate --wait \
+    mock-control-rtp control-app-edge siphon-control control-app-ivr
+
+  echo "--- deferred handover: siphon parks the INVITE, the app answers it ---"
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile control up \
+    --abort-on-container-exit --exit-code-from sipp-control-handover-uac sipp-control-handover-uac
+  docker compose -f "$COMPOSE_FILE" --profile control rm -sf sipp-control-handover-uac 2>/dev/null || true
+  control_dump_logs
+  assert_control_verdict handover control-app-edge.log
+
+  echo "--- handoff deadline: the controller never acts, siphon applies its default ---"
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile control up \
+    --abort-on-container-exit --exit-code-from sipp-control-deadline-uac sipp-control-deadline-uac
+  docker compose -f "$COMPOSE_FILE" --profile control rm -sf sipp-control-deadline-uac 2>/dev/null || true
+  control_dump_logs
+  assert_control_verdict deadline control-app-ivr.log
+
+  echo "--- media verbs on an answer-first channel (accepted AND performed) ---"
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile control up \
+    --abort-on-container-exit --exit-code-from sipp-control-media-uac sipp-control-media-uac
+  docker compose -f "$COMPOSE_FILE" --profile control rm -sf sipp-control-media-uac 2>/dev/null || true
+  control_dump_logs
+  assert_control_verdict media control-app-edge.log
+  assert_engine_performed play_media
+  assert_engine_performed stop_media
+
+  echo "--- exactly-one-owner dispatch across several app connections ---"
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile control up \
+    --abort-on-container-exit --exit-code-from sipp-control-owner-uac sipp-control-owner-uac
+  docker compose -f "$COMPOSE_FILE" --profile control rm -sf sipp-control-owner-uac 2>/dev/null || true
+  control_dump_logs
+  assert_control_verdict owner control-app-ivr.log
+
+  # Last of the persistent-app cases on purpose: it drops one of the app's
+  # sockets, so anything queued behind it would be running with fewer.
+  echo "--- resync: the owner drops, reconnects in the grace window, re-claims ---"
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile control up \
+    --abort-on-container-exit --exit-code-from sipp-control-resync-uac sipp-control-resync-uac
+  docker compose -f "$COMPOSE_FILE" --profile control rm -sf sipp-control-resync-uac 2>/dev/null || true
+  control_dump_logs
+  assert_control_verdict resync control-app-ivr.log
+
+  echo "Control-plane logs: $CONTROL_LOG_DIR"
 fi
 
 # ── Step 7a2: Single-leg cold transfer (optional) ─────────────────────────
