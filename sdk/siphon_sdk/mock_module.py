@@ -590,6 +590,8 @@ class MockB2bua:
         - ``@b2bua.on_cancel`` — unanswered call cancelled (RFC 3261 §9)
 
     Imperative:
+        - ``b2bua.originate(to=...)`` — place an outbound call with no inbound
+          INVITE behind it (records onto ``originates`` for test assertions)
         - ``b2bua.terminate(call_id)`` — end a call by SIP Call-ID from any
           context (records onto ``terminates`` for test assertions)
         - ``b2bua.refer(call_id, target)`` — transfer a call by SIP Call-ID
@@ -601,11 +603,140 @@ class MockB2bua:
         self.terminates: list[dict] = []
         # Records b2bua.refer(...) calls for test assertions.
         self.refers: list[dict] = []
+        # Records b2bua.originate(...) calls for test assertions.
+        self.originates: list[dict] = []
+        # Sequence counter for the mock's synthetic originated Call-IDs.
+        self._originate_seq = 0
 
     def clear(self) -> None:
         """Reset recorded imperative calls (called by ``reset()``)."""
         self.terminates.clear()
         self.refers.clear()
+        self.originates.clear()
+        self._originate_seq = 0
+
+    def originate(
+        self,
+        to: str,
+        from_uri: Optional[str] = None,
+        from_display: Optional[str] = None,
+        to_display: Optional[str] = None,
+        next_hop: Optional[str] = None,
+        p_asserted_identity: Optional[str] = None,
+        privacy: Optional[str] = None,
+        headers: Optional[dict] = None,
+        sdp: Optional[str] = None,
+        media: bool = False,
+        profile: Optional[str] = None,
+        ws_uri: Optional[str] = None,
+        timeout: int = 30,
+    ) -> str:
+        """Place an outbound call siphon owns, with no inbound INVITE behind it.
+
+        The primitive under click-to-dial, callbacks and outbound notification.
+        Unlike ``call.dial()`` (which builds a B-leg off a call that already
+        arrived), this creates a call from nothing.
+
+        **Asynchronous.** Returns as soon as the INVITE is on the wire, with the
+        new leg's SIP Call-ID — it does not wait for the callee. Ringing and
+        answer arrive through the ordinary handlers: ``@b2bua.on_answer`` fires
+        with ``(call, reply)``, ``@b2bua.on_failure`` with
+        ``(call, code, reason)``, ``@b2bua.on_bye`` on teardown. Feed the
+        returned Call-ID to ``b2bua.terminate()`` / ``b2bua.refer()``.
+
+        Exactly one media plan is required — an INVITE with no offer and no way
+        to answer the callee's would connect a call with no audio:
+
+        * ``sdp="v=0..."`` — your own offer, carried verbatim (any backend);
+        * ``media=True`` — siphon anchors the leg on the configured media
+          backend (siphon-rtp), so ``rtpengine.play_media()``, DTMF and the
+          WebSocket tee all work against it.
+
+        Args:
+            to: called party — the Request-URI and the To URI.
+            from_uri: calling identity (From URI). Defaults to siphon's own
+                advertised address.
+            from_display: From display name.
+            to_display: To display name.
+            next_hop: route the INVITE here while the R-URI keeps the called
+                party's shape (IMS edge / trunk steering).
+            p_asserted_identity: ``P-Asserted-Identity`` for a trusted next hop.
+            privacy: ``"allowed"`` or ``"restricted"``. Restricted anonymises
+                From and asserts ``Privacy: id``, keeping the real identity in
+                ``P-Asserted-Identity``.
+            headers: dict of extra headers applied last. Dialog-defining headers
+                (Via/From/To/Call-ID/CSeq/Contact/Route/…) are ignored.
+            sdp: your own SDP offer.
+            media: True to have siphon anchor the leg on the media backend.
+            profile: media profile for ``media=True`` (default
+                ``"rtp_passthrough"``).
+            ws_uri: per-call WebSocket bridge URI for ``media=True``.
+            timeout: ring timeout in seconds; the call is CANCELled when it
+                elapses. 0 disables it.
+
+        Returns:
+            str: the new leg's SIP Call-ID.
+
+        Raises:
+            ValueError: no media plan, both media plans, or an unrecognised
+                ``privacy`` value. Live siphon also raises for unparseable URIs,
+                no route, and a media plan the backend cannot serve — never a
+                silent ``None`` for a call that was never placed.
+
+        In the mock, records the full argument set on ``originates`` and returns
+        a synthetic Call-ID. Inspect via ``siphon.get_b2bua().originates``.
+
+        Usage::
+
+            @timer.every(seconds=60)
+            def reminders():
+                for number in due_numbers():
+                    b2bua.originate(
+                        to=f"sip:{number}@carrier.example",
+                        from_uri="sip:+14035550100@siphon.example",
+                        media=True,
+                    )
+        """
+        if sdp is not None and media:
+            raise ValueError(
+                "b2bua.originate takes either sdp= (your own offer) or "
+                "media=True (siphon anchors the leg), not both"
+            )
+        if sdp is not None and not sdp.strip():
+            raise ValueError("b2bua.originate sdp= must not be empty")
+        if sdp is None and not media:
+            raise ValueError(
+                "b2bua.originate needs a media plan: sdp= (your own offer) or "
+                "media=True (siphon anchors the leg)"
+            )
+        if privacy is not None and privacy not in (
+            "allowed", "allow", "present", "presented",
+            "restricted", "restrict", "private", "anonymous",
+        ):
+            raise ValueError(
+                'b2bua.originate privacy= must be "allowed" or "restricted", '
+                f"got '{privacy}'"
+            )
+
+        self._originate_seq += 1
+        call_id = f"b2b-originate-{self._originate_seq}"
+        self.originates.append({
+            "call_id": call_id,
+            "to": to,
+            "from_uri": from_uri,
+            "from_display": from_display,
+            "to_display": to_display,
+            "next_hop": next_hop,
+            "p_asserted_identity": p_asserted_identity,
+            "privacy": privacy,
+            "headers": dict(headers) if headers else {},
+            "sdp": sdp,
+            "media": media,
+            "profile": profile,
+            "ws_uri": ws_uri,
+            "timeout": timeout,
+        })
+        return call_id
 
     def terminate(self, call_id: str, reason: str = "Normal Clearing") -> bool:
         """Imperatively end a B2BUA call by its SIP Call-ID.

@@ -578,6 +578,52 @@ impl ControlBus {
         self.apps.get(app).and_then(|fanout| fanout.get(conn_id))
     }
 
+    /// The live connection that issued a command, so an adapter verb that
+    /// *creates* a channel (`originate`) can register it to the same owner the
+    /// command came in on — server-authoritative, never client-asserted, and
+    /// the same exactly-one-owner rule every offered channel follows.
+    /// `None` once the connection has gone (a command racing its own socket
+    /// close), which the adapter answers `unavailable` rather than leaking an
+    /// ownerless channel.
+    pub fn connection_for_command(&self, app: &str, conn_id: u64) -> Option<Arc<ConnHandle>> {
+        self.connection(app, conn_id)
+    }
+
+    /// Whether a channel id is already registered. Read by `originate` before
+    /// it places anything on the wire so a caller-supplied id that collides is
+    /// rejected as `conflict` — never silently re-pointed at a second call,
+    /// which would strand the first.
+    pub fn channel_exists(&self, channel_id: &str) -> bool {
+        self.channels.contains_key(channel_id)
+    }
+
+    /// Push an event to whichever channel owns `sip_call_id`, if any.
+    ///
+    /// The by-Call-ID twin of [`publish_to_channel`](Self::publish_to_channel),
+    /// for signalling-path callers (the B2BUA response handler) that hold the
+    /// SIP Call-ID and not the channel id. Idempotent no-op — never panics,
+    /// never blocks — when the call is uncontrolled (the common case), the
+    /// channel is orphaned, or its connection is gone. Adds and removes no
+    /// per-call state of its own. Returns whether an event was queued.
+    pub fn forward_channel_event(
+        &self,
+        sip_call_id: &str,
+        event: &str,
+        payload: serde_json::Value,
+    ) -> bool {
+        let Some(channel_id) = self.channel_id_for_sip_call_id(sip_call_id) else {
+            return false;
+        };
+        let (app, call_actor_id) = match self.channels.get(&channel_id) {
+            Some(entry) => (entry.app.clone(), entry.call_actor_id.clone()),
+            None => return false,
+        };
+        self.publish_to_channel(
+            &channel_id,
+            EventFrame::new(event, &channel_id, &app, &call_actor_id, sip_call_id, payload),
+        )
+    }
+
     /// Register a controlled channel to an owning connection.
     #[allow(clippy::too_many_arguments)]
     pub fn register_channel(
@@ -718,6 +764,26 @@ impl ControlBus {
     /// the channel. Idempotent — a no-op when the call is not controlled.
     /// Called from every B2BUA teardown junction, guarded internally.
     pub fn on_call_terminated(&self, sip_call_id: &str, reason: &str) {
+        self.on_call_terminated_with_cause(sip_call_id, reason, None, None);
+    }
+
+    /// [`on_call_terminated`](Self::on_call_terminated) carrying the SIP cause
+    /// that ended the call.
+    ///
+    /// A leg siphon *placed* (`originate`) can die on a final non-2xx —
+    /// `486 Busy Here`, `603 Decline` — and the controller has no other way to
+    /// learn which: there is no A-leg the response was relayed to and no reply
+    /// frame it belongs to (RFC 3261 §8.1.3.4 leaves the meaning to the code +
+    /// reason phrase, so both are surfaced). `code`/`response` ride alongside
+    /// `reason` in the `StasisEnd` payload and are omitted when absent, so an
+    /// ordinary BYE-driven teardown emits exactly the frame it emitted before.
+    pub fn on_call_terminated_with_cause(
+        &self,
+        sip_call_id: &str,
+        reason: &str,
+        code: Option<u16>,
+        response: Option<&str>,
+    ) {
         let Some(channel_id) = self.channel_id_for_sip_call_id(sip_call_id) else {
             return;
         };
@@ -725,6 +791,15 @@ impl ControlBus {
             Some(entry) => (entry.app.clone(), entry.call_actor_id.clone()),
             None => return,
         };
+        let mut payload = serde_json::json!({ "reason": reason });
+        if let Some(object) = payload.as_object_mut() {
+            if let Some(code) = code {
+                object.insert("code".to_string(), serde_json::json!(code));
+            }
+            if let Some(response) = response {
+                object.insert("response".to_string(), serde_json::json!(response));
+            }
+        }
         self.publish_to_channel(
             &channel_id,
             EventFrame::new(
@@ -733,11 +808,11 @@ impl ControlBus {
                 &app,
                 &call_actor_id,
                 sip_call_id,
-                serde_json::json!({ "reason": reason }),
+                payload,
             ),
         );
         self.remove_channel(&channel_id);
-        debug!(%channel_id, %sip_call_id, reason, "control plane: StasisEnd + channel removed");
+        debug!(%channel_id, %sip_call_id, reason, ?code, "control plane: StasisEnd + channel removed");
     }
 
     /// Forward an in-band DTMF digit (detected by the media engine on a
@@ -1566,5 +1641,117 @@ mod tests {
         }
         assert_eq!(conn.events.depth(), 4);
         assert_eq!(conn.events.dropped_count(), 996);
+    }
+
+    // --- originate support -------------------------------------------------
+
+    #[test]
+    fn channel_exists_is_the_duplicate_id_gate() {
+        let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
+        let conn = bus.register_connection("ivr-app");
+        assert!(!bus.channel_exists("cb-1"));
+        bus.register_channel("cb-1", &conn, "call-uuid", "sipcid", "hangup", HashMap::new());
+        assert!(bus.channel_exists("cb-1"));
+        bus.remove_channel("cb-1");
+        assert!(!bus.channel_exists("cb-1"), "the id must be free again after teardown");
+    }
+
+    #[test]
+    fn connection_for_command_resolves_only_a_live_owner() {
+        let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
+        let conn = bus.register_connection("ivr-app");
+        assert_eq!(
+            bus.connection_for_command("ivr-app", conn.id).map(|c| c.id),
+            Some(conn.id)
+        );
+        assert!(bus.connection_for_command("ivr-app", conn.id + 99).is_none());
+        assert!(bus.connection_for_command("other-app", conn.id).is_none());
+        bus.unregister_connection(&conn);
+        assert!(
+            bus.connection_for_command("ivr-app", conn.id).is_none(),
+            "a closed connection must never be handed a new channel to own"
+        );
+    }
+
+    #[test]
+    fn forward_channel_event_reaches_the_owner_by_sip_call_id() {
+        let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
+        let conn = bus.register_connection("ivr-app");
+        bus.register_channel("cb-1", &conn, "call-uuid", "sipcid@host", "hangup", HashMap::new());
+
+        assert!(bus.forward_channel_event(
+            "sipcid@host",
+            "ChannelStateChange",
+            serde_json::json!({ "state": "ringing", "code": 180 }),
+        ));
+        let frames = futures_executor_block_on_recv(&conn);
+        let event = frames
+            .iter()
+            .find_map(|frame| match frame {
+                OutboundFrame::Event(event) if event.event == "ChannelStateChange" => Some(event),
+                _ => None,
+            })
+            .expect("ChannelStateChange must be queued");
+        assert_eq!(event.channel.as_deref(), Some("cb-1"));
+        assert_eq!(event.sip_call_id.as_deref(), Some("sipcid@host"));
+        assert_eq!(event.payload["state"], "ringing");
+
+        // An uncontrolled call is a silent no-op, never a panic.
+        assert!(!bus.forward_channel_event("nobody@host", "ChannelStateChange", serde_json::json!({})));
+    }
+
+    #[test]
+    fn stasis_end_carries_the_sip_cause_when_one_is_known() {
+        let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
+        let conn = bus.register_connection("ivr-app");
+        bus.register_channel("cb-1", &conn, "call-uuid", "sipcid@host", "hangup", HashMap::new());
+
+        bus.on_call_terminated_with_cause("sipcid@host", "rejected", Some(486), Some("Busy Here"));
+        let frames = futures_executor_block_on_recv(&conn);
+        let event = frames
+            .iter()
+            .find_map(|frame| match frame {
+                OutboundFrame::Event(event) if event.event == "StasisEnd" => Some(event),
+                _ => None,
+            })
+            .expect("StasisEnd must be queued");
+        assert_eq!(event.payload["reason"], "rejected");
+        assert_eq!(event.payload["code"], 486);
+        assert_eq!(event.payload["response"], "Busy Here");
+        assert!(!bus.channel_exists("cb-1"), "the channel must drain with the call");
+    }
+
+    #[test]
+    fn stasis_end_without_a_cause_is_byte_identical_to_the_legacy_frame() {
+        // Regression guard: adding the cause must not change the frame an
+        // ordinary BYE-driven teardown emits.
+        let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
+        let conn = bus.register_connection("ivr-app");
+        bus.register_channel("cb-1", &conn, "call-uuid", "sipcid@host", "hangup", HashMap::new());
+        bus.on_call_terminated("sipcid@host", "bye");
+        let frames = futures_executor_block_on_recv(&conn);
+        let event = frames
+            .iter()
+            .find_map(|frame| match frame {
+                OutboundFrame::Event(event) if event.event == "StasisEnd" => Some(event),
+                _ => None,
+            })
+            .expect("StasisEnd must be queued");
+        assert_eq!(event.payload, serde_json::json!({ "reason": "bye" }));
+    }
+
+    /// Drain a connection's queue without an async runtime: the queue is
+    /// already populated by the synchronous `try_push_event`, so one poll is
+    /// enough.
+    fn futures_executor_block_on_recv(conn: &Arc<ConnHandle>) -> Vec<OutboundFrame> {
+        conn.events.close();
+        let mut frames = Vec::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        runtime.block_on(async {
+            frames = conn.events.recv_many().await;
+        });
+        frames
     }
 }

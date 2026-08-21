@@ -191,6 +191,103 @@ class _B2buaNamespace:
             return False
         return control.terminate(call_id, reason)
 
+    def originate(
+        self,
+        to,
+        from_uri=None,
+        from_display=None,
+        to_display=None,
+        next_hop=None,
+        p_asserted_identity=None,
+        privacy=None,
+        headers=None,
+        sdp=None,
+        media=False,
+        profile=None,
+        ws_uri=None,
+        timeout=30,
+    ):
+        """Place an outbound call siphon owns, with no inbound INVITE behind it.
+
+        The primitive under click-to-dial, callbacks and outbound notification:
+        unlike ``call.dial()`` (which builds a B-leg off a call that already
+        arrived), this creates a call from nothing.
+
+        **Asynchronous.** It returns as soon as the INVITE is on the wire, with
+        the new leg's SIP Call-ID — it does not wait for the callee. Ringing and
+        answer arrive through the ordinary handlers: ``@b2bua.on_answer`` fires
+        with ``(call, reply)``, ``@b2bua.on_failure`` with ``(call, code,
+        reason)``, ``@b2bua.on_bye`` on teardown. Feed the returned Call-ID to
+        ``b2bua.terminate()`` / ``b2bua.refer()`` to drive the leg from anywhere.
+
+        Exactly one media plan is required — an INVITE with no offer and no way
+        to answer the callee's would connect a call with no audio:
+
+        * ``sdp="v=0..."`` — your own offer, carried verbatim (any backend);
+        * ``media=True`` — siphon anchors the leg on the configured media
+          backend (siphon-rtp), so ``rtpengine.play_media()``, DTMF and the
+          WebSocket tee all work against it.
+
+        Args:
+            to: called party — the Request-URI and the To URI.
+            from_uri: calling identity (From URI). Defaults to siphon's own
+                advertised address.
+            from_display: From display name.
+            to_display: To display name.
+            next_hop: route the INVITE here while the R-URI keeps the called
+                party's shape (IMS edge / trunk steering).
+            p_asserted_identity: ``P-Asserted-Identity`` for a trusted next hop.
+            privacy: ``"allowed"`` or ``"restricted"``. Restricted anonymises
+                From and asserts ``Privacy: id``, keeping the real identity in
+                ``P-Asserted-Identity``.
+            headers: dict of extra headers applied last. Dialog-defining headers
+                (Via/From/To/Call-ID/CSeq/Contact/…) are ignored — the stack owns
+                them.
+            sdp: your own SDP offer.
+            media: True to have siphon anchor the leg on the media backend.
+            profile: media profile for ``media=True`` (default
+                ``"rtp_passthrough"``).
+            ws_uri: per-call WebSocket bridge URI for ``media=True``.
+            timeout: ring timeout in seconds; the call is CANCELled when it
+                elapses. 0 disables it.
+
+        Returns:
+            str: the new leg's SIP Call-ID.
+
+        Raises:
+            ValueError: the URIs do not parse, no route exists, the media plan
+                is not one the configured backend can serve, or the B2BUA is not
+                running. Never a silent None for a call that was never placed.
+
+        Usage:
+            @timer.every(seconds=60)
+            def reminders():
+                for number in due_numbers():
+                    b2bua.originate(
+                        to=f"sip:{number}@carrier.example",
+                        from_uri="sip:+14035550100@siphon.example",
+                        media=True,
+                    )
+        """
+        control = object.__getattribute__(self, "__dict__").get("_control")
+        if control is None:
+            raise ValueError("b2bua.originate requires a running siphon B2BUA")
+        return control.originate(
+            to,
+            from_uri,
+            from_display,
+            to_display,
+            next_hop,
+            p_asserted_identity,
+            privacy,
+            headers,
+            sdp,
+            media,
+            profile,
+            ws_uri,
+            timeout,
+        )
+
     def refer(self, call_id, target, replaces=None):
         """Imperatively send an outbound REFER on a live B2BUA call by SIP Call-ID.
 

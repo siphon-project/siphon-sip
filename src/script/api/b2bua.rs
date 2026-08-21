@@ -54,6 +54,129 @@ impl PyB2buaControl {
     /// silent no-op (no handler-return to act on). Returns True if the call was
     /// found and the REFER emitted, False if the Call-ID is unknown / already
     /// gone. Never raises (except on a malformed `replaces` dict).
+    /// Place an outbound call siphon owns, with no inbound INVITE behind it —
+    /// the primitive under click-to-dial, callbacks and outbound notification.
+    ///
+    /// Returns immediately with the new leg's **SIP Call-ID** as soon as the
+    /// INVITE is on the wire; it does *not* wait for the callee. Ringing and
+    /// answer arrive later through the ordinary handlers — `@b2bua.on_answer`
+    /// fires with `(call, reply)` when the callee answers, `@b2bua.on_failure`
+    /// with `(call, code, reason)` when it rejects, and `@b2bua.on_bye` when
+    /// either side hangs up. Feed the returned Call-ID to `b2bua.terminate()` /
+    /// `b2bua.refer()` to drive the leg from anywhere.
+    ///
+    /// Exactly one media plan is required, because an INVITE with no offer and
+    /// no way to answer the callee's leaves a connected call with no audio:
+    ///   * `sdp="v=0..."` — your own offer, carried verbatim; or
+    ///   * `media=True` — siphon anchors the leg on the configured media
+    ///     backend (siphon-rtp), so `rtpengine.play_media()`, DTMF and the
+    ///     WebSocket tee all work against it.
+    ///
+    /// ```python
+    /// call_id = b2bua.originate(
+    ///     to="sip:+14035551212@carrier.example",
+    ///     from_uri="sip:+14035550100@siphon.example",
+    ///     from_display="Reminders",
+    ///     media=True,
+    ///     headers={"X-Campaign": "reminder"},
+    ///     timeout=30,
+    /// )
+    /// ```
+    ///
+    /// Raises `ValueError` when the target/identity URIs do not parse, no route
+    /// exists, the media plan is not one the configured backend can serve, or
+    /// the B2BUA is not running — never a silent `None` for a call that was
+    /// never placed.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        to,
+        from_uri=None,
+        from_display=None,
+        to_display=None,
+        next_hop=None,
+        p_asserted_identity=None,
+        privacy=None,
+        headers=None,
+        sdp=None,
+        media=false,
+        profile=None,
+        ws_uri=None,
+        timeout=30,
+    ))]
+    fn originate(
+        &self,
+        to: &str,
+        from_uri: Option<&str>,
+        from_display: Option<&str>,
+        to_display: Option<&str>,
+        next_hop: Option<&str>,
+        p_asserted_identity: Option<&str>,
+        privacy: Option<&str>,
+        headers: Option<&Bound<'_, pyo3::types::PyDict>>,
+        sdp: Option<&str>,
+        media: bool,
+        profile: Option<&str>,
+        ws_uri: Option<&str>,
+        timeout: u32,
+    ) -> PyResult<String> {
+        use pyo3::exceptions::PyValueError;
+
+        let media_plan = match (sdp, media) {
+            (Some(_), true) => {
+                return Err(PyValueError::new_err(
+                    "b2bua.originate takes either sdp= (your own offer) or media=True (siphon anchors the leg), not both",
+                ));
+            }
+            (Some(sdp), false) if sdp.trim().is_empty() => {
+                return Err(PyValueError::new_err("b2bua.originate sdp= must not be empty"));
+            }
+            (Some(sdp), false) => crate::dispatcher::OriginateMedia::Offer(sdp.to_string()),
+            (None, true) => crate::dispatcher::OriginateMedia::Anchor {
+                profile: profile.unwrap_or("rtp_passthrough").to_string(),
+                ws_uri: ws_uri.map(str::to_string),
+            },
+            (None, false) => {
+                return Err(PyValueError::new_err(
+                    "b2bua.originate needs a media plan: sdp= (your own offer) or media=True (siphon anchors the leg)",
+                ));
+            }
+        };
+
+        let privacy = match privacy {
+            None => None,
+            Some(value) => Some(
+                crate::sip::privacy::CallerIdPresentation::parse(value).ok_or_else(|| {
+                    PyValueError::new_err(format!(
+                        "b2bua.originate privacy= must be \"allowed\" or \"restricted\", got '{value}'"
+                    ))
+                })?,
+            ),
+        };
+
+        let mut extra_headers = Vec::new();
+        if let Some(headers) = headers {
+            for (key, value) in headers.iter() {
+                extra_headers.push((key.to_string(), value.to_string()));
+            }
+        }
+
+        let params = crate::dispatcher::OriginateParams {
+            to: to.to_string(),
+            to_display: to_display.map(str::to_string),
+            from: from_uri.map(str::to_string),
+            from_display: from_display.map(str::to_string),
+            next_hop: next_hop.map(str::to_string),
+            p_asserted_identity: p_asserted_identity.map(str::to_string),
+            privacy,
+            headers: extra_headers,
+            timeout_secs: timeout,
+            media: media_plan,
+        };
+        crate::dispatcher::b2bua_originate(params)
+            .map(|placed| placed.sip_call_id)
+            .map_err(|error| PyValueError::new_err(error.to_string()))
+    }
+
     #[pyo3(signature = (call_id, target, replaces=None))]
     fn refer(
         &self,

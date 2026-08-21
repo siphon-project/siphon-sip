@@ -479,6 +479,28 @@ impl Leg {
         }
     }
 
+    /// Create the single leg of a call **siphon itself placed** (`originate`).
+    ///
+    /// Siphon is the UAC on this leg — there is no inbound INVITE and no caller
+    /// to bridge to — so it carries an *outbound* dialog ([`Dialog::new_outbound`])
+    /// while still occupying the A-leg slot: the A-leg is "the leg the call
+    /// starts from", and every teardown / in-dialog path
+    /// ([`crate::b2bua::actor::CallActor::request_direction`], the framework BYE
+    /// builder, the media safety-net) keys on it. `local_tag` is our From-tag
+    /// (RFC 3261 §8.1.1.3) and `branch` the INVITE's own Via branch.
+    pub fn new_originating_leg(
+        call_id: String,
+        local_tag: String,
+        target_uri: String,
+        branch: String,
+        transport: TransportInfo,
+    ) -> Self {
+        Self {
+            side: LegSide::A,
+            ..Self::new_b_leg(call_id, local_tag, target_uri, branch, transport)
+        }
+    }
+
     /// Create a new B-leg for an outbound INVITE.
     pub fn new_b_leg(
         call_id: String,
@@ -571,6 +593,17 @@ pub struct LegRegistry {
     /// B-leg path, which ACKs (wrong for a non-INVITE, RFC 3261 §17.1.2) and
     /// reasons about legs that do not exist on a single-leg call.
     originated_refers: DashMap<String, OriginatedRefer>,
+    /// Via branch → internal call ID for an INVITE **siphon originated**
+    /// (`originate`).
+    ///
+    /// Kept apart from [`Self::by_branch`] for the same reason
+    /// [`Self::originated_refers`] is: a response matched there runs
+    /// `handle_b2bua_response`, which relays the far end's provisionals/finals
+    /// to an A-leg and reasons about B-legs. An originated call *is* the A-leg
+    /// and has no B-leg, so relaying its own 180 back at the peer we are calling
+    /// is exactly wrong. This index gives the response path a first, explicit
+    /// hook (checked before the leg-branch lookup) into the UAC-side handler.
+    originated_calls: DashMap<String, String>,
 }
 
 /// A REFER siphon sent on one of its own legs, awaiting a response.
@@ -600,7 +633,32 @@ impl LegRegistry {
             by_call_id: DashMap::new(),
             by_branch: DashMap::new(),
             originated_refers: DashMap::new(),
+            originated_calls: DashMap::new(),
         }
+    }
+
+    /// Record a siphon-originated INVITE branch so its responses reach the
+    /// UAC-side handler instead of the B-leg relay machinery.
+    pub fn register_originated_call(&self, branch: &str, internal_id: &str) {
+        self.originated_calls
+            .insert(branch.to_string(), internal_id.to_string());
+    }
+
+    /// The internal call id of the originate this branch belongs to, if any.
+    pub fn lookup_originated_call(&self, branch: &str) -> Option<String> {
+        self.originated_calls.get(branch).map(|entry| entry.clone())
+    }
+
+    /// Drop the originate branch index entry of a call that is gone.
+    pub fn clear_originated_calls(&self, internal_id: &str) {
+        self.originated_calls
+            .retain(|_, id| id.as_str() != internal_id);
+    }
+
+    /// Number of tracked originate branches (leak-test accessor).
+    #[cfg(test)]
+    pub fn originated_call_count(&self) -> usize {
+        self.originated_calls.len()
     }
 
     /// Record a siphon-originated REFER so its response can be matched.
@@ -666,6 +724,10 @@ impl LegRegistry {
         // entry would leak one per abandoned transfer.
         self.originated_refers
             .retain(|_, refer| refer.call_id.as_str() != internal_id);
+        // ...and the originate branch, for the same reason: one entry per placed
+        // call would otherwise never drain.
+        self.originated_calls
+            .retain(|_, id| id.as_str() != internal_id);
     }
 
     /// Number of registered calls (unique internal IDs in Call-ID map).
@@ -915,6 +977,28 @@ pub struct CallActor {
     /// instead of the 408 timeout teardown. Cleared once the controller acts
     /// (answer/progress transitions the state) or the call is torn down.
     pub handoff_pending: bool,
+    /// True when siphon *placed* this call (`originate`) rather than receiving
+    /// an INVITE for it. The A-leg is then a UAC dialog siphon owns, so every
+    /// path that would answer the A-leg with a SIP *response* is wrong for it:
+    /// an un-answered originate is abandoned with a CANCEL (RFC 3261 §9.1), not
+    /// a 408/503 sent to the peer we are calling.
+    pub originated: bool,
+    /// The media anchor an originated call asked for, when it went out with no
+    /// offer. Read on the callee's 2xx to answer its offer locally and carry the
+    /// answer on the ACK (RFC 3261 §13.2.2.4). `None` for a call originated with
+    /// a controller-supplied offer, and for every inbound call.
+    pub originate_anchor: Option<OriginateAnchor>,
+}
+
+/// The media plan of an offerless originate, resolved when the callee's 2xx
+/// arrives. Names a profile in the media registry rather than carrying resolved
+/// engine flags, so the actor layer stays free of media types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginateAnchor {
+    /// Media profile whose `answer` flags the local anchor uses.
+    pub profile: String,
+    /// Per-call WebSocket bridge URI (templated), overriding the profile's.
+    pub ws_uri: Option<String>,
 }
 
 impl CallActor {
@@ -954,6 +1038,8 @@ impl CallActor {
             control_app: None,
             on_control_loss: None,
             handoff_pending: false,
+            originated: false,
+            originate_anchor: None,
         }
     }
 
@@ -1779,6 +1865,40 @@ impl CallActorStore {
         self.registry.clear_originated_refers(call_id);
     }
 
+    /// Mark a call as one siphon *placed* (`originate`) and index its INVITE's
+    /// Via branch so the response path routes to the UAC-side handler.
+    pub fn mark_originated(&self, call_id: &str, branch: &str) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.originated = true;
+        }
+        self.registry.register_originated_call(branch, call_id);
+    }
+
+    /// Whether this call was placed by siphon (`originate`).
+    pub fn is_originated(&self, call_id: &str) -> bool {
+        self.calls.get(call_id).is_some_and(|call| call.originated)
+    }
+
+    /// The internal call id of the originate whose INVITE carried `branch`.
+    pub fn lookup_originated_call(&self, branch: &str) -> Option<String> {
+        self.registry.lookup_originated_call(branch)
+    }
+
+    /// Record the media anchor an offerless originate must apply to the
+    /// callee's 2xx offer.
+    pub fn set_originate_anchor(&self, call_id: &str, anchor: OriginateAnchor) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.originate_anchor = Some(anchor);
+        }
+    }
+
+    /// The media anchor plan of an originated call, if it went out offerless.
+    pub fn originate_anchor(&self, call_id: &str) -> Option<OriginateAnchor> {
+        self.calls
+            .get(call_id)
+            .and_then(|call| call.originate_anchor.clone())
+    }
+
     /// Get a call by internal ID.
     pub fn get_call(&self, call_id: &str) -> Option<dashmap::mapref::one::Ref<'_, String, CallActor>> {
         self.calls.get(call_id)
@@ -2147,6 +2267,9 @@ impl CallActorStore {
             // would transfer is gone. Cleared here rather than left to age out,
             // so an abandoned transfer does not leak an entry per call.
             self.registry.clear_originated_refers(call_id);
+            // Likewise the originate branch index: one entry per placed call,
+            // dropped with the call so it can never outlive it.
+            self.registry.clear_originated_calls(call_id);
             // Clean up A-leg registry entries
             self.registry.remove_call_id(&call.a_leg.dialog.call_id);
             self.registry.remove_branch(&call.a_leg.branch);
@@ -2194,6 +2317,24 @@ impl CallActorStore {
     pub fn remove_call_after_cancel(&self, call_id: &str) -> bool {
         let mut captured = false;
         if let Some(call) = self.calls.get(call_id) {
+            // A call siphon placed (`originate`) carries its pending INVITE on
+            // the A-leg, not a B-leg, so the loop below would capture nothing
+            // and a 2xx racing our CANCEL would be dropped — leaving the callee
+            // retransmitting a 200 for a dialog nobody ever ACKs or BYEs
+            // (RFC 3261 §9.1 glare, §13.2.2.4, §15).
+            if call.originated
+                && matches!(call.state, CallState::Calling | CallState::Ringing)
+                && call.a_leg_invite.is_some()
+            {
+                self.zombie_cancelled.insert(
+                    call.a_leg.dialog.call_id.clone(),
+                    ZombieCancelledLeg {
+                        leg: call.a_leg.clone(),
+                        byed: false,
+                    },
+                );
+                captured = true;
+            }
             for (index, b_leg) in call.b_legs.iter().enumerate() {
                 let pending = matches!(
                     call.b_leg_status.get(index),
@@ -4377,5 +4518,124 @@ mod tests {
         assert!(!terminated.contains_key("cid-2"));
         assert!(terminated.contains_key("cid-3"));
         assert!(terminated.contains_key("cid-4"));
+    }
+}
+
+#[cfg(test)]
+mod originate_tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn transport() -> TransportInfo {
+        TransportInfo {
+            remote_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 5060),
+            connection_id: ConnectionId::default(),
+            transport: Transport::Udp,
+            local_addr: None,
+        }
+    }
+
+    fn originating_leg() -> Leg {
+        Leg::new_originating_leg(
+            "orig-call@siphon.invalid".to_string(),
+            "sip-from-tag".to_string(),
+            "sip:+14035551212@carrier.example".to_string(),
+            "z9hG4bK-orig1".to_string(),
+            transport(),
+        )
+    }
+
+    #[test]
+    fn originating_leg_is_an_a_leg_with_an_outbound_dialog() {
+        let leg = originating_leg();
+        assert_eq!(leg.side, LegSide::A);
+        // Outbound dialog: our tag is the local (From) tag, the remote tag is
+        // still unknown, and the target URI is the R-URI we INVITE.
+        assert_eq!(leg.dialog.local_tag, "sip-from-tag");
+        assert!(leg.dialog.remote_tag.is_none());
+        assert_eq!(
+            leg.dialog.target_uri.as_deref(),
+            Some("sip:+14035551212@carrier.example")
+        );
+        assert_eq!(leg.dialog.local_cseq, 1);
+        assert!(!leg.is_tracking_leg());
+    }
+
+    #[test]
+    fn a_fresh_call_is_not_originated() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(originating_leg());
+        assert!(!store.is_originated(&call_id));
+    }
+
+    #[test]
+    fn mark_originated_flags_the_call_and_indexes_the_branch() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(originating_leg());
+        store.mark_originated(&call_id, "z9hG4bK-orig1");
+
+        assert!(store.is_originated(&call_id));
+        assert_eq!(
+            store.lookup_originated_call("z9hG4bK-orig1").as_deref(),
+            Some(call_id.as_str())
+        );
+        assert!(store.lookup_originated_call("z9hG4bK-someone-else").is_none());
+    }
+
+    #[test]
+    fn removing_the_call_drains_the_originate_branch_index() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(originating_leg());
+        store.mark_originated(&call_id, "z9hG4bK-orig1");
+        assert_eq!(store.registry.originated_call_count(), 1);
+
+        store.remove_call(&call_id);
+        assert_eq!(store.registry.originated_call_count(), 0);
+        assert!(store.lookup_originated_call("z9hG4bK-orig1").is_none());
+    }
+
+    /// Steady-state leak guard for the originate branch index: a batch of
+    /// complete place-then-tear-down cycles must return every store to the
+    /// length it started at.
+    #[test]
+    fn originate_cycles_drain_every_store_to_baseline() {
+        let store = CallActorStore::new();
+        let baseline = (store.count(), store.registry.originated_call_count());
+
+        for index in 0..200 {
+            let leg = Leg::new_originating_leg(
+                format!("orig-{index}@siphon.invalid"),
+                format!("tag-{index}"),
+                "sip:+14035551212@carrier.example".to_string(),
+                format!("z9hG4bK-orig-{index}"),
+                transport(),
+            );
+            let call_id = store.create_call(leg);
+            store.mark_originated(&call_id, &format!("z9hG4bK-orig-{index}"));
+            store.remove_call(&call_id);
+        }
+
+        assert_eq!(
+            (store.count(), store.registry.originated_call_count()),
+            baseline,
+            "originate must not retain per-call state after teardown"
+        );
+    }
+
+    #[test]
+    fn an_originated_call_routes_its_own_in_dialog_requests_to_the_a_leg() {
+        // RFC 3261 §12: the far end's BYE carries our dialog Call-ID, and its
+        // From-tag is the tag it assigned (our `remote_tag`). A single-leg
+        // originated call must resolve that to the A-leg, never to "no dialog".
+        let mut actor = CallActor::new(originating_leg());
+        actor.a_leg.dialog.remote_tag = Some("peer-tag".to_string());
+        assert_eq!(
+            actor.request_direction("orig-call@siphon.invalid", Some("peer-tag")),
+            Some(LegSide::A)
+        );
+        assert_eq!(
+            actor.request_direction("some-other-call@elsewhere", Some("peer-tag")),
+            None
+        );
     }
 }

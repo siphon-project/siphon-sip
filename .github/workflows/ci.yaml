@@ -579,6 +579,66 @@ jobs:
             rtpengine-real.log
             *.log
 
+  # ── Control-plane `originate` (a call siphon places itself) ─────────────
+  # No inbound call anywhere: a control application dials siphon's control
+  # WebSocket and places a call under a channel id IT chose.
+  #
+  # The two halves of the acceptance criteria live on opposite sides of the
+  # rail, so both have to pass:
+  #   * the UAS asserts the outbound identity actually reached the wire (From +
+  #     display, P-Asserted-Identity, custom header, the caller-supplied offer,
+  #     no To-tag) and then holds `180 Ringing` for two seconds;
+  #   * the app asserts its accept came back during that ring rather than after
+  #     the answer, that the reply echoes its own id, that a duplicate id is
+  #     refused `conflict`, and that hangup produces the `StasisEnd`.
+  #
+  # The app prints one ORIGINATE-VERDICT line; the grep below fails the job on
+  # `"pass": false` AND on a verdict that never appeared (the app never
+  # connecting at all looks like success to `--exit-code-from` alone only if it
+  # exits 0, which it does not — but the grep is the belt to that braces).
+  sipp-originate:
+    runs-on: ubuntu-latest
+    needs: rust-tests
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build siphon-originate image
+        run: docker compose -f sipp/docker-compose.yaml --profile originate build siphon-originate
+
+      - name: Start siphon (control listener) + the UAS
+        run: docker compose -f sipp/docker-compose.yaml --profile originate up -d --wait siphon-originate
+
+      - name: Originate under a caller-supplied id, ring, answer, bridge-free hangup
+        run: docker compose -f sipp/docker-compose.yaml --profile originate up --abort-on-container-exit --exit-code-from originate-app sipp-originate-uas originate-app
+
+      - name: Assert the control app's verdict
+        if: always()
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs originate-app > originate-app.log 2>&1 || true
+          grep -q 'ORIGINATE-VERDICT' originate-app.log || { echo "no verdict — the control app never completed"; exit 1; }
+          if grep -q '"pass": false' originate-app.log; then
+            echo "originate acceptance checks failed:"; grep 'ORIGINATE-VERDICT' originate-app.log; exit 1
+          fi
+          grep 'ORIGINATE-VERDICT' originate-app.log
+
+      - name: Collect logs
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml logs siphon-originate > siphon-originate.log 2>&1 || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile originate down --remove-orphans
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-originate-logs
+          path: |
+            siphon-originate.log
+            originate-app.log
+            *.log
+
   # ── B2BUA A-leg INVITE authentication ──────────────────────────────────
   # siphon challenges the CALLER from @b2bua.on_invite. With a @b2bua handler
   # registered the dispatcher routes INVITE to the B2BUA path and

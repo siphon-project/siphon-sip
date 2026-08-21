@@ -5074,6 +5074,94 @@ services:
     profiles:
       - rtpproxy-real
 
+  # ── Control-plane `originate` (a call siphon places itself) ───────────────
+  # Requires the "originate" profile.
+  #
+  # IP assignments:
+  #   172.20.0.150 — siphon (control listener on :9092, SIP on :5060)
+  #   172.20.0.151 — SIPp UAS (the callee)
+  #   172.20.0.152 — the control application
+  #
+  # There is no inbound call: the control app dials siphon's control WebSocket
+  # and places one with a channel id it chose. The UAS asserts the outbound
+  # identity reached the wire and holds `180 Ringing` for two seconds; the app
+  # asserts its accept came back long before the answer did, and that a
+  # duplicate id is refused `conflict`.
+  #
+  # Usage:
+  #   docker compose -f sipp/docker-compose.yaml --profile originate \
+  #     up --abort-on-container-exit --exit-code-from originate-app \
+  #     siphon-originate sipp-originate-uas originate-app
+
+  siphon-originate:
+    build:
+      context: ..
+    container_name: siphon-originate-test
+    volumes:
+      - ./control/siphon-originate.yaml:/etc/siphon/siphon.yaml:ro
+      - ./control:/etc/siphon/scripts:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.150
+    healthcheck:
+      # The control listener is what this test needs up, so probe that rather
+      # than SIP: a siphon that answers OPTIONS but never bound :9092 would
+      # otherwise look healthy and the app would fail on connect.
+      test: ["CMD-SHELL", "python3 -c \"import socket; socket.create_connection(('127.0.0.1',9092),2).close()\""]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 8s
+    profiles:
+      - originate
+
+  # The callee. Asserts the From / P-Asserted-Identity / custom header / offer
+  # the app asked for, then rings for 2 s before answering.
+  sipp-originate-uas:
+    image: ctaloi/sipp:latest
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.151
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/originate_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "40"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - originate
+
+  originate-app:
+    image: python:3.12-slim
+    container_name: originate-app
+    depends_on:
+      siphon-originate:
+        condition: service_healthy
+      sipp-originate-uas:
+        condition: service_started
+    volumes:
+      - ./control:/app:ro
+    working_dir: /app
+    # websockets is not in the base image; install then run.
+    command: ["sh", "-c", "pip install --quiet --no-cache-dir websockets && exec python3 originate_app.py"]
+    environment:
+      CONTROL_URL: "ws://172.20.0.150:9092/control/ws"
+      CONTROL_TOKEN: "originate-test-token"
+      ORIGINATE_TO: "sip:+15551000001@172.20.0.151:5060"
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.152
+    profiles:
+      - originate
+
 # ── Network ────────────────────────────────────────────────────────────────
 networks:
   sipnet:

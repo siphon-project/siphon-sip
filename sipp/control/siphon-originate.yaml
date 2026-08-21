@@ -1,0 +1,40 @@
+# siphon config for the `originate` acceptance test
+# (sipp/control/originate_app.py + sipp/originate_uas.xml).
+#
+# There is no inbound call anywhere in this test: the control application dials
+# siphon's control WebSocket and places a call itself. So there is no B2BUA
+# script route to configure — the script only exists because a running siphon
+# wants one, and it registers no handlers.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "originate.test"
+    - "172.20.0.150"
+
+advertised_address: "172.20.0.150"
+
+script:
+  path: "/etc/siphon/scripts/originate_noop.py"
+
+control:
+  listen: "0.0.0.0:9092"
+  apps:
+    - name: "originate-app"
+      token: "originate-test-token"
+      # Inbound persistent mode: the app dials siphon and holds one socket.
+      # An originate has no inbound call to dial the app *for*, so per-call
+      # connect cannot apply to it.
+      per_call_connect: false
+      on_lost: "hangup"
+  limits:
+    event_queue_depth: 256
+    slow_consumer: drop_oldest
+    reattach_grace_secs: 5
+    handoff_deadline_ms: 3000
+
+log:
+  level: info

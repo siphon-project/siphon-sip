@@ -16,6 +16,10 @@ use serde::{Deserialize, Serialize};
 /// siphon-rtp-only, so a non-siphon-rtp backend answers them `unsupported_verb`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SipVerb {
+    /// Place an outbound call under a caller-supplied channel id. Returns as
+    /// soon as the INVITE is on the wire; ringing/answer/hangup arrive as
+    /// events on that id.
+    Originate,
     /// Send a UAS 2xx to the parked A-leg.
     Answer,
     /// Send a UAS 1xx / early media.
@@ -58,6 +62,7 @@ impl SipVerb {
     /// The exact wire token for this verb.
     pub const fn as_str(self) -> &'static str {
         match self {
+            SipVerb::Originate => "originate",
             SipVerb::Answer => "answer",
             SipVerb::Progress => "progress",
             SipVerb::Reject => "reject",
@@ -218,6 +223,7 @@ mod tests {
 
     #[test]
     fn sip_verb_wire_tokens() {
+        assert_eq!(SipVerb::Originate.as_str(), "originate");
         assert_eq!(SipVerb::Answer.as_str(), "answer");
         assert_eq!(SipVerb::Route.as_str(), "route");
         assert_eq!(SipVerb::SetHeader.as_str(), "set_header");

@@ -6,6 +6,60 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **`originate` — a call siphon places itself.** Both the control-plane verb
+  (`module: "sip"`, `verb: "originate"`) and the in-process
+  `b2bua.originate(...)`. Until now a call could only ever be a *reaction*:
+  `call.dial()` builds a B-leg off an INVITE that already arrived, and
+  `proxy.send_request()` is a one-shot request/response with no dialog you can
+  later answer, transfer or tear down. So click-to-dial, callbacks and outbound
+  notification had no primitive at all, and an application driving a transfer
+  could not place the leg it wanted to transfer *to*. An originated call is a
+  `CallActor` whose A-leg is a UAC dialog siphon owns end to end: it ACKs the 2xx
+  (RFC 3261 §13.2.2.4), ACKs a final non-2xx on the INVITE's own branch
+  (§17.1.1.3), CANCELs rather than answering a response when abandoned before
+  answer (§9.1 — a UAC has no business sending one to the party it is calling),
+  and tears down through the same funnel every other B2BUA call uses.
+  - **The channel id is supplied by the caller, never minted by siphon.** An
+    application stages its per-call context — routing, media plan, its own state
+    — keyed on an id it chose before anything reaches the network; returning an
+    id instead would force a round-trip a well-built controller has designed out.
+    Reusing a **live** id answers the new `conflict` error code (distinct from
+    `bad_request`: the frame is fine, the id collides, and retrying the same one
+    can never succeed); the id is free again once the call is gone.
+  - **The accept is the local action, not the far-end outcome.** The reply comes
+    back as soon as the INVITE is on the wire, while the callee is still ringing
+    — so ringback or a prompt can start during ring, and one ringing phone never
+    serialises a connection's command stream. Ringing, answer and hangup arrive
+    afterwards as `ChannelStateChange` / `StasisEnd` events on the supplied id,
+    and `StasisEnd` now carries the SIP cause (`code` + `response`) for a leg
+    that was rejected, which is the only way a controller can learn *why* when
+    there is no A-leg the response was relayed to.
+  - **Full outbound identity**: From URI and display name, To URI and display
+    name, `P-Asserted-Identity` (RFC 3325 §9.1), RFC 3323 §4.1 / TS 24.607 CLIR
+    via `privacy: "restricted"` (applied last, so a custom header cannot undo
+    it), a `next_hop` that steers egress without reshaping the R-URI, and
+    arbitrary custom headers. Dialog-defining headers are refused rather than
+    applied — overwriting one would leave the leg unaddressable for its own ACK.
+  - **Media**: either the caller's own SDP offer (any backend, or none), or
+    `media: true`, which sends the INVITE offerless and answers the callee's 2xx
+    offer locally on the media backend with the answer riding on the ACK. The
+    resulting session is keyed on the leg's SIP Call-ID, so `play` / `dtmf` /
+    `hold` / `stream_start` work against an originated leg exactly as they do
+    against an inbound-anchored one. A backend that cannot do it is refused at
+    the command (`unsupported_verb`), never connected as a mute call.
+  - Typed refusals throughout — `bad_request`, `conflict`, `not_found` (no
+    route), `unsupported_verb`, `unavailable` — each separately actionable, and
+    a refused originate registers no channel and places nothing on the wire.
+
+### Changed
+- **`hangup` on an un-answered call siphon originated now CANCELs** instead of
+  sending a final non-2xx. The response path is correct for an inbound call
+  parked under control; on a call siphon placed, siphon is the UAC.
+- Two new stable control-plane error codes, `conflict` and `invalid_state`,
+  mirrored into `siphon-control-proto` and the TypeScript SDK so a client parses
+  them as the refusals they are rather than a transport error.
+
 ## [1.6.0] — 2026-08-20
 
 ### Added

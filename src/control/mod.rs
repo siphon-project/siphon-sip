@@ -53,6 +53,15 @@ pub use registry::{
     Ownership, PushOutcome, SlowConsumerPolicy,
 };
 
+/// Push an event to the control channel owning `sip_call_id`, if the call is
+/// controlled. A no-op when the control plane is not installed. Signalling-path
+/// helper — never blocks, never panics.
+pub fn notify_channel_event(sip_call_id: &str, event: &str, payload: serde_json::Value) {
+    if let Some(bus) = ControlBus::global() {
+        bus.forward_channel_event(sip_call_id, event, payload);
+    }
+}
+
 /// The resolved target of an adapter command. The substrate resolves + ownership
 /// -checks a `{channel}` target before handing the command to the adapter, so an
 /// adapter never sees a channel its connection does not own.
@@ -62,6 +71,21 @@ pub enum ResolvedTarget {
     Channel(ChannelRef),
     /// No addressable resource (module-level verb).
     None,
+}
+
+/// The authenticated connection a command arrived on.
+///
+/// Carried alongside the resolved target because a verb that *creates* a
+/// resource (`originate`) has no target to resolve ownership from and must
+/// still register what it creates to exactly one owner — the connection that
+/// asked for it. Server-authoritative: the substrate fills this in from the
+/// authenticated socket, it is never read off the frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandOrigin {
+    /// The application the connection authenticated as.
+    pub app: String,
+    /// The originating connection id.
+    pub conn_id: u64,
 }
 
 /// A command handed to an adapter, with its target already resolved +
@@ -74,6 +98,8 @@ pub struct AdapterCommand {
     pub args: serde_json::Value,
     /// The resolved, ownership-checked target.
     pub target: ResolvedTarget,
+    /// The authenticated connection this command came in on.
+    pub origin: CommandOrigin,
 }
 
 /// Introspection schema for one adapter (`describe`).
@@ -331,6 +357,10 @@ async fn dispatch(
             verb: verb.to_string(),
             args,
             target: resolved,
+            origin: CommandOrigin {
+                app: app.to_string(),
+                conn_id,
+            },
         })
         .await
 }
