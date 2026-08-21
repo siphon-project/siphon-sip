@@ -5395,6 +5395,313 @@ services:
     profiles:
       - originate
 
+
+  # ── Control plane: the external application rail ──────────────────────────
+  # Requires the "control" profile.
+  #
+  # IP assignments:
+  #   172.20.0.160 — siphon (SIP :5060, control WebSocket :9092)
+  #   172.20.0.161 — mock control app, per-call-connect mode (WS server :8090)
+  #   172.20.0.162 — mock control app, persistent-inbound mode (2 sockets)
+  #   172.20.0.163 — mock siphon-rtp media engine (answer-first + media verbs)
+  #   172.20.0.164 — SIPp UAC, deferred handover happy path
+  #   172.20.0.165 — SIPp UAC, handoff deadline
+  #   172.20.0.166 — SIPp UAC, media verb round trip
+  #   172.20.0.167 — SIPp UAC, exactly-one-owner dispatch
+  #   172.20.0.168 — SIPp UAC, resync after a controller reconnect
+  #
+  # There is no UAS anywhere in this profile: every call is answered (or refused)
+  # by the out-of-process application over the control WebSocket, which is the
+  # whole point. Both connection modes run at once against one siphon, because
+  # they are different code paths and a given app can only be in one of them:
+  # `edge-app` is dialled per call (the multi-pod default) and `ivr-app` holds
+  # persistent inbound sockets (the only mode with round-robin ownership and
+  # `resync`).
+  #
+  # The mock app records every frame it sent and received, and the mock media
+  # engine records every command it was given — which together are what let a
+  # test assert on the actual exchange rather than on a call outcome that looks
+  # the same either way.
+  #
+  # Usage (one scenario at a time; --exit-code-from names the decider):
+  #   docker compose -f sipp/docker-compose.yaml --profile control \
+  #     up -d --wait mock-control-rtp control-app-edge siphon-control control-app-ivr
+  #   docker compose -f sipp/docker-compose.yaml --profile control \
+  #     up --abort-on-container-exit --exit-code-from sipp-control-handover-uac \
+  #     sipp-control-handover-uac
+
+  # Mock siphon-rtp — native JSON-over-TCP control on 8080. Only the answer-first
+  # (media verb) case needs it, but siphon resolves the backend at boot.
+  mock-control-rtp:
+    image: python:3.12-slim
+    container_name: mock-control-rtp
+    volumes:
+      - ./siphon-rtp:/app:ro
+    working_dir: /app
+    command: ["python3", "mock_siphon_rtp.py"]
+    environment:
+      SIPHON_RTP_PORT: "8080"
+      MOCK_MEDIA_IP: "203.0.113.1"
+      MOCK_MEDIA_PORT: "30000"
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.163
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket,struct,json; s=socket.create_connection(('127.0.0.1',8080),2); b=json.dumps({'id':1,'command':'ping'}).encode(); s.sendall(struct.pack('!I',len(b))+b); h=s.recv(4); n=struct.unpack('!I',h)[0]; d=s.recv(n); s.close(); exit(0 if b'pong' in d else 1)\""]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    profiles:
+      - control
+
+  # The per-call-connect application: siphon dials THIS, once per handed-over
+  # call. It must be listening before siphon needs it, so it starts first.
+  control-app-edge:
+    image: python:3.12-slim
+    container_name: control-app-edge
+    volumes:
+      - ./control:/app:ro
+    working_dir: /app
+    command: ["sh", "-c", "pip install --quiet --no-cache-dir websockets && exec python3 control_app.py"]
+    environment:
+      CONTROL_MODE: "outbound"
+      CONTROL_APP: "edge-app"
+      CONTROL_TOKEN: "edge-app-token"
+      CONTROL_LISTEN_PORT: "8090"
+      CONTROL_READY_FILE: "/tmp/control-app-ready"
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.161
+    healthcheck:
+      # The app heartbeats this file only while it is genuinely serviceable, and
+      # the check keys on its freshness rather than its existence: an app that is
+      # up but not accepting (or, in the persistent twin below, one whose sockets
+      # died when siphon restarted under it) must read unhealthy, not ready.
+      test: ["CMD-SHELL", "test -n \"$$(find /tmp/control-app-ready -newermt '-10 seconds' 2>/dev/null)\""]
+      interval: 2s
+      timeout: 3s
+      # Few retries on purpose: start-up slack belongs in start_period, and a
+      # long retry budget here would keep reporting healthy for a minute after
+      # the app stopped being able to take a call.
+      retries: 6
+      start_period: 25s
+    profiles:
+      - control
+
+  siphon-control:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
+    build:
+      context: ..
+    container_name: siphon-control-test
+    depends_on:
+      mock-control-rtp:
+        condition: service_healthy
+      control-app-edge:
+        condition: service_healthy
+    volumes:
+      - ./control/siphon-control.yaml:/etc/siphon/siphon.yaml:ro
+      - ./control:/etc/siphon/scripts:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.160
+    healthcheck:
+      # Both rails have to be up: the control listener for the application, and
+      # SIP for the UACs. A siphon that answers OPTIONS but never bound :9092
+      # would otherwise look healthy and every case would fail on connect.
+      test: ["CMD-SHELL", "python3 -c \"import socket; socket.create_connection(('127.0.0.1',9092),2).close(); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:control.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@control.test>;tag=hc\\r\\nTo: <sip:control.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    profiles:
+      - control
+
+  # The persistent-inbound application: it dials siphon and holds two sockets, so
+  # round-robin ownership has somewhere to go wrong.
+  control-app-ivr:
+    image: python:3.12-slim
+    container_name: control-app-ivr
+    depends_on:
+      siphon-control:
+        condition: service_healthy
+    volumes:
+      - ./control:/app:ro
+    working_dir: /app
+    command: ["sh", "-c", "pip install --quiet --no-cache-dir websockets && exec python3 control_app.py"]
+    environment:
+      CONTROL_MODE: "inbound"
+      CONTROL_APP: "ivr-app"
+      CONTROL_TOKEN: "ivr-app-token"
+      CONTROL_URL: "ws://172.20.0.160:9092/control/ws"
+      CONTROL_CONNECTIONS: "2"
+      CONTROL_READY_FILE: "/tmp/control-app-ready"
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.162
+    healthcheck:
+      # Freshness, not existence — see control-app-edge. This one matters more:
+      # this app's sockets are held for its whole life, so a siphon restart
+      # leaves it up, "ready" and unable to be handed a single call.
+      test: ["CMD-SHELL", "test -n \"$$(find /tmp/control-app-ready -newermt '-10 seconds' 2>/dev/null)\""]
+      interval: 2s
+      timeout: 3s
+      # Few retries on purpose: start-up slack belongs in start_period, and a
+      # long retry budget here would keep reporting healthy for a minute after
+      # the app stopped being able to take a call.
+      retries: 6
+      start_period: 25s
+    profiles:
+      - control
+
+  # Deferred handover, answered by the per-call-connect app.
+  sipp-control-handover-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-control:
+        condition: service_healthy
+      control-app-edge:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.164
+    entrypoint:
+      - sipp
+      - "172.20.0.160:5060"
+      - -sf
+      - /sipp/scenarios/control_handover_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control
+
+  # Handed to a controller that is connected and deliberately never acts.
+  sipp-control-deadline-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-control:
+        condition: service_healthy
+      control-app-ivr:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.165
+    entrypoint:
+      - sipp
+      - "172.20.0.160:5060"
+      - -sf
+      - /sipp/scenarios/control_deadline_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control
+
+  # Answer-first handover, then media verbs on the anchored channel.
+  sipp-control-media-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-control:
+        condition: service_healthy
+      control-app-edge:
+        condition: service_healthy
+      mock-control-rtp:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.166
+    entrypoint:
+      - sipp
+      - "172.20.0.160:5060"
+      - -sf
+      - /sipp/scenarios/control_media_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control
+
+  # One call, several app connections — exactly one must own it.
+  sipp-control-owner-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-control:
+        condition: service_healthy
+      control-app-ivr:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.167
+    entrypoint:
+      - sipp
+      - "172.20.0.160:5060"
+      - -sf
+      - /sipp/scenarios/control_owner_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control
+
+  # The owner drops its socket mid-call and re-claims the call after reconnect.
+  # Longer timeout: the scenario deliberately waits out the reconnect.
+  sipp-control-resync-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-control:
+        condition: service_healthy
+      control-app-ivr:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.168
+    entrypoint:
+      - sipp
+      - "172.20.0.160:5060"
+      - -sf
+      - /sipp/scenarios/control_resync_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "45"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - control
+
 # ── Network ────────────────────────────────────────────────────────────────
 networks:
   sipnet:
