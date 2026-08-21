@@ -865,6 +865,7 @@ services:
       - b2bua-update
       - b2bua-bye-glare
       - b2bua-cancel
+      - b2bua-cancel-ack
       - b2bua-early-media
       - b2bua-topology
       - b2bua-refer
@@ -911,6 +912,7 @@ services:
       - b2bua-update
       - b2bua-bye-glare
       - b2bua-cancel
+      - b2bua-cancel-ack
       - b2bua-early-media
       - b2bua-topology
       - b2bua-refer
@@ -2195,6 +2197,80 @@ services:
       - -trace_err
     profiles:
       - b2bua-cancel
+
+  # --- B2BUA CANCEL: the ACK for the 487 (RFC 3261 §17.1.1.3) ---
+  #
+  # Same call flow as the b2bua-cancel profile above and the same A-leg driver,
+  # but the B-leg UAS REQUIRES the ACK for its 487 instead of treating it as
+  # optional — so this profile, unlike that one, actually fails when siphon
+  # leaves a CANCELled leg unacknowledged and the peer retransmits to Timer H.
+  #
+  # The UAS is the deciding container: run it with
+  #   --exit-code-from sipp-b2bua-cancel-ack-uas
+  # The A-leg UAC sees a correct 487 either way, so reading the UAC's exit code
+  # here would pass vacuously.
+  #
+  # IP assignments (shared with the other b2bua profiles — one profile runs at a
+  # time, and the register helper is `run --rm` and gone before the UAS starts):
+  #   172.20.0.50 — siphon-b2bua
+  #   172.20.0.52 — B-leg UAS (the asserting side)
+  #   172.20.0.53 — A-leg UAC
+
+  sipp-b2bua-cancel-ack-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-b2bua-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.52
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/b2bua_cancel_ack_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      # Load-bearing: without it a scenario that never receives the ACK exits 0
+      # on the global timeout with "Successful call 0 / Failed call 0", and the
+      # mode passes vacuously while the defect under test is wide open.
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-cancel-ack
+
+  sipp-b2bua-cancel-ack-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-b2bua:
+        condition: service_healthy
+      sipp-b2bua-cancel-ack-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.53
+    entrypoint:
+      - sipp
+      - "172.20.0.50:5060"
+      - -sf
+      - /sipp/scenarios/b2bua_cancel_ack_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "40"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - b2bua-cancel-ack
 
   # ── IPsec VoLTE test ──────────────────────────────────────────────────────
   # Tests IMS REGISTER with AKA authentication and IPsec SA negotiation.
