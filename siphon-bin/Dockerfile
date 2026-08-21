@@ -1,9 +1,15 @@
 # SIPhon container image WITH opt-in extension modules (SMPP, HTTP, SIGTRAN).
 #
-# This builds the `siphon-bin` package — a drop-in `siphon` binary that composes
-# optional extension crates behind cargo features. It is SEPARATE from the root
-# Dockerfile (which builds the plain siphon-sip binary): siphon-bin git-deps the
-# published siphon-sip lib + the extension crates, so the build context is just
+# NOT the official image. The published ghcr.io image is built from the ROOT
+# Dockerfile, which also builds siphon-bin but patches siphon-sip to the
+# in-tree source and adds the pieces an operator image wants: the `ui`
+# dashboard, a baked siphon.yaml + default scripts, and the Python packages
+# scripts commonly import. Reach for THIS file when you want smpp or sigtran
+# compiled in, which the official image does not carry.
+#
+# It builds the `siphon-bin` package — a drop-in `siphon` binary that composes
+# optional extension crates behind cargo features — against the *published*
+# siphon-sip lib + extension crates via git deps, so the build context is just
 # this package directory (no root tree needed).
 #
 # Build (context = this directory). FEATURES defaults to the package's own

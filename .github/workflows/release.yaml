@@ -70,10 +70,42 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # siphon-bin is a separate, excluded workspace with its own target dir, so
+      # it needs its own cache entry — the default only covers the root one.
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            siphon-bin
 
-      - name: Build release binary
-        run: PYO3_PYTHON=python3.14 cargo build --release --target ${{ matrix.target }}
+      # The released binary is the siphon-bin composition, not the plain
+      # siphon-sip one: same `siphon` artifact, same CLI, same siphon.yaml, plus
+      # the `http` namespace (siphon-bin's default feature) and the `ui`
+      # dashboard (an explicit passthrough to siphon-sip's own feature).
+      #
+      # Pinning first is what makes the release contain THIS tag's lib rather
+      # than whatever siphon-bin/Cargo.lock's pinned SHA of main happens to be;
+      # the script asserts the patch actually applied, because cargo downgrades
+      # an unused [patch] to a warning and would otherwise build the git copy.
+      # ci.yaml runs the same composition on PRs so drift fails there instead of
+      # halfway through a release cut.
+      - name: Pin siphon-sip to this checkout
+        run: scripts/pin-siphon-sip-to-tree.sh
+
+      - name: Build release binary (siphon-bin — http + ui)
+        working-directory: siphon-bin
+        run: PYO3_PYTHON=python3.14 cargo build --release --target ${{ matrix.target }} --features ui
+
+      # Stage it where the packaging steps below already look. Everything in
+      # Cargo.toml's [package.metadata.deb] / [package.metadata.generate-rpm]
+      # then keeps working untouched: the binary asset resolves, and every other
+      # asset path (siphon.yaml, scripts/, dist/) stays relative to the root
+      # manifest. Moving that metadata into siphon-bin/ would mean rewriting
+      # every asset path as ../ for no gain.
+      - name: Stage the binary for packaging
+        run: |
+          install -D siphon-bin/target/${{ matrix.target }}/release/siphon \
+                     target/${{ matrix.target }}/release/siphon
 
       - name: Build .deb package
         if: matrix.target == 'x86_64-unknown-linux-gnu'

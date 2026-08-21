@@ -242,6 +242,33 @@ jobs:
       - name: Clippy (--features full)
         run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --features full -- -D warnings
 
+      # The release composition, and the one leg that is NOT a bit-rot guard.
+      # Everything above resolves siphon-sip from git, so it can be green against
+      # a lib many commits behind this branch. This leg patches siphon-sip to the
+      # in-tree source — exactly what release.yaml and the root Dockerfile do —
+      # and so answers the question the others cannot: does THIS branch still
+      # compile the binary the project actually ships?
+      #
+      # It matters because the release build now needs siphon-http to compile
+      # against the release tree. siphon-http touches a two-type surface
+      # (siphon::script::{ScriptHandle, HandlerHandle}); break it here and
+      # without this leg the first failure would land halfway through a release
+      # cut. `--features ui` mirrors the artifacts; `http` is already default.
+      #
+      # Kept last on purpose: the pin writes a .cargo config into siphon-bin and
+      # must not leak into the unpatched legs above.
+      # Invoked by relative path rather than with a working-directory override:
+      # this job defaults every step into siphon-bin/, and the script locates the
+      # repo root from its own path, so it works from wherever it is called.
+      - name: Pin siphon-sip to this checkout
+        run: ../scripts/pin-siphon-sip-to-tree.sh
+
+      - name: Build (patched to this tree — the released composition)
+        run: PYO3_PYTHON=python3.14 cargo build --features ui
+
+      - name: Clippy (patched to this tree — the released composition)
+        run: PYO3_PYTHON=python3.14 cargo clippy -p siphon-bin --features ui -- -D warnings
+
   # ── Python SDK tests ──────────────────────────────────────────────────
   sdk-tests:
     runs-on: ubuntu-latest

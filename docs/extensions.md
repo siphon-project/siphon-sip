@@ -1,40 +1,52 @@
 # Extensions (SMPP, HTTP, SIGTRAN)
 
 SIPhon's core speaks SIP. Protocol functionality **beyond SIP** — SMPP, HTTP and
-SIGTRAN/SS7 today — is provided by **opt-in extension modules**. They
-are not part of the default binary: you enable a module at build time and
-configure it through the `extensions:` block in `siphon.yaml`. Each module adds
-a scriptable Python namespace your routing scripts can use, alongside the
-built-in `proxy`, `registrar`, `cache`, and friends.
+SIGTRAN/SS7 today — is provided by **extension modules**: each one adds a
+scriptable Python namespace your routing scripts can use, alongside the built-in
+`proxy`, `registrar`, `cache`, and friends, and each is configured through the
+`extensions:` block in `siphon.yaml`.
 
-## How extensions work
+Which modules a given `siphon` binary can run is fixed when that binary is
+compiled. The official artifacts ship one of them.
 
-- **Not in the standard binary.** `cargo install siphon-sip`, and the default
-  container image, contain no extensions at all.
-- **Enabled at build.** An extension-capable build is produced by the
+## What's in the binary you have
+
+- **`http` is in the official artifacts.** The container image, the `.deb`, the
+  `.rpm` and the release tarball are all built from the
   [`siphon-bin`](https://github.com/siphon-project/siphon-sip/tree/main/siphon-bin)
-  package. It is a drop-in `siphon` binary — same CLI, same `siphon.yaml`, plus
-  the modules.
-- **`http` is on by default there.** A bare `cargo build -p siphon-bin` gets you
-  the `http` namespace. It is the one module with no deployment prerequisite —
-  no libsctp, no upstream SMSC bind, nothing to provision — and the one most
-  scripts reach for. Every other module is opt-in (`--features smpp`,
-  `--features sigtran`, or `--features full` for all of them), and features are
-  additive, so `--features smpp` gives you http **and** smpp. Drop HTTP with
-  `--no-default-features`.
+  package with `http` compiled in, so the `http` namespace is there and needs
+  only configuration. It is the module with no deployment prerequisite — no
+  libsctp, no upstream SMSC bind, nothing to provision — and the one most
+  scripts reach for.
+- **`cargo install siphon-sip` gets you a plain binary.** The crate is the SIP
+  core on its own, with no extensions. Extension crates depend on `siphon-sip`,
+  so the crate cannot depend back on them.
+- **`smpp` and `sigtran` need a `siphon-bin` build.** They stay opt-in because
+  each carries a deployment prerequisite. Build with `--features smpp`,
+  `--features sigtran`, or `--features full`; features are additive on top of
+  the default, so `--features smpp` gives you http **and** smpp. Drop HTTP with
+  `--no-default-features`. `siphon-bin/Dockerfile` builds a container image on
+  the same basis.
+- **Same binary either way.** `siphon-bin` produces an artifact called `siphon`
+  with the same CLI and the same `siphon.yaml` — it is a drop-in for the plain
+  one, and reports the same version.
 - **Configured in `siphon.yaml`.** An `extensions:` map points each enabled
   module at its own config file:
 
   ```yaml
   extensions:
+    http: /etc/siphon/http.yaml
     smpp: /etc/siphon/smpp.yaml
     sigtran: /etc/siphon/sigtran.yaml
   ```
 
+  A module that is compiled in but absent from this map is inert — it registers
+  nothing and costs nothing at runtime.
+
 - **Loud on mismatch.** If `extensions.smpp` is configured but the running
-  binary was *not* built with that feature, siphon logs a warning and skips the
-  module — it never silently ignores configuration. (This mirrors the optional
-  `sctp` transport feature.)
+  binary was *not* built with that feature, siphon says so on stderr at startup
+  and carries on without the module — it never silently ignores configuration.
+  (This mirrors the optional `sctp` transport feature.)
 
 ## SMPP (SMS, SMPP 3.4)
 
@@ -130,10 +142,13 @@ mutual TLS); the client is pooled reqwest.
     You do **not** need to declare an `http.servers` listener to use the client —
     an `http.yaml` with only a `clients:` block is enough.
 
-### 1. Build with the feature
+### 1. Check you have an HTTP-capable binary
+
+Nothing to do if you are on an official artifact — the image, deb, rpm and
+tarball all ship `http`. Building yourself, it is the default feature:
 
 ```bash
-cargo build -p siphon-bin --release --features http
+cargo build -p siphon-bin --release          # http is already in
 ```
 
 ### 2. Point siphon at the HTTP config

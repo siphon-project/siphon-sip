@@ -38,6 +38,14 @@ http = ["dep:siphon-http"] # HTTP/HTTPS — inbound routes + Rust-backed `http.C
 sigtran = ["dep:siphon-sigtran"]
 full = ["smpp", "http", "sigtran"] # convenience aggregate: every extension module
 
+# Passthroughs to siphon-sip's own optional features. Not extension modules —
+# they gate functionality inside the lib, and without a passthrough here there
+# is no way to turn them on from a siphon-bin build at all. Deliberately kept
+# out of `default` and out of `full` (which is the *extension* aggregate): the
+# official artifacts pass `--features ui` explicitly.
+ui = ["siphon-sip/ui"] # embedded operator web dashboard, served behind `admin.ui.enabled`
+sctp = ["siphon-sip/sctp"] # SIP + Diameter over SCTP; needs libsctp at build + runtime
+
 [dependencies]
 # Single-source rule: every crate here that depends on siphon-sip MUST use a
 # byte-identical git URL + ref, or cargo keys two separate `siphon-sip` sources

@@ -6,6 +6,48 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **`ui` and `sctp` cargo features on `siphon-bin`**, forwarding to the
+  `siphon-sip` features of the same name. Previously an extension build had no
+  way to turn either on, so composing extensions meant giving up the operator
+  dashboard and SCTP transport. The official artifacts build with `ui`.
+- **Release-cut now runs the security-advisory gate over the `siphon-bin`
+  composition too**, not just the `siphon-sip` graph. The released binary is
+  built from that composition, so the extension crates and their dependency
+  trees reach operators; an open advisory in one of them would previously have
+  left the gate green.
+
+### Changed
+- **The official artifacts now ship the `http` extension.** The container image,
+  the `.deb`, the `.rpm` and the release tarball are built from the
+  extension-composing `siphon-bin` package instead of the plain `siphon-sip`
+  one, so the scriptable `http` namespace (inbound `@http.route` handlers plus
+  the Rust-backed `http.Client`) is compiled in. Previously it was reachable
+  only by building `siphon-bin` yourself, which is a real barrier for anyone
+  installing from a package or running the image. It is the one module with no
+  deployment prerequisite, so it costs an operator nothing to carry.
+
+  Nothing changes for an existing deployment: the artifact is still a binary
+  called `siphon` with the same CLI and the same `siphon.yaml`, the embedded
+  `ui` dashboard is still compiled in, and a module that is compiled in but has
+  no `extensions:` entry registers nothing and costs nothing at runtime. To
+  start using it, add `extensions: { http: /etc/siphon/http.yaml }` — `siphon.yaml`
+  now carries a commented reference block for the section. `smpp` and `sigtran`
+  keep their deployment prerequisites and still need a `siphon-bin` build.
+
+  `cargo install siphon-sip` is unaffected and still installs the SIP core with
+  no extensions; the published crate is byte-identical to 1.6.0.
+- **`.deb` maintainer address** is now `maintainers@siphon-sip.org` rather than
+  a personal one.
+
+### Fixed
+- **A `siphon-bin` build reports the SIPhon version again.** It announced its
+  own package version (`0.1.0`) in the startup banner, the `User-Agent`/`Server`
+  headers and `/admin/health`, which broke the lockstep guarantee that the
+  crate, the binary, the image and the SDK all carry one number. It now inherits
+  the `siphon-sip` version it was built against. This matters more than it did
+  before, because that build is now what the official artifacts ship.
+
 ## [1.6.0] — 2026-08-20
 
 ### Added
