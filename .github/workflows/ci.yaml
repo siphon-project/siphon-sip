@@ -639,6 +639,111 @@ jobs:
             originate-app.log
             *.log
 
+  # ── Control plane: the external application rail ────────────────────────
+  # An out-of-process application drives real calls over a real WebSocket. Five
+  # cases against one siphon, both connection modes at once (per-call-connect,
+  # which siphon dials, and persistent-inbound, which dials siphon), because
+  # ownership round-robin and `resync` only exist in the second.
+  #
+  # Each SIPp scenario is the decider for its own step. What the SIP wire cannot
+  # show is asserted on the recorded frames afterwards, and that half is not
+  # optional: the media step below passes on the wire AND in the application's
+  # own reply even when the verb was accepted and never performed — only the
+  # media engine's record catches that.
+  #
+  # The `grep` patterns carry the space in `"key": "value"` because that is what
+  # `json.dumps` writes; without it they match nothing.
+  sipp-control:
+    runs-on: ubuntu-latest
+    needs: rust-tests
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build siphon-control image
+        run: docker compose -f sipp/docker-compose.yaml --profile control build siphon-control
+
+      # --force-recreate keeps the set coherent: the persistent app dials siphon
+      # once at start-up and holds its sockets for life, so an app reused across
+      # a recreated siphon would be connected to nothing.
+      - name: Start siphon, both control applications and the media engine
+        run: docker compose -f sipp/docker-compose.yaml --profile control up -d --force-recreate --wait mock-control-rtp control-app-edge siphon-control control-app-ivr
+
+      - name: Deferred handover — siphon parks the INVITE, the app answers it
+        run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-handover-uac sipp-control-handover-uac
+
+      - name: Handoff deadline — the controller never acts, siphon applies its default
+        run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-deadline-uac sipp-control-deadline-uac
+
+      - name: Media verbs on an answer-first channel
+        run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-media-uac sipp-control-media-uac
+
+      - name: Exactly-one-owner dispatch across several app connections
+        run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-owner-uac sipp-control-owner-uac
+
+      - name: Resync — the owner drops, reconnects in the grace window, re-claims
+        run: docker compose -f sipp/docker-compose.yaml --profile control up --abort-on-container-exit --exit-code-from sipp-control-resync-uac sipp-control-resync-uac
+
+      - name: Assert the recorded control frames
+        if: always()
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs control-app-edge > control-app-edge.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs control-app-ivr > control-app-ivr.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs mock-control-rtp > mock-control-rtp.log 2>&1 || true
+          fail=0
+          assert_verdict() {
+            local case="$1" log="$2" line
+            line="$(grep 'CONTROL-VERDICT' "$log" 2>/dev/null | grep "\"case\": \"$case\"" || true)"
+            if [ -z "$line" ]; then
+              echo "no CONTROL-VERDICT for case '$case' — the control app never completed it"
+              fail=1
+              return
+            fi
+            if echo "$line" | grep -q '"pass": false'; then
+              echo "control-plane case '$case' failed:"
+              echo "$line"
+              fail=1
+              return
+            fi
+            echo "ok: control case '$case'"
+          }
+          assert_performed() {
+            local verb="$1"
+            if ! grep -q "\"command\": \"$verb\"" mock-control-rtp.log; then
+              echo "the media engine never received '$verb' — the verb was accepted but never performed"
+              fail=1
+              return
+            fi
+            echo "ok: media engine performed '$verb'"
+          }
+          assert_verdict handover control-app-edge.log
+          assert_verdict deadline control-app-ivr.log
+          assert_verdict media    control-app-edge.log
+          assert_verdict owner    control-app-ivr.log
+          assert_verdict resync   control-app-ivr.log
+          assert_performed play_media
+          assert_performed stop_media
+          exit $fail
+
+      - name: Collect logs
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml logs siphon-control > siphon-control.log 2>&1 || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile control down --remove-orphans
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-control-logs
+          path: |
+            siphon-control.log
+            control-app-edge.log
+            control-app-ivr.log
+            mock-control-rtp.log
+            *.log
+
   # ── B2BUA A-leg INVITE authentication ──────────────────────────────────
   # siphon challenges the CALLER from @b2bua.on_invite. With a @b2bua handler
   # registered the dispatcher routes INVITE to the B2BUA path and
