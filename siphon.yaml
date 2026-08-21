@@ -698,8 +698,70 @@ auth:
 #   ws_vad_threshold    Mean-square energy threshold for the uplink VAD. Unset
 #                       uses the engine's 8/16 kHz L16 default (~1_000_000);
 #                       higher is less sensitive.
-#   ws_vad_hangover_ms  How long speech is held after energy drops before the
-#                       turn endpoint fires. Unset uses the engine's ~200 ms.
+#   ws_vad_hangover_ms  TRAILING hangover: how long speech is held after energy
+#                       drops before the turn endpoint fires. Unset uses the
+#                       engine's ~200 ms. Only meaningful with the energy
+#                       detector — neural holds speech with its own probability
+#                       hysteresis instead.
+#   ws_vad_min_speech_ms
+#                       LEADING minimum-speech run: how long the uplink must read
+#                       as speech CONTINUOUSLY before the speech-start edge (and
+#                       barge-in) fires. The counterpart to the trailing
+#                       ws_vad_hangover_ms. Unset means no leading requirement,
+#                       i.e. the edge fires on the first speech frame — which is
+#                       what lets a cough, a door or one burst of echo interrupt
+#                       a prompt. Rounded up to whole ptime frames, and it adds
+#                       directly to turn-start latency, so 60-120 ms is the
+#                       useful range. Works with either detector.
+#   ws_vad_engine       Which detector the uplink VAD runs:
+#                         energy (default) — mean-square energy against a
+#                           threshold. Cheap and exact, but it answers "is
+#                           something loud here", so breathing, mains hum, fan
+#                           noise and uncancelled echo all read as speech.
+#                         neural — a speech classifier; answers "is what is here
+#                           speech", so it does not turn-start on non-speech
+#                           noise. ~32 ms detection floor plus up to one media
+#                           frame. Pick it for turn taking and barge-in.
+#                       An unknown value is a hard config error, never a quiet
+#                       fall back to the detector you were avoiding.
+#   ws_sample_rate      L16 wire sample rate in Hz for the ws_uri bridge,
+#                       INDEPENDENT of the leg's codec rate and applied in BOTH
+#                       directions: the uplink is resampled into it and the
+#                       server's downlink is resampled back to the leg's codec
+#                       rate before re-encoding. So an 8 kHz G.711 call can speak
+#                       16 kHz L16 to the server, and a server rendering 24 kHz
+#                       audio is played at the right speed and pitch instead of
+#                       the wrong one. It is also the domain the uplink noise
+#                       suppressor and echo canceller run in, and those engage
+#                       only at 8 or 16 kHz — another rate leaves them off
+#                       without changing the wire rate. Must be a multiple of
+#                       1000 within 8000-48000; the engine FAILS the offer on
+#                       anything else rather than clamping, so siphon rejects a
+#                       bad value at boot. Unset leaves the leg codec's own PCM
+#                       rate with no conversion either way. Inert without ws_uri.
+#   beep_detection      Watch this leg's decoded ingress audio for the short
+#                       single tone an answering machine plays before it starts
+#                       recording (the "voicemail beep"), and deliver it to
+#                       @rtpengine.on_beep — the media half of answering-machine
+#                       detection, so a script can abort a transfer instead of
+#                       bridging the caller into a voicemail box. Set PER LEG:
+#                       arming it on the profile used toward the callee is what
+#                       watches the party that might be a machine. Like
+#                       noise_suppression it needs decoded audio, so it promotes
+#                       a same-codec plaintext call onto the userspace pipeline,
+#                       and it is inert unless the codec's native rate is 8 or
+#                       16 kHz. Fires ONCE per leg per call — there is no
+#                       mid-call re-arm (a fresh offer/answer re-arms it).
+#   beep_cadence_guard_ms
+#                       How long the beep detector waits after a candidate tone
+#                       ends to confirm no repeat follows — the discriminator
+#                       that keeps a cadenced ringback / busy / congestion tone
+#                       from reading as a record tone. It is ALSO the detection
+#                       latency: the event arrives this long after the beep.
+#                       Unset uses the engine default (4500 ms, longer than the
+#                       4 s silent interval of the slowest widely deployed
+#                       ringback cadence). Lower it to trade cadence robustness
+#                       for latency. Inert without beep_detection.
 #   ws_tee              Stream a COPY of this call's decoded audio to a WebSocket
 #                       media server. Not the same thing as ws_uri, and the
 #                       difference matters: ws_uri is a TAKEOVER (the WS server
@@ -721,6 +783,15 @@ auth:
 #                       ws_tee_direction: both — a single-leg tee is always mono.
 #                       Unset uses the engine default (2 for both legs, 1 for
 #                       one). Inert without ws_tee.
+#   ws_tee_sample_rate  L16 wire sample rate in Hz for ws_tee, independent of the
+#                       legs' codec rates — the engine resamples the teed copy
+#                       into it. Unlike ws_sample_rate this is SEND-ONLY, so it
+#                       changes only what the tee consumer receives and never
+#                       what the call itself hears. Same rule: a multiple of 1000
+#                       within 8000-48000, rejected at boot rather than clamped.
+#                       Unset uses the engine default. Inert without ws_tee.
+#                       A script can also set it per attach with
+#                       rtpengine.attach_ws_tee(..., sample_rate=...).
 #   text_events         Observe RFC 4103 real-time text (T.140) on this call.
 #                       When the call negotiates a plaintext m=text stream the
 #                       engine promotes ONLY that low-rate stream to its
@@ -757,10 +828,31 @@ auth:
 #         ws_vad: true
 #         ws_barge_in: true
 #         ws_vad_threshold: 2000000
-#         ws_vad_hangover_ms: 300
+#         ws_vad_hangover_ms: 300       # trailing: hold speech after energy drops
+#         ws_vad_engine: neural         # energy (default) | neural
+#         ws_vad_min_speech_ms: 80      # leading: continuous speech before barge-in
+#         ws_sample_rate: 16000         # multiple of 1000, 8000-48000
 #         noise_suppression: true
 #         echo_cancellation: true
 #       answer: *voice_ai_flags
+#
+# Answering-machine detection — arm the record-tone detector on the leg toward
+# the callee, so a transfer can be abandoned instead of dropped into voicemail.
+# The event arrives on @rtpengine.on_beep about beep_cadence_guard_ms after the
+# tone itself (the guard is what tells a record tone from a ringback cadence, and
+# it doubles as the detection latency):
+# media:
+#   backend: siphon-rtp
+#   siphon_rtp:
+#     address: "127.0.0.1:9000"
+#   profiles:
+#     screened_callee:
+#       offer:
+#         replace: ["origin"]
+#       answer:                         # the leg that might be a machine
+#         replace: ["origin"]
+#         beep_detection: true
+#         beep_cadence_guard_ms: 4500   # default; lower trades robustness for latency
 #
 # WebSocket tee — an ordinary relayed call, plus a copy of its audio streamed to
 # a transcription/analytics backend (the call keeps relaying; SIPREC unaffected):
@@ -775,6 +867,7 @@ auth:
 #         ws_tee: "wss://asr.example.com/stream/{call_id}"
 #         ws_tee_direction: both        # both | caller | callee
 #         ws_tee_channels: 2            # 2 = caller/callee stereo, 1 = mixed mono
+#         ws_tee_sample_rate: 16000     # multiple of 1000, 8000-48000
 #       answer: *tee_flags
 #
 # IPv4/IPv6 interworking — v6 access leg, v4 core:

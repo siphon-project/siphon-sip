@@ -31,6 +31,7 @@ use siphon_rtp_proto::{
     frame, CmdResult, Command, Event, LegSummary as ProtoLegSummary, PlayEndReason,
     PlayMediaSource as ProtoPlayMediaSource, ProfileFlags, Request, Response,
     WsTeeDirection as ProtoWsTeeDirection, WsTeeEndReason as ProtoWsTeeEndReason,
+    WsVadEngine as ProtoWsVadEngine,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -41,10 +42,10 @@ use tracing::{debug, info, trace, warn};
 use super::client::PlayMediaSource;
 use super::error::RtpEngineError;
 use super::events::{
-    CallLegSummary, CallSummary, DtmfEvent, RtpEngineEvent, TextEvent, TextStreamStats,
-    WsTeeEndReason, WsTeeStarted, WsTeeEnded,
+    BeepDetectedEvent, CallLegSummary, CallSummary, DtmfEvent, RtpEngineEvent, TextEvent,
+    TextStreamStats, WsTeeEndReason, WsTeeStarted, WsTeeEnded,
 };
-use super::profile::{NgFlags, WsTeeDirection};
+use super::profile::{NgFlags, WsTeeDirection, WsVadEngine};
 
 /// Reserved request id for the auth handshake (real requests start at 1).
 const AUTH_REQUEST_ID: u64 = 0;
@@ -85,9 +86,15 @@ pub(crate) fn profile_flags_from_ng(flags: &NgFlags) -> ProfileFlags {
         ws_barge_in: flags.ws_barge_in,
         ws_vad_threshold: flags.ws_vad_threshold,
         ws_vad_hangover_ms: flags.ws_vad_hangover_ms,
+        ws_sample_rate: flags.ws_sample_rate,
+        ws_vad_engine: flags.ws_vad_engine.map(proto_ws_vad_engine),
+        ws_vad_min_speech_ms: flags.ws_vad_min_speech_ms,
+        beep_detection: flags.beep_detection,
+        beep_cadence_guard_ms: flags.beep_cadence_guard_ms,
         ws_tee: flags.ws_tee.clone(),
         ws_tee_direction: flags.ws_tee_direction.map(proto_ws_tee_direction),
         ws_tee_channels: flags.ws_tee_channels,
+        ws_tee_sample_rate: flags.ws_tee_sample_rate,
         // The per-call address, not the `carry_received_from` policy bit — the
         // script API injects the former only when the latter is set, so an
         // opted-out profile leaves this `None` and serialises away.
@@ -106,6 +113,19 @@ pub(crate) fn proto_ws_tee_direction(direction: WsTeeDirection) -> ProtoWsTeeDir
     }
 }
 
+/// Map siphon's [`WsVadEngine`] onto the proto twin.
+///
+/// Deliberately exhaustive, mirroring the proto's own refusal to mark
+/// `WsVadEngine` `#[non_exhaustive]`: a detector swept into a wildcard here
+/// would silently downgrade the call to the detector the script was explicitly
+/// avoiding.  A new detector must break this function.
+pub(crate) fn proto_ws_vad_engine(engine: WsVadEngine) -> ProtoWsVadEngine {
+    match engine {
+        WsVadEngine::Energy => ProtoWsVadEngine::Energy,
+        WsVadEngine::Neural => ProtoWsVadEngine::Neural,
+    }
+}
+
 /// Map the proto [`ProtoWsTeeDirection`] back onto siphon's own enum, so the
 /// generic event type stays free of the proto.
 fn ws_tee_direction_from_proto(direction: ProtoWsTeeDirection) -> WsTeeDirection {
@@ -117,17 +137,44 @@ fn ws_tee_direction_from_proto(direction: ProtoWsTeeDirection) -> WsTeeDirection
 }
 
 /// Map siphon's [`PlayMediaSource`] to the proto variant.
+///
+/// Deliberately exhaustive on **siphon's own** enum (which is local, so no
+/// wildcard is forced): a source siphon grows must be carried here or fail to
+/// compile, never be silently dropped into a `play media` with no source.
 fn proto_play_source(source: &PlayMediaSource) -> ProtoPlayMediaSource {
     match source {
         PlayMediaSource::File(path) => ProtoPlayMediaSource::File { path: path.clone() },
         PlayMediaSource::Blob(data) => ProtoPlayMediaSource::Blob { data: data.clone() },
         PlayMediaSource::DbId(id) => ProtoPlayMediaSource::DbId { id: *id },
+        PlayMediaSource::Tone(tone) => ProtoPlayMediaSource::Tone { tone: tone.clone() },
+        // The engine fetches this itself, bounded by its own connect /
+        // first-byte / deadline / size / redirect caps and off the media path.
+        // siphon deliberately does not fetch: a controller-side fetch would put
+        // an unbounded third-party HTTP round-trip on the call-setup path.
+        PlayMediaSource::Http(url) => ProtoPlayMediaSource::Http { url: url.clone() },
     }
 }
 
 /// Completion signal for a blocking `play_media(wait=True)`: how the prompt ended
 /// plus the actual played duration (from `Event::PlayFinished`).
 type PlayWaiter = oneshot::Sender<(PlayEndReason, Option<u64>)>;
+
+/// What a `play media` accept (and, when waited on, its completion) yielded.
+///
+/// The `play_id` is the engine's handle on that specific playback: it is what
+/// `set_play_gain` retunes and what a targeted `stop_media` ends, and it is the
+/// only way to address one of the four concurrent overlay slots on a direction.
+/// Carried separately from the duration because the two answer different
+/// questions and an overlay generally has a handle but no useful duration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlayMediaOutcome {
+    /// The engine's handle on this playback, when it assigned one.
+    pub play_id: Option<u64>,
+    /// Played duration in milliseconds, when the engine reported one.  Always
+    /// absent for an HTTP source at accept time — the length is not known until
+    /// the body has arrived.
+    pub duration_ms: Option<u64>,
+}
 
 /// Native JSON-over-TCP control client for `siphon-rtp`.
 pub struct SiphonRtpClient {
@@ -403,7 +450,14 @@ impl SiphonRtpClient {
     }
 
     /// Inject an audio prompt; returns the engine-reported duration in ms.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// `overlay` mixes the prompt **under** the party's live egress instead of
+    /// replacing it (up to four concurrent overlays per direction, each with its
+    /// own `play_id`); `gain_decibels` sets the playout level relative to the
+    /// source's own, clamped engine-side to −60..=+12 dB.
+    ///
+    /// Returns the `play_id` alongside the duration so a caller can retune the
+    /// playback with [`SiphonRtpClient::set_play_gain`] or stop just this one.
     #[allow(clippy::too_many_arguments)]
     pub async fn play_media(
         &self,
@@ -414,8 +468,10 @@ impl SiphonRtpClient {
         start_pos_ms: Option<u64>,
         duration_ms: Option<u64>,
         to_tag: Option<&str>,
+        overlay: bool,
+        gain_decibels: Option<i32>,
         wait: bool,
-    ) -> Result<Option<u64>, RtpEngineError> {
+    ) -> Result<PlayMediaOutcome, RtpEngineError> {
         let result = self
             .request(Command::PlayMedia {
                 call_id: call_id.to_string(),
@@ -424,6 +480,8 @@ impl SiphonRtpClient {
                 repeat_times,
                 start_pos_ms,
                 duration_ms,
+                overlay,
+                gain_decibels,
                 to_tag: to_tag.map(str::to_string),
             })
             .await?;
@@ -441,7 +499,10 @@ impl SiphonRtpClient {
         // Fire-and-forget, or an engine that didn't assign a play_id: return on
         // accept, exactly as before.
         let (true, Some(play_id)) = (wait, play_id) else {
-            return Ok(accept_duration);
+            return Ok(PlayMediaOutcome {
+                play_id,
+                duration_ms: accept_duration,
+            });
         };
 
         // Block until the prompt ends. Register the waiter keyed by play_id (the
@@ -452,20 +513,44 @@ impl SiphonRtpClient {
         let (sender, receiver) = oneshot::channel::<(PlayEndReason, Option<u64>)>();
         self.play_pending.insert(play_id, sender);
         let deadline = Duration::from_millis(self.play_timeout_ms.max(1));
+        // Every outcome still reports the play_id: the caller may want to stop or
+        // retune a playback that merely failed to *complete* (an overlay ended
+        // early is still a live slot from the controller's point of view).
+        let outcome = |duration_ms| PlayMediaOutcome {
+            play_id: Some(play_id),
+            duration_ms,
+        };
         match tokio::time::timeout(deadline, receiver).await {
             // Prompt played out in full.
-            Ok(Ok((PlayEndReason::Completed, played_ms))) => Ok(played_ms.or(accept_duration)),
+            Ok(Ok((PlayEndReason::Completed, played_ms))) => {
+                Ok(outcome(played_ms.or(accept_duration)))
+            }
             // Ended early (stopped / superseded) — didn't play out; the script decides.
-            Ok(Ok((PlayEndReason::Stopped | PlayEndReason::Superseded, _))) => Ok(None),
-            // Engine reported an aborted playback.
+            Ok(Ok((PlayEndReason::Stopped | PlayEndReason::Superseded, _))) => Ok(outcome(None)),
+            // Engine reported an aborted playback — this is also how a bounded
+            // HTTP source reports a fetch that failed, since that play never
+            // produced audio.
             Ok(Ok((PlayEndReason::Error, _))) => {
                 warn!(call_id, play_id, "siphon-rtp play_media aborted (engine error)");
-                Ok(None)
+                Ok(outcome(None))
+            }
+            // A reason this build does not know. `PlayEndReason` is
+            // `#[non_exhaustive]` upstream precisely because the safe reading of
+            // an unknown reason is the documented one — the playback ended — so
+            // this reports "did not complete" rather than inventing a duration.
+            Ok(Ok((reason, _))) => {
+                warn!(
+                    call_id,
+                    play_id,
+                    ?reason,
+                    "siphon-rtp play_media ended for a reason this build does not know"
+                );
+                Ok(outcome(None))
             }
             // Connection dropped (sender cleared on disconnect) — treat as not completed.
             Ok(Err(_)) => {
                 warn!(call_id, play_id, "siphon-rtp play_media: connection lost before completion");
-                Ok(None)
+                Ok(outcome(None))
             }
             // Fallback timeout — no PlayFinished within play_timeout_ms.
             Err(_) => {
@@ -476,17 +561,52 @@ impl SiphonRtpClient {
                     timeout_ms = self.play_timeout_ms,
                     "siphon-rtp play_media: no completion within fallback timeout"
                 );
-                Ok(None)
+                Ok(outcome(None))
             }
         }
     }
 
-    /// Stop any prompt playing on the monologue selected by `from_tag`.
-    pub async fn stop_media(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
+    /// Stop prompt playback on the monologue selected by `from_tag`.
+    ///
+    /// `play_id` targets one playback (an individual overlay slot); `None` stops
+    /// everything playing on the leg.
+    pub async fn stop_media(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        play_id: Option<u64>,
+    ) -> Result<(), RtpEngineError> {
         expect_ok(
             self.request(Command::StopMedia {
                 call_id: call_id.to_string(),
                 from_tag: from_tag.to_string(),
+                play_id,
+            })
+            .await?,
+        )
+    }
+
+    /// Retune the playout gain of a playback that is already running — how a
+    /// controller ducks a music bed under a prompt and lifts it again.
+    ///
+    /// `play_id` is the handle the playback's accept returned.  The engine
+    /// answers an error when no playback on the call holds that id, so a stale
+    /// handle surfaces rather than silently doing nothing.
+    pub async fn set_play_gain(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        play_id: u64,
+        gain_decibels: i32,
+        to_tag: Option<&str>,
+    ) -> Result<(), RtpEngineError> {
+        expect_ok(
+            self.request(Command::SetPlayGain {
+                call_id: call_id.to_string(),
+                from_tag: from_tag.to_string(),
+                play_id,
+                gain_decibels,
+                to_tag: to_tag.map(str::to_string),
             })
             .await?,
         )
@@ -697,6 +817,7 @@ impl SiphonRtpClient {
         ws_uri: &str,
         direction: WsTeeDirection,
         channels: Option<u8>,
+        sample_rate: Option<u32>,
     ) -> Result<(), RtpEngineError> {
         expect_ok(
             self.request(Command::AttachWsTee {
@@ -705,6 +826,7 @@ impl SiphonRtpClient {
                 ws_uri: ws_uri.to_string(),
                 direction: proto_ws_tee_direction(direction),
                 channels,
+                sample_rate,
             })
             .await?,
         )
@@ -957,8 +1079,10 @@ impl SiphonRtpClientSet {
         start_pos_ms: Option<u64>,
         duration_ms: Option<u64>,
         to_tag: Option<&str>,
+        overlay: bool,
+        gain_decibels: Option<i32>,
         wait: bool,
-    ) -> Result<Option<u64>, RtpEngineError> {
+    ) -> Result<PlayMediaOutcome, RtpEngineError> {
         self.select(call_id)
             .play_media(
                 call_id,
@@ -968,14 +1092,35 @@ impl SiphonRtpClientSet {
                 start_pos_ms,
                 duration_ms,
                 to_tag,
+                overlay,
+                gain_decibels,
                 wait,
             )
             .await
     }
 
     /// Stop a prompt via the affinity-bound instance.
-    pub async fn stop_media(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
-        self.select(call_id).stop_media(call_id, from_tag).await
+    pub async fn stop_media(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        play_id: Option<u64>,
+    ) -> Result<(), RtpEngineError> {
+        self.select(call_id).stop_media(call_id, from_tag, play_id).await
+    }
+
+    /// Retune a running playback's gain via the affinity-bound instance.
+    pub async fn set_play_gain(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        play_id: u64,
+        gain_decibels: i32,
+        to_tag: Option<&str>,
+    ) -> Result<(), RtpEngineError> {
+        self.select(call_id)
+            .set_play_gain(call_id, from_tag, play_id, gain_decibels, to_tag)
+            .await
     }
 
     /// Inject DTMF via the affinity-bound instance.
@@ -1087,9 +1232,10 @@ impl SiphonRtpClientSet {
         ws_uri: &str,
         direction: WsTeeDirection,
         channels: Option<u8>,
+        sample_rate: Option<u32>,
     ) -> Result<(), RtpEngineError> {
         self.select(call_id)
-            .attach_ws_tee(call_id, from_tag, ws_uri, direction, channels)
+            .attach_ws_tee(call_id, from_tag, ws_uri, direction, channels, sample_rate)
             .await
     }
 
@@ -1190,6 +1336,11 @@ fn unexpected_result(context: &str, result: CmdResult) -> RtpEngineError {
 }
 
 /// A short, stable tag for a [`CmdResult`] variant, for error messages.
+///
+/// `CmdResult` is `#[non_exhaustive]` upstream, so the wildcard is forced.  It
+/// yields a named placeholder rather than being silently absorbed — the caller
+/// is building "unexpected `{kind}` response to {context}", and an empty kind
+/// would turn a real protocol violation into an unreadable error.
 fn result_kind(result: &CmdResult) -> &'static str {
     match result {
         CmdResult::Ok { .. } => "ok",
@@ -1200,6 +1351,7 @@ fn result_kind(result: &CmdResult) -> &'static str {
         CmdResult::Load { .. } => "load",
         CmdResult::NodeInfo { .. } => "node_info",
         CmdResult::Checkpoint { .. } => "checkpoint",
+        _ => "unrecognised",
     }
 }
 
@@ -1317,15 +1469,52 @@ fn convert_event(event: Event) -> RtpEngineEvent {
             frames_sent,
             frames_dropped,
         }),
+        Event::BeepDetected {
+            call_id,
+            from_tag,
+            to_tag,
+            frequency_hz,
+            duration_ms,
+            offset_ms,
+        } => RtpEngineEvent::BeepDetected(BeepDetectedEvent {
+            call_id,
+            from_tag,
+            to_tag,
+            frequency_hz,
+            duration_ms,
+            offset_ms,
+        }),
         Event::Unknown => RtpEngineEvent::Unknown {
             event: "unknown".to_string(),
             call_id: None,
             from_tag: None,
         },
+        // `Event` is `#[non_exhaustive]` upstream, so a build newer than this one
+        // can push a variant this one has no arm for. Surfaced through `Unknown`
+        // (which the dispatcher logs) rather than dropped — the correlation ids
+        // are unreachable behind the wildcard, but the fact that an unmodelled
+        // event arrived is exactly what tells an operator siphon is behind the
+        // engine. A serde-level `Event::Unknown` (an event tag the *proto* did
+        // not recognise) is the arm above; this is a tag it did.
+        other => {
+            debug!(?other, "siphon-rtp event not modelled by this build");
+            RtpEngineEvent::Unknown {
+                event: "unmodelled".to_string(),
+                call_id: None,
+                from_tag: None,
+            }
+        }
     }
 }
 
 /// Map the proto tee end-reason onto siphon's own enum.
+///
+/// `WsTeeEndReason` is `#[non_exhaustive]` upstream. The wildcard maps to
+/// [`WsTeeEndReason::TransportError`] rather than a silent
+/// [`WsTeeEndReason::Detached`]: `Detached` is the *only* orderly end, and the
+/// dispatcher keys its WARN-when-unexpected logging on that distinction, so
+/// treating an unknown reason as orderly would hide a dead stream on a live
+/// call — the exact failure this event exists to surface.
 fn ws_tee_end_reason_from_proto(reason: ProtoWsTeeEndReason) -> WsTeeEndReason {
     match reason {
         ProtoWsTeeEndReason::Detached => WsTeeEndReason::Detached,
@@ -1333,6 +1522,7 @@ fn ws_tee_end_reason_from_proto(reason: ProtoWsTeeEndReason) -> WsTeeEndReason {
         ProtoWsTeeEndReason::ServerStopped => WsTeeEndReason::ServerStopped,
         ProtoWsTeeEndReason::CallEnded => WsTeeEndReason::CallEnded,
         ProtoWsTeeEndReason::TransportError => WsTeeEndReason::TransportError,
+        _ => WsTeeEndReason::TransportError,
     }
 }
 
@@ -2120,9 +2310,15 @@ mod tests {
             ws_barge_in: true,
             ws_vad_threshold: Some(2_000_000),
             ws_vad_hangover_ms: Some(300),
+            ws_sample_rate: Some(24_000),
+            ws_vad_engine: Some(WsVadEngine::Neural),
+            ws_vad_min_speech_ms: Some(80),
+            beep_detection: true,
+            beep_cadence_guard_ms: Some(3_000),
             ws_tee: Some("wss://asr.invalid/tee".into()),
             ws_tee_direction: Some(WsTeeDirection::Callee),
             ws_tee_channels: Some(1),
+            ws_tee_sample_rate: Some(16_000),
             carry_received_from: true,
             received_from: Some("198.51.100.7".parse().unwrap()),
             rtcp_mux: vec!["require".into()],
@@ -2146,15 +2342,229 @@ mod tests {
             ws_barge_in: true,
             ws_vad_threshold: Some(2_000_000),
             ws_vad_hangover_ms: Some(300),
+            ws_sample_rate: Some(24_000),
+            ws_vad_engine: Some(ProtoWsVadEngine::Neural),
+            ws_vad_min_speech_ms: Some(80),
+            beep_detection: true,
+            beep_cadence_guard_ms: Some(3_000),
             ws_tee: Some("wss://asr.invalid/tee".into()),
             ws_tee_direction: Some(ProtoWsTeeDirection::Callee),
             ws_tee_channels: Some(1),
+            ws_tee_sample_rate: Some(16_000),
             received_from: Some("198.51.100.7".parse().unwrap()),
             rtcp_mux: vec!["require".into()],
             text_events: true,
         };
 
         assert_eq!(profile_flags_from_ng(&ng), expected);
+    }
+
+    /// Each new 0.3.0 profile field must reach the **wire**, not merely the
+    /// struct.  All six carry `skip_serializing_if`, so a field siphon forgot to
+    /// populate is indistinguishable from one it deliberately left unset when
+    /// you compare structs — only the emitted JSON tells them apart.
+    #[test]
+    fn new_profile_fields_reach_the_json_wire() {
+        let ng = NgFlags {
+            ws_uri: Some("wss://ai.invalid/stream".into()),
+            ws_vad: true,
+            ws_sample_rate: Some(16_000),
+            ws_vad_engine: Some(WsVadEngine::Neural),
+            ws_vad_min_speech_ms: Some(80),
+            beep_detection: true,
+            beep_cadence_guard_ms: Some(3_000),
+            ws_tee: Some("wss://asr.invalid/tee".into()),
+            ws_tee_sample_rate: Some(48_000),
+            ..NgFlags::default()
+        };
+
+        let json = serde_json::to_value(profile_flags_from_ng(&ng)).expect("serialize profile");
+
+        assert_eq!(json["ws_sample_rate"], 16_000);
+        assert_eq!(json["ws_vad_engine"], "neural");
+        assert_eq!(json["ws_vad_min_speech_ms"], 80);
+        assert_eq!(json["beep_detection"], true);
+        assert_eq!(json["beep_cadence_guard_ms"], 3_000);
+        assert_eq!(json["ws_tee_sample_rate"], 48_000);
+    }
+
+    /// The mirror of the test above: an unset field must be *absent* from the
+    /// wire, not present as a zero/null.  This is what keeps the default profile
+    /// serialising to `{}` and an older engine seeing a byte-identical command.
+    #[test]
+    fn unset_profile_fields_are_omitted_from_the_wire() {
+        let json =
+            serde_json::to_value(profile_flags_from_ng(&NgFlags::default())).expect("serialize");
+
+        for field in [
+            "ws_sample_rate",
+            "ws_vad_engine",
+            "ws_vad_min_speech_ms",
+            "beep_detection",
+            "beep_cadence_guard_ms",
+            "ws_tee_sample_rate",
+        ] {
+            assert!(
+                json.get(field).is_none(),
+                "{field} must be omitted when unset, got {:?}",
+                json.get(field)
+            );
+        }
+        assert_eq!(json, serde_json::json!({}), "default profile must be empty");
+    }
+
+    /// `energy` is the engine's own default, so siphon must still emit it
+    /// explicitly when a profile names it — otherwise a profile that pinned the
+    /// cheap detector would be indistinguishable from one that expressed no
+    /// preference, and a future change of engine default would silently move it.
+    #[test]
+    fn ws_vad_engine_energy_is_emitted_not_elided() {
+        let ng = NgFlags {
+            ws_vad_engine: Some(WsVadEngine::Energy),
+            ..NgFlags::default()
+        };
+        let json = serde_json::to_value(profile_flags_from_ng(&ng)).expect("serialize");
+        assert_eq!(json["ws_vad_engine"], "energy");
+    }
+
+    #[test]
+    fn beep_detected_event_converts_field_for_field() {
+        let converted = convert_event(Event::BeepDetected {
+            call_id: "call-beep-1".into(),
+            from_tag: "callee-tag".into(),
+            to_tag: Some("caller-tag".into()),
+            frequency_hz: 1_000.5,
+            duration_ms: 420,
+            offset_ms: 7_300,
+        });
+
+        let RtpEngineEvent::BeepDetected(beep) = converted else {
+            panic!("expected a BeepDetected event");
+        };
+        assert_eq!(beep.call_id, "call-beep-1");
+        assert_eq!(beep.from_tag, "callee-tag");
+        assert_eq!(beep.to_tag.as_deref(), Some("caller-tag"));
+        assert!((beep.frequency_hz - 1_000.5).abs() < f32::EPSILON);
+        assert_eq!(beep.duration_ms, 420);
+        // The offset of the *tone*, not of the event — the event trails it by
+        // the cadence guard, so this must be carried through untouched.
+        assert_eq!(beep.offset_ms, 7_300);
+    }
+
+    /// A `to_tag`-less beep (the common single-leg case, where the field is
+    /// skipped on the wire) must still convert.
+    #[test]
+    fn beep_detected_event_without_to_tag_converts() {
+        let converted = convert_event(Event::BeepDetected {
+            call_id: "call-beep-2".into(),
+            from_tag: "callee-tag".into(),
+            to_tag: None,
+            frequency_hz: 425.0,
+            duration_ms: 250,
+            offset_ms: 1_200,
+        });
+
+        let RtpEngineEvent::BeepDetected(beep) = converted else {
+            panic!("expected a BeepDetected event");
+        };
+        assert!(beep.to_tag.is_none());
+    }
+
+    /// Both new play sources must reach the wire under the tagged shape the
+    /// engine reads (`{"source": "...", ...}`).
+    #[test]
+    fn tone_and_http_play_sources_reach_the_wire() {
+        let tone = serde_json::to_value(proto_play_source(&PlayMediaSource::Tone(
+            "425/1000,0/4000*inf".into(),
+        )))
+        .expect("serialize tone");
+        assert_eq!(tone["source"], "tone");
+        assert_eq!(tone["tone"], "425/1000,0/4000*inf");
+
+        let preset =
+            serde_json::to_value(proto_play_source(&PlayMediaSource::Tone("ringback_eu".into())))
+                .expect("serialize preset");
+        assert_eq!(preset["source"], "tone");
+        assert_eq!(preset["tone"], "ringback_eu");
+
+        let http = serde_json::to_value(proto_play_source(&PlayMediaSource::Http(
+            "https://prompts.invalid/welcome.wav".into(),
+        )))
+        .expect("serialize http");
+        assert_eq!(http["source"], "http");
+        assert_eq!(http["url"], "https://prompts.invalid/welcome.wav");
+    }
+
+    /// `set_play_gain` addresses a running playback by its `play_id`; the wire
+    /// shape is what the engine matches on.
+    #[test]
+    fn set_play_gain_command_wire_shape() {
+        let json = serde_json::to_value(Command::SetPlayGain {
+            call_id: "call-gain".into(),
+            from_tag: "leg-a".into(),
+            play_id: 4,
+            gain_decibels: -18,
+            to_tag: None,
+        })
+        .expect("serialize set_play_gain");
+
+        assert_eq!(json["play_id"], 4);
+        assert_eq!(json["gain_decibels"], -18);
+        assert!(json.get("to_tag").is_none(), "unset to_tag must be omitted");
+    }
+
+    /// An overlay play and a targeted stop both travel by `play_id`.
+    #[test]
+    fn overlay_and_targeted_stop_wire_shape() {
+        let play = serde_json::to_value(Command::PlayMedia {
+            call_id: "call-overlay".into(),
+            from_tag: "leg-a".into(),
+            source: ProtoPlayMediaSource::Tone {
+                tone: "ringback_eu".into(),
+            },
+            repeat_times: None,
+            start_pos_ms: None,
+            duration_ms: None,
+            overlay: true,
+            gain_decibels: Some(-12),
+            to_tag: None,
+        })
+        .expect("serialize play_media");
+        assert_eq!(play["overlay"], true);
+        assert_eq!(play["gain_decibels"], -12);
+
+        let stop = serde_json::to_value(Command::StopMedia {
+            call_id: "call-overlay".into(),
+            from_tag: "leg-a".into(),
+            play_id: Some(4),
+        })
+        .expect("serialize stop_media");
+        assert_eq!(stop["play_id"], 4);
+
+        // A supersede play and an untargeted stop must stay byte-identical to
+        // what a pre-0.3.0 engine saw.
+        let plain_stop = serde_json::to_value(Command::StopMedia {
+            call_id: "call-overlay".into(),
+            from_tag: "leg-a".into(),
+            play_id: None,
+        })
+        .expect("serialize stop_media");
+        assert!(plain_stop.get("play_id").is_none());
+    }
+
+    /// The WS tee's wire rate is a distinct knob from the takeover bridge's.
+    #[test]
+    fn attach_ws_tee_carries_sample_rate() {
+        let json = serde_json::to_value(Command::AttachWsTee {
+            call_id: "call-tee".into(),
+            from_tag: "leg-a".into(),
+            ws_uri: "wss://asr.invalid/tee".into(),
+            direction: ProtoWsTeeDirection::Both,
+            channels: Some(2),
+            sample_rate: Some(16_000),
+        })
+        .expect("serialize attach_ws_tee");
+        assert_eq!(json["sample_rate"], 16_000);
     }
 
     /// `carry_received_from` is siphon-side policy, not a wire field: on its own
@@ -2567,10 +2977,13 @@ mod tests {
         let (event_tx, _event_rx) = channel();
         let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
         let played = client
-            .play_media("call-play", "tag-a", &play_source(), None, None, None, None, true)
+            .play_media("call-play", "tag-a", &play_source(), None, None, None, None, false, None, true)
             .await
             .unwrap();
-        assert_eq!(played, Some(1234));
+        assert_eq!(played.duration_ms, Some(1234));
+        // The handle must survive alongside the duration so a caller can still
+        // stop or retune the playback it just started.
+        assert_eq!(played.play_id, Some(7));
     }
 
     #[tokio::test]
@@ -2580,10 +2993,10 @@ mod tests {
         let (event_tx, _event_rx) = channel();
         let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
         let played = client
-            .play_media("call-play", "tag-a", &play_source(), None, None, None, None, true)
+            .play_media("call-play", "tag-a", &play_source(), None, None, None, None, false, None, true)
             .await
             .unwrap();
-        assert_eq!(played, None);
+        assert_eq!(played.duration_ms, None);
     }
 
     #[tokio::test]
@@ -2595,12 +3008,12 @@ mod tests {
         let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
         let played = tokio::time::timeout(
             Duration::from_millis(500),
-            client.play_media("call-play", "tag-a", &play_source(), None, None, None, None, false),
+            client.play_media("call-play", "tag-a", &play_source(), None, None, None, None, false, None, false),
         )
         .await
         .expect("play_media(wait=false) must return on accept, not block")
         .unwrap();
-        assert_eq!(played, None);
+        assert_eq!(played.duration_ms, None);
     }
 
     #[tokio::test]
@@ -2613,12 +3026,12 @@ mod tests {
         let client = SiphonRtpClient::new(address, None, 2000, 100, event_tx);
         let played = tokio::time::timeout(
             Duration::from_millis(2000),
-            client.play_media("call-play", "tag-a", &play_source(), None, None, None, None, true),
+            client.play_media("call-play", "tag-a", &play_source(), None, None, None, None, false, None, true),
         )
         .await
         .expect("play_media must give up at the fallback timeout, not hang")
         .unwrap();
-        assert_eq!(played, None);
+        assert_eq!(played.duration_ms, None);
     }
 
     #[tokio::test]

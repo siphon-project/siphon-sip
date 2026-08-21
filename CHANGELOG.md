@@ -59,6 +59,70 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 - Two new stable control-plane error codes, `conflict` and `invalid_state`,
   mirrored into `siphon-control-proto` and the TypeScript SDK so a client parses
   them as the refusals they are rather than a transport error.
+- **Answering-machine detection — `beep_detection` on a media profile and the
+  `@rtpengine.on_beep` handler.** The engine could hear the short record tone an
+  answering machine plays before it starts recording, but nothing carried it to a
+  script, so a transfer had no way to tell a person from a voicemail box and the
+  caller got bridged into the greeting. Arm it per leg (the profile used toward
+  the callee is what watches the party that might be a machine) and the tone
+  arrives as `fn(call_id, from_tag, to_tag, frequency_hz, duration_ms,
+  offset_ms)`, filterable by `call_id` / `from_tag` like the sibling media hooks.
+  It fires once per leg per call, so a handler never de-duplicates.
+  `beep_cadence_guard_ms` tunes the guard that tells a record tone from a
+  cadenced ringback or busy tone; it is also the detection latency, so the event
+  trails the tone itself by that long, and `offset_ms` is the offset of the
+  **tone**, not of the event.
+- **Synthesised call-progress tones and engine-fetched HTTP prompts** —
+  `rtpengine.play_media(target, tone=...)` and `url=...`. `tone` takes either a
+  preset name (`ringback_eu`, `busy_na`, `dial_uk`, …) or an explicit cadence
+  spec (`425/1000,0/4000*inf`), rendered at the leg's codec rate, so early media
+  no longer needs a provisioned audio file. `url` is fetched by the **engine**
+  from its own network position, bounded engine-side and off the media path: a
+  URL that never answers ends the playback, never the leg.
+- **Overlay playback with per-play gain** — `rtpengine.play_overlay(...)` mixes
+  audio *under* a party's live egress instead of replacing it and returns the
+  playback's `play_id`; `rtpengine.set_play_gain(target, play_id, decibels)`
+  retunes one that is already running, and `rtpengine.stop_media(target,
+  play_id=...)` stops a single slot rather than everything on the leg. Up to four
+  overlays run concurrently per direction. This is what a music bed ducked under
+  a prompt needs: `play_media` is a *start*, so reusing it to change a level
+  would mean "start another playback".
+- **Independent L16 wire rates for the WebSocket bridge and tee** —
+  `ws_sample_rate` and `ws_tee_sample_rate` on a media profile,
+  `rtpengine.attach_ws_tee(..., sample_rate=...)` per attach. The bridge rate
+  applies in both directions, so an 8 kHz G.711 call can speak 16 kHz to an
+  inference server and a server rendering 24 kHz audio plays at the right speed
+  and pitch instead of the wrong one. The tee rate is send-only and never changes
+  what the call hears. Both must be a multiple of 1000 within 8000–48000; the
+  media engine *fails* the offer rather than clamping, so siphon rejects a bad
+  value at config load and at the call instead of letting the box come up healthy
+  and answer every call into silence.
+- **Selectable uplink voice-activity detector** — `ws_vad_engine: energy |
+  neural` on a media profile. `energy` (the default, and the previous behaviour)
+  answers "is something loud here", so breathing, mains hum and uncancelled echo
+  all read as speech; `neural` answers "is what is here speech" and does not
+  turn-start on non-speech noise. An unknown value is a hard config error rather
+  than a quiet fall back to the detector the operator was avoiding.
+- **Leading minimum-speech run before barge-in** — `ws_vad_min_speech_ms`, the
+  counterpart to the existing trailing `ws_vad_hangover_ms`. Without it the
+  speech-start edge fires on the first speech frame, which is what lets a cough,
+  a door or one burst of echo interrupt a prompt. 60–120 ms is the useful range;
+  it adds directly to turn-start latency.
+- **All six new profile fields are accepted per call** on `rtpengine.offer()`,
+  `answer()` and `answer_local()`, the same way `ws_uri=` already was — so beep
+  detection can be armed on one leg of one call without a second profile.
+
+### Changed
+- The native media control contract moved from 0.2.0 to 0.3.0. The JSON wire is
+  unchanged (every new field is optional and omitted when unset, and a default
+  profile still serialises to `{}`), so an unset knob emits exactly the command
+  it did before. A media profile that sets any of the six new fields on the
+  `rtpengine` or `rtpproxy` backend is rejected at config load, as the existing
+  WebSocket and DSP fields already were: a field the engine never receives is a
+  dead call, not a degraded one. Likewise `tone=` / `url=` / `overlay` /
+  `gain_decibels` / a targeted `stop_media` / `set_play_gain` raise on those
+  backends rather than silently downgrading — an overlay quietly turned into a
+  supersede would cut the party's live audio.
 
 ## [1.6.0] — 2026-08-20
 

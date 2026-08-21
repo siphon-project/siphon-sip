@@ -2266,6 +2266,95 @@ def _resolve_media_target(
     return getattr(target, "call_id", None), getattr(target, "from_tag", None)
 
 
+def _media_overrides(
+    beep_detection: Optional[bool],
+    beep_cadence_guard_ms: Optional[int],
+    ws_sample_rate: Optional[int],
+    ws_tee_sample_rate: Optional[int],
+    ws_vad_engine: Optional[str],
+    ws_vad_min_speech_ms: Optional[int],
+) -> dict[str, Any]:
+    """Validate and collect the per-call media overrides for offer/answer.
+
+    Mirrors the runtime's ``MediaOverrides::parse``: the two wire rates and the
+    VAD-engine name are rejected here rather than at the engine, because the
+    engine *fails the whole offer* on a bad value instead of clamping or
+    falling back -- a script that passed one would get a call that answers and
+    never carries media.
+    """
+    if ws_sample_rate is not None:
+        _validate_ws_sample_rate("ws_sample_rate", ws_sample_rate)
+    if ws_tee_sample_rate is not None:
+        _validate_ws_sample_rate("ws_tee_sample_rate", ws_tee_sample_rate)
+    if ws_vad_engine is not None and ws_vad_engine.strip().lower() not in ("energy", "neural"):
+        raise ValueError(
+            f"ws_vad_engine must be one of energy / neural, got {ws_vad_engine!r}"
+        )
+    return {
+        "beep_detection": beep_detection,
+        "beep_cadence_guard_ms": beep_cadence_guard_ms,
+        "ws_sample_rate": ws_sample_rate,
+        "ws_tee_sample_rate": ws_tee_sample_rate,
+        "ws_vad_engine": ws_vad_engine,
+        "ws_vad_min_speech_ms": ws_vad_min_speech_ms,
+    }
+
+
+def _validate_ws_sample_rate(field: str, rate: int) -> None:
+    """Validate an L16 wire sample rate the way the media engine does.
+
+    The engine **fails** the offer/answer/attach on a bad rate rather than
+    clamping it, so a value that slips through produces a call that answers and
+    never carries media. Checked here so a script learns at the call site.
+    """
+    if rate < 8000 or rate > 48000 or rate % 1000 != 0:
+        raise ValueError(
+            f"{field} must be a multiple of 1000 within 8000-48000 Hz, got {rate}"
+        )
+
+
+def _resolve_play_source(
+    file: Optional[str],
+    blob: Optional[bytes],
+    db_id: Optional[int],
+    tone: Optional[str],
+    url: Optional[str],
+) -> str:
+    """Validate the exactly-one play-source rule and name the chosen source.
+
+    Mirrors the runtime's ``resolve_play_media_source``, including the two
+    checks it performs before the command leaves siphon: a ``tone`` is passed
+    through verbatim (the engine tells a preset name from a cadence spec by the
+    ``/``, and siphon deliberately keeps no copy of the preset table, which
+    would go stale the first time the engine adds one), and a ``url`` must be
+    ``http://`` or ``https://`` because those are the only schemes the engine
+    fetches.
+    """
+    count = sum(1 for x in (file, blob, db_id, tone, url) if x is not None)
+    if count != 1:
+        raise ValueError(
+            "play_media requires exactly one of file=, blob=, db_id=, tone=, or url="
+        )
+    if tone is not None:
+        if not tone.strip():
+            raise ValueError(
+                'play_media tone= must be a preset name (e.g. "ringback_eu") or a '
+                'cadence spec (e.g. "425/1000,0/4000*inf"), not an empty string'
+            )
+        return "tone"
+    if url is not None:
+        if not url.strip().lower().startswith(("http://", "https://")):
+            raise ValueError(
+                f"play_media url= must be an http:// or https:// URL, got {url!r}"
+            )
+        return "http"
+    if file is not None:
+        return "file"
+    if blob is not None:
+        return "blob"
+    return "db-id"
+
+
 class MockRtpEngine:
     """Mock RTPEngine namespace — records media operations for assertions.
 
@@ -2315,6 +2404,15 @@ class MockRtpEngine:
         self._ws_tee_started_handlers: list[dict[str, Any]] = []
         self._ws_tee_ended_handlers: list[dict[str, Any]] = []
         self._text_handlers: list[dict[str, Any]] = []
+        self._beep_handlers: list[dict[str, Any]] = []
+        self._play_overlay_id: Optional[int] = 1
+        self.media_overrides: list[tuple[str, dict[str, Any]]] = []
+        """``(operation, overrides)`` per offer/answer/answer_local.
+
+        The per-call media knobs (``beep_detection``, ``ws_sample_rate``,
+        ``ws_vad_engine``, ...) a script passed for that call, already
+        validated. ``None`` values mean "leave the profile's value alone".
+        """
 
     @property
     def active_sessions(self) -> int:
@@ -2380,7 +2478,13 @@ class MockRtpEngine:
 
     async def offer(self, request: Any,
                     profile: Optional[str] = None,
-                    ws_uri: Optional[str] = None) -> bool:
+                    ws_uri: Optional[str] = None,
+                    beep_detection: Optional[bool] = None,
+                    beep_cadence_guard_ms: Optional[int] = None,
+                    ws_sample_rate: Optional[int] = None,
+                    ws_tee_sample_rate: Optional[int] = None,
+                    ws_vad_engine: Optional[str] = None,
+                    ws_vad_min_speech_ms: Optional[int] = None) -> bool:
         """Send ``offer`` command to RTPEngine.
 
         Extracts SDP from message body, sends to engine, replaces body
@@ -2412,12 +2516,22 @@ class MockRtpEngine:
         """
         self.operations.append(("offer", profile or "rtp_passthrough"))
         self.ws_uris.append(("offer", self._resolve_ws_uri(ws_uri, request)))
+        self.media_overrides.append(("offer", _media_overrides(
+            beep_detection, beep_cadence_guard_ms, ws_sample_rate,
+            ws_tee_sample_rate, ws_vad_engine, ws_vad_min_speech_ms,
+        )))
         return True
 
     async def answer(self, reply: Any,
                      profile: Optional[str] = None,
                      call: Any = None,
-                     ws_uri: Optional[str] = None) -> bool:
+                     ws_uri: Optional[str] = None,
+                     beep_detection: Optional[bool] = None,
+                     beep_cadence_guard_ms: Optional[int] = None,
+                     ws_sample_rate: Optional[int] = None,
+                     ws_tee_sample_rate: Optional[int] = None,
+                     ws_vad_engine: Optional[str] = None,
+                     ws_vad_min_speech_ms: Optional[int] = None) -> bool:
         """Send ``answer`` command to RTPEngine.
 
         Profile precedence (matches the real implementation):
@@ -2455,6 +2569,10 @@ class MockRtpEngine:
                 profile = "rtp_passthrough"
         self.operations.append(("answer", profile))
         self.ws_uris.append(("answer", self._resolve_ws_uri(ws_uri, call or reply)))
+        self.media_overrides.append(("answer", _media_overrides(
+            beep_detection, beep_cadence_guard_ms, ws_sample_rate,
+            ws_tee_sample_rate, ws_vad_engine, ws_vad_min_speech_ms,
+        )))
         return True
 
     async def answer_local(
@@ -2463,6 +2581,12 @@ class MockRtpEngine:
         profile: Optional[str] = None,
         auto_reject: bool = True,
         ws_uri: Optional[str] = None,
+        beep_detection: Optional[bool] = None,
+        beep_cadence_guard_ms: Optional[int] = None,
+        ws_sample_rate: Optional[int] = None,
+        ws_tee_sample_rate: Optional[int] = None,
+        ws_vad_engine: Optional[str] = None,
+        ws_vad_min_speech_ms: Optional[int] = None,
     ) -> Optional[str]:
         """Single-leg UAS answer — synthesise an RFC 3264 answer for the
         caller's **own** offer, with the media engine as the far side (IVR /
@@ -2546,6 +2670,10 @@ class MockRtpEngine:
 
         self.operations.append(("answer_local", profile))
         self.ws_uris.append(("answer_local", resolved_ws_uri))
+        self.media_overrides.append(("answer_local", _media_overrides(
+            beep_detection, beep_cadence_guard_ms, ws_sample_rate,
+            ws_tee_sample_rate, ws_vad_engine, ws_vad_min_speech_ms,
+        )))
         self.media_calls.append({
             "op": "answer_local",
             "profile": profile,
@@ -2581,15 +2709,19 @@ class MockRtpEngine:
         file: Optional[str] = None,
         blob: Optional[bytes] = None,
         db_id: Optional[int] = None,
+        tone: Optional[str] = None,
+        url: Optional[str] = None,
         repeat: Optional[int] = None,
         start_ms: Optional[int] = None,
         duration_ms: Optional[int] = None,
+        gain_decibels: Optional[int] = None,
         to_tag: Optional[str] = None,
         wait: bool = True,
     ) -> Optional[int]:
-        """Inject an audio prompt into the call.
+        """Inject an audio prompt, replacing the party's live egress.
 
-        Exactly one of ``file``/``blob``/``db_id`` must be supplied. Per
+        Exactly one of ``file``/``blob``/``db_id``/``tone``/``url`` must be
+        supplied. Per
         rtpengine semantics, ``from-tag`` (derived from ``target``) selects
         the monologue whose outgoing audio is replaced by the prompt — the
         **peer** of that monologue hears it. Pass ``to_tag`` to scope to a
@@ -2604,9 +2736,26 @@ class MockRtpEngine:
             file: Absolute path to an audio file on the rtpengine host.
             blob: Raw audio bytes to play (e.g. TTS output).
             db_id: Reference to a prompt stored in rtpengine's prompt DB.
+            tone: A synthesised call-progress tone, with no audio file to
+                provision. Either a preset name (``"ringback_eu"``,
+                ``"busy_na"``, ``"dial_uk"``, ...) or an explicit cadence spec
+                in the engine's tone grammar (``"425/1000,0/4000*inf"`` is
+                425 Hz one second on, four seconds off, forever). The two are
+                told apart by the ``/``. Rendered at the leg's codec rate, so
+                never resampled. Native **siphon-rtp** backend only.
+            url: An ``http://`` / ``https://`` WAV the **engine** fetches from
+                its own network position. The fetch is bounded engine-side
+                (connect, first-byte, deadline, size cap, redirect cap) and runs
+                off the media path, so a URL that never answers ends the
+                *playback*, never the leg. The accept carries no duration, since
+                the length is unknown until the body arrives. Native
+                **siphon-rtp** backend only.
             repeat: Number of times to repeat the prompt.
             start_ms: Offset into the file at which to start (ms).
             duration_ms: Cap on playback length (ms).
+            gain_decibels: Playout gain in whole decibels relative to the
+                source's own level, clamped engine-side to -60..=+12. Native
+                **siphon-rtp** backend only.
             to_tag: Optional peer tag for MPTY scoping.
             wait: When ``True`` (default, native siphon-rtp backend), the real
                 runtime blocks until the prompt finishes playing so a script can
@@ -2629,12 +2778,7 @@ class MockRtpEngine:
                 await rtpengine.play_media(call, file="/prompts/welcome.wav")  # wait=True
                 await rtpengine.echo(call)                                     # after prompt
         """
-        count = sum(1 for x in (file, blob, db_id) if x is not None)
-        if count != 1:
-            raise ValueError(
-                "play_media requires exactly one of file=, blob=, or db_id="
-            )
-        source = "file" if file is not None else "blob" if blob is not None else "db-id"
+        source = _resolve_play_source(file, blob, db_id, tone, url)
         call_id, resolved_from_tag = _resolve_media_target(target)
         self.operations.append(("play_media", source))
         self.media_calls.append({
@@ -2644,26 +2788,160 @@ class MockRtpEngine:
             "file": file,
             "blob": blob,
             "db_id": db_id,
+            "tone": tone,
+            "url": url,
             "repeat": repeat,
             "start_ms": start_ms,
             "duration_ms": duration_ms,
+            "gain_decibels": gain_decibels,
+            "overlay": False,
             "to_tag": to_tag,
             "wait": wait,
         })
         return self._play_media_duration_ms
 
-    async def stop_media(self, target: Any) -> bool:
-        """Stop any prompt currently playing on the selected monologue.
+    async def play_overlay(
+        self,
+        target: Any,
+        file: Optional[str] = None,
+        blob: Optional[bytes] = None,
+        db_id: Optional[int] = None,
+        tone: Optional[str] = None,
+        url: Optional[str] = None,
+        repeat: Optional[int] = None,
+        start_ms: Optional[int] = None,
+        duration_ms: Optional[int] = None,
+        gain_decibels: Optional[int] = None,
+        to_tag: Optional[str] = None,
+    ) -> Optional[int]:
+        """Start an **overlay** playback and return its ``play_id`` handle.
+
+        The additive twin of :meth:`play_media`: audio is mixed *under* the
+        party's live egress instead of replacing it. Where ``play_media``
+        answers "how long did it play", this answers "which playback is it",
+        because that is what an overlay is for -- a music bed you will duck
+        with :meth:`set_play_gain` and stop individually with
+        ``stop_media(target, play_id=...)``.
+
+        Up to **four** overlays run concurrently per direction, each with its
+        own ``play_id`` and its own completion. Starting a fifth is rejected
+        rather than displacing one, since a script that lost a playback it
+        believes is running has no way to notice. An overlay never supersedes
+        anything, including another overlay.
+
+        Returns on the engine's accept: an overlay is background audio, so
+        there is no ``wait``. Native **siphon-rtp** backend only.
 
         Args:
             target: Request, Reply, or Call object.
+            file: Absolute path to an audio file on the engine host.
+            blob: Raw audio bytes to play.
+            db_id: Reference to a prompt in the engine's prompt DB.
+            tone: A preset name or cadence spec, as for :meth:`play_media`.
+            url: An ``http://`` / ``https://`` WAV the engine fetches.
+            repeat: Number of times to repeat.
+            start_ms: Offset into the source at which to start (ms).
+            duration_ms: Hard playout cap -- the only bound, short of a stop,
+                on an endless (``*inf``) tone.
+            gain_decibels: Playout gain relative to the source's own level.
+            to_tag: Optional peer tag for MPTY scoping.
+
+        Returns:
+            The ``play_id`` of the started overlay (mock returns the value set
+            via :meth:`set_play_overlay_id`, default ``1``).
+
+        Example::
+
+            bed = await rtpengine.play_overlay(call, file="/prompts/hold.wav")
+            await rtpengine.play_media(call, file="/prompts/agent.wav")
+            await rtpengine.set_play_gain(call, bed, -18)
+            await rtpengine.stop_media(call, play_id=bed)
+        """
+        source = _resolve_play_source(file, blob, db_id, tone, url)
+        call_id, resolved_from_tag = _resolve_media_target(target)
+        self.operations.append(("play_overlay", source))
+        self.media_calls.append({
+            "op": "play_overlay",
+            "call_id": call_id,
+            "from_tag": resolved_from_tag,
+            "file": file,
+            "blob": blob,
+            "db_id": db_id,
+            "tone": tone,
+            "url": url,
+            "repeat": repeat,
+            "start_ms": start_ms,
+            "duration_ms": duration_ms,
+            "gain_decibels": gain_decibels,
+            "overlay": True,
+            "to_tag": to_tag,
+        })
+        return self._play_overlay_id
+
+    async def stop_media(self, target: Any, play_id: Optional[int] = None) -> bool:
+        """Stop prompt playback on the selected monologue.
+
+        Args:
+            target: Request, Reply, or Call object.
+            play_id: Stop one specific playback (an individual overlay slot,
+                from :meth:`play_overlay`). Omitting it stops everything
+                playing on the leg. Native **siphon-rtp** backend only: the
+                other backends have no handle on an individual playback and
+                raise rather than widening this into "stop everything", which
+                would kill playbacks the script meant to keep running.
 
         Returns:
             ``True`` on success.
         """
         call_id, from_tag = _resolve_media_target(target)
-        self.operations.append(("stop_media", None))
-        self.media_calls.append({"op": "stop_media", "call_id": call_id, "from_tag": from_tag})
+        self.operations.append(("stop_media", play_id))
+        self.media_calls.append({
+            "op": "stop_media",
+            "call_id": call_id,
+            "from_tag": from_tag,
+            "play_id": play_id,
+        })
+        return True
+
+    async def set_play_gain(
+        self,
+        target: Any,
+        play_id: int,
+        gain_decibels: int,
+        to_tag: Optional[str] = None,
+    ) -> bool:
+        """Retune the playout gain of a playback that is already running.
+
+        How a script ducks a music bed under a prompt and lifts it again. A
+        separate verb rather than a field on :meth:`play_media` because
+        ``play_media`` is a *start*: reusing it would mean "start another
+        playback", not "change this one". ``play_id`` is already the contract's
+        handle on a running playback, so gain is addressed the same way.
+
+        The engine answers an error when no playback on the call holds that
+        ``play_id``, so a stale handle raises rather than silently doing
+        nothing. Native **siphon-rtp** backend only.
+
+        Args:
+            target: Request, Reply, or Call object.
+            play_id: The running playback to retune, from :meth:`play_overlay`.
+            gain_decibels: New gain in whole decibels, clamped engine-side to
+                -60..=+12.
+            to_tag: Optional peer tag for MPTY scoping.
+
+        Returns:
+            ``True`` on success.
+        """
+        call_id, from_tag = _resolve_media_target(target)
+        self.operations.append(("set_play_gain", play_id))
+        self.media_calls.append({
+            "op": "set_play_gain",
+            "call_id": call_id,
+            "from_tag": from_tag,
+            "play_id": play_id,
+            "gain_decibels": gain_decibels,
+            "to_tag": to_tag,
+        })
         return True
 
     async def play_dtmf(
@@ -2834,6 +3112,7 @@ class MockRtpEngine:
         ws_uri: str,
         direction: str = "both",
         channels: Optional[int] = None,
+        sample_rate: Optional[int] = None,
     ) -> bool:
         """Attach a **WebSocket tee** to a live call — stream a copy of its
         decoded audio to a WebSocket media server while the call keeps relaying.
@@ -2866,6 +3145,11 @@ class MockRtpEngine:
                 stereo, ``1`` mixes them to mono. Only meaningful with
                 ``direction="both"``; a single-leg tee is always mono. ``None``
                 (default) leaves the engine's choice: 2 for both legs, 1 for one.
+            sample_rate: L16 wire sample rate in Hz, independent of the legs'
+                codec rates -- the engine resamples the teed copy into it. Must
+                be a multiple of 1000 within 8000-48000; the engine *fails* the
+                attach on anything else rather than clamping, so it is checked
+                here first. ``None`` (default) leaves the engine's choice.
 
         Returns:
             ``True`` on success.
@@ -2889,6 +3173,8 @@ class MockRtpEngine:
             raise ValueError(
                 f"attach_ws_tee channels must be 1 or 2, got {channels}"
             )
+        if sample_rate is not None:
+            _validate_ws_sample_rate("attach_ws_tee sample_rate", sample_rate)
         call_id, from_tag = _resolve_media_target(target)
         self.operations.append(("attach_ws_tee", ws_uri))
         self.media_calls.append({
@@ -2898,6 +3184,7 @@ class MockRtpEngine:
             "ws_uri": ws_uri,
             "direction": direction,
             "channels": channels,
+            "sample_rate": sample_rate,
         })
         return True
 
@@ -3065,6 +3352,74 @@ class MockRtpEngine:
             fired += 1
         return fired
 
+    def on_beep(self, func_or_none: Any = None, *,
+                call_id: Optional[str] = None,
+                from_tag: Optional[str] = None) -> Any:
+        """Register a handler for **record-tone ("voicemail beep")** events.
+
+        Fires when the engine hears the short single tone an answering machine
+        plays before it starts recording, on a leg whose media profile set
+        ``beep_detection``. This is the *media* half of answering-machine
+        detection: a script can abort an attended transfer here instead of
+        bridging the caller into a voicemail box.
+
+        Arm it **per leg** -- the profile used toward the callee is what watches
+        the party that might be a machine. It fires **once per leg per call**
+        (the engine drops the detector after the first tone, so a handler never
+        has to de-duplicate, and there is no mid-call re-arm).
+
+        ``offset_ms`` is how much decoded audio was seen on the leg before the
+        tone **started** -- the offset of the tone itself, *not* of this event.
+        The event trails it by roughly the profile's ``beep_cadence_guard_ms``
+        (4500 ms by default), which is the detector's cadence guard *and* its
+        detection latency.
+
+        Delivered by the native **siphon-rtp** backend only.
+
+        Usage::
+
+            @rtpengine.on_beep
+            def machine(call_id, from_tag, to_tag, frequency_hz, duration_ms, offset_ms):
+                log.info(f"{call_id}: answering machine ({frequency_hz:.0f} Hz)")
+                b2bua.terminate(call_id, "Answering machine detected")
+
+            @rtpengine.on_beep(call_id="abc", from_tag="ftag1")
+            def machine_specific(call_id, from_tag, to_tag, frequency_hz, duration_ms, offset_ms):
+                ...
+        """
+        def decorator(fn: Any) -> Any:
+            self._beep_handlers.append({
+                "fn": fn,
+                "call_id": call_id,
+                "from_tag": from_tag,
+            })
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def fire_beep(self, call_id: str, from_tag: str,
+                  to_tag: Optional[str] = None,
+                  frequency_hz: float = 1000.0,
+                  duration_ms: int = 420,
+                  offset_ms: int = 7300) -> int:
+        """Test helper: fire a record-tone event.  Returns the number of
+        handlers that matched (and were invoked).
+
+        The defaults describe a typical voicemail beep: a ~1 kHz tone a few
+        hundred milliseconds long, several seconds into the leg's audio.
+        """
+        fired = 0
+        for entry in self._beep_handlers:
+            if entry["call_id"] is not None and entry["call_id"] != call_id:
+                continue
+            if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
+                continue
+            entry["fn"](call_id, from_tag, to_tag, frequency_hz, duration_ms,
+                        offset_ms)
+            fired += 1
+        return fired
+
     def on_ws_tee_started(self, func_or_none: Any = None, *,
                           call_id: Optional[str] = None,
                           from_tag: Optional[str] = None) -> Any:
@@ -3182,6 +3537,16 @@ class MockRtpEngine:
         """Configure the duration returned by :meth:`play_media` (test helper)."""
         self._play_media_duration_ms = duration_ms
 
+    def set_play_overlay_id(self, play_id: Optional[int]) -> None:
+        """Configure the ``play_id`` returned by :meth:`play_overlay` (test
+        helper).
+
+        Set it to ``None`` to model an engine that accepted the overlay without
+        assigning a handle, which is what a script's "can I duck this later"
+        branch has to cope with.
+        """
+        self._play_overlay_id = play_id
+
     def set_answer_local_sdp(self, sdp: str) -> None:
         """Configure the answer SDP returned by :meth:`answer_local` (test helper)."""
         self._answer_local_sdp = sdp
@@ -3196,11 +3561,13 @@ class MockRtpEngine:
         """Clear recorded operations and registered event handlers (test helper)."""
         self.operations.clear()
         self.media_calls.clear()
+        self.media_overrides.clear()
         self._dtmf_handlers.clear()
         self._media_timeout_handlers.clear()
         self._ws_tee_started_handlers.clear()
         self._ws_tee_ended_handlers.clear()
         self._text_handlers.clear()
+        self._beep_handlers.clear()
         self._answer_local_no_codec = False
 
 

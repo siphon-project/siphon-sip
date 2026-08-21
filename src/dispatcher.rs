@@ -1432,6 +1432,61 @@ pub async fn run(
                         })
                         .await;
                     }
+                    crate::rtpengine::events::RtpEngineEvent::BeepDetected(beep) => {
+                        tracing::debug!(
+                            call_id = %beep.call_id,
+                            from_tag = %beep.from_tag,
+                            frequency_hz = beep.frequency_hz,
+                            duration_ms = beep.duration_ms,
+                            offset_ms = beep.offset_ms,
+                            "media engine detected a record tone"
+                        );
+                        let engine_state = state_for_events.engine.state();
+                        let handlers =
+                            engine_state.beep_handlers(&beep.call_id, &beep.from_tag);
+                        if handlers.is_empty() {
+                            continue;
+                        }
+                        let state_ref = Arc::clone(&state_for_events);
+                        let beep_clone = beep.clone();
+                        let _ = crate::script::py_executor::try_run(move || {
+                            let engine_state = state_ref.engine.state();
+                            let handlers = engine_state
+                                .beep_handlers(&beep_clone.call_id, &beep_clone.from_tag);
+                            pyo3::Python::attach(|python| {
+                                for handler in handlers {
+                                    let callable = handler.callable.bind(python);
+                                    let result = callable.call1((
+                                        beep_clone.call_id.as_str(),
+                                        beep_clone.from_tag.as_str(),
+                                        beep_clone.to_tag.as_deref(),
+                                        beep_clone.frequency_hz,
+                                        beep_clone.duration_ms,
+                                        beep_clone.offset_ms,
+                                    ));
+                                    match result {
+                                        Ok(ret) => {
+                                            if handler.is_async {
+                                                if let Err(error) = run_coroutine(python, &ret) {
+                                                    tracing::error!(
+                                                        %error,
+                                                        "async rtpengine.on_beep handler error"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                %error,
+                                                "rtpengine.on_beep handler failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        })
+                        .await;
+                    }
                     crate::rtpengine::events::RtpEngineEvent::Unknown { event, call_id, .. } => {
                         tracing::debug!(
                             %event,

@@ -154,6 +154,15 @@ pub enum HandlerKind {
         call_id: Option<String>,
         from_tag: Option<String>,
     },
+    /// `@rtpengine.on_beep` — a record tone (the "voicemail beep") was detected
+    /// on a leg armed with `beep_detection`, the media half of
+    /// answering-machine detection. Fires once per leg per call.
+    ///
+    /// ``call_id`` and ``from_tag`` are optional filters.
+    RtpEngineOnBeep {
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    },
     /// Open extension point for handler kinds owned by host extensions.
     /// The string is the registry key the extension wrote (e.g.
     /// `"audit.sink"`); siphon-core does not interpret it. Per-handler
@@ -316,6 +325,21 @@ impl ScriptState {
             .iter()
             .filter(|h| match &h.kind {
                 HandlerKind::RtpEngineOnWsTeeEnded { call_id: filter_cid, from_tag: filter_ftag } => {
+                    filter_cid.as_deref().map_or(true, |v| v == call_id)
+                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// Return all `RtpEngineOnBeep` handlers whose optional call-id/from-tag
+    /// filters match the event.  `None` filters match everything.
+    pub fn beep_handlers(&self, call_id: &str, from_tag: &str) -> Vec<&HandlerEntry> {
+        self.handlers
+            .iter()
+            .filter(|h| match &h.kind {
+                HandlerKind::RtpEngineOnBeep { call_id: filter_cid, from_tag: filter_ftag } => {
                     filter_cid.as_deref().map_or(true, |v| v == call_id)
                         && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
                 }
@@ -1196,6 +1220,17 @@ fn extract_handlers(
                     .and_then(|v| v.extract().ok());
                 HandlerKind::RtpEngineOnText { call_id, from_tag }
             }
+            "rtpengine.on_beep" => {
+                let call_id: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("call_id").ok())
+                    .and_then(|v| v.extract().ok());
+                let from_tag: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("from_tag").ok())
+                    .and_then(|v| v.extract().ok());
+                HandlerKind::RtpEngineOnBeep { call_id, from_tag }
+            }
             "rtpengine.on_ws_tee_ended" => {
                 let call_id: Option<String> = metadata
                     .as_ref()
@@ -1903,6 +1938,48 @@ async def specific_text(call_id, from_tag, to_tag, text, direction):
                 HandlerKind::RtpEngineOnText { call_id: Some(c), .. } if c == "abc"
             ))
             .expect("filtered text handler registered");
+        assert!(specific.is_async);
+    }
+
+    #[test]
+    fn rtpengine_on_beep_decorator_registers_and_filters() {
+        // Same (call_id, from_tag) filter shape as the sibling rtpengine hooks.
+        // The from-tag names the leg the tone was heard *on*, which is what makes
+        // a per-leg filter meaningful: a transfer arms detection on the callee
+        // leg only and wants events from that leg alone.
+        let source = r#"
+from siphon import rtpengine
+
+@rtpengine.on_beep
+def any_beep(call_id, from_tag, to_tag, frequency_hz, duration_ms, offset_ms):
+    pass
+
+@rtpengine.on_beep(call_id="abc", from_tag="ftag1")
+async def specific_beep(call_id, from_tag, to_tag, frequency_hz, duration_ms, offset_ms):
+    pass
+"#;
+        let state = compile_temp_script(source).unwrap();
+        assert_eq!(state.handlers.len(), 2);
+
+        // Catch-all everywhere, plus the filtered one on an exact match only.
+        assert_eq!(state.beep_handlers("xyz", "other").len(), 1);
+        assert_eq!(state.beep_handlers("abc", "ftag1").len(), 2);
+        assert_eq!(state.beep_handlers("abc", "wrong").len(), 1);
+        assert_eq!(state.beep_handlers("wrong", "ftag1").len(), 1);
+
+        // A beep handler is not picked up by the other rtpengine hooks, and they
+        // are not picked up by it.
+        assert_eq!(state.ws_tee_started_handlers("abc", "ftag1").len(), 0);
+        assert_eq!(state.dtmf_handlers("abc", "ftag1").len(), 0);
+
+        let specific = state
+            .handlers
+            .iter()
+            .find(|h| matches!(
+                &h.kind,
+                HandlerKind::RtpEngineOnBeep { call_id: Some(c), .. } if c == "abc"
+            ))
+            .expect("filtered beep handler registered");
         assert!(specific.is_async);
     }
 

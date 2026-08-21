@@ -491,10 +491,14 @@ class _CacheNamespace:
 class _RtpEngineNamespace:
     """RTPEngine media proxy operations (stub)."""
 
-    async def offer(self, request, profile=None):
+    async def offer(self, request, profile=None, ws_uri=None, beep_detection=None,
+                    beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None,
+                    ws_vad_engine=None, ws_vad_min_speech_ms=None):
         raise NotImplementedError("rtpengine.offer() not available — no media.rtpengine in config")
 
-    async def answer(self, reply, profile=None):
+    async def answer(self, reply, profile=None, call=None, ws_uri=None, beep_detection=None,
+                     beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None,
+                     ws_vad_engine=None, ws_vad_min_speech_ms=None):
         raise NotImplementedError("rtpengine.answer() not available — no media.rtpengine in config")
 
     async def delete(self, request):
@@ -512,11 +516,19 @@ class _RtpEngineNamespace:
     async def unsubscribe(self, call_id, from_tag, to_tag):
         raise NotImplementedError("rtpengine.unsubscribe() not available — no media.rtpengine in config")
 
-    async def attach_ws_tee(self, target, ws_uri, direction="both", channels=None):
+    async def attach_ws_tee(self, target, ws_uri, direction="both", channels=None, sample_rate=None):
         raise NotImplementedError("rtpengine.attach_ws_tee() not available — no media.rtpengine in config")
 
     async def detach_ws_tee(self, target):
         raise NotImplementedError("rtpengine.detach_ws_tee() not available — no media.rtpengine in config")
+
+    async def play_overlay(self, target, file=None, blob=None, db_id=None, tone=None, url=None,
+                           repeat=None, start_ms=None, duration_ms=None, gain_decibels=None,
+                           to_tag=None):
+        raise NotImplementedError("rtpengine.play_overlay() not available — no media.rtpengine in config")
+
+    async def set_play_gain(self, target, play_id, gain_decibels, to_tag=None):
+        raise NotImplementedError("rtpengine.set_play_gain() not available — no media.rtpengine in config")
 
     def on_dtmf(self, func_or_none=None, *, call_id=None, from_tag=None):
         """Register a handler for inbound DTMF events from rtpengine.
@@ -590,6 +602,38 @@ class _RtpEngineNamespace:
             is_async = _asyncio.iscoroutinefunction(fn)
             metadata = {"call_id": call_id, "from_tag": from_tag}
             _registry.register("rtpengine.on_text", None, fn, is_async, metadata)
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def on_beep(self, func_or_none=None, *, call_id=None, from_tag=None):
+        """Register a handler for record-tone ("voicemail beep") events.
+
+        Fires when the engine hears the short tone an answering machine plays
+        before it starts recording, on a leg whose media profile set
+        ``beep_detection`` — the media half of answering-machine detection.
+
+        Arm it per leg (the profile used toward the callee watches the party
+        that might be a machine). Fires once per leg per call; there is no
+        mid-call re-arm.
+
+        ``offset_ms`` is the offset of the *tone*, not of the event: the event
+        trails it by roughly the profile's ``beep_cadence_guard_ms``.
+
+        Usage:
+            @rtpengine.on_beep
+            def handle_any(call_id, from_tag, to_tag, frequency_hz, duration_ms, offset_ms):
+                ...
+
+            @rtpengine.on_beep(call_id="abc")
+            def handle_specific(call_id, from_tag, to_tag, frequency_hz, duration_ms, offset_ms):
+                ...
+        """
+        def decorator(fn):
+            is_async = _asyncio.iscoroutinefunction(fn)
+            metadata = {"call_id": call_id, "from_tag": from_tag}
+            _registry.register("rtpengine.on_beep", None, fn, is_async, metadata)
             return fn
         if func_or_none is not None:
             return decorator(func_or_none)

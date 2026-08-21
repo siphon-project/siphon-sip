@@ -315,6 +315,84 @@ impl WsTeeDirection {
     pub const VALUES: [&'static str; 3] = ["both", "caller", "callee"];
 }
 
+/// Which voice-activity detector the WebSocket uplink VAD runs.
+///
+/// A siphon-side mirror of the native backend's `siphon_rtp_proto::WsVadEngine`,
+/// keeping the config and profile layers free of the proto type (the same
+/// posture [`WsTeeDirection`] takes).
+///
+/// Deliberately **not** `#[non_exhaustive]`, mirroring the proto: this selects
+/// behaviour the script asked for *by name*.  A consumer that met an unknown
+/// detector through a wildcard would have to fall back to the detector the
+/// script was explicitly avoiding — a silent downgrade.  Exhaustiveness forces
+/// that question to be answered in code.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WsVadEngine {
+    /// Mean-square energy against a threshold with a trailing hangover.  Cheap
+    /// and exact, but it answers "is something loud here", so breathing, mains
+    /// hum, fan noise and uncancelled echo all read as speech.  The engine's
+    /// default, and the right choice when a false turn start is harmless.
+    #[default]
+    Energy,
+    /// A neural speech classifier.  Answers "is what is here speech", so it does
+    /// not turn-start on non-speech noise, at the cost of a 32 ms detection
+    /// floor plus up to one media frame.  Pick it for turn taking and barge-in.
+    Neural,
+}
+
+impl WsVadEngine {
+    /// The YAML / Python spelling, matching the proto's `snake_case` wire form.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Energy => "energy",
+            Self::Neural => "neural",
+        }
+    }
+
+    /// Parse the YAML / Python spelling, case-insensitively.
+    ///
+    /// Returns `None` for anything else so the caller can raise a named error
+    /// rather than silently relaying a detector the engine would reject.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "energy" => Some(Self::Energy),
+            "neural" => Some(Self::Neural),
+            _ => None,
+        }
+    }
+
+    /// The accepted values, for error messages.
+    pub const VALUES: [&'static str; 2] = ["energy", "neural"];
+}
+
+/// Lowest L16 wire sample rate the engine accepts (`ws_sample_rate` /
+/// `ws_tee_sample_rate`).
+pub const WS_SAMPLE_RATE_MIN: u32 = 8_000;
+/// Highest L16 wire sample rate the engine accepts.
+pub const WS_SAMPLE_RATE_MAX: u32 = 48_000;
+/// The engine requires a whole number of kHz.
+pub const WS_SAMPLE_RATE_STEP: u32 = 1_000;
+
+/// Validate an L16 wire sample rate the way the engine does.
+///
+/// The engine **fails the offer/answer** on a bad rate rather than clamping it,
+/// so a profile carrying one is a call that never gets media.  Checking here
+/// lets config load reject it at boot and the script API reject it at the call,
+/// instead of the operator learning from a dead leg.
+///
+/// Returns a ready-to-print reason on rejection.
+pub fn validate_ws_sample_rate(rate: u32) -> Result<(), String> {
+    if !(WS_SAMPLE_RATE_MIN..=WS_SAMPLE_RATE_MAX).contains(&rate)
+        || rate % WS_SAMPLE_RATE_STEP != 0
+    {
+        return Err(format!(
+            "must be a multiple of {WS_SAMPLE_RATE_STEP} within \
+             {WS_SAMPLE_RATE_MIN}–{WS_SAMPLE_RATE_MAX} Hz, got {rate}"
+        ));
+    }
+    Ok(())
+}
+
 /// NG protocol flags sent with offer/answer commands.
 #[derive(Debug, Clone, Default)]
 pub struct NgFlags {
@@ -398,8 +476,71 @@ pub struct NgFlags {
     /// Trailing hangover for the WS uplink VAD in milliseconds — how long speech
     /// is held after energy drops before `speech_stopped` (the turn endpoint)
     /// fires.  `None` uses the engine's ~200 ms default.  Only meaningful with
-    /// [`NgFlags::ws_vad`] / [`NgFlags::ws_barge_in`].
+    /// [`NgFlags::ws_vad`] / [`NgFlags::ws_barge_in`], and only with the
+    /// [`WsVadEngine::Energy`] detector — [`WsVadEngine::Neural`] holds speech
+    /// with its own probability hysteresis instead.
     pub ws_vad_hangover_ms: Option<u32>,
+    /// L16 wire sample rate in Hz for the [`NgFlags::ws_uri`] takeover bridge,
+    /// **independent of the leg's codec rate** and applied in *both* directions:
+    /// the engine resamples the leg's decoded uplink into it and resamples the
+    /// server's downlink back into the leg's codec rate before re-encoding.  So
+    /// an 8 kHz G.711 call can speak 16 kHz L16 to the server, and a server
+    /// rendering 24 kHz audio is played at the right speed and pitch.
+    ///
+    /// It is also the domain the uplink noise suppressor and echo canceller run
+    /// in, and those engage only at 8 or 16 kHz — another rate leaves them off
+    /// without changing the wire rate.
+    ///
+    /// Must satisfy [`validate_ws_sample_rate`]; the engine *fails* the
+    /// offer/answer on a bad value rather than clamping.  `None` leaves the leg
+    /// codec's own PCM rate with no conversion in either direction.  Inert
+    /// without [`NgFlags::ws_uri`].
+    pub ws_sample_rate: Option<u32>,
+    /// Which detector the WS uplink VAD runs.  `None` leaves the engine's
+    /// default ([`WsVadEngine::Energy`]).  Only meaningful with
+    /// [`NgFlags::ws_vad`] / [`NgFlags::ws_barge_in`].
+    pub ws_vad_engine: Option<WsVadEngine>,
+    /// **Leading** minimum-speech run in milliseconds: how long the uplink must
+    /// read as speech *continuously* before the `speech_started` edge (and
+    /// barge-in) fires.  Distinct from the *trailing*
+    /// [`NgFlags::ws_vad_hangover_ms`].
+    ///
+    /// `None` means no leading requirement — the edge fires on the first speech
+    /// frame, which is what lets a cough, a door or one burst of echo interrupt
+    /// a prompt.  Rounded up to whole ptime frames by the engine, and it adds
+    /// directly to turn-start latency, so 60–120 ms is the useful range.  Works
+    /// with either detector.  Only meaningful with [`NgFlags::ws_vad`] /
+    /// [`NgFlags::ws_barge_in`].
+    pub ws_vad_min_speech_ms: Option<u32>,
+    /// Watch this leg's decoded ingress audio for the short single tone an
+    /// answering machine plays before it starts recording (the "voicemail
+    /// beep"), reporting it as `@rtpengine.on_beep` — the media half of
+    /// answering-machine detection, so a script can abort a transfer instead of
+    /// bridging the caller into a voicemail box.
+    ///
+    /// Set **per leg**: the flag arms the detector on the leg whose
+    /// `offer`/`answer` carries it, so arming it on the outbound (callee) leg is
+    /// what watches the party that might be a machine.  Like
+    /// [`NgFlags::noise_suppression`] it needs decoded audio, so it promotes a
+    /// same-codec plaintext call onto the userspace media pipeline, and it is
+    /// inert on a codec whose native rate is neither 8 nor 16 kHz.
+    ///
+    /// Fires **once per leg per call** — there is no mid-call re-arm; a fresh
+    /// `offer`/`answer` with the flag set re-arms it.
+    ///
+    /// A native `siphon-rtp` extension: the NG/bencode and rtpproxy backends
+    /// have no equivalent and cannot honour it.
+    pub beep_detection: bool,
+    /// How long in milliseconds the beep detector waits after a candidate tone
+    /// ends to confirm no repeat follows — the discriminator that keeps a
+    /// cadenced ringback / busy / congestion tone from reading as a record tone.
+    ///
+    /// It is **also the detection latency**: the event arrives this long after
+    /// the beep.  `None` uses the engine default (4500 ms, longer than the 4 s
+    /// silent interval of the slowest widely deployed ringback cadence).  Lower
+    /// it to trade cadence robustness for latency.  Inert without
+    /// [`NgFlags::beep_detection`].
+    pub beep_cadence_guard_ms: Option<u32>,
     /// Attach a **WebSocket tee** to this call at offer/answer time — the
     /// declarative twin of `rtpengine.attach_ws_tee(...)`, so a profile can turn
     /// the tee on without a second round-trip.
@@ -425,6 +566,15 @@ pub struct NgFlags {
     /// a single-leg tee is always mono.  `None` leaves the engine's default (2
     /// for both legs, 1 for one).  Inert without [`NgFlags::ws_tee`].
     pub ws_tee_channels: Option<u8>,
+    /// L16 wire sample rate in Hz for [`NgFlags::ws_tee`], independent of the
+    /// legs' codec rates — the engine resamples the teed copy into it.  Unlike
+    /// [`NgFlags::ws_sample_rate`] this is send-only, so it affects only what the
+    /// tee consumer receives and never what the call itself hears.
+    ///
+    /// Must satisfy [`validate_ws_sample_rate`]; the engine *fails* the
+    /// offer/answer on a bad value rather than clamping.  `None` leaves the
+    /// engine's default.  Inert without [`NgFlags::ws_tee`].
+    pub ws_tee_sample_rate: Option<u32>,
     /// Profile **policy**: carry the real post-NAT source IP the proxy saw this
     /// request arrive from (rtpengine's `received from`) on offer/answer.
     ///
@@ -477,9 +627,15 @@ impl NgFlags {
             ws_barge_in: config.ws_barge_in,
             ws_vad_threshold: config.ws_vad_threshold,
             ws_vad_hangover_ms: config.ws_vad_hangover_ms,
+            ws_sample_rate: config.ws_sample_rate,
+            ws_vad_engine: config.ws_vad_engine,
+            ws_vad_min_speech_ms: config.ws_vad_min_speech_ms,
+            beep_detection: config.beep_detection,
+            beep_cadence_guard_ms: config.beep_cadence_guard_ms,
             ws_tee: config.ws_tee.clone(),
             ws_tee_direction: config.ws_tee_direction,
             ws_tee_channels: config.ws_tee_channels,
+            ws_tee_sample_rate: config.ws_tee_sample_rate,
             carry_received_from: config.received_from,
             received_from: None,
             rtcp_mux: config.rtcp_mux.clone(),
@@ -547,12 +703,15 @@ impl NgFlags {
             let items: Vec<&str> = self.rtcp_mux.iter().map(|s| s.as_str()).collect();
             pairs.push(("rtcp-mux", BencodeValue::string_list(&items)));
         }
-        // The WS bridge, WS tee and DSP knobs (ws_uri, ws_vad, ws_barge_in,
-        // ws_vad_threshold, ws_vad_hangover_ms, ws_tee, ws_tee_direction,
-        // ws_tee_channels, noise_suppression, echo_cancellation) are native
-        // siphon-rtp extensions with no NG equivalent, so they are deliberately
-        // not emitted here.  A profile that sets them on this backend is rejected
-        // at config load rather than silently degraded — see
+        // The WS bridge, WS tee, VAD, beep-detection and DSP knobs (ws_uri,
+        // ws_vad, ws_barge_in, ws_vad_threshold, ws_vad_hangover_ms,
+        // ws_vad_engine, ws_vad_min_speech_ms, ws_sample_rate, ws_tee,
+        // ws_tee_direction, ws_tee_channels, ws_tee_sample_rate,
+        // beep_detection, beep_cadence_guard_ms, noise_suppression,
+        // echo_cancellation) are native siphon-rtp extensions with no NG
+        // equivalent, so they are deliberately not emitted here.  A profile that
+        // sets them on this backend is rejected at config load rather than
+        // silently degraded — see
         // `MediaBackendKind::unsupported_profile_fields`.
 
         pairs
@@ -566,6 +725,38 @@ impl NgFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ws_vad_engine_round_trips_its_wire_spelling() {
+        for engine in [WsVadEngine::Energy, WsVadEngine::Neural] {
+            assert_eq!(WsVadEngine::parse(engine.as_str()), Some(engine));
+        }
+        // Case-insensitive and whitespace-tolerant, matching WsTeeDirection.
+        assert_eq!(WsVadEngine::parse("  NEURAL "), Some(WsVadEngine::Neural));
+        // Anything else is None so the caller can raise a named error rather
+        // than silently downgrading to the detector the operator avoided.
+        assert_eq!(WsVadEngine::parse("telepathy"), None);
+        assert_eq!(WsVadEngine::parse(""), None);
+        assert_eq!(WsVadEngine::default(), WsVadEngine::Energy);
+    }
+
+    #[test]
+    fn ws_sample_rate_validation_matches_the_engines_rule() {
+        // Whole kHz within 8000-48000 inclusive.
+        for rate in [8_000, 16_000, 24_000, 47_000, 48_000] {
+            assert!(validate_ws_sample_rate(rate).is_ok(), "{rate} must be accepted");
+        }
+        // Out of range, or not a whole kHz. The engine fails the offer on these
+        // rather than clamping, so they must never reach it.
+        for rate in [0, 1_000, 7_999, 44_100, 48_001, 96_000] {
+            let error = validate_ws_sample_rate(rate)
+                .expect_err(&format!("{rate} must be rejected"));
+            assert!(
+                error.contains(&rate.to_string()),
+                "reason should quote the offending rate: {error}"
+            );
+        }
+    }
 
     #[test]
     fn default_registry_has_builtins() {
