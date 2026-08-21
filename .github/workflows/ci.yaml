@@ -487,6 +487,19 @@ jobs:
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-cancel down sipp-b2bua-cancel-uac sipp-b2bua-cancel-uas 2>/dev/null || true
 
+      # RFC 3261 §17.1.1.3 — the CANCELled B-leg's 487 MUST be ACKed, or the
+      # callee retransmits it on Timer G to Timer H (64*T1 = 32 s, §17.2.1) on
+      # every abandoned outbound attempt.  --exit-code-from names the UAS: the
+      # A-leg gets a correct 487 either way, so reading the UAC's exit code
+      # would pass vacuously — which is exactly why the step above, which does
+      # not name a container at all, never caught this.
+      - name: B2BUA CANCEL 487 is ACKed (RFC 3261 §17.1.1.3)
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-cancel-ack up --abort-on-container-exit --exit-code-from sipp-b2bua-cancel-ack-uas sipp-b2bua-cancel-ack-uac sipp-b2bua-cancel-ack-uas
+
+      - name: Cleanup cancel-ack containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-cancel-ack down sipp-b2bua-cancel-ack-uac sipp-b2bua-cancel-ack-uas 2>/dev/null || true
+
       - name: Deregister bob (clear previous contacts)
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-failure run --rm sipp-b2bua-deregister-bob
 
@@ -502,7 +515,7 @@ jobs:
 
       - name: Teardown
         if: always()
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-session-timer --profile b2bua-cancel --profile b2bua-failure down --remove-orphans
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-session-timer --profile b2bua-cancel --profile b2bua-cancel-ack --profile b2bua-failure down --remove-orphans
 
       - name: Upload logs
         if: always()
