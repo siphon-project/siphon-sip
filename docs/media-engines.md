@@ -131,6 +131,105 @@ the negotiated `channels` and `sample_rate` so a consumer decodes the binary
 frames rather than guessing; `stream_id` correlates the control event with the
 `start` envelope on the socket.
 
+Both the bridge and the tee can run at a wire rate independent of the legs'
+codec rates. `ws_sample_rate` applies to the `ws_uri` bridge in **both**
+directions, so an 8 kHz G.711 call can speak 16 kHz to an inference server, and
+a server rendering 24 kHz audio into that call plays at the right speed and
+pitch instead of the wrong one. `ws_tee_sample_rate` (or
+`attach_ws_tee(..., sample_rate=...)`) is send-only and changes only what the
+tee consumer receives. Both must be a multiple of 1000 within 8000–48000; the
+engine fails the offer rather than clamping, so siphon rejects a bad value at
+boot.
+
+---
+
+## Answering-machine detection
+
+The media half of AMD: the engine watches a leg's decoded audio for the short
+single tone an answering machine plays before it starts recording, and reports
+it. Without it a transfer cannot tell a person from a voicemail box, and the
+caller gets bridged into the greeting.
+
+Arm it **per leg**. The profile used toward the callee is what watches the party
+that might be a machine:
+
+```yaml
+media:
+  backend: siphon-rtp
+  profiles:
+    screened_callee:
+      offer:
+        replace: ["origin"]
+      answer:
+        replace: ["origin"]
+        beep_detection: true
+        beep_cadence_guard_ms: 4500   # default
+```
+
+```python
+@rtpengine.on_beep
+def machine(call_id, from_tag, to_tag, frequency_hz, duration_ms, offset_ms):
+    log.info(f"{call_id}: answering machine ({frequency_hz:.0f} Hz at {offset_ms} ms)")
+    b2bua.terminate(call_id, "Answering machine detected")
+```
+
+Three things to know:
+
+- **It fires once per leg per call.** The engine drops the detector after the
+  first tone, so a handler never de-duplicates, and there is no mid-call re-arm —
+  a fresh `offer`/`answer` with the flag set re-arms it.
+- **`beep_cadence_guard_ms` is also the detection latency.** It is the window the
+  detector waits to rule out a repeat, which is what tells a record tone from a
+  cadenced ringback, busy or congestion tone. The event therefore arrives that
+  long *after* the beep. Lowering it trades cadence robustness for latency.
+- **`offset_ms` is the offset of the tone, not of the event.** It counts decoded
+  audio seen on the leg before the tone started, so it is the right number to
+  reason about "how far into the call" — the event trails it by the guard.
+
+Detection needs decoded audio, so like `noise_suppression` it promotes a
+same-codec plaintext call onto the userspace media pipeline, and it is inert on
+a codec whose native rate is neither 8 nor 16 kHz.
+
+---
+
+## Prompts, tones and overlays
+
+`rtpengine.play_media(...)` replaces a party's outgoing audio with a prompt. Its
+source can be a file, raw bytes, an engine prompt-DB id, a **synthesised tone**,
+or a URL the **engine** fetches:
+
+```python
+await rtpengine.play_media(call, tone="ringback_eu")            # preset
+await rtpengine.play_media(call, tone="425/1000,0/4000*inf")     # cadence spec
+await rtpengine.play_media(call, url="https://prompts.internal/welcome.wav")
+```
+
+A tone needs no provisioned audio file and renders at the leg's codec rate, so it
+is never resampled. A preset name is told from a cadence spec by the `/`. An
+HTTP source is fetched by the engine from its own network position, bounded
+engine-side and off the media path — a URL that never answers ends the
+*playback*, never the leg — so restrict the reachable hosts if you do not fully
+trust whoever supplies the URL.
+
+**Overlays** mix audio *under* a party's live egress instead of replacing it, and
+return a handle so you can change or stop that one playback:
+
+```python
+bed = await rtpengine.play_overlay(call, file="/prompts/hold.wav", repeat=0)
+await rtpengine.play_media(call, file="/prompts/agent.wav")
+await rtpengine.set_play_gain(call, bed, -18)     # duck the bed under the prompt
+await rtpengine.stop_media(call, play_id=bed)     # stop just the bed
+```
+
+Up to four overlays run per direction, each with its own `play_id` and its own
+completion. Starting a fifth is rejected rather than displacing one — a script
+that lost a playback it believes is running has no way to notice.
+
+Tones, HTTP sources, overlays, per-play gain and a targeted `stop_media` are
+native `siphon-rtp` features. On the rtpengine and rtpproxy backends they raise
+rather than silently downgrading: an overlay quietly turned into a supersede
+would cut the party's live audio.
+
 ---
 
 ## Managing rtpengine

@@ -16,7 +16,9 @@ use pyo3::types::PyDict;
 use tracing::{debug, warn};
 
 use crate::rtpengine::client::PlayMediaSource;
-use crate::rtpengine::profile::{NgFlags, ProfileRegistry, WsTeeDirection};
+use crate::rtpengine::profile::{
+    validate_ws_sample_rate, NgFlags, ProfileRegistry, WsTeeDirection, WsVadEngine,
+};
 use crate::rtpengine::MediaBackend;
 use crate::rtpengine::RtpEngineError;
 use crate::rtpengine::session::{MediaSession, MediaSessionStore};
@@ -78,19 +80,28 @@ impl PyRtpEngine {
     }
 }
 
-/// Validate exactly-one of ``file``/``blob``/``db_id`` and build a [`PlayMediaSource`].
+/// Validate exactly-one of ``file``/``blob``/``db_id``/``tone``/``url`` and
+/// build a [`PlayMediaSource`].
 fn resolve_play_media_source(
     file: Option<String>,
     blob: Option<Vec<u8>>,
     db_id: Option<u64>,
+    tone: Option<String>,
+    url: Option<String>,
 ) -> PyResult<PlayMediaSource> {
-    let count = [file.is_some(), blob.is_some(), db_id.is_some()]
-        .iter()
-        .filter(|present| **present)
-        .count();
+    let count = [
+        file.is_some(),
+        blob.is_some(),
+        db_id.is_some(),
+        tone.is_some(),
+        url.is_some(),
+    ]
+    .iter()
+    .filter(|present| **present)
+    .count();
     if count != 1 {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "play_media requires exactly one of file=, blob=, or db_id="
+            "play_media requires exactly one of file=, blob=, db_id=, tone=, or url="
                 .to_string(),
         ));
     }
@@ -103,7 +114,52 @@ fn resolve_play_media_source(
     if let Some(id) = db_id {
         return Ok(PlayMediaSource::DbId(id));
     }
+    if let Some(spec) = tone {
+        return Ok(PlayMediaSource::Tone(validate_tone(spec)?));
+    }
+    if let Some(location) = url {
+        return Ok(PlayMediaSource::Http(validate_http_url(location)?));
+    }
     unreachable!("count == 1 guaranteed one branch above")
+}
+
+/// Reject an empty tone spec before it reaches the engine.
+///
+/// The engine tells a **preset name** from a **cadence spec** by the `/` (a
+/// preset never contains one; a cadence spec is never valid without one), so
+/// both forms are accepted verbatim — siphon deliberately does not keep its own
+/// copy of the preset table, which would go stale against the engine's the first
+/// time a preset is added.  Only the one thing that is wrong under either
+/// reading is caught here.
+fn validate_tone(spec: String) -> PyResult<String> {
+    if spec.trim().is_empty() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "play_media tone= must be a preset name (e.g. \"ringback_eu\") or a \
+             cadence spec (e.g. \"425/1000,0/4000*inf\"), not an empty string"
+                .to_string(),
+        ));
+    }
+    Ok(spec)
+}
+
+/// Reject a URL scheme the engine will not fetch.
+///
+/// The **engine** performs this fetch from its own network position, bounded by
+/// its own connect / first-byte / deadline / size / redirect caps and run off
+/// the media path, so a URL that never answers ends the *playback* (a
+/// play-finished `error`) and never stalls the leg.  siphon deliberately does
+/// not fetch it here: doing so would put an unbounded third-party HTTP
+/// round-trip on the call-setup path, which is the failure mode this design
+/// avoids.  What is checked here is only the part the engine would reject
+/// outright.
+fn validate_http_url(url: String) -> PyResult<String> {
+    let lowered = url.trim().to_ascii_lowercase();
+    if !(lowered.starts_with("http://") || lowered.starts_with("https://")) {
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "play_media url= must be an http:// or https:// URL, got {url:?}"
+        )));
+    }
+    Ok(url)
 }
 
 /// Default profile name when none is specified.
@@ -233,6 +289,94 @@ fn resolve_ws_uri(
     profile_ws_uri.map(|uri| uri.to_string())
 }
 
+/// The 0.3.0 media knobs a script can override for **one call**, on top of
+/// whatever its `media.profiles` entry set.
+///
+/// Same model as the existing per-call `ws_uri=`: `None` means "leave the
+/// profile's value alone", so passing nothing emits exactly the command a
+/// pre-override build did.  These are the knobs whose right value genuinely
+/// varies per call rather than per deployment — arming beep detection only on
+/// the leg being transferred, or matching the wire rate to the model a
+/// particular AI backend expects.
+#[derive(Debug, Clone, Copy, Default)]
+struct MediaOverrides {
+    beep_detection: Option<bool>,
+    beep_cadence_guard_ms: Option<u32>,
+    ws_sample_rate: Option<u32>,
+    ws_tee_sample_rate: Option<u32>,
+    ws_vad_min_speech_ms: Option<u32>,
+    ws_vad_engine: Option<WsVadEngine>,
+}
+
+impl MediaOverrides {
+    /// Parse the raw keyword values, rejecting anything the engine would refuse.
+    ///
+    /// The two sample rates are validated here rather than at the engine: the
+    /// engine *fails the offer* on a bad rate instead of clamping, so a script
+    /// that passed one would get a call that answers and never carries media.
+    fn parse(
+        beep_detection: Option<bool>,
+        beep_cadence_guard_ms: Option<u32>,
+        ws_sample_rate: Option<u32>,
+        ws_tee_sample_rate: Option<u32>,
+        ws_vad_min_speech_ms: Option<u32>,
+        ws_vad_engine: Option<&str>,
+    ) -> PyResult<Self> {
+        for (field, rate) in [
+            ("ws_sample_rate", ws_sample_rate),
+            ("ws_tee_sample_rate", ws_tee_sample_rate),
+        ] {
+            if let Some(rate) = rate {
+                validate_ws_sample_rate(rate).map_err(|reason| {
+                    pyo3::exceptions::PyValueError::new_err(format!("{field} {reason}"))
+                })?;
+            }
+        }
+
+        let ws_vad_engine = match ws_vad_engine {
+            None => None,
+            Some(value) => Some(WsVadEngine::parse(value).ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "ws_vad_engine must be one of {}, got {value:?}",
+                    WsVadEngine::VALUES.join(" / ")
+                ))
+            })?),
+        };
+
+        Ok(Self {
+            beep_detection,
+            beep_cadence_guard_ms,
+            ws_sample_rate,
+            ws_tee_sample_rate,
+            ws_vad_min_speech_ms,
+            ws_vad_engine,
+        })
+    }
+
+    /// Overlay the set values onto the profile's flags.
+    fn apply(self, flags: &mut NgFlags) -> PyResult<()> {
+        if let Some(value) = self.beep_detection {
+            flags.beep_detection = value;
+        }
+        if let Some(value) = self.beep_cadence_guard_ms {
+            flags.beep_cadence_guard_ms = Some(value);
+        }
+        if let Some(value) = self.ws_sample_rate {
+            flags.ws_sample_rate = Some(value);
+        }
+        if let Some(value) = self.ws_tee_sample_rate {
+            flags.ws_tee_sample_rate = Some(value);
+        }
+        if let Some(value) = self.ws_vad_min_speech_ms {
+            flags.ws_vad_min_speech_ms = Some(value);
+        }
+        if let Some(value) = self.ws_vad_engine {
+            flags.ws_vad_engine = Some(value);
+        }
+        Ok(())
+    }
+}
+
 /// Apply the per-call WebSocket URI and `received_from` address to a profile's
 /// resolved flags, and reject flags the configured backend cannot honour.
 ///
@@ -246,12 +390,14 @@ fn finalise_flags(
     mut flags: NgFlags,
     backend: &MediaBackend,
     ws_uri: Option<String>,
+    overrides: MediaOverrides,
     source_ip: Option<&str>,
     profile_name: &str,
 ) -> PyResult<NgFlags> {
     if let Some(uri) = ws_uri {
         flags.ws_uri = Some(uri);
     }
+    overrides.apply(&mut flags)?;
     if flags.carry_received_from {
         match source_ip.and_then(|ip| ip.parse::<std::net::IpAddr>().ok()) {
             Some(address) => flags.received_from = Some(address),
@@ -439,13 +585,42 @@ impl PyRtpEngine {
     ///             ``{from_tag}``, ``{from_user}`` and ``{to_user}``
     ///             placeholders. The resolved URI is recorded on the media
     ///             session, so a later ``answer`` reuses it automatically.
-    #[pyo3(signature = (request, profile=None, ws_uri=None))]
+    ///     beep_detection: Arm the record-tone ("voicemail beep") detector on this
+    ///             leg for this call, overriding the profile. Arming it on the leg
+    ///             toward the callee is what watches the party that might be a
+    ///             machine; the tone arrives as ``@rtpengine.on_beep``, once per
+    ///             leg per call. ``siphon-rtp`` backend only.
+    ///     beep_cadence_guard_ms: How long the detector waits after a candidate
+    ///             tone to rule out a cadenced ringback/busy tone. **Also the
+    ///             detection latency** — the event trails the tone by this long.
+    ///             Unset uses the engine default (4500 ms).
+    ///     ws_sample_rate: L16 wire rate in Hz for the ``ws_uri`` bridge,
+    ///             independent of the leg's codec rate and applied both ways.
+    ///             Must be a multiple of 1000 within 8000-48000 (the engine fails
+    ///             the offer rather than clamping, so it is checked here).
+    ///     ws_tee_sample_rate: L16 wire rate in Hz for the ``ws_tee`` copy. Same
+    ///             range rule; send-only, so it never changes what the call hears.
+    ///     ws_vad_engine: Which uplink VAD to run — ``"energy"`` (cheap; any loud
+    ///             sound reads as speech) or ``"neural"`` (answers "is this
+    ///             speech", so it does not turn-start on noise).
+    ///     ws_vad_min_speech_ms: **Leading** minimum continuous-speech run before
+    ///             the speech-start edge (and barge-in) fires — distinct from the
+    ///             trailing hangover. Rounded up to whole ptime frames and added
+    ///             to turn-start latency, so 60-120 ms is the useful range.
+    #[pyo3(signature = (request, profile=None, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None))]
+    #[allow(clippy::too_many_arguments)]
     fn offer<'py>(
         &self,
         python: Python<'py>,
         request: &Bound<'py, PyAny>,
         profile: Option<&str>,
         ws_uri: Option<&str>,
+        beep_detection: Option<bool>,
+        beep_cadence_guard_ms: Option<u32>,
+        ws_sample_rate: Option<u32>,
+        ws_tee_sample_rate: Option<u32>,
+        ws_vad_engine: Option<&str>,
+        ws_vad_min_speech_ms: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let profile_name = profile.unwrap_or(DEFAULT_PROFILE);
         let entry = self.registry.get(profile_name).ok_or_else(|| {
@@ -484,10 +659,19 @@ impl PyRtpEngine {
             }
             None => None,
         };
+        let overrides = MediaOverrides::parse(
+            beep_detection,
+            beep_cadence_guard_ms,
+            ws_sample_rate,
+            ws_tee_sample_rate,
+            ws_vad_min_speech_ms,
+            ws_vad_engine,
+        )?;
         let flags = finalise_flags(
             flags,
             &self.client,
             resolved_ws_uri.clone(),
+            overrides,
             source_ip.as_deref(),
             profile_name,
         )?;
@@ -592,7 +776,21 @@ impl PyRtpEngine {
     ///             backend only). When omitted, the URI recorded by the matching
     ///             ``offer`` is reused, then the resolved profile's own —
     ///             the same precedence as ``profile``.
-    #[pyo3(signature = (reply, profile=None, call=None, ws_uri=None))]
+    ///     beep_detection: Arm the record-tone ("voicemail beep") detector on this
+    ///             leg for this call, overriding the profile. Delivered as
+    ///             ``@rtpengine.on_beep``, once per leg per call. ``siphon-rtp``
+    ///             backend only.
+    ///     beep_cadence_guard_ms: Cadence guard for the beep detector, and also
+    ///             its detection latency. Unset uses the engine default (4500 ms).
+    ///     ws_sample_rate: L16 wire rate in Hz for the ``ws_uri`` bridge. Must be
+    ///             a multiple of 1000 within 8000-48000.
+    ///     ws_tee_sample_rate: L16 wire rate in Hz for the ``ws_tee`` copy. Same
+    ///             range rule; send-only.
+    ///     ws_vad_engine: ``"energy"`` or ``"neural"`` uplink VAD.
+    ///     ws_vad_min_speech_ms: Leading minimum continuous-speech run before the
+    ///             speech-start edge fires (60-120 ms is the useful range).
+    #[pyo3(signature = (reply, profile=None, call=None, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None))]
+    #[allow(clippy::too_many_arguments)]
     fn answer<'py>(
         &self,
         python: Python<'py>,
@@ -600,6 +798,12 @@ impl PyRtpEngine {
         profile: Option<&str>,
         call: Option<&Bound<'py, PyAny>>,
         ws_uri: Option<&str>,
+        beep_detection: Option<bool>,
+        beep_cadence_guard_ms: Option<u32>,
+        ws_sample_rate: Option<u32>,
+        ws_tee_sample_rate: Option<u32>,
+        ws_vad_engine: Option<&str>,
+        ws_vad_min_speech_ms: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let message = extract_message(reply)?;
 
@@ -659,10 +863,19 @@ impl PyRtpEngine {
         // A reply carries no source address of its own; when the script passed
         // `call=`, that object does.
         let source_ip = call.and_then(|object| extract_source_ip(object));
+        let overrides = MediaOverrides::parse(
+            beep_detection,
+            beep_cadence_guard_ms,
+            ws_sample_rate,
+            ws_tee_sample_rate,
+            ws_vad_min_speech_ms,
+            ws_vad_engine,
+        )?;
         let flags = finalise_flags(
             flags,
             &self.client,
             resolved_ws_uri,
+            overrides,
             source_ip.as_deref(),
             &profile_name,
         )?;
@@ -734,7 +947,21 @@ impl PyRtpEngine {
     /// Returns:
     ///     The answer SDP as ``str`` on success, or ``None`` when the offer had
     ///     no encodable codec and it was auto-rejected with a 488.
-    #[pyo3(signature = (call, profile=None, auto_reject=true, ws_uri=None))]
+    ///     beep_detection: Arm the record-tone ("voicemail beep") detector on this
+    ///             leg for this call, overriding the profile. Delivered as
+    ///             ``@rtpengine.on_beep``, once per leg per call. ``siphon-rtp``
+    ///             backend only.
+    ///     beep_cadence_guard_ms: Cadence guard for the beep detector, and also
+    ///             its detection latency. Unset uses the engine default (4500 ms).
+    ///     ws_sample_rate: L16 wire rate in Hz for the ``ws_uri`` bridge. Must be
+    ///             a multiple of 1000 within 8000-48000.
+    ///     ws_tee_sample_rate: L16 wire rate in Hz for the ``ws_tee`` copy. Same
+    ///             range rule; send-only.
+    ///     ws_vad_engine: ``"energy"`` or ``"neural"`` uplink VAD.
+    ///     ws_vad_min_speech_ms: Leading minimum continuous-speech run before the
+    ///             speech-start edge fires (60-120 ms is the useful range).
+    #[pyo3(signature = (call, profile=None, auto_reject=true, ws_uri=None, beep_detection=None, beep_cadence_guard_ms=None, ws_sample_rate=None, ws_tee_sample_rate=None, ws_vad_engine=None, ws_vad_min_speech_ms=None))]
+    #[allow(clippy::too_many_arguments)]
     fn answer_local<'py>(
         &self,
         python: Python<'py>,
@@ -742,6 +969,12 @@ impl PyRtpEngine {
         profile: Option<&str>,
         auto_reject: bool,
         ws_uri: Option<&str>,
+        beep_detection: Option<bool>,
+        beep_cadence_guard_ms: Option<u32>,
+        ws_sample_rate: Option<u32>,
+        ws_tee_sample_rate: Option<u32>,
+        ws_vad_engine: Option<&str>,
+        ws_vad_min_speech_ms: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let message = extract_message(call)?;
         let (call_id, from_tag, offer_sdp_bytes) = extract_offer_params(&message)?;
@@ -780,10 +1013,19 @@ impl PyRtpEngine {
             }
             None => None,
         };
+        let overrides = MediaOverrides::parse(
+            beep_detection,
+            beep_cadence_guard_ms,
+            ws_sample_rate,
+            ws_tee_sample_rate,
+            ws_vad_min_speech_ms,
+            ws_vad_engine,
+        )?;
         let flags = finalise_flags(
             flags,
             &self.client,
             resolved_ws_uri.clone(),
+            overrides,
             source_ip.as_deref(),
             &profile_name,
         )?;
@@ -902,7 +1144,8 @@ impl PyRtpEngine {
 
     /// Send a `play media` command — inject an audio prompt into the call.
     ///
-    /// Exactly one of ``file``, ``blob``, or ``db_id`` must be supplied.
+    /// Exactly one of ``file``, ``blob``, ``db_id``, ``tone`` or ``url`` must be
+    /// supplied.
     ///
     /// Per rtpengine semantics, ``from-tag`` selects the monologue whose
     /// outgoing audio is replaced by the prompt — the peer of that monologue
@@ -920,6 +1163,24 @@ impl PyRtpEngine {
     ///     file: Absolute path to an audio file on the rtpengine host.
     ///     blob: Raw audio bytes to play (e.g. TTS output).
     ///     db_id: Reference to a prompt stored in rtpengine's prompt DB.
+    ///     tone: A synthesised call-progress tone — no audio file to provision.
+    ///           Either a preset name (``"ringback_eu"``, ``"busy_na"``,
+    ///           ``"dial_uk"``, …) or an explicit cadence spec in the engine's
+    ///           tone grammar (``"425/1000,0/4000*inf"`` = 425 Hz one second on,
+    ///           four seconds off, forever). The two are told apart by the
+    ///           ``/``. Rendered at the leg's codec rate, so never resampled.
+    ///           Native **siphon-rtp** backend only.
+    ///     url: An ``http://`` / ``https://`` WAV the **engine** fetches from its
+    ///          own network position. The fetch is bounded engine-side (connect,
+    ///          first-byte, overall deadline, size cap, redirect cap) and runs
+    ///          off the media path, so a URL that never answers ends the
+    ///          *playback*, never the leg — it comes back as a play that
+    ///          produced no audio rather than a stalled call. The accept carries
+    ///          no duration (the length is unknown until the body arrives).
+    ///          Native **siphon-rtp** backend only.
+    ///     gain_decibels: Playout gain in whole decibels relative to the
+    ///           source's own level, clamped engine-side to −60..=+12. Native
+    ///           **siphon-rtp** backend only.
     ///     repeat: Number of times to repeat the prompt (default: 1).
     ///     start_ms: Offset into the file at which to start (milliseconds).
     ///     duration_ms: Cap on playback length (milliseconds).
@@ -937,7 +1198,7 @@ impl PyRtpEngine {
     ///     The played duration in milliseconds if the engine reports one, else
     ///     ``None`` (also ``None`` when the prompt was stopped / superseded before
     ///     it finished, or the fallback timeout elapsed).
-    #[pyo3(signature = (target, file=None, blob=None, db_id=None, repeat=None, start_ms=None, duration_ms=None, to_tag=None, wait=true))]
+    #[pyo3(signature = (target, file=None, blob=None, db_id=None, tone=None, url=None, repeat=None, start_ms=None, duration_ms=None, gain_decibels=None, to_tag=None, wait=true))]
     #[allow(clippy::too_many_arguments)]
     fn play_media<'py>(
         &self,
@@ -946,20 +1207,23 @@ impl PyRtpEngine {
         file: Option<String>,
         blob: Option<Vec<u8>>,
         db_id: Option<u64>,
+        tone: Option<String>,
+        url: Option<String>,
         repeat: Option<u64>,
         start_ms: Option<u64>,
         duration_ms: Option<u64>,
+        gain_decibels: Option<i32>,
         to_tag: Option<String>,
         wait: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let source = resolve_play_media_source(file, blob, db_id)?;
+        let source = resolve_play_media_source(file, blob, db_id, tone, url)?;
 
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
 
         let client = Arc::clone(&self.client);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            let duration = client
+            let outcome = client
                 .play_media(
                     &call_id,
                     &from_tag,
@@ -968,6 +1232,9 @@ impl PyRtpEngine {
                     start_ms,
                     duration_ms,
                     to_tag.as_deref(),
+                    // Superseding playback — `play_overlay` is the additive twin.
+                    false,
+                    gain_decibels,
                     wait,
                 )
                 .await
@@ -976,30 +1243,185 @@ impl PyRtpEngine {
                         "rtpengine.play_media failed: {error}"
                     ))
                 })?;
-            debug!(call_id = %call_id, duration_ms = ?duration, "rtpengine play_media");
-            Ok(duration)
+            debug!(
+                call_id = %call_id,
+                duration_ms = ?outcome.duration_ms,
+                "rtpengine play_media"
+            );
+            Ok(outcome.duration_ms)
         })
     }
 
-    /// Send a `stop media` command — stop any prompt currently playing on the
-    /// monologue selected by the SIP object's From-tag.
-    #[pyo3(signature = (target,))]
+    /// Start an **overlay** playback — mix audio *under* the party's live egress
+    /// instead of replacing it, and return its ``play_id`` handle.
+    ///
+    /// The additive twin of :meth:`play_media`. Where ``play_media`` answers
+    /// "how long did it play", this answers "which playback is it", because that
+    /// is what an overlay is for: a music bed you will duck with
+    /// :meth:`set_play_gain` and stop individually with
+    /// ``stop_media(target, play_id=...)``.
+    ///
+    /// Up to **four** overlays run concurrently per direction, each with its own
+    /// ``play_id`` and its own completion. Starting a fifth is rejected rather
+    /// than displacing one — a script that lost a playback it believes is
+    /// running has no way to notice. An overlay never supersedes anything,
+    /// including another overlay.
+    ///
+    /// Returns immediately on the engine's accept (an overlay is background
+    /// audio; there is no ``wait``). Native **siphon-rtp** backend only.
+    ///
+    /// ```python,ignore
+    /// bed = await rtpengine.play_overlay(call, file="/prompts/hold.wav", repeat=0)
+    /// await rtpengine.play_media(call, file="/prompts/agent.wav")
+    /// await rtpengine.set_play_gain(call, bed, -18)   # duck the bed
+    /// await rtpengine.stop_media(call, play_id=bed)
+    /// ```
+    ///
+    /// Args:
+    ///     target: Request, Reply, or Call object.
+    ///     file / blob / db_id / tone / url: exactly one, as for
+    ///         :meth:`play_media`.
+    ///     repeat: Number of times to repeat.
+    ///     start_ms: Offset into the source at which to start.
+    ///     duration_ms: Hard playout cap — the only bound, short of a stop, on
+    ///         an endless (``*inf``) tone.
+    ///     gain_decibels: Playout gain relative to the source's own level,
+    ///         clamped engine-side to −60..=+12.
+    ///     to_tag: Optional peer tag for MPTY scoping.
+    ///
+    /// Returns:
+    ///     The ``play_id`` of the started overlay, or ``None`` if the engine
+    ///     assigned none.
+    #[pyo3(signature = (target, file=None, blob=None, db_id=None, tone=None, url=None, repeat=None, start_ms=None, duration_ms=None, gain_decibels=None, to_tag=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn play_overlay<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+        file: Option<String>,
+        blob: Option<Vec<u8>>,
+        db_id: Option<u64>,
+        tone: Option<String>,
+        url: Option<String>,
+        repeat: Option<u64>,
+        start_ms: Option<u64>,
+        duration_ms: Option<u64>,
+        gain_decibels: Option<i32>,
+        to_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let source = resolve_play_media_source(file, blob, db_id, tone, url)?;
+
+        let (call_id, from_tag) = resolve_call_from_tag(target)?;
+
+        let client = Arc::clone(&self.client);
+
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            let outcome = client
+                .play_media(
+                    &call_id,
+                    &from_tag,
+                    &source,
+                    repeat,
+                    start_ms,
+                    duration_ms,
+                    to_tag.as_deref(),
+                    true,
+                    gain_decibels,
+                    // An overlay is background audio: blocking until it drains
+                    // would defeat the point (and an endless tone never drains).
+                    false,
+                )
+                .await
+                .map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "rtpengine.play_overlay failed: {error}"
+                    ))
+                })?;
+            debug!(
+                call_id = %call_id,
+                play_id = ?outcome.play_id,
+                "rtpengine play_overlay"
+            );
+            Ok(outcome.play_id)
+        })
+    }
+
+    /// Send a `stop media` command — stop prompt playback on the monologue
+    /// selected by the SIP object's From-tag.
+    ///
+    /// ``play_id`` stops one specific playback (an individual overlay slot, from
+    /// :meth:`play_overlay`); omitting it stops everything playing on the leg.
+    /// A ``play_id`` is native **siphon-rtp** only — the other backends have no
+    /// handle on an individual playback, and are refused rather than widened
+    /// into "stop everything", which would kill playbacks the script meant to
+    /// keep running.
+    #[pyo3(signature = (target, play_id=None))]
     fn stop_media<'py>(
         &self,
         python: Python<'py>,
         target: &Bound<'py, PyAny>,
+        play_id: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
 
         let client = Arc::clone(&self.client);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            client.stop_media(&call_id, &from_tag).await.map_err(|error| {
+            client.stop_media(&call_id, &from_tag, play_id).await.map_err(|error| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!(
                     "rtpengine.stop_media failed: {error}"
                 ))
             })?;
-            debug!(call_id = %call_id, "rtpengine stop_media");
+            debug!(call_id = %call_id, play_id = ?play_id, "rtpengine stop_media");
+            Ok(true)
+        })
+    }
+
+    /// Retune the playout gain of a playback that is already running — how a
+    /// script ducks a music bed under a prompt and lifts it again afterwards.
+    ///
+    /// A separate verb rather than a field on :meth:`play_media` because
+    /// ``play_media`` is a *start*: reusing it would mean "start another
+    /// playback", not "change this one".
+    ///
+    /// The engine answers an error when no playback on the call holds that
+    /// ``play_id``, so a stale handle raises rather than silently doing nothing.
+    /// Native **siphon-rtp** backend only.
+    ///
+    /// Args:
+    ///     target: Request, Reply, or Call object.
+    ///     play_id: The running playback to retune, from :meth:`play_overlay`.
+    ///     gain_decibels: New gain in whole decibels, clamped engine-side to
+    ///         −60..=+12.
+    ///     to_tag: Optional peer tag for MPTY scoping.
+    #[pyo3(signature = (target, play_id, gain_decibels, to_tag=None))]
+    fn set_play_gain<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+        play_id: u64,
+        gain_decibels: i32,
+        to_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (call_id, from_tag) = resolve_call_from_tag(target)?;
+
+        let client = Arc::clone(&self.client);
+
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            client
+                .set_play_gain(&call_id, &from_tag, play_id, gain_decibels, to_tag.as_deref())
+                .await
+                .map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "rtpengine.set_play_gain failed: {error}"
+                    ))
+                })?;
+            debug!(
+                call_id = %call_id,
+                play_id,
+                gain_decibels,
+                "rtpengine set_play_gain"
+            );
             Ok(true)
         })
     }
@@ -1314,7 +1736,12 @@ impl PyRtpEngine {
     ///         stereo, ``1`` mixes them to mono.  Only meaningful with
     ///         ``direction="both"``; a single-leg tee is always mono.  ``None``
     ///         (default) leaves the engine's choice: 2 for both legs, 1 for one.
-    #[pyo3(signature = (target, ws_uri, direction="both", channels=None))]
+    ///     sample_rate: L16 wire sample rate in Hz, independent of the legs'
+    ///         codec rates — the engine resamples the teed copy into it. Must be
+    ///         a multiple of 1000 within 8000–48000; the engine *fails* the
+    ///         attach on anything else rather than clamping, so it is checked
+    ///         here first. ``None`` (default) leaves the engine's choice.
+    #[pyo3(signature = (target, ws_uri, direction="both", channels=None, sample_rate=None))]
     fn attach_ws_tee<'py>(
         &self,
         python: Python<'py>,
@@ -1322,6 +1749,7 @@ impl PyRtpEngine {
         ws_uri: String,
         direction: &str,
         channels: Option<u8>,
+        sample_rate: Option<u32>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
 
@@ -1342,11 +1770,22 @@ impl PyRtpEngine {
             }
         }
 
+        // Same reason as `channels`: the engine fails the attach on a bad rate
+        // rather than clamping, so catching it here gives the script the precise
+        // rule instead of a generic engine rejection.
+        if let Some(rate) = sample_rate {
+            validate_ws_sample_rate(rate).map_err(|reason| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "rtpengine.attach_ws_tee sample_rate {reason}"
+                ))
+            })?;
+        }
+
         let client = Arc::clone(&self.client);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
             client
-                .attach_ws_tee(&call_id, &from_tag, &ws_uri, direction, channels)
+                .attach_ws_tee(&call_id, &from_tag, &ws_uri, direction, channels, sample_rate)
                 .await
                 .map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -1359,6 +1798,7 @@ impl PyRtpEngine {
                 ws_uri = %ws_uri,
                 direction = %direction.as_str(),
                 ?channels,
+                ?sample_rate,
                 "rtpengine attach_ws_tee"
             );
             Ok(true)
@@ -1643,6 +2083,73 @@ def make_decorator(call_id, from_tag):
 
         // Support both `@on_ws_tee_started` (bare) and
         // `@on_ws_tee_started(call_id=...)` forms.
+        match func_or_none {
+            Some(func) => decorator.call1((func.bind(python),)),
+            None => Ok(decorator),
+        }
+    }
+
+    /// Register a handler for **record-tone (voicemail beep)** events.
+    ///
+    /// Fires when the engine hears the short single tone an answering machine
+    /// plays before it starts recording, on a leg whose media profile set
+    /// ``beep_detection``.  This is the *media* half of answering-machine
+    /// detection: a script can abort an attended transfer here instead of
+    /// bridging the caller into a voicemail box.
+    ///
+    /// Arm it **per leg** — the profile used toward the callee is what watches
+    /// the party that might be a machine.  It fires **once per leg per call**
+    /// (the engine drops the detector after the first tone, so a handler never
+    /// has to de-duplicate, and there is no mid-call re-arm).
+    ///
+    /// ``offset_ms`` is how much decoded audio was seen on the leg before the
+    /// tone **started** — the offset of the tone itself, *not* of this event.
+    /// The event trails it by roughly the profile's ``beep_cadence_guard_ms``
+    /// (4500 ms by default), which is the detector's cadence guard *and* its
+    /// detection latency.
+    ///
+    /// Delivered by the native **siphon-rtp** backend only.
+    ///
+    /// ```python,ignore
+    /// @rtpengine.on_beep
+    /// def machine(call_id, from_tag, to_tag, frequency_hz, duration_ms, offset_ms):
+    ///     log.info(f"{call_id}: answering machine ({frequency_hz:.0f} Hz)")
+    ///     b2bua.terminate(call_id, "Answering machine detected")
+    /// ```
+    ///
+    /// Args:
+    ///     func_or_none: When applied directly (``@rtpengine.on_beep``) this is
+    ///         the function.  When called with keyword filters the return value
+    ///         is a decorator.
+    ///     call_id: Optional engine call-id filter.
+    ///     from_tag: Optional from-tag filter.
+    #[pyo3(signature = (func_or_none=None, *, call_id=None, from_tag=None))]
+    fn on_beep<'py>(
+        &self,
+        python: Python<'py>,
+        func_or_none: Option<Py<PyAny>>,
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let code = r#"
+def make_decorator(call_id, from_tag):
+    import asyncio
+    import _siphon_registry
+    def decorator(fn):
+        is_async = asyncio.iscoroutinefunction(fn)
+        metadata = {"call_id": call_id, "from_tag": from_tag}
+        _siphon_registry.register("rtpengine.on_beep", None, fn, is_async, metadata)
+        return fn
+    return decorator
+"#;
+        let globals = PyDict::new(python);
+        python.run(&std::ffi::CString::new(code)?, Some(&globals), None)?;
+        let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("failed to build on_beep decorator")
+        })?;
+        let decorator = make_decorator.call1((call_id, from_tag))?;
+
+        // Support both `@on_beep` (bare) and `@on_beep(call_id=...)` forms.
         match func_or_none {
             Some(func) => decorator.call1((func.bind(python),)),
             None => Ok(decorator),
@@ -2041,6 +2548,8 @@ mod tests {
             Some("/tmp/a.wav".to_string()),
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
         assert!(matches!(source, PlayMediaSource::File(ref path) if path == "/tmp/a.wav"));
@@ -2053,6 +2562,8 @@ mod tests {
             None,
             Some(vec![0x00, 0xff]),
             None,
+            None,
+            None,
         )
         .unwrap();
         assert!(matches!(source, PlayMediaSource::Blob(ref bytes) if bytes == &[0x00, 0xff]));
@@ -2061,14 +2572,173 @@ mod tests {
     #[test]
     fn resolve_play_media_source_db_id() {
         pyo3::Python::initialize();
-        let source = resolve_play_media_source(None, None, Some(7)).unwrap();
+        let source = resolve_play_media_source(None, None, Some(7), None, None).unwrap();
         assert!(matches!(source, PlayMediaSource::DbId(7)));
+    }
+
+    #[test]
+    fn resolve_play_media_source_tone_preset_and_cadence() {
+        pyo3::Python::initialize();
+        // Both forms are accepted verbatim — the engine tells them apart by the
+        // `/`, and siphon deliberately keeps no copy of the preset table, which
+        // would go stale the first time the engine adds a preset.
+        let preset =
+            resolve_play_media_source(None, None, None, Some("ringback_eu".to_string()), None)
+                .unwrap();
+        assert!(matches!(preset, PlayMediaSource::Tone(ref t) if t == "ringback_eu"));
+
+        let cadence = resolve_play_media_source(
+            None,
+            None,
+            None,
+            Some("425/1000,0/4000*inf".to_string()),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(cadence, PlayMediaSource::Tone(ref t) if t == "425/1000,0/4000*inf"));
+    }
+
+    #[test]
+    fn resolve_play_media_source_empty_tone_rejected() {
+        pyo3::Python::initialize();
+        let error =
+            resolve_play_media_source(None, None, None, Some("   ".to_string()), None).unwrap_err();
+        Python::attach(|py| {
+            assert!(error.value(py).to_string().contains("tone="));
+        });
+    }
+
+    #[test]
+    fn resolve_play_media_source_http_url() {
+        pyo3::Python::initialize();
+        for url in [
+            "http://prompts.invalid/a.wav",
+            "https://prompts.invalid/a.wav",
+            // Scheme match is case-insensitive, but the URL is passed through
+            // unchanged — the engine, not siphon, is what fetches it.
+            "HTTPS://prompts.invalid/a.wav",
+        ] {
+            let source =
+                resolve_play_media_source(None, None, None, None, Some(url.to_string())).unwrap();
+            assert!(matches!(source, PlayMediaSource::Http(ref got) if got == url));
+        }
+    }
+
+    #[test]
+    fn resolve_play_media_source_non_http_url_rejected() {
+        pyo3::Python::initialize();
+        for url in ["file:///etc/passwd", "ftp://host/a.wav", "prompts/a.wav"] {
+            let error =
+                resolve_play_media_source(None, None, None, None, Some(url.to_string()))
+                    .unwrap_err();
+            Python::attach(|py| {
+                assert!(
+                    error.value(py).to_string().contains("http://"),
+                    "error must state the accepted schemes for {url}"
+                );
+            });
+        }
+    }
+
+    /// The new sources join the same exactly-one rule as the old ones, so a
+    /// script cannot send an ambiguous command.
+    #[test]
+    fn resolve_play_media_source_tone_and_url_are_mutually_exclusive() {
+        pyo3::Python::initialize();
+        let error = resolve_play_media_source(
+            None,
+            None,
+            None,
+            Some("ringback_eu".to_string()),
+            Some("https://prompts.invalid/a.wav".to_string()),
+        )
+        .unwrap_err();
+        Python::attach(|py| {
+            assert!(error.value(py).to_string().contains("exactly one"));
+        });
+
+        let with_file = resolve_play_media_source(
+            Some("/tmp/a.wav".to_string()),
+            None,
+            None,
+            Some("ringback_eu".to_string()),
+            None,
+        )
+        .unwrap_err();
+        Python::attach(|py| {
+            assert!(with_file.value(py).to_string().contains("exactly one"));
+        });
+    }
+
+    /// A per-call override must reach the flags, and a bad one must raise rather
+    /// than reach an engine that would fail the whole offer.
+    #[test]
+    fn media_overrides_apply_and_validate() {
+        pyo3::Python::initialize();
+
+        let overrides = MediaOverrides::parse(
+            Some(true),
+            Some(3_000),
+            Some(16_000),
+            Some(48_000),
+            Some(80),
+            Some("neural"),
+        )
+        .unwrap();
+        let mut flags = NgFlags::default();
+        overrides.apply(&mut flags).unwrap();
+        assert!(flags.beep_detection);
+        assert_eq!(flags.beep_cadence_guard_ms, Some(3_000));
+        assert_eq!(flags.ws_sample_rate, Some(16_000));
+        assert_eq!(flags.ws_tee_sample_rate, Some(48_000));
+        assert_eq!(flags.ws_vad_min_speech_ms, Some(80));
+        assert_eq!(flags.ws_vad_engine, Some(WsVadEngine::Neural));
+
+        // Nothing set → the profile is left exactly as it was.
+        let mut untouched = NgFlags {
+            beep_detection: true,
+            ws_sample_rate: Some(24_000),
+            ..NgFlags::default()
+        };
+        MediaOverrides::default().apply(&mut untouched).unwrap();
+        assert!(untouched.beep_detection);
+        assert_eq!(untouched.ws_sample_rate, Some(24_000));
+
+        // An explicit `beep_detection=False` must be able to turn OFF a profile
+        // that had it on — the reason the field is `Option<bool>` and not `bool`.
+        let mut disarmed = NgFlags {
+            beep_detection: true,
+            ..NgFlags::default()
+        };
+        MediaOverrides::parse(Some(false), None, None, None, None, None)
+            .unwrap()
+            .apply(&mut disarmed)
+            .unwrap();
+        assert!(!disarmed.beep_detection);
+    }
+
+    #[test]
+    fn media_overrides_reject_bad_values() {
+        pyo3::Python::initialize();
+
+        let bad_rate =
+            MediaOverrides::parse(None, None, Some(44_100), None, None, None).unwrap_err();
+        let bad_tee_rate =
+            MediaOverrides::parse(None, None, None, Some(96_000), None, None).unwrap_err();
+        let bad_engine =
+            MediaOverrides::parse(None, None, None, None, None, Some("telepathy")).unwrap_err();
+
+        Python::attach(|py| {
+            assert!(bad_rate.value(py).to_string().contains("ws_sample_rate"));
+            assert!(bad_tee_rate.value(py).to_string().contains("ws_tee_sample_rate"));
+            assert!(bad_engine.value(py).to_string().contains("ws_vad_engine"));
+        });
     }
 
     #[test]
     fn resolve_play_media_source_none_rejected() {
         pyo3::Python::initialize();
-        let error = resolve_play_media_source(None, None, None).unwrap_err();
+        let error = resolve_play_media_source(None, None, None, None, None).unwrap_err();
         Python::attach(|py| {
             assert!(error.value(py).to_string().contains("exactly one"));
         });
@@ -2081,12 +2751,16 @@ mod tests {
             Some("/tmp/a.wav".to_string()),
             Some(vec![0x00]),
             None,
+            None,
+            None,
         )
         .unwrap_err();
         let error_file_and_db = resolve_play_media_source(
             Some("/tmp/a.wav".to_string()),
             None,
             Some(1),
+            None,
+            None,
         )
         .unwrap_err();
         Python::attach(|py| {

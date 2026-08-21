@@ -23,11 +23,52 @@ use super::profile::NgFlags;
 /// - `File` — absolute path on the rtpengine host
 /// - `Blob` — raw audio bytes embedded in the ng command (binary-safe via bencode)
 /// - `DbId` — reference to a prompt stored in rtpengine's internal database
+/// - `Tone` — a synthesised call-progress tone (`siphon-rtp` only)
+/// - `Http` — a WAV the *engine* fetches over HTTP(S) (`siphon-rtp` only)
 #[derive(Debug, Clone)]
 pub enum PlayMediaSource {
     File(String),
     Blob(Vec<u8>),
     DbId(u64),
+    /// A synthesised call-progress tone — no audio file to ship or provision.
+    ///
+    /// Either a **preset name** (`ringback_eu`, `busy_na`, `dial_uk`, …) or an
+    /// explicit **cadence spec** in the engine's tone grammar, e.g.
+    /// `425/1000,0/4000*inf` for 425 Hz one second on, four seconds off,
+    /// forever.  The two are told apart by the `/`: a preset name never contains
+    /// one and a cadence spec is never valid without one.  Rendered directly at
+    /// the leg's codec rate, so it is never resampled.
+    ///
+    /// A native `siphon-rtp` extension — the NG/bencode and rtpproxy backends
+    /// have no equivalent.
+    Tone(String),
+    /// A WAV fetched over HTTP(S) **by the engine**, from the engine's own
+    /// network position.
+    ///
+    /// siphon never performs this fetch: it passes the URL and the engine
+    /// bounds it (connect timeout, first-byte timeout, overall deadline,
+    /// response-size cap, redirect cap — all daemon-side settings) off the media
+    /// path, so a URL that never answers can never stall the leg.  The accept is
+    /// immediate with no duration (the length is unknown until the body
+    /// arrives); a fetch that fails for any reason ends the playback with a
+    /// play-finished `error` reason carrying the same `play_id`.
+    ///
+    /// A native `siphon-rtp` extension — the NG/bencode and rtpproxy backends
+    /// have no equivalent.
+    Http(String),
+}
+
+impl PlayMediaSource {
+    /// The source's name as it appears in the scripting API, for error text.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::File(_) => "file",
+            Self::Blob(_) => "blob",
+            Self::DbId(_) => "db_id",
+            Self::Tone(_) => "tone",
+            Self::Http(_) => "url",
+        }
+    }
 }
 
 /// Async client for the RTPEngine NG control protocol.
@@ -186,6 +227,22 @@ impl RtpEngineClient {
             }
             PlayMediaSource::DbId(id) => {
                 pairs.push(("db-id", BencodeValue::Integer(*id as i64)));
+            }
+            // Native siphon-rtp sources with no NG equivalent.  Refused rather
+            // than dropped: silently omitting the source would send a `play
+            // media` with no source at all, which the engine either rejects
+            // opaquely or answers with a play that never produces audio.
+            PlayMediaSource::Tone(_) => {
+                return Err(RtpEngineError::Unsupported {
+                    operation: "play_media(tone=...)",
+                    backend: "rtpengine",
+                });
+            }
+            PlayMediaSource::Http(_) => {
+                return Err(RtpEngineError::Unsupported {
+                    operation: "play_media(url=...)",
+                    backend: "rtpengine",
+                });
             }
         }
         if let Some(repeat) = repeat_times {

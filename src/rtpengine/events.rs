@@ -58,6 +58,10 @@ pub enum RtpEngineEvent {
     /// Emitted exactly once per started tee, so a script learns the stream died
     /// rather than silently losing audio.  `siphon-rtp` native backend only.
     WsTeeEnded(WsTeeEnded),
+    /// A record tone (the "voicemail beep") was detected on a leg armed with
+    /// `beep_detection` — the media half of answering-machine detection.
+    /// Emitted once per leg per call.  `siphon-rtp` native backend only.
+    BeepDetected(BeepDetectedEvent),
     /// An event we didn't recognise — passed through for logging.
     Unknown {
         event: String,
@@ -206,6 +210,34 @@ pub struct WsTeeStarted {
     pub channels: u8,
     /// Wire sample rate in Hz (L16, little-endian).
     pub sample_rate: u32,
+}
+
+/// A record tone was detected on a leg, carried by
+/// [`RtpEngineEvent::BeepDetected`].  A siphon-side mirror of the native
+/// backend's `siphon_rtp_proto::Event::BeepDetected` payload, keeping this
+/// generic event enum free of the proto type.
+///
+/// The engine drops the detector after the first tone, so this arrives **once
+/// per leg per call** and a consumer never has to de-duplicate.
+#[derive(Debug, Clone)]
+pub struct BeepDetectedEvent {
+    /// SIP Call-ID the media session is keyed on.
+    pub call_id: String,
+    /// The leg the tone was heard *on* — arming `beep_detection` on the profile
+    /// used toward the callee is what watches the party that might be a machine.
+    pub from_tag: String,
+    /// Optional peer tag, matching the `Dtmf` event's triple.
+    pub to_tag: Option<String>,
+    /// Measured tone frequency in Hz (sub-bin accurate, typically within a few Hz).
+    pub frequency_hz: f32,
+    /// Measured tone length in milliseconds, accurate to about one analysis
+    /// window (±32 ms).
+    pub duration_ms: u32,
+    /// Milliseconds of decoded audio seen on this leg before the tone
+    /// **started** — the offset of the tone itself, *not* of the event.  The
+    /// event is emitted after the detector's cadence guard has elapsed, so it
+    /// always trails this by roughly `beep_cadence_guard_ms`.
+    pub offset_ms: u64,
 }
 
 /// A WebSocket tee stopped, carried by [`RtpEngineEvent::WsTeeEnded`].

@@ -220,13 +220,22 @@ fn parse_play_source(
     let file = args.get("file").and_then(|value| value.as_str());
     let db_id = args.get("db_id").and_then(|value| value.as_u64());
     let blob = args.get("blob").and_then(|value| value.as_str());
-    let count = [file.is_some(), db_id.is_some(), blob.is_some()]
-        .iter()
-        .filter(|present| **present)
-        .count();
+    let tone = args.get("tone").and_then(|value| value.as_str());
+    let url = args.get("url").and_then(|value| value.as_str());
+    let count = [
+        file.is_some(),
+        db_id.is_some(),
+        blob.is_some(),
+        tone.is_some(),
+        url.is_some(),
+    ]
+    .iter()
+    .filter(|present| **present)
+    .count();
     if count != 1 {
         return Err(
-            "play requires exactly one of args.file (path), args.db_id (int), or args.blob (base64)"
+            "play requires exactly one of args.file (path), args.db_id (int), args.blob \
+             (base64), args.tone (preset or cadence spec), or args.url (http/https)"
                 .to_string(),
         );
     }
@@ -235,6 +244,19 @@ fn parse_play_source(
     }
     if let Some(id) = db_id {
         return Ok(PlayMediaSource::DbId(id));
+    }
+    if let Some(spec) = tone {
+        if spec.trim().is_empty() {
+            return Err("play args.tone must be a preset name or a cadence spec".to_string());
+        }
+        return Ok(PlayMediaSource::Tone(spec.to_string()));
+    }
+    if let Some(location) = url {
+        let lowered = location.trim().to_ascii_lowercase();
+        if !(lowered.starts_with("http://") || lowered.starts_with("https://")) {
+            return Err("play args.url must be an http:// or https:// URL".to_string());
+        }
+        return Ok(PlayMediaSource::Http(location.to_string()));
     }
     if let Some(encoded) = blob {
         use base64::Engine as _;
@@ -290,6 +312,12 @@ async fn play(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
             start_ms,
             duration_ms,
             to_tag.as_deref(),
+            // The control plane's `play` is a supersede, matching its documented
+            // "start an announcement" shape; overlays are a scripting-API verb.
+            false,
+            args.get("gain_decibels")
+                .and_then(|value| value.as_i64())
+                .and_then(|value| i32::try_from(value).ok()),
             false,
         )
         .await
@@ -307,7 +335,7 @@ async fn stop(channel: &ChannelRef) -> ControlResult {
         Ok(target) => target,
         Err(result) => return result,
     };
-    match backend.stop_media(&call_id, &from_tag).await {
+    match backend.stop_media(&call_id, &from_tag, None).await {
         Ok(()) => ControlResult::Ok(
             serde_json::json!({ "channel": channel.channel_id, "state": "stopped" }),
         ),
@@ -414,13 +442,35 @@ async fn stream_start(channel: &ChannelRef, args: &serde_json::Value) -> Control
         Ok(channels) => channels,
         Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
     };
+    // Rejected here rather than at the engine, which fails the attach on a bad
+    // rate rather than clamping — the controller gets the rule, not a generic
+    // engine refusal.
+    let sample_rate = match args.get("sample_rate") {
+        None => None,
+        Some(value) if value.is_null() => None,
+        Some(value) => {
+            let Some(rate) = value.as_u64().and_then(|rate| u32::try_from(rate).ok()) else {
+                return ControlResult::error(
+                    ControlErrorCode::BadRequest,
+                    "stream_start args.sample_rate must be an integer".to_string(),
+                );
+            };
+            if let Err(reason) = crate::rtpengine::profile::validate_ws_sample_rate(rate) {
+                return ControlResult::error(
+                    ControlErrorCode::BadRequest,
+                    format!("stream_start args.sample_rate {reason}"),
+                );
+            }
+            Some(rate)
+        }
+    };
 
     let (backend, call_id, from_tag) = match media_target(channel) {
         Ok(target) => target,
         Err(result) => return result,
     };
     match backend
-        .attach_ws_tee(&call_id, &from_tag, &ws_uri, direction, channels)
+        .attach_ws_tee(&call_id, &from_tag, &ws_uri, direction, channels, sample_rate)
         .await
     {
         Ok(()) => ControlResult::Ok(

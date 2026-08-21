@@ -6,7 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::path::Path;
 use std::sync::LazyLock;
 use crate::error::{Result, SiphonError};
-use crate::rtpengine::profile::WsTeeDirection;
+use crate::rtpengine::profile::{validate_ws_sample_rate, WsTeeDirection, WsVadEngine};
 
 // ---------------------------------------------------------------------------
 // Environment variable expansion — `${VAR}` and `${VAR:-default}`
@@ -2040,6 +2040,21 @@ impl MediaBackendKind {
             if flags.ws_vad_hangover_ms.is_some() {
                 unsupported.push("ws_vad_hangover_ms");
             }
+            if flags.ws_sample_rate.is_some() {
+                unsupported.push("ws_sample_rate");
+            }
+            if flags.ws_vad_engine.is_some() {
+                unsupported.push("ws_vad_engine");
+            }
+            if flags.ws_vad_min_speech_ms.is_some() {
+                unsupported.push("ws_vad_min_speech_ms");
+            }
+            if flags.beep_detection {
+                unsupported.push("beep_detection");
+            }
+            if flags.beep_cadence_guard_ms.is_some() {
+                unsupported.push("beep_cadence_guard_ms");
+            }
             if flags.noise_suppression {
                 unsupported.push("noise_suppression");
             }
@@ -2054,6 +2069,9 @@ impl MediaBackendKind {
             }
             if flags.ws_tee_channels.is_some() {
                 unsupported.push("ws_tee_channels");
+            }
+            if flags.ws_tee_sample_rate.is_some() {
+                unsupported.push("ws_tee_sample_rate");
             }
             if flags.text_events {
                 unsupported.push("text_events");
@@ -2406,6 +2424,75 @@ where
     })
 }
 
+/// Accept `energy` / `neural` case-insensitively for `ws_vad_engine`.
+///
+/// A detector the engine would reject is a config error rather than a value
+/// relayed onto the wire, matching `ws_tee_direction` above.  It is deliberately
+/// *not* forgiving: falling back to a detector the operator was explicitly
+/// avoiding is the silent downgrade the media engine already refuses.
+fn deserialize_ws_vad_engine<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<WsVadEngine>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de;
+
+    let value: Option<String> = Option::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    WsVadEngine::parse(&value).map(Some).ok_or_else(|| {
+        de::Error::custom(format!(
+            "media profile ws_vad_engine must be one of {}, got {value:?}",
+            WsVadEngine::VALUES.join(" / ")
+        ))
+    })
+}
+
+/// Validate `ws_sample_rate` at config load.
+///
+/// The media engine *fails* an offer/answer carrying an out-of-range rate rather
+/// than clamping it, so a profile with a bad value produces calls that answer
+/// and never get media.  Rejecting at load means the operator learns at boot.
+fn deserialize_ws_sample_rate<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_checked_sample_rate(deserializer, "ws_sample_rate")
+}
+
+/// Validate `ws_tee_sample_rate` at config load — same rule, same reason.
+fn deserialize_ws_tee_sample_rate<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_checked_sample_rate(deserializer, "ws_tee_sample_rate")
+}
+
+/// Shared body for the two L16 wire-rate fields, so the rule lives in one place.
+fn deserialize_checked_sample_rate<'de, D>(
+    deserializer: D,
+    field: &str,
+) -> std::result::Result<Option<u32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de;
+
+    let value: Option<u32> = Option::deserialize(deserializer)?;
+    let Some(rate) = value else {
+        return Ok(None);
+    };
+    validate_ws_sample_rate(rate)
+        .map_err(|reason| de::Error::custom(format!("media profile {field} {reason}")))?;
+    Ok(Some(rate))
+}
+
 /// A user-defined RTPEngine media profile with separate offer/answer NG flags.
 #[derive(Debug, Deserialize, Clone)]
 pub struct MediaProfileConfig {
@@ -2480,9 +2567,57 @@ pub struct NgFlagsConfig {
     pub ws_vad_threshold: Option<i64>,
     /// Trailing hangover for the WebSocket uplink VAD in milliseconds — how long
     /// speech is held after energy drops before the turn endpoint fires.  Unset
-    /// uses the engine default.
+    /// uses the engine default.  Only meaningful with the `energy` detector;
+    /// `neural` holds speech with its own probability hysteresis.
     #[serde(default)]
     pub ws_vad_hangover_ms: Option<u32>,
+    /// L16 wire sample rate in Hz for the `ws_uri` takeover bridge, independent
+    /// of the leg's codec rate and applied in both directions (uplink resampled
+    /// into it, downlink resampled back before re-encoding).  So an 8 kHz G.711
+    /// call can speak 16 kHz to the server, and a server rendering 24 kHz audio
+    /// plays at the right speed and pitch.
+    ///
+    /// Also the domain the noise suppressor and echo canceller run in, and those
+    /// engage only at 8 or 16 kHz.  Must be a multiple of 1000 within
+    /// 8000–48000 — the engine *fails* the offer rather than clamping, so a bad
+    /// value is rejected here at boot.  Inert without `ws_uri`.  `siphon-rtp`
+    /// backend only.
+    #[serde(default, deserialize_with = "deserialize_ws_sample_rate")]
+    pub ws_sample_rate: Option<u32>,
+    /// Which detector the WebSocket uplink VAD runs: `energy` (default, cheap,
+    /// but any loud sound reads as speech) or `neural` (answers "is this
+    /// speech", so it does not turn-start on noise).  Inert without `ws_vad` /
+    /// `ws_barge_in`.  `siphon-rtp` backend only.
+    #[serde(default, deserialize_with = "deserialize_ws_vad_engine")]
+    pub ws_vad_engine: Option<WsVadEngine>,
+    /// **Leading** minimum-speech run in milliseconds: how long the uplink must
+    /// read as speech *continuously* before the speech-start edge (and barge-in)
+    /// fires.  Distinct from the trailing `ws_vad_hangover_ms`.
+    ///
+    /// Unset means no leading requirement — the edge fires on the first speech
+    /// frame, which is what lets a cough or one burst of echo interrupt a
+    /// prompt.  Rounded up to whole ptime frames and added directly to
+    /// turn-start latency, so 60–120 ms is the useful range.  `siphon-rtp` only.
+    #[serde(default)]
+    pub ws_vad_min_speech_ms: Option<u32>,
+    /// Watch this leg's decoded ingress audio for the short tone an answering
+    /// machine plays before recording (the "voicemail beep") and deliver it to
+    /// `@rtpengine.on_beep` — the media half of answering-machine detection.
+    ///
+    /// Set per leg, so arming it on the profile used toward the callee is what
+    /// watches the party that might be a machine.  Needs decoded audio, so it
+    /// promotes a same-codec plaintext call onto the userspace pipeline, and it
+    /// is inert unless the codec's native rate is 8 or 16 kHz.  Fires once per
+    /// leg per call — no mid-call re-arm.  `siphon-rtp` backend only.
+    #[serde(default)]
+    pub beep_detection: bool,
+    /// How long in milliseconds the beep detector waits after a candidate tone
+    /// to confirm no repeat follows — what keeps a cadenced ringback / busy tone
+    /// from reading as a record tone.  **Also the detection latency**: the event
+    /// arrives this long after the beep.  Unset uses the engine default
+    /// (4500 ms).  Inert without `beep_detection`.  `siphon-rtp` backend only.
+    #[serde(default)]
+    pub beep_cadence_guard_ms: Option<u32>,
     /// Attach a **WebSocket tee** to this call: the engine dials this URI and
     /// streams a copy of the call's decoded audio to it as L16.  `siphon-rtp`
     /// backend only.
@@ -2508,6 +2643,16 @@ pub struct NgFlagsConfig {
     /// both legs, 1 for one).  Inert without `ws_tee`.
     #[serde(default)]
     pub ws_tee_channels: Option<u8>,
+    /// L16 wire sample rate in Hz for `ws_tee`, independent of the legs' codec
+    /// rates — the engine resamples the teed copy into it.  Send-only, unlike
+    /// `ws_sample_rate`: it changes only what the tee consumer receives, never
+    /// what the call itself hears.
+    ///
+    /// Must be a multiple of 1000 within 8000–48000 — the engine *fails* the
+    /// offer rather than clamping, so a bad value is rejected here at boot.
+    /// Inert without `ws_tee`.  `siphon-rtp` backend only.
+    #[serde(default, deserialize_with = "deserialize_ws_tee_sample_rate")]
+    pub ws_tee_sample_rate: Option<u32>,
     /// Carry the real post-NAT source IP the proxy saw the request arrive from
     /// (rtpengine's `received from`), gating the leg's media ingress to it.
     ///
@@ -5651,6 +5796,127 @@ media:
                 .ws_tee_direction,
             Some(WsTeeDirection::Caller)
         );
+    }
+
+    /// The six fields added with the 0.3.0 media contract must parse on the
+    /// native backend and land on the profile.
+    #[test]
+    fn parses_media_profile_beep_and_vad_engine_fields() {
+        let yaml = ws_profile_yaml(
+            SIPHON_RTP_BACKEND,
+            "      offer:\n        ws_uri: \"wss://ai.example.com/s\"\n        \
+             ws_vad: true\n        ws_sample_rate: 16000\n        \
+             ws_vad_engine: \"neural\"\n        ws_vad_min_speech_ms: 80\n        \
+             beep_detection: true\n        beep_cadence_guard_ms: 3000\n        \
+             ws_tee: \"wss://asr.example.com/t\"\n        \
+             ws_tee_sample_rate: 48000\n      answer: {}\n",
+        );
+        let config = Config::from_str(&yaml).unwrap();
+        let media = config.media.expect("media block");
+        let offer = &media.profiles.get("voice_ai_custom").unwrap().offer;
+
+        assert_eq!(offer.ws_sample_rate, Some(16_000));
+        assert_eq!(offer.ws_vad_engine, Some(WsVadEngine::Neural));
+        assert_eq!(offer.ws_vad_min_speech_ms, Some(80));
+        assert!(offer.beep_detection);
+        assert_eq!(offer.beep_cadence_guard_ms, Some(3_000));
+        assert_eq!(offer.ws_tee_sample_rate, Some(48_000));
+    }
+
+    /// `ws_vad_engine` is a closed selector: an unknown detector must be a hard
+    /// config error, never a quiet fall back to the detector the operator was
+    /// explicitly avoiding.
+    #[test]
+    fn rejects_media_profile_bad_ws_vad_engine() {
+        let yaml = ws_profile_yaml(
+            SIPHON_RTP_BACKEND,
+            "      offer:\n        ws_vad_engine: \"telepathy\"\n      answer: {}\n",
+        );
+        let error = Config::from_str(&yaml).expect_err("unknown detector must be rejected");
+        assert!(
+            error.to_string().contains("ws_vad_engine"),
+            "error should name the field: {error}"
+        );
+    }
+
+    /// The engine *fails* an offer carrying an out-of-range wire rate rather
+    /// than clamping it, so a bad value must be caught at boot — otherwise the
+    /// box comes up healthy and every call answers with no media.
+    #[test]
+    fn rejects_media_profile_bad_ws_sample_rates() {
+        for (field, value) in [
+            ("ws_sample_rate", "44100"),  // not a whole kHz
+            ("ws_sample_rate", "4000"),   // below the floor
+            ("ws_sample_rate", "96000"),  // above the ceiling
+            ("ws_tee_sample_rate", "12345"),
+            ("ws_tee_sample_rate", "0"),
+        ] {
+            let yaml = ws_profile_yaml(
+                SIPHON_RTP_BACKEND,
+                &format!("      offer:\n        {field}: {value}\n      answer: {{}}\n"),
+            );
+            let error = Config::from_str(&yaml)
+                .expect_err("{field}={value} must be rejected");
+            assert!(
+                error.to_string().contains(field),
+                "error should name {field}: {error}"
+            );
+        }
+    }
+
+    /// The boundary values must be accepted — a validator that is merely strict
+    /// is as wrong as one that is merely lax.
+    #[test]
+    fn accepts_media_profile_boundary_ws_sample_rates() {
+        for value in ["8000", "48000", "16000"] {
+            let yaml = ws_profile_yaml(
+                SIPHON_RTP_BACKEND,
+                &format!("      offer:\n        ws_sample_rate: {value}\n      answer: {{}}\n"),
+            );
+            Config::from_str(&yaml).unwrap_or_else(|error| panic!("{value} Hz rejected: {error}"));
+        }
+    }
+
+    /// All six are native `siphon-rtp` extensions.  On any other backend the
+    /// engine never sees them, so the call answers into a media path that was
+    /// never wired — a hard config error, not a warning.
+    #[test]
+    fn rejects_new_media_fields_on_non_native_backends() {
+        for field_line in [
+            "ws_sample_rate: 16000",
+            "ws_vad_engine: \"neural\"",
+            "ws_vad_min_speech_ms: 80",
+            "beep_detection: true",
+            "beep_cadence_guard_ms: 3000",
+            "ws_tee_sample_rate: 16000",
+        ] {
+            let field = field_line.split(':').next().expect("field name");
+            for backend in [RTPENGINE_BACKEND, RTPPROXY_BACKEND] {
+                let yaml = ws_profile_yaml(
+                    backend,
+                    &format!("      offer:\n        {field_line}\n      answer: {{}}\n"),
+                );
+                let error = Config::from_str(&yaml)
+                    .err()
+                    .unwrap_or_else(|| {
+                        panic!("{field} must be rejected on backend block {backend:?}")
+                    })
+                    .to_string();
+                assert!(
+                    error.contains(field),
+                    "error should name {field} on {backend:?}: {error}"
+                );
+            }
+
+            // ...and must be accepted on the native backend, so the gate is
+            // proven to be backend-specific rather than a blanket refusal.
+            let yaml = ws_profile_yaml(
+                SIPHON_RTP_BACKEND,
+                &format!("      offer:\n        {field_line}\n      answer: {{}}\n"),
+            );
+            Config::from_str(&yaml)
+                .unwrap_or_else(|error| panic!("{field} rejected on siphon-rtp: {error}"));
+        }
     }
 
     #[test]

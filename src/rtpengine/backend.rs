@@ -27,7 +27,7 @@ use super::client::{PlayMediaSource, RtpEngineSet};
 use super::error::RtpEngineError;
 use super::profile::{NgFlags, WsTeeDirection};
 use super::rtpproxy::RtpProxyClientSet;
-use super::siphon_rtp::SiphonRtpClientSet;
+use super::siphon_rtp::{PlayMediaOutcome, SiphonRtpClientSet};
 
 /// The configured media-control backend.
 pub enum MediaBackend {
@@ -152,23 +152,49 @@ impl MediaBackend {
         start_pos_ms: Option<u64>,
         duration_ms: Option<u64>,
         to_tag: Option<&str>,
+        overlay: bool,
+        gain_decibels: Option<i32>,
         wait: bool,
-    ) -> Result<Option<u64>, RtpEngineError> {
+    ) -> Result<PlayMediaOutcome, RtpEngineError> {
         match self {
             Self::RtpEngine(set) => {
                 if wait {
                     debug!(call_id, "play_media(wait=True) ignored on rtpengine backend (no completion event); returning on accept");
                 }
-                set.play_media(
-                    call_id,
-                    from_tag,
-                    source,
-                    repeat_times,
-                    start_pos_ms,
+                // Overlay mixing and per-play gain are native siphon-rtp
+                // features with no NG equivalent. Refused rather than dropped:
+                // an overlay silently downgraded to a supersede would cut the
+                // party's live audio, and a dropped gain would play a music bed
+                // at full level under a prompt.
+                if overlay {
+                    return Err(RtpEngineError::Unsupported {
+                        operation: "play_media(overlay=True)",
+                        backend: "rtpengine",
+                    });
+                }
+                if gain_decibels.is_some() {
+                    return Err(RtpEngineError::Unsupported {
+                        operation: "play_media(gain_decibels=...)",
+                        backend: "rtpengine",
+                    });
+                }
+                let duration_ms = set
+                    .play_media(
+                        call_id,
+                        from_tag,
+                        source,
+                        repeat_times,
+                        start_pos_ms,
+                        duration_ms,
+                        to_tag,
+                    )
+                    .await?;
+                // No play_id: the NG protocol has no handle on a playback, which
+                // is why set_play_gain and a targeted stop are siphon-rtp only.
+                Ok(PlayMediaOutcome {
+                    play_id: None,
                     duration_ms,
-                    to_tag,
-                )
-                .await
+                })
             }
             Self::SiphonRtp(client) => {
                 client
@@ -180,6 +206,8 @@ impl MediaBackend {
                         start_pos_ms,
                         duration_ms,
                         to_tag,
+                        overlay,
+                        gain_decibels,
                         wait,
                     )
                     .await
@@ -188,7 +216,7 @@ impl MediaBackend {
                 if wait {
                     debug!(call_id, "play_media(wait=True) ignored on rtpproxy backend (no completion event); returning on accept");
                 }
-                client
+                let duration_ms = client
                     .play_media(
                         call_id,
                         from_tag,
@@ -198,17 +226,78 @@ impl MediaBackend {
                         duration_ms,
                         to_tag,
                     )
-                    .await
+                    .await?;
+                Ok(PlayMediaOutcome {
+                    play_id: None,
+                    duration_ms,
+                })
             }
         }
     }
 
-    /// Stop a prompt playing on the monologue selected by `from_tag`.
-    pub async fn stop_media(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
+    /// Stop prompt playback on the monologue selected by `from_tag`.
+    ///
+    /// `play_id` targets one playback (an individual overlay slot); `None` stops
+    /// everything on the leg.  Only the native backend can address a single
+    /// playback — the others have no handle, so a `play_id` there is refused
+    /// rather than widened into "stop everything", which would silently kill
+    /// playbacks the script meant to keep running.
+    pub async fn stop_media(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        play_id: Option<u64>,
+    ) -> Result<(), RtpEngineError> {
         match self {
-            Self::RtpEngine(set) => set.stop_media(call_id, from_tag).await,
-            Self::SiphonRtp(client) => client.stop_media(call_id, from_tag).await,
-            Self::RtpProxy(client) => client.stop_media(call_id, from_tag).await,
+            Self::RtpEngine(set) => {
+                if play_id.is_some() {
+                    return Err(RtpEngineError::Unsupported {
+                        operation: "stop_media(play_id=...)",
+                        backend: "rtpengine",
+                    });
+                }
+                set.stop_media(call_id, from_tag).await
+            }
+            Self::SiphonRtp(client) => client.stop_media(call_id, from_tag, play_id).await,
+            Self::RtpProxy(client) => {
+                if play_id.is_some() {
+                    return Err(RtpEngineError::Unsupported {
+                        operation: "stop_media(play_id=...)",
+                        backend: "rtpproxy",
+                    });
+                }
+                client.stop_media(call_id, from_tag).await
+            }
+        }
+    }
+
+    /// Retune a running playback's gain — how a controller ducks a music bed
+    /// under a prompt and lifts it again afterwards.
+    ///
+    /// Native `siphon-rtp` only: the NG and rtpproxy protocols have no handle on
+    /// an individual playback, so there is nothing to address.
+    pub async fn set_play_gain(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        play_id: u64,
+        gain_decibels: i32,
+        to_tag: Option<&str>,
+    ) -> Result<(), RtpEngineError> {
+        match self {
+            Self::SiphonRtp(client) => {
+                client
+                    .set_play_gain(call_id, from_tag, play_id, gain_decibels, to_tag)
+                    .await
+            }
+            Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
+                operation: "set_play_gain",
+                backend: "rtpengine",
+            }),
+            Self::RtpProxy(_) => Err(RtpEngineError::Unsupported {
+                operation: "set_play_gain",
+                backend: "rtpproxy",
+            }),
         }
     }
 
@@ -439,11 +528,12 @@ impl MediaBackend {
         ws_uri: &str,
         direction: WsTeeDirection,
         channels: Option<u8>,
+        sample_rate: Option<u32>,
     ) -> Result<(), RtpEngineError> {
         match self {
             Self::SiphonRtp(client) => {
                 client
-                    .attach_ws_tee(call_id, from_tag, ws_uri, direction, channels)
+                    .attach_ws_tee(call_id, from_tag, ws_uri, direction, channels, sample_rate)
                     .await
             }
             Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {

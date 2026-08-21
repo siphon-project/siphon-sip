@@ -230,7 +230,7 @@ async fn attach_ws_tee_emits_the_documented_wire_shape() {
     // `direction` does not, so the engine always receives an explicit leg
     // selection rather than relying on its own default.
     backend
-        .attach_ws_tee("c", "f", "ws://h/s", WsTeeDirection::Both, None)
+        .attach_ws_tee("c", "f", "ws://h/s", WsTeeDirection::Both, None, None)
         .await
         .unwrap();
     let body = records.recv().await.expect("attach recorded");
@@ -242,7 +242,7 @@ async fn attach_ws_tee_emits_the_documented_wire_shape() {
 
     // Explicit non-default direction + channels are carried verbatim.
     backend
-        .attach_ws_tee("c", "f", "wss://h/s", WsTeeDirection::Caller, Some(1))
+        .attach_ws_tee("c", "f", "wss://h/s", WsTeeDirection::Caller, Some(1), None)
         .await
         .unwrap();
     let body = records.recv().await.expect("explicit attach recorded");
@@ -331,7 +331,7 @@ async fn ws_tee_is_rejected_by_backends_that_cannot_stream() {
         MediaBackend::RtpEngine(RtpEngineSet::new(vec![(ng, 500, 1)]).await.unwrap().into());
 
     let error = backend
-        .attach_ws_tee("c", "f", "ws://h/s", WsTeeDirection::Both, None)
+        .attach_ws_tee("c", "f", "ws://h/s", WsTeeDirection::Both, None, None)
         .await
         .expect_err("rtpengine cannot stream a websocket tee");
     let text = error.to_string();
