@@ -51,7 +51,13 @@ fn main() {
         std::process::exit(1);
     });
 
-    let mut builder = SiphonServer::builder().product("SIPhon", env!("CARGO_PKG_VERSION"));
+    // No `.product(...)` on purpose. The builder defaults to "SIPhon" plus
+    // siphon-sip's own CARGO_PKG_VERSION, which is the version this binary
+    // must report: the project versions the crate, the binary, the image and
+    // the SDK in lockstep off the git tag, and this package carries its own
+    // unrelated 0.1.0. Setting the product here would announce that 0.1.0 in
+    // the startup banner, the User-Agent/Server headers and /admin/health.
+    let mut builder = SiphonServer::builder();
     builder = ext::register_all(builder, &config);
     builder.config_path(&cli.config).run();
 }

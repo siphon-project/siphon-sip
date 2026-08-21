@@ -1,5 +1,17 @@
 # SIPhon container image.
 #
+# What it builds: the `siphon-bin` package, NOT the root `siphon-sip` one. Both
+# produce an artifact called `siphon` with the same CLI and the same
+# siphon.yaml, but siphon-bin additionally composes the opt-in extension crates,
+# so the official image ships the scriptable `http` namespace (siphon-bin's
+# default feature) alongside the `ui` dashboard. smpp/sigtran stay off — see
+# siphon-bin/Dockerfile for an image with those compiled in.
+#
+# The siphon-sip git dep is patched to this checkout (see the builder stage), so
+# an image built at tag vX.Y.Z contains that tag's lib. Without the patch cargo
+# would resolve the SHA pinned in siphon-bin/Cargo.lock and the image would
+# silently drift from the release.
+#
 # Python: free-threaded CPython 3.14t (PEP 703) installed via uv. Siphon's
 # Rust hot loop calls into embedded Python on every SIP request — the
 # persistent-attach optimization in src/server.rs (PyGILState_Ensure +
@@ -18,7 +30,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         libssl-dev \
         xz-utils \
+        git \
     && rm -rf /var/lib/apt/lists/*
+# git is load-bearing: siphon-bin reaches the extension crates through git
+# dependencies, and cargo shells out to git to fetch them.
 # NOTE: the default build excludes SIP/Diameter-over-SCTP (the `sctp` Cargo
 # feature is off by default), so libsctp-dev is not needed. To build an
 # SCTP-capable image, add `libsctp-dev` here, `libsctp1` to the runtime stage,
@@ -61,6 +76,15 @@ RUN cargo install cargo-chef
 WORKDIR /build
 
 # ── Plan dependencies ────────────────────────────────────────────────────────
+# The recipe is taken from the ROOT siphon-sip package, not from siphon-bin.
+# That is deliberate. Once siphon-sip is patched to a path dependency (below),
+# the chain siphon-bin -> siphon-http -> siphon-sip runs THROUGH first-party
+# source, and cargo-chef cannot cache-separate that: cooking siphon-bin's graph
+# would need the real siphon-sip source present, which would invalidate the
+# cooked layer on every src/ edit and defeat the point. Cooking siphon-sip's own
+# dependency graph instead keeps the expensive third-party bulk (tokio, pyo3,
+# axum, reqwest, hickory, rustls, …) cached behind a layer that only moves when
+# Cargo.toml/Cargo.lock move.
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
@@ -73,18 +97,37 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 # ── Build dependencies (cached until Cargo.toml/lock change) ─────────────────
 FROM chef AS builder
+# One target dir shared by the cook below and the siphon-bin build further down.
+# Without this they are /build/target and /build/siphon-bin/target, the cooked
+# artifacts are invisible to the build that needs them, and the whole dependency
+# graph compiles from scratch.
+ENV CARGO_TARGET_DIR=/build/target
 COPY --from=planner /build/recipe.json recipe.json
 RUN cargo chef cook --release --features ui --recipe-path recipe.json
 
-# Build the real binary. The embedded operator web UI (`ui` feature) is compiled
-# in by default in the image — it's an EXPERIMENTAL dashboard, served only when
-# `admin.ui.enabled` is set in siphon.yaml. `ui/` is a single self-contained HTML
-# file baked in by rust-embed (no Node/build step). Drop `--features ui` on both
-# the cook and build lines to produce a leaner image without it.
+# Build the real binary — the siphon-bin composition (see the file header).
+# Two features are in play and they are different kinds of thing:
+#   `http`  — a siphon-bin DEFAULT feature, so it needs no flag here. Compiles
+#             in the scriptable `http` namespace; it stays inert until
+#             siphon.yaml carries an `extensions.http` entry.
+#   `ui`    — a passthrough to siphon-sip's own feature, hence explicit. The
+#             EXPERIMENTAL operator dashboard, served only when
+#             `admin.ui.enabled` is set. `ui/` is a single self-contained HTML
+#             file baked in by rust-embed (no Node/build step).
+# Drop `--features ui` on both the cook and build lines for a leaner image; add
+# `--features smpp` / `sigtran` (plus their system deps) to compile in more.
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY benches/ benches/
 COPY ui/ ui/
+COPY siphon-bin/ siphon-bin/
+COPY scripts/ scripts/
+# Repoint siphon-sip at this checkout, so the image contains the lib from the
+# tree it was built from rather than the main-branch SHA pinned in
+# siphon-bin/Cargo.lock. The script asserts the patch actually applied — cargo
+# treats an unused [patch] as a warning and would otherwise build the git copy.
+RUN scripts/pin-siphon-sip-to-tree.sh
+WORKDIR /build/siphon-bin
 RUN cargo build --release --features ui
 
 # ── Runtime stage ────────────────────────────────────────────────────────────
@@ -109,7 +152,7 @@ RUN PY_BIN=$(find /opt/python -type f -name python3.14t -perm -u+x | head -n1) &
     echo "$PY_PREFIX/lib" > /etc/ld.so.conf.d/python3.14t.conf && \
     ldconfig
 
-# SIPhon binary
+# SIPhon binary (built from siphon-bin, so `http` is compiled in — see header)
 COPY --from=builder /build/target/release/siphon /usr/local/bin/siphon
 
 # Default scripts and config

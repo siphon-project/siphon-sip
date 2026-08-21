@@ -158,9 +158,17 @@ cargo install siphon-sip --features sctp
 
 Protocol extensions that aren't part of the core SIP datapath live in their own
 crates and are composed into a drop-in `siphon` binary by the separate
-[`siphon-bin`](siphon-bin/) package, each behind its own off-by-default cargo
-feature. The plain `cargo install siphon-sip` binary is unaffected; build the
-extension binary only if you need one:
+[`siphon-bin`](siphon-bin/) package.
+
+**`http` ships in the official artifacts** — the container image, the `.deb`,
+the `.rpm` and the release tarball are all built from `siphon-bin`, so the
+scriptable `http` namespace (inbound `@http.route` handlers plus a Rust-backed
+`http.Client`) is already compiled in and needs only an `extensions.http` entry.
+It is the one module with no deployment prerequisite.
+
+`smpp` and `sigtran` each carry one, so they stay off-by-default; build the
+binary yourself if you need them. `cargo install siphon-sip` is the SIP core
+alone, with no extensions:
 
 ```bash
 # SMPP 3.4 (scriptable `smpp` namespace: @smpp.on_pdu / @smpp.on_bind)
@@ -180,9 +188,13 @@ Point siphon at each extension's config from `siphon.yaml`:
 
 ```yaml
 extensions:
+  http: /etc/siphon/http.yaml
   smpp: /etc/siphon/smpp.yaml
   sigtran: /etc/siphon/sigtran.yaml
 ```
+
+A module that is compiled in but absent from this map is inert — it registers
+nothing and costs nothing at runtime.
 
 If `extensions.smpp` is present but the binary was built without `--features
 smpp`, it is skipped with a loud warning (same contract as `sctp`).

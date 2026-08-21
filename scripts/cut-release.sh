@@ -75,6 +75,14 @@ if [ "${ADVISORY_OK:-0}" != "1" ]; then
     || die "cargo-deny not installed — 'cargo install cargo-deny' (or set ADVISORY_OK=1 to skip)"
   cargo deny --all-features check advisories \
     || die "cargo-deny found an open advisory — bump the affected crate (cargo update -p <crate>) or add a reviewed ignore in deny.toml, then re-cut (or set ADVISORY_OK=1 to skip)"
+
+  # ...and the same for siphon-bin. The released binary is that composition, so
+  # its extension crates and their dependency trees ship to operators even
+  # though they are absent from the siphon-sip graph checked above. Without this
+  # a release could carry an open advisory in, say, siphon-http's tree and the
+  # gate above would be perfectly green.
+  cargo deny --manifest-path siphon-bin/Cargo.toml check advisories \
+    || die "cargo-deny found an open advisory in the siphon-bin composition (the graph the released binary is built from) — bump the affected crate or add a reviewed ignore in siphon-bin/deny.toml, then re-cut (or set ADVISORY_OK=1 to skip)"
 fi
 
 # ── Performance + memory-leak baseline (manual, per project policy) ─────────

@@ -1371,3 +1371,27 @@ log:
 #     slow_consumer: drop_oldest    # drop_oldest | disconnect
 #     reattach_grace_secs: 10       # window for a reconnecting app to `resync`
 #     handoff_deadline_ms: 3000     # default deadline before the parked call degrades
+
+# ---------------------------------------------------------------------------
+# Extensions — protocols beyond SIP
+# ---------------------------------------------------------------------------
+# Each entry names a module and points at that module's own config file. A
+# module contributes a scriptable Python namespace on top of the built-in
+# proxy / registrar / cache / … set, and does nothing at all until it appears
+# here: compiled in but unconfigured costs nothing at runtime.
+#
+# What the official artifacts (container image, deb, rpm, tarball) ship:
+#   http     — HTTP/HTTPS. Inbound routes via @http.route plus a Rust-backed
+#              http.Client for outbound calls. Compiled in, ready to configure.
+#   smpp     — SMPP 3.4 (SMS). NOT compiled in; needs a siphon-bin build.
+#   sigtran  — SIGTRAN/SS7: M3UA/M2PA/SUA over SCTP, MTP3, SCCP GTT, and
+#              MAP/CAP/INAP termination. NOT compiled in; needs a siphon-bin
+#              build plus libsctp. See docs/extensions.md.
+#
+# Configuring a module the running binary was NOT built with is not silently
+# ignored — siphon says so on stderr at startup and carries on without it.
+#
+# extensions:
+#   http: /etc/siphon/http.yaml
+#   smpp: /etc/siphon/smpp.yaml
+#   sigtran: /etc/siphon/sigtran.yaml
