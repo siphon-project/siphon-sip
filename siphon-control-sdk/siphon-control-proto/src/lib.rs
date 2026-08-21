@@ -126,6 +126,11 @@ pub enum ControlErrorCode {
     NotFound,
     /// The frame or its arguments were malformed.
     BadRequest,
+    /// The caller-supplied identifier is already in use (an `originate` reusing
+    /// a live channel id). The fix is a different id — never a retry.
+    Conflict,
+    /// The target exists but is in the wrong state for this verb.
+    InvalidState,
     /// The command exceeded a rate limit.
     RateLimited,
     /// An originate was denied by the toll-fraud gates.
@@ -503,6 +508,27 @@ mod tests {
             serde_json::to_string(&ControlErrorCode::UnsupportedVersion).unwrap(),
             "\"unsupported_version\""
         );
+        assert_eq!(
+            serde_json::to_string(&ControlErrorCode::Conflict).unwrap(),
+            "\"conflict\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ControlErrorCode::InvalidState).unwrap(),
+            "\"invalid_state\""
+        );
+    }
+
+    #[test]
+    fn originate_error_codes_round_trip_from_the_wire() {
+        // The server can emit these; a client that cannot parse them would
+        // surface a transport error instead of the real refusal.
+        for (wire, expected) in [
+            ("\"conflict\"", ControlErrorCode::Conflict),
+            ("\"invalid_state\"", ControlErrorCode::InvalidState),
+        ] {
+            let parsed: ControlErrorCode = serde_json::from_str(wire).unwrap();
+            assert_eq!(parsed, expected);
+        }
     }
 
     #[test]

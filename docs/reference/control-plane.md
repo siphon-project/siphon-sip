@@ -206,6 +206,7 @@ chunk, so logs join Homer and billing with no mapping table.
 
 | verb | module | args | notes |
 |---|---|---|---|
+| `originate` | sip | `{channel, to, from?, from_display?, to_display?, next_hop?, p_asserted_identity?, privacy?, headers?, sdp \| media, profile?, ws_uri?, timeout?, on_lost?, vars?}` | place an outbound call under a **caller-supplied** channel id; returns as soon as the INVITE is on the wire |
 | `answer` | sip | `{code, reason?, body?, content_type?}` | UAS 2xx to the parked A-leg |
 | `progress` | sip | `{code, reason?, body?, content_type?}` | 1xx / early media |
 | `reject` | sip | `{code, reason?}` | final non-2xx + tear down |
@@ -294,10 +295,95 @@ answers `bad_request`; a decision for a call with no pending REFER (already
 decided, timed out, or gone) answers `not_found`. A REFER on an **uncontrolled**
 call is unaffected — it still runs the Python `@b2bua.on_refer` path.
 
-`bridge` / `originate` verbs arrive in later phases over the same envelope. The
-client SDK facade methods for the media verbs and the transfer verbs land
-alongside them (until then, reach the verbs through the generic
-`command(verb, args)` escape hatch).
+## Placing a call: `originate`
+
+Every verb above acts on a call that already arrived. `originate` is the one that
+creates one — the primitive under click-to-dial, callbacks, outbound
+notification and the dial half of a transfer:
+
+```json
+{ "id":"c-7", "type":"command", "module":"sip", "verb":"originate",
+  "args": { "channel": "cb-7f3a",
+            "to": "sip:+15551000001@carrier.example",
+            "from": "sip:+15550000001@example.com",
+            "from_display": "Callback",
+            "p_asserted_identity": "sip:+15550000001@example.com",
+            "privacy": "allowed",
+            "headers": { "X-Campaign": "reminder" },
+            "media": true,
+            "timeout": 30 } }
+```
+
+```json
+{ "id":"c-7", "type":"reply", "status":"ok",
+  "result": { "channel":"cb-7f3a", "call_id":"<uuid>",
+              "sip_call_id":"<cid>", "state":"calling" } }
+```
+
+**The channel id is yours.** `args.channel` is required and siphon never mints
+one: a controller stages its per-call context — routing, media plan, its own
+state — keyed on an id it chose *before* anything reaches the network, and an API
+that returned the id instead would force a round-trip that a well-built
+controller has designed out. Reusing the id of a **live** channel answers
+`conflict` (distinguishable from `bad_request`: the frame is fine, the id just
+collides, and retrying the same one can never succeed). Once the call is gone the
+id is free again.
+
+**The reply is the local action, not the outcome.** It comes back as soon as the
+INVITE is on the wire, while the callee is still ringing — which is what lets you
+start ringback or a prompt during ring, and what stops one ringing phone
+serialising the connection's whole command stream. What happens next arrives as
+events on your id:
+
+| event | payload | when |
+|---|---|---|
+| `ChannelStateChange` | `{state:"ringing"\|"progress", code, early_media, sdp?}` | a 1xx from the callee (`progress` when it carried SDP) |
+| `ChannelStateChange` | `{state:"answered", code, sdp?}` | the callee answered; siphon has ACKed |
+| `StasisEnd` | `{reason:"rejected", code, response}` | the callee rejected it — the SIP cause, since there is no A-leg it was relayed to |
+| `StasisEnd` | `{reason:"bye"}` / `{reason:"ring timeout"}` / `{reason:<hangup reason>}` | the call ended |
+
+**Media.** Exactly one plan is required, because an INVITE with no offer and no
+way to answer the callee's leaves its 2xx unanswerable (RFC 3261 §13.2.2.4) — a
+connected call with no audio:
+
+- `sdp` — your own offer, carried verbatim. Works on any backend, or none.
+- `media: true` — siphon anchors the leg on the media backend: the INVITE goes
+  out offerless, the callee offers in its 2xx and siphon answers it locally with
+  the answer on the ACK. The session is keyed on the leg's SIP Call-ID, so
+  `play` / `dtmf` / `hold` / `stream_start` all work against it exactly as they do
+  for an inbound-anchored channel. `profile` (default `rtp_passthrough`) and
+  `ws_uri` shape it. Requires the `siphon-rtp` backend — anything else answers
+  `unsupported_verb` at the command rather than connecting a mute call.
+
+**Identity.** `from` / `from_display` / `to_display` / `p_asserted_identity`
+(RFC 3325 §9.1) and arbitrary `headers` all land on the INVITE. `privacy:
+"restricted"` anonymises From and asserts `Privacy: id` while keeping the real
+identity in `P-Asserted-Identity` for the trusted next hop (RFC 3323 §4.1 /
+TS 24.607) — applied last, so a custom header cannot undo it. Dialog-defining
+headers in `headers` (Via, From, To, Call-ID, CSeq, Contact, Max-Forwards,
+Content-Length, Route, Record-Route) are ignored: the stack owns them, and
+overwriting one would leave the leg unaddressable for its own ACK / BYE.
+
+**Ending it.** `hangup` works on an originated channel like any other: a BYE once
+answered, and a CANCEL (RFC 3261 §9.1) while it is still ringing — never a SIP
+response, which a UAC has no business sending to the party it is calling. The
+same CANCEL fires when `timeout` (default 30 s, `0` to disable) elapses unanswered.
+
+Refusals are typed and separately actionable: `bad_request` (missing/contradictory
+args, unparseable URI, bad `privacy`), `conflict` (the id is in use), `not_found`
+(no route to the target), `unsupported_verb` (the backend cannot serve the media
+plan), `unavailable` (the B2BUA is not running, or the commanding connection has
+gone — nothing would own the call).
+
+In-process, the same primitive is
+[`b2bua.originate(...)`](call.md#placing-a-call-b2buaoriginate), which returns the
+new leg's SIP Call-ID and drives the ordinary `@b2bua.on_answer` / `on_failure` /
+`on_bye` handlers.
+
+The `bridge` verb — joining two legs this process already owns — arrives in a
+later phase over the same envelope. The client SDK facade methods for the media,
+transfer and originate verbs land alongside it (until then, reach the verbs
+through the generic `command(verb, args)` escape hatch).
 
 The complete wire reference, both connection modes end to end, and two
 low-level example clients (one Python, one TypeScript) that drive calls with no

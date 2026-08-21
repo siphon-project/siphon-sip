@@ -14,6 +14,8 @@ export type ControlErrorCode =
   | "forbidden"
   | "not_found"
   | "bad_request"
+  | "conflict"
+  | "invalid_state"
   | "rate_limited"
   | "originate_denied"
   | "unsupported_verb"

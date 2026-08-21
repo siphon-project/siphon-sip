@@ -83,6 +83,15 @@ pub enum ControlErrorCode {
     NotFound,
     /// The frame or its arguments were malformed.
     BadRequest,
+    /// The caller-supplied identifier is already in use (an `originate` reusing
+    /// a live channel id). Distinct from `bad_request`: the frame is well
+    /// formed, the id just collides, and the fix is a different id — never a
+    /// retry of the same one.
+    Conflict,
+    /// The target resource exists and is addressable, but is in the wrong state
+    /// for this verb (bridging a leg that has not answered). Distinct from
+    /// `not_found` (no such leg) and from `conflict` (id already taken).
+    InvalidState,
     /// The command exceeded a rate limit.
     RateLimited,
     /// An originate was denied by the toll-fraud gates.
@@ -352,5 +361,33 @@ mod tests {
             serde_json::to_string(&ControlErrorCode::UnsupportedVersion).unwrap(),
             "\"unsupported_version\""
         );
+        assert_eq!(
+            serde_json::to_string(&ControlErrorCode::Conflict).unwrap(),
+            "\"conflict\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ControlErrorCode::InvalidState).unwrap(),
+            "\"invalid_state\""
+        );
+    }
+
+    #[test]
+    fn each_originate_failure_cause_has_its_own_code() {
+        // Requirement: unknown leg / duplicate id / wrong state / backend can't
+        // are four *distinguishable* wire codes, never one bucket.
+        let codes = [
+            ControlErrorCode::NotFound,
+            ControlErrorCode::Conflict,
+            ControlErrorCode::InvalidState,
+            ControlErrorCode::UnsupportedVerb,
+        ];
+        let rendered: Vec<String> = codes
+            .iter()
+            .map(|code| serde_json::to_string(code).unwrap_or_default())
+            .collect();
+        let mut unique = rendered.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), codes.len(), "codes collide on the wire: {rendered:?}");
     }
 }

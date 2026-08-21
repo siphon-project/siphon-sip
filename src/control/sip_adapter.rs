@@ -8,10 +8,12 @@
 //! the callee's answer / ACK / BYE-200 arrive later as events. A command against
 //! a dead/unknown call returns a typed `not_found`, never hangs.
 
+use std::collections::HashMap;
+
 use futures_util::future::BoxFuture;
 
 use super::protocol::{ControlErrorCode, ControlResult};
-use super::registry::ChannelRef;
+use super::registry::{ChannelRef, ControlBus};
 use super::{AdapterCommand, AdapterSchema, ControlAdapter, ResolvedTarget, VerbSchema};
 
 /// The SIP adapter (`module() == "sip"`).
@@ -34,7 +36,10 @@ impl ControlAdapter for SipControlAdapter {
         // Media verbs bind to the async MediaBackend, so they run on the async
         // path; every other verb is a synchronous decision over the B2BUA rail.
         Box::pin(async move {
-            if is_media_verb(&command.verb) {
+            if command.verb == "originate" {
+                // Module-level: it creates the channel rather than addressing one.
+                originate(command)
+            } else if is_media_verb(&command.verb) {
                 apply_media_verb(command).await
             } else {
                 apply_sip(command)
@@ -46,6 +51,7 @@ impl ControlAdapter for SipControlAdapter {
         AdapterSchema {
             module: "sip".to_string(),
             verbs: vec![
+                verb("originate", "Place an outbound call under a caller-supplied channel id and return as soon as the INVITE is on the wire (args: channel, to, from, from_display, to_display, next_hop, p_asserted_identity, privacy, headers, sdp | media, profile, ws_uri, timeout, on_lost, vars)"),
                 verb("answer", "Send a UAS 2xx to the parked A-leg (args: code, reason, body, content_type)"),
                 verb("progress", "Send a UAS 1xx / early media (args: code, reason, body, content_type)"),
                 verb("reject", "Send a final non-2xx and tear the call down (args: code, reason)"),
@@ -439,6 +445,237 @@ async fn stream_stop(channel: &ChannelRef) -> ControlResult {
     }
 }
 
+/// `originate` — place an outbound call the controller owns from the moment it
+/// is accepted.
+///
+/// **The channel id comes from the caller, never from siphon.** A controller
+/// stages its per-call context — routing, media plan, its own state — keyed on
+/// an id it chose *before* anything reaches the network; minting the id here and
+/// returning it would force a round-trip that a well-built controller has
+/// designed out, and would leave a window where the call exists and the
+/// controller cannot name it. A collision with a live channel is a `conflict`,
+/// never a silent re-point (which would strand the first call).
+///
+/// **Asynchronous by construction.** The reply is the *local* action — "the
+/// INVITE is on the wire" — and returns before the callee has done anything.
+/// Ringing (`ChannelStateChange`), answer (`ChannelStateChange{state:answered}`)
+/// and hangup (`StasisEnd`, with the SIP cause) arrive later as events on the
+/// supplied id. A synchronous originate that blocked to answer-or-timeout would
+/// serialise this connection's whole command stream behind one ringing phone and
+/// make ringback or a prompt during ring impossible.
+///
+/// The channel is registered **before** the INVITE is dialed (the two-phase
+/// [`crate::dispatcher::b2bua_originate_prepare`] / `..._dial` split), so a
+/// callee that answers instantly cannot beat its own `StasisStart`.
+fn originate(command: AdapterCommand) -> ControlResult {
+    let Some(bus) = ControlBus::global() else {
+        return ControlResult::error(
+            ControlErrorCode::Unavailable,
+            "control plane is not installed",
+        );
+    };
+    originate_with_bus(&bus, command)
+}
+
+/// [`originate`] with the bus injected, so the id-collision and ownership rules
+/// are testable without a process-global control plane.
+fn originate_with_bus(bus: &std::sync::Arc<ControlBus>, command: AdapterCommand) -> ControlResult {
+    let args = &command.args;
+    let Some(channel_id) = args.get("channel").and_then(|value| value.as_str()) else {
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "originate requires args.channel — the caller-supplied channel id this call is addressed by",
+        );
+    };
+    if channel_id.trim().is_empty() {
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "originate args.channel must not be empty",
+        );
+    }
+    let Some(to) = args.get("to").and_then(|value| value.as_str()) else {
+        return ControlResult::error(ControlErrorCode::BadRequest, "originate requires args.to");
+    };
+
+    let media = match parse_originate_media(args) {
+        Ok(media) => media,
+        Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
+    };
+    let privacy = match parse_privacy(args.get("privacy")) {
+        Ok(privacy) => privacy,
+        Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
+    };
+    let headers = parse_extra_headers(args.get("headers"));
+    let timeout_secs = args
+        .get("timeout")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(30) as u32;
+    let vars: HashMap<String, String> = args
+        .get("vars")
+        .and_then(|value| value.as_object())
+        .map(|object| {
+            object
+                .iter()
+                .filter_map(|(key, value)| value.as_str().map(|v| (key.clone(), v.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let on_lost = args
+        .get("on_lost")
+        .and_then(|value| value.as_str())
+        .unwrap_or("hangup")
+        .to_string();
+
+    if bus.channel_exists(channel_id) {
+        return ControlResult::error(
+            ControlErrorCode::Conflict,
+            format!("channel '{channel_id}' is already in use — pick a different id"),
+        );
+    }
+    // Resolve the owner up front: a channel with no live owner would be
+    // unaddressable and would leak, so a command racing its own socket close
+    // must fail before anything is placed on the wire.
+    let Some(conn) = bus.connection_for_command(&command.origin.app, command.origin.conn_id) else {
+        return ControlResult::error(
+            ControlErrorCode::Unavailable,
+            "the commanding connection is gone — nothing would own the originated call",
+        );
+    };
+
+    let params = crate::dispatcher::OriginateParams {
+        to: to.to_string(),
+        to_display: string_arg(args, "to_display"),
+        from: string_arg(args, "from"),
+        from_display: string_arg(args, "from_display"),
+        next_hop: string_arg(args, "next_hop"),
+        p_asserted_identity: string_arg(args, "p_asserted_identity"),
+        privacy,
+        headers,
+        timeout_secs,
+        media,
+    };
+
+    let prepared = match crate::dispatcher::b2bua_originate_prepare(params) {
+        Ok(prepared) => prepared,
+        Err(error) => return originate_error(error),
+    };
+
+    // Own it before it rings: register under the caller's id, then dial.
+    bus.register_channel(
+        channel_id,
+        &conn,
+        &prepared.internal_call_id,
+        &prepared.sip_call_id,
+        &on_lost,
+        vars,
+    );
+    if !crate::dispatcher::b2bua_originate_dial(&prepared) {
+        bus.remove_channel(channel_id);
+        return ControlResult::error(
+            ControlErrorCode::Unavailable,
+            "the originated call vanished before its INVITE could be sent",
+        );
+    }
+
+    ControlResult::Ok(serde_json::json!({
+        "channel": channel_id,
+        "call_id": prepared.internal_call_id,
+        "sip_call_id": prepared.sip_call_id,
+        "state": "calling",
+    }))
+}
+
+/// Read an optional non-empty string argument.
+fn string_arg(args: &serde_json::Value, name: &str) -> Option<String> {
+    args.get(name)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+}
+
+/// Parse the media plan: exactly one of `args.sdp` (a controller-supplied
+/// offer) or `args.media: true` (siphon anchors the leg on the media backend).
+///
+/// Neither is a `bad_request` rather than a default, because an INVITE with no
+/// offer and no plan to answer the callee's leaves its 2xx un-answerable
+/// (RFC 3261 §13.2.2.4) — a connected call with no audio, which is the exact
+/// hollow success this rail refuses to produce.
+fn parse_originate_media(
+    args: &serde_json::Value,
+) -> Result<crate::dispatcher::OriginateMedia, String> {
+    let sdp = args.get("sdp").and_then(|value| value.as_str());
+    let anchor = args
+        .get("media")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    match (sdp, anchor) {
+        (Some(_), true) => Err(
+            "originate takes either args.sdp (your own offer) or args.media=true (siphon anchors the leg), not both"
+                .to_string(),
+        ),
+        (Some(sdp), false) if sdp.trim().is_empty() => {
+            Err("originate args.sdp must not be empty".to_string())
+        }
+        (Some(sdp), false) => Ok(crate::dispatcher::OriginateMedia::Offer(sdp.to_string())),
+        (None, true) => Ok(crate::dispatcher::OriginateMedia::Anchor {
+            profile: args
+                .get("profile")
+                .and_then(|value| value.as_str())
+                .unwrap_or("rtp_passthrough")
+                .to_string(),
+            ws_uri: args
+                .get("ws_uri")
+                .and_then(|value| value.as_str())
+                .map(|value| value.to_string()),
+        }),
+        (None, false) => Err(
+            "originate requires a media plan: args.sdp (your own offer) or args.media=true (siphon anchors the leg)"
+                .to_string(),
+        ),
+    }
+}
+
+/// Parse the optional `privacy` argument (RFC 3323 §4.1 / TS 24.607). An
+/// unrecognised value is a typed error, never a silent "present the CLI" —
+/// guessing at a privacy setting is how identities leak.
+fn parse_privacy(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<crate::sip::privacy::CallerIdPresentation>, String> {
+    match value {
+        None => Ok(None),
+        Some(value) if value.is_null() => Ok(None),
+        Some(value) => match value.as_str() {
+            Some(text) => crate::sip::privacy::CallerIdPresentation::parse(text)
+                .map(Some)
+                .ok_or_else(|| {
+                    format!("originate args.privacy must be \"allowed\" or \"restricted\", got '{text}'")
+                }),
+            None => Err("originate args.privacy must be a string".to_string()),
+        },
+    }
+}
+
+/// Map an [`crate::dispatcher::OriginateError`] onto its own wire code, so a
+/// caller can tell a bad URI from no route from a backend that cannot do it.
+fn originate_error(error: crate::dispatcher::OriginateError) -> ControlResult {
+    use crate::dispatcher::OriginateError;
+    let message = error.to_string();
+    match error {
+        OriginateError::InvalidUri { .. } => {
+            ControlResult::error(ControlErrorCode::BadRequest, message)
+        }
+        // No reachable destination for the target: the request was well formed
+        // and the resource simply is not there to be called.
+        OriginateError::Unroutable(_) => ControlResult::error(ControlErrorCode::NotFound, message),
+        OriginateError::Unsupported(_) => {
+            ControlResult::error(ControlErrorCode::UnsupportedVerb, message)
+        }
+        OriginateError::Unavailable(_) | OriginateError::BuildFailed(_) => {
+            ControlResult::error(ControlErrorCode::Unavailable, message)
+        }
+    }
+}
+
 /// Fetch a clone of the stored A-leg INVITE Arc for a controlled call.
 fn stored_invite(call_actor_id: &str) -> Option<std::sync::Arc<std::sync::Mutex<crate::sip::message::SipMessage>>> {
     let store = crate::b2bua::actor::global_call_store()?;
@@ -526,17 +763,28 @@ fn reject(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
 
 fn hangup(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
     let reason = args.get("reason").and_then(|v| v.as_str());
-    let answered = crate::b2bua::actor::global_call_store()
+    let (answered, originated) = crate::b2bua::actor::global_call_store()
         .and_then(|store| {
-            store
-                .get_call(&channel.call_actor_id)
-                .map(|call| matches!(call.state, crate::b2bua::actor::CallState::Answered))
+            store.get_call(&channel.call_actor_id).map(|call| {
+                (
+                    matches!(call.state, crate::b2bua::actor::CallState::Answered),
+                    call.originated,
+                )
+            })
         })
-        .unwrap_or(false);
+        .unwrap_or((false, false));
 
     let ok = if answered {
         // Answered: BYE both legs via the full teardown funnel (Rf/Ro/CDR/media).
         crate::dispatcher::b2bua_terminate_call(&channel.sip_call_id, reason)
+    } else if originated {
+        // A call siphon placed that has not answered: abandon it with a CANCEL on
+        // our own INVITE (RFC 3261 §9.1). The arm below sends a final *response*,
+        // which a UAC has no business sending to the party it is calling.
+        crate::dispatcher::b2bua_cancel_originated_call(
+            &channel.sip_call_id,
+            Some(reason.unwrap_or("cancelled")),
+        )
     } else {
         // Unanswered/parked: send a final non-2xx and tear down (no B-leg to CANCEL
         // in Phase 1's single-CallActor model).
@@ -850,9 +1098,323 @@ mod tests {
         }
     }
 
+    fn test_origin() -> crate::control::CommandOrigin {
+        crate::control::CommandOrigin {
+            app: "ivr-app".to_string(),
+            conn_id: 1,
+        }
+    }
+
+    fn originate_command(args: serde_json::Value) -> AdapterCommand {
+        AdapterCommand {
+            verb: "originate".to_string(),
+            args,
+            target: ResolvedTarget::None,
+            origin: test_origin(),
+        }
+    }
+
+    /// Run `originate` against a fresh bus with a live owning connection, so a
+    /// test exercises the argument rules rather than the "no control plane"
+    /// short-circuit.
+    fn originate_args(args: serde_json::Value) -> ControlResult {
+        let bus = test_bus();
+        let conn = bus.register_connection("ivr-app");
+        let mut command = originate_command(args);
+        command.origin.conn_id = conn.id;
+        originate_with_bus(&bus, command)
+    }
+
     #[test]
     fn module_is_sip() {
         assert_eq!(SipControlAdapter::new().module(), "sip");
+    }
+
+    // --- originate ---------------------------------------------------------
+
+    #[test]
+    fn originate_without_a_channel_id_is_bad_request() {
+        // The id is the caller's to choose; siphon never mints one, so its
+        // absence is a malformed command rather than a defaulted call.
+        let result = originate_args(serde_json::json!({ "to": "sip:1@carrier.example", "media": true }));
+        match result {
+            ControlResult::Error { code, ref message } => {
+                assert_eq!(code, ControlErrorCode::BadRequest);
+                assert!(message.contains("args.channel"), "message was: {message}");
+            }
+            other => panic!("expected bad_request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn originate_with_an_empty_channel_id_is_bad_request() {
+        let result = originate_args(serde_json::json!({
+            "channel": "   ",
+            "to": "sip:1@carrier.example",
+            "media": true,
+        }));
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+        ));
+    }
+
+    #[test]
+    fn originate_without_a_target_is_bad_request() {
+        let result = originate_args(serde_json::json!({ "channel": "cb-1", "media": true }));
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+        ));
+    }
+
+    #[test]
+    fn originate_without_a_media_plan_is_bad_request() {
+        // An INVITE with no offer and no anchor cannot answer the callee's 2xx
+        // offer (RFC 3261 §13.2.2.4) — that would connect a call with no audio.
+        let result = originate_args(serde_json::json!({
+            "channel": "cb-1",
+            "to": "sip:1@carrier.example",
+        }));
+        match result {
+            ControlResult::Error { code, ref message } => {
+                assert_eq!(code, ControlErrorCode::BadRequest);
+                assert!(message.contains("media plan"), "message was: {message}");
+            }
+            other => panic!("expected bad_request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn originate_with_both_media_plans_is_bad_request() {
+        let result = originate_args(serde_json::json!({
+            "channel": "cb-1",
+            "to": "sip:1@carrier.example",
+            "sdp": "v=0\r\n",
+            "media": true,
+        }));
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+        ));
+    }
+
+    #[test]
+    fn originate_with_a_bad_privacy_value_is_bad_request() {
+        let result = originate_args(serde_json::json!({
+            "channel": "cb-1",
+            "to": "sip:1@carrier.example",
+            "media": true,
+            "privacy": "maybe",
+        }));
+        assert!(matches!(
+            result,
+            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+        ));
+    }
+
+    fn test_bus() -> std::sync::Arc<ControlBus> {
+        use crate::config::ControlAppConfig;
+        let (command_tx, _rx) = flume::unbounded();
+        ControlBus::new(
+            command_tx,
+            vec![ControlAppConfig {
+                name: "ivr-app".to_string(),
+                token: "tok".to_string(),
+                per_call_connect: false,
+                connect_url: None,
+                on_lost: Some("hangup".to_string()),
+            }],
+            64,
+            crate::control::SlowConsumerPolicy::DropOldest,
+            10,
+            3000,
+        )
+    }
+
+    #[test]
+    fn originate_rejects_a_duplicate_caller_supplied_id_with_conflict() {
+        // The caller owns the id, so a collision has to be told apart from a
+        // malformed command: retrying the same id can never succeed, and
+        // silently re-pointing it at a second call would strand the first.
+        let bus = test_bus();
+        let conn = bus.register_connection("ivr-app");
+        bus.register_channel("cb-1", &conn, "call-uuid", "sipcid@host", "hangup", HashMap::new());
+
+        let mut command = originate_command(serde_json::json!({
+            "channel": "cb-1",
+            "to": "sip:1@carrier.example",
+            "media": true,
+        }));
+        command.origin.conn_id = conn.id;
+        let result = originate_with_bus(&bus, command);
+        match result {
+            ControlResult::Error { code, ref message } => {
+                assert_eq!(code, ControlErrorCode::Conflict, "message was: {message}");
+                assert!(message.contains("cb-1"), "message was: {message}");
+            }
+            other => panic!("expected conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn originate_from_a_dead_connection_is_unavailable() {
+        // Nothing would own the resulting channel, so it must fail before an
+        // INVITE goes out — an ownerless channel is a leak with a live call
+        // behind it.
+        let bus = test_bus();
+        let mut command = originate_command(serde_json::json!({
+            "channel": "cb-ghost",
+            "to": "sip:1@carrier.example",
+            "media": true,
+        }));
+        command.origin.conn_id = 99;
+        assert!(matches!(
+            originate_with_bus(&bus, command),
+            ControlResult::Error { code: ControlErrorCode::Unavailable, .. }
+        ));
+        assert!(
+            !bus.channel_exists("cb-ghost"),
+            "a refused originate must register no channel"
+        );
+    }
+
+    #[test]
+    fn a_refused_originate_registers_no_channel() {
+        // The dispatcher is not running in this process, so prepare fails; the
+        // caller's id must be left free for a retry.
+        let bus = test_bus();
+        let conn = bus.register_connection("ivr-app");
+        let mut command = originate_command(serde_json::json!({
+            "channel": "cb-2",
+            "to": "sip:1@carrier.example",
+            "media": true,
+        }));
+        command.origin.conn_id = conn.id;
+        let result = originate_with_bus(&bus, command);
+        assert!(matches!(result, ControlResult::Error { .. }), "got {result:?}");
+        assert!(!bus.channel_exists("cb-2"));
+    }
+
+    #[test]
+    fn originate_without_a_control_bus_is_unavailable_not_a_hollow_ok() {
+        // No process-global bus in the unit-test process: the command must
+        // answer, and must not answer "ok" for a call nothing would own.
+        let result = originate(originate_command(serde_json::json!({
+            "channel": "cb-1",
+            "to": "sip:1@carrier.example",
+            "media": true,
+        })));
+        assert!(
+            matches!(result, ControlResult::Error { code: ControlErrorCode::Unavailable, .. }),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn originate_dispatches_through_apply_as_a_module_level_verb() {
+        // No channel target: `originate` creates the channel rather than
+        // addressing one, so it must not be rejected for a missing target.
+        let adapter = SipControlAdapter::new();
+        let result = adapter
+            .apply(originate_command(serde_json::json!({
+                "channel": "cb-1", "to": "sip:1@carrier.example", "media": true
+            })))
+            .await;
+        match result {
+            ControlResult::Error { code, ref message } => {
+                assert_ne!(
+                    code,
+                    ControlErrorCode::BadRequest,
+                    "originate must not be rejected for the missing channel target: {message}"
+                );
+            }
+            other => panic!("expected an error from the un-booted stack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_originate_media_variants() {
+        use crate::dispatcher::OriginateMedia;
+        assert_eq!(
+            parse_originate_media(&serde_json::json!({ "sdp": "v=0\r\n" })),
+            Ok(OriginateMedia::Offer("v=0\r\n".to_string()))
+        );
+        assert_eq!(
+            parse_originate_media(&serde_json::json!({ "media": true })),
+            Ok(OriginateMedia::Anchor {
+                profile: "rtp_passthrough".to_string(),
+                ws_uri: None,
+            })
+        );
+        assert_eq!(
+            parse_originate_media(&serde_json::json!({
+                "media": true, "profile": "voice_ai", "ws_uri": "ws://ai.invalid/{call_id}",
+            })),
+            Ok(OriginateMedia::Anchor {
+                profile: "voice_ai".to_string(),
+                ws_uri: Some("ws://ai.invalid/{call_id}".to_string()),
+            })
+        );
+        assert!(parse_originate_media(&serde_json::json!({})).is_err());
+        assert!(parse_originate_media(&serde_json::json!({ "sdp": "" })).is_err());
+        assert!(parse_originate_media(&serde_json::json!({ "sdp": "v=0", "media": true })).is_err());
+    }
+
+    #[test]
+    fn parse_privacy_variants() {
+        use crate::sip::privacy::CallerIdPresentation;
+        assert_eq!(parse_privacy(None), Ok(None));
+        assert_eq!(parse_privacy(Some(&serde_json::Value::Null)), Ok(None));
+        assert_eq!(
+            parse_privacy(Some(&serde_json::json!("restricted"))),
+            Ok(Some(CallerIdPresentation::Restricted))
+        );
+        assert_eq!(
+            parse_privacy(Some(&serde_json::json!("allowed"))),
+            Ok(Some(CallerIdPresentation::Allowed))
+        );
+        assert!(parse_privacy(Some(&serde_json::json!("sideways"))).is_err());
+        assert!(parse_privacy(Some(&serde_json::json!(1))).is_err());
+    }
+
+    #[test]
+    fn originate_error_maps_each_cause_to_its_own_code() {
+        use crate::dispatcher::OriginateError;
+        // Requirement: unknown target / bad argument / backend-cannot / stack-down
+        // must each be separately actionable on the wire.
+        assert!(matches!(
+            originate_error(OriginateError::InvalidUri {
+                field: "to",
+                detail: "nope".to_string()
+            }),
+            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+        ));
+        assert!(matches!(
+            originate_error(OriginateError::Unroutable("no route".to_string())),
+            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+        ));
+        assert!(matches!(
+            originate_error(OriginateError::Unsupported("no answer_local".to_string())),
+            ControlResult::Error { code: ControlErrorCode::UnsupportedVerb, .. }
+        ));
+        assert!(matches!(
+            originate_error(OriginateError::Unavailable("down".to_string())),
+            ControlResult::Error { code: ControlErrorCode::Unavailable, .. }
+        ));
+        assert!(matches!(
+            originate_error(OriginateError::BuildFailed("bad".to_string())),
+            ControlResult::Error { code: ControlErrorCode::Unavailable, .. }
+        ));
+    }
+
+    #[test]
+    fn string_arg_treats_empty_as_absent() {
+        let args = serde_json::json!({ "from": "", "from_display": "Support", "x": 7 });
+        assert_eq!(string_arg(&args, "from"), None);
+        assert_eq!(string_arg(&args, "from_display"), Some("Support".to_string()));
+        assert_eq!(string_arg(&args, "x"), None);
+        assert_eq!(string_arg(&args, "missing"), None);
     }
 
     #[test]
@@ -901,6 +1463,7 @@ mod tests {
             verb: "answer".to_string(),
             args: serde_json::json!({}),
             target: ResolvedTarget::None,
+            origin: test_origin(),
         });
         assert!(matches!(
             result,
@@ -914,6 +1477,7 @@ mod tests {
             verb: "teleport".to_string(),
             args: serde_json::json!({}),
             target: ResolvedTarget::Channel(channel()),
+            origin: test_origin(),
         });
         assert!(matches!(
             result,
@@ -954,6 +1518,7 @@ mod tests {
                     verb: verb.to_string(),
                     args,
                     target: ResolvedTarget::Channel(channel()),
+                    origin: test_origin(),
                 })
                 .await;
             assert!(
@@ -1108,6 +1673,7 @@ mod tests {
             verb: "remove_header".to_string(),
             args: serde_json::json!({ "name": "X-Foo" }),
             target: ResolvedTarget::Channel(channel()),
+            origin: test_origin(),
         });
         assert!(matches!(
             result,
@@ -1277,6 +1843,7 @@ mod tests {
             verb: "route".to_string(),
             args: serde_json::json!({ "targets": ["sip:1@carrier.example"] }),
             target: ResolvedTarget::Channel(channel()),
+            origin: test_origin(),
         });
         assert!(matches!(
             result,
@@ -1381,6 +1948,7 @@ mod tests {
             verb: "accept_refer".to_string(),
             args: serde_json::json!({}),
             target: ResolvedTarget::Channel(channel()),
+            origin: test_origin(),
         });
         assert!(matches!(
             result,
@@ -1412,6 +1980,7 @@ mod tests {
             verb: "reject_refer".to_string(),
             args: serde_json::json!({}),
             target: ResolvedTarget::Channel(channel()),
+            origin: test_origin(),
         });
         assert!(matches!(
             result,
