@@ -17920,11 +17920,30 @@ fn handle_originated_refer_response(
         return;
     };
 
+    // The attempt this response is about: attempt 1 is the first send, attempt
+    // N a credentialed retry (RFC 7616 §3.3).
+    let attempt = pending.auth_retries + 1;
+    let reason = response_reason_phrase(message);
+
     if (200..300).contains(&status_code) {
         debug!(
             call_id = %pending.call_id,
             status = status_code,
             "B2BUA: siphon-originated REFER accepted"
+        );
+        // RFC 3515 §2.4.4: a 2xx to a REFER means the referee accepted it *for
+        // processing* — it is NOT the transfer's outcome, which arrives later on
+        // the implicit subscription as a message/sipfrag NOTIFY. So this is
+        // progress, never completion.
+        control_forward_transfer_outcome(
+            state,
+            &pending.call_id,
+            crate::control::TransferOutcome::new(
+                crate::control::TransferStage::from_refer_response(status_code, false),
+            )
+            .with_refer_to(pending.refer_to.uri.clone())
+            .with_status(status_code, reason)
+            .with_attempt(attempt),
         );
         return;
     }
@@ -17934,6 +17953,22 @@ fn handle_originated_refer_response(
         && pending.auth_retries < MAX_B2BUA_AUTH_RETRIES
         && retry_originated_refer_with_credentials(&pending, message, status_code, state)
     {
+        // Progress, not failure: the peer challenged and siphon answered. The
+        // attempt number is what lets an application tell this apart from a
+        // refusal — the same 401/407 status carries both meanings.
+        control_forward_transfer_outcome(
+            state,
+            &pending.call_id,
+            crate::control::TransferOutcome::new(
+                crate::control::TransferStage::from_refer_response(
+                    status_code,
+                    /*challenge_answered=*/ true,
+                ),
+            )
+            .with_refer_to(pending.refer_to.uri.clone())
+            .with_status(status_code, reason)
+            .with_attempt(attempt),
+        );
         return;
     }
 
@@ -17956,9 +17991,63 @@ fn handle_originated_refer_response(
             "B2BUA: siphon-originated REFER rejected by the peer"
         );
     }
+    let stage = crate::control::TransferStage::from_refer_response(
+        status_code,
+        /*challenge_answered=*/ false,
+    );
+    // Terminal: the transfer never started. Emitted together with the
+    // subscription clear below so the two can never diverge — a cleared
+    // subscription with no verdict is a transfer that stays pending forever.
+    control_forward_transfer_outcome(
+        state,
+        &pending.call_id,
+        crate::control::TransferOutcome::new(stage)
+            .with_refer_to(pending.refer_to.uri.clone())
+            .with_status(status_code, reason)
+            .with_attempt(attempt),
+    );
     state
         .call_actors
         .clear_refer_subscriptions_on_leg(&pending.call_id, pending.on_a_leg);
+}
+
+/// The reason phrase of a response, or `""` when the peer sent none (RFC 3261
+/// §25.1 allows an empty `Reason-Phrase`).
+fn response_reason_phrase(message: &SipMessage) -> &str {
+    match &message.start_line {
+        StartLine::Response(status_line) => status_line.reason_phrase.as_str(),
+        StartLine::Request(_) => "",
+    }
+}
+
+/// Forward one verdict on a siphon-originated (outbound) REFER to the control
+/// connection owning this call, as `TransferProgress` / `TransferCompleted` /
+/// `TransferFailed` (RFC 3515 §2.4.4 — see [`crate::control::TransferStage`]).
+///
+/// **Additive** — this runs next to, never in place of, the in-process transfer
+/// machinery, and fires whether or not any Python handler is registered. A no-op
+/// when the control plane isn't configured or the call isn't controlled.
+///
+/// `internal_call_id` is the `CallActor` id; the control bus keys channels on
+/// the **A-leg** SIP Call-ID, which is not the dialog a REFER on the B-leg (or
+/// its NOTIFYs) travels on, so the A-leg Call-ID is resolved from the store here
+/// rather than taken from the message.
+fn control_forward_transfer_outcome(
+    state: &DispatcherState,
+    internal_call_id: &str,
+    outcome: crate::control::TransferOutcome,
+) {
+    let Some(bus) = crate::control::ControlBus::global() else {
+        return;
+    };
+    let Some(sip_call_id) = state
+        .call_actors
+        .get_call(internal_call_id)
+        .map(|call| call.a_leg.dialog.call_id.clone())
+    else {
+        return;
+    };
+    bus.forward_transfer_outcome(&sip_call_id, &outcome);
 }
 
 /// Re-send a challenged REFER carrying digest credentials. Returns `false` when
@@ -22316,12 +22405,31 @@ fn handle_b2bua_notify(inbound: InboundMessage, message: SipMessage, state: &Dis
             .get("Subscription-State")
             .map(|value| value.to_ascii_lowercase().contains("terminated"))
             .unwrap_or(false);
+        // RFC 3515 §2.4.4: the sipfrag Status-Line in this NOTIFY *is* the
+        // transfer's outcome — the 2xx to the REFER only said "accepted for
+        // processing". Parsing it is what turns the control rail's transfer
+        // report from "asked" into "happened".
+        let sipfrag = crate::b2bua::transfer::parse_sipfrag_status(&message.body);
         debug!(
             call_id = %call_id,
             terminated,
             body = %String::from_utf8_lossy(&message.body),
             "B2BUA NOTIFY: siphon-owned REFER subscription progress"
         );
+        // A terminating NOTIFY always yields a stage — including the
+        // no-readable-status one — so a transfer is never left pending; the
+        // verdict goes out alongside the subscription clear below, never instead
+        // of it.
+        if let Some(stage) = crate::control::TransferStage::from_notify(
+            terminated,
+            sipfrag.as_ref().map(|(code, _)| *code),
+        ) {
+            let mut outcome = crate::control::TransferOutcome::new(stage);
+            if let Some((code, reason)) = &sipfrag {
+                outcome = outcome.with_status(*code, reason);
+            }
+            control_forward_transfer_outcome(state, &call_id, outcome);
+        }
         if terminated {
             state
                 .call_actors

@@ -202,6 +202,9 @@ export type SipEventKind =
   | "ChannelHangupRequest"
   | "ChannelDtmfReceived"
   | "TransferRequested"
+  | "TransferProgress"
+  | "TransferCompleted"
+  | "TransferFailed"
   | (string & {});
 
 /** Parse a wire event name; unknown names pass through verbatim (forward-compatible). */
@@ -247,4 +250,69 @@ export interface TransferRequestedPayload {
   replaces?: TransferReplaces | null;
   /** The From-tag of the referring party, if known. */
   from_tag?: string | null;
+}
+
+/**
+ * Where a verdict on an *outbound* REFER came from — the `stage` of a
+ * {@link TransferOutcomePayload}. Unknown tokens pass through verbatim
+ * (forward-compatible).
+ */
+export type TransferStage =
+  /** `2xx` to the REFER: accepted for processing only (RFC 3515 §2.4.4). */
+  | "accepted"
+  /** `401`/`407` answered with credentials; `attempt` says which try. */
+  | "challenged"
+  /** A non-terminating `message/sipfrag` NOTIFY reported progress. */
+  | "notify"
+  /** A terminating sipfrag NOTIFY reported a `2xx`: the transfer completed. */
+  | "transferred"
+  /** A terminating sipfrag NOTIFY reported `3xx`+: the target failed. */
+  | "refused"
+  /** The referee refused the REFER itself: the transfer never started. */
+  | "rejected"
+  /** Challenged with no way to answer (no credentials / retry cap). */
+  | "unauthorized"
+  /** The subscription ended with no usable status — never read as success. */
+  | "no_outcome"
+  /** The call ended with the transfer still outstanding. */
+  | "call_ended"
+  | (string & {});
+
+/**
+ * The `payload` shared by the `TransferProgress`, `TransferCompleted` and
+ * `TransferFailed` events — one verdict on a transfer this app asked for with
+ * the `refer` verb.
+ *
+ * The `refer` command resolves as soon as siphon has sent the REFER; RFC 3515
+ * §2.4.4 puts the real outcome on the implicit subscription that follows. Expect
+ * zero or more `TransferProgress`, then exactly one `TransferCompleted` /
+ * `TransferFailed`. Cast a {@link import("./sip").CallEvent}'s `payload` to this
+ * when `kind` is one of those three.
+ */
+export interface TransferOutcomePayload {
+  /** Where this verdict came from. */
+  stage: TransferStage;
+  /** The Refer-To URI the REFER carried, when known. */
+  refer_to?: string | null;
+  /**
+   * The SIP status this verdict rests on: the REFER's own response status for
+   * `accepted` / `challenged` / `rejected` / `unauthorized`, the sipfrag status
+   * for the NOTIFY-driven stages.
+   */
+  code?: number | null;
+  /** That status's reason phrase, when the peer supplied one. */
+  reason?: string | null;
+  /**
+   * Which REFER attempt this verdict is about, 1-based. `null` once the REFER
+   * transaction is over (the NOTIFY-driven stages).
+   */
+  attempt?: number | null;
+}
+
+/**
+ * Whether an event name ends a transfer this app asked for. Exactly one such
+ * event arrives per `refer`, so this is the signal to stop waiting.
+ */
+export function isTransferFinal(name: string): boolean {
+  return name === "TransferCompleted" || name === "TransferFailed";
 }

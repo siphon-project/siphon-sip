@@ -385,6 +385,45 @@ later phase over the same envelope. The client SDK facade methods for the media,
 transfer and originate verbs land alongside it (until then, reach the verbs
 through the generic `command(verb, args)` escape hatch).
 
+An **outbound REFER** — the `refer` verb, where the app asks siphon to transfer a
+call — reports its far-end verdict as events, never in the command reply. The
+reply is `{refer: "sent"}` and means exactly that: RFC 3515 §2.4.4 makes the 2xx
+to a REFER "accepted for processing", with the real outcome arriving afterwards
+on the implicit subscription as a `message/sipfrag` NOTIFY. Folding that into the
+reply would mean blocking a command on the far end, so the rail carries it as:
+
+- `TransferProgress` — the transfer moved but is not finished. Never a success.
+- `TransferCompleted` — the referee reported a 2xx on the terminating NOTIFY.
+- `TransferFailed` — it did not happen.
+
+All three share the payload `{stage, refer_to?, code?, reason?, attempt?}`, where
+`stage` says where the verdict came from and `code`/`reason` carry the SIP status
+it rests on (the REFER's own response, or the sipfrag status):
+
+| stage | event | meaning |
+|---|---|---|
+| `accepted` | `TransferProgress` | 2xx to the REFER — taken on for processing, no outcome yet |
+| `challenged` | `TransferProgress` | 401/407, answered with the call's credentials; `attempt` is which try |
+| `notify` | `TransferProgress` | a non-terminating sipfrag NOTIFY (e.g. `100`, `180`) |
+| `transferred` | `TransferCompleted` | terminating sipfrag NOTIFY with a 2xx |
+| `refused` | `TransferFailed` | terminating sipfrag NOTIFY with a 3xx+ — the referee tried the target and it failed |
+| `rejected` | `TransferFailed` | the referee refused the REFER itself: the transfer never started |
+| `unauthorized` | `TransferFailed` | challenged with no way to answer (no credentials, unparseable challenge, retry cap) |
+| `no_outcome` | `TransferFailed` | the subscription ended with no usable status — never read as success |
+| `call_ended` | `TransferFailed` | the call was torn down with the transfer still outstanding |
+
+`attempt` is the 1-based REFER attempt the verdict is about, so a carrier that
+challenges and is answered (`TransferProgress{stage: "challenged", attempt: 1}`)
+is distinguishable from one that refuses (`TransferFailed{stage: "unauthorized"}`)
+even though both carry the same 407. Exactly one terminal event
+(`TransferCompleted` / `TransferFailed`) is emitted per `refer`, including when
+the call dies mid-transfer — a transfer is never left pending.
+
+`bridge` / `originate` verbs arrive in later phases over the same envelope. The
+client SDK facade methods for the media verbs and the transfer verbs land
+alongside them (until then, reach the verbs through the generic
+`command(verb, args)` escape hatch).
+
 The complete wire reference, both connection modes end to end, and two
 low-level example clients (one Python, one TypeScript) that drive calls with no
 SDK live in the repository:

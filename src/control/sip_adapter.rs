@@ -56,7 +56,7 @@ impl ControlAdapter for SipControlAdapter {
                 verb("progress", "Send a UAS 1xx / early media (args: code, reason, body, content_type)"),
                 verb("reject", "Send a final non-2xx and tear the call down (args: code, reason)"),
                 verb("hangup", "BYE an answered call, or reject an unanswered one (args: reason)"),
-                verb("refer", "Send an in-dialog REFER on the A-leg (args: to, replaces)"),
+                verb("refer", "Send an in-dialog REFER on the A-leg; the reply reports only that it was sent, the far end's verdict arrives as TransferProgress then TransferCompleted / TransferFailed (args: to, replaces)"),
                 verb("accept_refer", "Accept a pending inbound REFER (from a TransferRequested event) and run the transfer (args: target, next_hop, mode)"),
                 verb("reject_refer", "Reject a pending inbound REFER with a final non-2xx (args: code, reason)"),
                 verb("route", "Return control to siphon with a routing decision: un-park the call and dial the B-leg via LCR sequential failover (args: targets, strategy, headers)"),
@@ -78,6 +78,14 @@ impl ControlAdapter for SipControlAdapter {
                 "ChannelHangupRequest".to_string(),
                 "ChannelDtmfReceived".to_string(),
                 "TransferRequested".to_string(),
+                // The verdict on an *outbound* REFER (the `refer` verb). Three
+                // names, because RFC 3515 §2.4.4 splits "accepted for
+                // processing" (the 2xx to the REFER) from the real outcome (the
+                // message/sipfrag NOTIFY that follows): TransferProgress while
+                // it moves, then exactly one TransferCompleted / TransferFailed.
+                "TransferProgress".to_string(),
+                "TransferCompleted".to_string(),
+                "TransferFailed".to_string(),
             ],
         }
     }
@@ -847,6 +855,15 @@ fn hangup(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
     }
 }
 
+/// `refer` — send an in-dialog REFER on the A-leg (a siphon-originated cold
+/// transfer).
+///
+/// The reply says `{"refer": "sent"}` and nothing more, deliberately: RFC 3515
+/// §2.4.4 puts the transfer's outcome on the implicit subscription that follows
+/// (a `message/sipfrag` NOTIFY), so folding it into the reply would mean waiting
+/// on the far end inside a command. The verdict arrives as events instead —
+/// `TransferProgress` while it moves, then exactly one `TransferCompleted` /
+/// `TransferFailed` (see [`crate::control::TransferStage`]).
 fn refer(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
     let Some(to) = args.get("to").and_then(|v| v.as_str()) else {
         return ControlResult::error(ControlErrorCode::BadRequest, "refer requires args.to");
@@ -1502,9 +1519,32 @@ mod tests {
             "ChannelHangupRequest",
             "ChannelDtmfReceived",
             "TransferRequested",
+            "TransferProgress",
+            "TransferCompleted",
+            "TransferFailed",
         ] {
             assert!(events.contains(&expected), "missing event {expected}");
         }
+    }
+
+    #[test]
+    fn refer_reply_reports_only_local_acceptance() {
+        // The command/event split, asserted rather than assumed: the `refer`
+        // verb's summary must promise the outcome as an event, because the reply
+        // can only report that siphon sent the REFER. RFC 3515 §2.4.4 puts the
+        // real verdict on the implicit subscription, which arrives later.
+        let schema = SipControlAdapter::new().describe();
+        let refer = schema
+            .verbs
+            .iter()
+            .find(|verb| verb.verb == "refer")
+            .expect("refer verb");
+        assert!(
+            refer.summary.contains("TransferCompleted")
+                && refer.summary.contains("TransferFailed"),
+            "the refer verb must point at its outcome events, got: {}",
+            refer.summary
+        );
     }
 
     #[test]

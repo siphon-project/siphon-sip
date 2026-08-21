@@ -61,6 +61,7 @@ export {
   GET_VAR,
   SipVerb,
   sipEventKind,
+  isTransferFinal,
   encodeCommand,
   parseInboundFrame,
 } from "./protocol";
@@ -79,6 +80,8 @@ export type {
   ChannelDtmfPayload,
   TransferReplaces,
   TransferRequestedPayload,
+  TransferStage,
+  TransferOutcomePayload,
 } from "./protocol";
 
 export { ControlClient, EventStream } from "./client";

@@ -92,6 +92,45 @@ pub fn build_sipfrag_body(status_code: u16, reason: &str) -> String {
     format!("SIP/2.0 {status_code} {reason}\r\n")
 }
 
+/// Parse the `message/sipfrag` body of a REFER-subscription NOTIFY into its
+/// status code and reason phrase — the *outcome* of a transfer siphon
+/// originated (RFC 3515 §2.4.4: the referee reports progress as a sipfrag
+/// Status-Line; RFC 3420 defines the sipfrag body itself).
+///
+/// The inverse of [`build_sipfrag_body`]. Deliberately tolerant, because the
+/// body comes off the wire from a peer:
+///
+/// * A sipfrag MAY carry headers after the Status-Line (RFC 3420 §2), so only
+///   the first non-blank line is read.
+/// * A sipfrag MAY omit the start line entirely and carry only headers
+///   (RFC 3420 §2) — there is no status to report, so that yields `None`.
+/// * The reason phrase is optional in the Status-Line grammar (RFC 3261 §25.1
+///   allows an empty `Reason-Phrase`), so a bare `SIP/2.0 200` parses with an
+///   empty reason.
+///
+/// Returns `None` when the body carries no usable Status-Line; the caller
+/// treats that as "no outcome", never as success.
+pub fn parse_sipfrag_status(body: &[u8]) -> Option<(u16, String)> {
+    let text = std::str::from_utf8(body).ok()?;
+    let line = text.lines().find(|line| !line.trim().is_empty())?.trim();
+    // RFC 3261 §7.2: Status-Line = SIP-Version SP Status-Code SP Reason-Phrase.
+    let (version, rest) = line.split_once(' ')?;
+    if !version.eq_ignore_ascii_case("SIP/2.0") {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let (code_text, reason) = match rest.split_once(' ') {
+        Some((code_text, reason)) => (code_text, reason.trim()),
+        None => (rest, ""),
+    };
+    let code: u16 = code_text.parse().ok()?;
+    // RFC 3261 §21: a status code is 3 digits, 100..699.
+    if !(100..700).contains(&code) {
+        return None;
+    }
+    Some((code, reason.to_string()))
+}
+
 /// Build a `Subscription-State` header value for a REFER-subscription NOTIFY
 /// (RFC 3515 §2.4.4 / RFC 6665 §4.1.3).
 ///
@@ -195,6 +234,78 @@ mod tests {
     fn build_sipfrag_503() {
         let body = build_sipfrag_body(503, "Service Unavailable");
         assert_eq!(body, "SIP/2.0 503 Service Unavailable\r\n");
+    }
+
+    #[test]
+    fn parse_sipfrag_round_trips_build() {
+        // The inverse of build_sipfrag_body, on every status class it emits.
+        for (code, reason) in [(100, "Trying"), (200, "OK"), (503, "Service Unavailable")] {
+            let body = build_sipfrag_body(code, reason);
+            assert_eq!(
+                parse_sipfrag_status(body.as_bytes()),
+                Some((code, reason.to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn parse_sipfrag_ignores_trailing_headers() {
+        // RFC 3420 §2: a sipfrag may carry headers after the Status-Line.
+        let body = b"SIP/2.0 486 Busy Here
+Contact: <sip:carol@example.com>
+";
+        assert_eq!(
+            parse_sipfrag_status(body),
+            Some((486, "Busy Here".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_sipfrag_accepts_missing_reason_phrase() {
+        // RFC 3261 §25.1 allows an empty Reason-Phrase.
+        assert_eq!(parse_sipfrag_status(b"SIP/2.0 200
+"), Some((200, String::new())));
+    }
+
+    #[test]
+    fn parse_sipfrag_multi_word_reason_is_kept_whole() {
+        assert_eq!(
+            parse_sipfrag_status(b"SIP/2.0 480 Temporarily Unavailable
+"),
+            Some((480, "Temporarily Unavailable".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_sipfrag_without_status_line_is_none() {
+        // RFC 3420 §2: a header-only fragment carries no outcome at all.
+        assert_eq!(parse_sipfrag_status(b"Contact: <sip:carol@example.com>
+"), None);
+        assert_eq!(parse_sipfrag_status(b""), None);
+        assert_eq!(parse_sipfrag_status(b"
+
+"), None);
+        assert_eq!(parse_sipfrag_status(b"SIP/2.0 not-a-code
+"), None);
+        assert_eq!(parse_sipfrag_status(b"HTTP/1.1 200 OK
+"), None);
+        // Out of the 100..699 status range (RFC 3261 §21).
+        assert_eq!(parse_sipfrag_status(b"SIP/2.0 99 Nope
+"), None);
+        assert_eq!(parse_sipfrag_status(b"SIP/2.0 700 Nope
+"), None);
+        // Not UTF-8 at all.
+        assert_eq!(parse_sipfrag_status(&[0xff, 0xfe, 0x00]), None);
+    }
+
+    #[test]
+    fn parse_sipfrag_tolerates_leading_blank_lines() {
+        assert_eq!(
+            parse_sipfrag_status(b"
+SIP/2.0 200 OK
+"),
+            Some((200, "OK".to_string()))
+        );
     }
 
     #[test]
