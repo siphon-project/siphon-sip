@@ -266,6 +266,217 @@ struct ChannelEntry {
     on_lost: String,
     /// Per-call variables (drain with the channel — never on `CallActor`).
     vars: Mutex<HashMap<String, String>>,
+    /// The `Refer-To` of an outbound REFER whose verdict has not landed yet.
+    ///
+    /// Set by the first non-terminal [`TransferOutcome`] on this channel and
+    /// cleared by the terminal one. Its only job is the teardown flush: RFC 3515
+    /// §2.4.4's implicit subscription dies with the dialog, so a call that goes
+    /// away mid-transfer would otherwise leave the app waiting on a verdict that
+    /// can never arrive. One `Option<String>` per channel, drained by
+    /// [`ControlBus::remove_channel`] with everything else on the entry.
+    outbound_transfer: Mutex<Option<String>>,
+}
+
+/// Where a verdict on a **siphon-originated (outbound) REFER** came from — the
+/// `stage` field of the `TransferProgress` / `TransferCompleted` /
+/// `TransferFailed` payload, and what decides which of those three names the
+/// event carries.
+///
+/// The split exists because RFC 3515 §2.4.4 separates two things an application
+/// otherwise cannot tell apart: a `2xx` to the REFER means the referee accepted
+/// it **for processing**, while the transfer's real outcome arrives later on the
+/// implicit subscription as a `message/sipfrag` NOTIFY. Reporting that `2xx` as
+/// success would call every failed transfer a success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferStage {
+    /// The referee returned a `2xx` to the REFER: accepted for processing only
+    /// (RFC 3515 §2.4.4). Not an outcome — non-terminal.
+    Accepted,
+    /// The referee challenged the REFER (`401`/`407`) and siphon answered it
+    /// with the call's credentials; the credentialed retry is on the wire.
+    /// Non-terminal, and the signal that distinguishes "the peer challenged and
+    /// we answered" from "the peer refused".
+    Challenged,
+    /// A non-terminating sipfrag NOTIFY reported progress (e.g. `100`, `180`).
+    /// Non-terminal.
+    Notify,
+    /// A terminating sipfrag NOTIFY reported a `2xx` — the transfer completed.
+    Transferred,
+    /// A terminating sipfrag NOTIFY reported a `3xx`+ status — the referee tried
+    /// the target and it failed.
+    Refused,
+    /// The referee answered the REFER itself with a final non-2xx: the transfer
+    /// never started.
+    Rejected,
+    /// The REFER was challenged and the challenge could not be answered (no
+    /// credentials configured, an unparseable challenge, or the retry cap).
+    Unauthorized,
+    /// The subscription ended without a usable sipfrag status. Terminal by
+    /// construction: never report a transfer of unknown outcome as a success.
+    NoOutcome,
+    /// The call was torn down with the transfer still outstanding, so its
+    /// subscription can never report (RFC 3515 §2.4.4 — the implicit
+    /// subscription lives inside the dialog and dies with it).
+    CallEnded,
+}
+
+impl TransferStage {
+    /// The exact `stage` token on the wire.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TransferStage::Accepted => "accepted",
+            TransferStage::Challenged => "challenged",
+            TransferStage::Notify => "notify",
+            TransferStage::Transferred => "transferred",
+            TransferStage::Refused => "refused",
+            TransferStage::Rejected => "rejected",
+            TransferStage::Unauthorized => "unauthorized",
+            TransferStage::NoOutcome => "no_outcome",
+            TransferStage::CallEnded => "call_ended",
+        }
+    }
+
+    /// The event name this stage is published under.
+    pub fn event_name(&self) -> &'static str {
+        match self {
+            TransferStage::Accepted | TransferStage::Challenged | TransferStage::Notify => {
+                "TransferProgress"
+            }
+            TransferStage::Transferred => "TransferCompleted",
+            TransferStage::Refused
+            | TransferStage::Rejected
+            | TransferStage::Unauthorized
+            | TransferStage::NoOutcome
+            | TransferStage::CallEnded => "TransferFailed",
+        }
+    }
+
+    /// Whether this stage ends the transfer. Exactly one terminal stage is
+    /// emitted per outbound REFER — after it, no further verdict follows.
+    pub fn is_terminal(&self) -> bool {
+        !matches!(
+            self,
+            TransferStage::Accepted | TransferStage::Challenged | TransferStage::Notify
+        )
+    }
+
+    /// Classify the **final** response to a siphon-originated REFER.
+    /// `challenge_answered` is whether a credentialed retry actually went out
+    /// (`false` when there are no credentials, the challenge was unparseable, or
+    /// the retry cap was reached).
+    ///
+    /// Note what a `2xx` maps to: [`Accepted`](Self::Accepted), which is
+    /// non-terminal. RFC 3515 §2.4.4 makes a `2xx` to a REFER mean "accepted for
+    /// processing" and nothing more, so mapping it to a completion would report
+    /// every failed transfer as a success.
+    pub fn from_refer_response(status_code: u16, challenge_answered: bool) -> Self {
+        if (200..300).contains(&status_code) {
+            return TransferStage::Accepted;
+        }
+        match (status_code, challenge_answered) {
+            // RFC 3261 §22: a 401/407 is a challenge, not a refusal.
+            (401 | 407, true) => TransferStage::Challenged,
+            (401 | 407, false) => TransferStage::Unauthorized,
+            _ => TransferStage::Rejected,
+        }
+    }
+
+    /// Classify a `message/sipfrag` NOTIFY on the REFER subscription siphon owns
+    /// (RFC 3515 §2.4.4). `terminated` is whether the `Subscription-State`
+    /// header ends the subscription (RFC 6665 §4.1.3); `sipfrag` is the parsed
+    /// Status-Line status, if the body carried one.
+    ///
+    /// Returns `None` only for a *non*-terminating NOTIFY with no readable
+    /// status — nothing happened worth reporting. A terminating NOTIFY always
+    /// yields a stage, including
+    /// [`NoOutcome`](Self::NoOutcome): the subscription is over either way, so
+    /// silence there would leave the transfer pending forever.
+    pub fn from_notify(terminated: bool, sipfrag: Option<u16>) -> Option<Self> {
+        match (terminated, sipfrag) {
+            (true, Some(code)) if (200..300).contains(&code) => Some(TransferStage::Transferred),
+            (true, Some(code)) if code >= 300 => Some(TransferStage::Refused),
+            // A terminating NOTIFY still carrying a provisional (the referee gave
+            // up mid-flight), or a body with no Status-Line at all.
+            (true, _) => Some(TransferStage::NoOutcome),
+            (false, Some(_)) => Some(TransferStage::Notify),
+            (false, None) => None,
+        }
+    }
+}
+
+/// One verdict on a siphon-originated (outbound) REFER, published on the control
+/// rail as `TransferProgress` / `TransferCompleted` / `TransferFailed`.
+///
+/// Deliberately **never** folded into the `refer` command reply: the command
+/// reports only that the REFER was accepted for local processing; the far end's
+/// verdict is an event. Conflating them would make the reply wait on the peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferOutcome {
+    /// Where the verdict came from.
+    pub stage: TransferStage,
+    /// The `Refer-To` URI the REFER carried, when known.
+    pub refer_to: Option<String>,
+    /// The SIP status this verdict rests on: the REFER's own response status for
+    /// `accepted` / `challenged` / `rejected` / `unauthorized`, the sipfrag
+    /// status for the NOTIFY-driven stages.
+    pub code: Option<u16>,
+    /// That status's reason phrase, when the peer supplied one.
+    pub reason: Option<String>,
+    /// Which REFER attempt this verdict is about, 1-based — attempt 1 is the
+    /// first send, attempt N a credentialed retry (RFC 7616 §3.3). `None` for
+    /// the NOTIFY-driven stages, where the REFER transaction is long over.
+    pub attempt: Option<u32>,
+}
+
+impl TransferOutcome {
+    /// A verdict at `stage` with nothing else known yet.
+    pub fn new(stage: TransferStage) -> Self {
+        Self {
+            stage,
+            refer_to: None,
+            code: None,
+            reason: None,
+            attempt: None,
+        }
+    }
+
+    /// Attach the transfer target.
+    pub fn with_refer_to(mut self, refer_to: impl Into<String>) -> Self {
+        self.refer_to = Some(refer_to.into());
+        self
+    }
+
+    /// Attach the SIP status (and reason phrase, when the peer supplied one)
+    /// this verdict rests on.
+    pub fn with_status(mut self, code: u16, reason: &str) -> Self {
+        self.code = Some(code);
+        if !reason.is_empty() {
+            self.reason = Some(reason.to_string());
+        }
+        self
+    }
+
+    /// Attach the 1-based REFER attempt number this verdict is about.
+    pub fn with_attempt(mut self, attempt: u32) -> Self {
+        self.attempt = Some(attempt);
+        self
+    }
+
+    /// The event name this verdict publishes under.
+    pub fn event_name(&self) -> &'static str {
+        self.stage.event_name()
+    }
+
+    /// The event payload — the wire shape an SDK decodes.
+    pub fn payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "stage": self.stage.as_str(),
+            "refer_to": self.refer_to,
+            "code": self.code,
+            "reason": self.reason,
+            "attempt": self.attempt,
+        })
+    }
 }
 
 /// A read-only snapshot of a channel a connection owns (for command resolution
@@ -644,6 +855,7 @@ impl ControlBus {
                 sip_call_id: sip_call_id.to_string(),
                 on_lost: on_lost.to_string(),
                 vars: Mutex::new(vars),
+                outbound_transfer: Mutex::new(None),
             }),
         );
         self.app_calls
@@ -700,6 +912,9 @@ impl ControlBus {
             ),
             None => return false,
         };
+        // A transfer still awaiting its verdict can never get one once the
+        // channel is gone — report it before the StasisEnd that ends the stream.
+        self.flush_outbound_transfer(channel_id, &sip_call_id);
         self.publish_to_channel(
             channel_id,
             EventFrame::new(
@@ -791,6 +1006,9 @@ impl ControlBus {
             Some(entry) => (entry.app.clone(), entry.call_actor_id.clone()),
             None => return,
         };
+        // A transfer still awaiting its verdict can never get one once the call
+        // is gone — report it before the StasisEnd that ends the stream.
+        self.flush_outbound_transfer(&channel_id, sip_call_id);
         let mut payload = serde_json::json!({ "reason": reason });
         if let Some(object) = payload.as_object_mut() {
             if let Some(code) = code {
@@ -929,6 +1147,115 @@ impl ControlBus {
             debug!(%channel_id, %sip_call_id, target = %refer_to.uri, "control plane: TransferRequested forwarded");
         }
         pushed
+    }
+
+    /// Publish one verdict on a **siphon-originated (outbound) REFER** — the
+    /// `refer` verb's far-end outcome — to the owning control connection.
+    ///
+    /// The `refer` command reply says only that the REFER was accepted for local
+    /// processing; this is where the application learns what actually happened.
+    /// Three event names come out of one call, chosen by
+    /// [`TransferStage::event_name`]: `TransferProgress` while the transfer is
+    /// still moving, then exactly one of `TransferCompleted` / `TransferFailed`.
+    ///
+    /// RFC 3515 §2.4.4 is why that split has to exist: a `2xx` to the REFER is
+    /// "accepted for processing", *not* "transferred" — the real outcome arrives
+    /// afterwards on the implicit subscription as a `message/sipfrag` NOTIFY.
+    ///
+    /// A non-terminal verdict arms the channel's teardown flush; a terminal one
+    /// disarms it (see [`Self::flush_outbound_transfer`]), so a transfer is
+    /// never left pending and exactly one terminal event is emitted per REFER.
+    /// The only state involved is that one `Option<String>` on the channel
+    /// entry, which drains with the channel — no leak coverage of its own.
+    ///
+    /// Idempotent no-op — never panics — when the call is uncontrolled (the
+    /// common case) or the owning connection is gone. Returns whether an event
+    /// was pushed.
+    pub fn forward_transfer_outcome(&self, sip_call_id: &str, outcome: &TransferOutcome) -> bool {
+        let Some(channel_id) = self.channel_id_for_sip_call_id(sip_call_id) else {
+            return false;
+        };
+        let (app, call_actor_id) = match self.channels.get(&channel_id) {
+            Some(entry) => {
+                // Arm / disarm the teardown flush before publishing, so a
+                // teardown racing this event cannot double-report the transfer.
+                let mut pending = match entry.outbound_transfer.lock() {
+                    Ok(pending) => pending,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *pending = if outcome.stage.is_terminal() {
+                    None
+                } else {
+                    outcome.refer_to.clone().or_else(|| pending.clone())
+                };
+                drop(pending);
+                (entry.app.clone(), entry.call_actor_id.clone())
+            }
+            None => return false,
+        };
+        let pushed = self.publish_to_channel(
+            &channel_id,
+            EventFrame::new(
+                outcome.event_name(),
+                &channel_id,
+                &app,
+                &call_actor_id,
+                sip_call_id,
+                outcome.payload(),
+            ),
+        );
+        if pushed {
+            debug!(
+                %channel_id,
+                %sip_call_id,
+                event = outcome.event_name(),
+                stage = outcome.stage.as_str(),
+                code = outcome.code,
+                "control plane: outbound REFER verdict forwarded"
+            );
+        }
+        pushed
+    }
+
+    /// Emit the terminal verdict for an outbound REFER still outstanding on a
+    /// channel that is about to go away, then disarm.
+    ///
+    /// The transfer's implicit subscription lives inside the dialog (RFC 3515
+    /// §2.4.4), so once the call is gone no sipfrag NOTIFY can ever report it.
+    /// Without this an application that asked for a transfer and then lost the
+    /// call would wait forever for a verdict. Runs on every channel-removal
+    /// funnel, ahead of the `StasisEnd` that ends the channel.
+    fn flush_outbound_transfer(&self, channel_id: &str, sip_call_id: &str) {
+        let (app, call_actor_id, refer_to) = match self.channels.get(channel_id) {
+            Some(entry) => {
+                let refer_to = match entry.outbound_transfer.lock() {
+                    Ok(mut pending) => pending.take(),
+                    Err(poisoned) => poisoned.into_inner().take(),
+                };
+                match refer_to {
+                    Some(refer_to) => (entry.app.clone(), entry.call_actor_id.clone(), refer_to),
+                    None => return,
+                }
+            }
+            None => return,
+        };
+        let outcome = TransferOutcome::new(TransferStage::CallEnded).with_refer_to(refer_to);
+        self.publish_to_channel(
+            channel_id,
+            EventFrame::new(
+                outcome.event_name(),
+                channel_id,
+                &app,
+                &call_actor_id,
+                sip_call_id,
+                outcome.payload(),
+            ),
+        );
+        debug!(
+            %channel_id,
+            %sip_call_id,
+            "control plane: outbound REFER left outstanding by teardown — reported failed"
+        );
     }
 
     /// Offer a handed-over call to an app: assign a persistent owner (round
@@ -1474,6 +1801,441 @@ mod tests {
         assert!(!bus.forward_transfer_requested("unknown-ch", "unknown-cid", &refer_to, None));
         assert_eq!(conn.events.depth(), 0, "no event for an uncontrolled call");
         assert_eq!(bus.channel_count(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Outbound-REFER verdicts (`TransferProgress` / `TransferCompleted` /
+    // `TransferFailed`) — the far-end outcome of the `refer` verb.
+    // -----------------------------------------------------------------------
+
+    /// Drain the transfer verdicts a connection received, as
+    /// `(event_name, stage, code, attempt)`.
+    async fn transfer_events(
+        conn: &Arc<ConnHandle>,
+    ) -> Vec<(String, String, Option<u64>, Option<u64>)> {
+        conn.events
+            .recv_many()
+            .await
+            .into_iter()
+            .filter_map(|frame| match frame {
+                OutboundFrame::Event(event)
+                    if event.event.starts_with("Transfer") && event.event != "TransferRequested" =>
+                {
+                    Some((
+                        event.event.clone(),
+                        event.payload["stage"].as_str().unwrap_or_default().to_string(),
+                        event.payload["code"].as_u64(),
+                        event.payload["attempt"].as_u64(),
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn controlled_bus() -> (Arc<ControlBus>, Arc<ConnHandle>) {
+        let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
+        let conn = bus.register_connection("ivr-app");
+        bus.offer_channel(
+            "ivr-app",
+            "ch1",
+            "call-uuid",
+            "sipcid@h",
+            "hangup",
+            HashMap::new(),
+            serde_json::json!({}),
+        );
+        (bus, conn)
+    }
+
+    #[test]
+    fn transfer_stage_wire_tokens_event_names_and_terminality() {
+        // The three event names an app subscribes to, and which stages are
+        // terminal (exactly one terminal verdict per outbound REFER).
+        let progress = [
+            (TransferStage::Accepted, "accepted"),
+            (TransferStage::Challenged, "challenged"),
+            (TransferStage::Notify, "notify"),
+        ];
+        for (stage, token) in progress {
+            assert_eq!(stage.as_str(), token);
+            assert_eq!(stage.event_name(), "TransferProgress");
+            assert!(!stage.is_terminal(), "{token} must not end the transfer");
+        }
+        assert_eq!(TransferStage::Transferred.as_str(), "transferred");
+        assert_eq!(TransferStage::Transferred.event_name(), "TransferCompleted");
+        assert!(TransferStage::Transferred.is_terminal());
+        let failures = [
+            (TransferStage::Refused, "refused"),
+            (TransferStage::Rejected, "rejected"),
+            (TransferStage::Unauthorized, "unauthorized"),
+            (TransferStage::NoOutcome, "no_outcome"),
+            (TransferStage::CallEnded, "call_ended"),
+        ];
+        for (stage, token) in failures {
+            assert_eq!(stage.as_str(), token);
+            assert_eq!(stage.event_name(), "TransferFailed");
+            assert!(stage.is_terminal(), "{token} must end the transfer");
+        }
+    }
+
+    #[test]
+    fn refer_2xx_is_accepted_for_processing_never_completion() {
+        // RFC 3515 §2.4.4: a 2xx to a REFER says the referee took it on, not
+        // that the transfer happened. Reporting it as TransferCompleted would
+        // call every failed transfer a success — the whole point of the split.
+        for status in [200, 202, 299] {
+            let stage = TransferStage::from_refer_response(status, false);
+            assert_eq!(stage, TransferStage::Accepted);
+            assert_eq!(stage.event_name(), "TransferProgress");
+            assert!(!stage.is_terminal());
+        }
+    }
+
+    #[test]
+    fn refer_challenge_answered_is_progress_unanswered_is_failure() {
+        // The same 401/407 status means two opposite things; only whether a
+        // credentialed retry went out separates them.
+        for status in [401, 407] {
+            assert_eq!(
+                TransferStage::from_refer_response(status, true),
+                TransferStage::Challenged
+            );
+            assert_eq!(
+                TransferStage::from_refer_response(status, false),
+                TransferStage::Unauthorized
+            );
+        }
+        // Anything else final is a plain refusal, retry flag or not.
+        for status in [403, 404, 480, 603] {
+            assert_eq!(
+                TransferStage::from_refer_response(status, true),
+                TransferStage::Rejected
+            );
+            assert_eq!(
+                TransferStage::from_refer_response(status, false),
+                TransferStage::Rejected
+            );
+        }
+    }
+
+    #[test]
+    fn notify_classification_covers_every_terminating_body() {
+        // Terminating NOTIFY: the sipfrag status is the outcome.
+        assert_eq!(
+            TransferStage::from_notify(true, Some(200)),
+            Some(TransferStage::Transferred)
+        );
+        assert_eq!(
+            TransferStage::from_notify(true, Some(486)),
+            Some(TransferStage::Refused)
+        );
+        // A terminating NOTIFY with no usable outcome is still terminal — it
+        // must never read as success, and must never leave the app waiting.
+        assert_eq!(
+            TransferStage::from_notify(true, None),
+            Some(TransferStage::NoOutcome)
+        );
+        assert_eq!(
+            TransferStage::from_notify(true, Some(100)),
+            Some(TransferStage::NoOutcome)
+        );
+        // Non-terminating: progress when readable, nothing to report otherwise.
+        assert_eq!(
+            TransferStage::from_notify(false, Some(180)),
+            Some(TransferStage::Notify)
+        );
+        assert_eq!(TransferStage::from_notify(false, None), None);
+    }
+
+    #[test]
+    fn transfer_outcome_payload_shape() {
+        let outcome = TransferOutcome::new(TransferStage::Challenged)
+            .with_refer_to("sip:carol@example.net")
+            .with_status(407, "Proxy Authentication Required")
+            .with_attempt(2);
+        let payload = outcome.payload();
+        assert_eq!(payload["stage"], "challenged");
+        assert_eq!(payload["refer_to"], "sip:carol@example.net");
+        assert_eq!(payload["code"], 407);
+        assert_eq!(payload["reason"], "Proxy Authentication Required");
+        assert_eq!(payload["attempt"], 2);
+        // An empty reason phrase (RFC 3261 §25.1 permits one) is omitted rather
+        // than published as "".
+        let bare = TransferOutcome::new(TransferStage::Rejected).with_status(603, "");
+        assert!(bare.payload()["reason"].is_null());
+        assert!(bare.payload()["refer_to"].is_null());
+        assert!(bare.payload()["attempt"].is_null());
+    }
+
+    #[tokio::test]
+    async fn outbound_refer_accepted_then_progress_then_completed() {
+        // The full happy path: the referee 202s the REFER (progress), NOTIFYs
+        // 100 Trying (progress), then terminates the subscription with a
+        // sipfrag 200 (RFC 3515 §2.4.4) — only THAT is the completion.
+        let (bus, conn) = controlled_bus();
+        let target = "sip:carol@example.net";
+
+        assert!(bus.forward_transfer_outcome(
+            "sipcid@h",
+            &TransferOutcome::new(TransferStage::from_refer_response(202, false))
+                .with_refer_to(target)
+                .with_status(202, "Accepted")
+                .with_attempt(1),
+        ));
+        let notify = TransferStage::from_notify(false, Some(100)).expect("progress NOTIFY");
+        assert!(bus.forward_transfer_outcome(
+            "sipcid@h",
+            &TransferOutcome::new(notify).with_status(100, "Trying"),
+        ));
+        let done = TransferStage::from_notify(true, Some(200)).expect("terminating NOTIFY");
+        assert!(bus.forward_transfer_outcome(
+            "sipcid@h",
+            &TransferOutcome::new(done).with_status(200, "OK"),
+        ));
+
+        let events = transfer_events(&conn).await;
+        assert_eq!(
+            events
+                .iter()
+                .map(|(event, stage, ..)| (event.as_str(), stage.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("TransferProgress", "accepted"),
+                ("TransferProgress", "notify"),
+                ("TransferCompleted", "transferred"),
+            ]
+        );
+        assert_eq!(events[0].2, Some(202));
+        assert_eq!(events[0].3, Some(1));
+        assert_eq!(events[2].2, Some(200));
+
+        // The terminal verdict disarmed the teardown flush: no second, bogus
+        // TransferFailed when the call later ends.
+        bus.on_call_terminated("sipcid@h", "bye");
+        assert!(transfer_events(&conn).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn outbound_refer_accepted_then_refused() {
+        // Accepted for processing, then the referee reports the target refused
+        // it. An app that stopped at the 202 would have called this a success.
+        let (bus, conn) = controlled_bus();
+        bus.forward_transfer_outcome(
+            "sipcid@h",
+            &TransferOutcome::new(TransferStage::from_refer_response(202, false))
+                .with_refer_to("sip:carol@example.net")
+                .with_status(202, "Accepted")
+                .with_attempt(1),
+        );
+        let refused = TransferStage::from_notify(true, Some(486)).expect("terminating NOTIFY");
+        bus.forward_transfer_outcome(
+            "sipcid@h",
+            &TransferOutcome::new(refused).with_status(486, "Busy Here"),
+        );
+
+        let events = transfer_events(&conn).await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "TransferProgress");
+        assert_eq!(events[1].0, "TransferFailed");
+        assert_eq!(events[1].1, "refused");
+        assert_eq!(events[1].2, Some(486), "the sipfrag status must ride along");
+    }
+
+    #[tokio::test]
+    async fn outbound_refer_challenged_retried_then_completed() {
+        // The carrier challenges, siphon answers with credentials, the retry is
+        // accepted and the transfer completes. The challenge must read as
+        // progress carrying the attempt number, not as a refusal.
+        let (bus, conn) = controlled_bus();
+        bus.forward_transfer_outcome(
+            "sipcid@h",
+            &TransferOutcome::new(TransferStage::from_refer_response(407, true))
+                .with_refer_to("sip:carol@example.net")
+                .with_status(407, "Proxy Authentication Required")
+                .with_attempt(1),
+        );
+        bus.forward_transfer_outcome(
+            "sipcid@h",
+            &TransferOutcome::new(TransferStage::from_refer_response(202, false))
+                .with_refer_to("sip:carol@example.net")
+                .with_status(202, "Accepted")
+                .with_attempt(2),
+        );
+        let done = TransferStage::from_notify(true, Some(200)).expect("terminating NOTIFY");
+        bus.forward_transfer_outcome(
+            "sipcid@h",
+            &TransferOutcome::new(done).with_status(200, "OK"),
+        );
+
+        let events = transfer_events(&conn).await;
+        assert_eq!(
+            events
+                .iter()
+                .map(|(event, stage, code, attempt)| (
+                    event.as_str(),
+                    stage.as_str(),
+                    *code,
+                    *attempt
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("TransferProgress", "challenged", Some(407), Some(1)),
+                ("TransferProgress", "accepted", Some(202), Some(2)),
+                ("TransferCompleted", "transferred", Some(200), None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_refer_unretryable_challenge_is_terminal_failure() {
+        // Challenged with no way to answer (no credentials / unparseable
+        // challenge / retry cap): terminal, and distinguishable from the
+        // retried case by the event name + stage despite the identical status.
+        let (bus, conn) = controlled_bus();
+        bus.forward_transfer_outcome(
+            "sipcid@h",
+            &TransferOutcome::new(TransferStage::from_refer_response(407, false))
+                .with_refer_to("sip:carol@example.net")
+                .with_status(407, "Proxy Authentication Required")
+                .with_attempt(3),
+        );
+
+        let events = transfer_events(&conn).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, "TransferFailed");
+        assert_eq!(events[0].1, "unauthorized");
+        assert_eq!(events[0].2, Some(407));
+        assert_eq!(events[0].3, Some(3), "the attempt count must ride along");
+
+        // Terminal means terminal: the teardown flush was disarmed.
+        bus.on_call_terminated("sipcid@h", "bye");
+        assert!(transfer_events(&conn).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn outbound_refer_rejected_outright_is_terminal_failure() {
+        // The referee refuses the REFER itself: the transfer never started.
+        let (bus, conn) = controlled_bus();
+        bus.forward_transfer_outcome(
+            "sipcid@h",
+            &TransferOutcome::new(TransferStage::from_refer_response(603, false))
+                .with_refer_to("sip:carol@example.net")
+                .with_status(603, "Decline")
+                .with_attempt(1),
+        );
+        let events = transfer_events(&conn).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!((events[0].0.as_str(), events[0].1.as_str()), ("TransferFailed", "rejected"));
+        assert_eq!(events[0].2, Some(603));
+    }
+
+    #[tokio::test]
+    async fn outbound_refer_outstanding_at_teardown_reports_failed_before_stasis_end() {
+        // A transfer that can never complete: the referee accepted the REFER,
+        // then the call went away before any terminating NOTIFY. The implicit
+        // subscription lives in the dialog (RFC 3515 §2.4.4), so no verdict can
+        // ever arrive — the app must get a terminal one anyway, and it must
+        // arrive before the StasisEnd that ends the stream.
+        let (bus, conn) = controlled_bus();
+        bus.forward_transfer_outcome(
+            "sipcid@h",
+            &TransferOutcome::new(TransferStage::Accepted)
+                .with_refer_to("sip:carol@example.net")
+                .with_status(202, "Accepted")
+                .with_attempt(1),
+        );
+        bus.on_call_terminated("sipcid@h", "bye");
+
+        let names: Vec<String> = conn
+            .events
+            .recv_many()
+            .await
+            .into_iter()
+            .filter_map(|frame| match frame {
+                OutboundFrame::Event(event) => Some(event.event),
+                _ => None,
+            })
+            .collect();
+        let failed = names
+            .iter()
+            .position(|name| name == "TransferFailed")
+            .expect("a transfer left pending by teardown must be reported failed");
+        let ended = names
+            .iter()
+            .position(|name| name == "StasisEnd")
+            .expect("StasisEnd still fires");
+        assert!(failed < ended, "the verdict must precede StasisEnd: {names:?}");
+        // Everything drained — the flush marker lives on the channel entry.
+        assert_eq!(bus.channel_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn outbound_refer_outstanding_at_release_reports_failed() {
+        // Same guarantee on the other channel-removal funnel: the controller
+        // handed the call back to siphon (`route`) mid-transfer.
+        let (bus, conn) = controlled_bus();
+        bus.forward_transfer_outcome(
+            "sipcid@h",
+            &TransferOutcome::new(TransferStage::Accepted).with_refer_to("sip:carol@example.net"),
+        );
+        assert!(bus.release_channel("ch1", "routed"));
+
+        let events = transfer_events(&conn).await;
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].0, "TransferFailed");
+        assert_eq!(events[1].1, "call_ended");
+        assert_eq!(bus.channel_count(), 0);
+    }
+
+    #[test]
+    fn forward_transfer_outcome_on_uncontrolled_call_is_clean_noop() {
+        // A transfer verdict for a call no control app owns: silent no-op, no
+        // panic, no state (the in-process transfer path is unaffected).
+        let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
+        let conn = bus.register_connection("ivr-app");
+        assert!(!bus.forward_transfer_outcome(
+            "unknown-cid",
+            &TransferOutcome::new(TransferStage::Transferred).with_status(200, "OK"),
+        ));
+        assert_eq!(conn.events.depth(), 0, "no event for an uncontrolled call");
+        assert_eq!(bus.channel_count(), 0);
+    }
+
+    #[test]
+    fn outbound_transfer_marker_drains_to_baseline() {
+        // Steady-state leak gate for the one piece of per-call state this adds:
+        // N transfers armed and torn down leave the channel map at baseline.
+        let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
+        assert_eq!(bus.channel_count(), 0);
+        for cycle in 0..5 {
+            let conn = bus.register_connection("ivr-app");
+            for index in 0..8 {
+                let channel = format!("ch-{cycle}-{index}");
+                let sip_call_id = format!("sip-{cycle}-{index}");
+                bus.register_channel(
+                    &channel,
+                    &conn,
+                    &format!("call-{cycle}-{index}"),
+                    &sip_call_id,
+                    "hangup",
+                    HashMap::new(),
+                );
+                // Arm (non-terminal), then end the call without a verdict.
+                bus.forward_transfer_outcome(
+                    &sip_call_id,
+                    &TransferOutcome::new(TransferStage::Accepted).with_refer_to("sip:c@example.net"),
+                );
+                bus.on_call_terminated(&sip_call_id, "bye");
+            }
+            assert_eq!(bus.channel_count(), 0, "channels leaked on cycle {cycle}");
+            if let Some(fanout) = bus.apps.get(&conn.app) {
+                fanout.remove(conn.id);
+            }
+            conn.events.close();
+            bus.apps.remove_if(&conn.app, |_, fanout| fanout.is_empty());
+        }
+        assert!(bus.app_calls.is_empty(), "app_calls index leaked");
     }
 
     #[test]

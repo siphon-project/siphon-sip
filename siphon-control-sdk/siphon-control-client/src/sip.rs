@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tracing::{debug, warn};
 
 use siphon_control_proto::sip::{
-    ChannelDtmfPayload, SipEvent, SipVerb, TransferRequestedPayload,
+    ChannelDtmfPayload, SipEvent, SipVerb, TransferOutcomePayload, TransferRequestedPayload,
 };
 use siphon_control_proto::verbs::MODULE_SIP;
 use siphon_control_proto::{ChannelSnapshot, EventFrame};
@@ -265,6 +265,34 @@ impl CallEvent {
         }
         serde_json::from_value(self.payload.clone()).ok()
     }
+
+    /// The typed [`TransferOutcomePayload`] when this is a verdict on a transfer
+    /// this app asked for ([`SipEvent::TransferProgress`],
+    /// [`SipEvent::TransferCompleted`] or [`SipEvent::TransferFailed`]), else
+    /// `None`.
+    ///
+    /// This — not the `refer` call's return value — is where a transfer's
+    /// outcome lives: [`Call::refer`] resolves as soon as siphon has sent the
+    /// REFER, because RFC 3515 §2.4.4 delivers the outcome afterwards on the
+    /// implicit subscription.
+    pub fn transfer_outcome(&self) -> Option<TransferOutcomePayload> {
+        if !matches!(
+            self.kind,
+            SipEvent::TransferProgress | SipEvent::TransferCompleted | SipEvent::TransferFailed
+        ) {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+
+    /// Whether this event ends a transfer this app asked for — exactly one such
+    /// event arrives per `refer`, so this is the signal to stop waiting.
+    pub fn is_transfer_final(&self) -> bool {
+        matches!(
+            self.kind,
+            SipEvent::TransferCompleted | SipEvent::TransferFailed
+        )
+    }
 }
 
 struct CallInner {
@@ -427,6 +455,13 @@ impl Call {
     }
 
     /// Send an in-dialog REFER on the A-leg (blind transfer).
+    ///
+    /// Resolves as soon as siphon has sent the REFER — `Ok(())` means *sent*,
+    /// not *transferred*. RFC 3515 §2.4.4 delivers the outcome afterwards on the
+    /// implicit subscription, so read it off the event stream: zero or more
+    /// `TransferProgress`, then exactly one `TransferCompleted` /
+    /// `TransferFailed`. [`CallEvent::transfer_outcome`] decodes them and
+    /// [`CallEvent::is_transfer_final`] says when to stop waiting.
     pub async fn refer(&self, to: &str) -> Result<(), ControlError> {
         self.sip(SipVerb::Refer, json!({ "to": to })).await.map(drop)
     }
@@ -664,8 +699,10 @@ impl Call {
 
     /// Await the next event for this call (`ChannelStateChange`,
     /// `ChannelHangupRequest`, `ChannelDtmfReceived`, `TransferRequested`,
-    /// `StasisEnd`). `None` once the stream closes. Use [`CallEvent::dtmf`] /
-    /// [`CallEvent::transfer_requested`] to decode the payload.
+    /// `TransferProgress`, `TransferCompleted`, `TransferFailed`, `StasisEnd`).
+    /// `None` once the stream closes. Use [`CallEvent::dtmf`] /
+    /// [`CallEvent::transfer_requested`] / [`CallEvent::transfer_outcome`] to
+    /// decode the payload.
     pub async fn next_event(&self) -> Option<CallEvent> {
         self.inner.events.lock().await.recv().await
     }
@@ -1003,6 +1040,7 @@ impl SipServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use siphon_control_proto::sip::TransferStage;
     use siphon_control_proto::ChannelSnapshot;
     use std::collections::HashMap;
 
@@ -1241,5 +1279,65 @@ mod tests {
         assert_eq!(payload.replaces.expect("replaces").call_id, "abc");
         assert_eq!(payload.from_tag.as_deref(), Some("referrer-tag"));
         assert!(transfer.dtmf().is_none());
+        // An inbound REFER is a request to decide, not a verdict on one we sent.
+        assert!(transfer.transfer_outcome().is_none());
+        assert!(!transfer.is_transfer_final());
+    }
+
+    #[test]
+    fn outbound_transfer_verdicts_parse_from_frames() {
+        let frame = |event: &str, payload: serde_json::Value| {
+            CallEvent::from_frame(EventFrame::new(
+                event, "ch1", "ivr-app", "call-uuid", "sip@host", payload,
+            ))
+        };
+
+        // Progress: the referee challenged and siphon answered (attempt 1). The
+        // attempt number is what separates this from a refusal on the same 407.
+        let challenged = frame(
+            "TransferProgress",
+            json!({
+                "stage": "challenged",
+                "refer_to": "sip:carol@example.net",
+                "code": 407,
+                "reason": "Proxy Authentication Required",
+                "attempt": 1
+            }),
+        );
+        assert_eq!(challenged.kind, SipEvent::TransferProgress);
+        let payload = challenged.transfer_outcome().expect("outcome payload");
+        assert_eq!(payload.stage, TransferStage::Challenged);
+        assert_eq!(payload.code, Some(407));
+        assert_eq!(payload.attempt, Some(1));
+        assert!(
+            !challenged.is_transfer_final(),
+            "progress must not end the wait"
+        );
+
+        // Completion, from the terminating sipfrag NOTIFY (RFC 3515 §2.4.4).
+        let completed = frame(
+            "TransferCompleted",
+            json!({ "stage": "transferred", "code": 200, "reason": "OK" }),
+        );
+        assert_eq!(completed.kind, SipEvent::TransferCompleted);
+        assert_eq!(
+            completed.transfer_outcome().expect("outcome").stage,
+            TransferStage::Transferred
+        );
+        assert!(completed.is_transfer_final());
+
+        // Failure, carrying the sipfrag status the referee reported.
+        let failed = frame(
+            "TransferFailed",
+            json!({ "stage": "refused", "code": 486, "reason": "Busy Here" }),
+        );
+        assert_eq!(failed.kind, SipEvent::TransferFailed);
+        let payload = failed.transfer_outcome().expect("outcome");
+        assert_eq!(payload.stage, TransferStage::Refused);
+        assert_eq!(payload.code, Some(486));
+        assert!(failed.is_transfer_final());
+        // Wrong-kind accessors stay None.
+        assert!(failed.dtmf().is_none());
+        assert!(failed.transfer_requested().is_none());
     }
 }

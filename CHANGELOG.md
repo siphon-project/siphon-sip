@@ -124,6 +124,40 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   backends rather than silently downgrading — an overlay quietly turned into a
   supersede would cut the party's live audio.
 
+- **An outbound REFER on the external control rail now reports a real verdict.**
+  An application that asked siphon to transfer a call with the `refer` verb
+  learned only that the request had been accepted for processing — the outcome
+  existed inside siphon and was thrown away into a log line. Three new events
+  carry it on the owning connection: `TransferProgress` while the transfer is
+  still moving, then exactly one `TransferCompleted` / `TransferFailed`. Shared
+  payload `{stage, refer_to?, code?, reason?, attempt?}`, with `stage` naming
+  where the verdict came from (`accepted`, `challenged`, `notify`,
+  `transferred`, `refused`, `rejected`, `unauthorized`, `no_outcome`,
+  `call_ended`) and `code`/`reason` carrying the SIP status it rests on. Three
+  things this fixes: the `2xx` to a REFER is now reported as *progress*, not
+  success — RFC 3515 §2.4.4 makes it "accepted for processing", so treating it
+  as the answer called every failed transfer a success; the `message/sipfrag`
+  body of the REFER-subscription NOTIFY, which is where the real outcome lives,
+  is now parsed rather than only logged; and a carrier that challenges the REFER
+  and is answered with credentials is distinguishable from one that refuses,
+  via the stage plus the 1-based `attempt` number, even though both carry the
+  same `407`. Exactly one terminal event is emitted per REFER — including when
+  the call is torn down mid-transfer, whose implicit subscription can never
+  report — so a transfer is never left pending. The `refer` command reply is
+  unchanged (`{refer: "sent"}`): a far-end outcome is never folded into a
+  command reply, which would mean blocking a command on the peer.
+- **Control SDKs** (Rust `siphon-control-proto` / `siphon-control-client`,
+  TypeScript `@siphon-project/control`): the three events, a typed
+  `TransferOutcomePayload` + `TransferStage`, `CallEvent::transfer_outcome()` /
+  `CallEvent::is_transfer_final()` and the TypeScript `isTransferFinal()`.
+
+### Changed
+- **`siphon-control-proto`'s `SipEvent` is now `#[non_exhaustive]`.** The
+  server's event set grows, and without it every addition breaks any downstream
+  `match` with an arm per variant. A wildcard arm is now required once, and
+  every future event is purely additive. Consumers matching `SipEvent`
+  exhaustively need to add `_ => {}`.
+
 ## [1.6.0] — 2026-08-20
 
 ### Added

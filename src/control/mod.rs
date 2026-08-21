@@ -50,7 +50,7 @@ pub use protocol::{
 };
 pub use registry::{
     ChannelRef, ConnHandle, ControlBus, ControlCommand, OfferOutcome, OutboundFrame, OutboundQueue,
-    Ownership, PushOutcome, SlowConsumerPolicy,
+    Ownership, PushOutcome, SlowConsumerPolicy, TransferOutcome, TransferStage,
 };
 
 /// Push an event to the control channel owning `sip_call_id`, if the call is

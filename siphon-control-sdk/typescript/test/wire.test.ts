@@ -11,11 +11,12 @@ import { AsyncQueue } from "../src/internal";
 import {
   Call,
   encodeCommand,
+  isTransferFinal,
   sipEventKind,
   SipVerb,
   MODULE_SIP,
 } from "../src/index";
-import type { CallEvent } from "../src/index";
+import type { CallEvent, TransferOutcomePayload } from "../src/index";
 import type { CommandTransport } from "../src/session";
 
 describe("command wire bytes (byte-identical to the server)", () => {
@@ -65,7 +66,32 @@ describe("SipVerb wire tokens + event names", () => {
     expect(sipEventKind("StasisStart")).toBe("StasisStart");
     expect(sipEventKind("ChannelDtmfReceived")).toBe("ChannelDtmfReceived");
     expect(sipEventKind("TransferRequested")).toBe("TransferRequested");
+    expect(sipEventKind("TransferProgress")).toBe("TransferProgress");
+    expect(sipEventKind("TransferCompleted")).toBe("TransferCompleted");
+    expect(sipEventKind("TransferFailed")).toBe("TransferFailed");
     expect(sipEventKind("SomethingNew")).toBe("SomethingNew");
+  });
+
+  it("marks exactly the terminal outbound-REFER verdicts as final", () => {
+    // RFC 3515 §2.4.4: the 2xx to a REFER is only "accepted for processing", so
+    // TransferProgress must never end an app's wait for the outcome.
+    expect(isTransferFinal("TransferCompleted")).toBe(true);
+    expect(isTransferFinal("TransferFailed")).toBe(true);
+    expect(isTransferFinal("TransferProgress")).toBe(false);
+    expect(isTransferFinal("TransferRequested")).toBe(false);
+    expect(isTransferFinal("StasisEnd")).toBe(false);
+  });
+
+  it("decodes a transfer verdict payload", () => {
+    // Byte-identical to the server's TransferFailed payload.
+    const payload: TransferOutcomePayload = JSON.parse(
+      '{"stage":"unauthorized","refer_to":"sip:carol@example.net",' +
+        '"code":407,"reason":"Proxy Authentication Required","attempt":3}',
+    );
+    expect(payload.stage).toBe("unauthorized");
+    expect(payload.code).toBe(407);
+    expect(payload.attempt).toBe(3);
+    expect(payload.refer_to).toBe("sip:carol@example.net");
   });
 });
 

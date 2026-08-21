@@ -37,9 +37,11 @@ import type { CommandTransport } from "./session";
 
 /** One event delivered to a call's stream (`ChannelStateChange`,
  * `ChannelHangupRequest`, `ChannelDtmfReceived`, `TransferRequested`,
- * `StasisEnd`, …). Cast `payload` to
+ * `TransferProgress`, `TransferCompleted`, `TransferFailed`, `StasisEnd`, …).
+ * Cast `payload` to
  * {@link import("./protocol").ChannelDtmfPayload} /
- * {@link import("./protocol").TransferRequestedPayload} by `kind`. */
+ * {@link import("./protocol").TransferRequestedPayload} /
+ * {@link import("./protocol").TransferOutcomePayload} by `kind`. */
 export interface CallEvent {
   /** The parsed event kind. */
   kind: SipEventKind;
@@ -293,7 +295,17 @@ export class Call {
     await this.terminate(reason);
   }
 
-  /** Send an in-dialog REFER on the A-leg (blind transfer). */
+  /**
+   * Send an in-dialog REFER on the A-leg (blind transfer).
+   *
+   * Resolves as soon as siphon has sent the REFER — that is *sent*, not
+   * *transferred*. RFC 3515 §2.4.4 delivers the outcome afterwards on the
+   * implicit subscription, so read it off {@link Call.events}: zero or more
+   * `TransferProgress`, then exactly one `TransferCompleted` /
+   * `TransferFailed`, each carrying a
+   * {@link import("./protocol").TransferOutcomePayload}. Use
+   * {@link import("./protocol").isTransferFinal} to know when to stop waiting.
+   */
   async refer(to: string): Promise<void> {
     await this.sip(SipVerb.Refer, { to });
   }

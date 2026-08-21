@@ -96,8 +96,13 @@ impl std::fmt::Display for SipVerb {
 /// Deserializes from the wire event name; an unrecognised name maps to
 /// [`SipEvent::Other`] rather than failing, so a newer server that adds events
 /// never breaks an older client.
+/// `#[non_exhaustive]`: the server's event set grows (this release adds the
+/// three outbound-REFER verdicts), and every such addition would otherwise
+/// break any downstream `match` that had an arm per variant. With it, a
+/// wildcard arm is required once and every future event is purely additive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "String", into = "String")]
+#[non_exhaustive]
 pub enum SipEvent {
     /// A call was handed to this application — the first frame it sees.
     StasisStart,
@@ -113,6 +118,16 @@ pub enum SipEvent {
     /// An inbound REFER on a controlled call is asking the app to own the
     /// transfer decision ([`TransferRequestedPayload`]).
     TransferRequested,
+    /// A transfer this app asked for (the `refer` verb) moved forward but is not
+    /// finished ([`TransferOutcomePayload`]). Never a success: RFC 3515 §2.4.4
+    /// makes a `2xx` to a REFER mean "accepted for processing", with the real
+    /// outcome arriving afterwards on the implicit subscription.
+    TransferProgress,
+    /// A transfer this app asked for succeeded ([`TransferOutcomePayload`]).
+    TransferCompleted,
+    /// A transfer this app asked for failed — refused, rejected, unauthorized,
+    /// or ended without an outcome ([`TransferOutcomePayload`]).
+    TransferFailed,
     /// Any other event name (forward-compatible catch-all).
     Other(String),
 }
@@ -127,6 +142,9 @@ impl SipEvent {
             SipEvent::ChannelHangupRequest => "ChannelHangupRequest",
             SipEvent::ChannelDtmfReceived => "ChannelDtmfReceived",
             SipEvent::TransferRequested => "TransferRequested",
+            SipEvent::TransferProgress => "TransferProgress",
+            SipEvent::TransferCompleted => "TransferCompleted",
+            SipEvent::TransferFailed => "TransferFailed",
             SipEvent::Other(name) => name.as_str(),
         }
     }
@@ -141,6 +159,9 @@ impl From<&str> for SipEvent {
             "ChannelHangupRequest" => SipEvent::ChannelHangupRequest,
             "ChannelDtmfReceived" => SipEvent::ChannelDtmfReceived,
             "TransferRequested" => SipEvent::TransferRequested,
+            "TransferProgress" => SipEvent::TransferProgress,
+            "TransferCompleted" => SipEvent::TransferCompleted,
+            "TransferFailed" => SipEvent::TransferFailed,
             other => SipEvent::Other(other.to_string()),
         }
     }
@@ -217,6 +238,129 @@ pub struct TransferRequestedPayload {
     pub from_tag: Option<String>,
 }
 
+/// The `stage` of a [`TransferOutcomePayload`] — where the verdict on an
+/// outbound REFER came from.
+///
+/// Unrecognised tokens map to [`TransferStage::Other`] rather than failing, so a
+/// newer server never breaks an older client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+#[non_exhaustive]
+pub enum TransferStage {
+    /// The referee returned a `2xx` to the REFER: accepted for processing only
+    /// (RFC 3515 §2.4.4), *not* an outcome.
+    Accepted,
+    /// The referee challenged the REFER (`401`/`407`) and siphon answered with
+    /// the call's credentials; the retry is on the wire. `attempt` says which
+    /// try this was — the signal that separates "challenged and answered" from
+    /// "refused", since both carry the same status.
+    Challenged,
+    /// A non-terminating `message/sipfrag` NOTIFY reported progress.
+    Notify,
+    /// A terminating sipfrag NOTIFY reported a `2xx`: the transfer completed.
+    Transferred,
+    /// A terminating sipfrag NOTIFY reported a `3xx`+ status: the referee tried
+    /// the target and it failed.
+    Refused,
+    /// The referee answered the REFER itself with a final non-2xx: the transfer
+    /// never started.
+    Rejected,
+    /// The REFER was challenged and the challenge could not be answered (no
+    /// credentials, an unparseable challenge, or the retry cap).
+    Unauthorized,
+    /// The subscription ended with no usable sipfrag status — terminal, and
+    /// never to be read as success.
+    NoOutcome,
+    /// The call ended with the transfer still outstanding, so its subscription
+    /// can never report.
+    CallEnded,
+    /// Any other stage token (forward-compatible catch-all).
+    Other(String),
+}
+
+impl TransferStage {
+    /// The exact wire token.
+    pub fn as_str(&self) -> &str {
+        match self {
+            TransferStage::Accepted => "accepted",
+            TransferStage::Challenged => "challenged",
+            TransferStage::Notify => "notify",
+            TransferStage::Transferred => "transferred",
+            TransferStage::Refused => "refused",
+            TransferStage::Rejected => "rejected",
+            TransferStage::Unauthorized => "unauthorized",
+            TransferStage::NoOutcome => "no_outcome",
+            TransferStage::CallEnded => "call_ended",
+            TransferStage::Other(token) => token.as_str(),
+        }
+    }
+}
+
+impl From<&str> for TransferStage {
+    fn from(token: &str) -> Self {
+        match token {
+            "accepted" => TransferStage::Accepted,
+            "challenged" => TransferStage::Challenged,
+            "notify" => TransferStage::Notify,
+            "transferred" => TransferStage::Transferred,
+            "refused" => TransferStage::Refused,
+            "rejected" => TransferStage::Rejected,
+            "unauthorized" => TransferStage::Unauthorized,
+            "no_outcome" => TransferStage::NoOutcome,
+            "call_ended" => TransferStage::CallEnded,
+            other => TransferStage::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<String> for TransferStage {
+    fn from(token: String) -> Self {
+        TransferStage::from(token.as_str())
+    }
+}
+
+impl From<TransferStage> for String {
+    fn from(stage: TransferStage) -> Self {
+        stage.as_str().to_string()
+    }
+}
+
+impl std::fmt::Display for TransferStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The `payload` shared by [`SipEvent::TransferProgress`],
+/// [`SipEvent::TransferCompleted`] and [`SipEvent::TransferFailed`]: one verdict
+/// on a transfer this app asked for with the `refer` verb.
+///
+/// The `refer` command reply reports only that the REFER was sent. RFC 3515
+/// §2.4.4 puts the real outcome on the implicit subscription that follows, as a
+/// `message/sipfrag` NOTIFY — these events carry it. Expect zero or more
+/// `TransferProgress` and then exactly one `TransferCompleted` /
+/// `TransferFailed`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransferOutcomePayload {
+    /// Where this verdict came from.
+    pub stage: TransferStage,
+    /// The `Refer-To` URI the REFER carried, when known.
+    #[serde(default)]
+    pub refer_to: Option<String>,
+    /// The SIP status this verdict rests on: the REFER's own response status for
+    /// `accepted` / `challenged` / `rejected` / `unauthorized`, the sipfrag
+    /// status for the NOTIFY-driven stages.
+    #[serde(default)]
+    pub code: Option<u16>,
+    /// That status's reason phrase, when the peer supplied one.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Which REFER attempt this verdict is about, 1-based. `None` once the REFER
+    /// transaction is over (the NOTIFY-driven stages).
+    #[serde(default)]
+    pub attempt: Option<u32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +400,20 @@ mod tests {
             SipEvent::from("TransferRequested"),
             SipEvent::TransferRequested
         );
+        for name in ["TransferProgress", "TransferCompleted", "TransferFailed"] {
+            let parsed = SipEvent::from(name);
+            assert_eq!(parsed.as_str(), name);
+            assert_eq!(serde_json::to_string(&parsed).unwrap(), format!("\"{name}\""));
+        }
+        assert_eq!(
+            SipEvent::from("TransferProgress"),
+            SipEvent::TransferProgress
+        );
+        assert_eq!(
+            SipEvent::from("TransferCompleted"),
+            SipEvent::TransferCompleted
+        );
+        assert_eq!(SipEvent::from("TransferFailed"), SipEvent::TransferFailed);
         assert_eq!(
             SipEvent::from("SomethingNew"),
             SipEvent::Other("SomethingNew".to_string())
@@ -281,6 +439,65 @@ mod tests {
         assert_eq!(parsed.duration_ms, 100);
         assert_eq!(parsed.volume, -8);
         assert_eq!(parsed.from_tag, "alice-tag");
+    }
+
+    #[test]
+    fn transfer_outcome_payload_parses_every_server_shape() {
+        // Byte-identical to the server's TransferProgress / TransferCompleted /
+        // TransferFailed payloads.
+        let challenged: TransferOutcomePayload = serde_json::from_value(serde_json::json!({
+            "stage": "challenged",
+            "refer_to": "sip:carol@example.net",
+            "code": 407,
+            "reason": "Proxy Authentication Required",
+            "attempt": 1,
+        }))
+        .unwrap();
+        assert_eq!(challenged.stage, TransferStage::Challenged);
+        assert_eq!(challenged.code, Some(407));
+        assert_eq!(challenged.attempt, Some(1));
+
+        // The NOTIFY-driven stages carry no attempt and no Refer-To.
+        let completed: TransferOutcomePayload = serde_json::from_value(serde_json::json!({
+            "stage": "transferred",
+            "refer_to": null,
+            "code": 200,
+            "reason": "OK",
+            "attempt": null,
+        }))
+        .unwrap();
+        assert_eq!(completed.stage, TransferStage::Transferred);
+        assert_eq!(completed.attempt, None);
+        assert_eq!(completed.refer_to, None);
+
+        // Terminal with nothing else known at all.
+        let ended: TransferOutcomePayload =
+            serde_json::from_value(serde_json::json!({ "stage": "call_ended" })).unwrap();
+        assert_eq!(ended.stage, TransferStage::CallEnded);
+        assert_eq!(ended.code, None);
+    }
+
+    #[test]
+    fn transfer_stage_round_trips_known_and_unknown() {
+        for (token, stage) in [
+            ("accepted", TransferStage::Accepted),
+            ("challenged", TransferStage::Challenged),
+            ("notify", TransferStage::Notify),
+            ("transferred", TransferStage::Transferred),
+            ("refused", TransferStage::Refused),
+            ("rejected", TransferStage::Rejected),
+            ("unauthorized", TransferStage::Unauthorized),
+            ("no_outcome", TransferStage::NoOutcome),
+            ("call_ended", TransferStage::CallEnded),
+        ] {
+            assert_eq!(TransferStage::from(token), stage);
+            assert_eq!(stage.as_str(), token);
+            assert_eq!(stage.to_string(), token);
+            assert_eq!(serde_json::to_string(&stage).unwrap(), format!("\"{token}\""));
+        }
+        // A stage a newer server invents must not break decoding.
+        let novel: TransferStage = serde_json::from_str("\"something_new\"").unwrap();
+        assert_eq!(novel, TransferStage::Other("something_new".to_string()));
     }
 
     #[test]
