@@ -1466,21 +1466,38 @@ pub struct ZombieReInviteEntry {
     pub local_addr: Option<SocketAddr>,
 }
 
-/// Post-teardown state for a B-leg whose INVITE was CANCELled but might still
-/// be answered (RFC 3261 §9.1 glare): the callee put a 2xx on the wire before
-/// our CANCEL arrived. That 2xx still establishes a dialog, which the B2BUA
-/// MUST ACK (§13.2.2.4) and then BYE (§15) to release. `handle_b2bua_cancel`
-/// removes the call — unregistering the B-leg branch — so the racing 2xx would
-/// otherwise be dropped as "unknown branch"; this entry lets `handle_response`
-/// catch it and clean the dialog up.
+/// Post-teardown state for a leg whose INVITE was CANCELled but is still owed a
+/// final response.
 ///
-/// Keyed by B-leg SIP Call-ID. Auto-expires after 32 seconds (Timer H).
+/// Two outcomes reach this entry, and both would otherwise be dropped as
+/// "unknown branch" — the CANCEL paths remove the call, unregistering the leg's
+/// branch, at the moment they put the CANCEL on the wire:
+///
+///  * the **ordinary** one, a `487 Request Terminated` (RFC 3261 §9.1): every
+///    CANCELled INVITE draws a final non-2xx, and §17.1.1.3 makes ACKing it the
+///    client transaction's job. Unacknowledged, the peer's INVITE server
+///    transaction retransmits on Timer G until Timer H (64*T1 = 32 s, §17.2.1),
+///    holding transaction state on both sides for the whole window.
+///  * the **glare** one, a 2xx the callee put on the wire before our CANCEL
+///    arrived (§9.1). That 2xx still establishes a dialog, which the B2BUA MUST
+///    ACK (§13.2.2.4) and then BYE (§15) to release.
+///
+/// Keyed by the leg's SIP Call-ID. Auto-expires after 32 seconds (Timer H).
 #[derive(Debug, Clone)]
 pub struct ZombieCancelledLeg {
-    /// The cancelled B-leg's dialog + transport, used to build the ACK and BYE.
+    /// The cancelled leg's dialog + transport, used to build the ACK and BYE.
     /// `remote_tag` / `remote_contact` are filled from the racing 2xx at
     /// handling time (they were unknown when the INVITE was CANCELled).
     pub leg: Leg,
+    /// Request-URI of the INVITE that was CANCELled, captured at teardown.
+    ///
+    /// RFC 3261 §17.1.1.3 requires the ACK for a final non-2xx to carry the
+    /// same Request-URI as the INVITE it acknowledges, and by the time the
+    /// `487` lands the call — and with it the stashed INVITE — is gone. `None`
+    /// only when the INVITE could not be read back (poisoned mutex); no ACK is
+    /// built in that case, because a `sip:invalid` R-URI on the wire is worse
+    /// than none.
+    pub invite_ruri: Option<String>,
     /// Whether the BYE has already been sent. The first racing 2xx triggers
     /// ACK + BYE; later 200 OK retransmits re-ACK only (so a lost ACK still
     /// gets retried) without emitting a second BYE.
@@ -2602,10 +2619,12 @@ impl CallActorStore {
     }
 
     /// Tear down a CANCELled call, but first preserve every still-pending
-    /// B-leg (INVITE sent, no final response yet — status `Trying`/`Ringing`)
-    /// as a [`ZombieCancelledLeg`] so a 2xx that raced the CANCEL
-    /// (RFC 3261 §9.1) can still be ACKed (§13.2.2.4) and BYEd (§15) after the
-    /// call is gone. Used by `handle_b2bua_cancel` in place of `remove_call`.
+    /// leg (INVITE sent, no final response yet — status `Trying`/`Ringing`) as
+    /// a [`ZombieCancelledLeg`], so the final response the CANCEL provokes is
+    /// still answerable after the call is gone: the ordinary `487` gets its ACK
+    /// (RFC 3261 §17.1.1.3) and a 2xx that raced the CANCEL (§9.1) gets ACK
+    /// (§13.2.2.4) + BYE (§15). Used by the CANCEL paths in place of
+    /// `remove_call`.
     ///
     /// Returns true if any zombie-cancelled entries were captured (so the
     /// caller can schedule their expiry).
@@ -2614,21 +2633,24 @@ impl CallActorStore {
         if let Some(call) = self.calls.get(call_id) {
             // A call siphon placed (`originate`) carries its pending INVITE on
             // the A-leg, not a B-leg, so the loop below would capture nothing
-            // and a 2xx racing our CANCEL would be dropped — leaving the callee
-            // retransmitting a 200 for a dialog nobody ever ACKs or BYEs
-            // (RFC 3261 §9.1 glare, §13.2.2.4, §15).
+            // and the final response to our CANCEL would be dropped — leaving
+            // the callee retransmitting a 487 nobody ACKs (RFC 3261 §17.1.1.3),
+            // or a 200 for a dialog nobody ACKs or BYEs (§9.1 glare, §13.2.2.4,
+            // §15).
             if call.originated
                 && matches!(call.state, CallState::Calling | CallState::Ringing)
-                && call.a_leg_invite.is_some()
             {
-                self.zombie_cancelled.insert(
-                    call.a_leg.dialog.call_id.clone(),
-                    ZombieCancelledLeg {
-                        leg: call.a_leg.clone(),
-                        byed: false,
-                    },
-                );
-                captured = true;
+                if let Some(invite) = call.a_leg_invite.as_ref() {
+                    self.zombie_cancelled.insert(
+                        call.a_leg.dialog.call_id.clone(),
+                        ZombieCancelledLeg {
+                            leg: call.a_leg.clone(),
+                            invite_ruri: request_uri_of(invite),
+                            byed: false,
+                        },
+                    );
+                    captured = true;
+                }
             }
             for (index, b_leg) in call.b_legs.iter().enumerate() {
                 let pending = matches!(
@@ -2636,15 +2658,18 @@ impl CallActorStore {
                     Some(BLegStatus::Trying) | Some(BLegStatus::Ringing)
                 );
                 // Only legs whose INVITE actually went on the wire can answer.
-                if pending && b_leg.b_leg_invite.is_some() {
-                    self.zombie_cancelled.insert(
-                        b_leg.dialog.call_id.clone(),
-                        ZombieCancelledLeg {
-                            leg: b_leg.clone(),
-                            byed: false,
-                        },
-                    );
-                    captured = true;
+                if pending {
+                    if let Some(invite) = b_leg.b_leg_invite.as_ref() {
+                        self.zombie_cancelled.insert(
+                            b_leg.dialog.call_id.clone(),
+                            ZombieCancelledLeg {
+                                leg: b_leg.clone(),
+                                invite_ruri: request_uri_of(invite),
+                                byed: false,
+                            },
+                        );
+                        captured = true;
+                    }
                 }
             }
         }
@@ -2652,7 +2677,7 @@ impl CallActorStore {
         captured
     }
 
-    /// Resolve a racing 2xx to a CANCELled B-leg by SIP Call-ID.
+    /// Resolve a racing 2xx to a CANCELled leg by SIP Call-ID.
     ///
     /// Returns the captured leg plus a `first_2xx` flag: the first racing 2xx
     /// for a Call-ID returns `(leg, true)` so the caller sends ACK + BYE; later
@@ -2665,6 +2690,28 @@ impl CallActorStore {
             entry.byed = true;
             (entry.leg.clone(), first_2xx)
         })
+    }
+
+    /// Resolve a final non-2xx — in practice the `487 Request Terminated` that
+    /// RFC 3261 §9.1 makes the ordinary outcome of a CANCEL — to a CANCELled
+    /// leg by SIP Call-ID.
+    ///
+    /// Returns the captured leg and the CANCELled INVITE's Request-URI, so the
+    /// caller can build the ACK §17.1.1.3 requires on the INVITE's own branch.
+    ///
+    /// Unlike [`Self::zombie_cancelled_for_2xx`] there is no first-response
+    /// flag: the ACK for a final non-2xx belongs to the INVITE's client
+    /// transaction, which §17.1.1.3 has re-pass it to the transport on *every*
+    /// retransmission of the response while it sits in `Completed`. Answering
+    /// only the first would leave a peer whose ACK was lost retransmitting to
+    /// Timer H regardless — the exact stall this entry exists to end.
+    pub fn zombie_cancelled_for_non2xx(
+        &self,
+        sip_call_id: &str,
+    ) -> Option<(Leg, Option<String>)> {
+        self.zombie_cancelled
+            .get(sip_call_id)
+            .map(|entry| (entry.leg.clone(), entry.invite_ruri.clone()))
     }
 
     /// Iterate over all active calls (for session timer sweep).
@@ -2990,6 +3037,29 @@ pub fn extract_to_tag(message: &SipMessage) -> Option<String> {
                 .find(|p| p.trim().starts_with("tag="))
                 .map(|t| t.trim().trim_start_matches("tag=").to_string())
         })
+}
+
+/// The Request-URI of a stashed outbound request, as it went on the wire.
+///
+/// Read back for a leg being torn down, so an ACK built after the leg's INVITE
+/// is gone still carries the Request-URI RFC 3261 §17.1.1.3 requires it to
+/// share with the INVITE. Returns `None` on a poisoned mutex or a message that
+/// is somehow not a request — the callers treat that as "cannot build an ACK",
+/// which is the honest outcome; a placeholder R-URI on the wire is worse.
+fn request_uri_of(stashed: &Arc<Mutex<SipMessage>>) -> Option<String> {
+    let guard = match stashed.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            warn!("cancelled leg: stashed INVITE mutex poisoned, no Request-URI for its ACK");
+            return None;
+        }
+    };
+    match &guard.start_line {
+        crate::sip::message::StartLine::Request(request_line) => {
+            Some(request_line.request_uri.to_string())
+        }
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4087,6 +4157,76 @@ mod tests {
         assert!(!second, "a retransmit must not trigger a second BYE");
     }
 
+    /// The ORDINARY outcome of a CANCEL, not the glare one: the peer answers
+    /// the CANCELled INVITE `487 Request Terminated` (RFC 3261 §9.1), and
+    /// §17.1.1.3 requires an ACK for it. The call is gone by then, so the ACK
+    /// can only be built from the zombie entry — which therefore has to carry
+    /// the CANCELled INVITE's Request-URI (§17.1.1.3: the ACK's Request-URI
+    /// equals the INVITE's).
+    #[test]
+    fn store_zombie_captures_the_invite_ruri_so_the_487_can_be_acked() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+
+        let mut sent_leg = make_b_leg(0);
+        let sent_cid = sent_leg.dialog.call_id.clone();
+        let invite = crate::sip::builder::SipMessageBuilder::new()
+            .request(
+                crate::sip::message::Method::Invite,
+                crate::sip::uri::SipUri::new("198.51.100.20".to_string())
+                    .with_user("bob".to_string())
+                    .with_port(5060),
+            )
+            .via("SIP/2.0/UDP 198.51.100.10:5060;branch=z9hG4bK-bleg0".to_string())
+            .from("<sip:alice@198.51.100.10>;tag=a".to_string())
+            .to("<sip:bob@198.51.100.20>".to_string())
+            .call_id(sent_cid.clone())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        sent_leg.b_leg_invite = Some(Arc::new(Mutex::new(invite)));
+        store.add_b_leg(&call_id, sent_leg);
+
+        // A leg whose INVITE never went on the wire draws no final response, so
+        // it is not captured and nothing is owed an ACK.
+        let unsent_leg = make_b_leg(1);
+        let unsent_cid = unsent_leg.dialog.call_id.clone();
+        store.add_b_leg(&call_id, unsent_leg);
+
+        assert!(store.remove_call_after_cancel(&call_id));
+
+        let (leg, ruri) = store
+            .zombie_cancelled_for_non2xx(&sent_cid)
+            .expect("the CANCELled leg must still resolve for its 487");
+        assert_eq!(leg.dialog.call_id, sent_cid);
+        // The ACK goes out on the INVITE's own branch (§17.1.1.3), which is the
+        // leg's branch — not a fresh one.
+        assert_eq!(leg.branch, "z9hG4bK-bleg0");
+        assert_eq!(ruri.as_deref(), Some("sip:bob@198.51.100.20:5060"));
+        assert!(store.zombie_cancelled_for_non2xx(&unsent_cid).is_none());
+
+        // §17.1.1.3 has the client transaction re-pass the ACK to the transport
+        // on EVERY retransmission of the final response while it sits in
+        // Completed — so the lookup must keep resolving, not consume the entry.
+        assert!(
+            store.zombie_cancelled_for_non2xx(&sent_cid).is_some(),
+            "a retransmitted 487 must still be ACKable"
+        );
+
+        // ...and it must not have consumed the glare path's first-2xx flag: a
+        // 487 followed by a raced 2xx (both are possible on a forked downstream)
+        // must still produce ACK + BYE for the 2xx.
+        let (_leg, first_2xx) = store
+            .zombie_cancelled_for_2xx(&sent_cid)
+            .expect("the glare entry survives a 487 lookup");
+        assert!(
+            first_2xx,
+            "ACKing a 487 must not consume the BYE the glare 2xx path owes"
+        );
+    }
+
+
     #[test]
     fn store_sweep_stale() {
         let store = CallActorStore::new();
@@ -5026,6 +5166,47 @@ mod originate_tests {
         let store = CallActorStore::new();
         let call_id = store.create_call(originating_leg());
         assert!(!store.is_originated(&call_id));
+    }
+
+    /// A call siphon placed itself carries its pending INVITE on the A-leg, so
+    /// the B-leg capture loop finds nothing — without the A-leg arm the `487
+    /// Request Terminated` its CANCEL draws (RFC 3261 §9.1) is dropped as an
+    /// unknown branch, unACKed, and the peer retransmits to Timer H (§17.2.1).
+    #[test]
+    fn cancelled_originate_is_zombified_with_its_invite_ruri_for_the_487_ack() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(originating_leg());
+        store.mark_originated(&call_id, "z9hG4bK-orig1");
+
+        let sip_call_id = "orig-call@siphon.invalid".to_string();
+        let invite = crate::sip::builder::SipMessageBuilder::new()
+            .request(
+                crate::sip::message::Method::Invite,
+                crate::sip::uri::SipUri::new("carrier.example".to_string())
+                    .with_user("+14035551212".to_string()),
+            )
+            .via("SIP/2.0/UDP 198.51.100.10:5060;branch=z9hG4bK-orig1".to_string())
+            .from("<sip:siphon@198.51.100.10>;tag=sip-from-tag".to_string())
+            .to("<sip:+14035551212@carrier.example>".to_string())
+            .call_id(sip_call_id.clone())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        store.set_a_leg_invite(&call_id, Arc::new(Mutex::new(invite)));
+
+        assert!(
+            store.remove_call_after_cancel(&call_id),
+            "an originated call's pending A-leg must be captured"
+        );
+
+        let (leg, ruri) = store
+            .zombie_cancelled_for_non2xx(&sip_call_id)
+            .expect("the CANCELled originate must still resolve for its 487");
+        // RFC 3261 §17.1.1.3 — the ACK rides the INVITE's own branch and
+        // Request-URI.
+        assert_eq!(leg.branch, "z9hG4bK-orig1");
+        assert_eq!(ruri.as_deref(), Some("sip:+14035551212@carrier.example"));
     }
 
     #[test]

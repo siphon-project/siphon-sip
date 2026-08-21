@@ -5505,6 +5505,44 @@ fn handle_response(
         }
     }
 
+    // Post-CANCEL, the ORDINARY outcome: the `487 Request Terminated` the peer
+    // answers a CANCELled INVITE with (RFC 3261 §9.1). RFC 3261 §17.1.1.3 makes
+    // ACKing any final non-2xx to an INVITE the client transaction's job, and
+    // the B2BUA has no client transaction — it runs its own retransmit schedule
+    // (see the top of this function) — so nothing below generates it either.
+    // The CANCEL paths removed the call and with it the leg's branch index, so
+    // this response no longer resolves above; unanswered, the peer's INVITE
+    // server transaction retransmits on Timer G to Timer H (64*T1 = 32 s,
+    // §17.2.1), holding transaction state at both ends of every abandoned call.
+    //
+    // Matched via the same `zombie_cancelled` capture as the glare 2xx, which
+    // covers both shapes of pending leg: an ordinary B2BUA B-leg and the A-leg
+    // of a call siphon placed itself (`originate`).
+    //
+    // Gated on a CSeq of INVITE so the CANCEL's own final response — which
+    // shares the INVITE's branch (§9.1) — is never ACKed: a non-INVITE
+    // transaction takes no ACK (§17.1.2).
+    if status_code >= 300 {
+        if let Some(cseq_raw) = message.headers.get("CSeq") {
+            if cseq_raw.contains("INVITE") {
+                if let Some(sip_call_id) = message.headers.call_id() {
+                    if let Some((leg, invite_ruri)) =
+                        state.call_actors.zombie_cancelled_for_non2xx(sip_call_id)
+                    {
+                        handle_zombie_cancelled_non2xx(
+                            &leg,
+                            invite_ruri.as_deref(),
+                            &message,
+                            status_code,
+                            state,
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     // Parse CSeq once for both transaction processing and session routing.
     let sent_by = TransactionKey::format_sent_by(&top_via.host, top_via.port);
     let client_txn_key = message.headers.get("CSeq")
@@ -17107,6 +17145,84 @@ fn handle_zombie_cancelled_2xx(
     }
 }
 
+/// ACK the final non-2xx that a CANCELled INVITE draws — in practice the
+/// `487 Request Terminated` of RFC 3261 §9.1, the ordinary end of every
+/// CANCELled leg.
+///
+/// RFC 3261 §17.1.1.3: an INVITE client transaction MUST generate an ACK for
+/// any final non-2xx response, on the INVITE's *own* branch and carrying the
+/// response's To-tag, so the peer's server transaction can match it (§17.2.3).
+/// Everything the ACK needs beyond the response itself — the branch, the
+/// INVITE's Request-URI, the socket to leave from and advertise — comes from
+/// the leg captured at CANCEL time, because the call itself is already gone.
+///
+/// Unlike the 2xx glare path there is no BYE and no first-response guard: a
+/// non-2xx establishes no dialog to release, and §17.1.1.3 has the client
+/// transaction re-pass the ACK to the transport on every retransmission of the
+/// response while it sits in `Completed`.
+fn handle_zombie_cancelled_non2xx(
+    leg: &crate::b2bua::actor::Leg,
+    invite_ruri: Option<&str>,
+    response: &SipMessage,
+    status_code: u16,
+    state: &DispatcherState,
+) {
+    let transport = leg.transport.transport;
+    let destination = leg.transport.remote_addr;
+    // The socket this leg was dialled from (flow-pinned legs) — the ACK has to
+    // leave from it and advertise it, exactly as the INVITE did, or the peer's
+    // server transaction will not match it on sent-by (§17.2.3).
+    let local_addr = leg.transport.local_addr;
+    let (via_host, via_port) = b_leg_sent_by(local_addr, state, &transport);
+
+    let Some(ack) = build_cancelled_leg_ack(leg, invite_ruri, response, &via_host, via_port) else {
+        // No Request-URI means the stashed INVITE could not be read back. Say
+        // so rather than putting a placeholder R-URI on the wire — an ACK the
+        // peer cannot match is no better than none, and this must be
+        // diagnosable when the peer keeps retransmitting.
+        error!(
+            sip_call_id = %leg.dialog.call_id,
+            status = status_code,
+            "B2BUA: cannot ACK a CANCELled leg's final response — the CANCELled \
+             INVITE's Request-URI was not captured (RFC 3261 §17.1.1.3)"
+        );
+        return;
+    };
+
+    send_b2bua_to_bleg(ack, transport, destination, local_addr, state);
+    debug!(
+        sip_call_id = %leg.dialog.call_id,
+        status = status_code,
+        branch = %leg.branch,
+        "B2BUA: ACK for the final response to a CANCELled leg (RFC 3261 §17.1.1.3)"
+    );
+}
+
+/// Build the ACK a CANCELled leg's final non-2xx is owed (RFC 3261 §17.1.1.3).
+///
+/// Pure half of [`handle_zombie_cancelled_non2xx`], split out so the invariants
+/// that actually matter are unit-testable without a `DispatcherState` fixture:
+/// the ACK rides the INVITE's **own** branch and Request-URI, and carries the
+/// **response's** To-tag — the three fields the peer's server transaction
+/// matches on (§17.2.3). `None` when the Request-URI was never captured.
+fn build_cancelled_leg_ack(
+    leg: &crate::b2bua::actor::Leg,
+    invite_ruri: Option<&str>,
+    response: &SipMessage,
+    via_host: &str,
+    via_port: u16,
+) -> Option<SipMessage> {
+    let target_uri = invite_ruri?;
+    Some(build_b2bua_ack_for_non2xx(
+        response,
+        &leg.branch,
+        Some(target_uri),
+        leg.transport.transport,
+        via_host,
+        via_port,
+    ))
+}
+
 /// Handle a BYE for a B2BUA call — bridge to the other leg.
 fn handle_b2bua_bye(
     inbound: InboundMessage,
@@ -26178,6 +26294,74 @@ a=rtpmap:8 PCMA/8000\r\n";
         // CSeq number echoes the INVITE; method becomes ACK.
         assert_eq!(ack.headers.cseq().unwrap(), "1 ACK");
         assert_eq!(ack.headers.call_id().unwrap(), "b2b-aaaa-bbbb");
+    }
+
+    /// A CANCELled leg is answered `487 Request Terminated` (RFC 3261 §9.1) and
+    /// RFC 3261 §17.1.1.3 requires an ACK for it. By then the call is torn down,
+    /// so everything the ACK needs comes from the leg captured at CANCEL time
+    /// plus the response — and it must land on the INVITE's own branch and
+    /// Request-URI, carrying the 487's To-tag, or the peer's server transaction
+    /// cannot match it (§17.2.3) and retransmits to Timer H.
+    #[test]
+    fn cancelled_leg_ack_uses_the_invite_branch_ruri_and_the_487_to_tag() {
+        let leg = crate::b2bua::actor::Leg::new_b_leg(
+            "b2b-cancelled-leg".to_string(),
+            "b-leg-from-tag".to_string(),
+            "sip:bob@198.51.100.20".to_string(),
+            "z9hG4bK-bleg-invite".to_string(),
+            crate::b2bua::actor::TransportInfo {
+                remote_addr: "198.51.100.20:5060".parse().unwrap(),
+                connection_id: ConnectionId::default(),
+                transport: Transport::Udp,
+                local_addr: None,
+            },
+        );
+
+        let response = SipMessageBuilder::new()
+            .response(487, "Request Terminated".to_string())
+            .via("SIP/2.0/UDP 198.51.100.10:5060;branch=z9hG4bK-bleg-invite".to_string())
+            .from("<sip:alice@siphon.example.org>;tag=b-leg-from-tag".to_string())
+            .to("<sip:bob@198.51.100.20>;tag=uas-487-tag".to_string())
+            .call_id("b2b-cancelled-leg".to_string())
+            .cseq("1 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+
+        let ack = build_cancelled_leg_ack(
+            &leg,
+            Some("sip:bob@198.51.100.20:5060"),
+            &response,
+            "198.51.100.10",
+            5060,
+        )
+        .expect("a captured Request-URI must yield an ACK");
+
+        match &ack.start_line {
+            StartLine::Request(request_line) => {
+                assert_eq!(request_line.method, Method::Ack);
+                // §17.1.1.3 — same Request-URI as the INVITE being ACKed, NOT
+                // the response's Contact (that rule is for the 2xx ACK, §13.2.2.4).
+                assert_eq!(request_line.request_uri.host, "198.51.100.20");
+                assert_eq!(request_line.request_uri.user.as_deref(), Some("bob"));
+            }
+            _ => panic!("expected an ACK request line"),
+        }
+
+        // The INVITE's own branch — the ACK for a non-2xx is part of that same
+        // client transaction (§17.1.1.3), so a fresh branch would be unmatchable.
+        assert_eq!(
+            ack.headers.via().unwrap(),
+            "SIP/2.0/UDP 198.51.100.10:5060;branch=z9hG4bK-bleg-invite"
+        );
+        // The 487's To-tag, without which the UAS cannot match the ACK (§17.2.3).
+        assert!(ack.headers.to().unwrap().contains("tag=uas-487-tag"));
+        assert_eq!(ack.headers.cseq().unwrap(), "1 ACK");
+        assert_eq!(ack.headers.call_id().unwrap(), "b2b-cancelled-leg");
+
+        // Without a captured Request-URI there is no ACK to build — the caller
+        // logs it rather than emitting a placeholder R-URI the peer would drop.
+        assert!(build_cancelled_leg_ack(&leg, None, &response, "198.51.100.10", 5060).is_none());
     }
 
     /// Regression: an outbound INVITE to an authenticating trunk draws a 401,

@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA CANCEL — the ACK for the 487 (B-leg side, RFC 3261 §17.1.1.3).
+
+  Flow: recv INVITE -> 180 Ringing -> recv CANCEL -> 200 (CANCEL) ->
+        487 Request Terminated (INVITE) -> REQUIRE the ACK.
+
+  This is the sibling of b2bua_cancel_uas.xml, and the difference is the whole
+  point of it: there the closing `recv ACK` is `optional="true"`, so that
+  scenario reports success whether or not the ACK ever arrives. Here it is
+  MANDATORY, and the container runs with -timeout_error so a missing ACK is a
+  hard failure instead of "Successful call 0 / Failed call 0" and a zero exit.
+  This UAS is therefore the deciding container of its profile.
+
+  What it pins down: RFC 3261 §17.1.1.3 requires an INVITE client transaction to
+  generate an ACK for ANY final non-2xx response, and §9.1 makes 487 the
+  ordinary final response to a CANCELled INVITE. Without that ACK this UAS's
+  server transaction retransmits the 487 on Timer G until Timer H fires
+  (64*T1 = 32 s, §17.2.1), holding transaction state at both ends of every
+  abandoned or timed-out outbound attempt.
+
+  The ACK must also be MATCHABLE, so the two things this side can check without
+  a captured-variable comparison are checked: the To-tag is the one this UAS put
+  on the 487 (the INVITE and the CANCEL both carried a tagless To, so an ACK
+  echoing SIPpTag01 can only have taken it from the 487 — RFC 3261 §17.1.1.3),
+  and the topmost Via is siphon's own sent-by bearing the §8.1.1.7 magic cookie.
+
+  Exact branch equality — the ACK for a non-2xx rides the INVITE's OWN branch,
+  not a fresh one — is asserted in Rust instead
+  (`dispatcher::tests::cancelled_leg_ack_uses_the_invite_branch_ruri_and_the_487_to_tag`).
+  Injecting a captured variable into a match regexp (`branch=[$invite_branch]`)
+  is a FATAL scenario-load error on this SIPp build; see the note in
+  b2bua_cancel_uas.xml for the outage that caused.
+
+  The matching UAC (b2bua_cancel_uac.xml) sends the INVITE at CSeq 1, so the
+  487's CSeq is hardcoded `1 INVITE` (a 487 after a CANCEL echoes the INVITE's
+  CSeq, not the CANCEL's — `[last_CSeq:]` would wrongly be `1 CANCEL`).
+-->
+<scenario name="B2BUA CANCEL 487 ACK UAS">
+
+  <!-- The B-leg INVITE siphon dials out. -->
+  <recv request="INVITE" crlf="true" />
+
+  <!-- 180 Ringing — keep ringing so the A-leg has time to CANCEL. -->
+  <send>
+    <![CDATA[
+
+SIP/2.0 180 Ringing
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:bob@[local_ip]:[local_port];transport=[transport]>
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- The CANCEL siphon sends once the A-leg gives up (RFC 3261 §9.1). -->
+  <recv request="CANCEL" />
+
+  <!-- 200 OK to the CANCEL (RFC 3261 §9.2 — always 200). -->
+  <send>
+    <![CDATA[
+
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- 487 Request Terminated for the INVITE. Its To-tag is the one the ACK has
+       to echo back. -->
+  <send>
+    <![CDATA[
+
+SIP/2.0 487 Request Terminated
+[last_Via:]
+[last_From:]
+[last_To:];tag=[pid]SIPpTag01[call_number]
+[last_Call-ID:]
+CSeq: 1 INVITE
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- THE ASSERTION. Mandatory: RFC 3261 §17.1.1.3 makes this ACK a MUST, so an
+       ACK that never comes fails the run rather than being shrugged off. -->
+  <recv request="ACK" timeout="10000">
+    <action>
+      <!-- RFC 3261 §17.1.1.3: the ACK's To — tag included — is copied from the
+           response being acknowledged. The INVITE and the CANCEL both carried a
+           tagless To, so this tag can only have come from the 487. -->
+      <ereg regexp="tag=.*SIPpTag01"
+            search_in="hdr" header="To:" check_it="true" assign_to="ack_to_tag_ok" />
+      <!-- RFC 3261 §8.1.1.7: a single Via, siphon's own, bearing the magic
+           cookie. Its branch must be the INVITE's — see the note above for why
+           that exact comparison is asserted in Rust rather than here. -->
+      <ereg regexp="branch=z9hG4bK"
+            search_in="hdr" header="Via:" check_it="true" assign_to="ack_branch_ok" />
+      <!-- Reference the assigned vars so SIPp does not reject them as unused;
+           the pass/fail gate is check_it on the eregs above. -->
+      <log message="487 ACK assertions: to_tag=[$ack_to_tag_ok] branch=[$ack_branch_ok]" />
+    </action>
+  </recv>
+
+</scenario>
