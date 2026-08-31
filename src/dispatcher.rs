@@ -17056,6 +17056,40 @@ fn handle_b2bua_bye(
         }
     };
 
+    // The referrer of an in-flight siphon-terminated transfer hanging up is NOT
+    // the end of this call (RFC 5589 §7: the transferor is free to end its
+    // dialog as soon as the REFER is accepted — Microsoft Teams BYEs within a
+    // few hundred ms of the 202, long before the target answers). The surviving
+    // party is still up and is waiting to be bridged to the transfer target, so
+    // everything below — @b2bua.on_bye, the ACR-STOP/CDR close, the BYE
+    // generated at the far leg, the rtpengine teardown and `remove_call` —
+    // would destroy exactly the state the transfer needs to finish. Answer the
+    // BYE and keep the call.
+    //
+    // Left in place deliberately: the referrer's `Leg` stays on the actor until
+    // the target resolves, because `promote_transfer_target` swaps the target
+    // into its slot and the old anchor keyed on the A-leg Call-ID is what the
+    // media re-anchor reads. Only the subscription is flagged, which is what
+    // suppresses the NOTIFY + BYE aimed at a dialog that no longer exists.
+    if state.call_actors.mark_transfer_referrer_gone(&call_id, from_a_leg) {
+        let bye_response =
+            build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+        send_message_from(
+            bye_response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
+        info!(
+            call_id = %call_id,
+            referrer_on_a_leg = from_a_leg,
+            "B2BUA REFER (terminate): referrer hung up mid-transfer — call kept for the pending target"
+        );
+        return;
+    }
+
     // Extract the rest from the DashMap ref and drop it before entering Python
     let (a_leg_invite, a_leg_source_ip, a_leg_transport, a_leg_call_id, a_leg_flow) =
         match state.call_actors.get_call(&call_id) {
@@ -17718,6 +17752,65 @@ fn b2bua_terminate_call_inner(
     true
 }
 
+/// Tear down a call whose transfer collapsed after the referrer had already
+/// left, WITHOUT generating any further BYE.
+///
+/// The BYE-sending half of [`b2bua_terminate_call_inner`] is deliberately not
+/// reused here: that helper BYEs the A-leg and the winning B-leg unconditionally,
+/// and on this path one of those two is the referrer whose dialog is already
+/// terminated — an in-dialog BYE addressed to it would be answered 481 (RFC 3261
+/// §12.2.2). The caller has already released the one leg that is still up, so
+/// this is the cleanup tail only: accounting, media, recording, actor removal.
+fn b2bua_release_transferred_call(internal_call_id: &str, state: &DispatcherState) {
+    let Some(sip_call_id) = state
+        .call_actors
+        .get_call(internal_call_id)
+        .map(|call| call.a_leg.dialog.call_id.clone())
+    else {
+        return;
+    };
+
+    // Rf/Ro ACR-STOP (TS 32.299 §6.2.2) — framework-initiated teardown, so the
+    // Diameter "normal" cause, same as the session-timer path.
+    spawn_rf_b2bua_stop(state, internal_call_id, None);
+    spawn_ro_b2bua_stop(state, internal_call_id, None);
+
+    if crate::cdr::auto_emit_enabled() {
+        cdr_finalize(state, internal_call_id, "b2bua", None, None);
+    }
+
+    // Safety-net RTPEngine cleanup. Keyed on the A-leg Call-ID (the store key);
+    // a transfer that never completed leaves the pre-transfer anchor in place,
+    // and the fresh survivor↔target anchor offered in phase 1 is dropped by the
+    // engine's own timeout since the target never answered.
+    if let (Some(rtpengine_set), Some(media_sessions)) =
+        (&state.rtpengine_set, &state.rtpengine_sessions)
+    {
+        if let Some(session) = media_sessions.remove(&sip_call_id) {
+            let set = Arc::clone(rtpengine_set);
+            tokio::spawn(async move {
+                if let Err(error) = set.delete(session.rtpengine_id(), &session.from_tag).await {
+                    if error.is_call_not_found() {
+                        debug!(call_id = %session.call_id, "safety-net RTPEngine delete: call already gone ({error})");
+                    } else {
+                        warn!(call_id = %session.call_id, "safety-net RTPEngine delete failed: {error}");
+                    }
+                }
+            });
+        }
+    }
+
+    b2bua_stop_siprec(internal_call_id, state);
+    control_notify_terminated(&sip_call_id, "transfer_failed");
+
+    state
+        .call_actors
+        .set_state(internal_call_id, CallState::Terminated);
+    state.call_actors.remove_call(internal_call_id);
+    state.call_event_receivers.remove(internal_call_id);
+    schedule_zombie_reinvite_cleanup(&state.call_actors);
+}
+
 /// Emit a control-plane `StasisEnd` for a controlled call at teardown (no-op
 /// when the control plane isn't configured or the call isn't controlled).
 fn control_notify_terminated(sip_call_id: &str, reason: &str) {
@@ -18248,6 +18341,9 @@ fn b2bua_send_outbound_refer(
             notify_cseq: cseq,
             state: crate::b2bua::transfer::TransferState::Trying,
             target_leg_call_id: None,
+            // Subscriber role: siphon is the referrer here, so there is no
+            // remote referrer whose departure this could track.
+            referrer_gone: false,
         },
     );
     info!(
@@ -21422,6 +21518,55 @@ fn b2bua_refer_accept(
                 "B2BUA REFER: accepting (siphon-terminated) — 202 + NOTIFY 100 Trying"
             );
 
+            // Attended transfer (RFC 5589 §7): the INVITE siphon triggers towards
+            // the target MUST carry the `Replaces` naming the dialog it is to
+            // replace (RFC 3891 §3), otherwise the target treats it as an
+            // ordinary new call and the held call it was supposed to take over is
+            // left up — the referrer's second leg strands.
+            //
+            // The referrer named that dialog with the identifiers it can see. On
+            // a B2BUA those belong to the leg facing the referrer, and the target
+            // knows only the leg facing itself, so the triple is rewritten to the
+            // target's own view; a dialog siphon does not host is passed through
+            // untouched (best effort — it is not ours to translate).
+            let replaces_header = replaces.as_ref().map(|replaces| {
+                let translated = state
+                    .call_actors
+                    .replaces_as_seen_by_peer(
+                        &replaces.call_id,
+                        &replaces.from_tag,
+                        &replaces.to_tag,
+                    )
+                    // A `Replaces` pointing back at the very call carrying the
+                    // REFER would name the surviving party's own dialog: that is
+                    // not an attended transfer, and rewriting it would aim the
+                    // target at the leg it is meant to join. Leave it verbatim
+                    // and let the target reject it.
+                    .filter(|(replaced_call_id, _)| replaced_call_id != call_id);
+                match translated {
+                    Some((replaced_call_id, peer)) => {
+                        debug!(
+                            call_id = %call_id,
+                            replaced_call = %replaced_call_id,
+                            "B2BUA REFER (terminate): translated attended Replaces to the target's dialog view"
+                        );
+                        crate::sip::headers::refer::Replaces {
+                            call_id: peer.call_id,
+                            from_tag: peer.from_tag,
+                            to_tag: peer.to_tag,
+                            early_only: replaces.early_only,
+                        }
+                    }
+                    None => {
+                        debug!(
+                            call_id = %call_id,
+                            "B2BUA REFER (terminate): attended Replaces names a dialog this node does not host — forwarding verbatim"
+                        );
+                        replaces.clone()
+                    }
+                }
+            });
+
             // 202 Accepted to the referrer, on the flow the REFER arrived on,
             // followed by the first NOTIFY (sipfrag 100 Trying) opening the
             // implicit subscription.
@@ -21570,6 +21715,13 @@ fn b2bua_refer_accept(
                     None
                 }
             };
+            // Injected verbatim onto the triggered INVITE. `Replaces` is not a
+            // dialog-defining header for the dialog this INVITE creates — it
+            // references a *different* dialog — so it is safe in this slot.
+            let replaces_extra_headers: Vec<(String, String)> = replaces_header
+                .map(|replaces| vec![("Replaces".to_string(), replaces.to_string())])
+                .unwrap_or_default();
+
             let dialed = if let Some(template) = dial_template {
                 b2bua_send_b_leg_invite(
                     call_id,
@@ -21584,7 +21736,7 @@ fn b2bua_refer_accept(
                     None,
                     None,
                     None,
-                    &[],
+                    replaces_extra_headers.as_slice(),
                     state,
                 );
                 true
@@ -21611,6 +21763,7 @@ fn b2bua_refer_accept(
                     notify_cseq: refer_cseq,
                     state: crate::b2bua::transfer::TransferState::Trying,
                     target_leg_call_id,
+                    referrer_gone: false,
                 },
             );
         }
@@ -21633,17 +21786,23 @@ fn b2bua_complete_terminated_transfer(
     state: &DispatcherState,
 ) {
     // Snapshot the referrer side + the target (Z) leg before mutating.
-    let (referrer_on_a_leg, target_leg) = match state.call_actors.get_call(call_id) {
+    // `referrer_gone` is set when the referrer already BYE'd this call while the
+    // target was still ringing (see `mark_transfer_referrer_gone`): the transfer
+    // still completes, but there is no dialog left to NOTIFY or BYE.
+    let (referrer_on_a_leg, referrer_gone, target_leg) = match state.call_actors.get_call(call_id) {
         Some(call) => {
-            let Some(on_a_leg) = call
+            let Some(subscription) = call
                 .refer_subscriptions
                 .iter()
                 .find(|subscription| subscription.siphon_notifies)
-                .map(|subscription| subscription.on_a_leg)
             else {
                 return;
             };
-            (on_a_leg, call.b_legs.get(target_idx).cloned())
+            (
+                subscription.on_a_leg,
+                subscription.referrer_gone,
+                call.b_legs.get(target_idx).cloned(),
+            )
         }
         None => return,
     };
@@ -21752,11 +21911,20 @@ fn b2bua_complete_terminated_transfer(
     // Two separate sends do NOT order on UDP — the workers share the outbound
     // channel and each owns its own socket — so when both target the same flow
     // they travel as one unit (see `OutboundMessage::followups`).
+    //
+    // Both are skipped entirely when the referrer already left: its dialog is
+    // gone, so the NOTIFY would draw a 481 and the BYE would be addressed to a
+    // dialog that no longer exists (RFC 3515 §2.4.4).
     let mut referrer_messages: Vec<SipMessage> = Vec::new();
     let mut referrer_route: Option<(Transport, SocketAddr, ConnectionId, Option<SocketAddr>)> =
         None;
 
-    if let Some(cseq) = state.call_actors.reserve_leg_cseq(call_id, referrer_on_a_leg) {
+    let notify_cseq = if referrer_gone {
+        None
+    } else {
+        state.call_actors.reserve_leg_cseq(call_id, referrer_on_a_leg)
+    };
+    if let Some(cseq) = notify_cseq {
         if let Some(referrer_leg) = state.call_actors.clone_leg(call_id, referrer_on_a_leg) {
             let extra_headers = [
                 ("Event", "refer".to_string()),
@@ -21797,11 +21965,14 @@ fn b2bua_complete_terminated_transfer(
     }
 
     // Promote the target into the surviving pair, then BYE the referrer leg.
-    if let Some(referrer_leg) =
+    // The promotion runs either way — it is what makes the target the surviving
+    // party's peer, and is the whole point of the transfer. Only the BYE is
+    // conditional on there still being a referrer to receive it.
+    let promoted_referrer =
         state
             .call_actors
-            .promote_transfer_target(call_id, target_idx, referrer_on_a_leg)
-    {
+            .promote_transfer_target(call_id, target_idx, referrer_on_a_leg);
+    if let Some(referrer_leg) = promoted_referrer.filter(|_| !referrer_gone) {
         if let Some(bye) = build_b2bua_bye(&referrer_leg, state) {
             let (dest, transport) = resolve_in_dialog_destination(
                 &referrer_leg.dialog.route_set,
@@ -21927,7 +22098,8 @@ fn b2bua_complete_terminated_transfer(
     info!(
         call_id = %call_id,
         referrer_on_a_leg,
-        "B2BUA REFER (terminate): transfer completed — target active, referrer BYE'd"
+        referrer_gone,
+        "B2BUA REFER (terminate): transfer completed — target active, referrer released"
     );
 }
 
@@ -21941,14 +22113,50 @@ fn b2bua_fail_terminated_transfer(
     status_code: u16,
     state: &DispatcherState,
 ) {
-    let Some(referrer_on_a_leg) = state.call_actors.get_call(call_id).and_then(|call| {
-        call.refer_subscriptions
-            .iter()
-            .find(|subscription| subscription.siphon_notifies)
-            .map(|subscription| subscription.on_a_leg)
-    }) else {
+    let Some((referrer_on_a_leg, referrer_gone)) =
+        state.call_actors.get_call(call_id).and_then(|call| {
+            call.refer_subscriptions
+                .iter()
+                .find(|subscription| subscription.siphon_notifies)
+                .map(|subscription| (subscription.on_a_leg, subscription.referrer_gone))
+        })
+    else {
         return;
     };
+
+    // The referrer already hung up and the target it asked for is now refusing:
+    // nobody is left for the surviving party to talk to. Keeping the call would
+    // strand it on a dialog whose peer has gone and whose replacement never
+    // arrived, so release it and tear the call down. (When the referrer is still
+    // there the original call is intact and simply continues — the arm below.)
+    if referrer_gone {
+        let survivor_on_a_leg = !referrer_on_a_leg;
+        if let Some(survivor_leg) = state.call_actors.clone_leg(call_id, survivor_on_a_leg) {
+            if let Some(bye) = build_b2bua_bye(&survivor_leg, state) {
+                let (dest, transport) = resolve_in_dialog_destination(
+                    &survivor_leg.dialog.route_set,
+                    state,
+                    survivor_leg.transport.remote_addr,
+                    survivor_leg.transport.transport,
+                );
+                send_message_from(
+                    bye,
+                    transport,
+                    dest,
+                    survivor_leg.transport.connection_id,
+                    survivor_leg.transport.local_addr,
+                    state,
+                );
+            }
+        }
+        warn!(
+            call_id = %call_id,
+            status = status_code,
+            "B2BUA REFER (terminate): transfer target failed after the referrer left — releasing the orphaned surviving leg"
+        );
+        b2bua_release_transferred_call(call_id, state);
+        return;
+    }
 
     let failure = crate::b2bua::transfer::transfer_result_from_response(status_code);
     let (code, reason) = match &failure {
