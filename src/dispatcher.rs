@@ -12335,6 +12335,14 @@ fn handle_b2bua_invite(
     // Does Not Exist. Silently treating it as a fresh INVITE would defeat
     // the attended-transfer semantics (the referrer expects the old dialog
     // to go away once this INVITE succeeds).
+    //
+    // A match is only *recorded* here, never acted on. The takeover itself runs
+    // after `@b2bua.on_invite` has admitted the request, because RFC 3891 §5
+    // makes this header a call-hijack primitive for anyone who learns a dialog's
+    // identifiers, and the script's `auth.require_proxy_digest()` is siphon's
+    // admission control for an INVITE. Acting at parse time would take a live
+    // call away on the say-so of an unauthenticated request.
+    let mut pending_replaces: Option<crate::b2bua::actor::PendingReplaces> = None;
     if let Some(replaces_raw) = message.headers.get("Replaces") {
         match crate::sip::headers::refer::parse_replaces(replaces_raw) {
             Ok(replaces) => {
@@ -12343,18 +12351,55 @@ fn handle_b2bua_invite(
                     &replaces.from_tag,
                     &replaces.to_tag,
                 ) {
-                    Some(matched_call_id) => {
-                        // Dialog found — full attended-transfer bridging
-                        // (terminating the matched dialog and bridging the
-                        // remote party with the new INVITE's originator) is
-                        // still TODO. For now the INVITE flows through as a
-                        // normal new call so at least the caller reaches the
-                        // UAS; a dedicated ticket tracks the bridge step.
+                    Some(matched) => {
+                        // RFC 3891 §3: `early-only` asks to replace a dialog that
+                        // has not been answered. siphon only ever takes over a
+                        // confirmed one — an early dialog has no negotiated media
+                        // to hand across and no answered party to keep — so the
+                        // flag is honoured by declining, which is the response
+                        // the section names for this exact case.
+                        let confirmed = state
+                            .call_actors
+                            .get_call(&matched.call_id)
+                            .map(|call| call.state == CallState::Answered)
+                            .unwrap_or(false);
+                        if replaces.early_only && confirmed {
+                            debug!(
+                                call_id = %sip_call_id,
+                                matched_call = %matched.call_id,
+                                "B2BUA: rejecting INVITE with 486 — Replaces carries early-only but the dialog is confirmed"
+                            );
+                            let response = build_response(
+                                &message, 486, "Busy Here",
+                                state.server_header.as_deref(), &[],
+                            );
+                            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+                            return;
+                        }
+                        if !confirmed {
+                            debug!(
+                                call_id = %sip_call_id,
+                                matched_call = %matched.call_id,
+                                "B2BUA: rejecting INVITE with 486 — Replaces names a dialog that is not answered"
+                            );
+                            let response = build_response(
+                                &message, 486, "Busy Here",
+                                state.server_header.as_deref(), &[],
+                            );
+                            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+                            return;
+                        }
                         debug!(
                             call_id = %sip_call_id,
-                            matched_call = %matched_call_id,
-                            "B2BUA: INVITE with Replaces matched an existing dialog (bridge TODO)"
+                            matched_call = %matched.call_id,
+                            replaced_on_a_leg = matched.on_a_leg,
+                            "B2BUA: INVITE with Replaces matched a confirmed dialog — takeover deferred to script admission"
                         );
+                        pending_replaces = Some(crate::b2bua::actor::PendingReplaces {
+                            replaced_call_id: matched.call_id,
+                            replaced_on_a_leg: matched.on_a_leg,
+                            early_only: replaces.early_only,
+                        });
                     }
                     None => {
                         debug!(
@@ -12490,6 +12535,12 @@ fn handle_b2bua_invite(
         call.a_leg_local_addr = Some(inbound.local_addr);
     }
     state.call_event_receivers.insert(call_id.clone(), event_rx);
+
+    // Carry the resolved `Replaces` match onto the call so the post-admission
+    // step below can find it.
+    if let Some(pending) = pending_replaces {
+        state.call_actors.set_pending_replaces(&call_id, pending);
+    }
 
     // CDR: start tracking this call at INVITE time (cdr.auto_emit).
     cdr_track_b2bua_start(
@@ -12686,6 +12737,25 @@ fn handle_b2bua_invite(
         error!("message_arc lock poisoned in B2BUA invite handler");
         return;
     };
+
+    // The INVITE carried a `Replaces` naming a dialog this node hosts, and the
+    // script has now had its say. A reject (a digest challenge, a policy refusal)
+    // is honoured below like any other; anything else means the request was
+    // admitted, so the takeover runs instead of the routing the script asked for
+    // — an INVITE with `Replaces` is a request to join an existing call, not a
+    // new one to route, and the dial plan has no say in where it goes.
+    if !matches!(action, CallAction::Reject { .. } | CallAction::None) {
+        if let Some(pending) = state.call_actors.take_pending_replaces(&call_id) {
+            b2bua_bridge_inbound_replaces(
+                &inbound,
+                &message_guard,
+                &call_id,
+                &pending,
+                state,
+            );
+            return;
+        }
+    }
 
     match action {
         CallAction::None => {
@@ -18733,7 +18803,28 @@ fn b2bua_send_uas_response(
         response.headers.set("Content-Length", body_bytes.len().to_string());
         response.body = body_bytes;
     }
+    // A locally-generated 2xx needs the same retransmission cover as a relayed
+    // one: the B2BUA intercepts the A-leg INVITE before a server transaction
+    // exists, so nothing under this recovers a lost 200 and the caller would
+    // ring on until it gave up. Cancelled by the caller's ACK in the late-ACK
+    // handler (search `uas_2xx_retransmits`).
+    let retransmit = if final_response && (200..300).contains(&code) {
+        Some(response.clone())
+    } else {
+        None
+    };
     send_message_from(response, transport, remote_addr, connection_id, local_addr, state);
+    if let Some(retransmit) = retransmit {
+        arm_b2bua_2xx_retransmit(
+            internal_call_id,
+            retransmit,
+            transport,
+            remote_addr,
+            connection_id,
+            local_addr,
+            state,
+        );
+    }
 
     if final_response {
         // Confirm the A-leg dialog and mark the CDR answered (tracked at INVITE
@@ -21433,6 +21524,239 @@ fn b2bua_transfer_rtpengine_answer(
             None
         }
     }
+}
+
+/// Hand an existing call's dialog over to the party that sent an INVITE with
+/// `Replaces` (RFC 3891 §3 / RFC 5589 §7 attended transfer).
+///
+/// This is the inbound half of attended transfer — the transferee calls *us*
+/// naming the dialog it is taking over, where `b2bua_refer_accept` is the half
+/// where siphon places that call itself. The named party is dropped, the new
+/// caller takes its slot, and the party on the other side of the named dialog
+/// carries on without ever seeing a new call.
+///
+/// Runs only after `@b2bua.on_invite` has admitted the INVITE — see
+/// [`PendingReplaces`](crate::b2bua::actor::PendingReplaces) for why the header
+/// alone is not enough authority to end someone's call.
+fn b2bua_bridge_inbound_replaces(
+    inbound: &InboundMessage,
+    invite: &SipMessage,
+    new_call_id: &str,
+    pending: &crate::b2bua::actor::PendingReplaces,
+    state: &DispatcherState,
+) {
+    let replaced_call_id = pending.replaced_call_id.clone();
+
+    // Answer the new party with a hard failure rather than half a takeover:
+    // every one of these means the call it asked to join cannot be handed over
+    // intact, and the alternative is a connected call with dead audio.
+    let refuse = |code: u16, reason: &str, why: &str| {
+        warn!(
+            call_id = %new_call_id,
+            replaced_call = %replaced_call_id,
+            "B2BUA Replaces: refusing takeover with {code} — {why}"
+        );
+        let response =
+            build_response(invite, code, reason, state.server_header.as_deref(), &[]);
+        send_message_from(
+            response,
+            inbound.transport,
+            inbound.remote_addr,
+            inbound.connection_id,
+            Some(inbound.local_addr),
+            state,
+        );
+        state.call_actors.remove_call(new_call_id);
+        state.call_event_receivers.remove(new_call_id);
+    };
+
+    // The transferee offers (RFC 5589 §7). An offerless INVITE would make siphon
+    // the offerer and push the answer into the ACK, which is a different
+    // negotiation than the one the surviving leg is already in.
+    if invite.body.is_empty() {
+        refuse(488, "Not Acceptable Here", "the INVITE carries no offer");
+        return;
+    }
+
+    // The survivor is the peer of the dialog being replaced.
+    let survivor_on_a_leg = !pending.replaced_on_a_leg;
+    let Some(survivor) = state.call_actors.clone_leg(&replaced_call_id, survivor_on_a_leg) else {
+        refuse(481, "Call/Transaction Does Not Exist", "the replaced call went away");
+        return;
+    };
+    let (Some(survivor_tag), Some(survivor_sdp)) =
+        (survivor.dialog.remote_tag.clone(), survivor.last_sdp.clone())
+    else {
+        refuse(
+            488,
+            "Not Acceptable Here",
+            "the surviving leg has no negotiated media to hand over",
+        );
+        return;
+    };
+
+    let Some(new_leg) = state.call_actors.clone_leg(new_call_id, true) else {
+        refuse(481, "Call/Transaction Does Not Exist", "the new call went away");
+        return;
+    };
+    let new_tag = new_leg.dialog.local_tag.clone();
+    // The fresh engine call-id is the new party's SIP Call-ID, which is what the
+    // media store is keyed on once this leg occupies the A-leg slot.
+    let cid_new = new_leg.dialog.call_id.clone();
+
+    // The pre-takeover anchor, keyed on the replaced call's A-leg Call-ID.
+    let old_anchor = state
+        .call_actors
+        .get_call(&replaced_call_id)
+        .map(|call| call.a_leg.dialog.call_id.clone())
+        .and_then(|key| {
+            state
+                .rtpengine_sessions
+                .as_ref()
+                .and_then(|store| store.get(&key))
+                .map(|session| (key, session))
+        });
+
+    // Media. Anchored: re-offer the new party onto a fresh engine call-id and
+    // answer it with the survivor's already-negotiated SDP, so the 200 can go out
+    // now instead of waiting for the survivor's re-INVITE to come back.
+    // Unanchored: the two SDPs cross directly.
+    let (sdp_for_new_party, sdp_for_survivor) = match &old_anchor {
+        Some((_, session)) => {
+            let to_survivor = b2bua_transfer_rtpengine_offer(
+                state,
+                &cid_new,
+                &new_tag,
+                &invite.body,
+                &session.profile,
+            );
+            let to_new_party = b2bua_transfer_rtpengine_answer(
+                state,
+                &cid_new,
+                &new_tag,
+                &survivor_tag,
+                &survivor_sdp,
+                &session.profile,
+            );
+            match (to_survivor, to_new_party) {
+                (Some(survivor_side), Some(new_side)) => (new_side, survivor_side),
+                _ => {
+                    warn!(
+                        call_id = %new_call_id,
+                        "B2BUA Replaces: rtpengine re-anchor failed — crossing the raw SDP instead"
+                    );
+                    (survivor_sdp.clone(), invite.body.clone())
+                }
+            }
+        }
+        None => (survivor_sdp.clone(), invite.body.clone()),
+    };
+
+    // Move the new party's leg onto the call it is joining. Its own (now empty)
+    // call is dropped without retiring the dialog — the leg is moving, not ending.
+    let (stored_invite, stored_local_addr) = match state.call_actors.get_call(new_call_id) {
+        Some(call) => (call.a_leg_invite.clone(), call.a_leg_local_addr),
+        None => (None, None),
+    };
+    let Some(new_leg_owned) = state.call_actors.detach_a_leg_for_adoption(new_call_id) else {
+        refuse(481, "Call/Transaction Does Not Exist", "the new call went away");
+        return;
+    };
+    state.call_event_receivers.remove(new_call_id);
+
+    let Some((replaced, _survivor)) = state.call_actors.adopt_replaced_dialog(
+        &replaced_call_id,
+        pending.replaced_on_a_leg,
+        new_leg_owned,
+    ) else {
+        // The call vanished between the snapshot and the swap. The new party's
+        // actor is already gone, so answer from the raw INVITE and stop.
+        warn!(
+            call_id = %new_call_id,
+            replaced_call = %replaced_call_id,
+            "B2BUA Replaces: the call being taken over disappeared mid-swap — 481"
+        );
+        let response = build_response(
+            invite, 481, "Call/Transaction Does Not Exist",
+            state.server_header.as_deref(), &[],
+        );
+        send_message_from(
+            response, inbound.transport, inbound.remote_addr,
+            inbound.connection_id, Some(inbound.local_addr), state,
+        );
+        return;
+    };
+
+    // Handlers that rebuild a PyCall (on_bye, CDR finalize) read these off the
+    // call, and they now describe the new party.
+    if let Some(mut call) = state.call_actors.get_call_mut(&replaced_call_id) {
+        call.a_leg_invite = stored_invite;
+        call.a_leg_local_addr = stored_local_addr;
+    }
+
+    // Accept the takeover. Sent before the BYE below so the transferee is
+    // connected to the surviving party before the replaced one is told to go.
+    if !b2bua_answer_call(
+        &replaced_call_id,
+        invite,
+        200,
+        "OK",
+        Some(sdp_for_new_party),
+        Some("application/sdp"),
+    ) {
+        warn!(call_id = %replaced_call_id, "B2BUA Replaces: failed to answer the taking-over INVITE");
+    }
+
+    // RFC 3891 §3: the replaced dialog is terminated once the new INVITE is
+    // accepted. Its leg is already off the call, so this BYE is built from the
+    // snapshot taken during the swap.
+    if let Some(bye) = build_b2bua_bye(&replaced, state) {
+        let (destination, transport) = resolve_in_dialog_destination(
+            &replaced.dialog.route_set,
+            state,
+            replaced.transport.remote_addr,
+            replaced.transport.transport,
+        );
+        send_message_from(
+            bye,
+            transport,
+            destination,
+            replaced.transport.connection_id,
+            replaced.transport.local_addr,
+            state,
+        );
+    }
+
+    // Re-point the survivor at the new party (RFC 3261 §14) — it is still
+    // sending to the address of the party that just left. The survivor is the
+    // winning B-leg after the swap, always.
+    b2bua_send_media_reinvite(&replaced_call_id, false, sdp_for_survivor, state);
+
+    // Re-key the media session onto the new A-leg Call-ID and drop the old
+    // anchor, mirroring the terminate-transfer re-anchor.
+    if let Some((old_key, old_session)) = &old_anchor {
+        if let Some(store) = state.rtpengine_sessions.as_ref() {
+            store.insert(crate::rtpengine::session::MediaSession {
+                call_id: cid_new.clone(),
+                rtpengine_call_id: cid_new.clone(),
+                from_tag: new_tag.clone(),
+                to_tag: Some(survivor_tag.clone()),
+                profile: old_session.profile.clone(),
+                // A fresh engine call-id: any WebSocket bridge the old anchor
+                // held belonged to the call-id that just went away.
+                ws_uri: None,
+                created_at: std::time::Instant::now(),
+            });
+            store.remove(old_key);
+        }
+        b2bua_transfer_rtpengine_delete(state, old_session.rtpengine_id(), &old_session.from_tag);
+    }
+
+    info!(
+        call_id = %replaced_call_id,
+        replaced_on_a_leg = pending.replaced_on_a_leg,
+        "B2BUA Replaces: dialog taken over — replaced party BYE'd, survivor re-INVITEd to the new party"
+    );
 }
 
 /// rtpengine `delete` for the OLD anchor of a siphon-terminated transfer: tears

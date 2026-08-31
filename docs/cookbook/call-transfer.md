@@ -200,6 +200,24 @@ def on_refer(call):
     The handler is `def on_refer(call):` — one argument, no reply object
     (`REFER` is a request).
 
+!!! note "The other half: a transferee that calls *in*"
+    The flow above is siphon placing the transferred call itself. The mirror is a
+    transferee that calls siphon with a `Replaces` naming the dialog it is taking
+    over — which is what an endpoint does when it runs the transfer on its own.
+    siphon hands the existing call over: the named party is BYE'd, the caller
+    takes its place, and the party on the other side is re-INVITEd onto the new
+    media without ever seeing a new call. The named dialog may be either leg, so
+    both "the caller transferred it" and the everyday "answered, then transferred
+    it" work.
+
+    That takeover runs **after** `@b2bua.on_invite`, not before. RFC 3891 §5 makes
+    `Replaces` a way to hijack a call for anyone who learns its dialog
+    identifiers, so it has to clear the same admission as any other INVITE: an
+    `auth.require_proxy_digest()` or a `call.reject()` in that handler stops the
+    takeover. When the handler admits it, siphon performs the handover instead of
+    the routing the handler asked for — an INVITE with `Replaces` is a request to
+    join an existing call, not a new one to route.
+
 !!! note "The `Replaces` is rewritten for the target"
     The INVITE siphon triggers towards the transfer target carries the `Replaces`
     naming the dialog to be taken over (RFC 3891 §3). The referrer names that

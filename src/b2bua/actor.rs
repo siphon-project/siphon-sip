@@ -832,6 +832,35 @@ pub struct ReplacesDialog {
     pub to_tag: String,
 }
 
+/// Which call, and which of its legs, an inbound `Replaces` (RFC 3891) named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacesMatch {
+    /// Internal id of the call holding the named dialog.
+    pub call_id: String,
+    /// True when the named dialog is that call's A-leg; false for its winning
+    /// B-leg. Determines which party survives the takeover — the *other* one.
+    pub on_a_leg: bool,
+}
+
+/// An inbound INVITE carrying a `Replaces` (RFC 3891) that matched a dialog this
+/// node hosts, recorded on the new call while the INVITE is still being admitted.
+///
+/// The takeover is deliberately NOT performed at header-parse time. RFC 3891 §5
+/// warns that a party who learns a dialog's identifiers can use `Replaces` to
+/// hijack the call, so the request has to clear the same admission the script
+/// applies to any other INVITE — `auth.require_proxy_digest()` in
+/// `@b2bua.on_invite` — before siphon acts on it. This carries the resolved
+/// match across that gap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingReplaces {
+    /// The call whose dialog is being taken over.
+    pub replaced_call_id: String,
+    /// Which leg of that call the header named.
+    pub replaced_on_a_leg: bool,
+    /// The `early-only` flag (RFC 3891 §3) as it arrived.
+    pub early_only: bool,
+}
+
 /// Per-call supervisor managing A-leg + B-leg(s).
 ///
 /// Each call actor owns its legs as independent entities. The dispatcher
@@ -912,6 +941,10 @@ pub struct CallActor {
     pub session_timer_override: Option<crate::script::api::call::SessionTimerOverride>,
     /// Active transfer context (REFER handling).
     pub transfer: Option<super::transfer::TransferContext>,
+    /// Set when this call's own INVITE carried a `Replaces` naming a dialog
+    /// this node hosts. Acted on only once the script has admitted the INVITE
+    /// (see [`PendingReplaces`]).
+    pub pending_replaces: Option<PendingReplaces>,
     /// REFER subscriptions siphon owns for transfers in progress (RFC 3515).
     /// Present for the siphon-terminated inbound path (siphon is the notifier,
     /// sending `message/sipfrag` NOTIFYs to the referrer) and the
@@ -1046,6 +1079,7 @@ impl CallActor {
             session_timer: None,
             session_timer_override: None,
             transfer: None,
+            pending_replaces: None,
             refer_subscriptions: Vec::new(),
             outbound_credentials: None,
             digest_nc: crate::auth::NonceCounter::new(),
@@ -1712,12 +1746,15 @@ impl CallActorStore {
     /// The `from_tag` in the `Replaces` header is the tag of the UA
     /// that *sent* the original dialog request (the "remote" side from
     /// our perspective); `to_tag` is *our* tag for that dialog.
+    /// Reports which leg matched as well as which call, because the party that
+    /// survives a takeover is the *peer* of the named dialog and the caller
+    /// cannot work that out from the call id alone.
     pub fn find_call_by_replaces_dialog(
         &self,
         call_id: &str,
         from_tag: &str,
         to_tag: &str,
-    ) -> Option<String> {
+    ) -> Option<ReplacesMatch> {
         for entry in self.calls.iter() {
             let call = entry.value();
             let leg_matches = |leg: &Leg| {
@@ -1728,11 +1765,117 @@ impl CallActorStore {
                         .remote_tag
                         .as_deref() == Some(from_tag))
             };
-            if leg_matches(&call.a_leg) || call.b_legs.iter().any(leg_matches) {
-                return Some(entry.key().clone());
+            if leg_matches(&call.a_leg) {
+                return Some(ReplacesMatch {
+                    call_id: entry.key().clone(),
+                    on_a_leg: true,
+                });
+            }
+            if call.b_legs.iter().any(leg_matches) {
+                return Some(ReplacesMatch {
+                    call_id: entry.key().clone(),
+                    on_a_leg: false,
+                });
             }
         }
         None
+    }
+
+    /// Record the `Replaces` match resolved for a call still being admitted.
+    pub fn set_pending_replaces(&self, call_id: &str, pending: PendingReplaces) {
+        if let Some(mut call) = self.calls.get_mut(call_id) {
+            call.pending_replaces = Some(pending);
+        }
+    }
+
+    /// Take the recorded `Replaces` match, if any, leaving none behind.
+    pub fn take_pending_replaces(&self, call_id: &str) -> Option<PendingReplaces> {
+        self.calls
+            .get_mut(call_id)
+            .and_then(|mut call| call.pending_replaces.take())
+    }
+
+    /// Lift a call's A-leg out and drop the (now empty) call, WITHOUT retiring
+    /// the dialog.
+    ///
+    /// The leg is moving to another call, not ending, so this deliberately does
+    /// none of what [`remove_call`](Self::remove_call) does: the Call-ID keeps
+    /// its registry entry (re-pointed by [`adopt_replaced_dialog`]) and is never
+    /// marked terminated, because doing either would make the ACK for the 200
+    /// this leg is about to receive resolve to nothing and answer 481.
+    ///
+    /// [`adopt_replaced_dialog`]: Self::adopt_replaced_dialog
+    pub fn detach_a_leg_for_adoption(&self, call_id: &str) -> Option<Leg> {
+        let (_, call) = self.calls.remove(call_id)?;
+        call.shutdown_actors();
+        self.registry.remove_branch(&call.a_leg.branch);
+        Some(call.a_leg)
+    }
+
+    /// Hand a call's dialog over to a new party (RFC 3891 `Replaces`).
+    ///
+    /// `new_leg` takes the place of the leg named by the `Replaces`, and the
+    /// call is rebuilt around the pair that is left: the new leg in the A-leg
+    /// slot and the surviving party as the sole B-leg. The A-leg slot is not
+    /// negotiable — the inbound-ACK path resolves a call by Call-ID and then
+    /// marks `a_leg` acked, so a UAS leg parked anywhere else would never have
+    /// its ACK recorded and would retransmit its 200 to Timer B.
+    ///
+    /// Returns the replaced leg so the caller can BYE it (RFC 3891 §3 requires
+    /// the replaced dialog to be terminated once the new INVITE is accepted),
+    /// together with the survivor.
+    ///
+    /// The replaced dialog is retired here — registry entries dropped and the
+    /// Call-ID remembered as terminated — so a late in-dialog request on it
+    /// answers 481 rather than resolving to a call it is no longer part of.
+    pub fn adopt_replaced_dialog(
+        &self,
+        replaced_call_id: &str,
+        replaced_on_a_leg: bool,
+        new_leg: Leg,
+    ) -> Option<(Leg, Leg)> {
+        let new_sip_call_id = new_leg.dialog.call_id.clone();
+        let new_branch = new_leg.branch.clone();
+        let (replaced, survivor) = {
+            let mut call = self.calls.get_mut(replaced_call_id)?;
+            let winner = call.winner?;
+            if winner >= call.b_legs.len() {
+                return None;
+            }
+            let (replaced, survivor) = if replaced_on_a_leg {
+                let survivor = call.b_legs.swap_remove(winner);
+                let replaced = std::mem::replace(&mut call.a_leg, new_leg);
+                (replaced, survivor)
+            } else {
+                let replaced = call.b_legs.swap_remove(winner);
+                // The old A-leg becomes the surviving B-leg; the new party takes
+                // the A-leg slot it vacates.
+                let survivor = std::mem::replace(&mut call.a_leg, new_leg);
+                (replaced, survivor)
+            };
+            // Rebuild around the surviving pair. Any other B-leg on the call is
+            // a settled fork loser and has no dialog left to carry over.
+            call.b_legs.clear();
+            call.b_leg_status.clear();
+            call.b_leg_handles.clear();
+            call.b_legs.push(survivor.clone());
+            call.b_leg_status.push(BLegStatus::Answered);
+            call.b_leg_handles.push(None);
+            call.winner = Some(0);
+            call.state = CallState::Answered;
+            (replaced, survivor)
+        };
+
+        // The new party's dialog now belongs to this call, so its Call-ID has to
+        // resolve here — its ACK, re-INVITEs and BYE all arrive on it.
+        self.registry.register_call_id(&new_sip_call_id, replaced_call_id);
+        self.registry.register_branch(&new_branch, replaced_call_id);
+
+        self.registry.remove_call_id(&replaced.dialog.call_id);
+        self.registry.remove_branch(&replaced.branch);
+        self.remember_terminated(&replaced.dialog.call_id);
+
+        Some((replaced, survivor))
     }
 
     /// Resolve the `Replaces` triple a referrer supplied (its own view of the
@@ -3516,6 +3659,165 @@ mod tests {
         assert!(!store.try_mark_ringing("nonexistent"));
     }
 
+    /// The transferor may equally be the party siphon *called* — a callee
+    /// transferring a call it answered is the everyday case. Then the named
+    /// dialog is a B-leg, and the survivor is the A-leg.
+    #[test]
+    fn find_call_by_replaces_reports_a_b_leg_match() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        let mut b_leg = make_b_leg(0);
+        b_leg.dialog.remote_tag = Some("tag-callee".to_string());
+        let b_call_id = b_leg.dialog.call_id.clone();
+        let b_local_tag = b_leg.dialog.local_tag.clone();
+        store.add_b_leg(&call_id, b_leg);
+        store.set_winner(&call_id, 0);
+
+        let matched = store.find_call_by_replaces_dialog(&b_call_id, "tag-callee", &b_local_tag);
+        assert_eq!(
+            matched,
+            Some(ReplacesMatch {
+                call_id,
+                on_a_leg: false
+            })
+        );
+    }
+
+    #[test]
+    fn pending_replaces_round_trips_and_is_taken_once() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        let pending = PendingReplaces {
+            replaced_call_id: "other-call".to_string(),
+            replaced_on_a_leg: true,
+            early_only: false,
+        };
+        store.set_pending_replaces(&call_id, pending.clone());
+        assert_eq!(store.take_pending_replaces(&call_id), Some(pending));
+        // Taken once — a second admission pass must not re-run the takeover.
+        assert_eq!(store.take_pending_replaces(&call_id), None);
+    }
+
+    /// The leg is moving to another call, not ending. If the detach retired its
+    /// Call-ID the ACK for the 200 it is about to receive would resolve to
+    /// nothing and be answered 481, and the new party would retransmit its way
+    /// to Timer B.
+    #[test]
+    fn detaching_a_leg_for_adoption_keeps_its_call_id_live() {
+        let store = CallActorStore::new();
+        let a_leg = make_a_leg();
+        let sip_call_id = a_leg.dialog.call_id.clone();
+        let call_id = store.create_call(a_leg);
+
+        let detached = store.detach_a_leg_for_adoption(&call_id);
+        assert!(detached.is_some());
+        assert!(store.get_call(&call_id).is_none(), "the emptied call is dropped");
+        assert!(
+            !store.is_recently_terminated(&sip_call_id),
+            "the moving dialog must NOT be remembered as terminated"
+        );
+    }
+
+    /// The transferor is the caller (its dialog is the A-leg): the new party
+    /// takes the A-leg slot and the callee carries on as the sole B-leg.
+    #[test]
+    fn adopting_a_replaced_a_leg_rebuilds_the_call_around_the_new_party() {
+        let store = CallActorStore::new();
+        let a_leg = make_a_leg();
+        let replaced_sip_call_id = a_leg.dialog.call_id.clone();
+        let call_id = store.create_call(a_leg);
+        let mut b_leg = make_b_leg(0);
+        b_leg.dialog.remote_tag = Some("tag-callee".to_string());
+        let survivor_sip_call_id = b_leg.dialog.call_id.clone();
+        store.add_b_leg(&call_id, b_leg);
+        store.set_winner(&call_id, 0);
+
+        let mut new_leg = make_a_leg();
+        new_leg.dialog.call_id = "takeover@10.0.0.9".to_string();
+        new_leg.branch = "z9hG4bK-takeover".to_string();
+
+        let (replaced, survivor) = store
+            .adopt_replaced_dialog(&call_id, true, new_leg)
+            .expect("the swap must succeed on an answered call");
+
+        assert_eq!(replaced.dialog.call_id, replaced_sip_call_id);
+        assert_eq!(survivor.dialog.call_id, survivor_sip_call_id);
+
+        let call = store.get_call(&call_id).unwrap();
+        assert_eq!(call.a_leg.dialog.call_id, "takeover@10.0.0.9");
+        assert_eq!(call.b_legs.len(), 1);
+        assert_eq!(call.b_legs[0].dialog.call_id, survivor_sip_call_id);
+        assert_eq!(call.winner, Some(0));
+        assert_eq!(call.state, CallState::Answered);
+        drop(call);
+
+        // The new party's dialog resolves here — its ACK/BYE arrive on it.
+        assert_eq!(
+            store.find_by_sip_call_id("takeover@10.0.0.9").as_deref(),
+            Some(call_id.as_str())
+        );
+        // The replaced dialog is retired: gone from the registry and remembered
+        // terminated, so a late in-dialog request on it answers 481.
+        assert!(store.find_by_sip_call_id(&replaced_sip_call_id).is_none());
+        assert!(store.is_recently_terminated(&replaced_sip_call_id));
+    }
+
+    /// The transferor is the callee (its dialog is the winning B-leg): the new
+    /// party still lands in the A-leg slot — the inbound-ACK path only ever
+    /// marks `a_leg` — and the original caller moves across to be the B-leg.
+    #[test]
+    fn adopting_a_replaced_b_leg_moves_the_caller_to_the_b_slot() {
+        let store = CallActorStore::new();
+        let a_leg = make_a_leg();
+        let caller_sip_call_id = a_leg.dialog.call_id.clone();
+        let call_id = store.create_call(a_leg);
+        let mut b_leg = make_b_leg(0);
+        b_leg.dialog.remote_tag = Some("tag-callee".to_string());
+        let replaced_sip_call_id = b_leg.dialog.call_id.clone();
+        store.add_b_leg(&call_id, b_leg);
+        store.set_winner(&call_id, 0);
+
+        let mut new_leg = make_a_leg();
+        new_leg.dialog.call_id = "takeover-b@10.0.0.9".to_string();
+        new_leg.branch = "z9hG4bK-takeover-b".to_string();
+
+        let (replaced, survivor) = store
+            .adopt_replaced_dialog(&call_id, false, new_leg)
+            .expect("the swap must succeed on an answered call");
+
+        assert_eq!(replaced.dialog.call_id, replaced_sip_call_id);
+        assert_eq!(survivor.dialog.call_id, caller_sip_call_id);
+
+        let call = store.get_call(&call_id).unwrap();
+        assert_eq!(call.a_leg.dialog.call_id, "takeover-b@10.0.0.9");
+        assert_eq!(call.b_legs.len(), 1);
+        assert_eq!(
+            call.b_legs[0].dialog.call_id, caller_sip_call_id,
+            "the original caller survives as the B-leg"
+        );
+        assert_eq!(call.winner, Some(0));
+        drop(call);
+
+        assert!(store.is_recently_terminated(&replaced_sip_call_id));
+        assert!(
+            !store.is_recently_terminated(&caller_sip_call_id),
+            "the survivor's dialog is untouched"
+        );
+    }
+
+    /// A call that never answered has no negotiated media and no answered party
+    /// to keep, so there is nothing to hand over.
+    #[test]
+    fn adopting_refuses_a_call_with_no_winner() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(make_a_leg());
+        store.add_b_leg(&call_id, make_b_leg(0));
+
+        let mut new_leg = make_a_leg();
+        new_leg.dialog.call_id = "takeover-early@10.0.0.9".to_string();
+        assert!(store.adopt_replaced_dialog(&call_id, true, new_leg).is_none());
+    }
+
     /// RFC 3891 §3 dialog lookup: find a call where one of its legs has
     /// the dialog identifiers (call_id, local_tag, remote_tag) referenced
     /// by a `Replaces` header.
@@ -3531,7 +3833,13 @@ mod tests {
         // Replaces says: "the dialog you (siphon) have where YOU are tagged
         // `our_tag` and the OTHER end is tagged `their_tag`".
         let matched = store.find_call_by_replaces_dialog(&dialog_call_id, &their_tag, &our_tag);
-        assert_eq!(matched, Some(call_id));
+        assert_eq!(
+            matched,
+            Some(ReplacesMatch {
+                call_id,
+                on_a_leg: true
+            })
+        );
     }
 
     #[test]
