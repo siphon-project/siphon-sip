@@ -430,6 +430,13 @@ if [[ "$RUN_B2BUA" == true ]]; then
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-cancel up --abort-on-container-exit --exit-code-from sipp-b2bua-cancel-uac sipp-b2bua-cancel-uac sipp-b2bua-cancel-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-cancel rm -sf sipp-b2bua-cancel-uac sipp-b2bua-cancel-uas 2>/dev/null || true
 
+  echo "=== B2BUA CANCEL 487-ACK test (the CANCELled B-leg's 487 is ACKed — RFC 3261 §17.1.1.3) ==="
+  # --exit-code-from names the UAS, not the UAC: the A-leg gets a correct 487
+  # whether or not siphon ever ACKs the B-leg's, so reading the UAC's exit code
+  # would pass vacuously.  The UAS is the only side that can see the missing ACK.
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-cancel-ack up --abort-on-container-exit --exit-code-from sipp-b2bua-cancel-ack-uas sipp-b2bua-cancel-ack-uac sipp-b2bua-cancel-ack-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-cancel-ack rm -sf sipp-b2bua-cancel-ack-uac sipp-b2bua-cancel-ack-uas 2>/dev/null || true
+
   echo "=== B2BUA failure test (INVITE → 486 Busy) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-failure run --rm sipp-b2bua-register-failure
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-failure up --abort-on-container-exit --exit-code-from sipp-b2bua-failure-uac sipp-b2bua-failure-uac sipp-b2bua-failure-uas

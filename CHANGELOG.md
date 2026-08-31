@@ -324,6 +324,28 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   before, because that build is now what the official artifacts ship.
 
 
+### Fixed
+- **A `487 Request Terminated` answering a CANCEL siphon sent is now ACKed
+  (RFC 3261 §17.1.1.3).** It never was, on any CANCELled B2BUA leg. The CANCEL
+  paths tear the call down as they put the CANCEL on the wire, which unregisters
+  the leg's Via branch, so the `487` that RFC 3261 §9.1 makes the ordinary
+  outcome matched nothing and fell out of the response path as an unknown
+  branch. The B2BUA registers no client transaction — it runs its own retransmit
+  schedule — so nothing generated the ACK further down either. The peer's INVITE
+  server transaction then retransmitted the `487` on Timer G until Timer H
+  (64\*T1 = 32 s, §17.2.1), holding transaction state at both ends of every
+  abandoned call. It costs most on outbound traffic, where CANCEL is routine
+  rather than exceptional: each abandoned or timed-out attempt left a peer
+  retransmitting for 32 seconds. Existing handling covered only the §9.1 glare
+  case — a 2xx that beat the CANCEL — and that path is unchanged: a 2xx is still
+  ACKed and BYEd, never reclassified. The ACK rides the INVITE's own branch and
+  Request-URI and carries the response's To-tag, so the peer's server
+  transaction matches it (§17.2.3), and it is re-sent for every retransmission
+  of the response. Fixed for both an ordinary B2BUA B-leg and a call siphon
+  placed itself (`originate`), whose pending INVITE sits on the A-leg. The proxy
+  path was never affected: it relays and forks through real client transactions,
+  whose state machine already emits the ACK and caches it for retransmits.
+
 ## [1.6.0] — 2026-08-20
 
 ### Added
