@@ -66,6 +66,42 @@ async def route(call):
         call.dial(destination.uri)
 
 
+@b2bua.on_refer
+async def on_refer(call):
+    """A Teams user transferring the call away.
+
+    ``profile=`` is REQUIRED here and getting it wrong is silent. This SBC
+    anchors every call with a direction-bound profile — ``srtp_to_rtp`` says
+    "the offerer speaks SRTP, the answerer speaks plain RTP" — and a transfer
+    takes the SRTP party OUT of the call. Inherit that profile and siphon
+    re-INVITEs the surviving carrier leg with SRTP it never spoke; the carrier
+    answers ``m=audio 0`` and you get a connected call with no audio in either
+    direction, which looks perfectly healthy in the SIP trace.
+
+    Once Teams is gone both remaining legs are plain RTP on the carrier side,
+    so the surviving pair wants the symmetric ``rtp_passthrough``.
+    """
+    if not call.refer_to:
+        call.reject_refer(400, "Bad Request")
+        return
+
+    destination = gateway.select("carrier")
+    if not destination:
+        log.error(f"[{call.id}] no healthy carrier gateway for transfer")
+        call.reject_refer(503, "Service Unavailable")
+        return
+
+    log.info(f"[{call.id}] transfer -> {call.refer_to} via {destination.uri}")
+    call.accept_refer(
+        target=call.refer_to,
+        next_hop=destination.uri,
+        mode="terminate",
+        # The pair that REMAINS after Teams leaves — not the pair the call
+        # started as. See docs/cookbook/call-transfer.md.
+        profile="rtp_passthrough",
+    )
+
+
 @b2bua.on_answer
 async def answered(call, reply):
     # Reuse the offer profile (keyed by A-leg Call-ID) so the SRTP/RTP

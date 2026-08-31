@@ -88,6 +88,11 @@ pub enum CallAction {
         target: Option<String>,
         next_hop: Option<String>,
         mode: Option<ReferMode>,
+        /// Media profile for the pairing the transfer creates. `None` inherits
+        /// the profile the original call was anchored with, which is only
+        /// correct when that profile is symmetric — see
+        /// `ProfileEntry::is_direction_bound`.
+        profile: Option<String>,
     },
     /// Reject a REFER with a status code.
     RejectRefer { code: u16, reason: String },
@@ -2161,12 +2166,26 @@ impl PyCall {
     ///   call.accept_refer()
     ///   call.accept_refer(mode="transparent")
     ///   call.accept_refer(target="sip:+15550142@example.com", mode="terminate")
-    #[pyo3(signature = (target=None, next_hop=None, mode=None))]
+    ///
+    /// `profile` names the media profile for the pairing the transfer creates.
+    /// **Required whenever the call is anchored with a direction-bound profile**
+    /// — one whose offer and answer describe different sides, such as
+    /// `srtp_to_rtp` at a Teams/SRTP edge. Left unset, the transfer inherits the
+    /// original call's profile, whose answer half was written for the party that
+    /// is being transferred away; the surviving leg is then re-INVITEd with that
+    /// party's transport (SRTP toward a plain-RTP carrier) and answers `m=audio
+    /// 0`, leaving a connected call with no audio.
+    ///
+    ///   # both remaining parties are on the carrier side
+    ///   call.accept_refer(target=target, next_hop=gw.uri, mode="terminate",
+    ///                     profile="rtp_passthrough")
+    #[pyo3(signature = (target=None, next_hop=None, mode=None, profile=None))]
     fn accept_refer(
         &mut self,
         target: Option<String>,
         next_hop: Option<String>,
         mode: Option<&str>,
+        profile: Option<String>,
     ) -> PyResult<()> {
         let mode = match mode {
             None => None,
@@ -2182,6 +2201,7 @@ impl PyCall {
             target,
             next_hop,
             mode,
+            profile,
         };
         Ok(())
     }
@@ -2940,13 +2960,14 @@ mod tests {
     fn call_accept_refer() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
-        call.accept_refer(None, None, None).unwrap();
+        call.accept_refer(None, None, None, None).unwrap();
         assert_eq!(
             call.action(),
             &CallAction::AcceptRefer {
                 target: None,
                 next_hop: None,
-                mode: None
+                mode: None,
+                profile: None,
             }
         );
     }
@@ -2959,6 +2980,7 @@ mod tests {
             Some("sip:+15550142@example.com".to_string()),
             Some("sip:198.51.100.1:5060".to_string()),
             Some("transparent"),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2967,6 +2989,7 @@ mod tests {
                 target: Some("sip:+15550142@example.com".to_string()),
                 next_hop: Some("sip:198.51.100.1:5060".to_string()),
                 mode: Some(ReferMode::Transparent),
+                profile: None,
             }
         );
     }
@@ -2975,13 +2998,34 @@ mod tests {
     fn call_accept_refer_terminate_mode() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
-        call.accept_refer(None, None, Some("terminate")).unwrap();
+        call.accept_refer(None, None, Some("terminate"), None).unwrap();
         assert_eq!(
             call.action(),
             &CallAction::AcceptRefer {
                 target: None,
                 next_hop: None,
                 mode: Some(ReferMode::Terminate),
+                profile: None,
+            }
+        );
+    }
+
+    /// The media profile for the pairing a transfer creates is the script's to
+    /// choose; without it the transfer inherits the profile the call was
+    /// anchored with, whose answer half was written for the party leaving.
+    #[test]
+    fn call_accept_refer_carries_a_media_profile() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        call.accept_refer(None, None, Some("terminate"), Some("rtp_passthrough".to_string()))
+            .unwrap();
+        assert_eq!(
+            call.action(),
+            &CallAction::AcceptRefer {
+                target: None,
+                next_hop: None,
+                mode: Some(ReferMode::Terminate),
+                profile: Some("rtp_passthrough".to_string()),
             }
         );
     }
@@ -2990,7 +3034,7 @@ mod tests {
     fn call_accept_refer_rejects_bad_mode() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
-        let result = call.accept_refer(None, None, Some("bridge"));
+        let result = call.accept_refer(None, None, Some("bridge"), None);
         assert!(result.is_err());
         // The invalid call must not have mutated the action.
         assert_eq!(call.action(), &CallAction::None);

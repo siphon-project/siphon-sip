@@ -147,6 +147,54 @@ def on_refer(call):
                       next_hop="sip:trunk.example.com:5060")
 ```
 
+### Media profiles across a transfer — read this before deploying an SRTP edge
+
+!!! danger "A transfer re-pairs the call. A direction-bound profile does not follow."
+
+    A media profile has two halves, and for profiles like `srtp_to_rtp` they
+    describe **specific sides of the call**:
+
+    ```yaml
+    srtp_to_rtp:
+      offer:   { transport_protocol: "RTP/AVP",  direction: ["teams", "carrier"] }
+      answer:  { transport_protocol: "RTP/SAVP", direction: ["carrier", "teams"] }
+    ```
+
+    The `answer` half exists to talk to the SRTP party. A transfer moves that
+    party out of the call — so applying the same profile afterwards re-offers
+    **SRTP to whoever is left**, and a plain-RTP carrier answers `m=audio 0`.
+    The call connects, both parties think they are talking, and there is no
+    audio in either direction.
+
+    Pass `profile=` naming the profile for the pair that **remains**:
+
+    ```python
+    @b2bua.on_refer
+    def on_refer(call):
+        # Teams referred the call to a carrier number: once Teams is gone,
+        # both remaining legs are plain RTP on the carrier side.
+        call.accept_refer(target=target, next_hop=gw.uri, mode="terminate",
+                          profile="rtp_passthrough")
+    ```
+
+    siphon logs a `WARN` naming the profile when a transfer inherits a
+    direction-bound one, but it cannot pick the replacement for you — only the
+    script knows what the surviving pair looks like.
+
+**Which profiles are direction-bound?** Any whose two halves differ: a different
+`transport_protocol` (every SRTP/DTLS edge), or a `direction:` pair, or different
+DTLS handling. The built-ins `srtp_to_rtp`, `rtp_to_srtp`, `ws_to_rtp` and
+`wss_to_rtp` all are. `rtp_passthrough` is symmetric and re-pairs safely.
+
+The same applies to **anything else the profile pins to one side** — a transcoding
+or codec-shaping policy chosen because *that* party needed it does not
+automatically suit the party that replaces it. If the two halves of your profile
+are not interchangeable, name the profile explicitly on transfer.
+
+This is not specific to `REFER`: an inbound `INVITE` with `Replaces` re-pairs the
+call the same way, and warns the same way. Transfers across an SRTP or
+transcoding boundary want a symmetric profile on the surviving pair.
+
 ### Media anchoring (terminate mode)
 
 Terminate mode re-bridges the media plane by offering the **surviving** party's

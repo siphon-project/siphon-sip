@@ -18606,6 +18606,7 @@ fn b2bua_send_outbound_refer(
             // Subscriber role: siphon is the referrer here, so there is no
             // remote referrer whose departure this could track.
             referrer_gone: false,
+            media_profile: None,
         },
     );
     info!(
@@ -18647,8 +18648,10 @@ pub fn b2bua_refer_call(
 /// falling back to the referrer's SDP when there is no surviving leg to bridge).
 ///
 /// `target` overrides the Refer-To URI, `next_hop` steers egress without
-/// reshaping the R-URI, and `mode` overrides the configured
-/// `b2bua.default_refer_mode`. Returns `false` (never panics) when no REFER is
+/// reshaping the R-URI, `mode` overrides the configured
+/// `b2bua.default_refer_mode`, and `media_profile` names the profile for the
+/// pairing the transfer creates (see `accept_refer(profile=…)` — required when
+/// the call is anchored with a direction-bound profile). Returns `false` (never panics) when no REFER is
 /// pending for this call (already decided, timed out, or the call is gone),
 /// which the adapter maps to `not_found`. Safe from any thread (enters the
 /// dispatcher runtime), mirroring [`b2bua_refer_call`].
@@ -18657,6 +18660,7 @@ pub fn b2bua_accept_refer_call(
     target: Option<String>,
     next_hop: Option<String>,
     mode: Option<crate::script::api::call::ReferMode>,
+    media_profile: Option<String>,
 ) -> bool {
     let Some(control) = B2BUA_CONTROL.get() else {
         return false;
@@ -18688,6 +18692,7 @@ pub fn b2bua_accept_refer_call(
         next_hop.as_deref(),
         pending.refer_to.replaces.clone(),
         mode,
+        media_profile.as_deref(),
         state,
     );
     true
@@ -21623,6 +21628,7 @@ fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &Disp
             target,
             next_hop,
             mode,
+            profile,
         } => {
             let mode = mode.unwrap_or(state.default_refer_mode);
             let target_uri = target.unwrap_or_else(|| refer_to.uri.clone());
@@ -21635,6 +21641,7 @@ fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &Disp
                 next_hop.as_deref(),
                 refer_to.replaces.clone(),
                 mode,
+                profile.as_deref(),
                 state,
             );
         }
@@ -21819,6 +21826,22 @@ fn b2bua_bridge_inbound_replaces(
     // answer it with the survivor's already-negotiated SDP, so the 200 can go out
     // now instead of waiting for the survivor's re-INVITE to come back.
     // Unanchored: the two SDPs cross directly.
+    if let Some((_, session)) = &old_anchor {
+        if state
+            .rtpengine_profiles
+            .as_ref()
+            .and_then(|registry| registry.get(&session.profile))
+            .map(|entry| entry.is_direction_bound())
+            .unwrap_or(false)
+        {
+            warn!(
+                call_id = %replaced_call_id,
+                profile = %session.profile,
+                "B2BUA Replaces: the call is anchored with a direction-bound media profile and the takeover re-pairs it — the surviving leg may be re-offered the replaced party's transport. A symmetric profile is required for takeovers across an SRTP or transcoding boundary."
+            );
+        }
+    }
+
     let (sdp_for_new_party, sdp_for_survivor) = match &old_anchor {
         Some((_, session)) => {
             let to_survivor = b2bua_transfer_rtpengine_offer(
@@ -21994,6 +22017,7 @@ fn b2bua_refer_accept(
     next_hop: Option<&str>,
     replaces: Option<crate::sip::headers::refer::Replaces>,
     mode: crate::script::api::call::ReferMode,
+    media_profile: Option<&str>,
     state: &DispatcherState,
 ) {
     use crate::script::api::call::ReferMode;
@@ -22171,7 +22195,16 @@ fn b2bua_refer_accept(
             // id is forced onto the target leg's Call-ID so the post-promotion
             // store key lines up (see b2bua_complete_terminated_transfer). Absent
             // an anchor, offer the survivor's raw SDP directly.
-            let anchored_profile = state
+            //
+            // The profile is the script's to choose (`accept_refer(profile=…)`),
+            // because only it knows what the surviving pair looks like. Falling
+            // back to the call's own profile is right for a symmetric one and
+            // silently wrong for a direction-bound one: `srtp_to_rtp`'s answer
+            // half exists to talk to the SRTP party, and after the transfer that
+            // party is the one that left, so the survivor gets re-INVITEd with
+            // SRTP it never spoke and answers `m=audio 0`. Warned about here
+            // rather than guessed at.
+            let inherited_profile = state
                 .call_actors
                 .get_call(call_id)
                 .map(|c| c.a_leg.dialog.call_id.clone())
@@ -22182,6 +22215,26 @@ fn b2bua_refer_accept(
                         .and_then(|store| store.get(&key))
                         .map(|session| session.profile.clone())
                 });
+            if media_profile.is_none() {
+                if let Some(inherited) = inherited_profile.as_deref() {
+                    if state
+                        .rtpengine_profiles
+                        .as_ref()
+                        .and_then(|registry| registry.get(inherited))
+                        .map(|entry| entry.is_direction_bound())
+                        .unwrap_or(false)
+                    {
+                        warn!(
+                            call_id = %call_id,
+                            profile = %inherited,
+                            "REFER terminate: inheriting a direction-bound media profile for the transfer — its answer half was written for the party being transferred away, so the surviving leg will be re-offered that party's transport. Pass accept_refer(profile=…) naming the profile for the pair that remains."
+                        );
+                    }
+                }
+            }
+            let anchored_profile = media_profile
+                .map(|name| name.to_string())
+                .or(inherited_profile);
             let fresh_cid = crate::b2bua::actor::generate_call_id();
             let (target_offer_sdp, forced_cid) =
                 match (&anchored_profile, &survivor_sdp, &survivor_tag) {
@@ -22286,6 +22339,7 @@ fn b2bua_refer_accept(
                     state: crate::b2bua::transfer::TransferState::Trying,
                     target_leg_call_id,
                     referrer_gone: false,
+                    media_profile: media_profile.map(|name| name.to_string()),
                 },
             );
         }
@@ -22311,7 +22365,10 @@ fn b2bua_complete_terminated_transfer(
     // `referrer_gone` is set when the referrer already BYE'd this call while the
     // target was still ringing (see `mark_transfer_referrer_gone`): the transfer
     // still completes, but there is no dialog left to NOTIFY or BYE.
-    let (referrer_on_a_leg, referrer_gone, target_leg) = match state.call_actors.get_call(call_id) {
+    let (referrer_on_a_leg, referrer_gone, transfer_profile, target_leg) = match state
+        .call_actors
+        .get_call(call_id)
+    {
         Some(call) => {
             let Some(subscription) = call
                 .refer_subscriptions
@@ -22323,6 +22380,7 @@ fn b2bua_complete_terminated_transfer(
             (
                 subscription.on_a_leg,
                 subscription.referrer_gone,
+                subscription.media_profile.clone(),
                 call.b_legs.get(target_idx).cloned(),
             )
         }
@@ -22563,7 +22621,9 @@ fn b2bua_complete_terminated_transfer(
                     surv_tag,
                     tgt_tag,
                     &response.body,
-                    &old_session.profile,
+                    // The pairing the transfer created, not the one the call
+                    // started as — see `accept_refer(profile=…)`.
+                    transfer_profile.as_deref().unwrap_or(&old_session.profile),
                 )
             }
             _ => None,
@@ -22591,7 +22651,9 @@ fn b2bua_complete_terminated_transfer(
                         // the offerer for future role-based lookups.
                         from_tag: tgt_tag.clone(),
                         to_tag: Some(surv_tag.clone()),
-                        profile: old_session.profile.clone(),
+                        profile: transfer_profile
+                            .clone()
+                            .unwrap_or_else(|| old_session.profile.clone()),
                         // Deliberately not carried over from `old_session`: this
                         // is a fresh engine call-id for the survivor↔target
                         // pair, and any WebSocket bridge the pre-transfer anchor
