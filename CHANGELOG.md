@@ -201,6 +201,46 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   a personal one.
 
 ### Fixed
+- **An inbound `INVITE` with `Replaces` now actually takes the call over.** The
+  transferee half of attended transfer (RFC 3891 §3 / RFC 5589 §7): a UA calls in
+  naming the dialog it is taking over. siphon matched that dialog, logged it, and
+  then let the INVITE through as an ordinary new call — so the transfer only half
+  happened. The transferor was left in a call that never ended, and the
+  transferee got a second, unrelated call routed by the dial plan instead of the
+  one it asked to join. It now hands the call over: the named party is BYE'd
+  (§3 requires the replaced dialog to be terminated), the new caller takes its
+  place, and the party on the other side is re-INVITEd onto the new media
+  (RFC 3261 §14) rather than left sending audio to whoever just left. Works in
+  both directions — the named dialog may be the caller's or the callee's, and the
+  everyday "answer a call, then transfer it" is the callee case.
+  - **Off unless enabled** — `b2bua.accept_replaces: true`. Possession of a
+    dialog's identifiers is not proof of authorisation to end that dialog, and
+    the triple is handed to the transferee by design and readable by anyone who
+    can observe unprotected signalling, so this is a capability an operator opts
+    into rather than one an upgrade switches on. Left off, a `Replaces` naming a
+    dialog this node hosts is declined `603` rather than ignored — so the bug
+    above is fixed either way: the INVITE never becomes an unrelated second call.
+  - **The takeover runs only after the script admits the INVITE.** RFC 3891 §5
+    makes `Replaces` a call-hijack primitive for anyone who learns a dialog's
+    identifiers, and siphon's admission control for an INVITE is the script — so
+    an `auth.require_proxy_digest()` (or any `call.reject()`) in
+    `@b2bua.on_invite` stops a takeover exactly as it stops a call. Nothing is
+    torn down on the say-so of an unauthenticated request. When the script does
+    admit it, the takeover replaces whatever routing the script asked for: an
+    INVITE with `Replaces` is a request to join an existing call, not a new one
+    to route.
+  - `early-only` (RFC 3891 §3) is now honoured rather than parsed and ignored: it
+    asks to replace a dialog that has not been answered, and siphon only ever
+    takes over a confirmed one, so it is declined `486 Busy Here` — the response
+    that section names. A `Replaces` naming a dialog that is not answered gets the
+    same treatment, and one naming a dialog this node does not host still gets
+    `481` as before.
+- **A locally-generated 2xx is retransmitted like a relayed one.** `call.answer()`
+  sent the 200 once and armed nothing. The B2BUA intercepts the A-leg INVITE
+  before a server transaction exists, so nothing underneath recovers a lost 200
+  (RFC 3261 §13.3.1.4) and a single dropped packet left the caller ringing until
+  it gave up on a call siphon considered answered. Now armed on the same UAS
+  schedule as the relayed path and cancelled by the caller's ACK.
 - **A blind transfer no longer kills the call when the transferor hangs up
   first.** In a siphon-terminated `REFER` the transferor is free to end its own
   dialog the moment the transfer is accepted (RFC 5589 §7), and real ones do —

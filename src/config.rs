@@ -261,9 +261,45 @@ pub struct B2buaConfig {
     ///
     /// Unset → `"terminate"`.
     pub default_refer_mode: Option<String>,
+
+    /// Whether an inbound `INVITE` carrying a `Replaces` (RFC 3891) may take
+    /// over the dialog it names — the transferee half of attended transfer,
+    /// and the shape of a directed call pickup.
+    ///
+    /// **Off unless enabled.** Possession of a dialog's identifiers is not
+    /// proof of authorisation to end that dialog: RFC 3891 §5 calls out
+    /// exactly this, the transferor hands the triple to the transferee by
+    /// design, and anyone who can observe unprotected signalling reads it off
+    /// the wire. Turning this on grants every party that reaches this node —
+    /// subject to whatever admission `@b2bua.on_invite` applies — the ability
+    /// to disconnect one party from a live call and take their place. That is
+    /// a capability an operator opts into, not one an upgrade switches on.
+    ///
+    /// With it off, a `Replaces` naming a dialog this node hosts is declined
+    /// `603` (RFC 3891 §3's answer for a dialog the UA is unwilling to
+    /// replace) rather than being ignored — the INVITE never becomes an
+    /// unrelated second call.
+    ///
+    /// **Enable it only where INVITEs are authenticated or the source is
+    /// trusted.** `auth.require_proxy_digest()` in `@b2bua.on_invite` is what
+    /// makes this safe on an untrusted edge; the takeover runs only after that
+    /// handler admits the request, so a challenge or a `call.reject()` stops
+    /// it.
+    ///
+    /// ```yaml
+    /// b2bua:
+    ///   accept_replaces: true
+    /// ```
+    pub accept_replaces: Option<bool>,
 }
 
 impl B2buaConfig {
+    /// Whether an inbound `Replaces` may take a dialog over. Defaults to
+    /// `false` — see [`accept_replaces`](Self::accept_replaces).
+    pub fn replaces_takeover_enabled(&self) -> bool {
+        self.accept_replaces.unwrap_or(false)
+    }
+
     /// Resolve the configured default REFER mode. `None`, empty, or an
     /// unrecognized value fall back to the safe trunk-facing default
     /// (`Terminate`); only an explicit `"transparent"` selects transparent
@@ -4166,6 +4202,38 @@ fn default_lcr_cache_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `Replaces` takeover is a capability, not a default: an upgrade must
+    /// never hand every party that can reach this node the ability to
+    /// disconnect someone from a live call and take their place (RFC 3891 §5).
+    #[test]
+    fn replaces_takeover_is_off_unless_enabled() {
+        assert!(
+            !B2buaConfig::default().replaces_takeover_enabled(),
+            "an operator opts into call takeover; it is never inherited"
+        );
+        assert!(!B2buaConfig {
+            accept_replaces: Some(false),
+            ..Default::default()
+        }
+        .replaces_takeover_enabled());
+        assert!(B2buaConfig {
+            accept_replaces: Some(true),
+            ..Default::default()
+        }
+        .replaces_takeover_enabled());
+    }
+
+    #[test]
+    fn replaces_takeover_parses_from_yaml() {
+        let config: B2buaConfig =
+            serde_yaml_ng::from_str("accept_replaces: true").expect("b2bua block must parse");
+        assert!(config.replaces_takeover_enabled());
+        // An omitted key leaves the capability off.
+        let empty: B2buaConfig =
+            serde_yaml_ng::from_str("default_refer_mode: terminate").expect("must parse");
+        assert!(!empty.replaces_takeover_enabled());
+    }
 
     fn minimal_yaml() -> &'static str {
         r#"

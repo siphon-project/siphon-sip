@@ -1,0 +1,35 @@
+# siphon.b2bua-replaces-test.yaml — inbound INVITE-with-Replaces acceptance
+#
+# Used with: sipp/docker-compose.yaml (b2bua-replaces profile)
+# Script:    scripts/b2bua_replaces.py (bridges every INVITE to one fixed callee)
+# Test:      sipp/replaces/replaces_takeover_test.py
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.114"
+    - "127.0.0.1"
+
+# The takeover is opt-in (see b2bua.accept_replaces): possession of a dialog's
+# identifiers is not authority to end that dialog. Enabled here because that is
+# what this test exercises.
+b2bua:
+  accept_replaces: true
+
+script:
+  path: "scripts/b2bua_replaces.py"
+  reload: auto
+
+advertised_address: "172.20.0.114"
+
+registrar:
+  backend: memory
+  default_expires: 3600
+
+log:
+  level: debug
+  format: pretty

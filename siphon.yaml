@@ -1347,6 +1347,26 @@ auth:
 # b2bua:
 #   default_number_policy: "ims-e164@2026"
 
+# Whether an inbound INVITE carrying a Replaces header (RFC 3891) may take over
+# the dialog it names — the transferee half of attended transfer, and the shape
+# of a directed call pickup.
+#
+# OFF unless you turn it on. Possession of a dialog's identifiers is not proof
+# of authorisation to end that dialog: the transferor hands the triple to the
+# transferee by design, and anyone who can observe unprotected signalling reads
+# it off the wire (RFC 3891 §5). Enabling this lets any party that reaches this
+# node — subject to whatever admission @b2bua.on_invite applies — disconnect
+# someone from a live call and take their place.
+#
+# Enable it only where INVITEs are authenticated (auth.require_proxy_digest() in
+# @b2bua.on_invite) or the source is trusted. The takeover runs only after that
+# handler admits the request, so a challenge or a call.reject() stops it.
+#
+# Left off, a Replaces naming a dialog this node hosts is declined 603 rather
+# than ignored, so the INVITE never becomes an unrelated second call.
+# b2bua:
+#   accept_replaces: true
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------

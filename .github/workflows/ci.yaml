@@ -552,7 +552,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Build B2BUA / refer-modes / anchored siphon images
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-refer-terminate --profile b2bua-rtpengine-refer build siphon-b2bua siphon-b2bua-refer-modes siphon-b2bua-rtpengine-refer
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-refer-terminate --profile b2bua-replaces --profile b2bua-rtpengine-refer build siphon-b2bua siphon-b2bua-refer-modes siphon-b2bua-replaces siphon-b2bua-rtpengine-refer
 
       - name: Start siphon-b2bua
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua up -d --wait siphon-b2bua
@@ -614,6 +614,22 @@ jobs:
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-attended rm -sf sipp-b2bua-refer-attended-uac sipp-b2bua-refer-attended-bob-uas sipp-b2bua-refer-attended-carol-uas 2>/dev/null || true
 
+      # Inbound INVITE with Replaces: the transferee calls in naming the dialog
+      # it is taking over. The peer plays all three parties and prints one
+      # verdict line; grep it rather than trusting the exit code alone, so a
+      # peer that dies before running its assertions cannot read as a pass.
+      - name: B2BUA inbound Replaces takeover (RFC 3891 §3 — replaced party released, survivor re-INVITEd)
+        run: |
+          docker compose -f sipp/docker-compose.yaml --profile b2bua-replaces up -d --wait siphon-b2bua-replaces
+          docker compose -f sipp/docker-compose.yaml --profile b2bua-replaces up \
+            --abort-on-container-exit --exit-code-from replaces-takeover-peer \
+            replaces-takeover-peer | tee replaces-verdict.log
+          grep -q 'REPLACES-VERDICT .*"ok": true' replaces-verdict.log
+
+      - name: Cleanup replaces containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-replaces rm -sf replaces-takeover-peer siphon-b2bua-replaces 2>/dev/null || true
+
       - name: B2BUA REFER terminate + REAL rtpengine (media re-anchor offer/answer/delete)
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-rtpengine-refer up --abort-on-container-exit --exit-code-from sipp-anchored-refer-uac sipp-anchored-refer-uac sipp-anchored-refer-bob-uas sipp-anchored-refer-carol-uas
 
@@ -627,7 +643,7 @@ jobs:
 
       - name: Teardown
         if: always()
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-refer --profile b2bua-refer-reject --profile b2bua-refer-terminate --profile b2bua-refer-referrer-bye --profile b2bua-refer-attended --profile b2bua-rtpengine-refer down --remove-orphans
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-refer --profile b2bua-refer-reject --profile b2bua-refer-terminate --profile b2bua-refer-referrer-bye --profile b2bua-refer-attended --profile b2bua-replaces --profile b2bua-rtpengine-refer down --remove-orphans
 
       - name: Upload logs
         if: always()
