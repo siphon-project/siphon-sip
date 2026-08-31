@@ -14,6 +14,12 @@ domain:
     - "172.20.0.60"
     - "127.0.0.1"
 
+# The takeover is opt-in (see b2bua.accept_replaces): possession of a dialog's
+# identifiers is not authority to end that dialog. Enabled here because that is
+# what this test exercises.
+b2bua:
+  accept_replaces: true
+
 script:
   path: "scripts/b2bua_replaces.py"
   reload: auto

@@ -155,6 +155,11 @@ struct DispatcherState {
     /// calls `accept_refer()` without an explicit `mode=`.  Resolved from
     /// `config.b2bua.default_refer_mode` (defaults to `Terminate`).
     default_refer_mode: crate::script::api::call::ReferMode,
+    /// Whether an inbound `INVITE` with `Replaces` (RFC 3891) may take over the
+    /// dialog it names. Resolved from `config.b2bua.accept_replaces`; **off**
+    /// unless the operator turned it on, because possession of a dialog's
+    /// identifiers is not authority to end that dialog (RFC 3891 §5).
+    accept_replaces: bool,
     /// Outbound registration manager (None when registrant is not configured).
     registrant_manager: Option<Arc<crate::registrant::RegistrantManager>>,
     /// SIPREC recording manager (SRC role — sends recordings to external SRS).
@@ -702,6 +707,7 @@ pub async fn run(
         header_policy_registry,
         default_header_policy,
         default_refer_mode: config.b2bua.resolved_default_refer_mode(),
+        accept_replaces: config.b2bua.replaces_takeover_enabled(),
         registrant_manager,
         recording_manager: Arc::new(crate::siprec::RecordingManager::new(product_name, product_version)),
         li_siprec_srs_uri: config.lawful_intercept.as_ref()
@@ -12389,10 +12395,33 @@ fn handle_b2bua_invite(
                             send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
                             return;
                         }
+                        // Off unless the operator enabled it. Taking a party
+                        // out of a live call on the strength of identifiers that
+                        // are handed to the transferee by design — and readable
+                        // by anyone who can see unprotected signalling — is a
+                        // capability, not a default (RFC 3891 §5). Declined
+                        // rather than ignored: §3's answer for a dialog the UA
+                        // is unwilling to replace, and it stops the INVITE
+                        // becoming an unrelated second call.
+                        if !state.accept_replaces {
+                            info!(
+                                call_id = %sip_call_id,
+                                matched_call = %matched.call_id,
+                                source = %inbound.remote_addr,
+                                "B2BUA: declining INVITE with Replaces — b2bua.accept_replaces is not enabled"
+                            );
+                            let response = build_response(
+                                &message, 603, "Decline",
+                                state.server_header.as_deref(), &[],
+                            );
+                            send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+                            return;
+                        }
                         debug!(
                             call_id = %sip_call_id,
                             matched_call = %matched.call_id,
                             replaced_on_a_leg = matched.on_a_leg,
+                            source = %inbound.remote_addr,
                             "B2BUA: INVITE with Replaces matched a confirmed dialog — takeover deferred to script admission"
                         );
                         pending_replaces = Some(crate::b2bua::actor::PendingReplaces {
@@ -15333,7 +15362,16 @@ fn handle_b2bua_response(
     // On 2xx: sync remote_tag and remote_contact from response back to canonical CallActor.
     // The LegActor extracts this on its clone, but we need to update the
     // authoritative copy in the CallActorStore.
-    if matches!(&actor_event, Some(CallEvent::Answered { .. })) {
+    // Driven by the 2xx itself, not only by the leg actor's `Answered` event.
+    // The event races the response it describes — it is delivered by a separate
+    // task — and when the response wins, this capture used to be skipped
+    // entirely, leaving the leg with no remote tag, no tagged `remote_to_uri`
+    // and no remote target. Everything siphon later builds toward that leg
+    // (BYE, re-INVITE, UPDATE) needs them (RFC 3261 §12.1.2), so the dialog
+    // state is taken from the 2xx that establishes the dialog. Idempotent: the
+    // event path, when it does arrive first, writes the same values.
+    if matches!(&actor_event, Some(CallEvent::Answered { .. })) || (200..300).contains(&status_code)
+    {
         if let Some(idx) = b_leg_index {
             if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
                 if let Some(b_leg) = call.b_legs.get_mut(idx) {
@@ -21584,13 +21622,19 @@ fn b2bua_bridge_inbound_replaces(
         refuse(481, "Call/Transaction Does Not Exist", "the replaced call went away");
         return;
     };
-    let (Some(survivor_tag), Some(survivor_sdp)) =
-        (survivor.dialog.remote_tag.clone(), survivor.last_sdp.clone())
-    else {
+    let Some(survivor_tag) = survivor.dialog.remote_tag.clone() else {
         refuse(
             488,
             "Not Acceptable Here",
-            "the surviving leg has no negotiated media to hand over",
+            "the surviving leg has no remote tag — its dialog is not confirmed",
+        );
+        return;
+    };
+    let Some(survivor_sdp) = survivor.last_sdp.clone() else {
+        refuse(
+            488,
+            "Not Acceptable Here",
+            "the surviving leg has no recorded SDP to hand over",
         );
         return;
     };

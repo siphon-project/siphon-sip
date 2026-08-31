@@ -199,6 +199,13 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   (RFC 3261 §14) rather than left sending audio to whoever just left. Works in
   both directions — the named dialog may be the caller's or the callee's, and the
   everyday "answer a call, then transfer it" is the callee case.
+  - **Off unless enabled** — `b2bua.accept_replaces: true`. Possession of a
+    dialog's identifiers is not proof of authorisation to end that dialog, and
+    the triple is handed to the transferee by design and readable by anyone who
+    can observe unprotected signalling, so this is a capability an operator opts
+    into rather than one an upgrade switches on. Left off, a `Replaces` naming a
+    dialog this node hosts is declined `603` rather than ignored — so the bug
+    above is fixed either way: the INVITE never becomes an unrelated second call.
   - **The takeover runs only after the script admits the INVITE.** RFC 3891 §5
     makes `Replaces` a call-hijack primitive for anyone who learns a dialog's
     identifiers, and siphon's admission control for an INVITE is the script — so

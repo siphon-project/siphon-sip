@@ -210,6 +210,13 @@ def on_refer(call):
     both "the caller transferred it" and the everyday "answered, then transferred
     it" work.
 
+    It is **off unless you enable it** (`b2bua.accept_replaces: true`). Holding a
+    dialog's identifiers is not authority to end that dialog — the transferor
+    hands them to the transferee by design, and anyone who can see unprotected
+    signalling reads them off the wire — so this is a capability you opt into.
+    Left off, a `Replaces` naming a dialog siphon hosts is declined `603` instead
+    of being ignored, so it still never turns into an unrelated second call.
+
     That takeover runs **after** `@b2bua.on_invite`, not before. RFC 3891 §5 makes
     `Replaces` a way to hijack a call for anyone who learns its dialog
     identifiers, so it has to clear the same admission as any other INVITE: an
