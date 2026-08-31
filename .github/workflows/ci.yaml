@@ -626,6 +626,23 @@ jobs:
             replaces-takeover-peer | tee replaces-verdict.log
           grep -q 'REPLACES-VERDICT .*"ok": true' replaces-verdict.log
 
+      # The callee's ACK. Its own gate because nothing else catches it: the
+      # failure is invisible on the caller's side, and it only appears when a
+      # call's 18x and its 200 are handled concurrently, which the scenario
+      # files never produce. Greps the verdict so a peer that dies before
+      # asserting cannot read as a pass.
+      - name: B2BUA callee is ACKed on every answered call (RFC 3261 §14.1)
+        run: |
+          docker compose -f sipp/docker-compose.yaml --profile b2bua-bleg-ack up -d --wait siphon-b2bua-replaces
+          docker compose -f sipp/docker-compose.yaml --profile b2bua-bleg-ack up \
+            --abort-on-container-exit --exit-code-from bleg-ack-peer \
+            bleg-ack-peer | tee bleg-ack.log
+          grep -q 'ACK-REPRO .*"failures": 0' bleg-ack.log
+
+      - name: Cleanup bleg-ack containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-bleg-ack rm -sf bleg-ack-peer 2>/dev/null || true
+
       - name: Cleanup replaces containers
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-replaces rm -sf replaces-takeover-peer siphon-b2bua-replaces 2>/dev/null || true
@@ -643,7 +660,7 @@ jobs:
 
       - name: Teardown
         if: always()
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-refer --profile b2bua-refer-reject --profile b2bua-refer-terminate --profile b2bua-refer-referrer-bye --profile b2bua-refer-attended --profile b2bua-replaces --profile b2bua-rtpengine-refer down --remove-orphans
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-refer --profile b2bua-refer-reject --profile b2bua-refer-terminate --profile b2bua-refer-referrer-bye --profile b2bua-refer-attended --profile b2bua-replaces --profile b2bua-bleg-ack --profile b2bua-rtpengine-refer down --remove-orphans
 
       - name: Upload logs
         if: always()
