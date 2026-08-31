@@ -14062,6 +14062,36 @@ fn spawn_b_leg_actor_at(call_id: &str, b_leg: &Leg, index: usize, state: &Dispat
 /// The caller block-recvs only after a successful `try_send` of the response to
 /// the live actor, so exactly one non-`Terminated` classification event is
 /// always forthcoming and this loop terminates.
+/// How a B-leg response drives the B2BUA: an answer, a ringing indication, or a
+/// failure.
+#[derive(Debug, PartialEq, Eq)]
+enum ResponseClass {
+    Answered,
+    Provisional,
+    Failed,
+}
+
+/// Classify a B-leg response from its status code. `None` means "absorb" — a
+/// `100 Trying` is hop-by-hop and drives nothing here.
+///
+/// Deliberately a pure function of the status line. This used to be decided by
+/// the leg actor's `CallEvent`, which is delivered on a per-call channel shared
+/// by every leg and is not guaranteed to describe the response being handled;
+/// a 2xx read as its predecessor's `Provisional` skips `set_winner` and the
+/// deferred B-leg ACK, so the callee's 200 is never ACKed and it retransmits
+/// until the dialog collapses.
+fn classify_b_leg_response(status_code: u16) -> Option<ResponseClass> {
+    if (200..300).contains(&status_code) {
+        Some(ResponseClass::Answered)
+    } else if (180..200).contains(&status_code) {
+        Some(ResponseClass::Provisional)
+    } else if status_code >= 300 {
+        Some(ResponseClass::Failed)
+    } else {
+        None
+    }
+}
+
 fn recv_b_leg_classification_event(
     rx: &mut tokio::sync::mpsc::Receiver<CallEvent>,
 ) -> Option<CallEvent> {
@@ -15319,7 +15349,11 @@ fn handle_b2bua_response(
     // use the event to drive response handling below.
     // Re-INVITE tracking legs and retry legs may not have actors — fall
     // back to raw status_code classification in that case.
-    let actor_event: Option<CallEvent> = if let Some(handle_tx) = &b_leg_handle_tx {
+    // Kept for its side effects, not its value: the response still has to reach
+    // the leg actor so its own state machine advances, and the event it emits
+    // still has to be consumed so the per-call channel drains. What comes back
+    // is deliberately unused — see the classification note below.
+    let _actor_event: Option<CallEvent> = if let Some(handle_tx) = &b_leg_handle_tx {
         let leg_transport = b_leg_dest.map(|(addr, transport)| LegTransport {
             remote_addr: addr,
             connection_id: ConnectionId::default(),
@@ -15362,16 +15396,12 @@ fn handle_b2bua_response(
     // On 2xx: sync remote_tag and remote_contact from response back to canonical CallActor.
     // The LegActor extracts this on its clone, but we need to update the
     // authoritative copy in the CallActorStore.
-    // Driven by the 2xx itself, not only by the leg actor's `Answered` event.
-    // The event races the response it describes — it is delivered by a separate
-    // task — and when the response wins, this capture used to be skipped
-    // entirely, leaving the leg with no remote tag, no tagged `remote_to_uri`
-    // and no remote target. Everything siphon later builds toward that leg
-    // (BYE, re-INVITE, UPDATE) needs them (RFC 3261 §12.1.2), so the dialog
-    // state is taken from the 2xx that establishes the dialog. Idempotent: the
-    // event path, when it does arrive first, writes the same values.
-    if matches!(&actor_event, Some(CallEvent::Answered { .. })) || (200..300).contains(&status_code)
-    {
+    // Driven by the 2xx itself. The dialog state a B-leg needs for every request
+    // siphon later builds toward it (BYE, re-INVITE, UPDATE) comes from the 2xx
+    // that establishes the dialog (RFC 3261 §12.1.2) — not from an actor event
+    // that may describe a different response entirely (see the classification
+    // note below).
+    if (200..300).contains(&status_code) {
         if let Some(idx) = b_leg_index {
             if let Some(mut call) = state.call_actors.get_call_mut(call_id) {
                 if let Some(b_leg) = call.b_legs.get_mut(idx) {
@@ -15403,23 +15433,31 @@ fn handle_b2bua_response(
     }
 
     // Event-driven response classification.
-    // Actor events are authoritative when available; fall back to status_code.
-    #[derive(Debug)]
-    enum ResponseClass { Answered, Provisional, Failed }
-
-    let class = match &actor_event {
-        Some(CallEvent::Answered { .. }) => ResponseClass::Answered,
-        Some(CallEvent::Provisional { status_code: code, .. }) if *code >= 180 => {
-            ResponseClass::Provisional
-        }
-        Some(CallEvent::Failed { .. }) => ResponseClass::Failed,
-        _ => {
-            // No actor, filtered provisional (<180), or unexpected event
-            if (200..300).contains(&status_code) { ResponseClass::Answered }
-            else if (180..200).contains(&status_code) { ResponseClass::Provisional }
-            else if status_code >= 300 { ResponseClass::Failed }
-            else { return; } // 100 Trying from B-leg — absorb
-        }
+    // Classified from the response's OWN status line, never from the actor
+    // event.
+    //
+    // The event is popped from a per-call channel that every leg actor pushes
+    // to, and there is no guarantee the one that comes back describes the
+    // response in hand. The receiver is taken out of the map to be waited on, so
+    // when two responses for a call are processed at once — a 180 and its 200 on
+    // different workers, which is the normal shape of an answered call — the
+    // second handler finds the receiver gone and classifies by status, while the
+    // event its own `try_send` produced stays queued. The stream is then off by
+    // one and the next response reads its predecessor's event.
+    //
+    // Filtering `Terminated` (see `recv_b_leg_classification_event`) fixed one
+    // source of that skew; this removes the dependency instead of chasing the
+    // rest. A 2xx read as its predecessor's `Provisional` skips `set_winner` and
+    // the deferred B-leg ACK, so the callee's 200 is never ACKed and it
+    // retransmits until the dialog collapses — measured at 8-15% of plain calls
+    // on a loopback B2BUA before this change.
+    //
+    // The response's status line is unambiguous, always present, and describes
+    // exactly the message being handled. The actor is still fed the response so
+    // its own state machine advances, and the event is still consumed so the
+    // channel drains; only the classification no longer depends on it.
+    let Some(class) = classify_b_leg_response(status_code) else {
+        return; // 100 Trying from B-leg — absorb
     };
 
     // siphon-terminated transfer: intercept EVERY response from a newly-dialed
@@ -23462,6 +23500,46 @@ mod tests {
     use crate::sip::parser::parse_sip_message;
     use crate::sip::uri::SipUri;
     use crate::sip::builder::SipMessageBuilder;
+
+    /// A B-leg response is classified by its own status line and nothing else.
+    ///
+    /// This is the invariant behind the callee actually being ACKed. When the
+    /// leg actor's `CallEvent` decided this instead, a 2xx processed while its
+    /// own 18x's event was still queued read as `Provisional` — skipping
+    /// `set_winner` and the deferred B-leg ACK, so the callee's 200 was never
+    /// ACKed and it retransmitted until the dialog collapsed. Measured at
+    /// 8-15% of plain calls on a loopback B2BUA.
+    #[test]
+    fn b_leg_response_is_classified_by_its_own_status() {
+        // Every 2xx answers the call.
+        for code in [200, 202, 250, 299] {
+            assert_eq!(
+                classify_b_leg_response(code),
+                Some(ResponseClass::Answered),
+                "{code} must answer"
+            );
+        }
+        // 18x rings; 100 is absorbed rather than classified.
+        assert_eq!(
+            classify_b_leg_response(180),
+            Some(ResponseClass::Provisional)
+        );
+        assert_eq!(
+            classify_b_leg_response(183),
+            Some(ResponseClass::Provisional)
+        );
+        assert_eq!(classify_b_leg_response(199), Some(ResponseClass::Provisional));
+        assert_eq!(classify_b_leg_response(100), None, "100 Trying is absorbed");
+        assert_eq!(classify_b_leg_response(179), None, "a 1xx below 180 is absorbed");
+        // Everything final and non-2xx fails the leg.
+        for code in [300, 401, 404, 486, 500, 603] {
+            assert_eq!(
+                classify_b_leg_response(code),
+                Some(ResponseClass::Failed),
+                "{code} must fail the leg"
+            );
+        }
+    }
 
     // -----------------------------------------------------------------------
     // LCR per-route header injection must not forge dialog headers

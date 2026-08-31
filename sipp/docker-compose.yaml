@@ -1823,6 +1823,7 @@ services:
       start_period: 10s
     profiles:
       - b2bua-replaces
+      - b2bua-bleg-ack
 
   replaces-takeover-peer:
     image: python:3.12-slim
@@ -1840,6 +1841,29 @@ services:
     command: ["python3", "/peer/replaces_takeover_test.py"]
     profiles:
       - b2bua-replaces
+
+  # --- The callee is ACKed on every answered call (RFC 3261 §14.1) ---
+  # Reuses the replaces siphon (a plain bridge to one fixed callee) and drives
+  # calls in a tight loop, which is what makes a 18x and its 200 land on
+  # different workers at once.
+
+  bleg-ack-peer:
+    image: python:3.12-slim
+    depends_on:
+      siphon-b2bua-replaces:
+        condition: service_healthy
+    volumes:
+      - ./ack:/peer:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.115
+    environment:
+      SIPHON_ADDR: "172.20.0.114:5060"
+      SELF_IP: "172.20.0.115"
+      CALLS: "60"
+    command: ["python3", "/peer/bleg_ack_test.py"]
+    profiles:
+      - b2bua-bleg-ack
 
   # --- REFER terminate, ATTENDED (Refer-To carries a Replaces) ---
   # RFC 3891 §3: the dialog reference must reach the target's INVITE.

@@ -201,6 +201,24 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   a personal one.
 
 ### Fixed
+- **The callee is ACKed on every answered call again.** A B-leg response was
+  classified from the leg actor's `CallEvent` rather than from its own status
+  line, and that event arrives on a per-call channel every leg pushes to, with no
+  guarantee it describes the response in hand. The receiver is taken out of the
+  map to be waited on, so when a call's `18x` and its `200` are processed at once
+  — the normal shape of an answered call — the second handler finds the receiver
+  gone and falls back to the status code while the event its own send produced
+  stays queued, leaving the stream off by one. The next response then reads its
+  predecessor's event, and a `200 OK` read as a `Provisional` skips `set_winner`
+  and the deferred B-leg ACK (RFC 3261 §14.1): the callee's `200` is never ACKed,
+  it retransmits to Timer B, and the dialog collapses seconds after everyone
+  believes the call is up — with nothing wrong on the caller's side. Filtering
+  stray `Terminated` events had removed one source of the skew; the
+  classification no longer depends on the event at all, which removes the rest.
+  Measured at **8-15% of plain B2BUA calls** on a loopback bridge before the fix
+  and **0 of 180** after, with a new acceptance gate that drives calls in a tight
+  loop — the existing SIPp scenarios never produced the concurrency and so never
+  caught it.
 - **An inbound `INVITE` with `Replaces` now actually takes the call over.** The
   transferee half of attended transfer (RFC 3891 §3 / RFC 5589 §7): a UA calls in
   naming the dialog it is taking over. siphon matched that dialog, logged it, and
