@@ -666,6 +666,26 @@ Reference machine: AMD Ryzen AI 9 HX 370 (24 logical cores), 128 GB RAM, Linux 6
 
 `MODE=b2bua` swaps `scripts/proxy_default.py` for `scripts/b2bua_default.py` so the same call flow runs through the B2BUA path instead of the stateful proxy.
 
+`MODE=register` and `MODE=register_auth` drive REGISTER instead of a call, so
+they measure the registrar and dispatch path rather than the call flow. There is
+no callee, so no SIPp UAS peers are started and the per-pair ~1250 cps ceiling
+does not apply — a REGISTER row pushes the rig considerably further than the
+INVITE rows for the same `NUM_UACS`.
+
+The two rows differ only in the digest round trip, and `MODE=register` proves it
+by stripping the `auth.require_digest` guard from a copy of the very same
+`proxy_default.py` rather than pointing at a different script. `register` is one
+transaction per registration (the floor for parse → transaction → dispatch →
+binding save → respond); `register_auth` is the RFC 3261 §22 round trip on top
+(REGISTER → 401 → REGISTER+Authorization → 200), which is what a real
+P-CSCF/S-CSCF pays. The delta between them is the price of authenticating.
+
+Each UAC re-registers its own AoR for the whole run, so the binding store sits at
+steady state and the row reports dispatch throughput rather than insert cost.
+Registering a large unique population is a different measurement — registrar
+scale — and wants its own row.
+
+
 `TRANSPORT=tcp` switches the SIPp UAC/UAS to TCP. The proxy listens on UDP and TCP simultaneously on `:5060`.
 
 **Peak CPU%** is `pidstat -u` on the siphon process — 100 % = one fully-saturated logical core, so 493 % ≈ 5 cores out of 24 available. **Peak RSS** is the resident-set high-water mark (`pidstat -r`) seen during the run.
