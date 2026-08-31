@@ -7,6 +7,20 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **`listen.udp_recv_buffer_bytes` — the UDP listener receive buffer is now
+  sized by siphon instead of inherited from the kernel.** Listener sockets set
+  `SO_REUSEPORT` and otherwise took whatever `net.core.rmem_default` gave them,
+  typically ~212 KB, which is only a few hundred milliseconds of headroom at
+  IMS registration rates. A scheduler stall on a busy box then overflows the
+  socket queue and the kernel drops the datagrams silently — which a UAC sees
+  as a retransmission rather than an error, so it shows up as a sharp cliff in
+  the retransmit rate rather than gradual degradation, and looks like a peer
+  problem rather than a local one. Defaults to 1 MiB per socket. Because
+  `SO_REUSEPORT` gives one socket per worker the real cost is this value times
+  the worker count, and socket buffers are charged to the cgroup, so it is
+  deliberately modest; set `0` to leave the kernel default alone. siphon now
+  reads the granted size back and warns when `net.core.rmem_max` clamped the
+  request, which is otherwise invisible.
 - **`originate` — a call siphon places itself.** Both the control-plane verb
   (`module: "sip"`, `verb: "originate"`) and the in-process
   `b2bua.originate(...)`. Until now a call could only ever be a *reaction*:

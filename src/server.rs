@@ -1291,6 +1291,7 @@ impl SiphonServer {
         // DSCP → TOS byte resolution helper.
         // Per-entry overrides the global listen.dscp (default CS3 = 24 → TOS 96).
         let global_dscp = config.listen.dscp;
+        let udp_recv_buffer_bytes = config.listen.udp_recv_buffer_bytes;
         let resolve_tos = |entry: &config::ListenEntry| -> Option<u32> {
             let dscp = entry.dscp().or(global_dscp)?;
             if dscp == 0 { None } else { Some(config::dscp_to_tos(dscp)) }
@@ -1328,7 +1329,7 @@ impl SiphonServer {
                 .get(&addr)
                 .map(|(_, rx)| rx.clone())
                 .unwrap_or_else(|| flume::unbounded().1);
-            transport::udp::listen(addr, inbound_tx.clone(), listener_rx, Arc::clone(&transport_acl), tos).await;
+            transport::udp::listen(addr, inbound_tx.clone(), listener_rx, Arc::clone(&transport_acl), tos, udp_recv_buffer_bytes).await;
         }
 
         // RFC 5626 §4.4.1 pong tracker — created up front so it can be

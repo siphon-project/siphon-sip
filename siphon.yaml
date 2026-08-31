@@ -26,6 +26,19 @@ listen:
   # Set to 0 or "BE" (Best Effort) to disable marking.
   # Per-listener overrides are possible in the extended form (see below).
   dscp: CS3
+  # Receive buffer (SO_RCVBUF) in bytes for every UDP listener socket.
+  # Default: 1048576 (1 MiB).  The kernel default (net.core.rmem_default,
+  # typically ~212 KB) is only a few hundred milliseconds of headroom at IMS
+  # registration rates: a scheduler stall on a busy box overflows the socket
+  # queue and the kernel drops the datagrams silently.  A UAC sees that as a
+  # retransmission rather than an error, so it presents as a sharp cliff in the
+  # retransmit rate rather than gradual degradation.
+  # SO_REUSEPORT gives one socket per worker, so the real cost is this value
+  # times the worker count, and socket buffers are charged to the process's
+  # cgroup — raise it deliberately on a memory-capped deployment.
+  # net.core.rmem_max caps what the kernel will actually grant; siphon reads the
+  # value back and warns when it was clamped.  Set 0 to leave the kernel default.
+  udp_recv_buffer_bytes: 1048576
   # Path MTU (bytes) for the outbound UDP request path (RFC 3261 §18.1.1).
   # When set, an outbound SIP request built for UDP whose serialised length
   # exceeds mtu-200 is relayed over TCP instead (if the next hop has a reachable
