@@ -37,6 +37,7 @@ cd "$SCRIPT_DIR"
 cleanup() {
     pkill -f "invite_uac" 2>/dev/null || true
     pkill -f "invite_uas" 2>/dev/null || true
+    pkill -f "register_load" 2>/dev/null || true
     # SIGKILL siphon — perf runs are independent, the graceful drain
     # (server.drain_secs default 30) would otherwise keep the listener
     # bound for half a minute between rows and block port :5060.
@@ -113,6 +114,13 @@ echo "[+] build ok"
 # (siphon.yaml pins advertised_address: 127.0.0.1 for loopback testing — the
 # reason the loopback SIPp peers can reach siphon's Via/Contact.)
 MODE="${MODE:-proxy}"
+# REGISTER rows drive the registrar directly: no callee, so no UAS peers and no
+# pre-registration step. Set once here so every branch below agrees.
+case "$MODE" in
+    register)      REGISTER_MODE=1; LOAD_SCENARIO="sipp/register_load.xml";      RT_LABEL="register_rt"; RT_FLOW="REGISTER→200" ;;
+    register_auth) REGISTER_MODE=1; LOAD_SCENARIO="sipp/register_load_auth.xml"; RT_LABEL="register_rt"; RT_FLOW="REGISTER→200" ;;
+    *)             REGISTER_MODE=0; LOAD_SCENARIO="sipp/invite_uac_fast.xml";    RT_LABEL="invite_rt";   RT_FLOW="INVITE→200"   ;;
+esac
 case "$MODE" in
     proxy)
         CONFIG_FILE="siphon.yaml"
@@ -123,8 +131,28 @@ case "$MODE" in
         sed 's|scripts/proxy_default.py|scripts/b2bua_default.py|' siphon.yaml > "$CONFIG_FILE"
         echo "[*] Mode: b2bua  (config: $CONFIG_FILE)"
         ;;
+    register)
+        # No-auth REGISTER throughput. The only difference from the auth row is
+        # the digest guard, so it is removed from a copy of the *same* script
+        # rather than pointed at a different one — otherwise the two rows would
+        # differ in more than the thing being measured.
+        CONFIG_FILE="/tmp/siphon_scale_register.yaml"
+        SCRIPT_FILE="/tmp/siphon_scale_register.py"
+        sed '/auth.require_digest(request, realm=DOMAIN)/,+1d' scripts/proxy_default.py > "$SCRIPT_FILE"
+        if grep -q "require_digest" "$SCRIPT_FILE"; then
+            echo "FAIL: could not strip the digest guard from proxy_default.py"
+            exit 1
+        fi
+        sed "s|scripts/proxy_default.py|$SCRIPT_FILE|" siphon.yaml > "$CONFIG_FILE"
+        echo "[*] Mode: register  (no auth, config: $CONFIG_FILE)"
+        ;;
+    register_auth)
+        # Stock config: proxy_default.py already challenges REGISTER.
+        CONFIG_FILE="siphon.yaml"
+        echo "[*] Mode: register_auth  (digest, stock config)"
+        ;;
     *)
-        echo "FAIL: unknown MODE='$MODE' (use 'proxy' or 'b2bua')"
+        echo "FAIL: unknown MODE='$MODE' (use 'proxy', 'b2bua', 'register' or 'register_auth')"
         exit 1
         ;;
 esac
@@ -170,6 +198,11 @@ case "$TRANSPORT" in
 esac
 echo "[*] Transport: $TPORT_LABEL"
 
+if [ "$REGISTER_MODE" -eq 1 ]; then
+    echo "[*] REGISTER mode: no UAS peers, no pre-registration — the registrar is the callee"
+    echo "[*] Each UAC re-registers bob{i}, so the binding store is at steady state"
+else
+
 echo "[*] Registering bob1..bob${NUM_UACS} (one UAS per UAC, distinct IPs)..."
 REG_FAILED=0
 for i in $(seq 1 "$NUM_UACS"); do
@@ -195,6 +228,8 @@ done
 sleep 1
 echo "[+] $NUM_UACS UAS processes started"
 
+fi
+
 # --- Launch UACs ---
 # Each UAC also binds to a distinct loopback IP so its [local_ip] in
 # Via/Contact is unambiguous. UACs use 127.0.0.{50+i}.
@@ -206,12 +241,27 @@ START_NS=$(date +%s%N)
 for i in $(seq 1 "$NUM_UACS"); do
     ip="127.0.0.$((50 + i))"
     user="bob${i}"
-    sipp -sf sipp/invite_uac_fast.xml "$PROXY" \
-        -m "$CALLS_PER_UAC" -r "$CPS_PER_UAC" -t "$SIPP_T" \
-        -i "$ip" -p "$UAC_PORT" -s "$user" \
-        -trace_stat -stf "/tmp/sipp_uac_${i}.csv" -fd 1 \
-        -trace_msg -message_file "/tmp/sipp_uac_${i}.msg.log" \
-        -bg > /dev/null 2>&1 || true
+    if [ "$REGISTER_MODE" -eq 1 ]; then
+        # Each UAC re-registers its own AoR for the whole run, so the binding
+        # store is at steady state and the row measures dispatch throughput
+        # rather than insert cost. `-au`/`-ap` because sipp will not expand a
+        # field reference inside the [authentication] keyword; harmless on the
+        # no-auth row, which is never challenged.
+        sipp -sf "$LOAD_SCENARIO" "$PROXY" \
+            -m "$CALLS_PER_UAC" -r "$CPS_PER_UAC" -t "$SIPP_T" \
+            -i "$ip" -p "$UAC_PORT" -s "$user" \
+            -au "$user" -ap secret \
+            -trace_stat -stf "/tmp/sipp_uac_${i}.csv" -fd 1 \
+            -trace_msg -message_file "/tmp/sipp_uac_${i}.msg.log" \
+            -bg > /dev/null 2>&1 || true
+    else
+        sipp -sf "$LOAD_SCENARIO" "$PROXY" \
+            -m "$CALLS_PER_UAC" -r "$CPS_PER_UAC" -t "$SIPP_T" \
+            -i "$ip" -p "$UAC_PORT" -s "$user" \
+            -trace_stat -stf "/tmp/sipp_uac_${i}.csv" -fd 1 \
+            -trace_msg -message_file "/tmp/sipp_uac_${i}.msg.log" \
+            -bg > /dev/null 2>&1 || true
+    fi
 done
 
 echo "[+] $NUM_UACS UAC(s) launched, waiting..."
@@ -227,7 +277,7 @@ pidstat -u -r -h -p "$SIPHON_PID" 1 > "$PIDSTAT_LOG" 2>/dev/null &
 PIDSTAT_PID=$!
 
 # Poll until all UAC processes finish
-while pgrep -f "invite_uac_fast.xml" > /dev/null 2>&1; do
+while pgrep -f "$(basename "$LOAD_SCENARIO")" > /dev/null 2>&1; do
     sleep 1
 done
 
@@ -280,8 +330,8 @@ for i in $(seq 1 "$NUM_UACS"); do
         if [ "$peak" -gt "$PEAK_CPS" ]; then PEAK_CPS=$peak; fi
         RT_SUM=$(awk "BEGIN {print $RT_SUM + $rt}")
         RT_COUNT=$((RT_COUNT + 1))
-        printf "  UAC %d: success=%d failed=%d peak=%d cps  invite_rt=%dms  retrans=%d\n" \
-            "$i" "$s" "$f" "$peak" "$rt" "$retrans"
+        printf "  UAC %d: success=%d failed=%d peak=%d cps  %s=%dms  retrans=%d\n" \
+            "$i" "$s" "$f" "$peak" "$RT_LABEL" "$rt" "$retrans"
         # Keep CSV for post-mortem analysis
         mv "$csv" "/tmp/sipp_uac_${i}.last.csv"
     else
@@ -312,7 +362,7 @@ echo "  Retransmissions:   $TOTAL_RETRANS"
 echo "  Wall elapsed:      ${ELAPSED_MS}ms"
 echo "  Peak CPS (1s):     ~${AGG_PEAK_CPS}  (per-UAC peak: ${PEAK_CPS})"
 echo "  Wall avg CPS:      ~${WALL_CPS}  (includes ramp+drain)"
-echo "  Mean INVITE→200:   ${MEAN_RT}ms"
+echo "  Mean ${RT_FLOW}:   ${MEAN_RT}ms"
 echo "  Peak siphon CPU:   ${PEAK_CPU}%  (100% = 1 logical core)"
 echo "  Peak siphon RSS:   ${PEAK_RSS_MB} MB  (${PEAK_RSS_KB} KiB)"
 echo "  Proxy errors:      $SIPHON_ERRORS"

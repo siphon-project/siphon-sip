@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  REGISTER throughput, no authentication.
+
+  One transaction per registration (REGISTER -> 200), so this measures the
+  registrar and dispatch path on its own: parse, transaction, script dispatch,
+  binding save, response. Pair it with register_load_auth.xml, which is the same
+  flow plus the digest round trip, to separate the auth cost from the rest.
+
+  The AoR is the UAC's own identity (`-s bob{i}`), re-registered for the whole
+  run rather than being unique per call, so the binding store reaches steady
+  state instead of growing throughout — otherwise the number is dominated by
+  insert cost and drifts as the store expands, which is not what a throughput
+  row is meant to report. Re-registration is also the REGISTER traffic an IMS
+  actually carries in bulk. Registering a large unique population is a
+  different measurement (registrar scale, not dispatch throughput) and wants
+  its own row.
+
+  Driven by scripts/scale_test.sh (MODE=register).
+-->
+<scenario name="REGISTER load (no auth)">
+
+  <send retrans="500">
+    <![CDATA[
+REGISTER sip:[remote_ip] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:[service]@[remote_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[service]@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 REGISTER
+Contact: <sip:[service]@[local_ip]:[local_port];transport=[transport]>;expires=3600
+Max-Forwards: 70
+User-Agent: SIPp/siphon-register-load
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- siphon's NIST may auto-emit a 100 for a REGISTER that takes longer than
+       transaction.auto_100_delay to answer, which only happens under load.
+       Optional so it never blocks the scenario. -->
+  <recv response="100" optional="true" />
+
+  <recv response="200" rtd="true" />
+
+</scenario>
