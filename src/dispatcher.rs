@@ -21580,6 +21580,9 @@ fn handle_b2bua_refer(inbound: InboundMessage, message: SipMessage, state: &Disp
     )
     .with_flow(py_flow_from_inbound(&inbound));
     py_call.set_refer_to(refer_to.uri.clone(), refer_to.replaces.clone());
+    // Which side referred decides which side survives, and therefore what the
+    // surviving pair's media profile has to be (see `accept_refer(profile=…)`).
+    py_call.set_refer_from_a_leg(from_a_leg);
 
     let action = Python::attach(|python| {
         let call_obj = match Py::new(python, py_call) {

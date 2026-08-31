@@ -166,16 +166,30 @@ def on_refer(call):
     The call connects, both parties think they are talking, and there is no
     audio in either direction.
 
-    Pass `profile=` naming the profile for the pair that **remains**:
+    Pass `profile=` naming the profile for the pair that **remains**. The rule
+    is: **the survivor is the peer of the referrer**, and the profile describes
+    survivor → target. So the answer depends on *which side* transferred, which
+    `call.refer_side` (`"a"`/`"b"`, matching `on_bye`'s `initiator.side`) tells
+    you:
 
     ```python
     @b2bua.on_refer
     def on_refer(call):
-        # Teams referred the call to a carrier number: once Teams is gone,
-        # both remaining legs are plain RTP on the carrier side.
+        # from_gateway() answers for the A-leg; refer_side says which leg
+        # referred. They agree exactly when the SRTP party is the transferor.
+        a_leg_is_secure = call.from_gateway("teams")
+        referrer_is_secure = a_leg_is_secure == (call.refer_side == "a")
+
+        # The SRTP party leaving leaves two plain-RTP ends behind. The SRTP
+        # party SURVIVING keeps the asymmetric pairing.
+        profile = "rtp_passthrough" if referrer_is_secure else "srtp_to_rtp"
+
         call.accept_refer(target=target, next_hop=gw.uri, mode="terminate",
-                          profile="rtp_passthrough")
+                          profile=profile)
     ```
+
+    In practice the secure side is nearly always the transferor — a carrier
+    rarely sends `REFER` — but an SBC should not fall over the day one does.
 
     siphon logs a `WARN` naming the profile when a transfer inherits a
     direction-bound one, but it cannot pick the replacement for you — only the

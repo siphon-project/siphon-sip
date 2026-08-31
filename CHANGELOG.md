@@ -22,8 +22,16 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
                     profile="rtp_passthrough")
   ```
 
-  Also accepted as `profile` on the control plane's `accept_refer`. Unset keeps
+  Also accepted as `profile` on the control plane's `accept_refer`, and exposed
+  on all three control SDKs (Rust `accept_refer(.., profile)`, Python
+  `accept_refer(profile=…)`, TypeScript `acceptRefer({ profile })`). Unset keeps
   the previous inherit behaviour, which is correct for a symmetric profile.
+- **`call.refer_side` — which leg sent the REFER** (`"a"` / `"b"`, matching the
+  `initiator.side` convention in `@b2bua.on_bye`). Without it a script could not
+  work out *which party survives* a transfer, and therefore could not pick the
+  profile the surviving pair needs: the survivor is the peer of the referrer, so
+  at a mixed edge the right profile flips depending on which side transferred.
+  `examples/teams_sbc.py` shows the full rule.
 
 ### Fixed
 - **A transfer no longer silently inherits a direction-bound media profile.**

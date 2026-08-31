@@ -68,6 +68,7 @@ class Call:
         headers: Optional[dict[str, str]] = None,
         refer_to: Optional[str] = None,
         refer_replaces: Optional[dict] = None,
+        refer_side: Optional[str] = None,
         transport: str = "udp",
         active_route: Optional[Route] = None,
         flow: Optional[Flow] = None,
@@ -94,6 +95,7 @@ class Call:
         self._media = MediaHandle()
         self._refer_to = refer_to
         self._refer_replaces = refer_replaces
+        self._refer_side = refer_side
         self._contact_user_override: Optional[str] = None
         self._contact_override: Optional[str] = None
         # LCR: the carrier that won the sequential failover. In the engine the
@@ -331,6 +333,32 @@ class Call:
                 call.accept_refer()
         """
         return self._refer_to
+
+    @property
+    def refer_side(self) -> Optional[str]:
+        """Which leg sent the REFER: ``"a"`` (caller) or ``"b"`` (callee).
+
+        Available in ``@b2bua.on_refer`` handlers, matching the
+        ``initiator.side`` convention in ``@b2bua.on_bye``.  ``None`` when no
+        REFER is pending.
+
+        The party that **survives** the transfer is the peer of this one, which
+        is what decides the media profile the surviving pair needs — see
+        :meth:`accept_refer`.  At a mixed edge (SRTP on one side, plain RTP on
+        the other) the right profile differs depending on which side is
+        leaving.
+
+        Example::
+
+            @b2bua.on_refer
+            def handle_refer(call):
+                a_leg_is_secure = call.from_gateway("teams")
+                referrer_is_secure = a_leg_is_secure == (call.refer_side == "a")
+                # The secure party leaving leaves two plain-RTP ends behind.
+                profile = "rtp_passthrough" if referrer_is_secure else "srtp_to_rtp"
+                call.accept_refer(mode="terminate", profile=profile)
+        """
+        return self._refer_side
 
     @property
     def refer_replaces(self) -> Optional[dict]:
