@@ -1,0 +1,25 @@
+# Pull in the siphon image that the `build-image` job produced once for this run
+# and load it under the `sipp-siphon` tag that every siphon service in
+# sipp/docker-compose.yaml declares.
+#
+# With the tag present, `docker compose up` reuses it and never builds, which is
+# the whole point: a cold build of that image is ~10 minutes and it used to run
+# once per SIPp job. Any job using this action must declare `needs: build-image`.
+name: Load the siphon test image
+description: Download and load the sipp-siphon image built once per run by build-image.
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@v7
+      with:
+        name: sipp-siphon-image
+        path: /tmp
+
+    - name: docker load
+      shell: bash
+      run: |
+        docker load -i /tmp/sipp-siphon.tar.gz
+        # Fail loudly here rather than 10 minutes later inside an implicit
+        # `compose up` rebuild that would silently mask a broken artifact.
+        docker image inspect sipp-siphon:latest > /dev/null

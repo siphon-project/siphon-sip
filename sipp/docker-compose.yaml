@@ -521,6 +521,7 @@ services:
 
   # SIPhon proxy with RTPEngine config
   siphon-rtpengine:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-rtpengine-test
@@ -660,6 +661,7 @@ services:
 
   # SIPhon proxy with rtpproxy config (media.backend: rtpproxy)
   siphon-rtpproxy:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-rtpproxy-test
@@ -838,6 +840,7 @@ services:
   #   172.20.0.57 — A-leg UAC (cancel)
 
   siphon-b2bua:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-b2bua-test
@@ -974,6 +977,7 @@ services:
   # for the auth_passthrough fix. Uses the b2bua_auth_passthrough.py script.
 
   siphon-b2bua-auth:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-b2bua-auth-test
@@ -1059,6 +1063,7 @@ services:
   #   172.20.0.102 — SIPp UAC (A-leg caller)
 
   siphon-b2bua-invite-auth:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-b2bua-invite-auth-test
@@ -1204,6 +1209,7 @@ services:
   #   172.20.0.53 — A-leg UAC (non-100rel trunk)
 
   siphon-b2bua-trunk-edge:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-b2bua-trunk-edge-test
@@ -1525,6 +1531,7 @@ services:
   # picks the mode from the X-Refer-Mode header.
 
   siphon-b2bua-refer-modes:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-b2bua-refer-modes-test
@@ -1795,6 +1802,7 @@ services:
   # quote dialog identifiers that only exist once the first call is up.
 
   siphon-b2bua-replaces:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-b2bua-replaces-test
@@ -2521,6 +2529,7 @@ services:
   #   172.20.0.62 — SIPp UAC (caller)
 
   siphon-gateway:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-gateway-test
@@ -2600,6 +2609,7 @@ services:
   #   172.20.0.67 — SIPp UAC (A-leg caller)
 
   siphon-b2bua-gateway:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-b2bua-gateway-test
@@ -2688,6 +2698,7 @@ services:
   #     up --abort-on-container-exit sipp-ims-uac
 
   siphon-ims:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-ims-test
@@ -2877,6 +2888,7 @@ services:
   # stop-the-world). On a many-core host the stall is only transient, so the
   # bug does NOT reproduce without this limit.
   siphon-http-auth:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-http-auth-test
@@ -2939,6 +2951,7 @@ services:
   # the registrar-side, Python-level analogue of the blocking-while-attached
   # hazard (static auth, so the on_change notify is the only blocking call).
   siphon-onchange:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-onchange-test
@@ -2999,6 +3012,7 @@ services:
   # Real sip.js WS user agents register and call each other through siphon's
   # flow-based MT routing. profile: webrtc
   siphon-webrtc:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-webrtc-test
@@ -3044,6 +3058,7 @@ services:
   # Same two-UA WS call test, but siphon runs as a B2BUA (bridges onto a fresh
   # B-leg INVITE over the callee's captured WS flow). profile: webrtc
   siphon-webrtc-b2bua:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-webrtc-b2bua-test
@@ -3200,6 +3215,7 @@ services:
       - rtpengine-real
 
   siphon-b2bua-rtpengine-refer:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-b2bua-rtpengine-refer-test
@@ -4375,6 +4391,7 @@ services:
 
   # SIPhon B2BUA running examples/voice_ai_b2bua.py
   siphon-voice-ai:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-voice-ai-test
@@ -4460,6 +4477,7 @@ services:
       - refer-single-leg
 
   siphon-refer:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-refer-test
@@ -4574,6 +4592,7 @@ services:
       - reoffer
 
   siphon-reoffer:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-reoffer-test
@@ -4760,6 +4779,7 @@ services:
 
   # ── Native JSON control plane (media.backend: siphon-rtp) ─────────────────
   siphon-rtp-native:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-rtp-native-test
@@ -4864,6 +4884,7 @@ services:
   # Identical to the native stack above except for the media backend, and it
   # runs the same scenarios the rtpengine profile uses, unmodified.
   siphon-rtp-ng:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-rtp-ng-test
@@ -4992,6 +5013,7 @@ services:
       - voice-ai-real
 
   siphon-voice-ai-real:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-voice-ai-real-test
@@ -5055,6 +5077,7 @@ services:
   # run in CI; it asserts what siphon *sent*, this asserts a real engine
   # accepted it.
   siphon-rtpengine-real:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-rtpengine-real-test
@@ -5183,6 +5206,7 @@ services:
       - rtpproxy-real
 
   siphon-rtpproxy-real:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-rtpproxy-real-test
@@ -5302,6 +5326,7 @@ services:
   #     siphon-originate sipp-originate-uas originate-app
 
   siphon-originate:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
     build:
       context: ..
     container_name: siphon-originate-test

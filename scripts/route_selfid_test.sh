@@ -42,8 +42,15 @@ fail() {
 }
 
 echo "=== Route self-identity (RFC 3261 §16.4) ==="
-echo "[*] Building siphon image..."
-"${COMPOSE[@]}" build siphon-routing
+# CI loads sipp-siphon from the build-image job, and every siphon service in the
+# compose files shares that tag, so building here would redo a ~10 minute image
+# that is already present. Build only when it is absent, which is the local case.
+if docker image inspect sipp-siphon:latest >/dev/null 2>&1; then
+  echo "[*] Reusing the existing sipp-siphon image."
+else
+  echo "[*] Building siphon image..."
+  "${COMPOSE[@]}" build siphon-routing
+fi
 
 echo "[*] Starting siphon (two udp listeners, domain.local without the address)..."
 "${COMPOSE[@]}" up -d --wait siphon-routing \

@@ -41,8 +41,15 @@ wait_for_log() {
 }
 
 echo "=== Transport error on forwarding must be answered (RFC 3261 §16.9 / §16.7) ==="
-echo "[*] Building siphon image..."
-"${COMPOSE[@]}" build siphon-transport-error
+# CI loads sipp-siphon from the build-image job, and every siphon service in the
+# compose files shares that tag, so building here would redo a ~10 minute image
+# that is already present. Build only when it is absent, which is the local case.
+if docker image inspect sipp-siphon:latest >/dev/null 2>&1; then
+  echo "[*] Reusing the existing sipp-siphon image."
+else
+  echo "[*] Building siphon image..."
+  "${COMPOSE[@]}" build siphon-transport-error
+fi
 
 echo "[*] Starting siphon and the blackhole (up, listening on nothing)..."
 "${COMPOSE[@]}" up -d transport-error-blackhole

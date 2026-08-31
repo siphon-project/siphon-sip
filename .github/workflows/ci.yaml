@@ -320,15 +320,68 @@ jobs:
             sbom.spdx.json
             sbom.cdx.json
 
-  # ── SIPp functional tests (basic) ───────────────────────────────────────
-  sipp-functional:
+  # ── The one siphon image every SIPp job runs against ───────────────────────
+  # Every service in sipp/docker-compose.yaml that runs siphon builds `context: ..`
+  # against the root Dockerfile with no build-args and no target override, so they
+  # are all the same image. They share the `sipp-siphon` tag; this job produces it
+  # once and hands it to the SIPp jobs as an artifact, which they `docker load`.
+  # `docker compose up` only builds when the tag is absent, so a loaded image makes
+  # every one of them skip the build.
+  #
+  # Built here rather than per job because a cold `docker compose build` is ~10
+  # minutes (apt, uv, CPython 3.14t, rustup, cargo-chef, then the whole release
+  # dependency graph) against 10-40 s of actual SIPp testing — it used to be ~96 %
+  # of the SIPp fleet's runner time, repeated 20 times per run.
+  build-image:
     runs-on: ubuntu-latest
-    needs: rust-tests
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build siphon image
-        run: docker compose -f sipp/docker-compose.yaml build siphon
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build the siphon test image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          tags: sipp-siphon:latest
+          # Same scope as release.yaml's amd64 leg: identical context, Dockerfile
+          # and build-args, so the two share one cache entry rather than competing
+          # for the repo's cache budget, and each warms the other.
+          cache-from: type=gha,scope=linux/amd64
+          # Only trunk pushes write it. A cache written from a PR branch is scoped
+          # to that branch — invisible to every other PR and to main — so writing
+          # from a PR would evict entries that Swatinem/rust-cache also needs
+          # without ever being read back.
+          #
+          # mode=max is load-bearing: everything expensive lives in the chef/planner/
+          # builder stages, and mode=min exports only the final stage (debian plus
+          # the copied binary), which would cache nothing that costs anything.
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=linux/amd64' || '' }}
+          outputs: type=docker,dest=/tmp/sipp-siphon.tar
+
+      # ~100 MB compressed vs ~300 MB raw, and `docker load` reads gzip directly.
+      # gzip -1 plus compression-level 0 beats letting upload-artifact deflate the
+      # whole uncompressed tar.
+      - name: Compress
+        run: gzip -1 /tmp/sipp-siphon.tar
+
+      - name: Upload the siphon image
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-siphon-image
+          path: /tmp/sipp-siphon.tar.gz
+          retention-days: 1
+          compression-level: 0
+
+  # ── SIPp functional tests (basic) ───────────────────────────────────────
+  sipp-functional:
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: Start siphon
         run: docker compose -f sipp/docker-compose.yaml up -d --wait siphon
@@ -371,9 +424,12 @@ jobs:
   # the stack down on exit.
   sipp-mtu:
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: MTU §18.1.1 fallback tests (IPv4)
         run: scripts/mtu_test.sh v4
@@ -390,9 +446,12 @@ jobs:
   # consumed and the request relayed.
   sipp-route-selfid:
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: Route self-identity (in-dialog BYE must be relayed, not 404'd)
         run: scripts/route_selfid_test.sh
@@ -406,9 +465,12 @@ jobs:
   # caller demands the 500 within 20 s.
   sipp-transport-error:
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: Transport error on forwarding must be answered, not dropped
         run: scripts/transport_error_test.sh
@@ -425,9 +487,12 @@ jobs:
   # which downstream actually received each INVITE.
   sipp-failover:
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: Terminating failover (per-binding Path + on_failure retarget)
         run: scripts/failover_test.sh
@@ -445,9 +510,12 @@ jobs:
   # NOT.
   sipp-b2bua-path:
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: B2BUA B-leg follows the binding's Path (fork, dial, over-MTU)
         run: scripts/b2bua_path_test.sh
@@ -460,9 +528,12 @@ jobs:
   sipp-mtu-ipv6:
     if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: Enable docker IPv6 (merge into the runner's daemon.json)
         run: |
@@ -480,12 +551,12 @@ jobs:
   # ── B2BUA functional tests ─────────────────────────────────────────────
   sipp-b2bua:
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build siphon-b2bua image
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua build siphon-b2bua
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: Start siphon-b2bua
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua up -d --wait siphon-b2bua
@@ -547,12 +618,12 @@ jobs:
   # media session + delete of the old anchor).
   sipp-b2bua-refer:
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build B2BUA / refer-modes / anchored siphon images
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-refer-terminate --profile b2bua-replaces --profile b2bua-rtpengine-refer build siphon-b2bua siphon-b2bua-refer-modes siphon-b2bua-replaces siphon-b2bua-rtpengine-refer
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: Start siphon-b2bua
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua up -d --wait siphon-b2bua
@@ -674,12 +745,12 @@ jobs:
   # exits 0, which it does not — but the grep is the belt to that braces).
   sipp-originate:
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build siphon-originate image
-        run: docker compose -f sipp/docker-compose.yaml --profile originate build siphon-originate
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: Start siphon (control listener) + the UAS
         run: docker compose -f sipp/docker-compose.yaml --profile originate up -d --wait siphon-originate
@@ -728,12 +799,12 @@ jobs:
   # fails on the extra INVITE.
   sipp-b2bua-invite-auth:
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build siphon-b2bua-invite-auth image
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-invite-auth build siphon-b2bua-invite-auth
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: Start siphon-b2bua-invite-auth
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-invite-auth up -d --wait siphon-b2bua-invite-auth
@@ -764,12 +835,12 @@ jobs:
   # text-protocol client + siphon-side SDP rewrite work end-to-end.
   sipp-rtpproxy:
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build siphon-rtpproxy image
-        run: docker compose -f sipp/docker-compose.yaml --profile rtpproxy build siphon-rtpproxy
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: Start mock rtpproxy + siphon-rtpproxy
         run: docker compose -f sipp/docker-compose.yaml --profile rtpproxy up -d --wait mock-rtpproxy siphon-rtpproxy
@@ -807,12 +878,12 @@ jobs:
   # ── Voice-AI B2BUA (single-leg answer + WebSocket bridge) ──────────────
   sipp-voice-ai:
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build siphon-voice-ai image
-        run: docker compose -f sipp/docker-compose.yaml --profile voice-ai build siphon-voice-ai
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: Start mock siphon-rtp + siphon-voice-ai
         run: docker compose -f sipp/docker-compose.yaml --profile voice-ai up -d --wait mock-siphon-rtp siphon-voice-ai
@@ -847,12 +918,12 @@ jobs:
   # ── Re-INVITE renegotiation on the siphon-rtp backend ──────────────────
   sipp-reoffer:
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build siphon-reoffer image
-        run: docker compose -f sipp/docker-compose.yaml --profile reoffer build siphon-reoffer
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: Start mock siphon-rtp + siphon
         run: docker compose -f sipp/docker-compose.yaml --profile reoffer up -d --wait mock-siphon-rtp-reoffer siphon-reoffer
@@ -900,12 +971,12 @@ jobs:
   # ── Cold transfer off a single-leg answered call ───────────────────────
   sipp-refer-single-leg:
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build siphon-refer image
-        run: docker compose -f sipp/docker-compose.yaml --profile refer-single-leg build siphon-refer
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: Start mock siphon-rtp + siphon-refer
         run: docker compose -f sipp/docker-compose.yaml --profile refer-single-leg up -d --wait mock-siphon-rtp-refer siphon-refer
@@ -987,12 +1058,12 @@ jobs:
   # complementary half, that a real engine accepts it.
   sipp-siphon-rtp-native:
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build siphon-rtp-native image
-        run: docker compose -f sipp/docker-compose.yaml --profile siphon-rtp-native build siphon-rtp-native
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: Start the real engine + siphon
         run: docker compose -f sipp/docker-compose.yaml --profile siphon-rtp-native up -d --wait siphon-rtp-engine siphon-rtp-native
@@ -1043,12 +1114,12 @@ jobs:
   # straight from an existing rtpengine deployment.
   sipp-siphon-rtp-ng:
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build siphon-rtp-ng image
-        run: docker compose -f sipp/docker-compose.yaml --profile siphon-rtp-ng build siphon-rtp-ng
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: Start the real engine + siphon
         run: docker compose -f sipp/docker-compose.yaml --profile siphon-rtp-ng up -d --wait siphon-rtp-engine siphon-rtp-ng
@@ -1097,12 +1168,12 @@ jobs:
   # one until you measure the samples, which is what mock_ai_ws.py does.
   sipp-voice-ai-real:
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build siphon-voice-ai-real image
-        run: docker compose -f sipp/docker-compose.yaml --profile voice-ai-real build siphon-voice-ai-real
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: Start the real engine + AI server + siphon
         run: docker compose -f sipp/docker-compose.yaml --profile voice-ai-real up -d --wait siphon-rtp-engine mock-ai-ws siphon-voice-ai-real
@@ -1158,12 +1229,12 @@ jobs:
   # below in the same way sipp-rtpproxy is of sipp-rtpproxy-real.
   sipp-rtpengine:
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build siphon-rtpengine image
-        run: docker compose -f sipp/docker-compose.yaml --profile rtpengine build siphon-rtpengine
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: Start mock rtpengine + siphon
         run: docker compose -f sipp/docker-compose.yaml --profile rtpengine up -d --wait mock-rtpengine siphon-rtpengine
@@ -1200,12 +1271,12 @@ jobs:
   # behavioural difference between the jobs is attributable to the engine.
   sipp-rtpengine-real:
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build siphon-rtpengine-real image
-        run: docker compose -f sipp/docker-compose.yaml --profile rtpengine-real build siphon-rtpengine-real
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: Start real rtpengine + siphon
         run: docker compose -f sipp/docker-compose.yaml --profile rtpengine-real up -d --wait rtpengine-real siphon-rtpengine-real
@@ -1247,12 +1318,12 @@ jobs:
   # it did the work, active sessions back at 0 proves siphon sent the delete.
   sipp-rtpproxy-real:
     runs-on: ubuntu-latest
-    needs: rust-tests
+    needs: build-image
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build siphon-rtpproxy-real image
-        run: docker compose -f sipp/docker-compose.yaml --profile rtpproxy-real build siphon-rtpproxy-real
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
 
       - name: Start real rtpproxy + siphon
         run: docker compose -f sipp/docker-compose.yaml --profile rtpproxy-real up -d --wait rtpproxy-real siphon-rtpproxy-real
