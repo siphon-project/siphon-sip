@@ -42,8 +42,8 @@ import sys
 import time
 import uuid
 
-SIPHON = os.environ.get("SIPHON_ADDR", "172.20.0.60:5060")
-SELF_IP = os.environ.get("SELF_IP", "172.20.0.70")
+SIPHON = os.environ.get("SIPHON_ADDR", "172.20.0.114:5060")
+SELF_IP = os.environ.get("SELF_IP", "172.20.0.115")
 TIMEOUT = float(os.environ.get("STEP_TIMEOUT", "10"))
 
 SIPHON_HOST, SIPHON_PORT = SIPHON.split(":")

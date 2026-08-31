@@ -11,7 +11,7 @@ listen:
 domain:
   local:
     - "siphon.test"
-    - "172.20.0.60"
+    - "172.20.0.114"
     - "127.0.0.1"
 
 # The takeover is opt-in (see b2bua.accept_replaces): possession of a dialog's
@@ -24,7 +24,7 @@ script:
   path: "scripts/b2bua_replaces.py"
   reload: auto
 
-advertised_address: "172.20.0.60"
+advertised_address: "172.20.0.114"
 
 registrar:
   backend: memory

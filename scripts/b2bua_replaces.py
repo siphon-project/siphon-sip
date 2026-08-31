@@ -16,7 +16,7 @@ import os
 
 from siphon import b2bua, log, proxy
 
-CALLEE = os.environ.get("REPLACES_CALLEE", "sip:bob@172.20.0.70:6002")
+CALLEE = os.environ.get("REPLACES_CALLEE", "sip:bob@172.20.0.115:6002")
 
 
 @proxy.on_request
