@@ -6,6 +6,8 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.7.0] — 2026-08-31
+
 ### Added
 - **`listen.udp_recv_buffer_bytes` — the UDP listener receive buffer is now
   sized by siphon instead of inherited from the kernel.** Listener sockets set
@@ -323,8 +325,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the `siphon-sip` version it was built against. This matters more than it did
   before, because that build is now what the official artifacts ship.
 
-
-### Fixed
 - **A `487 Request Terminated` answering a CANCEL siphon sent is now ACKed
   (RFC 3261 §17.1.1.3).** It never was, on any CANCELled B2BUA leg. The CANCEL
   paths tear the call down as they put the CANCEL on the wire, which unregisters
