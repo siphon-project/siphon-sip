@@ -657,7 +657,7 @@ docker compose -f sipp/docker-compose.yaml run --rm sipp-register
 
 ### Current baseline
 
-Reference machine: AMD Ryzen AI 9 HX 370 (24 logical cores), 128 GB RAM, Linux 6.17, free-threaded Python 3.14t.
+Reference machine: AMD Ryzen AI 9 HX 370 (24 logical cores), 128 GB RAM, Linux 7.0, free-threaded Python 3.14t.
 
 `scale_test.sh` arguments are `TOTAL_CALLS TARGET_CPS NUM_UACS`:
 - **TOTAL_CALLS** — total INVITE→200→ACK→BYE→200 transactions to drive
@@ -708,6 +708,54 @@ scale — and wants its own row.
 | B2BUA | TCP       | `5000 1000 4`         |    1 004 |       50% |    111 MB |
 | B2BUA | TCP       | `20000 5000 4`        |    4 972 |      173% |    130 MB |
 | B2BUA | TCP       | `40000 10000 8`       |    9 912 |      321% |    150 MB |
+| Register      | UDP    | `1000 250 1`         |      250 |        8% |   97.7 MB |
+| Register      | UDP    | `5000 1000 4`        |    1 004 |       19% |  137.5 MB |
+| Register      | UDP    | `20000 5000 4`       |    4 984 |       53% |  230.2 MB |
+| Register      | UDP    | `40000 10000 8`      |   10 000 |       94% |  360.9 MB |
+| Register      | TCP    | `1000 250 1`         |      250 |        6% |   84.2 MB |
+| Register      | TCP    | `5000 1000 4`        |    1 004 |       21% |   85.7 MB |
+| Register      | TCP    | `20000 5000 4`       |    4 984 |       55% |   87.3 MB |
+| Register      | TCP    | `40000 10000 8`      |    9 904 |       80% |   88.7 MB |
+| Register+auth | UDP    | `1000 250 1`         |      250 |       13% |  109.2 MB |
+| Register+auth | UDP    | `5000 1000 4`        |    1 004 |       31% |  170.4 MB |
+| Register+auth | UDP    | `20000 5000 4`       |    4 968 |       90% |  370.5 MB |
+| Register+auth | UDP    | `40000 10000 8`      |    9 944 |      167% |  646.5 MB |
+| Register+auth | TCP    | `1000 250 1`         |      250 |       13% |   84.6 MB |
+| Register+auth | TCP    | `5000 1000 4`        |    1 004 |       30% |   87.8 MB |
+| Register+auth | TCP    | `20000 5000 4`       |    4 984 |       75% |   91.2 MB |
+| Register+auth | TCP    | `40000 10000 8`      |    9 976 |      128% |   92.6 MB |
+
+The REGISTER rows are cheaper than the call rows by a wide margin — 10 000
+registrations/sec costs under one core (94 % UDP, 80 % TCP) where 10 000
+calls/sec costs 3.2–3.7 — which is what you would expect from one transaction
+against an in-memory store versus a full INVITE→200→ACK→BYE→200 dialog.
+
+Digest authentication then adds 60–80 % on top (94 % → 167 % on UDP, 80 % →
+128 % on TCP at the 10 k rows): a second server transaction plus the hash. That
+is the number that matters for an IMS edge, because a real P-CSCF/S-CSCF
+challenges every registration — the unauthenticated row is the floor, not the
+operating point.
+
+**Peak CPU% on the shorter rows is noisy.** It is the maximum of 1-second
+`pidstat` samples, and a 5 000-call row at 1 000 cps only produces about five of
+them, so which sample lands on a scheduling spike is partly luck — repeat runs
+of the same row have come out 40 % and 21 %. Peak CPS and Peak RSS repeat
+tightly. Per project policy Peak CPS is the number that gates a release
+(alongside Failures/Retransmits being zero); treat CPU% on the 250/1 000 cps
+rows as indicative rather than a floor to compare against.
+
+Two asymmetries in the table are worth knowing about rather than puzzling over:
+
+- **TCP REGISTER completes at 40 000/10 000 where TCP *calls* strain the rig.**
+  The ephemeral-port pressure in the call rows comes from siphon's *outbound*
+  connections to the UAS peers. A REGISTER has no callee leg, so siphon opens no
+  outbound connections at all and the port table never comes under pressure.
+- **UDP REGISTER holds noticeably more RSS than TCP** (366 MB vs 87 MB at the
+  10 k row) while using *more* CPU. The UDP listener allocates a fresh receive
+  buffer per datagram across every worker, so at 10 k cps that is allocator
+  churn the stream transports do not pay; jemalloc holds the freed pages rather
+  than returning them immediately. It is retention, not growth — the memory-leak
+  test gates the growth case separately.
 
 ### Headroom
 

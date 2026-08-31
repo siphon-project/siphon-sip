@@ -88,10 +88,12 @@ fi
 # ── Performance + memory-leak baseline (manual, per project policy) ─────────
 if [ "${PERF_OK:-0}" != "1" ]; then
   echo
-  echo "Project policy requires the 16-row perf baseline + mem-leak test to PASS"
+  echo "Project policy requires the 32-row perf baseline + mem-leak test to PASS"
   echo "(Failures/Retransmits == 0, allocated flat) on the README hardware before"
   echo "a release. Run them now if you haven't:"
-  echo "    scripts/scale_test.sh ...        (all 16 rows)"
+  echo "    scripts/scale_test.sh ...                    (16 call rows: proxy/b2bua x udp/tcp)"
+  echo "    MODE=register      scripts/scale_test.sh ... (4 rows x udp/tcp)"
+  echo "    MODE=register_auth scripts/scale_test.sh ... (4 rows x udp/tcp)"
   echo "    scripts/mem_leak_test.sh         (and MODE=b2bua scripts/mem_leak_test.sh)"
   printf 'Have those passed on this hardware? [y/N] '
   read -r answer
