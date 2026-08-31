@@ -263,7 +263,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 # --- Debian packaging (cargo-deb) ---
 [package.metadata.deb]
-maintainer = "SIPhon Contributors <mvdvlies@gmail.com>"
+maintainer = "SIPhon Contributors <maintainers@siphon-sip.org>"
 section = "net"
 priority = "optional"
 extended-description = """\

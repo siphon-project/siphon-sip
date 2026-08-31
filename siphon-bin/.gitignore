@@ -1,1 +1,7 @@
 /target
+# Written on the fly by the release workflow and the root Dockerfile to point
+# the siphon-sip git dep at the in-tree source, so an artifact built at tag
+# vX.Y.Z contains that tag's lib rather than whatever `main` happened to be.
+# Deliberately never committed: the siphon-bin CI legs build against the git
+# deps on purpose, and a committed patch would silently void that guard.
+/.cargo/

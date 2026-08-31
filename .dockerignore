@@ -5,3 +5,9 @@ tasks/
 sipp/
 tests/
 .python-version
+# The patterns above anchor at the context root, so siphon-bin's own build
+# artifacts need their own entries now that the image builds that package.
+# .cargo/ is excluded because the image writes its own patch config there and a
+# developer's local copy must not shadow it.
+siphon-bin/target/
+siphon-bin/.cargo/
