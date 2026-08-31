@@ -74,7 +74,7 @@ async fn udp_roundtrip() {
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
 
-    udp::listen(addr, inbound_tx, outbound_rx, test_acl(), None).await;
+    udp::listen(addr, inbound_tx, outbound_rx, test_acl(), None, 0).await;
     tokio::time::sleep(SETTLE).await;
 
     // Client: send OPTIONS
@@ -637,7 +637,7 @@ async fn multi_transport_shared_inbound_channel() {
         Arc::new(DashMap::new());
 
     // Start all three transports with the same inbound_tx
-    udp::listen(udp_addr, inbound_tx.clone(), udp_outbound_rx, test_acl(), None).await;
+    udp::listen(udp_addr, inbound_tx.clone(), udp_outbound_rx, test_acl(), None, 0).await;
     tcp::listen(tcp_addr, inbound_tx.clone(), tcp_outbound_rx, Arc::clone(&tcp_connection_map), test_acl(), None, None, None, None).await;
     ws::listen(ws_addr, inbound_tx.clone(), ws_outbound_rx, Arc::clone(&ws_connection_map), test_acl(), StreamConnections::new(), None, None).await;
     drop(inbound_tx); // Only transport workers hold clones now

@@ -337,6 +337,16 @@ pub fn parse_dscp(value: &str) -> std::result::Result<u8, String> {
 }
 
 /// Convert a 6-bit DSCP value to the 8-bit TOS byte (RFC 2474 §3).
+/// Default UDP receive-buffer size: 1 MiB per listener socket.
+///
+/// Roughly 5x the usual kernel default, which is enough to ride out a
+/// scheduler stall at the throughput siphon targets, while staying small
+/// enough that `worker_count` sockets do not meaningfully dent a
+/// memory-capped container's cgroup budget.
+fn default_udp_recv_buffer_bytes() -> usize {
+    1024 * 1024
+}
+
 pub fn dscp_to_tos(dscp: u8) -> u32 {
     (dscp as u32) << 2
 }
@@ -447,6 +457,23 @@ pub struct ListenConfig {
     /// the inbound side is unaffected.
     #[serde(default)]
     pub mtu: Option<u16>,
+    /// Receive-buffer size in bytes (`SO_RCVBUF`) for every UDP listener
+    /// socket. Default 1 MiB.
+    ///
+    /// The kernel default (`net.core.rmem_default`, typically ~212 KB) is a
+    /// few hundred milliseconds of headroom at IMS registration rates, so a
+    /// scheduler stall on a busy box overflows the socket queue and the kernel
+    /// drops datagrams silently — which a UAC sees as a retransmit, not an
+    /// error, and which shows up as a sharp cliff rather than gradual
+    /// degradation. `SO_REUSEPORT` gives one socket per worker, so the real
+    /// cost is this value times the worker count.
+    ///
+    /// Socket buffers are charged to the process's cgroup, so raise this
+    /// deliberately on a memory-capped deployment. `net.core.rmem_max` caps
+    /// what the kernel will actually grant; siphon reads the value back and
+    /// warns when it was clamped. `0` leaves the kernel default in place.
+    #[serde(default = "default_udp_recv_buffer_bytes")]
+    pub udp_recv_buffer_bytes: usize,
     #[serde(default)]
     pub udp: Vec<ListenEntry>,
     #[serde(default)]
@@ -469,6 +496,7 @@ impl Default for ListenConfig {
         Self {
             dscp: default_dscp(),
             mtu: None,
+            udp_recv_buffer_bytes: default_udp_recv_buffer_bytes(),
             udp: Vec::new(),
             tcp: Vec::new(),
             tls: Vec::new(),
@@ -6840,6 +6868,43 @@ registrar:
         assert!(parse_dscp("INVALID").is_err());
         assert!(parse_dscp("CS8").is_err());
         assert!(parse_dscp("").is_err());
+    }
+
+    #[test]
+    fn udp_recv_buffer_defaults_and_overrides() {
+        // Absent → the 1 MiB default.
+        let config = Config::from_str(minimal_yaml()).unwrap();
+        assert_eq!(config.listen.udp_recv_buffer_bytes, 1024 * 1024);
+
+        // Explicit value wins.
+        let yaml = r#"
+listen:
+  udp_recv_buffer_bytes: 4194304
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert_eq!(config.listen.udp_recv_buffer_bytes, 4 * 1024 * 1024);
+
+        // 0 is the documented "leave the kernel default alone" escape hatch.
+        let yaml = r#"
+listen:
+  udp_recv_buffer_bytes: 0
+  udp:
+    - "0.0.0.0:5060"
+domain:
+  local:
+    - "example.com"
+script:
+  path: "scripts/proxy_default.py"
+"#;
+        let config = Config::from_str(yaml).unwrap();
+        assert_eq!(config.listen.udp_recv_buffer_bytes, 0);
     }
 
     #[test]

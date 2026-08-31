@@ -16,7 +16,7 @@ use std::sync::Arc;
 use bytes::BytesMut;
 use socket2::SockAddr;
 use tokio::net::UdpSocket;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport};
 use crate::transport::acl::TransportAcl;
@@ -30,6 +30,7 @@ pub async fn listen(
     outbound_rx: flume::Receiver<OutboundMessage>,
     acl: Arc<TransportAcl>,
     tos: Option<u32>,
+    recv_buffer_bytes: usize,
 ) {
     let worker_count = num_cpus::get();
     info!("Starting {} UDP workers on {}", worker_count, local_addr);
@@ -40,7 +41,7 @@ pub async fn listen(
         let acl = Arc::clone(&acl);
 
         tokio::spawn(async move {
-            let socket = match create_reusable_udp_socket(local_addr, tos) {
+            let socket = match create_reusable_udp_socket(local_addr, tos, recv_buffer_bytes) {
                 Ok(socket) => Arc::new(socket),
                 Err(error) => {
                     error!("[udp-worker-{}] failed to create socket: {}", worker_index, error);
@@ -126,7 +127,11 @@ fn udp_connection_id(local: SocketAddr, remote: SocketAddr) -> ConnectionId {
     ConnectionId(hasher.finish())
 }
 
-fn create_reusable_udp_socket(local_addr: SocketAddr, tos: Option<u32>) -> std::io::Result<UdpSocket> {
+fn create_reusable_udp_socket(
+    local_addr: SocketAddr,
+    tos: Option<u32>,
+    recv_buffer_bytes: usize,
+) -> std::io::Result<UdpSocket> {
     let socket = match local_addr {
         SocketAddr::V4(_) => socket2::Socket::new(
             socket2::Domain::IPV4,
@@ -151,14 +156,96 @@ fn create_reusable_udp_socket(local_addr: SocketAddr, tos: Option<u32>) -> std::
         super::apply_tos(&socket2::SockRef::from(&socket), tos);
     }
 
+    apply_recv_buffer(&socket, local_addr, recv_buffer_bytes);
+
     socket.bind(&SockAddr::from(local_addr))?;
 
     UdpSocket::from_std(socket.into())
 }
 
+/// Request `SO_RCVBUF` and report what the kernel actually granted.
+///
+/// Best-effort: a listener that cannot get the buffer it asked for is still a
+/// working listener, so a failure here warns rather than aborting the bind.
+///
+/// Linux returns roughly double the requested size from `getsockopt` (the extra
+/// is bookkeeping overhead), so "at least what we asked for" is the honest
+/// check — anything less means `net.core.rmem_max` clamped us, which is the
+/// case worth telling an operator about, because the symptom otherwise is
+/// silent datagram drops that look like peer retransmissions.
+fn apply_recv_buffer(socket: &socket2::Socket, local_addr: SocketAddr, requested: usize) {
+    if requested == 0 {
+        return;
+    }
+    if let Err(error) = socket.set_recv_buffer_size(requested) {
+        warn!(
+            "[udp {}] could not set SO_RCVBUF to {} bytes: {} — continuing with the kernel default",
+            local_addr, requested, error
+        );
+        return;
+    }
+    match socket.recv_buffer_size() {
+        Ok(granted) if granted < requested => warn!(
+            "[udp {}] SO_RCVBUF clamped to {} bytes (asked for {}) — raise net.core.rmem_max, \
+             or inbound bursts will be dropped by the kernel and look like peer retransmissions",
+            local_addr, granted, requested
+        ),
+        Ok(granted) => debug!("[udp {}] SO_RCVBUF granted {} bytes", local_addr, granted),
+        Err(error) => debug!("[udp {}] could not read back SO_RCVBUF: {}", local_addr, error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A listener asks the kernel for the configured `SO_RCVBUF` and gets at
+    /// least that much. Linux reports back roughly double the request, so the
+    /// assertion is "no less than asked", which is exactly the condition
+    /// `apply_recv_buffer` warns about when `net.core.rmem_max` clamps it.
+    ///
+    /// Uses a modest size so the test passes under a conservative `rmem_max`.
+    #[tokio::test]
+    async fn listener_socket_honours_the_configured_recv_buffer() {
+        const REQUESTED: usize = 256 * 1024;
+
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
+        let socket = create_reusable_udp_socket(addr, None, REQUESTED)
+            .expect("listener socket binds");
+
+        let granted = socket2::SockRef::from(&socket)
+            .recv_buffer_size()
+            .expect("SO_RCVBUF reads back");
+        assert!(
+            granted >= REQUESTED,
+            "kernel granted {granted} B for a {REQUESTED} B request — if this fails on a \
+             developer box, net.core.rmem_max is set below the request"
+        );
+    }
+
+    /// `0` is the documented "leave the kernel default alone" escape hatch, so
+    /// it must not fail the bind and must not raise the buffer.
+    #[tokio::test]
+    async fn zero_recv_buffer_leaves_the_kernel_default() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("addr parses");
+
+        let defaulted = create_reusable_udp_socket(addr, None, 0).expect("binds with 0");
+        let default_size = socket2::SockRef::from(&defaulted)
+            .recv_buffer_size()
+            .expect("SO_RCVBUF reads back");
+
+        let raised = create_reusable_udp_socket(addr, None, 4 * 1024 * 1024)
+            .expect("binds with an explicit size");
+        let raised_size = socket2::SockRef::from(&raised)
+            .recv_buffer_size()
+            .expect("SO_RCVBUF reads back");
+
+        assert!(
+            raised_size > default_size,
+            "an explicit request ({raised_size} B) should exceed the untouched default \
+             ({default_size} B)"
+        );
+    }
+
     use bytes::Bytes;
 
     #[test]
@@ -251,6 +338,7 @@ mod tests {
             outbound_rx,
             Arc::new(TransportAcl::new(vec![], vec![])),
             None,
+            0,
         )
         .await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
