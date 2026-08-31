@@ -328,38 +328,14 @@ impl SiphonServer {
         // PyGILState_Ensure calls from workers create proper per-thread state.
         pyo3::Python::initialize();
 
-        // Build the Tokio runtime with custom on_thread_start hooks that
-        // permanently attach each worker (async + blocking) to the Python
-        // interpreter. Free-threaded Python (3.14t) tears down a thread's
-        // mimalloc heap on every PyGILState_Release when the attach count
-        // returns to 0 — calling munmap and serializing all 24 worker
-        // threads on the process-wide mm_struct rwsem (clearly visible in
-        // perf flame graphs as `_PyThreadState_ClearMimallocHeaps →
-        // rwsem_down_write_slowpath`). By doing one un-paired
-        // `PyGILState_Ensure` at thread start we keep the count > 0 for
-        // the lifetime of the worker thread, turning every per-request
-        // pyo3 attach into a cheap nested no-op.
+        // Build the Tokio runtime with hooks that pin each runtime thread
+        // (async worker + blocking) to the Python interpreter for the thread's
+        // lifetime, and unpin it when the thread is torn down. See
+        // `pin_python_thread_state` for why both halves matter.
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .on_thread_start(|| {
-                // SAFETY: the gstate is intentionally leaked — we want the
-                // thread state to outlive every pyo3 attach/release cycle.
-                // It will be cleaned up when the worker thread itself
-                // terminates (i.e. process shutdown).
-                unsafe {
-                    let _gstate = pyo3::ffi::PyGILState_Ensure();
-                    // Re-detach so other threads (and pyo3 attaches on this
-                    // thread) can take the per-thread state without conflict
-                    // — but the underlying PyThreadState remains cached, so
-                    // mimalloc heap teardown is avoided.
-                    //
-                    // Don't call PyGILState_Release / PyEval_RestoreThread:
-                    // that omission is what pins the state to the OS thread.
-                    // Both handles are Copy with no Drop, so no mem::forget is
-                    // needed — the bindings simply fall out of scope.
-                    let _tstate = pyo3::ffi::PyEval_SaveThread();
-                }
-            })
+            .on_thread_start(pin_python_thread_state)
+            .on_thread_stop(unpin_python_thread_state)
             .build()
             .unwrap_or_else(|error| {
                 eprintln!("Failed to create tokio runtime: {error}");
@@ -3313,8 +3289,152 @@ fn listen_addr_map<'a>(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Runtime-thread Python attachment
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// The attach this thread is pinned with, so [`unpin_python_thread_state`]
+    /// can unwind it symmetrically. `None` on a thread that was never pinned
+    /// (or has already been unpinned), which makes the unpin idempotent.
+    static PINNED_PYTHON_ATTACH: std::cell::Cell<
+        Option<(pyo3::ffi::PyGILState_STATE, *mut pyo3::ffi::PyThreadState)>,
+    > = const { std::cell::Cell::new(None) };
+}
+
+/// Pin this runtime thread to the Python interpreter for its whole life.
+///
+/// Free-threaded Python (3.14t) tears down a thread's mimalloc heap on every
+/// `PyGILState_Release` whose attach count returns to 0 — calling `munmap` and
+/// serializing every worker on the process-wide `mm_struct` rwsem (visible in
+/// perf as `_PyThreadState_ClearMimallocHeaps → rwsem_down_write_slowpath`).
+/// Holding one attach open for the thread's lifetime keeps that count above 0,
+/// so each per-request pyo3 attach is a cheap nested no-op.
+///
+/// The attach is *held*, not leaked: the `(gstate, tstate)` pair is parked in a
+/// thread-local so [`unpin_python_thread_state`] can release it when the thread
+/// is reaped. That pairing is load-bearing — see that function.
+fn pin_python_thread_state() {
+    // SAFETY: called once per runtime thread, before any pyo3 attach on it.
+    // `PyEval_SaveThread` re-detaches so other threads (and pyo3 attaches on
+    // this one) can take the per-thread state without conflict, while the
+    // underlying `PyThreadState` stays cached against the OS thread.
+    unsafe {
+        let gstate = pyo3::ffi::PyGILState_Ensure();
+        let tstate = pyo3::ffi::PyEval_SaveThread();
+        PINNED_PYTHON_ATTACH.with(|slot| slot.set(Some((gstate, tstate))));
+    }
+}
+
+/// Release the attach [`pin_python_thread_state`] took, so CPython frees this
+/// thread's `PyThreadState` when the OS thread goes away.
+///
+/// Without this half, the pin is a leak. `PyGILState_Ensure` allocates the
+/// state with `PyMem_RawCalloc` — CPython's *raw* domain, i.e. plain
+/// `malloc`, invisible to jemalloc and therefore to `siphon_memory_*` — and an
+/// unreleased `GILState` keeps CPython from ever destroying it. The runtime's
+/// fixed async workers live for the whole process so it never showed there, but
+/// `on_thread_start` also fires for tokio's **elastic blocking pool**, whose
+/// threads are reaped after their idle keep-alive. Every reaped blocking thread
+/// then orphaned its `PyThreadState` on the C heap, for the life of the process:
+/// a steady, traffic-independent RSS climb on any deployment that does blocking
+/// work on a timer (DNS, netlink, TLS handshakes, health probes).
+///
+/// Releasing on thread *stop* costs nothing on the hot path — the workers this
+/// optimization exists for never stop — while bounding the blocking pool.
+fn unpin_python_thread_state() {
+    let Some((gstate, tstate)) = PINNED_PYTHON_ATTACH.with(|slot| slot.take()) else {
+        return;
+    };
+    // SAFETY: runs on the same thread `pin_python_thread_state` pinned, after
+    // its work is done. The thread is currently detached (the pin ended with
+    // `PyEval_SaveThread`), so restore that exact state before releasing the
+    // matching `GILState` — `PyGILState_Release` requires an attached thread.
+    unsafe {
+        pyo3::ffi::PyEval_RestoreThread(tstate);
+        pyo3::ffi::PyGILState_Release(gstate);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Regression guard for the reaped-thread `PyThreadState` leak.
+    ///
+    /// `pin_python_thread_state` runs on every tokio runtime thread, including
+    /// the elastic blocking pool whose threads are reaped after their idle
+    /// keep-alive. `PyGILState_Ensure` allocates the thread state through
+    /// CPython's raw domain (`PyMem_RawCalloc` → `malloc`), so an unreleased
+    /// pin orphans it on the **glibc** heap where neither jemalloc nor
+    /// `siphon_memory_*` can see it.
+    ///
+    /// Two arms so the test cannot pass vacuously: the unpaired pin (the old
+    /// behaviour) must visibly grow the C-side pool, and the paired
+    /// pin/unpin must not. Comparing the two also makes the assertion immune to
+    /// whatever unrelated allocation noise the harness contributes.
+    ///
+    /// glibc-only: `malloc_info` is what `read_stats` reads.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn reaped_thread_releases_its_python_thread_state() {
+        const WARM: usize = 32;
+        const BATCH: usize = 256;
+
+        pyo3::Python::initialize();
+
+        let in_use = || crate::metrics::glibc::read_stats().map(|stats| stats.in_use_bytes);
+        let Some(_) = in_use() else {
+            eprintln!("[reaped_thread_releases_its_python_thread_state] no glibc stats — skipping");
+            return;
+        };
+
+        // `paired` mirrors the runtime hooks; `!paired` reproduces the leak.
+        let churn = |count: usize, paired: bool| {
+            for _ in 0..count {
+                std::thread::spawn(move || {
+                    pin_python_thread_state();
+                    if paired {
+                        unpin_python_thread_state();
+                    }
+                })
+                .join()
+                .expect("churn thread joins");
+            }
+        };
+
+        // Warm up both paths so first-touch arena growth lands outside the
+        // measured batches.
+        churn(WARM, true);
+        churn(WARM, false);
+
+        let before_leaky = in_use().unwrap_or(0);
+        churn(BATCH, false);
+        let leaked = in_use().unwrap_or(0).saturating_sub(before_leaky);
+
+        let before_fixed = in_use().unwrap_or(0);
+        churn(BATCH, true);
+        let retained = in_use().unwrap_or(0).saturating_sub(before_fixed);
+
+        eprintln!(
+            "unpaired pin: {leaked} B over {BATCH} threads ({:.1} B/thread); \
+             paired pin/unpin: {retained} B ({:.1} B/thread)",
+            leaked as f64 / BATCH as f64,
+            retained as f64 / BATCH as f64,
+        );
+
+        // The leak must be visible, else the test proves nothing.
+        assert!(
+            leaked > BATCH as u64 * 64,
+            "unpaired pin did not reproduce the leak ({leaked} B over {BATCH} threads) — \
+             the guard cannot prove the fix"
+        );
+        // ...and pairing must remove essentially all of it.
+        assert!(
+            retained * 4 < leaked,
+            "pairing pin with unpin did not release the thread state: \
+             {retained} B retained vs {leaked} B leaked over {BATCH} threads"
+        );
+    }
+
     use crate::config::{ListenConfig, ListenEntry};
 
     fn listen_on(addresses: &[&str]) -> Vec<ListenEntry> {

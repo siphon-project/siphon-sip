@@ -224,6 +224,26 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   got no response at all, not even a `100`. The promoted-away dialog is now
   retired properly, so a late in-dialog request on it answers `481` like any
   other torn-down leg.
+- **Runtime threads no longer orphan a CPython thread state when they are
+  reaped — a steady, traffic-independent RSS climb on every deployment.** Each
+  tokio runtime thread is pinned to the interpreter at thread start with a held
+  `PyGILState_Ensure`, which keeps free-threaded CPython from tearing down and
+  re-creating that thread's mimalloc heap on every attach/release cycle. The
+  attach was never released, on the assumption that the thread state would be
+  reclaimed when the thread itself exited. It is not: an unreleased `GILState`
+  keeps CPython from ever destroying the state, and `PyGILState_Ensure`
+  allocates it through CPython's *raw* domain (`PyMem_RawCalloc` → `malloc`), so
+  the orphan lands on the C heap where neither jemalloc nor the
+  `siphon_memory_*` gauges can see it. Harmless for the fixed async workers,
+  which live as long as the process — but the same hook runs on tokio's elastic
+  blocking pool, whose threads are reaped after their idle keep-alive. Every
+  reaped blocking thread leaked **~15.6 KB**, measured. Any deployment doing
+  blocking work on a timer (DNS resolution, netlink, TLS handshakes, gateway
+  health probes) therefore grew at a constant rate whether or not it was
+  carrying calls, with `siphon_memory_allocated_bytes` sitting flat and
+  innocent throughout; only `siphon_glibc_in_use_bytes` moved. The pin is now
+  released on thread stop, which bounds the blocking pool while leaving the
+  optimization it exists for untouched — the workers it targets never stop.
 - **A `siphon-bin` build reports the SIPhon version again.** It announced its
   own package version (`0.1.0`) in the startup banner, the `User-Agent`/`Server`
   headers and `/admin/health`, which broke the lockstep guarantee that the
