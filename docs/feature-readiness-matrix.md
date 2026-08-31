@@ -334,6 +334,40 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | 5G SBI — SCP indirect communication | Implemented | `sbi.communication: indirect` | Spec-compliant indirect routing via the SCP (TS 29.500 §6.10). Npcf Model C emits `3gpp-Sbi-Target-apiRoot` (the PCF known from the BSF binding); Nbsf Model D (delegated discovery) emits `3gpp-Sbi-Discovery-target-nf-type: BSF` / `service-names: nbsf-management` / `requester-nf-type` (default `AF`). `direct` (default) is byte-identical to today. Header-level tested (axum mock); not yet validated against a live SCP. |
 | 5G SBI — Nchf (charging) | Implemented | `sbi` | |
 
+## External Control Plane
+
+An out-of-process application drives B2BUA calls over a WebSocket, in the model Asterisk
+has with ARI and FreeSWITCH with ESL. A Python handler hands a call over with
+`call.handover("app")`; siphon holds the INVITE un-dialed and emits `StasisStart`, and the
+application answers, routes, transfers or hangs up over the socket.
+
+Every verb's reply reports the **local** action only. A far-end outcome — the callee
+answering, a transfer completing — always arrives later as an event, never folded into a
+command reply.
+
+| Feature | Readiness | Config | Notes |
+|---------|-----------|--------|-------|
+| Call handover (`call.handover`) | Implemented | `control.apps[]` | siphon holds the INVITE un-dialed and emits `StasisStart` with the full SIP context (real headers, source, R-URI shape, body) plus a stable `{channel, call_id, sip_call_id}` id triple that joins CDR and HEP with no mapping table. Answer-first mode (`answer=True, ws_uri=…`) answers and anchors media to the WebSocket bridge before handover, so the app drives an already-connected channel; on a backend that cannot do it the handover fails visibly rather than returning a fake 200 |
+| Inbound WebSocket listener | Implemented | `control.listen` | Persistent connection; per-app bearer tokens, constant-time compared, feeding the auto-ban store |
+| Outbound per-call connect | Implemented | `control.apps[].connect_to` | siphon dials the controller at handover, so the instance that accepts the connection owns the call. The multi-instance default: no distributed lock, no claim key, and pairing the per-call `ws_uri` with it puts the audio socket on the same instance by construction |
+| Exactly-one-owner dispatch | Implemented | — | Per-tenant scoping; a cross-app target answers `forbidden` |
+| Handoff deadline | Implemented | `control.apps[].deadline_ms` | A safe default action (`503` / fallback) when no controller acts in time, so a call is never left parked on an absent app |
+| `resync` reattach | Implemented | — | A controller that reconnects inside the grace window recovers its calls instead of losing them |
+| Backpressure | Implemented | — | Bounded per-connection outbound queue with per-call event/reply ordering and drop-oldest overflow; a slow controller can never stall the datapath |
+| Call verbs: `answer` `progress` `reject` `hangup` `route` | Implemented | — | `progress` covers 180 and 183 + early media |
+| `originate` | Implemented | — | A call siphon places itself — the primitive under click-to-dial, callbacks and the dial half of a transfer. The channel id is **supplied by the caller**, never minted, so an application stages per-call context before anything reaches the network; a duplicate live id answers the distinct `conflict` code. Asynchronous: the reply is the local action, ringing and answer follow as events. ACKs the 2xx (RFC 3261 §13.2.2.4), ACKs a final non-2xx on the INVITE's own branch (§17.1.1.3), and CANCELs rather than answering when abandoned before answer (§9.1). Media requires exactly one plan — a verbatim `sdp`, or `media: true` for an offerless INVITE answered locally — because an unanswerable 2xx is a connected call with no audio |
+| `bridge` | **Planned** | — | Joining two legs the process already owns. 3PCC re-negotiation across two answered dialogs, a media re-anchor across two call actors, and glare handling; not yet implemented |
+| Media verbs: `play` `stop` `dtmf` `hold` `unhold` | Implemented | — | Bound to the configured media backend, with typed replies rather than a hang: no anchored session → `not_found`, backend cannot → `unsupported_verb`, otherwise `unavailable`. `hold` is implemented as silence; a gate verb is a follow-up |
+| `stream_start` / `stream_stop` | Implemented | `media.backend: siphon-rtp` | Attach and detach a WebSocket audio tee mid-call. Native backend only — rtpengine and rtpproxy raise a typed error rather than reporting success while streaming nothing |
+| Header verbs: `set_header` `get_header` `remove_header` | Implemented | — | |
+| Inbound REFER → `TransferRequested` | Implemented | — | A REFER on a controlled call is held un-answered and the decision goes to the owning app via `accept_refer` / `reject_refer`. If the app never decides, a deadline sweep answers `603 Decline` so a REFER is never left pending. An uncontrolled call still runs the in-process handler |
+| Outbound REFER verdict | Implemented | — | `TransferProgress` while it moves, then exactly one `TransferCompleted` / `TransferFailed`. RFC 3515 §2.4.4 splits "accepted for processing" (the 2xx to the REFER) from the real outcome (the `message/sipfrag` NOTIFY), so a 2xx is progress and never completion. The 1-based `attempt` distinguishes a carrier that challenged and was answered from one that refused, when both arrive as `407`. A terminating NOTIFY always yields a terminal stage — including when the body carries no readable status — and a call torn down mid-transfer flushes a `call_ended` failure before `StasisEnd` |
+| Events: `StasisStart` `StasisEnd` `ChannelStateChange` `ChannelHangupRequest` `ChannelDtmfReceived` | Implemented | — | `StasisEnd` carries the SIP cause code and response phrase where one exists, which is the only way a controller learns why a leg it *placed* died |
+| Adapter API for extensions | Implemented | `SiphonServer::register_control_adapter` | `ControlAdapter` trait with an opaque JSON DTO seam, so a protocol extension registers its own control surface on the same rail. The built-in SIP adapter ships in core |
+| Client SDKs | Implemented | — | `siphon-control` (PyPI), `siphon-control-client` (crates.io) and the TypeScript client. They version independently of siphon core against the protocol, on their own release train |
+| Prometheus metrics | Implemented | `metrics.prometheus` | `siphon_control_connections`, `siphon_control_controlled_calls`, `siphon_control_commands_total`, `siphon_control_events_dropped_total`, `siphon_control_auth_failures_total`, `siphon_control_handoff_timeouts_total` |
+| Functional (SIPp) coverage | **Planned** | — | `originate` is covered end to end by the `sipp-originate` job. The rest of the rail — handover, the handoff deadline, media verbs, one-owner dispatch, `resync` — is unit-tested only; a general control-rail harness is in progress |
+
 ## Lawful Intercept / Recording
 
 | Feature | Readiness | Config | Notes |
@@ -363,4 +397,5 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Scripting | 14 (proxy, B2BUA, registrar, auth, gateway, cache, presence, logging, metrics, async, ...) | 3 (LI, timer, SDK) | 17 |
 | 3GPP/IMS | 10 (Cx, Sh, Rx, peer mgmt, IMS AKA HSS-backed, IPsec, iFC, P/I/S-CSCF, Npcf) | 4 (Ro, Rf, local Milenage AKA, Nchf) | 14 |
 | LI/Recording | 0 | 5 (X1, X2, X3, SIPREC, audit) | 5 |
-| **Totals** | **~66** | **~43** | **~110** |
+| Control plane | 0 | 17 (handover, both connection modes, one-owner dispatch, deadline, resync, backpressure, call/media/header verbs, originate, REFER in + out, events, adapter API, SDKs, metrics) | 19 |
+| **Totals** | **~66** | **~60** | **~129** |
