@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  B2BUA REFER siphon-terminated, referrer leaves mid-transfer — Alice:
+  INVITE → 200 → ACK
+  → REFER (X-Refer-Mode: terminate, Refer-To: carol) → 202
+  → NOTIFY (sipfrag 100 Trying) → 200
+  → BYE (Alice hangs up IMMEDIATELY, while carol is still ringing) → 200
+  → nothing further
+
+  RFC 5589 §7 lets the transferor end its dialog as soon as the REFER is
+  accepted, and real transferors do: a Teams blind transfer BYEs within a few
+  hundred ms of the 202, roughly a second before the target answers. The
+  transfer must still complete — bob stays up and is bridged to carol.
+
+  Two properties are asserted here, and the rest on the bob/carol UAS sides:
+    * the BYE is answered 200 (the referrer leaves cleanly), and
+    * NOTHING further is sent to this dialog. The closing pause outlives
+      carol's answer, so a terminating sipfrag NOTIFY or a referrer BYE
+      emitted after the referrer already left lands inside the call and SIPp
+      fails it as an unexpected message (RFC 3515 §2.4.4 — the implicit
+      subscription died with the dialog, so a late NOTIFY would draw a 481).
+-->
+<scenario name="B2BUA REFER terminate, referrer BYEs mid-transfer">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/b2bua-refer-referrer-bye-test
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=sendrecv
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <label id="1" />
+  <recv response="180" optional="true" next="1" />
+
+  <recv response="200" rtd="true" crlf="true" />
+
+  <send>
+    <![CDATA[
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="500" />
+
+  <send retrans="500">
+    <![CDATA[
+REFER sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 REFER
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Refer-To: <sip:carol@172.20.0.54:5060>
+X-Refer-Mode: terminate
+User-Agent: SIPp/b2bua-refer-referrer-bye-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="202" crlf="true" />
+
+  <!-- sipfrag NOTIFY 100 Trying opens the implicit subscription. -->
+  <recv request="NOTIFY" crlf="true" />
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!--
+    Hang up NOW — carol has not answered yet (she holds 180 for 1.5 s). This is
+    the exact ordering a Teams transfer produces and the one that used to take
+    the surviving leg down with it.
+  -->
+  <send retrans="500">
+    <![CDATA[
+BYE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 3 BYE
+Max-Forwards: 70
+Reason: Q.850;cause=16;text="Referrer left after the REFER was accepted"
+User-Agent: SIPp/b2bua-refer-referrer-bye-test
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" crlf="true" />
+
+  <!--
+    Outlives carol's answer + the bridge. Any NOTIFY or BYE siphon sends to the
+    departed referrer arrives here and fails the call.
+  -->
+  <pause milliseconds="3000" />
+
+</scenario>

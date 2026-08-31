@@ -581,6 +581,39 @@ jobs:
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-terminate rm -sf sipp-b2bua-refer-terminate-uac sipp-b2bua-refer-terminate-bob-uas sipp-b2bua-refer-terminate-carol-uas 2>/dev/null || true
 
+      # Every leg is graded, NOT just the UAC. The referrer completes its own
+      # scenario cleanly even when the transfer is broken — the damage lands on
+      # the surviving leg (an unexpected BYE) and on the transfer target (a 200
+      # that is never ACKed), so `--exit-code-from` on the UAC alone reports a
+      # green run over both failures. All three scenarios self-terminate, so
+      # plain `up` returns once they have, and each exit code is then asserted.
+      - name: B2BUA REFER terminate, referrer BYEs mid-transfer (RFC 5589 §7 — survivor kept, target ACKed)
+        run: |
+          docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-referrer-bye up \
+            sipp-b2bua-refer-referrer-bye-uac \
+            sipp-b2bua-refer-referrer-bye-bob-uas \
+            sipp-b2bua-refer-referrer-bye-carol-uas
+          status=0
+          for service in uac bob-uas carol-uas; do
+            code=$(docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-referrer-bye \
+              ps -a --format '{{.Service}} {{.ExitCode}}' \
+              | awk -v s="sipp-b2bua-refer-referrer-bye-$service" '$1 == s { print $2 }')
+            echo "sipp-b2bua-refer-referrer-bye-$service exit=$code"
+            if [ "$code" != "0" ]; then status=1; fi
+          done
+          exit $status
+
+      - name: Cleanup referrer-bye containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-referrer-bye rm -sf sipp-b2bua-refer-referrer-bye-uac sipp-b2bua-refer-referrer-bye-bob-uas sipp-b2bua-refer-referrer-bye-carol-uas 2>/dev/null || true
+
+      - name: B2BUA REFER terminate attended (RFC 3891 §3 — Replaces reaches the target's INVITE)
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-attended up --abort-on-container-exit --exit-code-from sipp-b2bua-refer-attended-carol-uas sipp-b2bua-refer-attended-uac sipp-b2bua-refer-attended-bob-uas sipp-b2bua-refer-attended-carol-uas
+
+      - name: Cleanup attended containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-attended rm -sf sipp-b2bua-refer-attended-uac sipp-b2bua-refer-attended-bob-uas sipp-b2bua-refer-attended-carol-uas 2>/dev/null || true
+
       - name: B2BUA REFER terminate + REAL rtpengine (media re-anchor offer/answer/delete)
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-rtpengine-refer up --abort-on-container-exit --exit-code-from sipp-anchored-refer-uac sipp-anchored-refer-uac sipp-anchored-refer-bob-uas sipp-anchored-refer-carol-uas
 
@@ -594,7 +627,7 @@ jobs:
 
       - name: Teardown
         if: always()
-        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-refer --profile b2bua-refer-reject --profile b2bua-refer-terminate --profile b2bua-rtpengine-refer down --remove-orphans
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-refer --profile b2bua-refer-reject --profile b2bua-refer-terminate --profile b2bua-refer-referrer-bye --profile b2bua-refer-attended --profile b2bua-rtpengine-refer down --remove-orphans
 
       - name: Upload logs
         if: always()

@@ -187,6 +187,43 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   a personal one.
 
 ### Fixed
+- **A blind transfer no longer kills the call when the transferor hangs up
+  first.** In a siphon-terminated `REFER` the transferor is free to end its own
+  dialog the moment the transfer is accepted (RFC 5589 §7), and real ones do —
+  a Microsoft Teams blind transfer BYEs within a few hundred milliseconds of the
+  `202`, roughly a second before the transfer target answers. That BYE was
+  treated as an ordinary bridge hangup: siphon generated a BYE at the far leg
+  (killing the very party the transfer exists to keep), deleted the media
+  session and destroyed the call actor. The target's `200 OK` then matched
+  nothing and was never ACKed, so it retransmitted to Timer B and the transfer
+  target was left in a call no one was on. Both parties dropped and the transfer
+  destination rang into nowhere. The referrer's departure is now recognised
+  while the transfer is in flight: the BYE is answered `200`, the surviving leg
+  is kept, the target is dialled through to completion and bridged, and the
+  terminating sipfrag `NOTIFY` and referrer `BYE` are skipped because the
+  implicit subscription died with the dialog (RFC 3515 §2.4.4). `@b2bua.on_bye`
+  no longer fires for that BYE either — the call is not ending, so a handler
+  that tears the call down on it can no longer undo the transfer. If the target
+  then *fails*, the now-orphaned surviving leg is released instead of being left
+  stranded.
+- **Attended transfer emits the `Replaces` it was given.** An attended `REFER`
+  carries `Refer-To: <target?Replaces=dialog>`, and RFC 3891 §3 requires that
+  dialog reference on the INVITE sent to the transfer target. siphon parsed the
+  `Replaces`, used it only to label a log line, and dropped it — so every
+  attended transfer degraded silently into a blind one and the held call it was
+  meant to take over was never replaced. The reference is now carried onto the
+  triggered INVITE, and rewritten to the dialog as the *target* sees it when
+  siphon hosts the replaced call: the referrer names it with the identifiers of
+  the leg facing itself, which on a B2BUA are meaningless at the far end and
+  would draw a `481`. A dialog siphon does not host crosses unchanged.
+- **A completed transfer no longer strands the referrer's Call-ID.** The leg the
+  transfer promoted away from left the call without its registry entry being
+  cleared, and teardown only walks the legs still attached, so the mapping
+  outlived the call permanently. A later INVITE reusing that Call-ID matched the
+  "call already exists" guard and was absorbed as a retransmission — the caller
+  got no response at all, not even a `100`. The promoted-away dialog is now
+  retired properly, so a late in-dialog request on it answers `481` like any
+  other torn-down leg.
 - **A `siphon-bin` build reports the SIPhon version again.** It announced its
   own package version (`0.1.0`) in the startup banner, the `User-Agent`/`Server`
   headers and `/admin/health`, which broke the lockstep guarantee that the

@@ -2181,6 +2181,7 @@ fn refer_subscription_push_query_clear() {
             notify_cseq: 4,
             state: TransferState::Trying,
             target_leg_call_id: None,
+            referrer_gone: false,
         },
     );
     assert!(store.has_subscriber_refer_subscription(&call_id, true));
@@ -2189,6 +2190,257 @@ fn refer_subscription_push_query_clear() {
 
     store.clear_refer_subscriptions_on_leg(&call_id, true);
     assert!(!store.has_subscriber_refer_subscription(&call_id, true));
+}
+
+#[test]
+fn promoting_the_transfer_target_retires_the_referrers_call_id() {
+    // The referrer's leg leaves the call at promotion, so the teardown never
+    // walks it. If its Call-ID stays in the registry, a later INVITE reusing
+    // that Call-ID matches the dispatcher's "call already exists" guard and is
+    // absorbed as a retransmission — the caller gets no response at all.
+    let store = CallActorStore::new();
+    let referrer_call_id = "referrer-dialog@test";
+    let call_id = store.create_call(make_a_leg(referrer_call_id));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.3:5060"));
+
+    assert_eq!(
+        store.find_by_sip_call_id(referrer_call_id).as_deref(),
+        Some(call_id.as_str()),
+        "the referrer's dialog resolves while the call is up"
+    );
+
+    // Target is at index 1; the referrer is the A-leg (the Teams shape).
+    let promoted = store.promote_transfer_target(&call_id, 1, true);
+    assert!(promoted.is_some(), "the target must be promoted");
+
+    assert!(
+        store.find_by_sip_call_id(referrer_call_id).is_none(),
+        "the promoted-away referrer's Call-ID must not resolve to the call any more"
+    );
+
+    // The call itself carries on, now fronted by the transfer target.
+    assert!(store.get_call(&call_id).is_some());
+}
+
+#[test]
+fn transfer_referrer_bye_is_recognised_and_flags_the_subscription() {
+    // The Teams blind-transfer shape: A REFERs, siphon dials the target, and A
+    // BYEs its own dialog ~300 ms later, long before the target answers. That
+    // BYE must be recognised as the referrer leaving a transfer that is still
+    // running (RFC 5589 §7) and NOT as the end of the call — the surviving
+    // party is still up, waiting to be bridged to the target.
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("teams-refer@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+
+    let target = make_b_leg("10.0.0.3:5060");
+    let target_call_id = target.dialog.call_id.clone();
+    store.add_b_leg(&call_id, target);
+    store.push_refer_subscription(
+        &call_id,
+        ReferSubscription {
+            on_a_leg: true,
+            siphon_notifies: true,
+            event_id: 2,
+            notify_cseq: 2,
+            state: TransferState::Trying,
+            target_leg_call_id: Some(target_call_id),
+            referrer_gone: false,
+        },
+    );
+
+    assert!(!store.transfer_referrer_gone(&call_id, true));
+    assert!(store.mark_transfer_referrer_gone(&call_id, true));
+    assert!(store.transfer_referrer_gone(&call_id, true));
+
+    // The call itself survives — that is the whole point.
+    assert!(store.get_call(&call_id).is_some());
+}
+
+#[test]
+fn transfer_referrer_bye_is_idempotent_for_retransmissions() {
+    // A BYE is retransmitted to Timer F over UDP. The second one must be
+    // recognised the same way, or it would fall through to the normal teardown
+    // and kill the call the first one deliberately kept.
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("retx@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+    let target = make_b_leg("10.0.0.3:5060");
+    let target_call_id = target.dialog.call_id.clone();
+    store.add_b_leg(&call_id, target);
+    store.push_refer_subscription(
+        &call_id,
+        ReferSubscription {
+            on_a_leg: true,
+            siphon_notifies: true,
+            event_id: 2,
+            notify_cseq: 2,
+            state: TransferState::Trying,
+            target_leg_call_id: Some(target_call_id),
+            referrer_gone: false,
+        },
+    );
+
+    assert!(store.mark_transfer_referrer_gone(&call_id, true));
+    assert!(store.mark_transfer_referrer_gone(&call_id, true));
+}
+
+#[test]
+fn plain_bye_is_not_mistaken_for_a_transfer_referrer_bye() {
+    // No transfer in flight: an ordinary hangup must take the normal teardown
+    // path, or every BYE would leak a call.
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("plain@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+
+    assert!(!store.mark_transfer_referrer_gone(&call_id, true));
+    assert!(!store.mark_transfer_referrer_gone(&call_id, false));
+}
+
+#[test]
+fn surviving_party_bye_during_transfer_still_tears_the_call_down() {
+    // Only the REFERRER's departure is survivable. When the party that is being
+    // transferred hangs up instead, there is nothing left to hand to the target,
+    // so that BYE must take the ordinary teardown path.
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("survivor-bye@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+    let target = make_b_leg("10.0.0.3:5060");
+    let target_call_id = target.dialog.call_id.clone();
+    store.add_b_leg(&call_id, target);
+    store.push_refer_subscription(
+        &call_id,
+        ReferSubscription {
+            on_a_leg: true,
+            siphon_notifies: true,
+            event_id: 2,
+            notify_cseq: 2,
+            state: TransferState::Trying,
+            target_leg_call_id: Some(target_call_id),
+            referrer_gone: false,
+        },
+    );
+
+    // Referrer is the A-leg, so a B-leg BYE is the survivor's.
+    assert!(!store.mark_transfer_referrer_gone(&call_id, false));
+}
+
+#[test]
+fn transparent_transfer_referrer_bye_is_a_normal_teardown() {
+    // Transparent mode owns no siphon subscription — the far leg runs the
+    // transfer itself — so the referrer hanging up genuinely ends this bridge.
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("transparent@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+
+    assert!(!store.mark_transfer_referrer_gone(&call_id, true));
+}
+
+#[test]
+fn originated_refer_subscription_never_flags_referrer_gone() {
+    // The subscriber role is siphon's own outbound REFER: siphon IS the
+    // referrer, so there is no remote referrer to leave, and a BYE on that leg
+    // is a real hangup.
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("originated@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+    store.push_refer_subscription(
+        &call_id,
+        ReferSubscription {
+            on_a_leg: true,
+            siphon_notifies: false,
+            event_id: 3,
+            notify_cseq: 3,
+            state: TransferState::Trying,
+            target_leg_call_id: None,
+            referrer_gone: false,
+        },
+    );
+
+    assert!(!store.mark_transfer_referrer_gone(&call_id, true));
+}
+
+#[test]
+fn attended_replaces_is_translated_to_the_targets_dialog_view() {
+    // RFC 3891 §3: the triggered INVITE names the dialog to replace with the
+    // identifiers the RECEIVING UAS knows. On a B2BUA the referrer names the
+    // leg facing itself, so the triple has to be rewritten to the far leg —
+    // forwarded verbatim it names a dialog the target has never seen and draws
+    // a 481.
+    let store = CallActorStore::new();
+
+    // The referrer's held call: A-leg faces the referrer, B-leg faces the target.
+    let mut held_a = make_a_leg("held-call@test");
+    held_a.dialog.local_tag = "siphon-to-referrer".to_string();
+    held_a.dialog.remote_tag = Some("referrer-tag".to_string());
+    let held_call = store.create_call(held_a);
+
+    let mut held_b = make_b_leg("10.0.0.9:5060");
+    held_b.dialog.call_id = "held-b-leg@test".to_string();
+    held_b.dialog.local_tag = "siphon-to-target".to_string();
+    held_b.dialog.remote_tag = Some("target-tag".to_string());
+    store.add_b_leg(&held_call, held_b);
+    store.set_winner(&held_call, 0);
+
+    // The referrer's view of that dialog: its own Call-ID, its tag as from-tag,
+    // siphon's tag as to-tag.
+    let (found_call, peer) = store
+        .replaces_as_seen_by_peer("held-call@test", "referrer-tag", "siphon-to-referrer")
+        .expect("dialog is hosted here, so it must resolve");
+
+    assert_eq!(found_call, held_call);
+    assert_eq!(peer.call_id, "held-b-leg@test");
+    // from-tag is siphon's tag on the leg facing the target...
+    assert_eq!(peer.from_tag, "siphon-to-target");
+    // ...and to-tag is the target's own.
+    assert_eq!(peer.to_tag, "target-tag");
+}
+
+#[test]
+fn attended_replaces_for_an_unknown_dialog_is_left_alone() {
+    // A referrer transferring against a call that never traversed this node:
+    // nothing to translate, so the caller forwards the triple verbatim.
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("unrelated@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+
+    assert!(store
+        .replaces_as_seen_by_peer("not-ours@elsewhere", "x", "y")
+        .is_none());
+}
+
+#[test]
+fn attended_replaces_resolves_from_the_b_leg_side_too() {
+    // The referrer may be the callee: then the leg facing it is a B-leg and the
+    // peer to name is the A-leg.
+    let store = CallActorStore::new();
+    let mut held_a = make_a_leg("held-from-b@test");
+    held_a.dialog.local_tag = "siphon-to-caller".to_string();
+    held_a.dialog.remote_tag = Some("caller-tag".to_string());
+    let held_call = store.create_call(held_a);
+
+    let mut held_b = make_b_leg("10.0.0.9:5060");
+    held_b.dialog.call_id = "b-side@test".to_string();
+    held_b.dialog.local_tag = "siphon-to-referrer".to_string();
+    held_b.dialog.remote_tag = Some("referrer-tag".to_string());
+    store.add_b_leg(&held_call, held_b);
+    store.set_winner(&held_call, 0);
+
+    let (_, peer) = store
+        .replaces_as_seen_by_peer("b-side@test", "referrer-tag", "siphon-to-referrer")
+        .expect("B-leg-facing referrer must resolve to the A-leg");
+    assert_eq!(peer.call_id, "held-from-b@test");
+    assert_eq!(peer.from_tag, "siphon-to-caller");
+    assert_eq!(peer.to_tag, "caller-tag");
 }
 
 #[test]
@@ -2207,6 +2459,7 @@ fn refer_notifier_subscription_is_not_a_subscriber_one() {
             notify_cseq: 2,
             state: TransferState::Trying,
             target_leg_call_id: None,
+            referrer_gone: false,
         },
     );
     assert!(!store.has_subscriber_refer_subscription(&call_id, true));

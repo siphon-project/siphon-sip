@@ -103,6 +103,40 @@ Alice (A-leg)            siphon 198.51.100.1            Bob (B-leg)      Carol (
      |------------------------->|                            |                |
 ```
 
+#### When the transferor hangs up first
+
+The ladder above shows siphon BYEing the referrer once the target answers, but a
+transferor is entitled to leave the moment its `REFER` is accepted (RFC 5589 §7),
+and several real ones do — a Microsoft Teams blind transfer BYEs a few hundred
+milliseconds after the `202`, well before the target picks up:
+
+```
+   Alice (referrer)              siphon                    Carol (target)
+     |  REFER / 202 / NOTIFY 100 |                            |
+     |------------------------->|  INVITE (new leg) --------->|  (ringing)
+     |  BYE                     |                            |
+     |------------------------->|                            |
+     |  200 OK                  |                            |
+     |<-------------------------|            200 OK          |
+     |     (Alice is gone)      |<---------------------------|
+     |                          |  ACK ---------------------->|
+     |                          |     Bob <== bridged ==> Carol
+```
+
+siphon treats that as the transferor leaving, **not** as the end of the call: the
+BYE is answered `200`, the surviving party stays up, and the target is dialled
+through and bridged as normal. The terminating sipfrag `NOTIFY` and the referrer
+`BYE` are simply skipped, because the implicit subscription died with the dialog
+(RFC 3515 §2.4.4).
+
+Two consequences worth knowing when you write handlers:
+
+* **`@b2bua.on_bye` does not fire for that BYE.** The call is not ending, so a
+  handler that calls `call.terminate()` on every BYE cannot accidentally undo the
+  transfer. `on_bye` fires later, when the transferred call really ends.
+* **If the target then fails**, the surviving party has nobody left to talk to,
+  so siphon releases it and tears the call down rather than stranding it.
+
 Rewrite the destination or steer egress without touching what the endpoints see:
 
 ```python
@@ -165,6 +199,16 @@ def on_refer(call):
 !!! warning "One argument, no reply"
     The handler is `def on_refer(call):` — one argument, no reply object
     (`REFER` is a request).
+
+!!! note "The `Replaces` is rewritten for the target"
+    The INVITE siphon triggers towards the transfer target carries the `Replaces`
+    naming the dialog to be taken over (RFC 3891 §3). The referrer names that
+    dialog with the identifiers of the leg facing **itself**, which on a B2BUA
+    are not the ones the target knows — so when siphon hosts the replaced call
+    the reference is rewritten to the far leg's Call-ID and tag pair before it
+    goes out. A dialog siphon does not host crosses unchanged, which is the
+    right best-effort behaviour when the replaced call never traversed this
+    node.
 
 ```text
 Alice                    siphon 198.51.100.1            Bob            Carol

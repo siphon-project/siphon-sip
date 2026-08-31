@@ -803,6 +803,33 @@ pub struct ReferSubscription {
     /// so an unrelated leg dialed while a transfer is pending can't be mistaken
     /// for the transfer target. `None` for the subscriber (outbound) role.
     pub target_leg_call_id: Option<String>,
+    /// True once the referrer's dialog ended while this transfer was still in
+    /// flight — the referrer sent a BYE after siphon accepted the REFER but
+    /// before the dialed target resolved.
+    ///
+    /// RFC 3515 §2.4.4: the implicit refer subscription lives in the dialog the
+    /// REFER arrived on, so once that dialog ends no further NOTIFY can be
+    /// delivered (a late one draws a 481) and the referrer needs no BYE at
+    /// completion — it already left. The transfer itself continues: RFC 5589 §7
+    /// has the transferor free to end its dialog as soon as the REFER is
+    /// accepted, and the surviving party ↔ target call is what the transfer
+    /// exists to create. Notifier (siphon-terminated) role only.
+    pub referrer_gone: bool,
+}
+
+/// One end of a dialog, in the shape `Replaces` (RFC 3891) names it.
+///
+/// Produced by [`CallActorStore::replaces_as_seen_by_peer`] when an attended
+/// transfer's `Replaces` has to be rewritten from the referrer's view of a
+/// dialog to the transfer target's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacesDialog {
+    /// Call-ID of the dialog, as the far party knows it.
+    pub call_id: String,
+    /// The `from-tag` parameter — siphon's local tag on the leg facing that party.
+    pub from_tag: String,
+    /// The `to-tag` parameter — that party's own tag.
+    pub to_tag: String,
 }
 
 /// Per-call supervisor managing A-leg + B-leg(s).
@@ -1708,6 +1735,56 @@ impl CallActorStore {
         None
     }
 
+    /// Resolve the `Replaces` triple a referrer supplied (its own view of the
+    /// dialog to be replaced) into the triple the *far* party of that dialog
+    /// would recognise, together with the internal call id the dialog belongs to.
+    ///
+    /// On a B2BUA the two ends of a call never share dialog identifiers: the
+    /// referrer names its held call by the Call-ID and tag pair of the leg
+    /// facing *it*, while the transfer target only knows the leg facing itself.
+    /// A `Replaces` forwarded verbatim therefore names a dialog the target has
+    /// never seen, and RFC 3891 §3 requires it to answer `481`. This returns the
+    /// far leg's identifiers *as the far party sees them* — its Call-ID,
+    /// siphon's local tag as the `from-tag`, and the far party's own tag as the
+    /// `to-tag` (RFC 3891 §3 matches those against the remote and local tag of
+    /// the dialog at the receiving UAS, respectively).
+    ///
+    /// `None` when the dialog is not one this node hosts (a referrer
+    /// transferring against a call that never traversed siphon), when the far
+    /// leg has no tag yet (nothing to replace), or when the far leg has not been
+    /// chosen — the caller passes the referrer's own triple through in that case.
+    pub fn replaces_as_seen_by_peer(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        to_tag: &str,
+    ) -> Option<(String, ReplacesDialog)> {
+        for entry in self.calls.iter() {
+            let call = entry.value();
+            let matches = |leg: &Leg| {
+                leg.dialog.call_id == call_id
+                    && leg.dialog.local_tag == to_tag
+                    && leg.dialog.remote_tag.as_deref() == Some(from_tag)
+            };
+            let peer = if matches(&call.a_leg) {
+                call.winner.and_then(|index| call.b_legs.get(index))
+            } else if call.b_legs.iter().any(matches) {
+                Some(&call.a_leg)
+            } else {
+                continue;
+            }?;
+            return Some((
+                entry.key().clone(),
+                ReplacesDialog {
+                    call_id: peer.dialog.call_id.clone(),
+                    from_tag: peer.dialog.local_tag.clone(),
+                    to_tag: peer.dialog.remote_tag.clone()?,
+                },
+            ));
+        }
+        None
+    }
+
     /// Atomically increment the local CSeq counter on the A-leg or the
     /// winning B-leg and return the new value. Used when the B2BUA needs
     /// to originate an in-dialog request (PRACK, BYE, re-INVITE) and must
@@ -2108,6 +2185,60 @@ impl CallActorStore {
             .unwrap_or(false)
     }
 
+    /// Record that the referrer of an in-flight siphon-terminated transfer has
+    /// ended its dialog (sent BYE) before the dialed target resolved, and report
+    /// whether that was the case.
+    ///
+    /// `true` means the BYE closed the *referrer's* leg of a transfer that is
+    /// still running, so the call must NOT be torn down: the surviving party is
+    /// waiting to be bridged to the transfer target (RFC 5589 §7 — the
+    /// transferor is free to leave as soon as the REFER is accepted). Every
+    /// matching notifier subscription is flagged so the completion path skips
+    /// the terminating NOTIFY and the referrer BYE it can no longer deliver
+    /// (RFC 3515 §2.4.4 — the implicit subscription died with the dialog).
+    ///
+    /// `false` for every other BYE — a plain hangup, the surviving party's own
+    /// BYE, a transparent-mode transfer (siphon owns no subscription there), or
+    /// a transfer whose target already resolved — and those take the normal
+    /// teardown path unchanged.
+    ///
+    /// Idempotent: a retransmitted BYE re-flags an already-flagged subscription
+    /// and still reports `true`, so the retransmission is answered the same way
+    /// rather than falling through to a teardown.
+    pub fn mark_transfer_referrer_gone(&self, call_id: &str, on_a_leg: bool) -> bool {
+        let Some(mut call) = self.calls.get_mut(call_id) else {
+            return false;
+        };
+        let mut matched = false;
+        for subscription in call.refer_subscriptions.iter_mut() {
+            if subscription.siphon_notifies
+                && subscription.on_a_leg == on_a_leg
+                && subscription.target_leg_call_id.is_some()
+            {
+                subscription.referrer_gone = true;
+                matched = true;
+            }
+        }
+        matched
+    }
+
+    /// True when the referrer of the in-flight siphon-terminated transfer on
+    /// this leg has already left (see [`mark_transfer_referrer_gone`]).
+    ///
+    /// [`mark_transfer_referrer_gone`]: Self::mark_transfer_referrer_gone
+    pub fn transfer_referrer_gone(&self, call_id: &str, on_a_leg: bool) -> bool {
+        self.calls
+            .get(call_id)
+            .map(|call| {
+                call.refer_subscriptions.iter().any(|subscription| {
+                    subscription.siphon_notifies
+                        && subscription.on_a_leg == on_a_leg
+                        && subscription.referrer_gone
+                })
+            })
+            .unwrap_or(false)
+    }
+
     /// Drop any REFER subscriptions recorded on the given leg (e.g. on the
     /// terminating NOTIFY of a siphon-owned subscription).
     pub fn clear_refer_subscriptions_on_leg(&self, call_id: &str, on_a_leg: bool) {
@@ -2239,13 +2370,34 @@ impl CallActorStore {
                 _ => {}
             }
             let old_referrer = std::mem::replace(&mut call.a_leg, target);
+            drop(call);
+            self.retire_promoted_referrer(&old_referrer);
             Some(old_referrer)
         } else {
             let old_winner_idx = call.winner?;
             let old_referrer = call.b_legs.get(old_winner_idx).cloned()?;
             call.winner = Some(target_idx);
+            drop(call);
+            self.retire_promoted_referrer(&old_referrer);
             Some(old_referrer)
         }
+    }
+
+    /// Retire the dialog the transfer promoted away from.
+    ///
+    /// The referrer's leg leaves the call at promotion, so `remove_call` will
+    /// never see it at teardown — it only walks the legs still attached. Without
+    /// this its `Call-ID → call` registry entry outlives the call forever, and
+    /// the next INVITE that reuses that Call-ID matches the dispatcher's
+    /// "call already exists" guard and is silently absorbed as a retransmission:
+    /// the caller gets no response at all, not even a 100. Retiring it here also
+    /// makes a late in-dialog request on the retired dialog answer 481 rather
+    /// than resolving to a call that has moved on (RFC 3261 §12.2.2), which is
+    /// the same treatment every other torn-down leg gets.
+    fn retire_promoted_referrer(&self, referrer: &Leg) {
+        self.registry.remove_call_id(&referrer.dialog.call_id);
+        self.registry.remove_branch(&referrer.branch);
+        self.remember_terminated(&referrer.dialog.call_id);
     }
 
     /// Remove a call and clean up all registry entries.
