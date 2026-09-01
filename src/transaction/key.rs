@@ -9,9 +9,28 @@
 //! identification. Without sent-by, two different UAs that generate the same branch
 //! (e.g., SIPp's deterministic branches) would incorrectly collide.
 //!
-//! For RFC 2543 backwards-compat (no branch or non-magic-cookie branch), the key
-//! falls back to: From-tag + Call-ID + CSeq + top Via sent-by. We implement this
-//! as a simple hash fallback.
+//! # RFC 2543 legacy matching is NOT implemented
+//!
+//! §17.2.3 also defines matching for a request whose topmost Via carries no
+//! branch, or one without the `z9hG4bK` magic cookie: Request-URI, To tag,
+//! From tag, Call-ID, CSeq and top Via, with ACK keyed on the To tag of the
+//! *response* rather than the request. siphon does none of that — a request
+//! with no branch parameter fails [`super::TransactionManager::key_from_message`]
+//! and never gets a server transaction at all.
+//!
+//! (This module used to claim the fallback was implemented "as a simple hash
+//! fallback". It never was, and the claim outlived several people reading it.)
+//!
+//! The consequence is not a rejection but a silent downgrade: the dispatcher
+//! logs the failure at debug and processes the request anyway, statelessly. So
+//! a legacy peer's retransmissions are not absorbed, and each one runs the
+//! script again. `siphon_requests_without_branch_total` counts them, because
+//! the alternative to counting is finding out from a duplicate-call report.
+//!
+//! Implementing §17.2.3 properly needs a second index (the ACK case keys on a
+//! tag siphon only learns when it sends the response), which is why this is a
+//! documented gap rather than a half-built one. Nothing in siphon's deployment
+//! profile — IMS, WebRTC, modern trunks — speaks RFC 2543.
 
 use std::fmt;
 use std::hash::Hash;

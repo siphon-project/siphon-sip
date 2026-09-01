@@ -35,7 +35,77 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
     while the framer's ASCII trim left it alone. Header names are ASCII tokens
     (§25.1), so the parser now trims ASCII too.
 
+### Added
+- **`siphon_requests_without_branch_total`.** Counts inbound requests whose
+  topmost Via carries no `branch` parameter (mandatory since RFC 3261 §8.1.1.7).
+  siphon has no RFC 2543 legacy transaction matching, so these are processed
+  statelessly — their retransmissions are not absorbed and each one runs the
+  script again. Previously this degradation was invisible outside a debug log.
+  The gap is now stated in the feature-readiness matrix; the `transaction::key`
+  module documentation had claimed a fallback that was never implemented.
+
+
+- **Framing fuzz target (`stream_framing_fuzz`).** Fuzzes the stream framer's
+  invariants — a framed length never exceeds the buffer or the ceiling, and a
+  refused message's header block stays inside the buffer — alongside the
+  existing parser target in CI.
+
+- **Control plane: `ring` is its own verb, split from `progress`.** RFC 3261
+  §13.2.1 makes the `180 Ringing` the "callee is being alerted" signal and
+  §21.1.2 gives it no session semantics; RFC 3960 §3.1 puts early media on the
+  response that carries the SDP. They were one verb, so an application had to
+  know which status code meant which. Now `ring` sends a plain 180 — and refuses
+  a body rather than putting an early-media offer on the wire under a verb that
+  says it only alerts — while `progress` stays the one that opens an early-media
+  path. That is what lets an application ring for an interval of its own
+  choosing and separately decide whether to open early media. Mirrored in all
+  three control SDKs (`Call::ring` / `call.ring()` / `Call.ring()`).
+- **Control plane: a `PlayStarted` event.** `play` was fire-and-forget with no
+  event at all, and its reply dropped the media engine's `play_id`, so an
+  application had nothing to hang a playback watchdog or a gain ramp on and no
+  way to correlate one. The `play` reply now carries `play_id` and `duration_ms`
+  when the engine reports them, and the accept is also pushed as `PlayStarted`
+  with payload `{source, play_id?, duration_ms?}`. The media contract answers
+  `play` accept-on-start, so the event means the engine armed the playback, not
+  that audio has reached the wire — a `url` source accepts before its body has
+  arrived. A play the backend refuses pushes **no** event, so "no `PlayStarted`
+  yet" always reads as "not started".
+
+### Changed
+- **Control plane: `StasisEnd` now carries the SIP status on every teardown that
+  had one.** `code` / `response` were only populated on the two originate paths;
+  four more now report theirs — `487 Request Terminated` on a CANCEL in either
+  direction (RFC 3261 §9.1/§9.2), `408 Request Timeout` on the B2BUA answer
+  timeout, and the status siphon actually sent on a `reject`, an unanswered
+  `hangup`, or the handoff-deadline default (`503`). A teardown with no SIP
+  response (an ordinary BYE, a script-driven terminate) still omits both keys
+  rather than inventing one, so `code` present always means a real status was on
+  the wire.
+- **Control plane: a provisional's reply names what it sent.** `progress`
+  reported `state: "ringing"` for every 1xx, including a 183 carrying early
+  media. It now replies `{state: "ringing"|"progress", code, early_media}`,
+  using the same rule as the callee-side `ChannelStateChange` on an originated
+  leg, so there is one vocabulary to learn rather than two.
+- **`SipVerb` in `siphon-control-proto` is now `#[non_exhaustive]`** (as
+  `SipEvent` already was), so every future verb is additive for consumers rather
+  than breaking an exhaustive `match`.
+
 ### Fixed
+- **A request racing an in-flight copy of itself no longer forks the call
+  twice.** The dispatcher checks `handle_server_retransmit` and then creates the
+  server transaction, which is a check-then-act: when a request and its
+  retransmission land on two workers at once, both saw "no transaction" and both
+  created one. The second `insert` overwrote the first's live state — its cached
+  response and running timers — and, worse, both passed the request to the TU,
+  so the script ran twice and forked downstream twice on a fresh branch each
+  time. Creation is now atomic: the first caller owns the transaction and a
+  concurrent duplicate is absorbed. Reachable under packet loss on UDP, where a
+  UAC's Timer A fires while the original is still being processed.
+- **A colliding client transaction is refused instead of silently replacing the
+  live one.** siphon picks its own branch, so a collision is not a peer
+  retransmission — a blind `insert` destroyed a running transaction's timers and
+  left its request unanswered.
+
 - **A header with an empty value no longer swallows the next header line.**
   RFC 3261 §25.1 has `SWS = [LWS]` and `LWS = [*WSP CRLF] 1*WSP` — a CRLF after
   the header colon is only whitespace when a space or tab follows it. siphon
@@ -66,13 +136,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   so an unrepresentable declaration is refused as over-sized. Found by the new
   framing fuzz target.
 
-### Added
-- **Framing fuzz target (`stream_framing_fuzz`).** Fuzzes the stream framer's
-  invariants — a framed length never exceeds the buffer or the ceiling, and a
-  refused message's header block stays inside the buffer — alongside the
-  existing parser target in CI.
-
-### Fixed
 - **The ACK for a bridged re-INVITE was addressed to siphon itself.** RFC 3261
   §13.2.2.4 puts the responder's own remote target in the ACK's Request-URI, and
   siphon read it from the 200 OK — but only *after* `sanitize_b2bua_response` had
@@ -131,46 +194,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   it alone, as the CAP_NET_ADMIN tests already are. Alone it is exact: ambient
   0 B, 241664 B leaked, 0 B retained, every run. The guard is unchanged in what
   it proves.
-### Added
-- **Control plane: `ring` is its own verb, split from `progress`.** RFC 3261
-  §13.2.1 makes the `180 Ringing` the "callee is being alerted" signal and
-  §21.1.2 gives it no session semantics; RFC 3960 §3.1 puts early media on the
-  response that carries the SDP. They were one verb, so an application had to
-  know which status code meant which. Now `ring` sends a plain 180 — and refuses
-  a body rather than putting an early-media offer on the wire under a verb that
-  says it only alerts — while `progress` stays the one that opens an early-media
-  path. That is what lets an application ring for an interval of its own
-  choosing and separately decide whether to open early media. Mirrored in all
-  three control SDKs (`Call::ring` / `call.ring()` / `Call.ring()`).
-- **Control plane: a `PlayStarted` event.** `play` was fire-and-forget with no
-  event at all, and its reply dropped the media engine's `play_id`, so an
-  application had nothing to hang a playback watchdog or a gain ramp on and no
-  way to correlate one. The `play` reply now carries `play_id` and `duration_ms`
-  when the engine reports them, and the accept is also pushed as `PlayStarted`
-  with payload `{source, play_id?, duration_ms?}`. The media contract answers
-  `play` accept-on-start, so the event means the engine armed the playback, not
-  that audio has reached the wire — a `url` source accepts before its body has
-  arrived. A play the backend refuses pushes **no** event, so "no `PlayStarted`
-  yet" always reads as "not started".
-
-### Changed
-- **Control plane: `StasisEnd` now carries the SIP status on every teardown that
-  had one.** `code` / `response` were only populated on the two originate paths;
-  four more now report theirs — `487 Request Terminated` on a CANCEL in either
-  direction (RFC 3261 §9.1/§9.2), `408 Request Timeout` on the B2BUA answer
-  timeout, and the status siphon actually sent on a `reject`, an unanswered
-  `hangup`, or the handoff-deadline default (`503`). A teardown with no SIP
-  response (an ordinary BYE, a script-driven terminate) still omits both keys
-  rather than inventing one, so `code` present always means a real status was on
-  the wire.
-- **Control plane: a provisional's reply names what it sent.** `progress`
-  reported `state: "ringing"` for every 1xx, including a 183 carrying early
-  media. It now replies `{state: "ringing"|"progress", code, early_media}`,
-  using the same rule as the callee-side `ChannelStateChange` on an originated
-  leg, so there is one vocabulary to learn rather than two.
-- **`SipVerb` in `siphon-control-proto` is now `#[non_exhaustive]`** (as
-  `SipEvent` already was), so every future verb is additive for consumers rather
-  than breaking an exhaustive `match`.
 
 ## [1.7.1] — 2026-09-01
 

@@ -3993,7 +3993,21 @@ fn handle_request(
     // ACK is excluded (handled by existing IST), as are requests going to B2BUA.
     let txn_transport = crate::transaction::state::Transport::from(inbound.transport);
     let server_key = match state.transaction_manager.new_server_transaction(&message, txn_transport) {
-        Ok((key, actions)) => {
+        Ok(outcome) if !outcome.is_new => {
+            // Another worker created this transaction between our
+            // `handle_server_retransmit` check above and the create — i.e. a
+            // retransmission arrived while the original was still being
+            // processed, and both landed on different workers. It is already
+            // being handled; running the script for this copy too would fork
+            // the call a second time downstream on a fresh branch.
+            debug!(
+                method = %method,
+                key = %outcome.key,
+                "request raced an in-flight copy of itself — absorbed"
+            );
+            return;
+        }
+        Ok(crate::transaction::ServerTransactionOutcome { key, actions, .. }) => {
             // Schedule any initial server-side timers
             for action in &actions {
                 if let Action::StartTimer(name, duration) = action {
@@ -4015,6 +4029,16 @@ fn handle_request(
             Some(key)
         }
         Err(error) => {
+            // The request is still processed, statelessly — but with no
+            // transaction there is no retransmission absorption, so every
+            // retransmission runs the script again. Overwhelmingly this is a
+            // topmost Via with no `branch` (mandatory since RFC 3261 §8.1.1.7;
+            // siphon has no RFC 2543 legacy matching — see
+            // `transaction::key`), which is worth counting rather than
+            // learning about later from a duplicate-call report.
+            if let Some(metrics) = crate::metrics::try_metrics() {
+                metrics.requests_without_branch_total.inc();
+            }
             debug!(method = %method, "failed to create server transaction: {error}");
             None
         }
@@ -28507,7 +28531,7 @@ a=rtpmap:8 PCMA/8000\r\n";
         let manager = TransactionManager::default();
         let invite = sample_invite();
         let txn_transport = crate::transaction::state::Transport::Udp;
-        let (key, actions) = manager.new_server_transaction(&invite, txn_transport).unwrap();
+        let crate::transaction::ServerTransactionOutcome { key, actions, .. } = manager.new_server_transaction(&invite, txn_transport).unwrap();
         assert_eq!(key.method, Method::Invite);
         assert_eq!(manager.count(), 1);
         assert!(actions.iter().any(|a| matches!(a, Action::PassToTu(_))));
