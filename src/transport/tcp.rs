@@ -129,14 +129,23 @@ pub async fn listen(
 /// Content-Length is missing (assumes 0-length body in that case once
 /// the header block is complete).
 pub fn extract_sip_message_length(buffer: &[u8]) -> Option<usize> {
+    // Skip leading CRLF keepalives (RFC 3261 §7.5 / RFC 5626 §4.4.1) using the
+    // same helper the parser does. The stream readers drain them before framing
+    // so this rarely fires — but a framer and a parser that disagree about
+    // where a message *starts* is the same class of bug as disagreeing about
+    // where it ends, and sharing the helper makes them agree by construction
+    // rather than by one layer happening to sanitise for the other.
+    let prefix = crate::sip::parser::leading_crlf_len(buffer);
+    let rest = &buffer[prefix..];
+
     // Find end of headers
-    let header_end = buffer
+    let header_end = rest
         .windows(4)
         .position(|w| w == b"\r\n\r\n")?;
-    let headers_len = header_end + 4; // include the \r\n\r\n
+    let headers_len = prefix + header_end + 4; // include the \r\n\r\n
 
     // Parse Content-Length from header block
-    let header_block = &buffer[..header_end];
+    let header_block = &rest[..header_end];
     let content_length = extract_content_length(header_block).unwrap_or(0);
 
     // Saturate rather than wrap. `Content-Length: 18446744073709551615` parses
@@ -250,11 +259,13 @@ pub fn frame_sip_message(buffer: &[u8], max_message_bytes: usize) -> FrameVerdic
     };
     if len > max_message_bytes {
         // Safe: `extract_sip_message_length` returned `Some`, so `\r\n\r\n`
-        // is present and the header block is fully buffered.
-        let header_len = buffer
+        // is present and the header block is fully buffered. Measured past any
+        // leading CRLF keepalives, exactly as the length above was.
+        let prefix = crate::sip::parser::leading_crlf_len(buffer);
+        let header_len = buffer[prefix..]
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
-            .map(|end| end + 4)
+            .map(|end| prefix + end + 4)
             .unwrap_or(buffer.len());
         return FrameVerdict::Oversized { declared: len, header_len };
     }
@@ -267,23 +278,64 @@ pub fn frame_sip_message(buffer: &[u8], max_message_bytes: usize) -> FrameVerdic
 
 /// Extract Content-Length value from raw header bytes.
 /// Handles both full name and compact form (`l:`).
+/// This scan runs *before* parsing, on bytes nobody has validated, and its
+/// answer decides where the next message starts. So it has to model lines the
+/// same way the parser does, or the two disagree about where this message ends
+/// — and the bytes in between are attacker-controlled and belong, to one of
+/// them, to the following message. Two shapes the fuzzer found:
+///
+/// ```text
+/// Subject: hello\r\n Content-Length: 99\r\nContent-Length: 0\r\n\r\n
+/// ```
+///
+/// The continuation line is part of `Subject` to the parser (RFC 3261 §7.3.1
+/// folding) and a header of its own to a naive line scan: 133 bytes against
+/// 232. And the reverse, a folded value the parser reads and a line scan does
+/// not:
+///
+/// ```text
+/// Content-Length:   \r\n\t   1\r\n\r\n
+/// ```
+///
+/// So: skip the start line (never a header, and a Request-URI contains a colon
+/// of its own), skip folded continuation lines, and fold their content into the
+/// value of the header they continue.
 fn extract_content_length(headers: &[u8]) -> Option<usize> {
-    // Search line-by-line for Content-Length or compact form "l:"
-    for line in headers.split(|&b| b == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        // Skip lines without a colon (request-line, empty lines from keepalive CRLFs)
-        let colon_pos = match line.iter().position(|&b| b == b':') {
-            Some(pos) => pos,
-            None => continue,
+    let mut lines = headers
+        .split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .filter(|line| !line.is_empty())
+        .peekable();
+
+    // The first non-empty line is the request/status line, not a header. (Any
+    // empty lines before it are the RFC 5626 §4.4.1 keepalive prefix.)
+    lines.next()?;
+
+    while let Some(line) = lines.next() {
+        // A continuation of a header we already rejected — skip it whole.
+        if matches!(line.first(), Some(b' ' | b'\t')) {
+            continue;
+        }
+        let Some(colon_pos) = line.iter().position(|&b| b == b':') else {
+            continue;
         };
         let (name, value) = line.split_at(colon_pos);
-        let value = &value[1..]; // skip the ':'
         let name_lower: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
-        let name_trimmed = name_lower.trim_ascii();
-        if name_trimmed == b"content-length" || name_trimmed == b"l" {
-            let value_str = std::str::from_utf8(value).ok()?;
-            return value_str.trim().parse().ok();
+        if name_lower.trim_ascii() != b"content-length" && name_lower.trim_ascii() != b"l" {
+            continue;
         }
+
+        // Fold the continuation lines into the value, as the parser does.
+        let mut value = value[1..].to_vec(); // skip the ':'
+        while lines
+            .peek()
+            .is_some_and(|next| matches!(next.first(), Some(b' ' | b'\t')))
+        {
+            value.push(b' ');
+            value.extend_from_slice(lines.next()?);
+        }
+        let value_str = std::str::from_utf8(&value).ok()?;
+        return value_str.trim().parse().ok();
     }
     None
 }

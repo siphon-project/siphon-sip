@@ -3,7 +3,7 @@
 use nom::{
     IResult, Parser,
     bytes::complete::{tag, take_until, take_while, take_while1},
-    character::complete::{char, space1, digit1, multispace0},
+    character::complete::{char, space1, digit1},
     sequence::{preceded, delimited},
     multi::many0,
     combinator::{opt, map_res},
@@ -31,18 +31,85 @@ pub fn parse_sip_message(input: &str) -> IResult<&str, SipMessage> {
     }))
 }
 
+/// Reject a header block whose lines are not all CRLF-terminated.
+///
+/// RFC 3261 §7.5 and the §25.1 grammar make CRLF the only line terminator in a
+/// SIP message: "The start-line, each message-header line, and the empty line
+/// MUST be terminated by a carriage-return line-feed sequence (CRLF)."
+///
+/// Enforcing that is a framing-consistency requirement, not pedantry. siphon's
+/// header-value scan continues to the next CRLF, so a line ended with a bare LF
+/// is absorbed into the *previous* header's value — while the stream framer's
+/// `Content-Length` scan splits on LF and reads that same line as a header of
+/// its own. Given
+///
+/// ```text
+/// X-Pad: a\nContent-Length: 4\r\nContent-Length: 0\r\n\r\nAAAA
+/// ```
+///
+/// the parser sees `Content-Length: 0` and a header `X-Pad` whose value happens
+/// to contain a newline, and the framer sees `Content-Length: 4`. Any upstream
+/// element that treats a bare LF as a terminator (proxies and load balancers
+/// commonly do) sees a different message again, which is the shape request
+/// smuggling is built out of. A bare CR is rejected on the same grounds.
+///
+/// Bodies are untouched — they are opaque octets, and RFC 4475's multipart case
+/// carries bare CR and LF inside one legitimately.
+fn validate_header_line_endings(header_bytes: &[u8]) -> Result<(), String> {
+    for (index, byte) in header_bytes.iter().enumerate() {
+        match byte {
+            b'\n' if index == 0 || header_bytes[index - 1] != b'\r' => {
+                return Err(format!(
+                    "bare LF at offset {index} in the header block; RFC 3261 §7.5 requires CRLF"
+                ));
+            }
+            b'\r' if header_bytes.get(index + 1) != Some(&b'\n') => {
+                return Err(format!(
+                    "bare CR at offset {index} in the header block; RFC 3261 §7.5 requires CRLF"
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Count the leading CRLF pairs a peer may send before the start-line
+/// (RFC 3261 §7.5). Only whole pairs count — a lone CR or LF at the front is
+/// not a keepalive and is left for [`validate_header_line_endings`] to refuse.
+pub(crate) fn leading_crlf_len(input: &[u8]) -> usize {
+    let mut offset = 0;
+    while input[offset..].starts_with(b"\r\n") {
+        offset += 2;
+    }
+    offset
+}
+
 /// Parse the start line and header block out of raw message bytes.
 ///
 /// Returns the parsed start line, the headers, and the index of the `\r\n\r\n`
 /// boundary. Shared by [`parse_sip_message_bytes`] and
 /// [`parse_sip_headers_only`], which differ only in how they treat the body.
 fn parse_header_block(input: &[u8]) -> Result<(StartLine, SipHeaders, usize), String> {
-    let boundary = find_header_boundary(input)
-        .ok_or_else(|| "no header/body boundary (\\r\\n\\r\\n) found".to_string())?;
+    // RFC 3261 §7.5: "Implementations processing SIP messages over
+    // stream-oriented transports MUST ignore any CRLF appearing before the
+    // start-line." Skip them *before* looking for the header/body boundary —
+    // searching first would find the leading CRLF pair itself and leave an
+    // empty start line. (The `trim_start_matches` further down was meant to
+    // cover this but can never fire, for exactly that reason.) The stream
+    // transports drain keepalives in their own read tasks, so in practice this
+    // is the UDP path, where a datagram prefixed with a stray CRLF used to be
+    // dropped as a parse error.
+    let prefix = leading_crlf_len(input);
+    let body = &input[prefix..];
+    let boundary = prefix
+        + find_header_boundary(body)
+            .ok_or_else(|| "no header/body boundary (\\r\\n\\r\\n) found".to_string())?;
 
     // Headers portion including the terminating \r\n\r\n must be valid UTF-8
     let header_end = boundary + 4; // include \r\n\r\n
-    let header_bytes = &input[..header_end.min(input.len())];
+    let header_bytes = &input[prefix..header_end.min(input.len())];
+    validate_header_line_endings(header_bytes)?;
     let header_str = std::str::from_utf8(header_bytes)
         .map_err(|error| format!("non-UTF8 in SIP headers: {error}"))?;
 
@@ -50,7 +117,7 @@ fn parse_header_block(input: &[u8]) -> Result<(StartLine, SipHeaders, usize), St
     // The text parser handles start line → headers → body in one pass.
     // We feed it the header portion only; it will see no body (Content-Length
     // references bytes beyond what we pass, so parse_body returns "").
-    let trimmed = header_str.trim_start_matches("\r\n");
+    let trimmed = header_str;
     let (_, start_line) = parse_start_line(trimmed)
         .map_err(|error| format!("start line parse error: {error}"))?;
     // Skip past start line to parse headers
@@ -455,8 +522,20 @@ fn parse_headers(input: &str) -> IResult<&str, SipHeaders> {
             return Ok((after, headers));
         }
 
-        // Skip leading whitespace (but NOT CRLF — those are checked above)
-        remaining = remaining.trim_start_matches([' ', '\t']);
+        // A line starting with SP or HTAB is a folded continuation (RFC 3261
+        // §7.3.1). `parse_header_line` consumes the continuations belonging to
+        // the header it just read, so reaching the top of this loop on one
+        // means it continues nothing — the header section opened with a fold.
+        // Trimming the whitespace away, as this used to, promoted that line to
+        // a header of its own, which the stream framer skips as a fold: the
+        // two then disagree about whether a `Content-Length` on it counts.
+        // There is no antecedent to fold into, so it is malformed either way.
+        if remaining.starts_with([' ', '\t']) {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                remaining,
+                nom::error::ErrorKind::Space,
+            )));
+        }
 
         match parse_header_line(remaining) {
             Ok((input, (name, value))) => {
@@ -481,7 +560,19 @@ fn parse_header_line(input: &str) -> IResult<&str, (String, String)> {
     // §3.1.1.1 ("TO :") and §3.1.1.7 ("v :", "Via  :") both exercise it.
     let (input, _) = take_while(|c: char| matches!(c, ' ' | '\t'))(input)?;
     let (input, _) = char(':')(input)?;
-    let (input, _) = multispace0(input)?;
+    // SWS, not "any whitespace". RFC 3261 §25.1 has `SWS = [LWS]` and
+    // `LWS = [*WSP CRLF] 1*WSP` — a CRLF may only appear inside linear
+    // whitespace when at least one space or tab follows it, which is exactly
+    // the folding rule the value loop below implements. `multispace0` accepted
+    // a bare CRLF here, so a header with an empty value swallowed the whole of
+    // the next line as its own value:
+    //
+    //     X:\r\nContent-Length: 5\r\n\r\n
+    //
+    // parsed as one header `X` with the value `Content-Length: 5` and no
+    // Content-Length at all, while the stream framer read the 5. Consume only
+    // spaces and tabs and let the fold loop decide about continuation lines.
+    let (input, _) = take_while(|c: char| matches!(c, ' ' | '\t'))(input)?;
 
     // Parse header value (may be folded with SP/TAB on next line)
     let mut value = String::new();
@@ -494,12 +585,12 @@ fn parse_header_line(input: &str) -> IResult<&str, (String, String)> {
         let (input, _) = parse_crlf(input)?;
 
         if input.is_empty() {
-            return Ok((input, (name.trim().to_string(), value.trim().to_string())));
+            return Ok((input, (name.trim_ascii().to_string(), value.trim().to_string())));
         }
 
         let trimmed = input.trim_start_matches([' ', '\t']);
         if trimmed.is_empty() {
-            return Ok((input, (name.trim().to_string(), value.trim().to_string())));
+            return Ok((input, (name.trim_ascii().to_string(), value.trim().to_string())));
         }
 
         if input.starts_with([' ', '\t']) {
@@ -507,7 +598,7 @@ fn parse_header_line(input: &str) -> IResult<&str, (String, String)> {
             value.push(' ');
             remaining = input;
         } else {
-            return Ok((input, (name.trim().to_string(), value.trim().to_string())));
+            return Ok((input, (name.trim_ascii().to_string(), value.trim().to_string())));
         }
     }
 }
@@ -548,6 +639,220 @@ fn parse_crlf(input: &str) -> IResult<&str, &str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- line-ending strictness in the header block (RFC 3261 §7.5) --------
+
+    /// The differential this rejection closes, stated as the two disagreeing
+    /// readings of one byte string.
+    ///
+    /// `parse_header_line` scans a value up to the next CRLF, so a bare LF is
+    /// absorbed into the preceding header's value — siphon used to read the
+    /// message below as `Content-Length: 0` with an `X-Pad` whose value
+    /// contained a newline. The stream framer's `Content-Length` scan splits on
+    /// LF, so it read `Content-Length: 4` off the same bytes. Two components of
+    /// the same proxy disagreed about where the message ended, and any upstream
+    /// element that treats a bare LF as a terminator made a third reading.
+    #[test]
+    fn bare_lf_smuggling_shape_is_refused() {
+        let smuggled = concat!(
+            "INVITE sip:bob@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/TCP host;branch=z9hG4bK1\r\n",
+            "X-Pad: a\nContent-Length: 4\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        )
+        .as_bytes();
+
+        let error = parse_sip_message_bytes(smuggled)
+            .expect_err("a header block with a bare LF must not parse");
+        assert!(error.contains("bare LF"), "unexpected error: {error}");
+
+        // And the framer really did read it the other way, which is why this
+        // has to be refused rather than reconciled.
+        assert_eq!(
+            crate::transport::tcp::extract_sip_message_length(smuggled),
+            Some(smuggled.len() + 4),
+            "precondition: the framer counts the smuggled Content-Length"
+        );
+    }
+
+    /// A bare CR is refused on the same grounds — it is the other half of a
+    /// terminator, and implementations differ on whether it ends a line.
+    #[test]
+    fn bare_cr_in_the_header_block_is_refused() {
+        let message = concat!(
+            "INVITE sip:bob@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/TCP host;branch=z9hG4bK1\rX-Pad: a\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        )
+        .as_bytes();
+        let error = parse_sip_message_bytes(message)
+            .expect_err("a header block with a bare CR must not parse");
+        assert!(error.contains("bare CR"), "unexpected error: {error}");
+    }
+
+    /// Bodies are opaque octets and are not held to CRLF framing. RFC 4475's
+    /// multipart case (`TC_MPART01`) carries bare CR and LF inside its body
+    /// legitimately, so the check must stop at the header/body boundary.
+    #[test]
+    fn bare_line_endings_are_allowed_in_the_body() {
+        let mut message = concat!(
+            "MESSAGE sip:bob@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/TCP host;branch=z9hG4bK1\r\n",
+            "Content-Type: application/octet-stream\r\n",
+            "Content-Length: 9\r\n",
+            "\r\n",
+        )
+        .as_bytes()
+        .to_vec();
+        message.extend_from_slice(b"a\nb\rc\r\nd\n");
+        let parsed = parse_sip_message_bytes(&message).expect("body octets are opaque");
+        assert_eq!(parsed.body, b"a\nb\rc\r\nd\n");
+    }
+
+    /// Ordinary CRLF messages, folded headers and the leading-CRLF keepalive
+    /// prefix (RFC 3261 §7.5) all still parse.
+    #[test]
+    fn well_formed_messages_still_parse() {
+        let folded = concat!(
+            "\r\n\r\n",
+            "INVITE sip:bob@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/TCP host;branch=z9hG4bK1\r\n",
+            "Subject: I know you are there,\r\n",
+            " \tpick up the phone\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        )
+        .as_bytes();
+        let parsed = parse_sip_message_bytes(folded).expect("folded headers are legal");
+        assert_eq!(
+            parsed.headers.get("Subject").map(String::as_str),
+            Some("I know you are there, pick up the phone")
+        );
+    }
+
+    /// `parse_sip_headers_only` shares the same check — the reject path must
+    /// not become a way to parse a message the main path refuses.
+    #[test]
+    fn headers_only_parse_applies_the_same_check() {
+        let smuggled = concat!(
+            "INVITE sip:bob@example.com SIP/2.0\r\n",
+            "X-Pad: a\nContent-Length: 4\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        )
+        .as_bytes();
+        assert!(parse_sip_headers_only(smuggled).is_err());
+    }
+
+    // --- framer/parser agreement, each shape found by the fuzz target -------
+    //
+    // The invariant: for any bytes the parser accepts, the framer must compute
+    // the same total length. Where they differ, the bytes in between belong to
+    // this message for one of them and to the next message for the other.
+
+    /// Assert both sides read the same message length out of `raw`.
+    fn framer_and_parser_agree(raw: &[u8]) {
+        let parsed = parse_sip_message_bytes(raw).expect("fixture must parse");
+        let boundary = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        assert_eq!(
+            crate::transport::tcp::extract_sip_message_length(raw),
+            Some(boundary + parsed.body.len()),
+            "framer and parser disagree on message length"
+        );
+    }
+
+    /// A continuation line carrying a `Content-Length`. The parser folds it
+    /// into `Subject`; a naive line scan read it as a header of its own.
+    #[test]
+    fn folded_line_carrying_content_length_agrees() {
+        framer_and_parser_agree(
+            concat!(
+                "INVITE sip:bob@example.com SIP/2.0\r\n",
+                "Subject: hello\r\n",
+                " Content-Length: 99\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n",
+            )
+            .as_bytes(),
+        );
+    }
+
+    /// The reverse: a `Content-Length` whose value is folded onto the next
+    /// line. The parser reads it; a naive line scan saw an empty value.
+    #[test]
+    fn folded_content_length_value_agrees() {
+        framer_and_parser_agree(
+            concat!(
+                "INVITE sip:bob@example.com SIP/2.0\r\n",
+                "Content-Length:\r\n",
+                "\t1\r\n",
+                "\r\n",
+                "A",
+            )
+            .as_bytes(),
+        );
+    }
+
+    /// RFC 3261 §25.1 `SWS = [LWS]`, `LWS = [*WSP CRLF] 1*WSP` — a CRLF after
+    /// the colon is only whitespace when a space or tab follows it. Accepting a
+    /// bare one made a header with an empty value swallow the whole next line,
+    /// so the message below parsed as a single header `X` with the value
+    /// `Content-Length: 5` and no Content-Length at all, while the framer read
+    /// the 5.
+    #[test]
+    fn empty_header_value_does_not_swallow_the_next_line() {
+        let raw = concat!(
+            "INVITE sip:bob@example.com SIP/2.0\r\n",
+            "X:\r\n",
+            "Content-Length: 5\r\n",
+            "\r\n",
+            "AAAAA",
+        )
+        .as_bytes();
+        let parsed = parse_sip_message_bytes(raw).expect("fixture must parse");
+        assert_eq!(parsed.headers.get("X").map(String::as_str), Some(""));
+        assert_eq!(parsed.headers.content_length(), Some(5));
+        framer_and_parser_agree(raw);
+    }
+
+    /// A continuation line with nothing to continue — the header section opens
+    /// with a fold. The parser used to trim the leading whitespace and promote
+    /// it to a header (here a compact `l:`, i.e. Content-Length); the framer
+    /// skipped it as a fold.
+    #[test]
+    fn header_section_opening_with_a_fold_is_refused() {
+        let raw = concat!(
+            "INVITE sip:bob@example.com SIP/2.0\r\n",
+            "\tl: 1\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        )
+        .as_bytes();
+        assert!(
+            parse_sip_message_bytes(raw).is_err(),
+            "a fold with no antecedent is malformed"
+        );
+    }
+
+    /// A vertical tab in a header name. `str::trim` is Unicode-aware and
+    /// stripped it, turning `content-length\\x0b` into `Content-Length`;
+    /// `[u8]::trim_ascii` in the framer does not treat VT as whitespace and
+    /// left the name alone. Header names are ASCII tokens (§25.1), so the
+    /// parser trims ASCII too and neither side calls this Content-Length.
+    #[test]
+    fn vertical_tab_in_a_header_name_is_not_content_length() {
+        let raw = concat!(
+            "INVITE sip:bob@example.com SIP/2.0\r\n",
+            "content-length\u{0b} : 5\r\n",
+            "\r\n",
+        )
+        .as_bytes();
+        let parsed = parse_sip_message_bytes(raw).expect("fixture must parse");
+        assert_eq!(parsed.headers.content_length(), None);
+        framer_and_parser_agree(raw);
+    }
 
     #[test]
     fn tel_uri_global_number() {
