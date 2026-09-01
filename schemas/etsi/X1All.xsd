@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Validation entry point for the shipped ETSI X1 schema set.
+
+  The published TS 103 221-1 modules declare <xs:import> without a
+  schemaLocation, so a validator cannot resolve them on its own.  This
+  wrapper supplies the locations for the modules this profile uses:
+  the TS 103 280 dictionary, HashedID, DestinationSet and the main X1
+  schema.
+
+  TrafficPolicy and Configuration are deliberately excluded: they pull in
+  TS 103 120 and TS 104 000 respectively, which are not part of the
+  profile and would fail to compile without those further downloads.
+-->
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:import namespace="http://uri.etsi.org/03280/common/2017/07" schemaLocation="TS_103_280_v021701.xsd"/>
+  <xs:import namespace="http://uri.etsi.org/03221/X1/2017/10/HashedID" schemaLocation="TS_103_221_01_HashedID.xsd"/>
+  <xs:import namespace="http://uri.etsi.org/03221/X1/2017/10/DestinationSet" schemaLocation="TS_103_221_01_DestinationSet.xsd"/>
+  <xs:import namespace="http://uri.etsi.org/03221/X1/2017/10" schemaLocation="TS_103_221_01.xsd"/>
+</xs:schema>

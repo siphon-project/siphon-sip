@@ -75,13 +75,17 @@ class TestIsTarget:
 class TestIntercept:
     """Tests for li.intercept()."""
 
-    def test_intercept_records_event(self):
+    def test_intercept_reports_a_match_without_emitting(self):
+        # Interception is enforced in the dispatcher against ADMF-provisioned
+        # warrants, so `intercept()` reports rather than acts. If it still
+        # emitted, a script that called it would produce a duplicate IRI
+        # record for an event the dispatcher had already reported.
         li = get_li()
         li.add_target("sip:alice@example.com")
         request = FakeRequest(from_uri="sip:alice@example.com")
         result = li.intercept(request)
         assert result is True
-        assert ("intercept", "sip:alice@example.com") in li.events
+        assert li.events == []
 
     def test_intercept_no_match_returns_false(self):
         li = get_li()
@@ -102,13 +106,15 @@ class TestIntercept:
 class TestStopIntercept:
     """Tests for li.stop_intercept()."""
 
-    def test_stop_intercept_records_event(self):
+    def test_stop_intercept_reports_a_match_without_emitting(self):
+        # Session teardown records come from the dispatcher when the dialog
+        # ends, not from a script call.
         li = get_li()
         li.add_target("sip:alice@example.com")
         request = FakeRequest(from_uri="sip:alice@example.com")
         result = li.stop_intercept(request)
         assert result is True
-        assert ("stop_intercept", "sip:alice@example.com") in li.events
+        assert li.events == []
 
     def test_stop_intercept_no_match_returns_false(self):
         li = get_li()
@@ -161,8 +167,9 @@ class TestClear:
     def test_clear_resets_targets_and_events(self):
         li = get_li()
         li.add_target("sip:alice@example.com")
-        request = FakeRequest(from_uri="sip:alice@example.com")
-        li.intercept(request)
+        # `record` is the operator-driven SIPREC path, which does still record
+        # an event; `intercept` only reports.
+        li.record(FakeRequest(from_uri="sip:alice@example.com"))
 
         assert len(li.targets) == 1
         assert len(li.events) == 1
@@ -171,6 +178,16 @@ class TestClear:
 
         assert len(li.targets) == 0
         assert len(li.events) == 0
+
+    def test_provisioned_counts_are_reported(self):
+        # Warrants are provisioned by the ADMF over X1, never by a script;
+        # the namespace exposes the counts read-only.
+        li = get_li()
+        assert li.task_count == 0
+        assert li.destination_count == 0
+        li.set_provisioned_counts(tasks=2, destinations=1)
+        assert li.task_count == 2
+        assert li.destination_count == 1
 
 
 class TestAddTarget:

@@ -85,7 +85,7 @@ futures-util = "0.3"
 # with the siphon-rtp media engine. Only the tiny `proto` crate is pulled in
 # (serde types + length-prefixed framing); the engine/codec/datapath crates
 # stay out of siphon. Used by the `media.backend: siphon-rtp` path.
-siphon-rtp-proto = "0.3.0"
+siphon-rtp-proto = "0.3.1"
 # SIP-over-SCTP (RFC 4168) + Diameter-over-SCTP transport. Optional because it
 # links the `libsctp` system library (libsctp-dev to build, libsctp1 at runtime)
 # and needs the kernel SCTP module — most SIP proxy/B2BUA deployments never use
@@ -93,6 +93,14 @@ siphon-rtp-proto = "0.3.0"
 # `--features sctp`.
 tokio-sctp = { version = "0.2", optional = true }
 http = "1"
+# The ETSI X1 listener is one HTTPS endpoint behind mutual TLS. It is served
+# directly on hyper rather than through the admin axum server, because the
+# handler needs the peer certificate (to bind `admfIdentifier` to it) and the
+# TLS acceptor has to be ours to get at it. Both crates are already in the
+# tree via axum/reqwest; naming them here adds no new supply chain.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
 # Diameter AVP decoding
 serde_json = "1"
@@ -149,6 +157,19 @@ rasn = "0.28"
 rasn-derive = "0.28"
 chrono = { version = "0.4", default-features = false }
 quick-xml = { version = "0.41", features = ["serialize"] }
+# ETSI X1 (TS 103 221-1) schema validation. Pure Rust, zero transitive
+# dependencies, XSD 1.1 — validates every X1 message against the schemas
+# shipped in `schemas/etsi/` on the way in AND on the way out, rather than
+# trusting a hand-rolled reader. Note its one known gap (pattern facets are
+# not inherited through an empty <xs:restriction base="..."/>, which is how
+# TS 103 221-1 derives XId/DId/X1TransactionId from the dictionary UUID):
+# those identifiers are parsed into real `Uuid` newtypes, so the typed model
+# covers precisely what the validator misses. See src/li/x1/schema.rs.
+uppsala = "0.9"
+# Materialises the `include_str!`-embedded ETSI XSDs to a scratch directory
+# at LI startup so uppsala can resolve their imports; the compiled validator
+# outlives the directory, so there is no runtime file dependency.
+tempfile = "3"
 
 # iFC evaluation engine — regex for SPT header content matching
 regex = "1"
@@ -179,12 +200,11 @@ libc = "0.2"
 [dev-dependencies]
 proptest = "1"
 tokio-test = "0.4"
-tempfile = "3"
 rcgen = "0.14"
 # Build siphon-rtp control frames in the integration test's in-process fake
 # engine (the lib already depends on this crate; integration-test crates need
 # it listed here to name it directly).
-siphon-rtp-proto = "0.3.0"
+siphon-rtp-proto = "0.3.1"
 # Per-message hot-path microbenchmarks (benches/sip_hot_path.rs). The
 # release-cut gate (scripts/cut-release.sh) runs these via `critcmp` against a
 # committed baseline; CI only proves they compile (`cargo bench --no-run`).

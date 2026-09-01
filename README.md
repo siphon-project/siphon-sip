@@ -844,6 +844,10 @@ SIPhon stands on the shoulders of [Kamailio](https://www.kamailio.org/) and [Ope
 
 IMS IPsec and AKA testing leans on [carstenbock/sipp_ipsec](https://github.com/carstenbock/sipp_ipsec), Carsten Bock's SIPp fork that teaches the UE simulator sec-agree and IPsec. It drives the VoLTE REGISTER + AKA + IPsec sec-agree flows under [`sipp/ipsec/`](sipp/ipsec/), and it's the harness the P-CSCF is validated against.
 
+The ETSI lawful-intercept work owes a lot to sipgate's [li-lib-x1x2x3](https://github.com/sipgate/li-lib-x1x2x3) and [li-simulator-x1x2x3](https://github.com/sipgate/li-simulator-x1x2x3), both MIT. The library is a second, independent reading of TS 103 221 — the clause 6.7 error-code table in [`src/li/x1/error.rs`](src/li/x1/error.rs) is cross-checked against theirs, which is exactly the kind of thing that is wrong in a way no round-trip test can see. The simulator plays ADMF and MDF against a real network element, and it's what the X1 implementation is exercised with.
+
+On the X2/X3 side, [x2x3PduDissector](https://github.com/hyavari/x2x3PduDissector) is the independent decoder the TS 103 221-2 PDU framing is validated against. A round-trip through our own reader would pass a shared encode/decode bug; feeding the bytes we emit to somebody else's dissector via `tshark` will not. Same principle as the Wireshark cross-checks elsewhere in the stack.
+
 ## Platform Partner
 
 <p align="center">

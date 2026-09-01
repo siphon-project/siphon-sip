@@ -94,6 +94,15 @@ pub struct SiphonMetrics {
     /// Zero when `ro.enabled` is off.
     pub ro_sessions: IntGauge,
 
+    /// Sessions with a remembered lawful-intercept matching decision.
+    ///
+    /// The dispatcher decides once per session rather than per message, and
+    /// keys that on the Call-ID — which the peer chooses. This is what makes
+    /// the bound observable: it must track live dialogs and fall back, never
+    /// climb monotonically. Pinned at the cap means the map is being cleared
+    /// repeatedly, which is the signature of a Call-ID flood.
+    pub li_remembered_sessions: IntGauge,
+
     /// Live SUBSCRIBE dialogs in the L1 `subscribe_state` store.  A monotonic
     /// climb under a steady subscribe/expire workload means expired dialogs
     /// are leaking (L1 has no TTL; the sweep reaps them).
@@ -313,6 +322,11 @@ impl SiphonMetrics {
         let ro_sessions = IntGauge::new(
             "siphon_ro_sessions",
             "Live Ro online-charging sessions (CCR-INITIAL without CCR-TERMINATION)",
+        )?;
+
+        let li_remembered_sessions = IntGauge::new(
+            "siphon_li_remembered_sessions",
+            "Sessions with a remembered lawful-intercept matching decision",
         )?;
 
         let subscribe_dialogs = IntGauge::new(
@@ -598,6 +612,7 @@ impl SiphonMetrics {
         registry.register(Box::new(cdr_sessions.clone()))?;
         registry.register(Box::new(rf_sessions.clone()))?;
         registry.register(Box::new(ro_sessions.clone()))?;
+        registry.register(Box::new(li_remembered_sessions.clone()))?;
         registry.register(Box::new(subscribe_dialogs.clone()))?;
         registry.register(Box::new(ipsec_sa_pairs.clone()))?;
         registry.register(Box::new(registrations_active.clone()))?;
@@ -655,6 +670,7 @@ impl SiphonMetrics {
             cdr_sessions,
             rf_sessions,
             ro_sessions,
+            li_remembered_sessions,
             subscribe_dialogs,
             ipsec_sa_pairs,
             registrations_active,

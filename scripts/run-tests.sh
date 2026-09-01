@@ -49,6 +49,7 @@ RUN_BANSCAN=false
 RUN_SECURITY=false
 RUN_RFC4475=false
 RUN_WEBRTC=false
+RUN_LI=false
 SKIP_RUST=false
 
 # Scenario modes selected on this invocation.  Exactly one is allowed — see the
@@ -79,6 +80,7 @@ for arg in "$@"; do
     --security)   RUN_SECURITY=true;   SELECTED_MODES+=("$arg") ;;
     --rfc4475)    RUN_RFC4475=true;    SELECTED_MODES+=("$arg") ;;
     --webrtc)     RUN_WEBRTC=true;     SELECTED_MODES+=("$arg") ;;
+    --li)         RUN_LI=true;         SELECTED_MODES+=("$arg") ;;
     --skip-rust)  SKIP_RUST=true ;;
     --help|-h)
       echo "Usage: $0 [<one scenario mode>] [--skip-rust]"
@@ -610,6 +612,76 @@ if [[ "$RUN_WEBRTC" == true ]]; then
     siphon-webrtc-b2bua webrtc-b2bua-client
   docker compose -f "$COMPOSE_FILE" --profile webrtc rm -sf \
     siphon-webrtc-b2bua webrtc-b2bua-client 2>/dev/null || true
+fi
+
+if [[ "$RUN_LI" == true ]]; then
+  # ETSI TS 103 221-1 X1 interop against sipgate's li-simulator-x1x2x3, which
+  # plays both the Administration Function and the Mediation and Delivery
+  # Function. The peer is an independent implementation of the same
+  # specification, which is the point: siphon agreeing with its own reader
+  # proves nothing about conformance.
+  LI_COMPOSE="sipp/li/docker-compose.li.yaml"
+
+  echo "=== Building the network element image ==="
+  docker compose -f "$LI_COMPOSE" build network-element
+
+  echo "=== ETSI X1/X2/X3: provisioning, refusals and real delivery vs a real ADMF/MDF ==="
+  docker compose -f "$LI_COMPOSE" build li-x1-test
+
+  # Start from nothing: a container left over from an earlier run is reused by
+  # `up`, which makes the driver's verdict come from the wrong invocation.
+  docker compose -f "$LI_COMPOSE" down -v --remove-orphans 2>/dev/null || true
+
+  # Bring the estate up detached, then run the driver as a one-shot.
+  #
+  # Not `up --abort-on-container-exit`: that aborts when *any* container exits,
+  # and this profile has four that are supposed to — the certificate bootstraps
+  # and the engine readiness probe. The first of them finishing tore down the
+  # called party before the call was placed, which showed up as a call that
+  # timed out rather than as a harness fault. `run` gives the driver's exit code
+  # directly and leaves everything else alone.
+  #
+  # `up -d` still honours `depends_on`, so the bootstraps run to completion and
+  # the health gates are waited on before this returns.
+  docker compose -f "$LI_COMPOSE" up -d \
+    init-admf-certs init-ne-certs init-keystores \
+    siphon-rtp siphon-rtp-ready network-element simulator li-uas
+
+  li_status=0
+  docker compose -f "$LI_COMPOSE" run --rm li-x1-test || li_status=$?
+
+  # Two different questions, so two drivers. The first asks whether X1 is
+  # conformant and whether X2/X3 actually reach the mediation function. This one
+  # asks whether a warrant on each target identifier type *matches anything* —
+  # which provisioning cannot tell you, because provisioning succeeded.
+  if [[ $li_status -eq 0 ]]; then
+    echo "=== ETSI: detection coverage across every target identifier type ==="
+    docker compose -f "$LI_COMPOSE" run --rm li-target-types || li_status=$?
+  fi
+
+  # The only measurement in this repo taken with interception switched on. The
+  # 16-row baseline and the memory-leak soak both run without it, so without
+  # this the enforcement path — which runs on every message of every leg — is
+  # never under load and its per-session state is never watched draining.
+  if [[ $li_status -eq 0 ]]; then
+    echo "=== ETSI: interception under load, and its per-session state draining ==="
+    docker compose -f "$LI_COMPOSE" run --rm li-load || li_status=$?
+  fi
+
+  if [[ $li_status -ne 0 ]]; then
+    echo "--- network element log (tail) ---"
+    docker compose -f "$LI_COMPOSE" logs --tail 80 network-element || true
+    echo "--- media engine log (tail) ---"
+    docker compose -f "$LI_COMPOSE" logs --tail 40 siphon-rtp || true
+  fi
+
+  docker compose -f "$LI_COMPOSE" down -v --remove-orphans 2>/dev/null || true
+
+  if [[ $li_status -ne 0 ]]; then
+    echo "ETSI LI interop FAILED (exit $li_status)" >&2
+    exit $li_status
+  fi
+  echo "ETSI X1/X2/X3 interop passed"
 fi
 
 echo ""

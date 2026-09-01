@@ -1,0 +1,17 @@
+# Test driver for the lawful-intercept profile: needs SIPp to place calls and
+# Python to speak X1 and query the mediation function, which no stock image
+# has both of.
+FROM debian:trixie-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        sip-tester \
+        python3 \
+        ca-certificates \
+        # For the capture profile: the same image doubles as the tcpdump
+        # sidecar, so a packet capture needs no second image pull.
+        tcpdump \
+        socat \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app

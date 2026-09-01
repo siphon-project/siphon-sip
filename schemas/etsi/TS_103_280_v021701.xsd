@@ -1,0 +1,397 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns="http://uri.etsi.org/03280/common/2017/07" targetNamespace="http://uri.etsi.org/03280/common/2017/07" version="2.17.1" elementFormDefault="qualified">
+    <xs:simpleType name="ShortString">
+        <xs:restriction base="xs:string">
+            <xs:maxLength value="255"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="LongString">
+        <xs:restriction base="xs:string">
+            <xs:maxLength value="65535"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="LIID">
+        <xs:restriction base="xs:normalizedString">
+            <xs:pattern value="([!-~]{1,25})|([0-9a-f]{26,50})"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="UTCDateTime">
+        <xs:restriction base="xs:dateTime">
+            <xs:pattern value="[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="UTCMicrosecondDateTime">
+        <xs:restriction base="xs:dateTime">
+            <xs:pattern value="[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="QualifiedDateTime">
+        <xs:restriction base="xs:dateTime">
+            <xs:pattern value="[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2})"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="QualifiedMicrosecondDateTime">
+        <xs:restriction base="xs:dateTime">
+            <xs:pattern value="[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}(Z|[+-][0-9]{2}:[0-9]{2})"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="InternationalE164">
+        <xs:restriction base="xs:token">
+            <xs:pattern value="[0-9]{1,15}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="IMSI">
+        <xs:restriction base="xs:token">
+            <xs:pattern value="[0-9]{6,15}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="IMEI">
+        <xs:restriction base="xs:token">
+            <xs:pattern value="[0-9]{14}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="IMEICheckDigit">
+        <xs:restriction base="xs:token">
+            <xs:pattern value="[0-9]{15}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="IMEISV">
+        <xs:restriction base="xs:token">
+            <xs:pattern value="[0-9]{16}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="IPv4Address">
+        <xs:restriction base="xs:token">
+            <xs:pattern value="((25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9])"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="IPv4CIDR">
+        <xs:restriction base="xs:token">
+            <xs:pattern value="((25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9])/([1-2]?[0-9]|3[0-2])"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="IPv6Address">
+        <xs:restriction base="xs:token">
+            <xs:pattern value="([0-9a-f]{4}:){7}([0-9a-f]{4})"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="IPv6CIDR">
+        <xs:restriction base="xs:token">
+            <xs:pattern value="([0-9a-f]{4}:){7}([0-9a-f]{4})/(([1-9]?[0-9])|(1[0-1][0-9])|(12[0-8]))"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:complexType name="IPAddress">
+        <xs:choice>
+            <xs:element name="IPv4Address" type="IPv4Address"/>
+            <xs:element name="IPv6Address" type="IPv6Address"/>
+        </xs:choice>
+    </xs:complexType>
+    <xs:complexType name="IPCIDR">
+        <xs:choice>
+            <xs:element name="IPv4CIDR" type="IPv4CIDR"/>
+            <xs:element name="IPv6CIDR" type="IPv6CIDR"/>
+        </xs:choice>
+    </xs:complexType>
+    <xs:simpleType name="TCPPort">
+        <xs:restriction base="xs:integer">
+            <xs:minExclusive value="1"/>
+            <xs:maxInclusive value="65535"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:complexType name="TCPPortRange">
+        <xs:sequence>
+            <xs:element name="start" type="TCPPort"/>
+            <xs:element name="end" type="TCPPort"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:simpleType name="UDPPort">
+        <xs:restriction base="xs:integer">
+            <xs:minInclusive value="0"/>
+            <xs:maxInclusive value="65535"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:complexType name="UDPPortRange">
+        <xs:sequence>
+            <xs:element name="start" type="UDPPort"/>
+            <xs:element name="end" type="UDPPort"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="Port">
+        <xs:choice>
+            <xs:element name="TCPPort" type="TCPPort"/>
+            <xs:element name="UDPPort" type="UDPPort"/>
+        </xs:choice>
+    </xs:complexType>
+    <xs:complexType name="PortRange">
+        <xs:choice>
+            <xs:element name="TCPPortRange" type="TCPPortRange"/>
+            <xs:element name="UDPPortRange" type="UDPPortRange"/>
+        </xs:choice>
+    </xs:complexType>
+    <xs:complexType name="IPAddressPort">
+        <xs:sequence>
+            <xs:element name="address" type="IPAddress"/>
+            <xs:element name="port" type="Port"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="IPAddressPortRange">
+        <xs:sequence>
+            <xs:element name="address" type="IPAddress"/>
+            <xs:element name="portRange" type="PortRange"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:simpleType name="MACAddress">
+        <xs:restriction base="xs:token">
+            <xs:pattern value="([a-f0-9]{2}:){5}[a-f0-9]{2}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="EmailAddress">
+        <xs:restriction base="ShortString">
+            <xs:pattern value="[a-zA-Z0-9\.!#$%&amp;'\*\+\\/=\?\^_`\{\|\}~\-]+@[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="UUID">
+        <xs:restriction base="xs:token">
+            <xs:pattern value="[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="ISOCountryCode">
+        <xs:restriction base="xs:token">
+            <xs:pattern value="[A-Z]{2}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="SIPURI">
+        <xs:restriction base="xs:anyURI">
+            <xs:pattern value="sips?:[a-zA-Z0-9!#$&amp;-;=?-\[\]_~%]+"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="TELURI">
+        <xs:restriction base="xs:anyURI">
+            <xs:pattern value="tel:[a-zA-Z0-9!#$&amp;-;=?-\[\]_~%]+"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:complexType name="WGS84CoordinateDecimal">
+        <xs:sequence>
+            <xs:element name="latitude" type="WGS84LatitudeDecimal"/>
+            <xs:element name="longitude" type="WGS84LongitudeDecimal"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:simpleType name="WGS84LatitudeDecimal">
+        <xs:restriction base="xs:string">
+            <xs:pattern value="[NS][0-9]{2}\.[0-9]{6}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="WGS84LongitudeDecimal">
+        <xs:restriction base="xs:string">
+            <xs:pattern value="[EW][0-9]{3}\.[0-9]{6}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:complexType name="WGS84CoordinateAngular">
+        <xs:sequence>
+            <xs:element name="latitude" type="WGS84LatitudeAngular"/>
+            <xs:element name="longitude" type="WGS84LongitudeAngular"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:simpleType name="WGS84LatitudeAngular">
+        <xs:restriction base="xs:string">
+            <xs:pattern value="[NS][0-9]{6}\.[0-9]{2}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="WGS84LongitudeAngular">
+        <xs:restriction base="xs:string">
+            <xs:pattern value="[EW][0-9]{7}\.[0-9]{2}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="SUPIIMSI">
+        <xs:restriction base="IMSI"/>
+    </xs:simpleType>
+    <xs:simpleType name="SUPINAI">
+        <xs:restriction base="NAI"/>
+    </xs:simpleType>
+    <xs:simpleType name="SUCI">
+        <xs:restriction base="xs:hexBinary"/>
+    </xs:simpleType>
+    <xs:simpleType name="PEIIMEI">
+        <xs:restriction base="IMEI"/>
+    </xs:simpleType>
+    <xs:simpleType name="PEIIMEICheckDigit">
+        <xs:restriction base="IMEICheckDigit"/>
+    </xs:simpleType>
+    <xs:simpleType name="PEIIMEISV">
+        <xs:restriction base="IMEISV"/>
+    </xs:simpleType>
+    <xs:simpleType name="GPSIMSISDN">
+        <xs:restriction base="xs:token">
+            <xs:pattern value="[0-9]{1,15}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="GPSINAI">
+        <xs:restriction base="NAI"/>
+    </xs:simpleType>
+    <xs:simpleType name="NAI">
+        <xs:restriction base="xs:string"/>
+    </xs:simpleType>
+    <xs:simpleType name="LDID">
+        <xs:restriction base="xs:string">
+            <xs:pattern value="([A-Z]{2}-.+-.+)"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="InternationalizedEmailAddress">
+        <xs:restriction base="ShortString">
+            <xs:pattern value=".+@.+"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="EUI64">
+        <xs:restriction base="xs:token">
+            <xs:pattern value="([a-f0-9]{2}:){7}[a-f0-9]{2}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="CGI">
+        <xs:restriction base="xs:token">
+            <xs:pattern value="[0-9]{3}-[0-9]{2,3}-[a-f0-9]{4}-[a-f0-9]{4}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="ECGI">
+        <xs:restriction base="xs:token">
+            <xs:pattern value="[0-9]{3}-[0-9]{2,3}-[a-f0-9]{7}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="NCGI">
+        <xs:restriction base="xs:token">
+            <xs:pattern value="[0-9]{3}-[0-9]{2,3}-[a-f0-9]{9}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="ICCID">
+        <xs:restriction base="xs:token">
+            <xs:pattern value="[0-9]{19,20}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="IPProtocol">
+        <xs:restriction base="xs:integer">
+            <xs:minInclusive value="0"/>
+            <xs:maxInclusive value="255"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="VLANID">
+        <xs:restriction base="xs:integer">
+            <xs:minInclusive value="0"/>
+            <xs:maxInclusive value="4095"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="VIN">
+        <xs:restriction base="xs:string">
+            <xs:pattern value="[A-HJ-NPR-Z0-9]{17}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="ServiceAccessIdentifier">
+        <xs:restriction base="xs:string"/>
+    </xs:simpleType>
+    <xs:simpleType name="EUICCID">
+        <xs:restriction base="xs:token">
+            <xs:pattern value="[0-9]{32}"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="APN">
+        <xs:restriction base="LongString"/>
+    </xs:simpleType>
+    <xs:simpleType name="DNN">
+        <xs:restriction base="LongString"/>
+    </xs:simpleType>
+    <xs:simpleType name="H323URI">
+        <xs:restriction base="ShortString">
+            <xs:pattern value="h323:[a-zA-Z0-9!#$&amp;-;=?-\[\]_~%]+"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="IMPU">
+        <xs:restriction base="ShortString">
+            <xs:pattern value="[a-zA-Z0-9!#$&amp;-;=?-\[\]_~%]+"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="IMPI">
+        <xs:restriction base="NAI"/>
+    </xs:simpleType>
+    <xs:simpleType name="VRF">
+        <xs:restriction base="ShortString"/>
+    </xs:simpleType>
+    <xs:simpleType name="Percentage">
+        <xs:restriction base="xs:integer">
+            <xs:minInclusive value="0"/>
+            <xs:maxInclusive value="100"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="AltitudeMeters">
+        <xs:restriction base="xs:integer">
+            <xs:minInclusive value="-1000"/>
+            <xs:maxInclusive value="50000"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:complexType name="Altitude">
+        <xs:choice>
+            <xs:element name="altitudeAboveGroundLevel" type="AltitudeMeters"/>
+            <xs:element name="altitudeAboveMeanSeaLevel" type="AltitudeMeters"/>
+        </xs:choice>
+    </xs:complexType>
+    <xs:simpleType name="UncertaintyMeters">
+        <xs:restriction base="xs:integer">
+            <xs:minInclusive value="1"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:complexType name="GNSSLocation">
+        <xs:sequence>
+            <xs:element name="location" type="GeoShape"/>
+            <xs:element name="fixMode" type="FixMode"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="WGS84Location">
+        <xs:sequence>
+            <xs:element name="location" type="WGS84Coordinate"/>
+            <xs:element name="altitude" type="Altitude" minOccurs="0"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="WGS84Coordinate">
+        <xs:choice>
+            <xs:element name="wGS84CoordinateDecimal" type="WGS84CoordinateDecimal"/>
+            <xs:element name="wGS84CoordinateAngular" type="WGS84CoordinateAngular"/>
+        </xs:choice>
+    </xs:complexType>
+    <xs:complexType name="GeoShape">
+        <xs:sequence>
+            <xs:element name="shape" type="GMLShape"/>
+            <xs:element name="confidence" type="Percentage" minOccurs="0"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="GMLShape">
+        <xs:choice>
+            <xs:element name="point" type="GeoPoint"/>
+            <xs:element name="sphere" type="GeoSphere"/>
+            <xs:element name="xyEllipsoid" type="XYEllipsoid"/>
+        </xs:choice>
+    </xs:complexType>
+    <xs:complexType name="GeoPoint">
+        <xs:choice>
+            <xs:element name="wGS84Point" type="WGS84Location"/>
+        </xs:choice>
+    </xs:complexType>
+    <xs:complexType name="GeoSphere">
+        <xs:sequence>
+            <xs:element name="centerPoint" type="GeoPoint"/>
+            <xs:element name="radiusMeters" type="UncertaintyMeters"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="XYEllipsoid">
+        <xs:sequence>
+            <xs:element name="centerPoint" type="GeoPoint"/>
+            <xs:element name="uncertaintyLongitude" type="UncertaintyMeters"/>
+            <xs:element name="uncertaintyLatitude" type="UncertaintyMeters"/>
+            <xs:element name="uncertaintyAltitude" type="UncertaintyMeters" minOccurs="0"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:simpleType name="FixMode">
+        <xs:restriction base="xs:string">
+            <xs:enumeration value="unknown"/>
+            <xs:enumeration value="noFix"/>
+            <xs:enumeration value="fix2D"/>
+            <xs:enumeration value="fix3D"/>
+        </xs:restriction>
+    </xs:simpleType>
+</xs:schema>

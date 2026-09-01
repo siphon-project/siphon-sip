@@ -1,0 +1,355 @@
+# ETSI TS 103 221-1 interop: siphon as the network element, driven by a real ADMF.
+#
+# The peer is sipgate's li-simulator-x1x2x3 (MIT), which plays both the
+# Administration Function and the Mediation and Delivery Function. Using a
+# published, independently-written implementation is the whole point — siphon
+# checked against its own reader proves nothing about conformance.
+#
+# Run with: scripts/run-tests.sh --li
+#
+# Certificates are produced by the simulator's own bootstrap (vendored under
+# init-mutual-tls/) into a shared volume, so both sides get their PKI from the
+# same place and neither is configured to trust the other by hand:
+#
+#   simulator        the ADMF. siphon trusts its CA for client certificates and
+#                    binds `admfIdentifier` to its CN, so provisioning only
+#                    succeeds if the binding passes.
+#   network-element  siphon. The simulator trusts its CA for the server
+#                    certificate, and `network-element` is a SAN on it.
+
+name: siphon-li-interop
+
+services:
+  # --- PKI -----------------------------------------------------------------
+  init-admf-certs:
+    image: alpine/openssl:latest
+    entrypoint: ["/bin/sh"]
+    volumes:
+      - "./init-mutual-tls:/init-mtls:ro"
+      - "mutual-tls-stores:/mutual-tls-stores"
+    environment:
+      ROLE: "simulator"
+      COMMON_NAME: "simulator"
+    command: ["/init-mtls/create-certificates.sh"]
+    networks:
+      - li-net
+
+  init-ne-certs:
+    image: alpine/openssl:latest
+    entrypoint: ["/bin/sh"]
+    volumes:
+      - "./init-mutual-tls:/init-mtls:ro"
+      - "mutual-tls-stores:/mutual-tls-stores"
+    environment:
+      ROLE: "network-element"
+      COMMON_NAME: "network-element"
+    command: ["/init-mtls/create-certificates.sh"]
+    networks:
+      - li-net
+
+  # The simulator builds a network-element SSL context eagerly at startup even
+  # when it is only acting as the ADMF, so these Java stores have to exist or it
+  # will not boot. siphon needs none of them — it reads PEM directly.
+  init-keystores:
+    image: eclipse-temurin:21-alpine
+    depends_on:
+      init-admf-certs:
+        condition: service_completed_successfully
+      init-ne-certs:
+        condition: service_completed_successfully
+    volumes:
+      - "./init-mutual-tls:/init-mtls:ro"
+      - "mutual-tls-stores:/mutual-tls-stores"
+    entrypoint: ["/bin/sh"]
+    command: ["/init-mtls/create-keystores.sh"]
+    networks:
+      - li-net
+
+  # --- the network element under test --------------------------------------
+  #
+  # Named `network-element` because that is a SAN on the certificate the
+  # bootstrap issues *and* the host the simulator derives `neIdentifier` from.
+  network-element:
+    image: sipp-siphon
+    build:
+      context: ../..
+    container_name: network-element
+    hostname: network-element
+    depends_on:
+      init-ne-certs:
+        condition: service_completed_successfully
+      init-admf-certs:
+        condition: service_completed_successfully
+      # The media backend has to answer before siphon offers a call to it, and
+      # `lawful_intercept.x3` refuses to load on any other backend.
+      siphon-rtp-ready:
+        condition: service_completed_successfully
+    volumes:
+      - "./siphon-li.yaml:/etc/siphon/siphon.yaml:ro"
+      - "../../scripts:/etc/siphon/scripts:ro"
+      - ".:/etc/siphon/li-scripts:ro"
+      - "mutual-tls-stores:/mutual-tls-stores:ro"
+    networks:
+      li-net:
+        ipv4_address: 172.29.0.10
+    healthcheck:
+      # The X1 listener answering a TLS handshake is the readiness signal that
+      # matters here — a siphon that came up without it would fail the test in
+      # a far more confusing way.
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.create_connection(('127.0.0.1',8443),2); s.close()\""]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 8s
+
+  # --- the media engine ------------------------------------------------------
+  #
+  # X3 content framing lives here rather than in siphon: the engine is what
+  # holds the RTP, so it frames TS 103 221-2 content PDUs and delivers them to
+  # the Mediation Function itself. siphon's part is the X1 warrant and the
+  # `attach_x3` that starts it.
+  #
+  # Pinned to the release siphon pins `siphon-rtp-proto` to, so this exercises a
+  # known-good pairing rather than whatever `latest` drifted to.
+  #
+  # The three X3 certificate flags are all required by the engine — it refuses
+  # `attach_x3` unless it has all of them, rather than accepting the warrant and
+  # delivering nowhere.
+  siphon-rtp:
+    image: ghcr.io/siphon-project/siphon-rtp:0.3.1
+    container_name: li-siphon-rtp
+    depends_on:
+      init-ne-certs:
+        condition: service_completed_successfully
+      init-admf-certs:
+        condition: service_completed_successfully
+    volumes:
+      - "mutual-tls-stores:/mutual-tls-stores:ro"
+    command:
+      - "--control"
+      - "0.0.0.0:8080"
+      # The engine's own address, not loopback and not 0.0.0.0.
+      #
+      # Loopback is the default and answers `c=IN IP4 127.0.0.1`, which no peer
+      # on this network can reach. `0.0.0.0` is no better: it binds everywhere
+      # but gets advertised verbatim, so the caller sends its RTP nowhere, the
+      # engine relays nothing, and an X3 interception attaches perfectly and
+      # delivers zero packets — which looks like a lawful-intercept bug and is
+      # not one.
+      - "--relay-bind-ip"
+      - "172.29.0.30"
+      - "--port-min"
+      - "30000"
+      - "--port-max"
+      - "30200"
+      - "--metrics-addr"
+      - "0.0.0.0:9091"
+      # The engine is a client to the Mediation Function, and presents the same
+      # network-element identity siphon does.
+      - "--x3-client-cert"
+      - "/mutual-tls-stores/certs/network-element.crt"
+      - "--x3-client-key"
+      - "/mutual-tls-stores/keys/network-element.pk8.key"
+      - "--x3-ca"
+      - "/mutual-tls-stores/ca-certs/simulator-ca.crt"
+      - "--x3-network-function-id"
+      - "siphon-li-interop"
+      - "--x3-interception-point-id"
+      - "network-element"
+    networks:
+      li-net:
+        ipv4_address: 172.29.0.30
+    # The image is distroless, so no CMD-SHELL probe can run inside it.
+    # Readiness is gated by siphon-rtp-ready below, which probes from outside.
+
+  siphon-rtp-ready:
+    image: python:3.12-slim
+    depends_on:
+      siphon-rtp:
+        condition: service_started
+    command:
+      - python3
+      - -c
+      - |
+        import sys, time, urllib.request
+        for _ in range(60):
+            try:
+                with urllib.request.urlopen("http://siphon-rtp:9091/readyz", timeout=2) as r:
+                    if r.status == 200:
+                        print("engine ready"); sys.exit(0)
+            except Exception:
+                pass
+            time.sleep(1)
+        sys.exit("the media engine never became ready")
+    networks:
+      - li-net
+
+  # --- the ADMF + MDF ------------------------------------------------------
+  simulator:
+    image: sipgategmbh/li-simulator-x1x2x3:1.0.8
+    container_name: li-simulator
+    depends_on:
+      init-keystores:
+        condition: service_completed_successfully
+      network-element:
+        condition: service_healthy
+    volumes:
+      - "mutual-tls-stores:/mutual-tls-stores"
+    ports:
+      # Loopback only. This is how scripts/validate_li_capture.sh reads back
+      # the PDUs the mediation function actually received, so they can be run
+      # through a third-party dissector from outside the estate.
+      - "127.0.0.1:18080:8080"
+    environment:
+      SIPGATE_LI_SIMULATOR_TARGETURI: "https://network-element:8443/X1/NE"
+      # Must equal the CN of the certificate it presents, because siphon binds
+      # the two and answers 1030 when they disagree.
+      SIPGATE_LI_SIMULATOR_ADMFIDENTIFIER: "simulator"
+      # X2 and X3 arrive on one port, so one TLS setting covers both — and the
+      # media engine's X3 delivery is TLS-only, so that setting is on. The
+      # simulator's own entrypoint builds the stores this needs: it presents
+      # `CN=simulator` and trusts the network-element CA, which is exactly the
+      # certificate siphon and the engine present as clients.
+      SIPGATE_LI_SIMULATOR_X2X3SERVER_SSLENABLED: "true"
+      SIPGATE_LI_SIMULATOR_X2X3SERVER_PORT: "42069"
+    networks:
+      li-net:
+        ipv4_address: 172.29.0.20
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:8080/health || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+      start_period: 20s
+
+  # --- the called party ------------------------------------------------------
+  li-uas:
+    image: li-test-driver
+    build:
+      context: .
+      dockerfile: Dockerfile.driver
+    volumes:
+      - ".:/app:ro"
+    working_dir: /app
+    command:
+      - sipp
+      # No `-bg`: that daemonises, the foreground process exits, and compose
+      # stops the container just as the call arrives.
+      - "-sf"
+      - "/app/li_target_uas.xml"
+      - "-p"
+      - "5060"
+      - "-mp"
+      - "6000"
+      # High enough for the load profile, which places thousands. A low cap
+      # here does not fail loudly: SIPp simply stops answering once it is hit,
+      # and the load run reads as siphon failing to route.
+      - "-m"
+      - "1000000"
+      - "-nostdin"
+    networks:
+      li-net:
+        ipv4_address: 172.29.0.40
+
+  # --- drivers ---------------------------------------------------------------
+  #
+  # Two questions, deliberately answered separately:
+  #
+  #   li-x1-test      is siphon's X1 conformant? Asked by driving a real,
+  #                   independently-written ADMF.
+  #   li-target-types does siphon actually *detect* a warrant on every target
+  #                   identifier type? Asked by placing a call per type and
+  #                   checking the mediation function received IRI.
+  li-x1-test:
+    image: li-test-driver
+    build:
+      context: .
+      dockerfile: Dockerfile.driver
+    depends_on:
+      simulator:
+        condition: service_healthy
+      # The call has to reach a called party, or a routing failure would read
+      # as a failure to intercept.
+      li-uas:
+        condition: service_started
+    volumes:
+      - ".:/app:ro"
+    working_dir: /app
+    environment:
+      SIMULATOR_URL: "http://simulator:8080"
+      SIPHON_SIP: "network-element:5060"
+      SIPP_SCENARIO: "/app/li_target_uac.xml"
+      RUN_CALL: "true"
+    command: ["python3", "li_x1_test.py"]
+    networks:
+      - li-net
+
+  # Interception under load: what it costs, and whether its per-session state
+  # drains. Every other measurement in this repo runs with `lawful_intercept`
+  # absent, so without this the enforcement path — which runs on every message
+  # of every call — is never under load at all.
+  li-load:
+    image: li-test-driver
+    build:
+      context: .
+      dockerfile: Dockerfile.driver
+    depends_on:
+      simulator:
+        condition: service_healthy
+      li-uas:
+        condition: service_started
+    volumes:
+      - ".:/app:ro"
+      - "mutual-tls-stores:/mutual-tls-stores:ro"
+    working_dir: /app
+    environment:
+      NE_URL: "https://network-element:8443/X1/NE"
+      METRICS_URL: "http://network-element:9090/metrics"
+      SIPHON_SIP: "network-element:5060"
+      MDF_HOST: "172.29.0.20"
+    command: ["python3", "li_load_test.py"]
+    networks:
+      - li-net
+
+  li-target-types:
+    image: li-test-driver
+    build:
+      context: .
+      dockerfile: Dockerfile.driver
+    depends_on:
+      simulator:
+        condition: service_healthy
+    volumes:
+      - ".:/app:ro"
+      - "mutual-tls-stores:/mutual-tls-stores:ro"
+    working_dir: /app
+    environment:
+      NE_URL: "https://network-element:8443/X1/NE"
+      SIMULATOR_URL: "http://simulator:8080"
+      SIPHON_SIP: "network-element:5060"
+      CALLEE: "callee@li-uas:5060"
+    command: ["python3", "li_target_types_test.py"]
+    networks:
+      - li-net
+
+volumes:
+  mutual-tls-stores:
+
+networks:
+  # The addresses are pinned, and that is forced by the specification rather
+  # than a convenience.
+  #
+  # A destination is provisioned over X1 as a TS 103 280 `IPAddressPort`, whose
+  # `IPv4Address` is a dotted quad by definition — a hostname is not a legal
+  # value. So the media engine dials the mediation function by literal address,
+  # and verifies its certificate against the literal it dialled. That address
+  # therefore has to be on the certificate as an IP SAN, and a SAN cannot be
+  # issued for an address the bootstrap does not yet know.
+  #
+  # 172.29.0.0/24 is chosen to sit clear of the other compose profiles in this
+  # repo (sipp uses 172.20) and of the lab networks that tend to exist
+  # alongside them.
+  li-net:
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24

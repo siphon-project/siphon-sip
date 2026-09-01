@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns="http://uri.etsi.org/03221/X1/2017/10/DestinationSet" xmlns:x1="http://uri.etsi.org/03221/X1/2017/10" xmlns:etsi103280="http://uri.etsi.org/03280/common/2017/07" targetNamespace="http://uri.etsi.org/03221/X1/2017/10/DestinationSet" elementFormDefault="qualified" version="1.11.1">
+    <xs:import namespace="http://uri.etsi.org/03280/common/2017/07"/>
+    <xs:import namespace="http://uri.etsi.org/03221/X1/2017/10"/>
+    <!-- Message containers -->
+    <xs:complexType name="DestinationSetDetails">
+        <xs:complexContent>
+            <xs:extension base="x1:GenericObject">
+                <xs:sequence>
+                    <xs:element name="friendlyName" type="xs:string" minOccurs="0"/>
+                    <xs:element name="listOfAssociatedDIDs" type="ListOfAssociatedDIDs"/>
+                    <xs:element name="destinationSetDetailsExtension" type="DestinationSetDetailsExtension" minOccurs="0" maxOccurs="unbounded"/>
+                    <xs:element name="destinationSetType" type="DestinationSetType"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="ListOfAssociatedDIDs">
+        <xs:sequence>
+            <xs:element name="AssociatedDID" type="AssociatedDID" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="AssociatedDID">
+        <xs:sequence>
+            <xs:element name="dId" type="x1:DId"/>
+            <xs:element name="preference" type="xs:integer"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="DestinationSetDetailsExtension">
+        <xs:complexContent>
+            <xs:extension base="x1:Extension"/>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:simpleType name="DestinationSetType">
+        <xs:restriction base="xs:string">
+            <xs:enumeration value="Redundant"/>
+            <xs:enumeration value="Duplicate"/>
+        </xs:restriction>
+    </xs:simpleType>
+</xs:schema>

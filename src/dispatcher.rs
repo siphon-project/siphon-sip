@@ -293,6 +293,12 @@ struct DispatcherState {
     /// / reject / the decision-deadline sweep. Empty and cheaply skipped when no
     /// control plane is configured (no call is ever controlled).
     pending_inbound_refer: Arc<PendingInboundReferStore>,
+    /// Lawful interception. `None` when `lawful_intercept.enabled` is false.
+    ///
+    /// The dispatcher consults this on every message, so interception does not
+    /// depend on the operator's script calling anything — see
+    /// [`intercept_message`].
+    li_manager: Option<crate::li::LiManager>,
 }
 
 /// Bundle held in `DispatcherState::rf_sessions` so ACR-STOP can reuse
@@ -741,6 +747,10 @@ pub async fn run(
         ro_sessions: Arc::new(DashMap::new()),
         cdr_sessions: Arc::new(DashMap::new()),
         pending_inbound_refer: Arc::new(PendingInboundReferStore::default()),
+        // Interception is enforced here, not in the script. `LI_MANAGER` is
+        // set by `init_li` before the dispatcher is built when
+        // `lawful_intercept.enabled` is true.
+        li_manager: crate::server::li_manager(),
     });
 
     // Hand the freshly-constructed manager handles to the drain coordinator
@@ -1493,6 +1503,105 @@ pub async fn run(
                         })
                         .await;
                     }
+                    crate::rtpengine::events::RtpEngineEvent::X3Started(started) => {
+                        info!(
+                            call_id = %started.call_id,
+                            delivery = %started.delivery,
+                            correlation_id = started.correlation_id,
+                            "X3 content delivery started"
+                        );
+                    }
+                    crate::rtpengine::events::RtpEngineEvent::X3Loss(loss) => {
+                        // Warranted content did not reach the agency. This is a
+                        // reportable compliance failure, not a degraded
+                        // recording, so it goes to the ADMF as a
+                        // destination-level report and not only to the log.
+                        error!(
+                            call_id = %loss.call_id,
+                            dropped = loss.dropped,
+                            delivered = loss.delivered,
+                            dropped_since_ms = loss.dropped_since_ms,
+                            "X3 content was DROPPED rather than delivered — warranted \
+                             content did not reach the agency"
+                        );
+                        if let Some(li) = state_for_events.li_manager.as_ref() {
+                            for attachment in li.x3_attachments_for(&loss.call_id) {
+                                let li = li.clone();
+                                let detail = format!(
+                                    "X3 delivery loss on task {}: {} packet(s) dropped, {} \
+                                     delivered, gap began {} ms into the interception",
+                                    attachment.x_id,
+                                    loss.dropped,
+                                    loss.delivered,
+                                    loss.dropped_since_ms
+                                );
+                                let d_id = attachment.d_id;
+                                tokio::spawn(async move {
+                                    report_destination_fault(
+                                        &li,
+                                        d_id,
+                                        crate::li::x1::types::TaskReportType::NonTerminatingFault,
+                                        detail,
+                                    )
+                                    .await;
+                                });
+                            }
+                        }
+                    }
+                    crate::rtpengine::events::RtpEngineEvent::X3Ended(ended) => {
+                        // An orderly end is our own detach. Anything else means
+                        // delivery stopped for a reason the ADMF should hear,
+                        // and any drop at all means content was lost.
+                        if ended.orderly && ended.dropped == 0 {
+                            info!(
+                                call_id = %ended.call_id,
+                                delivered = ended.delivered,
+                                "X3 content delivery ended cleanly"
+                            );
+                        } else {
+                            error!(
+                                call_id = %ended.call_id,
+                                reason = %ended.reason,
+                                delivered = ended.delivered,
+                                dropped = ended.dropped,
+                                "X3 content delivery ended without a clean detach or with \
+                                 dropped content"
+                            );
+                        }
+                        if let Some(li) = state_for_events.li_manager.as_ref() {
+                            // The engine has stopped; drop our record either
+                            // way so the map does not grow across calls.
+                            let attachments = if ended.orderly && ended.dropped == 0 {
+                                li.take_x3_attachments(&ended.call_id)
+                            } else {
+                                li.x3_attachments_for(&ended.call_id)
+                            };
+                            if !(ended.orderly && ended.dropped == 0) {
+                                for attachment in attachments {
+                                    let li = li.clone();
+                                    let detail = format!(
+                                        "X3 delivery ended for task {} ({}): {} delivered, {} \
+                                         dropped",
+                                        attachment.x_id,
+                                        ended.reason,
+                                        ended.delivered,
+                                        ended.dropped
+                                    );
+                                    let d_id = attachment.d_id;
+                                    tokio::spawn(async move {
+                                        report_destination_fault(
+                                            &li,
+                                            d_id,
+                                            crate::li::x1::types::TaskReportType::TerminatingFault,
+                                            detail,
+                                        )
+                                        .await;
+                                    });
+                                }
+                                li.take_x3_attachments(&ended.call_id);
+                            }
+                        }
+                    }
                     crate::rtpengine::events::RtpEngineEvent::Unknown { event, call_id, .. } => {
                         tracing::debug!(
                             %event,
@@ -2017,6 +2126,13 @@ async fn sweep_stale_entries(state: &DispatcherState) {
         metrics.cdr_sessions.set(state.cdr_sessions.len() as i64);
         metrics.subscribe_dialogs.set(subscribe_dialogs as i64);
         metrics.ipsec_sa_pairs.set(ipsec_sa_pairs as i64);
+        // Keyed on a value the peer chooses, so its size is worth watching:
+        // it should track live dialogs and fall back, never climb.
+        if let Some(li) = state.li_manager.as_ref() {
+            metrics
+                .li_remembered_sessions
+                .set(li.remembered_session_count() as i64);
+        }
     }
     // Refresh allocator memory gauges (jemalloc live/resident/retained bytes)
     // so operators can alert on `siphon_memory_allocated_bytes` growth — the
@@ -2895,6 +3011,25 @@ fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
         }
     }
 
+    // --- Lawful interception (ETSI TS 103 221) ---
+    //
+    // Every message, every leg, every path — before routing, and before any
+    // Python handler runs. This is deliberately not something a script opts
+    // into: a warrant a script forgot to act on is a missed intercept, and a
+    // missed leg on a warranted intercept is a reportable failure.
+    //
+    // Placed after parse and validation so the identities are trustworthy, and
+    // before dispatch so a script cannot drop the message first.
+    //
+    // That placement is also before transaction matching, so a UDP
+    // retransmission produces a second record for a message the mediation
+    // function has already seen. That is deliberate and not an oversight: the
+    // element reports what arrived, and de-duplicating would mean keeping
+    // another map keyed on peer-supplied values and accepting a way to *drop* a
+    // record that only looked like a repeat. For a warrant, a duplicated record
+    // is recoverable at the mediation function and a missing one is not.
+    intercept_message(&message, &inbound, state);
+
     match &message.start_line {
         StartLine::Request(request_line) => {
             let method = request_line.method.as_str().to_string();
@@ -2904,6 +3039,505 @@ fn handle_inbound(inbound: InboundMessage, state: &Arc<DispatcherState>) {
             let status_code = status_line.status_code;
             handle_response(inbound, message, status_code, state);
         }
+    }
+}
+
+/// Match one SIP message against the provisioned warrants and emit IRI.
+///
+/// Costs one `Option` test on a node with LI disabled, and one further
+/// emptiness check on a node with LI enabled but nothing provisioned, so the
+/// common case is a predictable branch rather than a lookup.
+fn intercept_message(
+    message: &SipMessage,
+    inbound: &InboundMessage,
+    state: &Arc<DispatcherState>,
+) {
+    let Some(li) = state.li_manager.as_ref() else {
+        return;
+    };
+
+    // Borrowed, not owned. This runs on every message, and the overwhelming
+    // majority match nothing — building four Strings only to discard them is a
+    // cost the hot path should not carry. The owned forms are built below,
+    // after something has actually matched.
+    let request_uri = match &message.start_line {
+        StartLine::Request(request_line) => Some(request_line.request_uri.to_string()),
+        StartLine::Response(_) => None,
+    };
+    let from_uri = message.headers.get("From").map(String::as_str);
+    let to_uri = message.headers.get("To").map(String::as_str);
+    let source_ip = Some(inbound.remote_addr.ip());
+
+    let Some(call_id) = message.headers.call_id() else {
+        // Every SIP message carries a Call-ID (RFC 3261 §8.1.1.4); one that
+        // does not has already failed validation above. Without it there is no
+        // session to correlate on, so the record would be unusable — and no
+        // session to decide, either.
+        return;
+    };
+
+    // Decided once per session, not once per message. See `check_session`:
+    // this is what stops a warrant delivering the INVITE and then missing the
+    // BYE, because a later message need not carry the target in matchable form.
+    let matches = li.check_session(
+        call_id,
+        request_uri.as_deref(),
+        from_uri,
+        to_uri,
+        source_ip,
+    );
+    if matches.is_empty() {
+        // An unwarranted session is remembered as unwarranted, and that
+        // memory has to be released when the dialog ends or the map would
+        // grow with every call the node ever handles and rely on the cap to
+        // save it. The cap is for traffic that never reaches an end at all.
+        if terminates_dialog(message) {
+            li.forget_session(call_id);
+        }
+        return;
+    }
+
+    // A retransmission is the same message arriving again, not a new event.
+    // Recording it twice would give the mediation function a duplicate and
+    // re-run the session's lifecycle — a resent INVITE would restart content
+    // capture on a call already being captured.
+    if !li.record_message_once(call_id, message_instance_key(message)) {
+        debug!(
+            call_id = %call_id,
+            "LI: message already recorded for this session, not recording the retransmission"
+        );
+        return;
+    }
+
+    let method = match &message.start_line {
+        StartLine::Request(request_line) => request_line.method.as_str().to_string(),
+        StartLine::Response(_) => message
+            // A response's method is the one its CSeq names, which is what the
+            // IRI record has to attribute it to.
+            .headers
+            .get("CSeq")
+            .and_then(|cseq| cseq.split_whitespace().nth(1).map(str::to_string))
+            .unwrap_or_else(|| "UNKNOWN".to_string()),
+    };
+    let status_code = match &message.start_line {
+        StartLine::Request(_) => None,
+        StartLine::Response(status_line) => Some(status_line.status_code),
+    };
+    let from_uri = from_uri.unwrap_or_default().to_string();
+    let to_uri = to_uri.unwrap_or_default().to_string();
+
+    // The event type follows the message, not the warrant: a mediation
+    // function reconstructs the session from the sequence.
+    let event_type = match (&message.start_line, method.as_str()) {
+        (StartLine::Request(_), "INVITE") if !to_has_tag(message) => crate::li::IriEventType::Begin,
+        (StartLine::Request(_), "BYE") | (StartLine::Request(_), "CANCEL") => {
+            crate::li::IriEventType::End
+        }
+        (StartLine::Request(_), "REGISTER")
+        | (StartLine::Request(_), "MESSAGE")
+        | (StartLine::Request(_), "SUBSCRIBE")
+        | (StartLine::Request(_), "PUBLISH")
+        | (StartLine::Request(_), "OPTIONS") => crate::li::IriEventType::Report,
+        (StartLine::Request(_), _) => crate::li::IriEventType::Continue,
+        (StartLine::Response(_), _) => match status_code {
+            Some(code) if code >= 300 => crate::li::IriEventType::End,
+            _ => crate::li::IriEventType::Continue,
+        },
+    };
+
+    for matched in &matches {
+        let x_id = matched.task.details.x_id;
+        let event = li.build_iri_event(
+            matched,
+            event_type,
+            call_id,
+            &method,
+            status_code,
+            &from_uri,
+            &to_uri,
+            request_uri.clone(),
+            source_ip,
+            Some(inbound.data.to_vec()),
+        );
+        li.emit_iri(event);
+        li.tasks().mark_intercept(x_id);
+
+        li.audit(
+            crate::li::AuditOperation::InterceptMatch,
+            Some(&x_id.to_string()),
+            format!(
+                "method={method} call_id={call_id} delivery={} event={event_type:?} party={:?}",
+                matched.task.details.delivery_type, matched.party
+            ),
+        );
+
+        // Content capture stops when the dialog ends. There is no matching
+        // "start" here: the attachment is made at the ACK, below, because the
+        // engine has no call to intercept until the script has offered it one.
+        if event_type == crate::li::IriEventType::End {
+            detach_x3(call_id, state);
+        }
+
+        // X3 attaches when the media session is established, not when the
+        // warrant matches.
+        //
+        // Interception is matched here, before the script runs, so a script
+        // cannot decline a warrant. The attachment cannot be made here though,
+        // because the engine only learns of a call when the script offers it
+        // there and this runs first. Two earlier placements were both too
+        // early, and the engine said so rather than accepting them:
+        //
+        //   at the dialog-forming INVITE  — "unknown call": the offer had not
+        //                                   reached the engine yet.
+        //   at the answer                 — "no answered second leg": the
+        //                                   response had not been dispatched
+        //                                   yet, so the script had not answered
+        //                                   it to the engine.
+        //
+        // The ACK is the first message that arrives with the session already
+        // established: RFC 3261 §13 completes the offer/answer there, both legs
+        // are answered in the engine, and it is in-dialog so it cannot be
+        // confused with the INVITE. Attaching there means one attempt that
+        // succeeds, which matters because a failed attempt is a compliance
+        // signal reported to the ADMF and must not be routine.
+        if is_ack(message, &method) {
+            attach_x3(matched, call_id, message, state);
+        }
+    }
+
+    // Released once, after the message has been recorded, and in one place for
+    // matched and unmatched sessions alike.
+    //
+    // Once per message rather than once per matching warrant, and *after* the
+    // loop rather than inside it: the session is one thing however many
+    // warrants cover it.
+    if terminates_dialog(message) {
+        li.forget_session(call_id);
+    }
+}
+
+/// A stable identity for one message *instance*, for retransmission detection.
+///
+/// Built from the top `Via` branch, the CSeq, the method and the status. RFC
+/// 3261 §8.1.1.7 requires a new branch for every new transaction, so a resend
+/// keeps its branch while anything genuinely new does not — and the remaining
+/// fields separate the messages within one transaction, so an ACK, a second
+/// provisional and a final response never collide with each other.
+///
+/// Hashed rather than assembled, because the only question asked of it is
+/// whether it has been seen, and a per-message allocation on this path is
+/// exactly what the rest of this function avoids.
+fn message_instance_key(message: &SipMessage) -> u64 {
+    // FNV-1a, matching `correlation_from_call_id`: no allocation, and stable
+    // within the process, which is all this needs.
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET_BASIS;
+    let mut absorb = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        // A separator, so that ("ab", "c") and ("a", "bc") do not collide.
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(PRIME);
+    };
+
+    absorb(top_via_branch(message).unwrap_or_default().as_bytes());
+    absorb(
+        message
+            .headers
+            .get("CSeq")
+            .map(String::as_str)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    match &message.start_line {
+        StartLine::Request(request_line) => absorb(request_line.method.as_str().as_bytes()),
+        StartLine::Response(status_line) => absorb(&status_line.status_code.to_be_bytes()),
+    }
+    hash
+}
+
+/// The branch parameter of the top `Via`.
+///
+/// Read straight out of the header rather than through the typed parser: this
+/// runs per intercepted message and only needs the token, not a parsed Via.
+fn top_via_branch(message: &SipMessage) -> Option<&str> {
+    // A single header line may carry several comma-separated Vias; the top one
+    // is the first.
+    let top = message.headers.get("Via")?.split(',').next()?;
+    top.split(';')
+        .map(str::trim)
+        .find_map(|parameter| parameter.strip_prefix("branch="))
+}
+
+/// Whether this message ends the dialog it belongs to.
+///
+/// Used to release a session's remembered matching decision. Deliberately
+/// generous about what counts: releasing early costs one re-derivation on the
+/// next message of a session that turned out not to be over, while releasing
+/// late costs memory on a busy node.
+fn terminates_dialog(message: &SipMessage) -> bool {
+    match &message.start_line {
+        StartLine::Request(request_line) => {
+            matches!(request_line.method.as_str(), "BYE" | "CANCEL")
+        }
+        StartLine::Response(status_line) => {
+            // A final failure to an INVITE ends a session that never started.
+            // A 2xx to an INVITE does not — that is where the dialog begins.
+            if status_line.status_code >= 300 {
+                return true;
+            }
+            // The response to a BYE or CANCEL is the last message of the
+            // dialog, and it has to count.
+            //
+            // Releasing on the BYE alone is not enough, and the way it fails is
+            // quiet: the BYE frees the session, its 200 arrives, finds nothing
+            // remembered, re-derives a decision that still matches — the To
+            // header carries the target either way — and puts it straight back.
+            // Nothing after that ever removes it, so a node leaked one entry
+            // for every call it completed.
+            let cseq_method = message
+                .headers
+                .get("CSeq")
+                .and_then(|cseq| cseq.split_whitespace().nth(1));
+            matches!(cseq_method, Some("BYE") | Some("CANCEL"))
+        }
+    }
+}
+
+/// Whether this message is an ACK request.
+///
+/// The point in a dialog where offer/answer is complete and the media session
+/// is established on both legs (RFC 3261 §13.2.2.4), which is what an X3
+/// attachment needs to be true.
+fn is_ack(message: &SipMessage, method: &str) -> bool {
+    matches!(message.start_line, StartLine::Request(_)) && method == "ACK"
+}
+
+/// Tell the media engine to start ETSI TS 103 221-2 content delivery for a
+/// matched warrant.
+///
+/// Only for a task whose `deliveryType` asks for content — an `X2Only` warrant
+/// carries no content and must not open a delivery connection. Provisioning has
+/// already refused a content warrant this node cannot service, so reaching here
+/// means the backend can do it; a failure at the command is therefore a real
+/// delivery fault and is reported to the ADMF rather than logged and forgotten.
+fn attach_x3(
+    matched: &crate::li::x1::store::TaskMatch,
+    call_id: &str,
+    message: &SipMessage,
+    state: &Arc<DispatcherState>,
+) {
+    if !matched.task.details.delivery_type.includes_content() {
+        return;
+    }
+    let Some(li) = state.li_manager.as_ref() else {
+        return;
+    };
+    let Some(backend) = state.rtpengine_set.as_ref() else {
+        error!(
+            xid = %matched.task.details.x_id,
+            "a content warrant matched but no media backend is configured — no content \
+             can be delivered for this intercept"
+        );
+        return;
+    };
+    // The engine keys an interception on the offerer's tag, which is the
+    // dialog's From-tag.
+    let from_tag = message.headers.get("From").and_then(|from| {
+        from.split(';')
+            .find(|part| part.trim().starts_with("tag="))
+            .map(|tag| tag.trim().trim_start_matches("tag=").to_string())
+    });
+    let Some(from_tag) = from_tag else {
+        error!(
+            xid = %matched.task.details.x_id,
+            "a content warrant matched a message with no From-tag; cannot attach X3"
+        );
+        return;
+    };
+
+    // Exactly the content-capable destinations this warrant named, less the
+    // ones already being delivered to.
+    //
+    // Several messages in a dialog carry SDP — the 183, the 200, a re-INVITE —
+    // and any of them can be the one that finds the session established, so
+    // this runs more than once per call by design. Attaching twice would open a
+    // second interception on the same leg and deliver every packet to the
+    // agency twice.
+    let already: std::collections::HashSet<_> = li
+        .x3_attachments_for(call_id)
+        .into_iter()
+        .filter(|attachment| attachment.x_id == matched.task.details.x_id)
+        .map(|attachment| attachment.d_id)
+        .collect();
+    let destinations: Vec<_> = li
+        .tasks()
+        .destinations_for_interface(matched.task.details.x_id, true)
+        .into_iter()
+        .filter(|destination| !already.contains(&destination.details.d_id))
+        .collect();
+    if !already.is_empty() && destinations.is_empty() {
+        // Everything this warrant names is already attached; nothing to do and
+        // nothing wrong.
+        return;
+    }
+    if destinations.is_empty() {
+        error!(
+            xid = %matched.task.details.x_id,
+            "a content warrant named no content-capable destination — refusing to \
+             attach rather than deliver nowhere"
+        );
+        return;
+    }
+
+    let correlation_id = li.correlation_for(&matched.task, call_id);
+    let xid = matched.task.details.x_id.as_bytes();
+    // TS 103 221-2 §5.2.6 measures a delivered packet's direction against the
+    // target, so which end the warrant names is load-bearing rather than
+    // cosmetic: getting it wrong inverts the direction on every packet.
+    let target_leg = match matched.party {
+        crate::li::target::MatchedParty::Originating => {
+            crate::rtpengine::backend::X3TargetLeg::Caller
+        }
+        crate::li::target::MatchedParty::Terminating => {
+            crate::rtpengine::backend::X3TargetLeg::Callee
+        }
+    };
+
+    for destination in destinations {
+        let Some(delivery) = destination.details.delivery_address.socket_addr() else {
+            continue;
+        };
+        let backend = Arc::clone(backend);
+        let li = li.clone();
+        let call_id = call_id.to_string();
+        let from_tag = from_tag.clone();
+        let x_id = matched.task.details.x_id;
+        let d_id = destination.details.d_id;
+        tokio::spawn(async move {
+            match backend
+                .attach_x3(
+                    &call_id,
+                    &from_tag,
+                    &delivery.to_string(),
+                    xid,
+                    correlation_id,
+                    target_leg,
+                )
+                .await
+            {
+                Ok(()) => {
+                    li.record_x3_attachment(
+                        &call_id,
+                        crate::li::ActiveIntercept {
+                            x_id,
+                            d_id,
+                            from_tag: from_tag.clone(),
+                            correlation_id,
+                        },
+                    );
+                    info!(
+                        %x_id, %d_id, %call_id, %delivery, correlation_id,
+                        "X3 content delivery attached"
+                    );
+                    li.audit(
+                        crate::li::AuditOperation::MediaCaptureStarted,
+                        Some(&x_id.to_string()),
+                        format!("X3 attached call_id={call_id} destination={delivery}"),
+                    );
+                }
+                Err(error) => {
+                    // Warranted content is not being delivered. The ADMF has to
+                    // hear about it — this is the whole point of the
+                    // network-element-to-ADMF direction.
+                    error!(
+                        %x_id, %d_id, %call_id, %error,
+                        "could not attach X3 content delivery — warranted content is \
+                         NOT being delivered for this call"
+                    );
+                    li.audit(
+                        crate::li::AuditOperation::MediaCaptureStarted,
+                        Some(&x_id.to_string()),
+                        format!("X3 attach FAILED call_id={call_id}: {error}"),
+                    );
+                    report_destination_fault(
+                        &li,
+                        d_id,
+                        crate::li::x1::types::TaskReportType::TerminatingFault,
+                        format!("could not attach X3 delivery for task {x_id}: {error}"),
+                    )
+                    .await;
+                }
+            }
+        });
+    }
+}
+
+/// Stop content delivery for a call, if any was attached.
+fn detach_x3(call_id: &str, state: &Arc<DispatcherState>) {
+    let Some(li) = state.li_manager.as_ref() else {
+        return;
+    };
+    let attachments = li.take_x3_attachments(call_id);
+    if attachments.is_empty() {
+        return;
+    }
+    let Some(backend) = state.rtpengine_set.as_ref() else {
+        return;
+    };
+    let backend = Arc::clone(backend);
+    let li = li.clone();
+    let call_id = call_id.to_string();
+    tokio::spawn(async move {
+        for attachment in attachments {
+            // Idempotent on the engine, so a duplicate teardown is harmless.
+            if let Err(error) = backend.detach_x3(&call_id, &attachment.from_tag).await {
+                warn!(
+                    x_id = %attachment.x_id, %call_id, %error,
+                    "could not detach X3 content delivery"
+                );
+            }
+            li.audit(
+                crate::li::AuditOperation::MediaCaptureStopped,
+                Some(&attachment.x_id.to_string()),
+                format!("X3 detached call_id={call_id}"),
+            );
+        }
+    });
+}
+
+/// Raise a destination-level report toward the ADMF.
+///
+/// Delivery faults are exactly what the network-element-to-ADMF direction
+/// exists for: a mediation outage has to be *reported*, not merely survived. A
+/// node with no `admf:` block configured can only log it.
+async fn report_destination_fault(
+    li: &crate::li::LiManager,
+    d_id: crate::li::x1::types::DId,
+    report_type: crate::li::x1::types::TaskReportType,
+    detail: String,
+) {
+    let Some(client) = li.x1_client() else {
+        warn!(
+            %d_id, %detail,
+            "an X3 delivery fault could not be reported to the ADMF — \
+             lawful_intercept.x1.admf is not configured"
+        );
+        return;
+    };
+    if let Err(error) = client
+        .report_destination_issue(
+            d_id,
+            report_type,
+            Some(crate::li::x1::ErrorCode::TerminatingFault.number()),
+            Some(detail),
+        )
+        .await
+    {
+        error!(%d_id, %error, "could not report an X3 delivery fault to the ADMF");
     }
 }
 
@@ -28559,6 +29193,254 @@ a=rtpmap:8 PCMA/8000\r\n";
         let out_of_dialog = in_dialog_request(Method::Invite, "cid@host", None);
         assert!(to_has_tag(&in_dialog));
         assert!(!to_has_tag(&out_of_dialog));
+    }
+
+    // --- X3 attachment timing (ETSI TS 103 221-2) ---------------------------
+    //
+    // Interception is matched before the script runs, so a script cannot
+    // decline a warrant — but the attachment cannot be made at that moment.
+    // The engine only learns of a call when the script offers it there, and it
+    // refuses an interception on a call it does not have ("unknown call") or on
+    // one whose second leg is not answered yet. The ACK is the first message
+    // that arrives with both already true.
+
+    fn li_message(raw: &str) -> SipMessage {
+        parse_sip_message(raw).expect("test message must parse").1
+    }
+
+    // --- retransmission identity -------------------------------------------
+    //
+    // Interception runs before transaction matching, so a resend arrives here
+    // looking like a new message. These pin what counts as "the same message
+    // again" — the risk on both sides being real: collapsing two distinct
+    // messages loses a record, and failing to collapse a resend duplicates one
+    // and re-runs the session's lifecycle.
+
+    fn keyed(via_branch: &str, cseq: &str, first_line: &str) -> u64 {
+        message_instance_key(&li_message(&format!(
+            concat!(
+                "{}\r\n",
+                "Via: SIP/2.0/UDP 192.0.2.1:5060;branch={}\r\n",
+                "From: <sip:a@example.com>;tag=1\r\n",
+                "To: <sip:b@example.com>\r\n",
+                "Call-ID: c@example.com\r\n",
+                "CSeq: {}\r\n",
+                "Content-Length: 0\r\n",
+                "\r\n",
+            ),
+            first_line, via_branch, cseq
+        )))
+    }
+
+    #[test]
+    fn the_same_message_again_keys_the_same() {
+        assert_eq!(
+            keyed("z9hG4bK1", "1 INVITE", "INVITE sip:b@example.com SIP/2.0"),
+            keyed("z9hG4bK1", "1 INVITE", "INVITE sip:b@example.com SIP/2.0"),
+            "a retransmission is byte-identical and must collapse"
+        );
+    }
+
+    #[test]
+    fn messages_that_are_genuinely_different_key_differently() {
+        let invite = keyed("z9hG4bK1", "1 INVITE", "INVITE sip:b@example.com SIP/2.0");
+
+        // A re-INVITE opens a new transaction, so it carries a new branch.
+        assert_ne!(
+            invite,
+            keyed("z9hG4bK2", "2 INVITE", "INVITE sip:b@example.com SIP/2.0"),
+            "a re-INVITE is a new message, not a resend"
+        );
+        // An ACK to a non-2xx shares the INVITE's branch and CSeq number, and
+        // is separated only by its method. This is the collision that would
+        // lose a record if the method were left out of the key.
+        assert_ne!(
+            invite,
+            keyed("z9hG4bK1", "1 ACK", "ACK sip:b@example.com SIP/2.0"),
+            "an ACK on the INVITE's own branch must not read as a resend of it"
+        );
+        // Provisional and final responses share the branch and the CSeq, and
+        // are separated only by their status.
+        let ringing = keyed("z9hG4bK1", "1 INVITE", "SIP/2.0 180 Ringing");
+        let ok = keyed("z9hG4bK1", "1 INVITE", "SIP/2.0 200 OK");
+        assert_ne!(ringing, ok, "180 and 200 are different records");
+        assert_ne!(invite, ringing, "a response is not its own request");
+        assert_eq!(
+            ringing,
+            keyed("z9hG4bK1", "1 INVITE", "SIP/2.0 180 Ringing"),
+            "a resent 180 is a resend"
+        );
+    }
+
+    /// The last message of a dialog is the response to its BYE, not the BYE.
+    ///
+    /// Regression test for a leak that a per-call soak found and no unit test
+    /// would have: releasing on the BYE alone freed the session, then its 200
+    /// arrived, found nothing remembered, re-derived a decision that still
+    /// matched — the To header carries the target either way — and put it back
+    /// permanently. One leaked entry per completed call, on a map keyed by a
+    /// value the peer chooses.
+    #[test]
+    fn the_response_to_a_bye_ends_the_dialog_too() {
+        let bye = li_message(concat!(
+            "BYE sip:b@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK3\r\n",
+            "From: <sip:a@example.com>;tag=1\r\n",
+            "To: <sip:b@example.com>;tag=2\r\n",
+            "Call-ID: c@example.com\r\n",
+            "CSeq: 2 BYE\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ));
+        assert!(terminates_dialog(&bye), "the BYE ends the dialog");
+
+        let bye_ok = li_message(concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK3\r\n",
+            "From: <sip:a@example.com>;tag=1\r\n",
+            "To: <sip:b@example.com>;tag=2\r\n",
+            "Call-ID: c@example.com\r\n",
+            "CSeq: 2 BYE\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ));
+        assert!(
+            terminates_dialog(&bye_ok),
+            "the 200 to a BYE is the dialog's last message and must release it, \
+             or it re-derives a decision nothing will ever remove"
+        );
+
+        let cancel_ok = li_message(concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK4\r\n",
+            "From: <sip:a@example.com>;tag=1\r\n",
+            "To: <sip:b@example.com>\r\n",
+            "Call-ID: c@example.com\r\n",
+            "CSeq: 1 CANCEL\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ));
+        assert!(terminates_dialog(&cancel_ok), "so is the 200 to a CANCEL");
+
+        // The 200 that *starts* a dialog must not release it.
+        let invite_ok = li_message(concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK1\r\n",
+            "From: <sip:a@example.com>;tag=1\r\n",
+            "To: <sip:b@example.com>;tag=2\r\n",
+            "Call-ID: c@example.com\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ));
+        assert!(
+            !terminates_dialog(&invite_ok),
+            "the 200 to an INVITE opens the dialog; releasing there would drop \
+             the decision for the whole call"
+        );
+
+        // A failure to an INVITE ends a session that never started.
+        let busy = li_message(concat!(
+            "SIP/2.0 486 Busy Here\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK1\r\n",
+            "From: <sip:a@example.com>;tag=1\r\n",
+            "To: <sip:b@example.com>;tag=2\r\n",
+            "Call-ID: c@example.com\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ));
+        assert!(terminates_dialog(&busy));
+    }
+
+    #[test]
+    fn the_top_via_branch_is_the_one_read() {
+        let stacked = li_message(concat!(
+            "INVITE sip:b@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP proxy.example.com;branch=z9hG4bK-top\r\n",
+            "Via: SIP/2.0/UDP ua.example.com;branch=z9hG4bK-bottom\r\n",
+            "From: <sip:a@example.com>;tag=1\r\n",
+            "To: <sip:b@example.com>\r\n",
+            "Call-ID: c@example.com\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ));
+        assert_eq!(top_via_branch(&stacked), Some("z9hG4bK-top"));
+
+        // Several Vias folded onto one line: the top is still the first.
+        let folded = li_message(concat!(
+            "INVITE sip:b@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP proxy.example.com;branch=z9hG4bK-first,",
+            "SIP/2.0/UDP ua.example.com;branch=z9hG4bK-second\r\n",
+            "From: <sip:a@example.com>;tag=1\r\n",
+            "To: <sip:b@example.com>\r\n",
+            "Call-ID: c@example.com\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ));
+        assert_eq!(top_via_branch(&folded), Some("z9hG4bK-first"));
+    }
+
+    #[test]
+    fn only_the_ack_triggers_a_content_attachment() {
+        let ack = li_message(concat!(
+            "ACK sip:b@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK2\r\n",
+            "From: <sip:a@example.com>;tag=1\r\n",
+            "To: <sip:b@example.com>;tag=2\r\n",
+            "Call-ID: c@example.com\r\n",
+            "CSeq: 1 ACK\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ));
+        assert!(is_ack(&ack, "ACK"));
+
+        // The INVITE is too early: the engine has never heard of the call.
+        let invite = li_message(concat!(
+            "INVITE sip:b@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK1\r\n",
+            "From: <sip:a@example.com>;tag=1\r\n",
+            "To: <sip:b@example.com>\r\n",
+            "Call-ID: c@example.com\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ));
+        assert!(!is_ack(&invite, "INVITE"));
+
+        // So is the answer: it has not been dispatched to the script yet, so
+        // the second leg is not answered in the engine.
+        let ok = li_message(concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK1\r\n",
+            "From: <sip:a@example.com>;tag=1\r\n",
+            "To: <sip:b@example.com>;tag=2\r\n",
+            "Call-ID: c@example.com\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ));
+        assert!(
+            !is_ack(&ok, "INVITE"),
+            "a response's CSeq method is INVITE; it must not be read as the ACK"
+        );
+
+        // A response to an ACK does not exist in SIP, but the CSeq of a 200 to
+        // a BYE names BYE — guard that the predicate keys on both the start
+        // line and the method rather than the method alone.
+        let bye_ok = li_message(concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK3\r\n",
+            "From: <sip:a@example.com>;tag=1\r\n",
+            "To: <sip:b@example.com>;tag=2\r\n",
+            "Call-ID: c@example.com\r\n",
+            "CSeq: 2 BYE\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ));
+        assert!(!is_ack(&bye_ok, "ACK"));
     }
 
     // --- truncate_for_log ---------------------------------------------------

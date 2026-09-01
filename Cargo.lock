@@ -3103,9 +3103,9 @@ checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
 
 [[package]]
 name = "siphon-rtp-proto"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4dbd8c70053af200a0d5d77e55e439fc3650e1ea06e3236627d7e58a951daf7"
+checksum = "4bb75fb1c1bb6292201107966cd3e252d3ed56361315c270e297861557b8855c"
 dependencies = [
  "serde",
  "serde_bytes",
@@ -3131,6 +3131,9 @@ dependencies = [
  "getrandom 0.4.3",
  "hickory-resolver",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "indexmap",
  "ipnet",
  "libc",
@@ -3175,6 +3178,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uppsala",
  "uuid",
  "webpki-roots",
  "x509-cert",
@@ -3919,6 +3923,12 @@ name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+
+[[package]]
+name = "uppsala"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b83b4950a552cd9812b6afd150ea10729617d28208bba122912eb196c2261d4d"
 
 [[package]]
 name = "url"

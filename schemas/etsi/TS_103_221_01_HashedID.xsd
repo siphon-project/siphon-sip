@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns="http://uri.etsi.org/03221/X1/2017/10/HashedID" xmlns:x1="http://uri.etsi.org/03221/X1/2017/10" xmlns:etsi103280="http://uri.etsi.org/03280/common/2017/07" targetNamespace="http://uri.etsi.org/03221/X1/2017/10/HashedID" elementFormDefault="qualified" version="1.10.1">
+    <xs:import namespace="http://uri.etsi.org/03280/common/2017/07"/>
+    <xs:import namespace="http://uri.etsi.org/03221/X1/2017/10"/>
+    <!-- Message containers -->
+    <xs:complexType name="HashContext">
+        <xs:complexContent>
+            <xs:extension base="x1:GenericObject">
+                <xs:sequence>
+                    <xs:element name="hashAlgorithm" type="HashAlgorithm"/>
+                    <xs:element name="salt" type="Salt"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:simpleType name="HashAlgorithm">
+        <xs:restriction base="xs:string">
+            <xs:enumeration value="sha-256"/>
+            <xs:enumeration value="sha-512"/>
+            <xs:enumeration value="sha3-512"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="Salt">
+        <xs:restriction base="xs:hexBinary">
+            <xs:minLength value="8"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:complexType name="HashedIdentifier">
+        <xs:sequence>
+            <xs:element name="hashContextID" type="x1:GenericObjectID"/>
+            <xs:element name="targetIdentityType" type="etsi103280:ShortString"/>
+            <xs:element name="hashDigest" type="xs:hexBinary"/>
+        </xs:sequence>
+    </xs:complexType>
+</xs:schema>

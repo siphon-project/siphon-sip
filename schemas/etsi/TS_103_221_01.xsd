@@ -1,0 +1,1055 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns="http://uri.etsi.org/03221/X1/2017/10" xmlns:etsi103280="http://uri.etsi.org/03280/common/2017/07" xmlns:hashedID="http://uri.etsi.org/03221/X1/2017/10/HashedID" xmlns:destinationSet="http://uri.etsi.org/03221/X1/2017/10/DestinationSet" targetNamespace="http://uri.etsi.org/03221/X1/2017/10" elementFormDefault="qualified" version="1.23.1">
+    <xs:import namespace="http://uri.etsi.org/03280/common/2017/07"/>
+    <xs:import namespace="http://uri.etsi.org/03221/X1/2017/10/HashedID"/>
+    <!-- Message containers -->
+    <xs:element name="X1Request" type="RequestContainer"/>
+    <xs:element name="X1Response" type="ResponseContainer"/>
+    <xs:element name="X1TopLevelErrorResponse" type="TopLevelErrorResponse"/>
+    <xs:complexType name="RequestContainer">
+        <xs:sequence>
+            <xs:element name="x1RequestMessage" type="X1RequestMessage" minOccurs="1" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="ResponseContainer">
+        <xs:sequence>
+            <xs:element name="x1ResponseMessage" type="X1ResponseMessage" minOccurs="1" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <!-- Top-level Message definitions -->
+    <!-- See section 6.1 -->
+    <xs:complexType name="X1RequestMessage">
+        <xs:sequence>
+            <xs:element name="admfIdentifier" type="AdmfIdentifier"/>
+            <xs:element name="neIdentifier" type="NeIdentifier"/>
+            <xs:element name="messageTimestamp" type="etsi103280:QualifiedMicrosecondDateTime"/>
+            <xs:element name="version" type="Version"/>
+            <xs:element name="x1TransactionId" type="X1TransactionId"/>
+        </xs:sequence>
+    </xs:complexType>
+    <!-- See section 6.1 -->
+    <xs:complexType name="X1ResponseMessage">
+        <xs:sequence>
+            <xs:element name="admfIdentifier" type="AdmfIdentifier"/>
+            <xs:element name="neIdentifier" type="NeIdentifier"/>
+            <xs:element name="messageTimestamp" type="etsi103280:QualifiedMicrosecondDateTime"/>
+            <xs:element name="version" type="Version"/>
+            <xs:element name="x1TransactionId" type="X1TransactionId"/>
+        </xs:sequence>
+    </xs:complexType>
+    <!-- See section 5.1 -->
+    <xs:simpleType name="XId">
+        <xs:restriction base="etsi103280:UUID"/>
+    </xs:simpleType>
+    <xs:simpleType name="DId">
+        <xs:restriction base="etsi103280:UUID"/>
+    </xs:simpleType>
+    <!-- See section 5.2 -->
+    <xs:simpleType name="X1TransactionId">
+        <xs:restriction base="etsi103280:UUID"/>
+    </xs:simpleType>
+    <!-- See section 6.1 -->
+    <xs:simpleType name="AdmfIdentifier">
+        <xs:restriction base="xs:token"/>
+    </xs:simpleType>
+    <!-- See section 6.1 -->
+    <xs:simpleType name="NeIdentifier">
+        <xs:restriction base="xs:token"/>
+    </xs:simpleType>
+    <!-- See section 6.1 -->
+    <xs:simpleType name="Version">
+        <xs:restriction base="xs:string">
+            <xs:pattern value="v1\.\d+\.\d+"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <!-- Error Reponse -->
+    <xs:complexType name="TopLevelErrorResponse">
+        <xs:sequence>
+            <xs:element name="admfIdentifier" type="AdmfIdentifier"/>
+            <xs:element name="neIdentifier" type="NeIdentifier"/>
+            <xs:element name="messageTimestamp" type="etsi103280:QualifiedMicrosecondDateTime"/>
+            <xs:element name="version" type="Version"/>
+        </xs:sequence>
+    </xs:complexType>
+    <!-- See section 6.7 -->
+    <xs:complexType name="ErrorResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="requestMessageType" type="RequestMessageType"/>
+                    <xs:element name="errorInformation" type="ErrorInformation"/>
+                    <xs:element name="extensionInformation" type="ExtensionInformation" minOccurs="0"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:simpleType name="RequestMessageType">
+        <xs:restriction base="xs:string">
+            <xs:enumeration value="ActivateTask"/>
+            <xs:enumeration value="ModifyTask"/>
+            <xs:enumeration value="DeactivateTask"/>
+            <xs:enumeration value="DeactivateAllTasks"/>
+            <xs:enumeration value="GetTaskDetails"/>
+            <xs:enumeration value="CreateDestination"/>
+            <xs:enumeration value="ModifyDestination"/>
+            <xs:enumeration value="RemoveDestination"/>
+            <xs:enumeration value="RemoveAllDestinations"/>
+            <xs:enumeration value="GetDestinationDetails"/>
+            <xs:enumeration value="GetNEStatus"/>
+            <xs:enumeration value="GetAllDetails"/>
+            <xs:enumeration value="GetAllTaskDetails"/>
+            <xs:enumeration value="GetAllDestinationDetails"/>
+            <xs:enumeration value="GetAllGenericObjectDetails"/>
+            <xs:enumeration value="ListAllDetails"/>
+            <xs:enumeration value="ReportTaskIssue"/>
+            <xs:enumeration value="ReportDestinationIssue"/>
+            <xs:enumeration value="ReportNEIssue"/>
+            <xs:enumeration value="Ping"/>
+            <xs:enumeration value="Keepalive"/>
+            <xs:enumeration value="CreateObject"/>
+            <xs:enumeration value="ModifyObject"/>
+            <xs:enumeration value="GetObject"/>
+            <xs:enumeration value="DeleteObject"/>
+            <xs:enumeration value="ListObjectsOfType"/>
+            <xs:enumeration value="DeleteAllObjects"/>
+            <xs:enumeration value="ExtendedRequestMessageType"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:complexType name="ErrorInformation">
+        <xs:sequence>
+            <xs:element name="errorCode" type="xs:integer"/>
+            <xs:element name="errorDescription" type="xs:string"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="ExtensionInformation">
+        <xs:sequence>
+            <xs:element name="extensionSpecification" type="ExtensionSpecification"/>
+            <xs:element name="extendedRequestMessageType" type="xs:string"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:simpleType name="ExtensionSpecification">
+        <xs:restriction base="xs:string">
+            <xs:enumeration value="TS133128"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <!-- Individual Message Definitions -->
+    <!-- See section 6.2.1 -->
+    <xs:complexType name="ActivateTaskRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence>
+                    <xs:element name="taskDetails" type="TaskDetails"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.2.1.2 -->
+    <xs:complexType name="TaskDetails">
+        <xs:sequence>
+            <xs:element name="xId" type="XId"/>
+            <xs:element name="targetIdentifiers" type="ListOfTargetIdentifiers"/>
+            <xs:element name="deliveryType" type="DeliveryType"/>
+            <xs:element name="listOfDIDs" type="ListOfDids"/>
+            <xs:element name="listOfMediationDetails" type="ListOfMediationDetails" minOccurs="0"/>
+            <xs:element name="correlationID" type="xs:nonNegativeInteger" minOccurs="0"/>
+            <xs:element name="implicitDeactivationAllowed" type="xs:boolean" minOccurs="0"/>
+            <xs:element name="productID" type="XId" minOccurs="0"/>
+            <xs:element name="listOfServiceTypes" type="ListOfServiceTypes" minOccurs="0"/>
+            <xs:element name="taskDetailsExtensions" type="TaskDetailsExtensions" minOccurs="0" maxOccurs="unbounded"/>
+            <xs:element name="listOfTrafficPolicyReferences" type="ListOfTrafficPolicyReferences" minOccurs="0"/>
+            <xs:element name="listOfIRIPolicyReferences" type="ListOfIRIPolicyReferences" minOccurs="0"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="ListOfTargetIdentifiers">
+        <xs:sequence>
+            <xs:element name="targetIdentifier" type="TargetIdentifier" minOccurs="1" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="TargetIdentifier">
+        <xs:choice>
+            <xs:element name="e164Number" type="etsi103280:InternationalE164"/>
+            <xs:element name="imsi" type="etsi103280:IMSI"/>
+            <xs:element name="imei" type="etsi103280:IMEI"/>
+            <xs:element name="macAddress" type="etsi103280:MACAddress"/>
+            <xs:element name="ipv4Address" type="etsi103280:IPv4Address"/>
+            <xs:element name="ipv6Address" type="etsi103280:IPv6Address"/>
+            <xs:element name="ipv4Cidr" type="etsi103280:IPCIDR"/>
+            <xs:element name="ipv6Cidr" type="etsi103280:IPv6CIDR"/>
+            <xs:element name="tcpPort" type="etsi103280:TCPPort"/>
+            <xs:element name="tcpPortRange" type="etsi103280:TCPPortRange"/>
+            <xs:element name="tcpPortList" type="TCPPortList"/>
+            <xs:element name="udpPort" type="etsi103280:UDPPort"/>
+            <xs:element name="udpPortRange" type="etsi103280:UDPPortRange"/>
+            <xs:element name="udpPortList" type="UDPPortList"/>
+            <xs:element name="emailAddress" type="etsi103280:EmailAddress"/>
+            <xs:element name="internationalizedEmailAddress" type="etsi103280:InternationalizedEmailAddress"/>
+            <xs:element name="sipUri" type="etsi103280:SIPURI"/>
+            <xs:element name="telUri" type="etsi103280:TELURI"/>
+            <xs:element name="h323Uri" type="etsi103280:H323URI"/>
+            <xs:element name="impu" type="etsi103280:IMPU"/>
+            <xs:element name="impi" type="etsi103280:IMPI"/>
+            <xs:element name="nai" type="etsi103280:NAI"/>
+            <xs:element name="radiusAttribute" type="xs:hexBinary"/>
+            <xs:element name="gtpuTunnelId" type="GtpTunnelId"/>
+            <xs:element name="gtpcTunnelId" type="GtpTunnelId"/>
+            <xs:element name="callPartyRole" type="CallPartyRole"/>
+            <xs:element name="nonLocalIdentifier" type="NonLocalIdentifier"/>
+            <xs:element name="supiimsi" type="etsi103280:SUPIIMSI"/>
+            <xs:element name="supinai" type="etsi103280:SUPINAI"/>
+            <xs:element name="suci" type="etsi103280:SUCI"/>
+            <xs:element name="peiImei" type="etsi103280:PEIIMEI"/>
+            <xs:element name="peiImeiCheckDigit" type="etsi103280:PEIIMEICheckDigit"/>
+            <xs:element name="peiImeisv" type="etsi103280:PEIIMEISV"/>
+            <xs:element name="gpsiMsisdn" type="etsi103280:GPSIMSISDN"/>
+            <xs:element name="gpsiNai" type="etsi103280:GPSINAI"/>
+            <xs:element name="eui64" type="etsi103280:EUI64"/>
+            <xs:element name="serviceAccessIdentifier" type="etsi103280:ServiceAccessIdentifier"/>
+            <xs:element name="hashedIdentifier" type="hashedID:HashedIdentifier"/>
+            <xs:element name="targetIdentifierExtension" type="TargetIdentifierExtension"/>
+            <xs:element name="vrf" type="etsi103280:VRF"/>
+        </xs:choice>
+    </xs:complexType>
+    <xs:complexType name="TCPPortList">
+        <xs:sequence>
+            <xs:element name="tcpPort" type="etsi103280:TCPPort" minOccurs="1" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="UDPPortList">
+        <xs:sequence>
+            <xs:element name="udpPort" type="etsi103280:UDPPort" minOccurs="1" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:simpleType name="GtpTunnelId">
+        <xs:restriction base="xs:integer">
+            <xs:minInclusive value="0"/>
+            <xs:maxInclusive value="4294967296"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="CallPartyRole">
+        <xs:restriction base="xs:string">
+            <xs:enumeration value="Originating"/>
+            <xs:enumeration value="Terminating"/>
+            <xs:enumeration value="Forwarded-To"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="NonLocalIdentifier">
+        <xs:restriction base="xs:string">
+            <xs:enumeration value="Local"/>
+            <xs:enumeration value="NonLocal"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:complexType name="TargetIdentifierExtension">
+        <xs:complexContent>
+            <xs:extension base="Extension"/>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="MediationDetails">
+        <xs:sequence>
+            <xs:element name="LIID" type="etsi103280:LIID"/>
+            <xs:element name="deliveryType" type="MediationDeliveryType"/>
+            <xs:element name="StartTime" type="etsi103280:QualifiedMicrosecondDateTime" minOccurs="0"/>
+            <xs:element name="EndTime" type="etsi103280:QualifiedMicrosecondDateTime" minOccurs="0"/>
+            <xs:element name="listOfDIDs" type="ListOfDids" minOccurs="0"/>
+            <xs:element name="mediationDetailsExtensions" type="MediationDetailsExtensions" minOccurs="0" maxOccurs="unbounded"/>
+            <xs:element name="serviceScopingOptions" type="ListOfServiceScopingOptions" minOccurs="0"/>
+            <xs:element name="listOfTrafficPolicyReferences" type="ListOfTrafficPolicyReferences" minOccurs="0"/>
+            <xs:element name="listOfIRIPolicyReferences" type="ListOfIRIPolicyReferences" minOccurs="0"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="ListOfServiceScopingOptions">
+        <xs:sequence>
+            <xs:element name="serviceScopingOptions" type="ServiceScopingOptions" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="ServiceScopingOptions">
+        <xs:sequence>
+            <xs:element name="serviceType" type="ListOfServiceTypes" minOccurs="0"/>
+            <xs:element name="locationType" type="LocationTypeOptions" minOccurs="0"/>
+            <xs:element name="suspendOnOutboundInternationalRoaming" type="xs:boolean" minOccurs="0"/>
+            <xs:element name="reportPostDialledDigits" type="xs:boolean" minOccurs="0"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="ListOfServiceTypes">
+        <xs:sequence>
+            <xs:element name="serviceType" type="ServiceType" minOccurs="1" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:simpleType name="ServiceType">
+        <xs:restriction base="xs:string">
+            <xs:enumeration value="voice"/>
+            <xs:enumeration value="data"/>
+            <xs:enumeration value="messaging"/>
+            <xs:enumeration value="pushToTalk"/>
+            <xs:enumeration value="LALS"/>
+            <xs:enumeration value="RCS"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:complexType name="LocationTypeOptions">
+        <xs:choice>
+            <xs:element name="doNotReport" type="xs:string" fixed=""/>
+            <xs:element name="listOfLocationTypes" type="ListOfLocationTypes"/>
+        </xs:choice>
+    </xs:complexType>
+    <xs:complexType name="ListOfLocationTypes">
+        <xs:sequence>
+            <xs:element name="locationType" type="LocationType" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="LocationType">
+        <xs:sequence>
+            <xs:element name="beginningAndEnd" type="xs:boolean" minOccurs="0"/>
+            <xs:element name="uponChange" type="xs:boolean" minOccurs="0"/>
+            <xs:element name="LALS" type="xs:boolean" minOccurs="0"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:simpleType name="DeliveryType">
+        <xs:restriction base="xs:string">
+            <xs:enumeration value="X2Only"/>
+            <xs:enumeration value="X3Only"/>
+            <xs:enumeration value="X2andX3"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="MediationDeliveryType">
+        <xs:restriction base="xs:string">
+            <xs:enumeration value="HI2Only"/>
+            <xs:enumeration value="HI3Only"/>
+            <xs:enumeration value="HI2andHI3"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:complexType name="ListOfDids">
+        <xs:sequence>
+            <xs:element name="dId" type="DId" minOccurs="0" maxOccurs="unbounded"/>
+            <xs:element name="dSId" type="GenericObjectID" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="ListOfTrafficPolicyReferences">
+        <xs:sequence>
+            <xs:element name="trafficPolicyReference" type="TrafficPolicyReference" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:simpleType name="TrafficPolicyReference">
+        <xs:restriction base="GenericObjectID"/>
+    </xs:simpleType>
+    <xs:complexType name="ListOfIRIPolicyReferences">
+        <xs:sequence>
+            <xs:element name="iRIPolicyReference" type="IRIPolicyReference" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:simpleType name="IRIPolicyReference">
+        <xs:restriction base="GenericObjectID"/>
+    </xs:simpleType>
+    <xs:complexType name="ListOfMediationDetails">
+        <xs:sequence>
+            <xs:element name="mediationDetails" type="MediationDetails" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="TaskDetailsExtensions">
+        <xs:complexContent>
+            <xs:extension base="Extension"/>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="MediationDetailsExtensions">
+        <xs:complexContent>
+            <xs:extension base="Extension"/>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="TaskStatusExtensions">
+        <xs:complexContent>
+            <xs:extension base="Extension"/>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="Extension">
+        <xs:sequence>
+            <xs:element name="Owner" type="xs:string"/>
+            <xs:any namespace="##other" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="TaskIssueExtensions">
+        <xs:complexContent>
+            <xs:extension base="Extension"/>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="NEIssueExtensions">
+        <xs:complexContent>
+            <xs:extension base="Extension"/>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.2.1 -->
+    <xs:complexType name="ActivateTaskResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="oK" type="OK"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:simpleType name="OK">
+        <xs:restriction base="xs:string">
+            <xs:enumeration value="AcknowledgedAndCompleted"/>
+            <xs:enumeration value="Acknowledged"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="OKAckAndComplete">
+        <xs:restriction base="xs:string">
+            <xs:enumeration value="AcknowledgedAndCompleted"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <!-- See section 6.2.2 -->
+    <xs:complexType name="ModifyTaskRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence>
+                    <xs:element name="taskDetails" type="TaskDetails"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.2.2 -->
+    <xs:complexType name="ModifyTaskResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="oK" type="OK"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.2.3 -->
+    <xs:complexType name="DeactivateTaskRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence>
+                    <xs:element name="xId" type="XId"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.2.3 -->
+    <xs:complexType name="DeactivateTaskResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="oK" type="OK"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.2.4 -->
+    <xs:complexType name="DeactivateAllTasksRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence/>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.2.4 -->
+    <xs:complexType name="DeactivateAllTasksResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="oK" type="OK"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.3.1 -->
+    <xs:complexType name="CreateDestinationRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence>
+                    <xs:element name="destinationDetails" type="DestinationDetails"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.3.1.2 -->
+    <xs:complexType name="DestinationDetails">
+        <xs:sequence>
+            <xs:element name="dId" type="DId"/>
+            <xs:element name="friendlyName" type="xs:string" minOccurs="0"/>
+            <xs:element name="deliveryType" type="DeliveryType"/>
+            <xs:element name="deliveryAddress" type="DeliveryAddress"/>
+            <xs:element name="destinationDetailsExtensions" type="DestinationDetailsExtensions" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="DeliveryAddress">
+        <xs:choice>
+            <xs:element name="ipAddressAndPort" type="etsi103280:IPAddressPort"/>
+            <xs:element name="e164Number" type="etsi103280:InternationalE164"/>
+            <xs:element name="uri" type="xs:anyURI"/>
+            <xs:element name="emailAddress" type="etsi103280:EmailAddress"/>
+        </xs:choice>
+    </xs:complexType>
+    <xs:complexType name="DestinationDetailsExtensions">
+        <xs:complexContent>
+            <xs:extension base="Extension"/>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.3.1 -->
+    <xs:complexType name="CreateDestinationResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="oK" type="OK"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.3.2 -->
+    <xs:complexType name="ModifyDestinationRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence>
+                    <xs:element name="destinationDetails" type="DestinationDetails"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.3.2 -->
+    <xs:complexType name="ModifyDestinationResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="oK" type="OK"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.3.3 -->
+    <xs:complexType name="RemoveDestinationRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence>
+                    <xs:element name="dId" type="DId"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.3.3 -->
+    <xs:complexType name="RemoveDestinationResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="oK" type="OK"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.3.4 -->
+    <xs:complexType name="RemoveAllDestinationsRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence/>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.3.4 -->
+    <xs:complexType name="RemoveAllDestinationsResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="oK" type="OK"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.4.2 -->
+    <xs:complexType name="GetTaskDetailsRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence>
+                    <xs:element name="xId" type="XId"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.4.2 -->
+    <xs:complexType name="GetTaskDetailsResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="taskResponseDetails" type="TaskResponseDetails"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="TaskResponseDetails">
+        <xs:sequence>
+            <xs:element name="taskDetails" type="TaskDetails"/>
+            <xs:element name="taskStatus" type="TaskStatus"/>
+        </xs:sequence>
+    </xs:complexType>
+    <!-- See section 6.4.2.2 -->
+    <xs:complexType name="TaskStatus">
+        <xs:sequence>
+            <xs:element name="provisioningStatus" type="ProvisioningStatus"/>
+            <xs:element name="listOfFaults" type="ListOfFaults"/>
+            <xs:element name="timeOfLastIntercept" type="etsi103280:QualifiedMicrosecondDateTime" minOccurs="0"/>
+            <xs:element name="amountOfX2Data" type="xs:integer" minOccurs="0"/>
+            <xs:element name="amountOfX3Data" type="xs:integer" minOccurs="0"/>
+            <xs:element name="timeOfLastModification" type="etsi103280:QualifiedMicrosecondDateTime" minOccurs="0"/>
+            <xs:element name="numberOfModifications" type="xs:integer" minOccurs="0"/>
+            <xs:element name="taskStatusExtensions" type="TaskStatusExtensions" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:simpleType name="ProvisioningStatus">
+        <xs:restriction base="xs:string">
+            <xs:enumeration value="awaitingProvisioning"/>
+            <xs:enumeration value="failed"/>
+            <xs:enumeration value="complete"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:complexType name="ListOfFaults">
+        <xs:sequence>
+            <xs:element name="unresolvedFault" type="ErrorInformation" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <!-- See section 6.4.3 -->
+    <xs:complexType name="GetDestinationDetailsRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence>
+                    <xs:element name="dId" type="DId"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.4.3 -->
+    <xs:complexType name="GetDestinationDetailsResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="destinationResponseDetails" type="DestinationResponseDetails"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="DestinationResponseDetails">
+        <xs:sequence>
+            <xs:element name="destinationDetails" type="DestinationDetails"/>
+            <xs:element name="destinationStatus" type="DestinationStatus"/>
+        </xs:sequence>
+    </xs:complexType>
+    <!-- See section 6.4.3.2 -->
+    <xs:complexType name="DestinationStatus">
+        <xs:sequence>
+            <xs:element name="destinationDeliveryStatus" type="DestinationDeliveryStatus"/>
+            <xs:element name="listOfFaults" type="ListOfFaults"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:simpleType name="DestinationDeliveryStatus">
+        <xs:restriction base="xs:string">
+            <xs:enumeration value="activeAndWorking"/>
+            <xs:enumeration value="deliveryFault"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <!-- See section 6.4.4 -->
+    <xs:complexType name="GetNEStatusRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence/>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.4.4 -->
+    <xs:complexType name="GetNEStatusResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="neStatusDetails" type="NeStatusDetails"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="NeStatusDetails">
+        <xs:sequence>
+            <xs:element name="neStatus" type="NeStatus"/>
+            <xs:element name="listOfFaults" type="ListOfFaults"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:simpleType name="NeStatus">
+        <xs:restriction base="xs:string">
+            <xs:enumeration value="OK"/>
+            <xs:enumeration value="Faults"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <!-- See section 6.4.5 -->
+    <xs:complexType name="GetAllDetailsRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence/>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.4.5 -->
+    <xs:complexType name="GetAllDetailsResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="neStatusDetails" type="NeStatusDetails"/>
+                    <xs:element name="listOfTaskResponseDetails" type="ListOfTaskResponseDetails"/>
+                    <xs:element name="listOfDestinationResponseDetails" type="ListOfDestinationResponseDetails"/>
+                    <xs:element name="listOfGenericObjectResponseDetails" type="ListOfGenericObjectResponseDetails" minOccurs="0"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="ListOfTaskResponseDetails">
+        <xs:sequence>
+            <xs:element name="taskResponseDetails" type="TaskResponseDetails" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="ListOfDestinationResponseDetails">
+        <xs:sequence>
+            <xs:element name="destinationResponseDetails" type="DestinationResponseDetails" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <!-- See section 6.4.6 -->
+    <xs:complexType name="ListAllDetailsRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence/>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.4.6 -->
+    <xs:complexType name="ListAllDetailsResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="ListOfXIDs" type="ListOfXids"/>
+                    <xs:element name="ListOfDIDs" type="ListOfDids"/>
+                    <xs:element name="ListOfGenericObjectIDs" type="ListOfGenericObjectIDs" minOccurs="0"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="ListOfXids">
+        <xs:sequence>
+            <xs:element name="xId" type="XId" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <!-- See section 6.4.7 -->
+    <xs:complexType name="GetAllTaskDetailsRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence/>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.4.7 -->
+    <xs:complexType name="GetAllTaskDetailsResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="listOfTaskResponseDetails" type="ListOfTaskResponseDetails" minOccurs="0"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.4.8 -->
+    <xs:complexType name="GetAllDestinationDetailsRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence/>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.4.8 -->
+    <xs:complexType name="GetAllDestinationDetailsResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="listOfDestinationResponseDetails" type="ListOfDestinationResponseDetails" minOccurs="0"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.4.9 -->
+    <xs:complexType name="GetAllGenericObjectDetailsRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence>
+                    <xs:element name="objectType" type="GenericObjectType" minOccurs="0"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.4.9 -->
+    <xs:complexType name="GetAllGenericObjectDetailsResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="listOfGenericObjectResponseDetails" type="ListOfGenericObjectResponseDetails" minOccurs="0"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.5.2 -->
+    <xs:complexType name="ReportTaskIssueRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence>
+                    <xs:element name="xId" type="XId"/>
+                    <xs:element name="taskReportType" type="TaskReportType"/>
+                    <xs:element name="taskIssueErrorCode" type="xs:integer" minOccurs="0"/>
+                    <xs:element name="taskIssueDetails" type="xs:string" minOccurs="0"/>
+                    <xs:element name="taskIssueExtensions" type="TaskIssueExtensions" minOccurs="0" maxOccurs="unbounded"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.4.2.2 -->
+    <xs:simpleType name="TaskReportType">
+        <xs:restriction base="xs:string">
+            <xs:enumeration value="AllClear"/>
+            <xs:enumeration value="Warning"/>
+            <xs:enumeration value="NonTerminatingFault"/>
+            <xs:enumeration value="TerminatingFault"/>
+            <xs:enumeration value="ImplicitDeactivation"/>
+            <xs:enumeration value="FullyActionedAndSuccessful"/>
+            <xs:enumeration value="FullyActionedAndUnsuccessful"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <!-- See section 6.5.2 -->
+    <xs:complexType name="ReportTaskIssueResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="oK" type="OK"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.5.3 -->
+    <xs:complexType name="ReportDestinationIssueRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence>
+                    <xs:element name="dId" type="DId"/>
+                    <xs:element name="destinationReportType" type="TaskReportType"/>
+                    <xs:element name="destinationIssueErrorCode" type="xs:integer" minOccurs="0"/>
+                    <xs:element name="destinationIssueDetails" type="xs:string" minOccurs="0"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.5.3 -->
+    <xs:complexType name="ReportDestinationIssueResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="oK" type="OK"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.5.4 -->
+    <xs:complexType name="ReportNEIssueRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence>
+                    <xs:element name="typeOfNeIssueMessage" type="TypeOfNeIssueMessage"/>
+                    <xs:element name="description" type="xs:string"/>
+                    <xs:element name="issueCode" type="xs:integer" minOccurs="0"/>
+                    <xs:element name="nEIssueExtensions" type="NEIssueExtensions" minOccurs="0" maxOccurs="unbounded"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.5.4 -->
+    <xs:simpleType name="TypeOfNeIssueMessage">
+        <xs:restriction base="xs:string">
+            <xs:enumeration value="Warning"/>
+            <xs:enumeration value="FaultCleared"/>
+            <xs:enumeration value="FaultReport"/>
+            <xs:enumeration value="Alert"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <!-- See section 6.5.4 -->
+    <xs:complexType name="ReportNEIssueResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="oK" type="OKAckAndComplete"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.6.1 -->
+    <xs:complexType name="PingRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence/>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.6.1 -->
+    <xs:complexType name="PingResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="oK" type="OK"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.6.2 -->
+    <xs:complexType name="KeepaliveRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence/>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <!-- See section 6.6.2 -->
+    <xs:complexType name="KeepaliveResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="oK" type="OK"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:simpleType name="GenericObjectID">
+        <xs:restriction base="etsi103280:UUID"/>
+    </xs:simpleType>
+    <xs:simpleType name="GenericObjectType">
+        <xs:restriction base="xs:string">
+            <xs:pattern value="Q\{[^{}]*\}.+"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:complexType name="GenericObject" abstract="true">
+        <xs:sequence>
+            <xs:element name="objectId" type="GenericObjectID"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="CreateObjectRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence>
+                    <xs:element name="createObject" type="GenericObject"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="CreateObjectResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="oK" type="OK"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="ModifyObjectRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence>
+                    <xs:element name="modifyObject" type="GenericObject"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="ModifyObjectResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="oK" type="OK"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="GetObjectRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence>
+                    <xs:element name="objectId" type="GenericObjectID"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="GetObjectResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="genericObjectResponseDetails" type="GenericObjectResponseDetails"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="GenericObjectResponseDetails">
+        <xs:sequence>
+            <xs:element name="object" type="GenericObject"/>
+            <xs:element name="status" type="GenericObjectStatus" minOccurs="0"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="ListOfGenericObjectResponseDetails">
+        <xs:sequence>
+            <xs:element name="genericObjectResponseDetails" type="GenericObjectResponseDetails" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="GenericObjectStatus">
+        <xs:sequence/>
+    </xs:complexType>
+    <xs:complexType name="DeleteObjectRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence>
+                    <xs:element name="objectId" type="GenericObjectID"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="DeleteObjectResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="oK" type="OK"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="ListObjectsOfTypeRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence>
+                    <xs:element name="objectType" type="GenericObjectType"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="ListObjectsOfTypeResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="listOfObjects" type="ListOfGenericObjectIDs"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="ListOfGenericObjectIDs">
+        <xs:sequence>
+            <xs:element name="objectId" type="GenericObjectID" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="DeleteAllObjectsRequest">
+        <xs:complexContent>
+            <xs:extension base="X1RequestMessage">
+                <xs:sequence>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="DeleteAllObjectsResponse">
+        <xs:complexContent>
+            <xs:extension base="X1ResponseMessage">
+                <xs:sequence>
+                    <xs:element name="oK" type="OK"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+</xs:schema>

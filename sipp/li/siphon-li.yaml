@@ -1,0 +1,122 @@
+# siphon as an ETSI TS 103 221-1 network element, driven by a real ADMF.
+#
+# The peer is sipgate's li-simulator-x1x2x3, which plays both the
+# Administration Function (provisioning over X1) and the Mediation and Delivery
+# Function (receiving X2 IRI and X3 content). It is an *independent*
+# implementation of the same specification, which is the point: agreement
+# between siphon and a peer built from the same schema by other people is worth
+# far more than agreement between siphon and its own reader.
+#
+# Two identity details are load-bearing and easy to get wrong:
+#
+#  * `admf_identifier` must equal the CN of the certificate the simulator
+#    presents, which its cert bootstrap sets to `simulator`. siphon binds the
+#    two and answers 1030 when they disagree, so this is exercising the check
+#    rather than working around it.
+#  * `ne_identifier` must equal what the simulator puts in `neIdentifier`, and
+#    it derives that from the *host of its target URI*. The compose file points
+#    it at `https://network-element:8443/X1/NE`, so the value is
+#    `network-element` — which is also a SAN on the certificate the bootstrap
+#    issues, so the simulator's own TLS verification passes.
+#
+# Used with: sipp/docker-compose.yaml (li profile)
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+# A literal: this lands in Via and Record-Route, which peers dial back.
+advertised_address: "172.29.0.10"
+
+domain:
+  local:
+    - "siphon.test"
+    - "network-element"
+    - "172.29.0.10"
+    - "127.0.0.1"
+
+script:
+  path: "/etc/siphon/li-scripts/li_proxy.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+# X3 content framing lives in the media engine, so the native backend is not
+# optional here — config load refuses `lawful_intercept.x3` on any other.
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    # A literal, not the service name: this is parsed as a socket address and a
+    # hostname is refused at load ("invalid socket address syntax"), which shows
+    # up later as `rtpengine.offer() not available` rather than as a config
+    # error. The compose pins it.
+    address: "172.29.0.30:8080"
+    timeout_ms: 2000
+
+lawful_intercept:
+  enabled: true
+  audit_log: "/tmp/li-audit.log"
+
+  x1:
+    listen: "0.0.0.0:8443"
+    path: "/X1/NE"
+    ne_identifier: "network-element"
+    admf_identifier: "simulator"
+    # The simulator declares v1.6.1 on the wire while siphon is built to
+    # v1.23.1. That is expected and is precisely what the version analysis
+    # predicted: the message set is identical across the published v1.x range,
+    # so the declared string differs and nothing else does. siphon accepts any
+    # well-formed v1.x version rather than demanding an exact match.
+    version: "v1.23.1"
+    bind_admf_identifier_to_certificate: true
+    tls:
+      # Written by the simulator's own cert bootstrap into a shared volume.
+      certificate: "/mutual-tls-stores/certs/network-element.crt"
+      private_key: "/mutual-tls-stores/keys/network-element.pk8.key"
+      client_ca: "/mutual-tls-stores/ca-certs/simulator-ca.crt"
+
+  # IRI delivery to the simulator's X2/X3 server.
+  #
+  # TLS because the engine's X3 delivery is TLS-only and both interfaces arrive
+  # on the same port, so one setting covers both. siphon presents the same
+  # network-element certificate the engine does, and verifies the mediation
+  # function against the simulator's CA — `server_name` is `simulator` because
+  # that is the CN and a SAN on the certificate it presents.
+  x2:
+    delivery_address: "simulator:42069"
+    transport: tls
+    tls:
+      certificate: "/mutual-tls-stores/certs/network-element.crt"
+      private_key: "/mutual-tls-stores/keys/network-element.pk8.key"
+      ca_cert: "/mutual-tls-stores/ca-certs/simulator-ca.crt"
+      server_name: "simulator"
+    reconnect_interval_secs: 2
+    channel_size: 1000
+
+  # Content delivery is performed by the media engine, which frames the
+  # TS 103 221-2 PDUs and ships them to the destinations the ADMF provisioned
+  # over X1. Presence is the whole setting, and it is what the config-load gate
+  # checks against `media.backend`.
+  x3:
+    enabled: true
+
+# Metrics, so the load profile can assert that the interception bookkeeping
+# drains rather than grows. `siphon_li_remembered_sessions` is the one that
+# matters: it is keyed on the Call-ID, so it must track live dialogs and fall
+# back to zero, never climb with total calls handled.
+admin:
+  listen: "0.0.0.0:9090"
+
+log:
+  level: debug
+  format: pretty

@@ -62,6 +62,22 @@ pub enum RtpEngineEvent {
     /// `beep_detection` — the media half of answering-machine detection.
     /// Emitted once per leg per call.  `siphon-rtp` native backend only.
     BeepDetected(BeepDetectedEvent),
+    /// ETSI TS 103 221-2 X3 content delivery started for an intercepted call:
+    /// the engine reached the Mediation Function and warranted media is now
+    /// being framed and shipped.  `siphon-rtp` native backend only.
+    X3Started(X3StartedEvent),
+    /// Warranted content was **dropped** rather than delivered, because the
+    /// delivery buffer filled — the Mediation Function was unreachable or too
+    /// slow for longer than the buffer covers.
+    ///
+    /// This is a reportable compliance failure, not a degraded recording: a
+    /// destination-level report is owed to the Administration Function.
+    /// `siphon-rtp` native backend only.
+    X3Loss(X3LossEvent),
+    /// X3 content delivery ended, with the counts for the compliance record.
+    /// A non-zero `dropped` means warranted content did not reach the agency.
+    /// `siphon-rtp` native backend only.
+    X3Ended(X3EndedEvent),
     /// An event we didn't recognise — passed through for logging.
     Unknown {
         event: String,
@@ -462,6 +478,60 @@ async fn read_event_stream(
 // Shared Arc wrapper, used by callers that want to stash the event sender
 // alongside other rtpengine state.
 pub type EventSender = Arc<mpsc::Sender<RtpEngineEvent>>;
+
+/// Payload of [`RtpEngineEvent::X3Started`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct X3StartedEvent {
+    /// The engine's call identifier.
+    pub call_id: String,
+    /// The leg's `from_tag`.
+    pub from_tag: String,
+    /// Where the Mediation Function was dialled, as `host:port`.
+    pub delivery: String,
+    /// The 16-byte interception task identifier, echoed from the attach.
+    pub xid: [u8; 16],
+    /// The session correlation, echoed. Matches this session's X2 records.
+    pub correlation_id: u64,
+}
+
+/// Payload of [`RtpEngineEvent::X3Loss`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct X3LossEvent {
+    /// The engine's call identifier.
+    pub call_id: String,
+    /// The leg's `from_tag`.
+    pub from_tag: String,
+    /// Packets dropped on this interception so far.
+    pub dropped: u64,
+    /// Packets successfully handed to the delivery transport so far.
+    pub delivered: u64,
+    /// Milliseconds since the interception started, at the first drop of the
+    /// current gap.
+    pub dropped_since_ms: u64,
+}
+
+/// Payload of [`RtpEngineEvent::X3Ended`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct X3EndedEvent {
+    /// The engine's call identifier.
+    pub call_id: String,
+    /// The leg's `from_tag`.
+    pub from_tag: String,
+    /// Why delivery stopped, as the engine described it.
+    pub reason: String,
+    /// Whether the engine called this an orderly end.
+    ///
+    /// Only a controller-driven detach is orderly. Anything else — the call
+    /// ending mid-interception, the Mediation Function closing the connection,
+    /// a transport failure — means delivery stopped for a reason the
+    /// Administration Function should hear about.
+    pub orderly: bool,
+    /// Packets handed to the delivery transport over the interception's life.
+    pub delivered: u64,
+    /// Packets dropped because the buffer filled. Non-zero means warranted
+    /// content did not reach the agency.
+    pub dropped: u64,
+}
 
 #[cfg(test)]
 mod tests {

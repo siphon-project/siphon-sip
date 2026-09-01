@@ -3520,10 +3520,7 @@ fn default_registrant_transport() -> String {
 ///     reconnect_interval_secs: 5
 ///     channel_size: 10000
 ///   x3:
-///     listen_udp: "127.0.0.1:0"
-///     delivery_address: "10.0.0.50:6544"
-///     transport: udp
-///     encapsulation: etsi
+///     enabled: true
 ///   siprec:
 ///     srs_uri: "sip:srs@recorder.example.com"
 ///     session_copies: 1
@@ -3548,12 +3545,112 @@ pub struct LawfulInterceptConfig {
 /// X1 admin interface — separate HTTPS listener with mTLS.
 #[derive(Debug, Deserialize, Clone)]
 pub struct LiX1Config {
-    /// Bind address for X1 HTTPS API (e.g. "127.0.0.1:8443").
+    /// Bind address for the X1 HTTPS listener (e.g. "0.0.0.0:8443").
     pub listen: String,
-    /// TLS settings (mTLS recommended for LEA authentication).
-    pub tls: Option<LiTlsConfig>,
-    /// Optional bearer token for additional authentication.
-    pub auth_token: Option<String>,
+    /// Path the single X1 endpoint is served on.
+    ///
+    /// TS 103 221-1 mandates one endpoint but does not name it. `/X1/NE` is
+    /// the convention (it is the default target of the sipgate X1/X2/X3
+    /// simulator, among others); confirm it with the mediation partner, since
+    /// a wrong path stops the very first message reaching the server.
+    #[serde(default = "default_x1_path")]
+    pub path: String,
+    /// TLS for the listener. Mutual TLS is the authentication on X1, so
+    /// `client_ca` is required — see [`LiX1TlsConfig`].
+    pub tls: LiX1TlsConfig,
+    /// This network element's identifier, as it appears in `neIdentifier`.
+    pub ne_identifier: String,
+    /// The ADMF identifier this element expects in `admfIdentifier`.
+    ///
+    /// When set, a message naming a different ADMF is refused with
+    /// `UnexpectedAdmfIdentifier` (1040). When unset, any well-formed
+    /// identifier is accepted and only the certificate binding applies.
+    pub admf_identifier: Option<String>,
+    /// The schema version declared in every message's `version` element.
+    ///
+    /// Defaults to the version this build implements. Override only when a
+    /// mediation partner pins an older one; the message set is identical
+    /// across the published v1.x range, so only the declared string differs.
+    #[serde(default = "default_x1_version")]
+    pub version: String,
+    /// Bind the `admfIdentifier` to the presented client certificate.
+    ///
+    /// When true (the default), a message whose `admfIdentifier` does not
+    /// match the certificate's subject Common Name is refused with
+    /// `AdmfIdentifierDoesNotMatchCertificateDetails` (1030). Turn it off only
+    /// when the ADMF's certificate legitimately carries an unrelated CN.
+    #[serde(default = "default_true")]
+    pub bind_admf_identifier_to_certificate: bool,
+    /// The network-element-to-ADMF direction. Absent means siphon serves X1
+    /// but never initiates toward the ADMF.
+    pub admf: Option<LiX1AdmfConfig>,
+}
+
+fn default_x1_path() -> String {
+    "/X1/NE".to_string()
+}
+
+fn default_x1_version() -> String {
+    crate::li::x1::types::DEFAULT_VERSION.to_string()
+}
+
+/// TLS for the X1 listener.
+///
+/// All three fields are mandatory. X1 carries warrant provisioning, and mutual
+/// TLS is the only authentication the specification defines for it, so a
+/// listener without a client CA would accept anyone. A missing field is a
+/// startup error, not a silent downgrade — the same fail-closed rule the SIP
+/// TLS listener applies to `verify_client` without `client_ca`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct LiX1TlsConfig {
+    /// PEM certificate chain this element presents.
+    pub certificate: String,
+    /// PEM private key for `certificate`.
+    pub private_key: String,
+    /// PEM CA bundle that ADMF client certificates must chain to.
+    pub client_ca: String,
+}
+
+/// The network-element-to-ADMF direction (TS 103 221-1 clause 6.5).
+///
+/// Without this block siphon answers X1 but never speaks first: no issue
+/// reports, no keepalives, and no reconciliation of provisioned state after a
+/// restart.
+#[derive(Debug, Deserialize, Clone)]
+pub struct LiX1AdmfConfig {
+    /// Absolute URL of the ADMF's X1 endpoint.
+    pub endpoint: String,
+    /// PEM client certificate this element presents to the ADMF.
+    pub client_certificate: String,
+    /// PEM private key for `client_certificate`.
+    pub client_private_key: String,
+    /// PEM CA bundle used to verify the ADMF's server certificate.
+    ///
+    /// Absent falls back to the platform/webpki roots, which is right for a
+    /// publicly-issued certificate and wrong for the private CA most ADMF
+    /// deployments use — set it.
+    pub server_ca: Option<String>,
+    /// Keepalive interval in seconds. Zero disables keepalives.
+    #[serde(default = "default_x1_keepalive_secs")]
+    pub keepalive_secs: u64,
+    /// Per-request timeout in seconds.
+    #[serde(default = "default_x1_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+    /// Reconcile provisioned state with the ADMF at startup.
+    ///
+    /// Issues `GetAllDetails` outbound so the two sides agree after a restart.
+    /// Without it, a bounce silently diverges the ADMF's view from the
+    /// element's.
+    #[serde(default = "default_true")]
+    pub reconcile_on_start: bool,
+}
+
+fn default_x1_keepalive_secs() -> u64 {
+    30
+}
+
+fn default_x1_request_timeout_secs() -> u64 {
+    10
 }
 
 /// X2 IRI delivery — ASN.1/BER encoded signaling events over TCP/TLS.
@@ -3574,21 +3671,25 @@ pub struct LiX2Config {
     pub tls: Option<LiTlsConfig>,
 }
 
-/// X3 CC delivery — RTPEngine recording mirror + encapsulation to mediation.
+/// X3 content delivery.
+///
+/// Presence is the switch, and there is deliberately nothing else to set.
+///
+/// The TS 103 221-2 content framing lives in the media engine, because that is
+/// where the RTP is, and the engine delivers straight to the destinations the
+/// ADMF provisioned over X1. So this process has no collector address to dial,
+/// no transport to choose and no encapsulation to pick — every one of those was
+/// a setting for a path that no longer exists, and a setting that changes
+/// nothing is worse than no setting at all.
 #[derive(Debug, Deserialize, Clone)]
 pub struct LiX3Config {
-    /// Local UDP address to receive mirrored RTP from RTPEngine.
-    /// Default: "127.0.0.1:0" (OS-assigned port).
-    #[serde(default = "default_li_x3_listen")]
-    pub listen_udp: String,
-    /// Mediation device CC collector address (host:port).
-    pub delivery_address: String,
-    /// Transport: "udp" or "tcp". Default: "udp".
-    #[serde(default = "default_li_x3_transport")]
-    pub transport: String,
-    /// Encapsulation format: "etsi" (TS 102 232 CC-PDU) or "raw_ip".
-    #[serde(default = "default_li_x3_encapsulation")]
-    pub encapsulation: String,
+    /// Whether this node delivers content.
+    ///
+    /// Required, so that writing the block is a statement rather than an empty
+    /// gesture. `true` requires `media.backend: siphon-rtp` and is refused at
+    /// load on anything else; `false` is the same as omitting the block, and is
+    /// there so content can be turned off without deleting configuration.
+    pub enabled: bool,
 }
 
 /// SIPREC (RFC 7866) — SIP-based media recording.
@@ -3626,9 +3727,6 @@ pub struct LiTlsConfig {
 fn default_li_x2_transport() -> String { "tcp".to_string() }
 fn default_li_reconnect_interval() -> u64 { 5 }
 fn default_li_channel_size() -> usize { 10_000 }
-fn default_li_x3_listen() -> String { "127.0.0.1:0".to_string() }
-fn default_li_x3_transport() -> String { "udp".to_string() }
-fn default_li_x3_encapsulation() -> String { "etsi".to_string() }
 fn default_siprec_session_copies() -> u32 { 1 }
 fn default_siprec_transport() -> String { "tcp".to_string() }
 fn default_siprec_src_profile() -> String { "siprec_src".to_string() }
@@ -3820,7 +3918,63 @@ impl Config {
         let config: Self = serde_yaml_ng::from_str(yaml)
             .map_err(|e| SiphonError::Config(format!("invalid siphon.yaml: {e}")))?;
         config.validate_media_profiles()?;
+        config.validate_lawful_intercept()?;
         Ok(config)
+    }
+
+    /// Reject an X3 content-delivery configuration the media backend cannot honour.
+    ///
+    /// X1 and X2 are backend-independent — provisioning is HTTPS and IRI is
+    /// SIP signalling, so both behave identically on `rtpengine`, `rtpproxy`
+    /// and `siphon-rtp`. X3 carries the content of communication, and the
+    /// TS 103 221-2 framing lives in the media engine, so only the native
+    /// `siphon-rtp` backend can emit it.
+    ///
+    /// | `deliveryType` | rtpengine | rtpproxy | siphon-rtp |
+    /// |---|---|---|---|
+    /// | `X2Only`  | yes | yes | yes |
+    /// | `X3Only`  | no  | no  | yes |
+    /// | `X2andX3` | no  | no  | yes |
+    ///
+    /// Refused at load rather than at the first warrant, following
+    /// [`Self::validate_media_profiles`]: name the offending field, the
+    /// backend that cannot honour it, and the remedy. The same rule is applied
+    /// again at `ActivateTask`, because a task can be provisioned long after
+    /// boot.
+    fn validate_lawful_intercept(&self) -> Result<()> {
+        let Some(lawful_intercept) = &self.lawful_intercept else {
+            return Ok(());
+        };
+        if !lawful_intercept.enabled {
+            return Ok(());
+        }
+        // `enabled: false` is the same as no block at all, so a node that has
+        // turned content off is not held to the backend requirement.
+        if !lawful_intercept
+            .x3
+            .as_ref()
+            .is_some_and(|x3| x3.enabled)
+        {
+            return Ok(());
+        }
+
+        let backend = self
+            .media
+            .as_ref()
+            .map(|media| media.backend)
+            .unwrap_or_default();
+        if backend == MediaBackendKind::SiphonRtp {
+            return Ok(());
+        }
+
+        Err(SiphonError::Config(format!(
+            "lawful_intercept.x3 is configured, but media.backend is {:?}, which cannot \
+             deliver X3 content of communication — ETSI TS 103 221-2 content framing is \
+             implemented in the siphon-rtp media engine only. Set media.backend to \
+             \"siphon-rtp\", or remove lawful_intercept.x3 and provision X2Only warrants \
+             (X1 provisioning and X2 IRI delivery work on every backend).",
+            backend.as_str(),
+        )))
     }
 
     /// Reject a media profile asking for something `media.backend` cannot do.
@@ -6467,11 +6621,17 @@ session_timer:
             "  audit_log: \"/var/log/siphon/li-audit.log\"\n",
             "  x1:\n",
             "    listen: \"127.0.0.1:8443\"\n",
+            "    ne_identifier: \"siphon-ne-1\"\n",
+            "    admf_identifier: \"admf-id\"\n",
             "    tls:\n",
             "      certificate: \"/etc/siphon/li/x1.crt\"\n",
             "      private_key: \"/etc/siphon/li/x1.key\"\n",
-            "      verify_client: true\n",
-            "    auth_token: \"warrant-auth-xyz\"\n",
+            "      client_ca: \"/etc/siphon/li/admf-ca.pem\"\n",
+            "    admf:\n",
+            "      endpoint: \"https://admf.example/X1/ADMF\"\n",
+            "      client_certificate: \"/etc/siphon/li/ne.pem\"\n",
+            "      client_private_key: \"/etc/siphon/li/ne.key\"\n",
+            "      keepalive_secs: 45\n",
             "  x2:\n",
             "    delivery_address: \"10.0.0.50:6543\"\n",
             "    transport: tls\n",
@@ -6480,14 +6640,15 @@ session_timer:
             "    tls:\n",
             "      ca_cert: \"/etc/siphon/li/mediation-ca.pem\"\n",
             "  x3:\n",
-            "    listen_udp: \"127.0.0.1:19000\"\n",
-            "    delivery_address: \"10.0.0.50:6544\"\n",
-            "    transport: udp\n",
-            "    encapsulation: etsi\n",
+            "    enabled: true\n",
             "  siprec:\n",
             "    srs_uri: \"sip:srs@recorder.example.com\"\n",
             "    session_copies: 2\n",
             "    transport: tls\n",
+            // X3 content delivery is only possible on the native media
+            // engine, and the config-load gate enforces that.
+            "media:\n",
+            "  backend: siphon-rtp\n",
         );
         let config = Config::from_str(yaml).unwrap();
         let li = config.lawful_intercept.unwrap();
@@ -6497,10 +6658,23 @@ session_timer:
         // X1
         let x1 = li.x1.unwrap();
         assert_eq!(x1.listen, "127.0.0.1:8443");
-        assert_eq!(x1.auth_token.unwrap(), "warrant-auth-xyz");
-        let x1_tls = x1.tls.unwrap();
-        assert!(x1_tls.verify_client);
-        assert_eq!(x1_tls.certificate.unwrap(), "/etc/siphon/li/x1.crt");
+        assert_eq!(x1.ne_identifier, "siphon-ne-1");
+        assert_eq!(x1.admf_identifier.as_deref(), Some("admf-id"));
+        // The endpoint path and declared schema version default rather than
+        // being spelled out in every deployment.
+        assert_eq!(x1.path, "/X1/NE");
+        assert_eq!(x1.version, crate::li::x1::types::DEFAULT_VERSION);
+        assert!(x1.bind_admf_identifier_to_certificate);
+        assert_eq!(x1.tls.certificate, "/etc/siphon/li/x1.crt");
+        assert_eq!(x1.tls.private_key, "/etc/siphon/li/x1.key");
+        assert_eq!(x1.tls.client_ca, "/etc/siphon/li/admf-ca.pem");
+
+        // The network-element-to-ADMF direction.
+        let admf = x1.admf.unwrap();
+        assert_eq!(admf.endpoint, "https://admf.example/X1/ADMF");
+        assert_eq!(admf.client_certificate, "/etc/siphon/li/ne.pem");
+        assert_eq!(admf.keepalive_secs, 45);
+        assert!(admf.reconcile_on_start);
 
         // X2
         let x2 = li.x2.unwrap();
@@ -6510,12 +6684,9 @@ session_timer:
         assert_eq!(x2.channel_size, 5000);
         assert_eq!(x2.tls.unwrap().ca_cert.unwrap(), "/etc/siphon/li/mediation-ca.pem");
 
-        // X3
-        let x3 = li.x3.unwrap();
-        assert_eq!(x3.listen_udp, "127.0.0.1:19000");
-        assert_eq!(x3.delivery_address, "10.0.0.50:6544");
-        assert_eq!(x3.transport, "udp");
-        assert_eq!(x3.encapsulation, "etsi");
+        // X3 is a switch and nothing more: the media engine frames the content
+        // and delivers it to the destinations provisioned over X1.
+        assert!(li.x3.unwrap().enabled);
 
         // SIPREC
         let siprec = li.siprec.unwrap();
@@ -6540,7 +6711,7 @@ session_timer:
             "  x2:\n",
             "    delivery_address: \"10.0.0.50:6543\"\n",
             "  x3:\n",
-            "    delivery_address: \"10.0.0.50:6544\"\n",
+            "    enabled: true\n",
         );
         let config = Config::from_str(yaml).unwrap();
         let li = config.lawful_intercept.unwrap();
@@ -6553,10 +6724,8 @@ session_timer:
         assert_eq!(x2.reconnect_interval_secs, 5);
         assert_eq!(x2.channel_size, 10_000);
 
-        let x3 = li.x3.unwrap();
-        assert_eq!(x3.listen_udp, "127.0.0.1:0");
-        assert_eq!(x3.transport, "udp");
-        assert_eq!(x3.encapsulation, "etsi");
+        // An empty block is enough to switch content delivery on.
+        assert!(li.x3.unwrap().enabled);
     }
 
     #[test]

@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  A short signalling-only call, run at rate, for the interception load profile.
+
+  No media: the question here is what interception costs on the *signalling*
+  path, which is where it runs — the dispatcher matches every message on every
+  leg. Adding RTP would put the media engine's throughput in the same number and
+  make it impossible to read.
+
+  Deliberately a full dialog rather than a single request. Interception has a
+  per-session lifecycle — a decision taken at the first message and released at
+  the last — so a scenario that never sent a BYE would exercise the half that
+  allocates and never the half that frees, which is exactly the half being
+  tested for leaks.
+-->
+<scenario name="LI load UAC">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:[to_uri] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: "load" <sip:[from_user]@[from_host]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:[to_uri]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:[from_user]@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+Subject: LI load
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="180" optional="true" />
+  <recv response="200" rtd="true" />
+
+  <send>
+    <![CDATA[
+ACK sip:[to_uri] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: "load" <sip:[from_user]@[from_host]>;tag=[pid]SIPpTag00[call_number]
+[last_To:]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <send retrans="500">
+    <![CDATA[
+BYE sip:[to_uri] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: "load" <sip:[from_user]@[from_host]>;tag=[pid]SIPpTag00[call_number]
+[last_To:]
+Call-ID: [call_id]
+CSeq: 2 BYE
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" crlf="true" />
+
+</scenario>
