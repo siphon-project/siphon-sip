@@ -815,6 +815,11 @@ pub struct ReferSubscription {
     /// accepted, and the surviving party ↔ target call is what the transfer
     /// exists to create. Notifier (siphon-terminated) role only.
     pub referrer_gone: bool,
+    /// Media profile chosen for the pairing this transfer creates
+    /// (`accept_refer(profile=…)`). `None` inherits the profile the call was
+    /// anchored with — correct only when that profile is symmetric, see
+    /// [`ProfileEntry::is_direction_bound`](crate::rtpengine::ProfileEntry::is_direction_bound).
+    pub media_profile: Option<String>,
 }
 
 /// One end of a dialog, in the shape `Replaces` (RFC 3891) names it.

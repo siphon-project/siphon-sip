@@ -147,6 +147,68 @@ def on_refer(call):
                       next_hop="sip:trunk.example.com:5060")
 ```
 
+### Media profiles across a transfer — read this before deploying an SRTP edge
+
+!!! danger "A transfer re-pairs the call. A direction-bound profile does not follow."
+
+    A media profile has two halves, and for profiles like `srtp_to_rtp` they
+    describe **specific sides of the call**:
+
+    ```yaml
+    srtp_to_rtp:
+      offer:   { transport_protocol: "RTP/AVP",  direction: ["teams", "carrier"] }
+      answer:  { transport_protocol: "RTP/SAVP", direction: ["carrier", "teams"] }
+    ```
+
+    The `answer` half exists to talk to the SRTP party. A transfer moves that
+    party out of the call — so applying the same profile afterwards re-offers
+    **SRTP to whoever is left**, and a plain-RTP carrier answers `m=audio 0`.
+    The call connects, both parties think they are talking, and there is no
+    audio in either direction.
+
+    Pass `profile=` naming the profile for the pair that **remains**. The rule
+    is: **the survivor is the peer of the referrer**, and the profile describes
+    survivor → target. So the answer depends on *which side* transferred, which
+    `call.refer_side` (`"a"`/`"b"`, matching `on_bye`'s `initiator.side`) tells
+    you:
+
+    ```python
+    @b2bua.on_refer
+    def on_refer(call):
+        # from_gateway() answers for the A-leg; refer_side says which leg
+        # referred. They agree exactly when the SRTP party is the transferor.
+        a_leg_is_secure = call.from_gateway("teams")
+        referrer_is_secure = a_leg_is_secure == (call.refer_side == "a")
+
+        # The SRTP party leaving leaves two plain-RTP ends behind. The SRTP
+        # party SURVIVING keeps the asymmetric pairing.
+        profile = "rtp_passthrough" if referrer_is_secure else "srtp_to_rtp"
+
+        call.accept_refer(target=target, next_hop=gw.uri, mode="terminate",
+                          profile=profile)
+    ```
+
+    In practice the secure side is nearly always the transferor — a carrier
+    rarely sends `REFER` — but an SBC should not fall over the day one does.
+
+    siphon logs a `WARN` naming the profile when a transfer inherits a
+    direction-bound one, but it cannot pick the replacement for you — only the
+    script knows what the surviving pair looks like.
+
+**Which profiles are direction-bound?** Any whose two halves differ: a different
+`transport_protocol` (every SRTP/DTLS edge), or a `direction:` pair, or different
+DTLS handling. The built-ins `srtp_to_rtp`, `rtp_to_srtp`, `ws_to_rtp` and
+`wss_to_rtp` all are. `rtp_passthrough` is symmetric and re-pairs safely.
+
+The same applies to **anything else the profile pins to one side** — a transcoding
+or codec-shaping policy chosen because *that* party needed it does not
+automatically suit the party that replaces it. If the two halves of your profile
+are not interchangeable, name the profile explicitly on transfer.
+
+This is not specific to `REFER`: an inbound `INVITE` with `Replaces` re-pairs the
+call the same way, and warns the same way. Transfers across an SRTP or
+transcoding boundary want a symmetric profile on the surviving pair.
+
 ### Media anchoring (terminate mode)
 
 Terminate mode re-bridges the media plane by offering the **surviving** party's

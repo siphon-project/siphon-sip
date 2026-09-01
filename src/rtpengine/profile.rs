@@ -29,6 +29,28 @@ pub struct ProfileEntry {
     pub answer: NgFlags,
 }
 
+impl ProfileEntry {
+    /// True when this profile's two halves are not interchangeable — the offer
+    /// and answer flags describe *specific sides* of the call rather than a
+    /// symmetric relay.
+    ///
+    /// A profile like `srtp_to_rtp` says "the offerer speaks SRTP, the answerer
+    /// speaks plain RTP" and reverses `direction` between the two halves. That
+    /// is exactly right for the pairing it was chosen for, and wrong for any
+    /// other: apply its `answer` flags to a party that is on the *plain* side
+    /// and you offer them SRTP, which they reject.
+    ///
+    /// This matters when a call is re-paired underneath the profile — a
+    /// siphon-terminated transfer, or a `Replaces` takeover — because the party
+    /// each half was written for may be the one that just left.
+    pub fn is_direction_bound(&self) -> bool {
+        self.offer.transport_protocol != self.answer.transport_protocol
+            || !self.offer.direction.is_empty()
+            || !self.answer.direction.is_empty()
+            || self.offer.dtls != self.answer.dtls
+    }
+}
+
 /// Registry of named media profiles.
 ///
 /// Populated at startup from built-in defaults + YAML config.  Shared via
@@ -724,6 +746,52 @@ impl NgFlags {
 
 #[cfg(test)]
 mod tests {
+    /// The profiles that re-pair badly. A transfer or a `Replaces` takeover
+    /// changes who is on each side of the call, so a profile whose two halves
+    /// describe *specific* sides stops being correct the moment the pairing
+    /// changes — its answer half was written for the party that just left.
+    #[test]
+    fn direction_bound_profiles_are_recognised() {
+        let registry = ProfileRegistry::new();
+
+        // Asymmetric transport (an SRTP edge) — the classic trap: after a
+        // transfer the surviving carrier leg gets re-offered SRTP and answers
+        // `m=audio 0`, leaving a connected call with no audio.
+        for name in ["srtp_to_rtp", "rtp_to_srtp", "ws_to_rtp", "wss_to_rtp"] {
+            let entry = registry.get(name).expect("built-in profile must exist");
+            assert!(
+                entry.is_direction_bound(),
+                "{name} names specific sides and must be flagged"
+            );
+        }
+
+        // A symmetric relay re-pairs safely — both halves say the same thing.
+        let passthrough = registry
+            .get("rtp_passthrough")
+            .expect("built-in profile must exist");
+        assert!(
+            !passthrough.is_direction_bound(),
+            "rtp_passthrough is symmetric and survives a re-pairing"
+        );
+    }
+
+    /// A `direction` pair is direction-bound by definition, even when both
+    /// halves negotiate the same transport.
+    #[test]
+    fn a_direction_pair_alone_is_direction_bound() {
+        let entry = ProfileEntry {
+            offer: NgFlags {
+                direction: vec!["external".into(), "internal".into()],
+                ..NgFlags::default()
+            },
+            answer: NgFlags {
+                direction: vec!["internal".into(), "external".into()],
+                ..NgFlags::default()
+            },
+        };
+        assert!(entry.is_direction_bound());
+    }
+
     use super::*;
 
     #[test]

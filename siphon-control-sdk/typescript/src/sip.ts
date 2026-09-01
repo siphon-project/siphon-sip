@@ -93,6 +93,22 @@ export interface AcceptReferOptions {
   target?: string;
   nextHop?: string;
   mode?: "terminate" | "transparent";
+  /**
+   * Media profile for the pairing the transfer creates.
+   *
+   * **Required when the call is anchored with a direction-bound profile** — one
+   * whose offer and answer halves describe different sides, such as
+   * `srtp_to_rtp` at an SRTP edge. A transfer moves the party that half was
+   * written for out of the call, so inheriting the profile re-offers *that
+   * party's* transport to whoever remains: SRTP toward a plain-RTP carrier,
+   * which answers `m=audio 0`. The call connects and carries no audio in either
+   * direction while the SIP trace looks healthy.
+   *
+   * Pass the profile for the pair that remains (commonly `"rtp_passthrough"`).
+   * Omitted inherits the call's profile, which is correct only when it is
+   * symmetric.
+   */
+  profile?: string;
 }
 
 /** A {@link Call.route} target carrying per-target overrides. */
@@ -364,6 +380,9 @@ export class Call {
    * egress, and `mode` (`"terminate"` / `"transparent"`) overrides
    * `b2bua.default_refer_mode`. No pending REFER (already decided, timed out, or
    * the call is gone) rejects with `code === "not_found"`.
+   *
+   * `profile` names the media profile for the pairing the transfer creates —
+   * see {@link AcceptReferOptions.profile}, which is required at an SRTP edge.
    */
   async acceptRefer(options?: AcceptReferOptions): Promise<void> {
     const args: Record<string, unknown> = {};
@@ -375,6 +394,9 @@ export class Call {
     }
     if (options?.mode !== undefined) {
       args.mode = options.mode;
+    }
+    if (options?.profile !== undefined) {
+      args.profile = options.profile;
     }
     await this.sip(SipVerb.AcceptRefer, args);
   }

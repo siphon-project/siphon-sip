@@ -623,6 +623,31 @@ auth:
 #
 # Custom media profiles (extend or override built-ins):
 #
+# ---------------------------------------------------------------------------
+# DIRECTION-BOUND PROFILES AND TRANSFERS — read before deploying an SRTP edge
+# ---------------------------------------------------------------------------
+# A profile has two halves. When they differ — a different transport_protocol,
+# a `direction:` pair, different DTLS — they describe SPECIFIC SIDES of the
+# call, not a symmetric relay. `srtp_to_rtp` means "the offerer speaks SRTP,
+# the answerer speaks plain RTP".
+#
+# A transfer, or an inbound INVITE with Replaces, RE-PAIRS the call: the party
+# one half was written for is often the one that just left. Inheriting the
+# profile then re-offers that party's transport to whoever remains — SRTP to a
+# plain-RTP carrier, which answers `m=audio 0`. The call connects and carries
+# no audio in either direction, and the SIP trace looks healthy.
+#
+# So on a transfer across an SRTP (or any one-sided transcoding) boundary, name
+# the profile for the pair that REMAINS:
+#
+#   call.accept_refer(target=target, next_hop=gw.uri, mode="terminate",
+#                     profile="rtp_passthrough")
+#
+# siphon logs a WARN naming the inherited profile when it is direction-bound,
+# but cannot choose the replacement — only the script knows the surviving pair.
+# Direction-bound built-ins: srtp_to_rtp, rtp_to_srtp, ws_to_rtp, wss_to_rtp.
+# Symmetric (safe to inherit): rtp_passthrough.
+#
 # Built-in profiles (always available):
 #   rtp_passthrough — Plain RTP both sides, media anchoring only (default)
 #   srtp_to_rtp     — SRTP UE ↔ RTP core

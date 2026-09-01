@@ -919,11 +919,18 @@ fn accept_refer(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult
         Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
     };
 
+    // Media profile for the pairing the transfer creates. Same requirement as
+    // the in-process `accept_refer(profile=…)`: a direction-bound profile
+    // (`srtp_to_rtp` and friends) must be replaced, because its answer half was
+    // written for the party being transferred away.
+    let media_profile = args.get("profile").and_then(|v| v.as_str());
+
     if crate::dispatcher::b2bua_accept_refer_call(
         &channel.sip_call_id,
         target.map(|s| s.to_string()),
         next_hop.map(|s| s.to_string()),
         mode,
+        media_profile.map(|s| s.to_string()),
     ) {
         ControlResult::Ok(
             serde_json::json!({ "channel": channel.channel_id, "transfer": "accepted" }),

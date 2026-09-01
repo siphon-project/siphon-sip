@@ -2182,6 +2182,7 @@ fn refer_subscription_push_query_clear() {
             state: TransferState::Trying,
             target_leg_call_id: None,
             referrer_gone: false,
+            media_profile: None,
         },
     );
     assert!(store.has_subscriber_refer_subscription(&call_id, true));
@@ -2249,6 +2250,7 @@ fn transfer_referrer_bye_is_recognised_and_flags_the_subscription() {
             state: TransferState::Trying,
             target_leg_call_id: Some(target_call_id),
             referrer_gone: false,
+            media_profile: None,
         },
     );
 
@@ -2282,6 +2284,7 @@ fn transfer_referrer_bye_is_idempotent_for_retransmissions() {
             state: TransferState::Trying,
             target_leg_call_id: Some(target_call_id),
             referrer_gone: false,
+            media_profile: None,
         },
     );
 
@@ -2324,6 +2327,7 @@ fn surviving_party_bye_during_transfer_still_tears_the_call_down() {
             state: TransferState::Trying,
             target_leg_call_id: Some(target_call_id),
             referrer_gone: false,
+            media_profile: None,
         },
     );
 
@@ -2362,6 +2366,7 @@ fn originated_refer_subscription_never_flags_referrer_gone() {
             state: TransferState::Trying,
             target_leg_call_id: None,
             referrer_gone: false,
+            media_profile: None,
         },
     );
 
@@ -2460,6 +2465,7 @@ fn refer_notifier_subscription_is_not_a_subscriber_one() {
             state: TransferState::Trying,
             target_leg_call_id: None,
             referrer_gone: false,
+            media_profile: None,
         },
     );
     assert!(!store.has_subscriber_refer_subscription(&call_id, true));

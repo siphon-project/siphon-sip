@@ -294,19 +294,33 @@ impl Call {
     /// and run the transfer. `target` overrides the Refer-To URI, `next_hop`
     /// steers egress, and `mode` is `"terminate"` / `"transparent"`. No pending
     /// REFER raises `ControlError` with `code == "not_found"`.
-    #[pyo3(signature = (target=None, next_hop=None, mode=None))]
+    ///
+    /// `profile` names the media profile for the pairing the transfer creates,
+    /// and is **required when the call is anchored with a direction-bound
+    /// profile** (`srtp_to_rtp` and every other SRTP edge): its answer half was
+    /// written for the party being transferred away, so inheriting it re-offers
+    /// that party's transport to whoever remains and the survivor answers
+    /// `m=audio 0` — a connected call with no audio either way. Pass the profile
+    /// for the pair that remains, commonly `"rtp_passthrough"`.
+    #[pyo3(signature = (target=None, next_hop=None, mode=None, profile=None))]
     fn accept_refer<'py>(
         &self,
         py: Python<'py>,
         target: Option<String>,
         next_hop: Option<String>,
         mode: Option<String>,
+        profile: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            call.accept_refer(target.as_deref(), next_hop.as_deref(), mode.as_deref())
-                .await
-                .map_err(to_pyerr)
+            call.accept_refer(
+                target.as_deref(),
+                next_hop.as_deref(),
+                mode.as_deref(),
+                profile.as_deref(),
+            )
+            .await
+            .map_err(to_pyerr)
         })
     }
 

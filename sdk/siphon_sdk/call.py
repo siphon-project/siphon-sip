@@ -68,6 +68,7 @@ class Call:
         headers: Optional[dict[str, str]] = None,
         refer_to: Optional[str] = None,
         refer_replaces: Optional[dict] = None,
+        refer_side: Optional[str] = None,
         transport: str = "udp",
         active_route: Optional[Route] = None,
         flow: Optional[Flow] = None,
@@ -94,6 +95,7 @@ class Call:
         self._media = MediaHandle()
         self._refer_to = refer_to
         self._refer_replaces = refer_replaces
+        self._refer_side = refer_side
         self._contact_user_override: Optional[str] = None
         self._contact_override: Optional[str] = None
         # LCR: the carrier that won the sequential failover. In the engine the
@@ -331,6 +333,32 @@ class Call:
                 call.accept_refer()
         """
         return self._refer_to
+
+    @property
+    def refer_side(self) -> Optional[str]:
+        """Which leg sent the REFER: ``"a"`` (caller) or ``"b"`` (callee).
+
+        Available in ``@b2bua.on_refer`` handlers, matching the
+        ``initiator.side`` convention in ``@b2bua.on_bye``.  ``None`` when no
+        REFER is pending.
+
+        The party that **survives** the transfer is the peer of this one, which
+        is what decides the media profile the surviving pair needs — see
+        :meth:`accept_refer`.  At a mixed edge (SRTP on one side, plain RTP on
+        the other) the right profile differs depending on which side is
+        leaving.
+
+        Example::
+
+            @b2bua.on_refer
+            def handle_refer(call):
+                a_leg_is_secure = call.from_gateway("teams")
+                referrer_is_secure = a_leg_is_secure == (call.refer_side == "a")
+                # The secure party leaving leaves two plain-RTP ends behind.
+                profile = "rtp_passthrough" if referrer_is_secure else "srtp_to_rtp"
+                call.accept_refer(mode="terminate", profile=profile)
+        """
+        return self._refer_side
 
     @property
     def refer_replaces(self) -> Optional[dict]:
@@ -849,7 +877,8 @@ class Call:
 
     def accept_refer(self, target: Optional[str] = None,
                      next_hop: Optional[str] = None,
-                     mode: Optional[str] = None) -> None:
+                     mode: Optional[str] = None,
+                     profile: Optional[str] = None) -> None:
         """Accept an incoming REFER and honour the transfer.
 
         Call this from a ``@b2bua.on_refer`` handler to proceed with the
@@ -878,6 +907,23 @@ class Call:
                 - ``None`` (default) — use the configured
                   ``b2bua.default_refer_mode`` from ``siphon.yaml`` (which
                   itself defaults to ``"terminate"``).
+            profile: Media profile for the pairing the transfer creates.
+
+                **Required whenever the call is anchored with a
+                direction-bound profile** — one whose offer and answer halves
+                describe different sides, such as ``srtp_to_rtp`` at a
+                Teams/SRTP edge.  A transfer moves the party that half was
+                written for out of the call, so inheriting the profile
+                re-offers *that party's* transport to whoever remains: SRTP to
+                a plain-RTP carrier, which answers ``m=audio 0``.  The call
+                connects and carries no audio in either direction, and the SIP
+                trace looks healthy.
+
+                Direction-bound built-ins: ``srtp_to_rtp``, ``rtp_to_srtp``,
+                ``ws_to_rtp``, ``wss_to_rtp``.  ``rtp_passthrough`` is
+                symmetric and re-pairs safely.  ``None`` inherits the call's
+                profile, which is correct only when it is symmetric; siphon
+                logs a WARN when it is not.
 
         Raises:
             ValueError: if ``mode`` is not one of ``None``, ``"terminate"``,
@@ -895,6 +941,13 @@ class Call:
                 # Steer the referred-to leg out a specific trunk, transparently.
                 call.accept_refer(next_hop="sip:trunk.example.com:5060",
                                   mode="transparent")
+
+            @b2bua.on_refer
+            def handle_refer(call):
+                # SRTP edge: the SRTP party is the one leaving, so the pair
+                # that remains is plain RTP on both sides.
+                call.accept_refer(target=call.refer_to, mode="terminate",
+                                  profile="rtp_passthrough")
         """
         if mode not in (None, "terminate", "transparent"):
             raise ValueError(
@@ -905,7 +958,7 @@ class Call:
             kind="accept_refer",
             targets=[target] if target else None,
             next_hop=next_hop,
-            extras={"mode": mode},
+            extras={"mode": mode, "profile": profile},
         ))
 
     def reject_refer(self, code: int, reason: str) -> None:

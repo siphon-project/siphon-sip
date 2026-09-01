@@ -6,6 +6,53 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **`call.accept_refer(profile=…)` — the media profile for the pairing a
+  transfer creates.** A media profile has two halves, and when they differ
+  (`srtp_to_rtp` and every other SRTP/DTLS edge) they describe *specific sides*
+  of the call. A transfer re-pairs it, and the party a half was written for is
+  usually the one leaving — so inheriting the profile re-offers **that party's
+  transport to whoever remains**: SRTP toward a plain-RTP carrier, which answers
+  `m=audio 0`. The call connects and carries no audio in either direction, and
+  the SIP trace looks healthy throughout. Name the profile for the pair that
+  remains:
+
+  ```python
+  call.accept_refer(target=target, next_hop=gw.uri, mode="terminate",
+                    profile="rtp_passthrough")
+  ```
+
+  Also accepted as `profile` on the control plane's `accept_refer`, and exposed
+  on all three control SDKs (Rust `accept_refer(.., profile)`, Python
+  `accept_refer(profile=…)`, TypeScript `acceptRefer({ profile })`). Unset keeps
+  the previous inherit behaviour, which is correct for a symmetric profile.
+- **`call.refer_side` — which leg sent the REFER** (`"a"` / `"b"`, matching the
+  `initiator.side` convention in `@b2bua.on_bye`). Without it a script could not
+  work out *which party survives* a transfer, and therefore could not pick the
+  profile the surviving pair needs: the survivor is the peer of the referrer, so
+  at a mixed edge the right profile flips depending on which side transferred.
+  `examples/teams_sbc.py` shows the full rule.
+
+### Fixed
+- **A transfer no longer silently inherits a direction-bound media profile.**
+  When one is inherited with no `profile=` override, siphon now logs a `WARN`
+  naming it and saying what will happen, instead of producing a connected call
+  with dead audio and no clue why. Same warning on an inbound `INVITE` with
+  `Replaces`, which re-pairs the call the same way. siphon does not guess a
+  replacement — only the script knows what the surviving pair looks like.
+- **`examples/teams_sbc.yaml` no longer shows a config key that does nothing.**
+  Both profiles carried `codec: ["offer", "PCMA,PCMU"]`; there is no `codec`
+  field on a media profile and nothing encodes it, so the line was silently
+  ignored while implying siphon restricts codecs on the operator's behalf — it
+  looks like a real rtpengine NG flag, but `NgFlagsConfig` has no such field and
+  no `deny_unknown_fields`, so serde dropped it and nothing ever reached the
+  engine. Removed, with a note pointing at the mechanism that does work: codec
+  selection is done from a script through the `sdp` namespace
+  (`filter_codecs`/`remove_codecs`), not through a media profile. Both
+  direction-bound profiles are now labelled as such, and the example gains a
+  `@b2bua.on_refer` handler showing the `profile=` a Teams SBC needs — the exact
+  topology where getting this wrong costs you the audio.
+
 ## [1.7.0] — 2026-08-31
 
 ### Added

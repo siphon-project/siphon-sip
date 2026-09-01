@@ -242,17 +242,36 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
   it("acceptRefer / rejectRefer", async () => {
     const transport = new RecordingTransport();
     const call = makeCall(transport);
-    await call.acceptRefer({ target: "sip:c@pbx", nextHop: "sip:sbc", mode: "terminate" });
+    await call.acceptRefer({
+      target: "sip:c@pbx",
+      nextHop: "sip:sbc",
+      mode: "terminate",
+      profile: "rtp_passthrough",
+    });
     await call.rejectRefer(603, "Decline");
     expect(transport.calls).toEqual([
       {
         module: MODULE_SIP,
         verb: "accept_refer",
         target: { channel: "ch1" },
-        args: { target: "sip:c@pbx", next_hop: "sip:sbc", mode: "terminate" },
+        args: {
+          target: "sip:c@pbx",
+          next_hop: "sip:sbc",
+          mode: "terminate",
+          profile: "rtp_passthrough",
+        },
       },
       { module: MODULE_SIP, verb: "reject_refer", target: { channel: "ch1" }, args: { code: 603, reason: "Decline" } },
     ]);
+  });
+
+  it("acceptRefer omits an unset profile", async () => {
+    // Absent, not null — so the server's "inherit the call's profile" default
+    // is what applies.
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.acceptRefer({ mode: "terminate" });
+    expect(transport.calls[0]?.args).toEqual({ mode: "terminate" });
   });
 
   it("media verbs — play (file/dbId/blob), stop, dtmf, hold, unhold, stream", async () => {

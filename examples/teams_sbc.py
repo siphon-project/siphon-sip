@@ -66,6 +66,60 @@ async def route(call):
         call.dial(destination.uri)
 
 
+@b2bua.on_refer
+async def on_refer(call):
+    """A party transfers the call away — pick the profile for the pair that REMAINS.
+
+    Every call here is anchored with a DIRECTION-BOUND profile: ``srtp_to_rtp``
+    means "the offerer speaks SRTP, the answerer speaks plain RTP". A transfer
+    takes one of those two parties out of the call, so the profile that suited
+    the original pairing is usually wrong for the new one — and the failure is
+    silent, a connected call with no audio in either direction.
+
+    The rule: **the survivor is the peer of the referrer**, and the profile
+    describes survivor -> target.
+
+      Teams refers   -> Teams leaves, a carrier leg survives and the target is
+                        carrier-side too: plain RTP both ends, ``rtp_passthrough``.
+      Carrier refers -> the TEAMS leg survives, so the new pair is still
+                        SRTP -> plain RTP: keep ``srtp_to_rtp``.
+
+    ``call.refer_side`` ("a"/"b") says which leg referred. In practice Teams is
+    almost always the transferor, but the SBC should not fall over otherwise.
+    """
+    if not call.refer_to:
+        call.reject_refer(400, "Bad Request")
+        return
+
+    # from_gateway() answers for the A-leg; refer_side says which leg referred.
+    # They agree exactly when the Teams party is the one transferring.
+    a_leg_is_teams = call.from_gateway("teams")
+    referrer_is_teams = a_leg_is_teams == (call.refer_side == "a")
+
+    # Teams leaving leaves two plain-RTP ends behind; Teams surviving keeps the
+    # asymmetric pairing.
+    profile = "rtp_passthrough" if referrer_is_teams else "srtp_to_rtp"
+
+    destination = gateway.select("carrier")
+    if not destination:
+        log.error(f"[{call.id}] no healthy carrier gateway for transfer")
+        call.reject_refer(503, "Service Unavailable")
+        return
+
+    log.info(
+        f"[{call.id}] transfer -> {call.refer_to} via {destination.uri} "
+        f"(referrer={'teams' if referrer_is_teams else 'carrier'}, profile={profile})"
+    )
+    call.accept_refer(
+        target=call.refer_to,
+        next_hop=destination.uri,
+        mode="terminate",
+        # The pair that REMAINS after the referrer leaves — never simply the
+        # profile the call started with. See docs/cookbook/call-transfer.md.
+        profile=profile,
+    )
+
+
 @b2bua.on_answer
 async def answered(call, reply):
     # Reuse the offer profile (keyed by A-leg Call-ID) so the SRTP/RTP

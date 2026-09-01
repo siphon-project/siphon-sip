@@ -88,6 +88,11 @@ pub enum CallAction {
         target: Option<String>,
         next_hop: Option<String>,
         mode: Option<ReferMode>,
+        /// Media profile for the pairing the transfer creates. `None` inherits
+        /// the profile the original call was anchored with, which is only
+        /// correct when that profile is symmetric — see
+        /// `ProfileEntry::is_direction_bound`.
+        profile: Option<String>,
     },
     /// Reject a REFER with a status code.
     RejectRefer { code: u16, reason: String },
@@ -298,6 +303,10 @@ pub struct PyCall {
     refer_to_uri: Option<String>,
     /// Replaces info from Refer-To (for attended transfer).
     refer_replaces_info: Option<crate::sip::headers::refer::Replaces>,
+    /// Which leg the REFER arrived on — `Some(true)` for the A-leg. The party
+    /// that survives a transfer is the *peer* of this one, which is what decides
+    /// the media profile the surviving pair needs.
+    refer_from_a_leg: Option<bool>,
     /// Credentials for B-leg digest auth retry (set by Python script).
     outbound_credentials: Option<(String, String)>,
     /// Whether li.record() was called for this call.
@@ -422,6 +431,7 @@ impl PyCall {
             media_handle: PyMediaHandle::default(),
             session_timer_override: None,
             refer_to_uri: None,
+            refer_from_a_leg: None,
             refer_replaces_info: None,
             outbound_credentials: None,
             li_record_flag: false,
@@ -890,6 +900,12 @@ impl PyCall {
     ) {
         self.refer_to_uri = Some(uri);
         self.refer_replaces_info = replaces;
+    }
+
+    /// Record which leg the REFER arrived on (called by B2BUA core before
+    /// firing on_refer).
+    pub fn set_refer_from_a_leg(&mut self, from_a_leg: bool) {
+        self.refer_from_a_leg = Some(from_a_leg);
     }
 }
 
@@ -1761,6 +1777,31 @@ impl PyCall {
         self.refer_to_uri.as_deref()
     }
 
+    /// Which side sent the REFER: `"a"` (the caller's leg) or `"b"` (the
+    /// callee's), matching the `initiator.side` convention in
+    /// `@b2bua.on_bye`. `None` outside an `@b2bua.on_refer` handler.
+    ///
+    /// The party that SURVIVES the transfer is the peer of this one, which is
+    /// what decides the media profile the surviving pair needs — see
+    /// `accept_refer(profile=…)`. At a mixed edge (SRTP one side, plain RTP the
+    /// other) the answer differs depending on which side is leaving, so this is
+    /// what a script keys that decision on:
+    ///
+    /// ```python
+    /// @b2bua.on_refer
+    /// def on_refer(call):
+    ///     a_leg_is_secure = call.from_gateway("teams")
+    ///     referrer_is_secure = a_leg_is_secure == (call.refer_side == "a")
+    ///     # The secure party leaving means both survivors are plain RTP.
+    ///     profile = "rtp_passthrough" if referrer_is_secure else "srtp_to_rtp"
+    ///     call.accept_refer(mode="terminate", profile=profile)
+    /// ```
+    #[getter]
+    fn refer_side(&self) -> Option<&str> {
+        self.refer_from_a_leg
+            .map(|from_a_leg| if from_a_leg { "a" } else { "b" })
+    }
+
     /// Replaces info from the Refer-To header (for attended transfer).
     ///
     /// Returns a dict with keys: call_id, from_tag, to_tag, early_only.
@@ -2161,12 +2202,26 @@ impl PyCall {
     ///   call.accept_refer()
     ///   call.accept_refer(mode="transparent")
     ///   call.accept_refer(target="sip:+15550142@example.com", mode="terminate")
-    #[pyo3(signature = (target=None, next_hop=None, mode=None))]
+    ///
+    /// `profile` names the media profile for the pairing the transfer creates.
+    /// **Required whenever the call is anchored with a direction-bound profile**
+    /// — one whose offer and answer describe different sides, such as
+    /// `srtp_to_rtp` at a Teams/SRTP edge. Left unset, the transfer inherits the
+    /// original call's profile, whose answer half was written for the party that
+    /// is being transferred away; the surviving leg is then re-INVITEd with that
+    /// party's transport (SRTP toward a plain-RTP carrier) and answers `m=audio
+    /// 0`, leaving a connected call with no audio.
+    ///
+    ///   # both remaining parties are on the carrier side
+    ///   call.accept_refer(target=target, next_hop=gw.uri, mode="terminate",
+    ///                     profile="rtp_passthrough")
+    #[pyo3(signature = (target=None, next_hop=None, mode=None, profile=None))]
     fn accept_refer(
         &mut self,
         target: Option<String>,
         next_hop: Option<String>,
         mode: Option<&str>,
+        profile: Option<String>,
     ) -> PyResult<()> {
         let mode = match mode {
             None => None,
@@ -2182,6 +2237,7 @@ impl PyCall {
             target,
             next_hop,
             mode,
+            profile,
         };
         Ok(())
     }
@@ -2940,13 +2996,14 @@ mod tests {
     fn call_accept_refer() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
-        call.accept_refer(None, None, None).unwrap();
+        call.accept_refer(None, None, None, None).unwrap();
         assert_eq!(
             call.action(),
             &CallAction::AcceptRefer {
                 target: None,
                 next_hop: None,
-                mode: None
+                mode: None,
+                profile: None,
             }
         );
     }
@@ -2959,6 +3016,7 @@ mod tests {
             Some("sip:+15550142@example.com".to_string()),
             Some("sip:198.51.100.1:5060".to_string()),
             Some("transparent"),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2967,6 +3025,7 @@ mod tests {
                 target: Some("sip:+15550142@example.com".to_string()),
                 next_hop: Some("sip:198.51.100.1:5060".to_string()),
                 mode: Some(ReferMode::Transparent),
+                profile: None,
             }
         );
     }
@@ -2975,13 +3034,50 @@ mod tests {
     fn call_accept_refer_terminate_mode() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
-        call.accept_refer(None, None, Some("terminate")).unwrap();
+        call.accept_refer(None, None, Some("terminate"), None).unwrap();
         assert_eq!(
             call.action(),
             &CallAction::AcceptRefer {
                 target: None,
                 next_hop: None,
                 mode: Some(ReferMode::Terminate),
+                profile: None,
+            }
+        );
+    }
+
+    /// The media profile for the pairing a transfer creates is the script's to
+    /// choose; without it the transfer inherits the profile the call was
+    /// anchored with, whose answer half was written for the party leaving.
+    /// Which leg referred is what tells a script which party survives, and
+    /// therefore which media profile the surviving pair needs.
+    #[test]
+    fn call_refer_side_reports_the_referring_leg() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        // Outside an on_refer handler there is no referring leg.
+        assert_eq!(call.refer_side(), None);
+
+        call.set_refer_from_a_leg(true);
+        assert_eq!(call.refer_side(), Some("a"));
+
+        call.set_refer_from_a_leg(false);
+        assert_eq!(call.refer_side(), Some("b"), "matches the on_bye initiator convention");
+    }
+
+    #[test]
+    fn call_accept_refer_carries_a_media_profile() {
+        let message = Arc::new(Mutex::new(make_invite()));
+        let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
+        call.accept_refer(None, None, Some("terminate"), Some("rtp_passthrough".to_string()))
+            .unwrap();
+        assert_eq!(
+            call.action(),
+            &CallAction::AcceptRefer {
+                target: None,
+                next_hop: None,
+                mode: Some(ReferMode::Terminate),
+                profile: Some("rtp_passthrough".to_string()),
             }
         );
     }
@@ -2990,7 +3086,7 @@ mod tests {
     fn call_accept_refer_rejects_bad_mode() {
         let message = Arc::new(Mutex::new(make_invite()));
         let mut call = PyCall::new("test-id".to_string(), message, "10.0.0.1".to_string(), "udp".to_string());
-        let result = call.accept_refer(None, None, Some("bridge"));
+        let result = call.accept_refer(None, None, Some("bridge"), None);
         assert!(result.is_err());
         // The invalid call must not have mutated the action.
         assert_eq!(call.action(), &CallAction::None);

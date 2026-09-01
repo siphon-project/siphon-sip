@@ -495,11 +495,23 @@ impl Call {
     /// (`"terminate"` / `"transparent"`) overrides `b2bua.default_refer_mode`.
     /// No pending REFER (already decided, timed out, or the call is gone) →
     /// [`ControlError`] with `code == "not_found"`.
+    ///
+    /// `profile` names the media profile for the pairing the transfer creates,
+    /// and is **required when the call is anchored with a direction-bound
+    /// profile** — one whose offer and answer halves describe different sides,
+    /// such as `srtp_to_rtp` at an SRTP edge. A transfer moves the party that
+    /// half was written for out of the call, so inheriting the profile
+    /// re-offers *that party's* transport to whoever remains: SRTP toward a
+    /// plain-RTP carrier, which answers `m=audio 0`. The call connects and
+    /// carries no audio in either direction. Pass the profile for the pair that
+    /// remains (commonly `"rtp_passthrough"`); `None` inherits, which is correct
+    /// only for a symmetric profile.
     pub async fn accept_refer(
         &self,
         target: Option<&str>,
         next_hop: Option<&str>,
         mode: Option<&str>,
+        profile: Option<&str>,
     ) -> Result<(), ControlError> {
         let mut args = serde_json::Map::new();
         if let Some(target) = target {
@@ -510,6 +522,9 @@ impl Call {
         }
         if let Some(mode) = mode {
             args.insert("mode".to_string(), json!(mode));
+        }
+        if let Some(profile) = profile {
+            args.insert("profile".to_string(), json!(profile));
         }
         self.sip(SipVerb::AcceptRefer, serde_json::Value::Object(args))
             .await
@@ -1226,9 +1241,14 @@ mod tests {
         let call = make_call(recorder.clone());
 
         call.remove_header("X-Foo").await.expect("remove_header ok");
-        call.accept_refer(Some("sip:c@pbx"), Some("sip:sbc"), Some("terminate"))
-            .await
-            .expect("accept_refer ok");
+        call.accept_refer(
+            Some("sip:c@pbx"),
+            Some("sip:sbc"),
+            Some("terminate"),
+            Some("rtp_passthrough"),
+        )
+        .await
+        .expect("accept_refer ok");
         call.reject_refer(603, Some("Decline")).await.expect("reject_refer ok");
 
         let recorded = lock(&recorder.calls).clone();
@@ -1237,10 +1257,35 @@ mod tests {
         assert_eq!(recorded[1].verb, "accept_refer");
         assert_eq!(
             recorded[1].args,
-            json!({ "target": "sip:c@pbx", "next_hop": "sip:sbc", "mode": "terminate" })
+            json!({
+                "target": "sip:c@pbx",
+                "next_hop": "sip:sbc",
+                "mode": "terminate",
+                // The pairing the transfer creates — omitted means "inherit",
+                // which is wrong for a direction-bound profile.
+                "profile": "rtp_passthrough",
+            })
         );
         assert_eq!(recorded[2].verb, "reject_refer");
         assert_eq!(recorded[2].args, json!({ "code": 603, "reason": "Decline" }));
+    }
+
+    /// An omitted profile is absent from the frame rather than sent as null, so
+    /// the server's "inherit the call's profile" default is what applies.
+    #[tokio::test]
+    async fn accept_refer_omits_an_unset_profile() {
+        let recorder = Arc::new(RecordingTransport {
+            calls: Mutex::new(Vec::new()),
+            result: json!({ "channel": "ch1" }),
+        });
+        let call = make_call(recorder.clone());
+
+        call.accept_refer(None, None, Some("terminate"), None)
+            .await
+            .expect("accept_refer ok");
+
+        let recorded = lock(&recorder.calls).clone();
+        assert_eq!(recorded[0].args, json!({ "mode": "terminate" }));
     }
 
     #[test]

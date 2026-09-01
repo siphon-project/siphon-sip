@@ -43,7 +43,14 @@ async def answered(call, reply):
 @b2bua.on_refer
 def on_refer(call):
     log.info(f"Call {call.id} REFER -> {call.refer_to} (terminate)")
-    call.accept_refer(mode="terminate")
+    # Name the profile for the pairing the transfer creates rather than
+    # inheriting the call's. Here they happen to be the same symmetric profile,
+    # so the wire result is unchanged — what this exercises is that an explicit
+    # profile threads all the way through the anchored path (the target offer,
+    # the survivor's re-INVITE answer, and the re-keyed media session) against a
+    # REAL rtpengine. A direction-bound profile is where the difference bites,
+    # and that needs an SRTP endpoint pair this harness does not have.
+    call.accept_refer(mode="terminate", profile=PROFILE)
 
 
 @b2bua.on_bye

@@ -128,26 +128,50 @@ media:
     # PSTN -> Teams: carrier offers RTP, transcode up to SRTP for Teams.
     # The direction labels ("carrier"/"teams") must match the interface names
     # configured in rtpengine.conf.
+    # NOTE: a media profile controls transport, ICE, DTLS, direction and SDP
+    # rewriting — NOT codec selection. There is no `codec:` key here; one would
+    # be silently ignored. Restrict or reorder codecs from the script with the
+    # `sdp` namespace instead, e.g. in @b2bua.on_invite:
+    #     s = sdp.parse(call)
+    #     s.filter_codecs(["PCMA", "PCMU", "telephone-event"])
+    #     s.apply(call)
+    # DIRECTION-BOUND, like its mirror below — do not inherit it across a
+    # transfer or a Replaces takeover.
     rtp_to_srtp:
       offer:
         transport_protocol: "RTP/SAVP"
         ice: "remove"
         replace: ["origin", "session-connection"]
         direction: ["carrier", "teams"]
-        codec: ["offer", "PCMA,PCMU"]
       answer:
         transport_protocol: "RTP/AVP"
         ice: "remove"
         replace: ["origin", "session-connection"]
         direction: ["teams", "carrier"]
+    # Symmetric: both halves say the same thing, so it survives a re-pairing.
+    # This is what a transfer away from Teams uses — see teams_sbc.py's
+    # @b2bua.on_refer. Named explicitly here even though siphon ships a built-in
+    # of the same name, so the example is readable on its own.
+    rtp_passthrough:
+      offer:
+        replace: ["origin", "session-connection"]
+        flags: ["trust-address"]
+      answer:
+        replace: ["origin", "session-connection"]
+        flags: ["trust-address"]
     # Teams -> PSTN: Teams offers SRTP, transcode down to RTP for the carrier.
+    # DIRECTION-BOUND. The two halves describe specific sides: the offerer
+    # speaks SRTP, the answerer speaks plain RTP, and `direction` names which
+    # rtpengine interface each is on. That is correct for the pairing it was
+    # chosen for and wrong for any other — so a call transferred away from Teams
+    # must NOT inherit it. See the @b2bua.on_refer handler in teams_sbc.py:
+    # accept_refer(profile="rtp_passthrough") for the pair that remains.
     srtp_to_rtp:
       offer:
         transport_protocol: "RTP/AVP"
         ice: "remove"
         replace: ["origin", "session-connection"]
         direction: ["teams", "carrier"]
-        codec: ["offer", "PCMA,PCMU"]
       answer:
         transport_protocol: "RTP/SAVP"
         ice: "remove"
