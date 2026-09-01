@@ -4419,6 +4419,16 @@ fn handle_request(
                     );
                 }
             }
+
+            // `request.stop_propagation()` — this handler owns the outcome.
+            // Every matching handler shares one action slot, and only its final
+            // value executes, so without this a later handler silently replaces
+            // an earlier one's decision (registration order decides). Checked
+            // after the handler returns so an async one has already been driven
+            // to completion above.
+            if py_request.borrow(python).is_propagation_stopped() {
+                break;
+            }
         }
 
         let mut borrowed = py_request.borrow_mut(python);

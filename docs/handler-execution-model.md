@@ -41,6 +41,98 @@ The queue feeding the pool is **bounded** (`script.executor_queue_capacity`,
 default 1024): once the pool is at its thread cap *and* the queue is full, new
 jobs are shed.
 
+## Which handlers run, and which decision survives
+
+`@proxy.on_request` takes an optional method filter. A **filtered handler does
+not replace the unfiltered one — both run**, in registration order, and an
+unfiltered handler matches every method.
+
+That much is ordinary middleware. The part that surprises people is what
+happens to the *routing decision*.
+
+### One action slot, last writer wins
+
+Every handler that runs for a request shares **one request object with a single
+action slot**. `reply()`, `relay()`, `fork()` and `reject()` do not send
+anything — they **assign** that slot. The dispatcher executes its final value
+once, after every handler has returned.
+
+So handlers do not each act. They take turns overwriting one decision:
+
+```python
+@proxy.on_request("OPTIONS")
+def probe(request):
+    request.reply(200, "OK")       # ← discarded
+
+@proxy.on_request
+def route(request):
+    request.relay(NEXT_HOP)        # ← this is what happens
+```
+
+The health probe is **not answered and then relayed**. It is *only relayed* —
+the `reply(200)` is gone, silently, because a later handler assigned over it.
+Registration order decides, which is rarely what the author meant.
+
+Side effects are different: `set_header()`, `record_route()`, `log`, metrics and
+cache writes all happen, from every handler that runs. It is only the routing
+decision that is last-writer-wins.
+
+### Keeping your decision: `stop_propagation()`
+
+```python
+@proxy.on_request("OPTIONS")
+def probe(request):
+    request.reply(200, "OK")
+    request.stop_propagation()     # nothing may overwrite this
+```
+
+The dispatcher stops the chain and executes what this handler chose.
+
+It is opt-in on purpose. Answering is not on its own a request to stop — a
+metrics or logging handler running afterwards is legitimate, and stopping by
+default would silently drop it. Idempotent, and it leaves the chosen action
+alone.
+
+The alternative, if you would rather not register two handlers at all, is to
+branch inside one:
+
+```python
+@proxy.on_request
+def route(request):
+    if request.method == "OPTIONS" and not request.in_dialog:
+        request.reply(200, "OK")
+        return
+    request.relay(NEXT_HOP)
+```
+
+!!! note "Coming from Kamailio or OpenSIPS?"
+
+    There is no equivalent of this in either. Both have exactly **one**
+    automatic entry point — Kamailio's `request_route`, OpenSIPS's `route{}` —
+    and everything else (`route(NAME)`, `branch_route`, `failure_route`) is
+    invoked or armed explicitly. You branch inside the one route with
+    `if (is_method("INVITE"))`, so two blocks can never both claim a request.
+
+    siphon's model is closer to HTTP middleware: several handlers may match, and
+    `stop_propagation()` is the `next()`-style control that model needs.
+    `@proxy.on_request("INVITE")` is therefore **not** a drop-in for
+    `is_method("INVITE")` — the Kamailio form is an exclusive branch, the
+    decorator is additive.
+
+!!! warning "`@diameter.on_request` is the other way round"
+
+    The Diameter decorator takes a filter of the same shape
+    (`@diameter.on_request("ULR")`, `"ULR|AIR"`, `"S6a:ULR"`) but dispatches
+    **one** handler per request: the most specific filter that matches wins, and
+    an unfiltered `@diameter.on_request` is the lowest-specificity fallback that
+    runs only when nothing more specific matched.
+
+    The difference is deliberate rather than accidental. A Diameter request
+    needs exactly **one** answer, so one handler must own it. A SIP request can
+    legitimately interest several handlers at once — metrics, lawful intercept,
+    authentication, routing — so they compose. Worth knowing all the same if you
+    are porting a routing pattern between the two namespaces.
+
 ## The blocking contract — what script authors must know
 
 A handler may call Rust APIs that block the worker thread on I/O:

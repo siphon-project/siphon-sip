@@ -40,8 +40,47 @@ a debugger, `pytest` — not an expression language.
 | `sl_send_reply()` / `t_reply()` | `request.reply(code, reason)` |
 | `$ru`, `$rU`, `$rd` | `request.ruri`, `request.ruri.user`, `request.ruri.host` |
 | `$fU`/`$tU`, `$ft`/`$tt` | `request.from_uri`/`to_uri`, `request.from_tag`/`to_tag` |
-| `is_method("INVITE")` | `@proxy.on_request("INVITE")` or `request.method == "INVITE"` |
+| `is_method("INVITE")` | `request.method == "INVITE"` inside one handler — **not** `@proxy.on_request("INVITE")`, see the note below |
 | `has_totag()` / loose-route dialog check | `request.in_dialog` |
+
+### One route block vs. several handlers
+
+The one structural difference worth reading before you port anything.
+
+Kamailio and OpenSIPS have exactly **one** automatic entry point — `request_route`
+and `route{}` respectively. Everything else (`route(NAME)`, `branch_route`,
+`failure_route`) is invoked or armed explicitly, so two blocks can never both
+claim a request. `is_method("INVITE")` is an **exclusive branch** inside that one
+route.
+
+SIPhon registers handlers, and **every** `@proxy.on_request` whose filter matches
+runs — an unfiltered one matches every method. So
+`@proxy.on_request("INVITE")` is *additive*, not a branch: it runs alongside your
+catch-all rather than instead of it. They also share a single action slot, so the
+last handler to call `reply()` / `relay()` / `fork()` is the one that takes
+effect; an earlier handler's decision is discarded silently.
+
+Two ways to write the Kamailio shape:
+
+```python
+# Closest to the original: one handler, branch inside it.
+@proxy.on_request
+def route(request):
+    if request.method == "INVITE":
+        ...
+        return
+    request.relay()
+```
+
+```python
+# Or keep the filtered handler and claim the outcome explicitly.
+@proxy.on_request("INVITE")
+def invites(request):
+    ...
+    request.stop_propagation()
+```
+
+See [Handler execution model](handler-execution-model.md) for the full rules.
 
 CANCEL handling, Max-Forwards enforcement, retransmission absorption and ACK-for-non-2xx
 are done by the SIPhon transaction layer automatically — you don't write routes for

@@ -158,7 +158,16 @@ pub struct PyRequest {
     /// Whether Record-Route was requested.
     record_routed: bool,
     /// The action the script chose.
+    ///
+    /// One slot, shared by every handler that runs for this request, and
+    /// executed once after they all return. `reply()` / `relay()` / `fork()`
+    /// assign it rather than sending, so a later handler silently replaces an
+    /// earlier one's decision — [`Self::propagation_stopped`] is how a handler
+    /// keeps its own.
     action: RequestAction,
+    /// Set by `request.stop_propagation()`: the dispatcher runs no further
+    /// handlers for this request.
+    propagation_stopped: bool,
     /// Authenticated username (set after digest auth succeeds).
     auth_user: Option<String>,
     /// Local domains from config (for `ruri.is_local`).
@@ -224,6 +233,7 @@ impl PyRequest {
             source_port,
             record_routed: false,
             action: RequestAction::None,
+            propagation_stopped: false,
             auth_user: None,
             local_domains: None,
             self_identity: None,
@@ -279,6 +289,7 @@ impl PyRequest {
             source_port,
             record_routed: false,
             action: RequestAction::None,
+            propagation_stopped: false,
             auth_user: None,
             local_domains: Some(local_domains),
             self_identity: Some(Arc::new(identity)),
@@ -318,6 +329,12 @@ impl PyRequest {
     /// Inbound `ConnectionId.0` (Rust-side accessor).
     pub fn inbound_connection_id_u64(&self) -> Option<u64> {
         self.inbound_connection_id
+    }
+
+    /// Whether a handler asked the dispatcher to stop running the rest of the
+    /// chain for this request (`request.stop_propagation()`).
+    pub fn is_propagation_stopped(&self) -> bool {
+        self.propagation_stopped
     }
 
     /// Get the action the script chose.
@@ -920,6 +937,37 @@ impl PyRequest {
             reason: reason.to_string(),
             reliable,
         };
+    }
+
+    /// Stop the dispatcher running any further handlers for this request.
+    ///
+    /// Every ``@proxy.on_request`` handler whose filter matches runs, and they
+    /// share one request object with a **single action slot**. ``reply()`` /
+    /// ``relay()`` / ``fork()`` assign that slot rather than sending anything,
+    /// and only its final value is executed — so a later handler silently
+    /// replaces an earlier one's routing decision. Registration order decides,
+    /// which is rarely what the author meant:
+    ///
+    /// ```python,ignore
+    /// @proxy.on_request("OPTIONS")
+    /// def probe(request):
+    ///     request.reply(200, "OK")      # discarded below
+    ///
+    /// @proxy.on_request
+    /// def route(request):
+    ///     request.relay(NEXT_HOP)       # the probe is forwarded, not answered
+    /// ```
+    ///
+    /// Calling ``request.stop_propagation()`` after the reply keeps it: the
+    /// dispatcher stops the chain and executes what this handler chose.
+    ///
+    /// It is opt-in on purpose. Answering is not on its own a request to stop —
+    /// a metrics or logging handler running afterwards is legitimate, and
+    /// stopping by default would silently drop it.
+    ///
+    /// Idempotent, and it does not disturb the action already chosen.
+    fn stop_propagation(&mut self) {
+        self.propagation_stopped = true;
     }
 
     /// Relay the request to its Request-URI, or to an explicit next-hop,
@@ -1988,6 +2036,61 @@ mod tests {
                 reliable: false,
             }
         );
+    }
+
+    /// The hazard `stop_propagation` exists for.
+    ///
+    /// Every handler whose filter matches runs, and they share one request with
+    /// a single action slot. `reply()` and `relay()` both *assign* that slot —
+    /// neither sends anything — and the dispatcher executes only its final
+    /// value. So a later handler does not run "as well as" an earlier one: it
+    /// silently discards the earlier one's routing decision.
+    ///
+    /// The shape that bit the interop stack: an `@proxy.on_request("OPTIONS")`
+    /// answering a health probe, and a bare `@proxy.on_request` relaying. The
+    /// probe was never answered — it was forwarded to the next hop.
+    #[test]
+    fn a_later_action_silently_replaces_an_earlier_one() {
+        let mut request = make_request();
+
+        // Handler 1: "I have answered this."
+        request.reply(200, "OK", false);
+        assert!(matches!(*request.action(), RequestAction::Reply { code: 200, .. }));
+
+        // Handler 2, which never knew handler 1 ran.
+        request.relay(None, None, None, None, None).unwrap();
+        assert_eq!(
+            *request.action(),
+            RequestAction::Relay { next_hop: None, flow: None, send_socket: None },
+            "the reply is gone, not merged — only the last assignment executes"
+        );
+    }
+
+    /// `stop_propagation()` is how a handler keeps its decision: the dispatcher
+    /// stops running further handlers, so nothing can overwrite the slot.
+    #[test]
+    fn stop_propagation_is_off_until_a_handler_asks() {
+        let mut request = make_request();
+        assert!(!request.is_propagation_stopped());
+        request.reply(200, "OK", false);
+        assert!(
+            !request.is_propagation_stopped(),
+            "answering is not on its own a request to stop — a metrics handler \
+             after it is legitimate"
+        );
+        request.stop_propagation();
+        assert!(request.is_propagation_stopped());
+    }
+
+    /// Idempotent, and it does not disturb the action already chosen.
+    #[test]
+    fn stop_propagation_preserves_the_action_and_is_idempotent() {
+        let mut request = make_request();
+        request.reply(486, "Busy Here", false);
+        request.stop_propagation();
+        request.stop_propagation();
+        assert!(request.is_propagation_stopped());
+        assert!(matches!(*request.action(), RequestAction::Reply { code: 486, .. }));
     }
 
     #[test]

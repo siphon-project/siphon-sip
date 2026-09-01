@@ -235,6 +235,35 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   PR that causes it. Both rows now say which.
 
 
+- **`request.stop_propagation()` — a handler can now keep its decision.**
+  Every `@proxy.on_request` whose filter matches runs, and they share one
+  request object with a **single action slot**: `reply()` / `relay()` / `fork()`
+  assign it rather than sending, and only its final value is executed. So a
+  later handler did not run *as well as* an earlier one — it silently replaced
+  the earlier one's routing decision, with registration order deciding. An
+  `@proxy.on_request("OPTIONS")` answering a health probe beside a bare
+  `@proxy.on_request` that relays meant the probe was **never answered**, only
+  forwarded. Calling `request.stop_propagation()` stops the chain so nothing can
+  overwrite the choice.
+
+  Opt-in: answering is not on its own a request to stop, since a metrics or
+  logging handler running afterwards is legitimate, and stopping by default
+  would silently drop it. Side effects (`set_header`, `record_route`, logging,
+  metrics) still run from every handler — only the routing decision is
+  last-writer-wins. Documented in the handler execution model and mirrored in
+  the SDK.
+
+  `@diameter.on_request` dispatches the single most specific match instead. That
+  difference is deliberate, and now says why: a Diameter request needs exactly
+  one answer, where a SIP request can legitimately interest several handlers at
+  once. Its docstring previously described the filter as mirroring
+  `@proxy.on_request("INVITE")`, which is true of the syntax and false of the
+  dispatch.
+
+  The Kamailio/OpenSIPS migration guide mapped `is_method("INVITE")` to
+  `@proxy.on_request("INVITE")`. Both of those have exactly one automatic route
+  block, so `is_method()` is an *exclusive branch*; the decorator is additive.
+  The guide now shows both correct forms.
 - **Control plane: `StasisEnd` now carries the SIP status on every teardown that
   had one.** `code` / `response` were only populated on the two originate paths;
   four more now report theirs — `487 Request Terminated` on a CANCEL in either

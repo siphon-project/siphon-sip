@@ -128,6 +128,34 @@ class MockProxy:
             - ``@proxy.on_request()`` — same, explicit call
             - ``@proxy.on_request("REGISTER")`` — single method filter
             - ``@proxy.on_request("INVITE|SUBSCRIBE")`` — pipe-separated filter
+
+        **A filtered handler does not replace the unfiltered one — both run**,
+        in registration order; an unfiltered handler matches every method.
+
+        They also share **one action slot**. ``reply()`` / ``relay()`` /
+        ``fork()`` assign it rather than sending, and only its final value is
+        executed, so a later handler silently replaces an earlier one's routing
+        decision::
+
+            @proxy.on_request("OPTIONS")
+            def probe(request):
+                request.reply(200, "OK")      # discarded below
+
+            @proxy.on_request          # also runs for OPTIONS
+            def route(request):
+                request.relay(NEXT_HOP)
+
+        The probe is *not* answered and then relayed — it is only relayed. Use
+        ``request.stop_propagation()`` to keep a decision, or branch inside one
+        handler rather than registering two. Side effects (``set_header``,
+        ``record_route``, logging, metrics) do happen from every handler; it is
+        only the routing decision that is last-writer-wins.
+
+        (``@diameter.on_request`` takes a filter of the same shape but
+        dispatches only the single most specific match: a Diameter request needs
+        exactly one answer, where a SIP request can legitimately interest
+        several handlers at once.)
+
         """
         if fn_or_filter is None or callable(fn_or_filter):
             fn = fn_or_filter
@@ -5776,10 +5804,23 @@ class MockDiameter:
         ``await req.forward_to(peer, ...)``, ``req.answer(code)``, or ``None``
         (→ DIAMETER_UNABLE_TO_DELIVER, 3002).
 
-        An optional command filter scopes the handler (mirrors
-        ``@proxy.on_request("INVITE")``): bare ``@diameter.on_request`` (all),
-        ``@diameter.on_request("ULR")``, ``"ULR|AIR"``, or app-qualified
-        ``"S6a:ULR"``. The mock treats it as an identity decorator either way.
+        An optional command filter scopes the handler — bare
+        ``@diameter.on_request`` (all), ``@diameter.on_request("ULR")``,
+        ``"ULR|AIR"``, or app-qualified ``"S6a:ULR"``. The mock treats it as an
+        identity decorator either way.
+
+        The filter has the same *shape* as ``@proxy.on_request("INVITE")`` but
+        **not** the same dispatch rule: exactly one Diameter handler runs per
+        request — the most specific filter that matches — and a bare
+        ``@diameter.on_request`` is the lowest-specificity fallback, reached
+        only when nothing more specific matched. ``@proxy.on_request`` instead
+        runs *every* handler whose filter matches, unfiltered ones included.
+
+        Deliberate, not an inconsistency: a Diameter request needs exactly one
+        answer, so one handler must own it. A SIP request can legitimately
+        interest several handlers at once (metrics, lawful intercept,
+        authentication, routing), so they compose — and
+        ``request.stop_propagation()`` is how one of them claims the outcome.
 
         Example::
 
