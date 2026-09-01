@@ -53,7 +53,8 @@ impl ControlAdapter for SipControlAdapter {
             verbs: vec![
                 verb("originate", "Place an outbound call under a caller-supplied channel id and return as soon as the INVITE is on the wire (args: channel, to, from, from_display, to_display, next_hop, p_asserted_identity, privacy, headers, sdp | media, profile, ws_uri, timeout, on_lost, vars)"),
                 verb("answer", "Send a UAS 2xx to the parked A-leg (args: code, reason, body, content_type)"),
-                verb("progress", "Send a UAS 1xx / early media (args: code, reason, body, content_type)"),
+                verb("ring", "Send 180 Ringing to the parked A-leg — alerting only, no early media (RFC 3261 §13.2.1); a body is refused, use progress for that (args: reason)"),
+                verb("progress", "Send a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to 183 Session Progress (args: code, reason, body, content_type)"),
                 verb("reject", "Send a final non-2xx and tear the call down (args: code, reason)"),
                 verb("hangup", "BYE an answered call, or reject an unanswered one (args: reason)"),
                 verb("refer", "Send an in-dialog REFER on the A-leg; the reply reports only that it was sent, the far end's verdict arrives as TransferProgress then TransferCompleted / TransferFailed (args: to, replaces)"),
@@ -63,7 +64,7 @@ impl ControlAdapter for SipControlAdapter {
                 verb("set_header", "Set a header on the stored A-leg INVITE (args: name, value)"),
                 verb("remove_header", "Remove a header from the stored A-leg INVITE (args: name)"),
                 verb("get_header", "Read a header from the stored A-leg INVITE (args: name)"),
-                verb("play", "Play an announcement on the A-leg media, fire-and-forget (args: one of file|db_id|blob, repeat, start_ms, duration_ms, to_tag)"),
+                verb("play", "Play an announcement on the A-leg media, fire-and-forget; the reply and a PlayStarted event carry the play_id a later stop addresses (args: one of file|db_id|blob|tone|url, repeat, start_ms, duration_ms, gain_decibels, to_tag)"),
                 verb("stop", "Stop the announcement currently playing on the A-leg media"),
                 verb("dtmf", "Inject DTMF digits toward the A-leg (args: digits, duration_ms, volume_dbm0, pause_ms, to_tag)"),
                 verb("hold", "Hold the A-leg media via silence"),
@@ -77,6 +78,12 @@ impl ControlAdapter for SipControlAdapter {
                 "ChannelStateChange".to_string(),
                 "ChannelHangupRequest".to_string(),
                 "ChannelDtmfReceived".to_string(),
+                // The accept of a `play`, on the event stream rather than only
+                // in the command reply, carrying the `play_id` a later `stop` /
+                // gain change addresses. "Started" is the media contract's
+                // accept-on-start, not a claim that audio is already on the
+                // wire — a fetched source accepts before its body arrives.
+                "PlayStarted".to_string(),
                 "TransferRequested".to_string(),
                 // The verdict on an *outbound* REFER (the `refer` verb). Three
                 // names, because RFC 3515 §2.4.4 splits "accepted for
@@ -140,6 +147,7 @@ fn apply_sip(command: AdapterCommand) -> ControlResult {
 
     match command.verb.as_str() {
         "answer" => answer(&channel, &command.args, true),
+        "ring" => ring(&channel, &command.args),
         "progress" => answer(&channel, &command.args, false),
         "reject" => reject(&channel, &command.args),
         "hangup" => hangup(&channel, &command.args),
@@ -291,9 +299,77 @@ fn parse_stream_channels(value: Option<&serde_json::Value>) -> Result<Option<u8>
     }
 }
 
+/// The short token naming which source a `play` was started from, carried on the
+/// `PlayStarted` event so an application can tell a prompt apart from a tone or
+/// a fetched URL without keeping its own table of outstanding plays.
+fn play_source_kind(source: &crate::rtpengine::client::PlayMediaSource) -> &'static str {
+    use crate::rtpengine::client::PlayMediaSource;
+    match source {
+        PlayMediaSource::File(_) => "file",
+        PlayMediaSource::Blob(_) => "blob",
+        PlayMediaSource::DbId(_) => "db_id",
+        PlayMediaSource::Tone(_) => "tone",
+        PlayMediaSource::Http(_) => "url",
+    }
+}
+
+/// Turn a `play_media` result into the command reply and, when the playback
+/// really started, the `PlayStarted` payload to publish.
+///
+/// Split out from [`play`] so both halves are directly testable, including the
+/// one that matters most: a play the backend **refused** yields `None` — no
+/// start event is ever published for a playback that never began, which is what
+/// lets a controller read "no `PlayStarted` yet" as "not started", full stop.
+///
+/// The media contract answers `play_media` **accept-on-start** — the accept
+/// carries the `play_id` and means the engine armed the playback — so the accept
+/// is the start, and there is no separate engine-side start signal to wait for.
+/// It is deliberately *not* a claim that audio has reached the wire: a fetched
+/// source (`url`) accepts before its body has arrived, which is why
+/// `duration_ms` can be absent here and why a fetch that never completes shows
+/// up later as a playback that ends without ever producing audio.
+fn play_accept(
+    channel_id: &str,
+    source: &crate::rtpengine::client::PlayMediaSource,
+    result: Result<crate::rtpengine::siphon_rtp::PlayMediaOutcome, crate::rtpengine::RtpEngineError>,
+) -> (ControlResult, Option<serde_json::Value>) {
+    let outcome = match result {
+        Ok(outcome) => outcome,
+        Err(error) => return (media_error(error), None),
+    };
+    let kind = play_source_kind(source);
+    let mut reply = serde_json::json!({ "channel": channel_id, "state": "playing" });
+    let mut started = serde_json::json!({ "source": kind });
+    // `play_id` is the engine's handle on this one playback — what `stop`
+    // targets, what a gain change addresses, and what a completion correlates
+    // against. Absent on backends that assign none (rtpengine / rtpproxy), and
+    // then omitted rather than faked, so a controller can tell "this engine has
+    // no handles" from "handle 0".
+    if let (Some(object), Some(play_id)) = (reply.as_object_mut(), outcome.play_id) {
+        object.insert("play_id".to_string(), serde_json::json!(play_id));
+    }
+    if let (Some(object), Some(duration_ms)) = (reply.as_object_mut(), outcome.duration_ms) {
+        object.insert("duration_ms".to_string(), serde_json::json!(duration_ms));
+    }
+    if let (Some(object), Some(play_id)) = (started.as_object_mut(), outcome.play_id) {
+        object.insert("play_id".to_string(), serde_json::json!(play_id));
+    }
+    if let (Some(object), Some(duration_ms)) = (started.as_object_mut(), outcome.duration_ms) {
+        object.insert("duration_ms".to_string(), serde_json::json!(duration_ms));
+    }
+    (ControlResult::Ok(reply), Some(started))
+}
+
 /// `play` — start an announcement on the A-leg's media. Fire-and-forget: `wait`
 /// is false, so this returns on the backend's *accept*, never blocking on
 /// playback completion (the far-end result is not the command reply).
+///
+/// The accept is also published as a `PlayStarted` event, so a controller that
+/// runs its playback logic off the event stream — a watchdog on a source that
+/// may never produce audio, a gain ramp on a prompt — has one ordered place to
+/// hang it rather than having to join a command reply against later events.
+/// The event and the command reply travel on different paths and either may
+/// land first; both carry the same `play_id`, which is what correlates them.
 async fn play(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
     let source = match parse_play_source(args) {
         Ok(source) => source,
@@ -311,7 +387,7 @@ async fn play(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
         Ok(target) => target,
         Err(result) => return result,
     };
-    match backend
+    let result = backend
         .play_media(
             &call_id,
             &from_tag,
@@ -328,13 +404,12 @@ async fn play(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
                 .and_then(|value| i32::try_from(value).ok()),
             false,
         )
-        .await
-    {
-        Ok(_) => ControlResult::Ok(
-            serde_json::json!({ "channel": channel.channel_id, "state": "playing" }),
-        ),
-        Err(error) => media_error(error),
+        .await;
+    let (reply, started) = play_accept(&channel.channel_id, &source, result);
+    if let Some(payload) = started {
+        crate::control::notify_channel_event(&channel.sip_call_id, "PlayStarted", payload);
     }
+    reply
 }
 
 /// `stop` — stop any prompt currently playing on the A-leg's media.
@@ -764,6 +839,74 @@ fn response_args(args: &serde_json::Value, default_code: u16, default_reason: &s
     (code, reason, body, content_type)
 }
 
+/// Whether an argument is present and not JSON `null` — an explicit `null` is
+/// how most clients spell "not set", so it has to read as absent.
+fn arg_present(args: &serde_json::Value, key: &str) -> bool {
+    args.get(key).is_some_and(|value| !value.is_null())
+}
+
+/// The `state` token for a provisional siphon just sent, by the **same rule** as
+/// the callee-side `ChannelStateChange` on an originated leg: a 1xx carrying a
+/// body opened an early-media path (`progress`); one that did not is alerting
+/// only (`ringing`). One vocabulary in both directions, so an application that
+/// already reads the event needs no second mapping for the verb reply.
+///
+/// RFC 3261 §13.2.1 makes the 180 the "callee is being alerted" signal and
+/// §21.1.2 gives it no session semantics; RFC 3960 §3.1 puts early media on the
+/// response that carries the SDP.
+fn provisional_state(has_body: bool) -> &'static str {
+    if has_body {
+        "progress"
+    } else {
+        "ringing"
+    }
+}
+
+/// Send one UAS response on the parked A-leg. `Err` is the typed reply to hand
+/// back; `Ok` means it is on the wire.
+fn send_uas_response(
+    channel: &ChannelRef,
+    code: u16,
+    reason: &str,
+    body: Option<Vec<u8>>,
+    content_type: Option<&str>,
+    final_response: bool,
+) -> Result<(), ControlResult> {
+    let Some(invite_arc) = stored_invite(&channel.call_actor_id) else {
+        return Err(ControlResult::error(ControlErrorCode::NotFound, "call is gone"));
+    };
+    let Ok(invite) = invite_arc.lock() else {
+        return Err(ControlResult::error(
+            ControlErrorCode::Unavailable,
+            "call invite lock poisoned",
+        ));
+    };
+    let sent = if final_response {
+        crate::dispatcher::b2bua_answer_call(
+            &channel.call_actor_id,
+            &invite,
+            code,
+            reason,
+            body,
+            content_type,
+        )
+    } else {
+        crate::dispatcher::b2bua_progress_call(
+            &channel.call_actor_id,
+            &invite,
+            code,
+            reason,
+            body,
+            content_type,
+        )
+    };
+    if sent {
+        Ok(())
+    } else {
+        Err(ControlResult::error(ControlErrorCode::NotFound, "call is gone"))
+    }
+}
+
 fn answer(channel: &ChannelRef, args: &serde_json::Value, final_response: bool) -> ControlResult {
     let (default_code, default_reason) = if final_response { (200, "OK") } else { (183, "Session Progress") };
     let (code, reason, body, content_type) = response_args(args, default_code, default_reason);
@@ -775,36 +918,63 @@ fn answer(channel: &ChannelRef, args: &serde_json::Value, final_response: bool) 
         return ControlResult::error(ControlErrorCode::BadRequest, "progress requires a 1xx code");
     }
 
-    let Some(invite_arc) = stored_invite(&channel.call_actor_id) else {
-        return ControlResult::error(ControlErrorCode::NotFound, "call is gone");
-    };
-    let Ok(invite) = invite_arc.lock() else {
-        return ControlResult::error(ControlErrorCode::Unavailable, "call invite lock poisoned");
-    };
-    let sent = if final_response {
-        crate::dispatcher::b2bua_answer_call(
-            &channel.call_actor_id,
-            &invite,
-            code,
-            &reason,
-            body,
-            content_type.as_deref(),
-        )
-    } else {
-        crate::dispatcher::b2bua_progress_call(
-            &channel.call_actor_id,
-            &invite,
-            code,
-            &reason,
-            body,
-            content_type.as_deref(),
-        )
-    };
-    if !sent {
-        return ControlResult::error(ControlErrorCode::NotFound, "call is gone");
+    let has_body = body.as_ref().is_some_and(|bytes| !bytes.is_empty());
+    if let Err(result) =
+        send_uas_response(channel, code, &reason, body, content_type.as_deref(), final_response)
+    {
+        return result;
     }
-    let state = if final_response { "answered" } else { "ringing" };
-    ControlResult::Ok(serde_json::json!({ "channel": channel.channel_id, "state": state, "code": code }))
+    if final_response {
+        return ControlResult::Ok(
+            serde_json::json!({ "channel": channel.channel_id, "state": "answered", "code": code }),
+        );
+    }
+    // The reply names which of the two this provisional actually was, instead of
+    // calling every 1xx "ringing": a 183 carrying early media reported as
+    // ringing is the exact conflation the `ring` / `progress` split removes.
+    ControlResult::Ok(serde_json::json!({
+        "channel": channel.channel_id,
+        "state": provisional_state(has_body),
+        "code": code,
+        "early_media": has_body,
+    }))
+}
+
+/// `ring` — send `180 Ringing` on the parked A-leg: alerting, and nothing else.
+///
+/// RFC 3261 §13.2.1 has the UAS send a 180 while the callee is being alerted,
+/// and §21.1.2 gives that response no session semantics; RFC 3960 §3.1 puts
+/// early media on a response that carries SDP. Two different acts, so two verbs:
+/// an application rings for an interval of its own choosing with `ring`, and
+/// separately opens an early-media path with `progress`, without having to know
+/// which status code carries which meaning.
+///
+/// A body is refused rather than sent, because a 180 with SDP *is* an
+/// early-media response — accepting one here would put an early-media offer on
+/// the wire under a verb whose contract is that it only alerts.
+fn ring(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
+    if arg_present(args, "body") || arg_present(args, "content_type") {
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "ring sends a plain 180 Ringing (alerting only); SDP on an 18x is early media \
+             (RFC 3960 §3.1) — use the progress verb for that",
+        );
+    }
+    let reason = args
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Ringing")
+        .to_string();
+    if let Err(result) = send_uas_response(channel, 180, &reason, None, None, false) {
+        return result;
+    }
+    ControlResult::Ok(serde_json::json!({
+        "channel": channel.channel_id,
+        "state": "ringing",
+        "code": 180,
+        "early_media": false,
+    }))
 }
 
 fn reject(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
@@ -1179,6 +1349,136 @@ mod tests {
         }
     }
 
+    fn sip_command(verb: &str, args: serde_json::Value) -> ControlResult {
+        apply_sip(AdapterCommand {
+            verb: verb.to_string(),
+            args,
+            target: ResolvedTarget::Channel(channel()),
+            origin: test_origin(),
+        })
+    }
+
+    #[test]
+    fn ring_refuses_a_body_because_sdp_on_an_18x_is_early_media() {
+        // RFC 3960 §3.1: SDP on an 18x opens an early-media path. `ring` says it
+        // only alerts, so it must refuse rather than quietly put an early-media
+        // offer on the wire under that name.
+        for args in [
+            serde_json::json!({ "body": "v=0\r\n" }),
+            serde_json::json!({ "content_type": "application/sdp" }),
+        ] {
+            let result = sip_command("ring", args);
+            let ControlResult::Error { code, message } = result else {
+                panic!("ring with a body must be refused");
+            };
+            assert_eq!(code, ControlErrorCode::BadRequest);
+            assert!(message.contains("progress"), "the refusal must point at progress: {message}");
+        }
+    }
+
+    #[test]
+    fn ring_reads_an_explicit_null_body_as_absent() {
+        // Most clients spell "not set" as an explicit JSON null; refusing that
+        // would make `ring` unusable from a client that always sends the key.
+        // With no dispatcher installed the call store is empty, so reaching
+        // not_found proves the arg check let it through.
+        let result = sip_command("ring", serde_json::json!({ "body": null, "content_type": null }));
+        assert!(
+            matches!(result, ControlResult::Error { code: ControlErrorCode::NotFound, .. }),
+            "a null body must read as absent and let ring reach the call store"
+        );
+    }
+
+    #[test]
+    fn provisional_state_matches_the_originate_side_vocabulary() {
+        // The callee-side ChannelStateChange already splits these two by whether
+        // the 1xx carried a body; the verb reply must use the identical rule, or
+        // an app needs a second mapping for the same distinction. The old reply
+        // said "ringing" for every provisional, including a 183 with early media.
+        assert_eq!(provisional_state(false), "ringing");
+        assert_eq!(provisional_state(true), "progress");
+    }
+
+    #[test]
+    fn play_accept_publishes_a_start_event_carrying_the_engines_handle() {
+        use crate::rtpengine::client::PlayMediaSource;
+        use crate::rtpengine::siphon_rtp::PlayMediaOutcome;
+
+        let (reply, started) = play_accept(
+            "ch1",
+            &PlayMediaSource::File("/prompts/welcome.wav".to_string()),
+            Ok(PlayMediaOutcome { play_id: Some(7), duration_ms: Some(1500) }),
+        );
+        let ControlResult::Ok(value) = reply else {
+            panic!("an accepted play must reply ok");
+        };
+        assert_eq!(value["state"], "playing");
+        assert_eq!(value["play_id"], 7);
+        assert_eq!(value["duration_ms"], 1500);
+
+        let started = started.expect("an accepted play must publish a start event");
+        assert_eq!(started["play_id"], 7);
+        assert_eq!(started["duration_ms"], 1500);
+        assert_eq!(started["source"], "file");
+    }
+
+    #[test]
+    fn play_accept_omits_a_handle_the_engine_never_assigned() {
+        use crate::rtpengine::client::PlayMediaSource;
+        use crate::rtpengine::siphon_rtp::PlayMediaOutcome;
+
+        // rtpengine / rtpproxy assign no play_id and a fetched source has no
+        // known length at accept time. Both are omitted rather than faked — a
+        // fabricated `play_id: 0` is a handle a later `stop` would aim at the
+        // wrong playback.
+        let (reply, started) = play_accept(
+            "ch1",
+            &PlayMediaSource::Http("https://example.com/prompt.wav".to_string()),
+            Ok(PlayMediaOutcome { play_id: None, duration_ms: None }),
+        );
+        let ControlResult::Ok(value) = reply else {
+            panic!("an accepted play must reply ok");
+        };
+        assert!(value.get("play_id").is_none());
+        assert!(value.get("duration_ms").is_none());
+        let started = started.expect("a play with no handle still started");
+        assert!(started.get("play_id").is_none());
+        assert!(started.get("duration_ms").is_none());
+        assert_eq!(started["source"], "url");
+    }
+
+    #[test]
+    fn play_the_backend_refuses_publishes_no_start_event() {
+        use crate::rtpengine::client::PlayMediaSource;
+
+        // The negative that makes the start event worth having: a playback that
+        // never began must produce no PlayStarted, so "no start event yet" reads
+        // as "not started" and never as "started, silently".
+        let (reply, started) = play_accept(
+            "ch1",
+            &PlayMediaSource::File("/prompts/missing.wav".to_string()),
+            Err(crate::rtpengine::RtpEngineError::Unsupported {
+                operation: "play_media",
+                backend: "rtpproxy",
+            }),
+        );
+        assert!(
+            matches!(reply, ControlResult::Error { .. }),
+            "a refused play must answer with a typed error"
+        );
+        assert!(started.is_none(), "a play that never started must publish no start event");
+    }
+
+    #[test]
+    fn play_source_kind_names_every_source() {
+        use crate::rtpengine::client::PlayMediaSource;
+        assert_eq!(play_source_kind(&PlayMediaSource::File("/a.wav".into())), "file");
+        assert_eq!(play_source_kind(&PlayMediaSource::Blob(vec![0u8; 2])), "blob");
+        assert_eq!(play_source_kind(&PlayMediaSource::DbId(3)), "db_id");
+        assert_eq!(play_source_kind(&PlayMediaSource::Tone("ringback_eu".into())), "tone");
+        assert_eq!(play_source_kind(&PlayMediaSource::Http("https://h/x.wav".into())), "url");
+    }
+
     fn originate_command(args: serde_json::Value) -> AdapterCommand {
         AdapterCommand {
             verb: "originate".to_string(),
@@ -1498,6 +1798,7 @@ mod tests {
         let verbs: Vec<&str> = schema.verbs.iter().map(|v| v.verb.as_str()).collect();
         for expected in [
             "answer",
+            "ring",
             "progress",
             "reject",
             "hangup",
@@ -1525,6 +1826,7 @@ mod tests {
             "ChannelStateChange",
             "ChannelHangupRequest",
             "ChannelDtmfReceived",
+            "PlayStarted",
             "TransferRequested",
             "TransferProgress",
             "TransferCompleted",
@@ -1532,6 +1834,34 @@ mod tests {
         ] {
             assert!(events.contains(&expected), "missing event {expected}");
         }
+    }
+
+    #[test]
+    fn ring_and_progress_are_separate_verbs_in_the_schema() {
+        // The declared schema is the only thing an app can discover the surface
+        // from (`describe`), so the split has to be visible there: one verb that
+        // says it only alerts, one that says it can open early media. A single
+        // "1xx / early media" verb leaves the app guessing at status codes.
+        let schema = SipControlAdapter::new().describe();
+        let find = |name: &str| {
+            schema
+                .verbs
+                .iter()
+                .find(|verb| verb.verb == name)
+                .map(|verb| verb.summary.clone())
+                .unwrap_or_default()
+        };
+        let ring = find("ring");
+        assert!(ring.contains("180"), "ring must name the status it sends: {ring}");
+        assert!(
+            ring.contains("no early media") || ring.contains("alerting only"),
+            "ring must say it does not open early media: {ring}"
+        );
+        let progress = find("progress");
+        assert!(
+            progress.contains("early-media") || progress.contains("early media"),
+            "progress must name early media as its job: {progress}"
+        );
     }
 
     #[test]
@@ -1587,7 +1917,7 @@ mod tests {
         for verb in ["play", "stop", "dtmf", "hold", "unhold", "stream_start", "stream_stop"] {
             assert!(is_media_verb(verb), "{verb} should route to the async media path");
         }
-        for verb in ["answer", "progress", "reject", "hangup", "refer", "accept_refer", "reject_refer", "route", "set_header", "remove_header", "get_header", "collect_dtmf", "teleport"] {
+        for verb in ["answer", "ring", "progress", "reject", "hangup", "refer", "accept_refer", "reject_refer", "route", "set_header", "remove_header", "get_header", "collect_dtmf", "teleport"] {
             assert!(!is_media_verb(verb), "{verb} should NOT route to the async media path");
         }
     }

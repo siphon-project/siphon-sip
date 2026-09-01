@@ -1,0 +1,131 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Control-plane ring vs early media, on the wire:
+  INVITE -> 100 -> 180 (no SDP) -> 183 (the CONTROLLER's SDP) -> 200 -> ACK -> BYE -> 200
+
+  siphon parks this INVITE and the out-of-process application drives every
+  response.  What this scenario exists to prove is the split: the application
+  asked to *alert* and, separately and later, to open an *early-media path*, and
+  two different responses came out — a body-less 180 (RFC 3261 §13.2.1: the
+  callee is being alerted, no session semantics) followed by a 183 carrying SDP
+  (RFC 3960 §3.1: early media rides on the response with the SDP).
+
+  Both halves are asserted, and both are `check_it` / `check_it_inverse` so they
+  fail the call rather than merely logging:
+
+    * the 180 must NOT carry SDP — if a single conflated verb had sent one
+      response for both intents, this is what catches it;
+    * the 183 must carry the application's own media address (RFC 5737
+      TEST-NET-2, 198.51.100.20), which is what proves the early-media SDP came
+      from the controller and was not synthesised by siphon.
+
+  The application half of the case (the reply each verb returned, and that a
+  `ring` carrying a body is refused) is asserted on the app's recorded frames —
+  see sipp/control/control_app.py, case "progress".
+-->
+<scenario name="Control-plane ring / early-media UAC">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:progress@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550001@control.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:progress@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/control-progress-uac
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <!-- Alerting. A 180 that carried SDP would be early media (RFC 3960 §3.1),
+       i.e. the conflation this split removes, so check_it_inverse fails the
+       call if any SDP shows up here. -->
+  <recv response="180">
+    <action>
+      <ereg regexp="v=0"
+            search_in="body"
+            check_it_inverse="true"
+            assign_to="ringing_had_sdp" />
+      <log message="180 Ringing carried no SDP (alerting only): [$ringing_had_sdp]" />
+      <ereg regexp="application/sdp"
+            search_in="hdr" header="Content-Type:"
+            check_it_inverse="true"
+            assign_to="ringing_content_type" />
+      <log message="180 Ringing declared no SDP body: [$ringing_content_type]" />
+    </action>
+  </recv>
+
+  <!-- Early media, opened separately and later by the same application. -->
+  <recv response="183">
+    <action>
+      <ereg regexp="c=IN IP4 198\.51\.100\.20"
+            search_in="body"
+            check_it="true"
+            assign_to="early_media_sdp" />
+      <log message="183 carries the controller's early-media SDP: [$early_media_sdp]" />
+    </action>
+  </recv>
+
+  <recv response="200" rtd="true" crlf="true" rrs="true">
+    <action>
+      <ereg regexp="c=IN IP4 198\.51\.100\.20"
+            search_in="body"
+            check_it="true"
+            assign_to="answer_sdp" />
+      <log message="200 OK carries the controller's answer SDP: [$answer_sdp]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550001@control.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:progress@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <pause milliseconds="500" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550001@control.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:progress@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 BYE
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+</scenario>

@@ -172,6 +172,12 @@ export function parseInboundFrame(text: string): ReplyFrame | EventFrame | null 
  */
 export const SipVerb = {
   Answer: "answer",
+  /**
+   * `180 Ringing` — alerting only, no early media (RFC 3261 §13.2.1). A body is
+   * refused: SDP on an 18x is early media (RFC 3960 §3.1), which is
+   * {@link SipVerb.Progress}'s job.
+   */
+  Ring: "ring",
   Progress: "progress",
   Reject: "reject",
   Hangup: "hangup",
@@ -201,6 +207,7 @@ export type SipEventKind =
   | "ChannelStateChange"
   | "ChannelHangupRequest"
   | "ChannelDtmfReceived"
+  | "PlayStarted"
   | "TransferRequested"
   | "TransferProgress"
   | "TransferCompleted"
@@ -227,6 +234,28 @@ export interface ChannelDtmfPayload {
   volume: number;
   /** The From-tag of the leg the digit came from. */
   from_tag: string;
+}
+
+/**
+ * The `payload` of a `PlayStarted` event — a `play` the media backend accepted
+ * and started. Cast a {@link import("./sip").CallEvent}'s `payload` to this when
+ * `kind === "PlayStarted"`.
+ *
+ * `play_id` is the engine's handle on that one playback — what a targeted `stop`
+ * ends and what a gain change addresses — and is the same value the `play`
+ * command reply carried, which is how the event correlates with the command.
+ * The media contract answers `play` accept-on-start, so this event is the
+ * playback beginning, not a claim that audio has reached the wire: a fetched
+ * source (`source: "url"`) accepts before its body has arrived, which is why
+ * `duration_ms` can be absent.
+ */
+export interface PlayStartedPayload {
+  /** Which source it started from: `file`, `blob`, `db_id`, `tone` or `url`. */
+  source: string;
+  /** The engine's handle on this playback, when it assigned one. */
+  play_id?: number | null;
+  /** The playback's length in ms, when the engine knew it at accept time. */
+  duration_ms?: number | null;
 }
 
 /** The RFC 3891 `Replaces` triple embedded in a {@link TransferRequestedPayload}. */

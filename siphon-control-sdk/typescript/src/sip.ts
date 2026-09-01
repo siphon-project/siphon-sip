@@ -284,7 +284,23 @@ export class Call {
     await this.sip(SipVerb.Answer, options ? responseArgs(options) : {});
   }
 
-  /** Send a UAS 1xx / early media (default `183 Session Progress`). */
+  /**
+   * Send `180 Ringing`: alerting only, no early media.
+   *
+   * RFC 3261 §13.2.1 makes the 180 the "callee is being alerted" signal, and
+   * RFC 3960 §3.1 puts early media on a response that carries SDP — two
+   * different acts, so two verbs. Ring for as long as your own policy says,
+   * then {@link Call.answer}; open an early-media path with
+   * {@link Call.progress}.
+   */
+  async ring(reason?: string): Promise<void> {
+    await this.sip(SipVerb.Ring, reason !== undefined ? { reason } : {});
+  }
+
+  /**
+   * Send a UAS 1xx, optionally opening an early-media path with SDP (default
+   * `183 Session Progress`). For plain alerting use {@link Call.ring}.
+   */
   async progress(options?: ResponseOptions): Promise<void> {
     await this.sip(SipVerb.Progress, options ? responseArgs(options) : {});
   }

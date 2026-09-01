@@ -17,7 +17,8 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tracing::{debug, warn};
 
 use siphon_control_proto::sip::{
-    ChannelDtmfPayload, SipEvent, SipVerb, TransferOutcomePayload, TransferRequestedPayload,
+    ChannelDtmfPayload, PlayStartedPayload, SipEvent, SipVerb, TransferOutcomePayload,
+    TransferRequestedPayload,
 };
 use siphon_control_proto::verbs::MODULE_SIP;
 use siphon_control_proto::{ChannelSnapshot, EventFrame};
@@ -257,6 +258,19 @@ impl CallEvent {
         serde_json::from_value(self.payload.clone()).ok()
     }
 
+    /// The typed [`PlayStartedPayload`] when this is a [`SipEvent::PlayStarted`]
+    /// event, else `None`.
+    ///
+    /// This is where a playback's start lives on the event stream. Its `play_id`
+    /// is the same handle the `play` command reply carried, so a watchdog or a
+    /// gain ramp driven off events correlates the two without a side table.
+    pub fn play_started(&self) -> Option<PlayStartedPayload> {
+        if self.kind != SipEvent::PlayStarted {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+
     /// The typed [`TransferRequestedPayload`] when this is a
     /// [`SipEvent::TransferRequested`] event, else `None`.
     pub fn transfer_requested(&self) -> Option<TransferRequestedPayload> {
@@ -417,7 +431,23 @@ impl Call {
             .map(drop)
     }
 
-    /// Send a UAS 1xx / early media (default `183 Session Progress`).
+    /// Send `180 Ringing`: alerting only, no early media.
+    ///
+    /// RFC 3261 §13.2.1 makes the 180 the "callee is being alerted" signal, and
+    /// RFC 3960 §3.1 puts early media on a response that carries SDP — two
+    /// different acts, so two verbs. Ring for as long as your own policy says,
+    /// then [`Call::answer`]; open an early-media path with [`Call::progress`].
+    pub async fn ring(&self) -> Result<(), ControlError> {
+        self.sip(SipVerb::Ring, json!({})).await.map(drop)
+    }
+
+    /// [`Call::ring`] with an explicit reason phrase.
+    pub async fn ring_with_reason(&self, reason: &str) -> Result<(), ControlError> {
+        self.sip(SipVerb::Ring, json!({ "reason": reason })).await.map(drop)
+    }
+
+    /// Send a UAS 1xx, optionally opening an early-media path (default
+    /// `183 Session Progress`). For plain alerting use [`Call::ring`].
     pub async fn progress(&self) -> Result<(), ControlError> {
         self.sip(SipVerb::Progress, json!({})).await.map(drop)
     }
@@ -1286,6 +1316,65 @@ mod tests {
 
         let recorded = lock(&recorder.calls).clone();
         assert_eq!(recorded[0].args, json!({ "mode": "terminate" }));
+    }
+
+    /// Ringing and early media are two verbs on the wire, not one verb with a
+    /// status code the app has to know: `ring` must emit its own token and
+    /// carry no body, and `progress` must stay the one that can.
+    #[tokio::test]
+    async fn ring_and_progress_emit_separate_verbs() {
+        let recorder = Arc::new(RecordingTransport {
+            calls: Mutex::new(Vec::new()),
+            result: json!({ "channel": "ch1", "state": "ringing", "code": 180 }),
+        });
+        let call = make_call(recorder.clone());
+
+        call.ring().await.expect("ring ok");
+        call.ring_with_reason("Alerting").await.expect("ring_with_reason ok");
+        call.progress_with(183, Some("Session Progress"), Some("v=0\r\n"), Some("application/sdp"))
+            .await
+            .expect("progress ok");
+
+        let recorded = lock(&recorder.calls).clone();
+        assert_eq!(recorded[0].verb, "ring");
+        assert_eq!(recorded[0].args, json!({}));
+        assert_eq!(recorded[1].verb, "ring");
+        assert_eq!(recorded[1].args, json!({ "reason": "Alerting" }));
+        assert_eq!(recorded[2].verb, "progress");
+        assert_eq!(recorded[2].args["code"], 183);
+        assert_eq!(recorded[2].args["body"], "v=0\r\n");
+    }
+
+    #[test]
+    fn play_started_parses_from_a_frame() {
+        let started = CallEvent::from_frame(EventFrame::new(
+            "PlayStarted",
+            "ch1",
+            "ivr-app",
+            "call-uuid",
+            "sip@host",
+            json!({ "source": "file", "play_id": 7, "duration_ms": 1500 }),
+        ));
+        assert_eq!(started.kind, SipEvent::PlayStarted);
+        let payload = started.play_started().expect("PlayStarted payload");
+        assert_eq!(payload.source, "file");
+        assert_eq!(payload.play_id, Some(7));
+        assert_eq!(payload.duration_ms, Some(1500));
+
+        // The helper must key on the event *kind*, not on whether the payload
+        // happens to deserialize: this frame's payload is a perfectly valid
+        // PlayStartedPayload, and it is still not a PlayStarted event. A helper
+        // gated only on the parse would hand a caller a playback that never
+        // started.
+        let other = CallEvent::from_frame(EventFrame::new(
+            "ChannelStateChange",
+            "ch1",
+            "ivr-app",
+            "call-uuid",
+            "sip@host",
+            json!({ "source": "file", "play_id": 7, "duration_ms": 1500 }),
+        ));
+        assert!(other.play_started().is_none());
     }
 
     #[test]

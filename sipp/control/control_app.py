@@ -225,6 +225,18 @@ class Session:
                 if not future.done():
                     future.set_exception(ConnectionError(f"{self.label} closed"))
 
+    def take_events(self, predicate) -> list[dict]:
+        """Remove and return the backlogged events matching `predicate`.
+
+        For a check that asserts an event was *not* delivered: `wait_event`
+        cannot express "and nothing else matched", so the case takes what is
+        left over and inspects it. Only matching events are removed — draining
+        the whole backlog would swallow the `StasisEnd` a later check waits for.
+        """
+        taken = [event for event in self._events if predicate(event)]
+        self._events = [event for event in self._events if not predicate(event)]
+        return taken
+
     async def close(self) -> None:
         self.closed = True
         await self.socket.close()
@@ -373,6 +385,75 @@ async def case_handover(app: App, session: Session, event: dict, verdict: Verdic
     verdict.check("stasis_end_delivered", True, json.dumps(end.get("payload")))
 
 
+async def case_progress(app: App, session: Session, event: dict, verdict: Verdict) -> None:
+    """Ringing and early media are two verbs, driven on the app's own clock.
+
+    RFC 3261 §13.2.1 makes the 180 the "callee is being alerted" signal with no
+    session semantics; RFC 3960 §3.1 puts early media on the response carrying
+    the SDP. This case rings, holds the ring for an interval **it** chooses, then
+    opens early media, then answers — and checks that each verb reported what it
+    actually put on the wire. The SIPp scenario asserts the SIP side (a body-less
+    180 then a 183 with this app's SDP); these checks assert the rail side.
+    """
+    channel = event.get("channel") or ""
+
+    ring = await session.command("ring", {}, target={"channel": channel})
+    result = ring.get("result") or {}
+    verdict.check(
+        "ring_sent_a_plain_180",
+        ring.get("status") == "ok"
+        and result.get("code") == 180
+        and result.get("state") == "ringing"
+        and result.get("early_media") is False,
+        json.dumps(ring),
+    )
+
+    # The negative: `ring` promises alerting only, so a body has to be refused
+    # rather than quietly put an early-media offer on the wire under that name.
+    with_body = await session.command(
+        "ring",
+        {"body": ANSWER_SDP, "content_type": "application/sdp"},
+        target={"channel": channel},
+    )
+    error = with_body.get("error") or {}
+    verdict.check(
+        "ring_with_a_body_is_refused",
+        with_body.get("status") == "error"
+        and error.get("code") == "bad_request"
+        and "progress" in str(error.get("message") or ""),
+        json.dumps(with_body),
+    )
+
+    # The application's own ring interval — the whole point of splitting the two.
+    await asyncio.sleep(1.0)
+
+    early = await session.command(
+        "progress",
+        {
+            "code": 183,
+            "reason": "Session Progress",
+            "body": ANSWER_SDP,
+            "content_type": "application/sdp",
+        },
+        target={"channel": channel},
+    )
+    result = early.get("result") or {}
+    verdict.check(
+        "progress_reports_early_media_not_ringing",
+        early.get("status") == "ok"
+        and result.get("code") == 183
+        and result.get("state") == "progress"
+        and result.get("early_media") is True,
+        json.dumps(early),
+    )
+
+    reply = await answer_with_our_sdp(session, channel)
+    verdict.check("answer_accepted", reply.get("status") == "ok", json.dumps(reply))
+
+    end = await session.wait_event(is_end(channel))
+    verdict.check("stasis_end_delivered", True, json.dumps(end.get("payload")))
+
+
 async def case_deadline(app: App, session: Session, event: dict, verdict: Verdict) -> None:
     """The handoff deadline: the controller deliberately does nothing, and
     siphon must apply its safe default rather than hang the call."""
@@ -393,6 +474,15 @@ async def case_deadline(app: App, session: Session, event: dict, verdict: Verdic
         payload.get("reason") == "No Controller Response",
         json.dumps(payload),
     )
+    # The teardown's SIP status, not just its cause. An app branches on both, and
+    # `reason` alone cannot say whether the caller got a 503 it may retry
+    # elsewhere or a final refusal. RFC 3261 §8.1.3.4 leaves the meaning to the
+    # code plus the reason phrase, so both must be on the frame.
+    verdict.check(
+        "stasis_end_carries_the_sip_response_code",
+        payload.get("code") == 503 and bool(payload.get("response")),
+        json.dumps(payload),
+    )
     # The configured deadline is 2s. Anything past ~10s means some other timer
     # ended the call (the 408 answer timeout, a sweep), not the handoff deadline.
     verdict.check(
@@ -411,11 +501,56 @@ async def case_media(app: App, session: Session, event: dict, verdict: Verdict) 
     """
     channel = event.get("channel") or ""
 
+    # The negative first, and before any real play, so a start event seen later
+    # can only have come from the accepted one: a source the adapter refuses
+    # never starts, so it must push no PlayStarted at all.
+    refused = await session.command(
+        "play", {"file": PROMPT_FILE, "db_id": 7}, target={"channel": channel}
+    )
+    verdict.check(
+        "play_with_two_sources_is_refused",
+        refused.get("status") == "error"
+        and (refused.get("error") or {}).get("code") == "bad_request",
+        json.dumps(refused),
+    )
+
     play = await session.command("play", {"file": PROMPT_FILE}, target={"channel": channel})
+    result = play.get("result") or {}
     verdict.check(
         "play_accepted",
-        play.get("status") == "ok" and (play.get("result") or {}).get("state") == "playing",
+        play.get("status") == "ok" and result.get("state") == "playing",
         json.dumps(play),
+    )
+
+    # The start event: an app that watchdogs a source which may never produce
+    # audio, or ramps gain on a running prompt, drives that off the event stream
+    # and has nothing to hang it on without this. It must correlate with the
+    # accept, which is what `play_id` is for.
+    started = await session.wait_event(
+        lambda event: event.get("event") == "PlayStarted" and event.get("channel") == channel,
+        timeout=10,
+    )
+    started_payload = started.get("payload") or {}
+    verdict.check(
+        "play_start_event_delivered",
+        started_payload.get("source") == "file",
+        json.dumps(started_payload),
+    )
+    verdict.check(
+        "play_start_event_correlates_with_the_accept",
+        started_payload.get("play_id") is not None
+        and started_payload.get("play_id") == result.get("play_id"),
+        json.dumps({"accept": result.get("play_id"), "event": started_payload.get("play_id")}),
+    )
+
+    # Exactly one — the refused play above must not have produced a second.
+    extra_starts = session.take_events(
+        lambda frame: frame.get("event") == "PlayStarted" and frame.get("channel") == channel
+    )
+    verdict.check(
+        "a_refused_play_produced_no_start_event",
+        not extra_starts,
+        json.dumps(extra_starts),
     )
 
     await asyncio.sleep(0.2)
@@ -529,6 +664,7 @@ async def case_resync(app: App, session: Session, event: dict, verdict: Verdict)
 
 CASES = {
     "handover": case_handover,
+    "progress": case_progress,
     "deadline": case_deadline,
     "media": case_media,
     "owner": case_owner,

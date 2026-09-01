@@ -78,6 +78,7 @@ export type {
   SipVerbToken,
   SipEventKind,
   ChannelDtmfPayload,
+  PlayStartedPayload,
   TransferReplaces,
   TransferRequestedPayload,
   TransferStage,

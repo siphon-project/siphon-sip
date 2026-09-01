@@ -14,7 +14,13 @@ use serde::{Deserialize, Serialize};
 /// (`play`/`stop`/`dtmf`/`hold`/`unhold`/`stream_start`/`stream_stop`) are
 /// dispatched against the configured media backend; the WebSocket-tee pair is
 /// siphon-rtp-only, so a non-siphon-rtp backend answers them `unsupported_verb`.
+///
+/// `#[non_exhaustive]`: the server's verb set grows (this release adds `ring`),
+/// and without it every addition breaks any downstream `match` with one arm per
+/// variant. With it, a wildcard arm is written once and every future verb is
+/// purely additive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum SipVerb {
     /// Place an outbound call under a caller-supplied channel id. Returns as
     /// soon as the INVITE is on the wire; ringing/answer/hangup arrive as
@@ -22,7 +28,12 @@ pub enum SipVerb {
     Originate,
     /// Send a UAS 2xx to the parked A-leg.
     Answer,
-    /// Send a UAS 1xx / early media.
+    /// Send `180 Ringing` — alerting only, no early media (RFC 3261 §13.2.1).
+    /// A body is refused: SDP on an 18x is early media (RFC 3960 §3.1), which is
+    /// [`SipVerb::Progress`]'s job.
+    Ring,
+    /// Send a UAS 1xx, optionally opening an early-media path with SDP.
+    /// Defaults to `183 Session Progress`.
     Progress,
     /// Send a final non-2xx and tear the call down.
     Reject,
@@ -64,6 +75,7 @@ impl SipVerb {
         match self {
             SipVerb::Originate => "originate",
             SipVerb::Answer => "answer",
+            SipVerb::Ring => "ring",
             SipVerb::Progress => "progress",
             SipVerb::Reject => "reject",
             SipVerb::Hangup => "hangup",
@@ -115,6 +127,13 @@ pub enum SipEvent {
     /// An in-band DTMF digit was detected on the call's media
     /// ([`ChannelDtmfPayload`]).
     ChannelDtmfReceived,
+    /// A `play` was accepted and the playback started ([`PlayStartedPayload`]).
+    ///
+    /// The media contract answers `play` **accept-on-start**, so this event is
+    /// the playback beginning — not a claim that audio has reached the wire. A
+    /// fetched source (`source: "url"`) accepts before its body has arrived,
+    /// which is why `duration_ms` can be absent.
+    PlayStarted,
     /// An inbound REFER on a controlled call is asking the app to own the
     /// transfer decision ([`TransferRequestedPayload`]).
     TransferRequested,
@@ -141,6 +160,7 @@ impl SipEvent {
             SipEvent::ChannelStateChange => "ChannelStateChange",
             SipEvent::ChannelHangupRequest => "ChannelHangupRequest",
             SipEvent::ChannelDtmfReceived => "ChannelDtmfReceived",
+            SipEvent::PlayStarted => "PlayStarted",
             SipEvent::TransferRequested => "TransferRequested",
             SipEvent::TransferProgress => "TransferProgress",
             SipEvent::TransferCompleted => "TransferCompleted",
@@ -158,6 +178,7 @@ impl From<&str> for SipEvent {
             "ChannelStateChange" => SipEvent::ChannelStateChange,
             "ChannelHangupRequest" => SipEvent::ChannelHangupRequest,
             "ChannelDtmfReceived" => SipEvent::ChannelDtmfReceived,
+            "PlayStarted" => SipEvent::PlayStarted,
             "TransferRequested" => SipEvent::TransferRequested,
             "TransferProgress" => SipEvent::TransferProgress,
             "TransferCompleted" => SipEvent::TransferCompleted,
@@ -207,6 +228,30 @@ pub struct ChannelDtmfPayload {
     /// The From-tag of the leg the digit came from.
     #[serde(default)]
     pub from_tag: String,
+}
+
+/// The `payload` of a [`SipEvent::PlayStarted`] event: a `play` the media
+/// backend accepted and started.
+///
+/// `play_id` is the engine's handle on that one playback — what a targeted
+/// `stop` ends and what a gain change addresses — and it is the same value the
+/// `play` command reply carried, which is how an application correlates the
+/// event with the command that produced it. It is absent on backends that
+/// assign no handles (rtpengine / rtpproxy), omitted rather than defaulted to a
+/// value a later `stop` would aim at the wrong playback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlayStartedPayload {
+    /// Which source the playback was started from: `file`, `blob`, `db_id`,
+    /// `tone` or `url`.
+    pub source: String,
+    /// The engine's handle on this playback, when it assigned one.
+    #[serde(default)]
+    pub play_id: Option<u64>,
+    /// The playback's length in milliseconds, when the engine knew it at accept
+    /// time. Always absent for a `url` source — the length is not known until
+    /// the fetched body has arrived.
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
 }
 
 /// The RFC 3891 `Replaces` triple embedded in a [`TransferRequestedPayload`]
@@ -376,6 +421,8 @@ mod tests {
         assert_eq!(SipVerb::RemoveHeader.as_str(), "remove_header");
         assert_eq!(SipVerb::AcceptRefer.as_str(), "accept_refer");
         assert_eq!(SipVerb::RejectRefer.as_str(), "reject_refer");
+        assert_eq!(SipVerb::Ring.as_str(), "ring");
+        assert_eq!(SipVerb::Progress.as_str(), "progress");
         assert_eq!(SipVerb::Play.as_str(), "play");
         assert_eq!(SipVerb::Stop.as_str(), "stop");
         assert_eq!(SipVerb::Dtmf.as_str(), "dtmf");
@@ -426,6 +473,32 @@ mod tests {
         );
         let parsed: SipEvent = serde_json::from_str("\"NovelEvent\"").unwrap();
         assert_eq!(parsed, SipEvent::Other("NovelEvent".to_string()));
+    }
+
+    #[test]
+    fn play_started_round_trips_and_carries_the_correlation_handle() {
+        assert_eq!(SipEvent::from("PlayStarted"), SipEvent::PlayStarted);
+        assert_eq!(SipEvent::PlayStarted.as_str(), "PlayStarted");
+        assert_eq!(
+            serde_json::to_string(&SipEvent::PlayStarted).unwrap(),
+            "\"PlayStarted\""
+        );
+
+        let parsed: PlayStartedPayload = serde_json::from_value(serde_json::json!({
+            "source": "file", "play_id": 7, "duration_ms": 1500
+        }))
+        .unwrap();
+        assert_eq!(parsed.source, "file");
+        assert_eq!(parsed.play_id, Some(7));
+        assert_eq!(parsed.duration_ms, Some(1500));
+
+        // A backend that assigns no handle, and a fetched source whose length is
+        // not known at accept time, both omit the field entirely — the payload
+        // must parse rather than fail, and must not invent a zero.
+        let sparse: PlayStartedPayload =
+            serde_json::from_value(serde_json::json!({ "source": "url" })).unwrap();
+        assert_eq!(sparse.play_id, None);
+        assert_eq!(sparse.duration_ms, None);
     }
 
     #[test]
