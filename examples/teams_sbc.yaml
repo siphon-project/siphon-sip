@@ -128,13 +128,6 @@ media:
     # PSTN -> Teams: carrier offers RTP, transcode up to SRTP for Teams.
     # The direction labels ("carrier"/"teams") must match the interface names
     # configured in rtpengine.conf.
-    # NOTE: a media profile controls transport, ICE, DTLS, direction and SDP
-    # rewriting — NOT codec selection. There is no `codec:` key here; one would
-    # be silently ignored. Restrict or reorder codecs from the script with the
-    # `sdp` namespace instead, e.g. in @b2bua.on_invite:
-    #     s = sdp.parse(call)
-    #     s.filter_codecs(["PCMA", "PCMU", "telephone-event"])
-    #     s.apply(call)
     # DIRECTION-BOUND, like its mirror below — do not inherit it across a
     # transfer or a Replaces takeover.
     rtp_to_srtp:
@@ -143,6 +136,10 @@ media:
         ice: "remove"
         replace: ["origin", "session-connection"]
         direction: ["carrier", "teams"]
+        # Offer Teams only what it should see, in this order. rtpengine honours
+        # codec manipulation on the OFFER; it is mostly ignored on an answer.
+        codec:
+          offer: ["PCMA", "PCMU", "telephone-event"]
       answer:
         transport_protocol: "RTP/AVP"
         ice: "remove"
@@ -172,6 +169,12 @@ media:
         ice: "remove"
         replace: ["origin", "session-connection"]
         direction: ["teams", "carrier"]
+        # Teams offers SILK, which most PSTN carriers cannot take. Drop it and
+        # hand the carrier a plain G.711 offer; `transcode` would additionally
+        # let rtpengine convert, at the cost of engaging the transcoder.
+        codec:
+          strip: ["SILK"]
+          offer: ["PCMA", "PCMU", "telephone-event"]
       answer:
         transport_protocol: "RTP/SAVP"
         ice: "remove"

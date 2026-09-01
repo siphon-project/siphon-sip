@@ -2295,6 +2295,7 @@ mod tests {
     fn profile_flags_from_ng_maps_every_field() {
         let ng = NgFlags {
             transport_protocol: Some("RTP/SAVPF".into()),
+            codec: Default::default(),
             ice: Some("force".into()),
             dtls: Some("passive".into()),
             replace: vec!["origin".into()],

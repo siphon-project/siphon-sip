@@ -38,6 +38,23 @@ media:
   rtpengine:
     address: "172.20.0.44:22222"
     timeout_ms: 2000
+  profiles:
+    # Real-engine proof that codec manipulation reaches rtpengine as its own NG
+    # dict and is applied. The UAC offers `0 8 101` (PCMU, PCMA,
+    # telephone-event); this drops PCMA and restricts the offer, so the SDP the
+    # callee receives is observably narrower than what the caller sent. Encode
+    # it wrong — as tokens in `flags`, say — and the engine silently ignores it
+    # and all three codecs cross, which is exactly what the UAS asserts against.
+    codec_restricted:
+      offer:
+        replace: ["origin"]
+        flags: ["trust-address"]
+        codec:
+          strip: ["PCMA"]
+          offer: ["PCMU", "telephone-event"]
+      answer:
+        replace: ["origin"]
+        flags: ["trust-address"]
 
 log:
   level: debug

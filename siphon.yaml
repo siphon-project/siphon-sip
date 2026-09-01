@@ -648,6 +648,47 @@ auth:
 # Direction-bound built-ins: srtp_to_rtp, rtp_to_srtp, ws_to_rtp, wss_to_rtp.
 # Symmetric (safe to inherit): rtp_passthrough.
 #
+# ---------------------------------------------------------------------------
+# CODEC MANIPULATION (rtpengine only)
+# ---------------------------------------------------------------------------
+# A profile half can restrict, reorder, drop or transcode codecs through the
+# rtpengine `codec` dictionary. Every key is a list of RTP payload names:
+#
+#   strip      remove these from the outgoing SDP (`all` / `full` wildcards)
+#   offer      the only codecs to offer, in this order (also fixes preference)
+#   transcode  add these even if the offerer did not list them (engages the
+#              transcoder — rtpengine must be built --with-transcoding)
+#   mask       hide from the far side but keep accepting from the offerer
+#   consume    like mask, but engages the transcoder on its own
+#   accept     like mask/consume but leaves the codec in the offered list
+#   except     allow only these through
+#   ignore     treat as though the offer never contained them
+#   set        options for accepted transcoding codecs (bitrate/rate/channels)
+#
+# Put it on the OFFER half — rtpengine applies codec manipulation to the offer
+# and ignores most of it on an answer:
+#
+#   media:
+#     profiles:
+#       teams_to_carrier:
+#         offer:
+#           transport_protocol: "RTP/AVP"
+#           codec:
+#             strip: ["SILK"]                             # carrier cannot take it
+#             offer: ["PCMA", "PCMU", "telephone-event"]  # and in this order
+#
+# rtpengine ONLY. The native siphon-rtp engine and rtpproxy cannot express it,
+# and a profile that sets it on either is REFUSED at config load rather than
+# reading as a codec restriction while every offered codec crosses untouched.
+#
+# An asymmetric codec policy makes a profile direction-bound (see above): it was
+# chosen for the party on the far side of that half, so do not inherit it across
+# a transfer.
+#
+# Codecs can also be shaped from a script with the `sdp` namespace
+# (`filter_codecs` / `remove_codecs`), which works on every backend because it
+# rewrites the SDP directly rather than asking the engine to.
+#
 # Built-in profiles (always available):
 #   rtp_passthrough — Plain RTP both sides, media anchoring only (default)
 #   srtp_to_rtp     — SRTP UE ↔ RTP core

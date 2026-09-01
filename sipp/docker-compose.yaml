@@ -3377,7 +3377,7 @@ services:
     entrypoint:
       - sipp
       - -sf
-      - /sipp/scenarios/b2bua_refer_terminate_bob_uas.xml
+      - /sipp/scenarios/b2bua_refer_anchored_bob_uas.xml
       - -p
       - "5060"
       - -m
