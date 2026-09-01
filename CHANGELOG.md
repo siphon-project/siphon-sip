@@ -24,11 +24,13 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   and ignores most of it on an answer. It reaches the engine as its own nested
   dict, not as tokens in `flags`, which the engine would drop.
 
-  **rtpengine only.** Neither the native `siphon-rtp` engine's `ProfileFlags` nor
-  rtpproxy can carry it, so a profile setting it on either is **refused at config
-  load** rather than reading as a codec restriction while every offered codec
-  crosses untouched. Codecs can still be shaped from a script with the `sdp`
-  namespace on any backend.
+  **One block, both real engines.** rtpengine takes the NG `codec` dictionary;
+  the native `siphon-rtp` engine already implements the same model but reads it
+  off its flag list, so siphon flattens the block to `codec-<op>-<NAME>` for it
+  — the policy is written once. `ignore` and `set` have no native equivalent and
+  are refused on that backend; `rtpproxy` is a plain relay with no transcoder and
+  refuses the block outright. Refused at config load, never silently dropped.
+  Codecs can also still be shaped from a script with the `sdp` namespace.
 
   An asymmetric codec policy also makes a profile **direction-bound**: it was
   chosen for the party on the far side of that half, so it is not inherited

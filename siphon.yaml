@@ -677,9 +677,14 @@ auth:
 #             strip: ["SILK"]                             # carrier cannot take it
 #             offer: ["PCMA", "PCMU", "telephone-event"]  # and in this order
 #
-# rtpengine ONLY. The native siphon-rtp engine and rtpproxy cannot express it,
-# and a profile that sets it on either is REFUSED at config load rather than
-# reading as a codec restriction while every offered codec crosses untouched.
+# Works on BOTH real engines from the same block. rtpengine takes it as its NG
+# `codec` dictionary; the native siphon-rtp engine implements the same model but
+# reads it off its flag list, so siphon flattens the block to `codec-<op>-<NAME>`
+# for it — you write the policy once.
+#
+# Two exceptions, refused at config load rather than left looking applied:
+#   * `ignore:` and `set:` have no native equivalent — rtpengine only.
+#   * `rtpproxy` is a plain relay with no transcoder: any codec block is refused.
 #
 # An asymmetric codec policy makes a profile direction-bound (see above): it was
 # chosen for the party on the far side of that half, so do not inherit it across

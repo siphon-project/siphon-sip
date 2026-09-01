@@ -21,10 +21,15 @@ perform, not to relax the engine. Both legs here are plain RTP, so
 Testing the real SRTP interworking path needs a UAS that answers SAVP with a
 crypto line; that is a separate scenario, not this one.
 """
+
+import os
 from siphon import proxy, registrar, auth, rtpengine, log
 
 DOMAIN = "siphon.test"
-PROFILE = "rtp_passthrough"
+# The two control-plane A/B jobs (siphon-rtp-native / siphon-rtp-ng) override
+# this to a codec-restricted profile so both planes are asserted to apply the
+# same codec policy. Everything else keeps the plain relay.
+PROFILE = os.environ.get("MEDIA_PROFILE", "rtp_passthrough")
 
 
 @proxy.on_request

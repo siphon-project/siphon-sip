@@ -49,6 +49,21 @@ media:
     address: "172.20.0.130:22222"
     timeout_ms: 2000
 
+  profiles:
+    # Both control planes must apply the SAME codec policy from the SAME block:
+    # rtpengine takes it as its NG `codec` dict, the native engine reads it off
+    # the flag list siphon flattens it onto. The UAS asserts the result, so a
+    # plane that drops it fails the run rather than relaying every codec.
+    codec_restricted:
+      offer:
+        replace: ["origin"]
+        flags: ["trust-address"]
+        codec:
+          strip: ["PCMA"]
+          offer: ["PCMU", "telephone-event"]
+      answer:
+        replace: ["origin"]
+        flags: ["trust-address"]
 log:
   level: debug
   format: pretty

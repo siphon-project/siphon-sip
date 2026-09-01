@@ -73,6 +73,44 @@ impl CodecFlags {
         }
     }
 
+    /// The ops the native `siphon-rtp` engine understands, flattened to the
+    /// `codec-<op>-<NAME>` flag strings its `ProfileFlags.flags` carries.
+    ///
+    /// The engine implements the same rtpengine codec model but reads it off the
+    /// flag list rather than a nested dict, so one profile drives both engines.
+    /// `ignore` and `set` have no native equivalent and are deliberately not
+    /// emitted here — the config gate refuses them on that backend rather than
+    /// letting them look applied.
+    pub fn to_native_flags(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (op, list) in [
+            ("strip", &self.strip),
+            ("mask", &self.mask),
+            ("consume", &self.consume),
+            ("except", &self.except),
+            ("accept", &self.accept),
+            ("offer", &self.offer),
+            ("transcode", &self.transcode),
+        ] {
+            for name in list {
+                out.push(format!("codec-{op}-{name}"));
+            }
+        }
+        out
+    }
+
+    /// The ops with no native equivalent, for the backend capability gate.
+    pub fn native_unsupported_ops(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if !self.ignore.is_empty() {
+            out.push("codec.ignore");
+        }
+        if !self.set.is_empty() {
+            out.push("codec.set");
+        }
+        out
+    }
+
     /// The `codec` sub-dict, or `None` when nothing is set. Keys are emitted in
     /// a fixed order so a command is byte-stable for a given profile.
     fn to_bencode(&self) -> Option<super::bencode::BencodeValue> {
@@ -900,6 +938,55 @@ mod tests {
         assert!(
             flags_pair.is_none(),
             "codec manipulation must not be smuggled into the flags list"
+        );
+    }
+
+    /// The native engine takes the same codec model off its flag list, so the
+    /// block is flattened to `codec-<op>-<NAME>` for it. One profile, two
+    /// engines — an operator does not write the policy twice.
+    #[test]
+    fn codec_flags_flatten_for_the_native_engine() {
+        let codec = CodecFlags {
+            strip: vec!["SILK".into()],
+            offer: vec!["PCMA".into(), "PCMU".into()],
+            transcode: vec!["PCMA".into()],
+            except: vec!["telephone-event".into()],
+            ..CodecFlags::default()
+        };
+        let flat = codec.to_native_flags();
+
+        assert!(flat.contains(&"codec-strip-SILK".to_string()), "{flat:?}");
+        assert!(flat.contains(&"codec-offer-PCMA".to_string()), "{flat:?}");
+        assert!(flat.contains(&"codec-offer-PCMU".to_string()), "{flat:?}");
+        assert!(flat.contains(&"codec-transcode-PCMA".to_string()), "{flat:?}");
+        assert!(
+            flat.contains(&"codec-except-telephone-event".to_string()),
+            "{flat:?}"
+        );
+        // Order within `offer` is the operator's stated preference and must survive.
+        let offer_positions: Vec<usize> = ["codec-offer-PCMA", "codec-offer-PCMU"]
+            .iter()
+            .map(|needle| flat.iter().position(|f| f == needle).expect("present"))
+            .collect();
+        assert!(
+            offer_positions[0] < offer_positions[1],
+            "codec-offer order is the preference order: {flat:?}"
+        );
+
+        // The two ops the engine has no equivalent for are never emitted...
+        let unmappable = CodecFlags {
+            ignore: vec!["G729".into()],
+            set: vec!["opus/48000/2".into()],
+            ..CodecFlags::default()
+        };
+        assert!(
+            unmappable.to_native_flags().is_empty(),
+            "unmappable ops must not be flattened into something meaningless"
+        );
+        // ...and are reported so the config gate can refuse them.
+        assert_eq!(
+            unmappable.native_unsupported_ops(),
+            vec!["codec.ignore", "codec.set"]
         );
     }
 

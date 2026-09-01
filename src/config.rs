@@ -2151,12 +2151,20 @@ impl MediaBackendKind {
             }
         }
 
-        // Codec manipulation is an rtpengine capability. Neither the native
-        // engine's `ProfileFlags` nor rtpproxy's control protocol can carry it,
-        // so a profile asking for it anywhere else is refused at load — the
-        // alternative is a config that reads as "this call is restricted to
-        // PCMA/PCMU" while every codec the endpoints offered crosses untouched.
-        if !matches!(self, Self::Rtpengine) && !flags.codec.is_empty() {
+        // Codec manipulation works on both real engines. rtpengine takes it as
+        // its NG `codec` dict; the native engine implements the same model but
+        // reads it off the flag list, so siphon flattens the block for it
+        // (`CodecFlags::to_native_flags`). Only the two ops with no native
+        // equivalent are refused there — the alternative is a config that reads
+        // as "restricted to PCMA/PCMU" while every offered codec crosses
+        // untouched, which is the failure this feature replaces.
+        if matches!(self, Self::SiphonRtp) {
+            for op in flags.codec.native_unsupported_ops() {
+                unsupported.push(op);
+            }
+        }
+        // rtpproxy is a plain relay with no transcoder and no codec control.
+        if matches!(self, Self::Rtpproxy) && !flags.codec.is_empty() {
             unsupported.push("codec");
         }
 
@@ -2579,10 +2587,15 @@ pub struct MediaProfileConfig {
 /// Every field is a list of RTP payload names (`PCMA`, `opus`, `AMR-WB`), and
 /// an empty one is omitted from the wire entirely.
 ///
-/// **rtpengine only.** The native `siphon-rtp` engine and `rtpproxy` have no way
-/// to express this, so a profile that sets any of it on those backends is
-/// refused at config load rather than quietly relaying whatever the endpoints
-/// happened to offer.
+/// Works on both real engines from one block: rtpengine takes it as its NG
+/// `codec` dictionary, and the native `siphon-rtp` engine implements the same
+/// model but reads it off its flag list, so siphon flattens the block to
+/// `codec-<op>-<NAME>` for it.
+///
+/// `ignore` and `set` have no native equivalent and are refused on that backend;
+/// `rtpproxy` is a plain relay with no transcoder and refuses the block outright.
+/// Refused at config load, never silently dropped — a codec policy that reads as
+/// applied but is not is the failure this exists to remove.
 ///
 /// **Honoured on `offer:`.** rtpengine applies codec manipulation to the offer;
 /// most of it is ignored on an answer, so put it under the `offer:` half.
@@ -2630,6 +2643,20 @@ pub struct CodecFlagsConfig {
 }
 
 impl CodecFlagsConfig {
+    /// The ops the native `siphon-rtp` engine has no equivalent for. It
+    /// implements the rest of the rtpengine codec model, so only these are
+    /// refused on that backend.
+    pub fn native_unsupported_ops(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if !self.ignore.is_empty() {
+            out.push("codec.ignore");
+        }
+        if !self.set.is_empty() {
+            out.push("codec.set");
+        }
+        out
+    }
+
     /// True when nothing is set, so nothing is emitted on the wire.
     pub fn is_empty(&self) -> bool {
         self.strip.is_empty()
@@ -4306,13 +4333,41 @@ mod tests {
                 .is_empty(),
             "rtpengine speaks the codec dict"
         );
-        for backend in [MediaBackendKind::SiphonRtp, MediaBackendKind::Rtpproxy] {
-            assert!(
-                backend.unsupported_profile_fields(&flags).contains(&"codec"),
-                "{} cannot express codec manipulation and must refuse it",
-                backend.as_str()
-            );
-        }
+        // The native engine implements the same codec model, reading it off the
+        // flag list — so an `offer` list is honoured there, not refused.
+        assert!(
+            MediaBackendKind::SiphonRtp
+                .unsupported_profile_fields(&flags)
+                .is_empty(),
+            "siphon-rtp implements codec manipulation and must accept it"
+        );
+        // rtpproxy is a plain relay: no transcoder, no codec control.
+        assert!(
+            MediaBackendKind::Rtpproxy
+                .unsupported_profile_fields(&flags)
+                .contains(&"codec"),
+            "rtpproxy cannot express codec manipulation and must refuse it"
+        );
+
+        // The two ops with no native equivalent ARE refused on siphon-rtp,
+        // rather than silently dropped when the block is flattened to flags.
+        let unmappable = NgFlagsConfig {
+            codec: CodecFlagsConfig {
+                ignore: vec!["G729".to_string()],
+                set: vec!["opus/48000/2".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let native = MediaBackendKind::SiphonRtp.unsupported_profile_fields(&unmappable);
+        assert!(native.contains(&"codec.ignore"), "got {native:?}");
+        assert!(native.contains(&"codec.set"), "got {native:?}");
+        assert!(
+            MediaBackendKind::Rtpengine
+                .unsupported_profile_fields(&unmappable)
+                .is_empty(),
+            "rtpengine takes every op"
+        );
 
         // An unset codec block is inert on every backend.
         let bare = NgFlagsConfig::default();
