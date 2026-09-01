@@ -75,8 +75,8 @@ impl ControlAdapter for SipControlAdapter {
                 verb("dtmf", "Inject DTMF digits toward the A-leg (args: digits, duration_ms, volume_dbm0, pause_ms, to_tag)"),
                 verb("hold", "Hold the A-leg media via silence"),
                 verb("unhold", "Resume the A-leg media after a hold"),
-                verb("stream_start", "Attach a WebSocket audio tee — siphon-rtp backend only (args: ws_uri, direction, channels)"),
-                verb("stream_stop", "Detach the WebSocket audio tee"),
+                verb("stream_start", "Stream the call's audio to a WebSocket server — siphon-rtp backend only (args: ws_uri, mode=tee|bridge, and for tee: direction, channels, sample_rate). mode=tee streams a copy while the call keeps relaying; mode=bridge is a takeover that makes the server the leg's far side, and re-points in place if one is already attached"),
+                verb("stream_stop", "Stop streaming the call's audio (args: mode=tee|bridge). A tee stop is idempotent; a bridge stop is refused where there is no relay to return the call to"),
             ],
             events: vec![
                 "StasisStart".to_string(),
@@ -107,6 +107,15 @@ impl ControlAdapter for SipControlAdapter {
                 "ChannelBridged".to_string(),
                 "BridgeFailed".to_string(),
                 "ChannelUnbridged".to_string(),
+                // The lifecycle of a `stream_start` with `mode: bridge`. A
+                // *tee* dying costs a consumer its copy of the audio; a
+                // *bridge* dying costs the call its far side, so a controller
+                // that can start one over this rail has to be able to learn it
+                // died over the same rail rather than inferring it from both
+                // parties going quiet. Exactly one WsBridgeEnded per
+                // WsBridgeStarted, and a re-point is an ended+started pair.
+                "WsBridgeStarted".to_string(),
+                "WsBridgeEnded".to_string(),
             ],
         }
     }
@@ -207,7 +216,7 @@ async fn apply_media_verb(command: AdapterCommand) -> ControlResult {
         "hold" => hold(&channel, true).await,
         "unhold" => hold(&channel, false).await,
         "stream_start" => stream_start(&channel, &command.args).await,
-        "stream_stop" => stream_stop(&channel).await,
+        "stream_stop" => stream_stop(&channel, &command.args).await,
         other => ControlResult::error(
             ControlErrorCode::UnsupportedVerb,
             format!("sip adapter does not implement verb '{other}' in this build"),
@@ -304,6 +313,43 @@ fn parse_play_source(
     }
     // Unreachable given count == 1, but return a typed error rather than panic.
     Err("play requires a media source".to_string())
+}
+
+/// Which kind of WebSocket stream a `stream_start` / `stream_stop` addresses.
+///
+/// The two are not variations on one thing: a **tee** is additive (the call
+/// relays on and a copy is streamed out), a **bridge** is a takeover (the
+/// server becomes the leg's far side and A↔B is unwired). Defaulting to `Tee`
+/// keeps every existing controller working unchanged — and is the safe default
+/// of the two, since a caller who meant `tee` and got `bridge` would have the
+/// call's audio path silently replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamMode {
+    Tee,
+    Bridge,
+}
+
+/// Parse the optional `mode` arg. Absent means `tee`.
+fn parse_stream_mode(
+    value: Option<&serde_json::Value>,
+    verb: &str,
+) -> Result<StreamMode, ControlResult> {
+    match value {
+        None => Ok(StreamMode::Tee),
+        Some(value) if value.is_null() => Ok(StreamMode::Tee),
+        Some(serde_json::Value::String(mode)) => match mode.as_str() {
+            "tee" => Ok(StreamMode::Tee),
+            "bridge" => Ok(StreamMode::Bridge),
+            other => Err(ControlResult::error(
+                ControlErrorCode::BadRequest,
+                format!("{verb} args.mode must be one of tee/bridge, got '{other}'"),
+            )),
+        },
+        Some(_) => Err(ControlResult::error(
+            ControlErrorCode::BadRequest,
+            format!("{verb} args.mode must be a string, one of tee/bridge"),
+        )),
+    }
 }
 
 /// Parse an optional `channels` arg for `stream_start` (1 = mixed mono, 2 =
@@ -530,6 +576,43 @@ async fn stream_start(channel: &ChannelRef, args: &serde_json::Value) -> Control
         );
     };
     let ws_uri = ws_uri.to_string();
+    let mode = match parse_stream_mode(args.get("mode"), "stream_start") {
+        Ok(mode) => mode,
+        Err(result) => return result,
+    };
+
+    if mode == StreamMode::Bridge {
+        // `direction`, `channels` and `sample_rate` shape a *tee's* wire; a
+        // takeover bridge has one leg and negotiates its own rate with the
+        // server. Refused rather than ignored, because silently dropping a
+        // `channels: 2` would hand the controller a mono takeover it believed
+        // was stereo, and it would not find out from the reply.
+        for unsupported in ["direction", "channels", "sample_rate"] {
+            if args.get(unsupported).is_some_and(|value| !value.is_null()) {
+                return ControlResult::error(
+                    ControlErrorCode::BadRequest,
+                    format!(
+                        "stream_start args.{unsupported} applies to mode=tee only; \
+                         a takeover bridge negotiates its own wire shape"
+                    ),
+                );
+            }
+        }
+        let (backend, call_id, from_tag) = match media_target(channel) {
+            Ok(target) => target,
+            Err(result) => return result,
+        };
+        return match backend.attach_ws_bridge(&call_id, &from_tag, &ws_uri).await {
+            Ok(()) => {
+                crate::dispatcher::b2bua_media_set_ws_bridge_attached(&channel.sip_call_id, true);
+                ControlResult::Ok(serde_json::json!({
+                    "channel": channel.channel_id,
+                    "state": "bridged",
+                }))
+            }
+            Err(error) => media_error(error),
+        };
+    }
     let direction = match args.get("direction").and_then(|value| value.as_str()) {
         None => crate::rtpengine::profile::WsTeeDirection::Both,
         Some(value) => match crate::rtpengine::profile::WsTeeDirection::parse(value) {
@@ -577,24 +660,53 @@ async fn stream_start(channel: &ChannelRef, args: &serde_json::Value) -> Control
         .attach_ws_tee(&call_id, &from_tag, &ws_uri, direction, channels, sample_rate)
         .await
     {
-        Ok(()) => ControlResult::Ok(
-            serde_json::json!({ "channel": channel.channel_id, "state": "streaming" }),
-        ),
+        Ok(()) => {
+            // Recorded only on acceptance, so a refused attach never leaves a
+            // later bridge plan detaching a tee that is not there.
+            crate::dispatcher::b2bua_media_set_ws_tee(&channel.sip_call_id, Some(ws_uri));
+            ControlResult::Ok(
+                serde_json::json!({ "channel": channel.channel_id, "state": "streaming" }),
+            )
+        }
         Err(error) => media_error(error),
     }
 }
 
 /// `stream_stop` — detach the WebSocket audio tee (idempotent on siphon-rtp;
 /// `unsupported_verb` on the other backends, same reason as `stream_start`).
-async fn stream_stop(channel: &ChannelRef) -> ControlResult {
+async fn stream_stop(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
+    let mode = match parse_stream_mode(args.get("mode"), "stream_stop") {
+        Ok(mode) => mode,
+        Err(result) => return result,
+    };
     let (backend, call_id, from_tag) = match media_target(channel) {
         Ok(target) => target,
         Err(result) => return result,
     };
-    match backend.detach_ws_tee(&call_id, &from_tag).await {
-        Ok(()) => ControlResult::Ok(
-            serde_json::json!({ "channel": channel.channel_id, "state": "detached" }),
-        ),
+    // A tee detach is idempotent; a bridge detach is not, and the engine
+    // refuses one where there is no relay to return the call to (a
+    // `ws_uri`-negotiated bridge, or a single-leg takeover). That refusal is
+    // surfaced rather than smoothed into an ok, because the alternative is a
+    // live call with no audio path at all.
+    let outcome = match mode {
+        StreamMode::Tee => backend.detach_ws_tee(&call_id, &from_tag).await,
+        StreamMode::Bridge => backend.detach_ws_bridge(&call_id, &from_tag).await,
+    };
+    match outcome {
+        Ok(()) => {
+            match mode {
+                StreamMode::Tee => {
+                    crate::dispatcher::b2bua_media_set_ws_tee(&channel.sip_call_id, None)
+                }
+                StreamMode::Bridge => crate::dispatcher::b2bua_media_set_ws_bridge_attached(
+                    &channel.sip_call_id,
+                    false,
+                ),
+            }
+            ControlResult::Ok(
+                serde_json::json!({ "channel": channel.channel_id, "state": "detached" }),
+            )
+        }
         Err(error) => media_error(error),
     }
 }
@@ -1600,6 +1712,47 @@ mod tests {
             matches!(result, ControlResult::Error { code: ControlErrorCode::NotFound, .. }),
             "a null body must read as absent and let ring reach the call store"
         );
+    }
+
+    #[test]
+    fn stream_mode_defaults_to_tee_and_rejects_anything_else() {
+        // Absent and null both mean tee — every controller written before the
+        // bridge existed keeps working, and tee is the safe default of the two
+        // since a caller who meant tee and got bridge would have the call's
+        // audio path silently replaced.
+        assert_eq!(parse_stream_mode(None, "stream_start"), Ok(StreamMode::Tee));
+        assert_eq!(
+            parse_stream_mode(Some(&serde_json::Value::Null), "stream_start"),
+            Ok(StreamMode::Tee)
+        );
+        assert_eq!(
+            parse_stream_mode(Some(&serde_json::json!("tee")), "stream_start"),
+            Ok(StreamMode::Tee)
+        );
+        assert_eq!(
+            parse_stream_mode(Some(&serde_json::json!("bridge")), "stream_start"),
+            Ok(StreamMode::Bridge)
+        );
+
+        // An unknown or wrongly-typed mode is refused rather than defaulted:
+        // silently treating "bridged" as a tee would leave the controller
+        // believing it had taken the call over.
+        for bad in [
+            serde_json::json!("bridged"),
+            serde_json::json!("takeover"),
+            serde_json::json!(""),
+            serde_json::json!(1),
+            serde_json::json!(true),
+        ] {
+            let result = parse_stream_mode(Some(&bad), "stream_start");
+            assert!(
+                matches!(
+                    result,
+                    Err(ControlResult::Error { code: ControlErrorCode::BadRequest, .. })
+                ),
+                "{bad} must be refused, got {result:?}"
+            );
+        }
     }
 
     #[test]

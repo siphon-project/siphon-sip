@@ -154,6 +154,25 @@ pub enum HandlerKind {
         call_id: Option<String>,
         from_tag: Option<String>,
     },
+    /// `@rtpengine.on_ws_bridge_started` — a WebSocket **takeover** bridge began
+    /// on a live call. Unlike a tee this replaced the call's audio path rather
+    /// than copying it, so the far side is now the WebSocket server.
+    ///
+    /// ``call_id`` and ``from_tag`` are optional filters.
+    RtpEngineOnWsBridgeStarted {
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    },
+    /// `@rtpengine.on_ws_bridge_ended` — a WebSocket takeover bridge stopped,
+    /// for any reason including the *server* ending it. Emitted exactly once
+    /// per started bridge. An unexpected end leaves a live call with no far
+    /// side at all, so this is the handler that re-points or tears down.
+    ///
+    /// ``call_id`` and ``from_tag`` are optional filters.
+    RtpEngineOnWsBridgeEnded {
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    },
     /// `@rtpengine.on_beep` — a record tone (the "voicemail beep") was detected
     /// on a leg armed with `beep_detection`, the media half of
     /// answering-machine detection. Fires once per leg per call.
@@ -325,6 +344,46 @@ impl ScriptState {
             .iter()
             .filter(|h| match &h.kind {
                 HandlerKind::RtpEngineOnWsTeeEnded { call_id: filter_cid, from_tag: filter_ftag } => {
+                    filter_cid.as_deref().map_or(true, |v| v == call_id)
+                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// Return all `RtpEngineOnWsBridgeStarted` handlers whose optional
+    /// call-id/from-tag filters match the event.  `None` filters match
+    /// everything.
+    pub fn ws_bridge_started_handlers(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Vec<&HandlerEntry> {
+        self.handlers
+            .iter()
+            .filter(|h| match &h.kind {
+                HandlerKind::RtpEngineOnWsBridgeStarted { call_id: filter_cid, from_tag: filter_ftag } => {
+                    filter_cid.as_deref().map_or(true, |v| v == call_id)
+                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// Return all `RtpEngineOnWsBridgeEnded` handlers whose optional
+    /// call-id/from-tag filters match the event.  `None` filters match
+    /// everything.
+    pub fn ws_bridge_ended_handlers(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Vec<&HandlerEntry> {
+        self.handlers
+            .iter()
+            .filter(|h| match &h.kind {
+                HandlerKind::RtpEngineOnWsBridgeEnded { call_id: filter_cid, from_tag: filter_ftag } => {
                     filter_cid.as_deref().map_or(true, |v| v == call_id)
                         && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
                 }
@@ -1241,6 +1300,28 @@ fn extract_handlers(
                     .and_then(|meta| meta.get_item("from_tag").ok())
                     .and_then(|v| v.extract().ok());
                 HandlerKind::RtpEngineOnWsTeeEnded { call_id, from_tag }
+            }
+            "rtpengine.on_ws_bridge_started" => {
+                let call_id: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("call_id").ok())
+                    .and_then(|v| v.extract().ok());
+                let from_tag: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("from_tag").ok())
+                    .and_then(|v| v.extract().ok());
+                HandlerKind::RtpEngineOnWsBridgeStarted { call_id, from_tag }
+            }
+            "rtpengine.on_ws_bridge_ended" => {
+                let call_id: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("call_id").ok())
+                    .and_then(|v| v.extract().ok());
+                let from_tag: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("from_tag").ok())
+                    .and_then(|v| v.extract().ok());
+                HandlerKind::RtpEngineOnWsBridgeEnded { call_id, from_tag }
             }
             other => HandlerKind::Custom { kind: other.to_owned() },
         };

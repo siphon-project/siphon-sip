@@ -213,6 +213,8 @@ async fn session_store_tracks_offer_and_answer() {
         to_tag: None,
         profile: "srtp_to_rtp".to_string(),
         ws_uri: None,
+        ws_tee: None,
+        ws_bridge_attached: false,
         created_at: std::time::Instant::now(),
     });
 

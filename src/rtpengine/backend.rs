@@ -644,6 +644,60 @@ impl MediaBackend {
         }
     }
 
+    /// Attach a WebSocket **takeover** bridge to a live call, or re-point an
+    /// existing one at a different server.
+    ///
+    /// A native `siphon-rtp` extension, refused rather than hollow-successful
+    /// on the others for the same reason as [`Self::attach_ws_tee`], and with
+    /// more riding on it: a bridge *replaces* the call's media path, so an
+    /// `Ok(())` from a backend that cannot do it would read as "both parties
+    /// are now talking to the media server" while they are in fact still
+    /// relaying to each other.
+    pub async fn attach_ws_bridge(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        ws_uri: &str,
+    ) -> Result<(), RtpEngineError> {
+        match self {
+            Self::SiphonRtp(client) => client.attach_ws_bridge(call_id, from_tag, ws_uri).await,
+            Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
+                operation: "attach_ws_bridge",
+                backend: "rtpengine",
+            }),
+            Self::RtpProxy(_) => Err(RtpEngineError::Unsupported {
+                operation: "attach_ws_bridge",
+                backend: "rtpproxy",
+            }),
+        }
+    }
+
+    /// Detach a call's WebSocket takeover bridge, returning its media path to
+    /// relaying.
+    ///
+    /// Not idempotent, unlike [`Self::detach_ws_tee`]: the engine refuses a
+    /// detach where there is no relay to go back to (a `ws_uri`-negotiated
+    /// bridge, or a single-leg takeover), because silently answering `Ok` would
+    /// leave a live call with no audio path at all.  Unsupported on the other
+    /// backends for the same reason as [`Self::attach_ws_bridge`].
+    pub async fn detach_ws_bridge(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        match self {
+            Self::SiphonRtp(client) => client.detach_ws_bridge(call_id, from_tag).await,
+            Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
+                operation: "detach_ws_bridge",
+                backend: "rtpengine",
+            }),
+            Self::RtpProxy(_) => Err(RtpEngineError::Unsupported {
+                operation: "detach_ws_bridge",
+                backend: "rtpproxy",
+            }),
+        }
+    }
+
     /// Begin ETSI TS 103 221-2 X3 content delivery for a call.
     ///
     /// Native `siphon-rtp` only, and refused rather than hollow-successful on
@@ -916,6 +970,43 @@ mod tests {
                 .is_ok(),
             "rtpproxy must send a re-offer as a plain offer"
         );
+    }
+
+    /// A takeover bridge *replaces* the call's media path, so a backend that
+    /// cannot do it must refuse rather than answer `Ok(())` — a hollow success
+    /// would read as "both parties are on the media server" while they are in
+    /// fact still relaying to each other.
+    #[tokio::test]
+    async fn ws_bridge_verbs_are_refused_on_rtpengine_and_rtpproxy() {
+        let rtpengine = MediaBackend::RtpEngine(Arc::new(
+            RtpEngineSet::new(vec![(dead_address(), 200, 1)]).await.unwrap(),
+        ));
+        let rtpproxy = MediaBackend::RtpProxy(
+            RtpProxyClientSet::new(vec![(dead_address(), 200, 1)], 0).await.unwrap(),
+        );
+
+        for (backend, name) in [(&rtpengine, "rtpengine"), (&rtpproxy, "rtpproxy")] {
+            let error = backend
+                .attach_ws_bridge("call-1", "tag-a", "wss://ai.invalid/one")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    RtpEngineError::Unsupported { operation: "attach_ws_bridge", backend: b } if b == name
+                ),
+                "{name} must refuse attach_ws_bridge, got {error:?}"
+            );
+
+            let error = backend.detach_ws_bridge("call-1", "tag-a").await.unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    RtpEngineError::Unsupported { operation: "detach_ws_bridge", backend: b } if b == name
+                ),
+                "{name} must refuse detach_ws_bridge, got {error:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -638,3 +638,89 @@ class TestWebSocketTee:
         harness.rtpengine.clear()
         assert harness.rtpengine.fire_ws_tee_started("c", "f", "s", "ws://h/s") == 0
         assert harness.rtpengine.fire_ws_tee_ended("c", "f", "s") == 0
+
+
+class TestWebSocketTakeoverBridge:
+    """``attach_ws_bridge`` / ``detach_ws_bridge`` — the takeover, and the
+    re-point that is the whole reason it exists.
+
+    The opposite of the tee above: a bridge makes the WebSocket server the
+    leg's far side and unwires A-to-B, so the party on the other end is talking
+    to the media server rather than to their peer.
+    """
+
+    def test_attach_records_the_target_and_uri(self, harness):
+        call = Call(call_id="bridge-1@example.invalid")
+        asyncio.run(
+            harness.rtpengine.attach_ws_bridge(call, "wss://ai.example.com/s1")
+        )
+        assert (
+            "attach_ws_bridge",
+            "wss://ai.example.com/s1",
+        ) in harness.rtpengine.operations
+        recorded = harness.rtpengine.media_calls[-1]
+        assert recorded["op"] == "attach_ws_bridge"
+        assert recorded["call_id"] == "bridge-1@example.invalid"
+        assert recorded["ws_uri"] == "wss://ai.example.com/s1"
+
+    def test_reattaching_is_a_repoint_not_an_error(self, harness):
+        """Moving a party from one model session to another is an attach on a
+        call that already has a bridge — it must record a second attach rather
+        than requiring a detach in between, because the detach is exactly the
+        gap the caller would hear."""
+        call = Call(call_id="bridge-2@example.invalid")
+        asyncio.run(
+            harness.rtpengine.attach_ws_bridge(call, "wss://ai.example.com/s1")
+        )
+        asyncio.run(
+            harness.rtpengine.attach_ws_bridge(call, "wss://ai.example.com/s2")
+        )
+        attaches = [
+            entry for entry in harness.rtpengine.media_calls
+            if entry["op"] == "attach_ws_bridge"
+        ]
+        assert [entry["ws_uri"] for entry in attaches] == [
+            "wss://ai.example.com/s1",
+            "wss://ai.example.com/s2",
+        ]
+        assert not any(
+            entry["op"] == "detach_ws_bridge"
+            for entry in harness.rtpengine.media_calls
+        )
+
+    def test_detach_records_the_target(self, harness):
+        call = Call(call_id="bridge-3@example.invalid")
+        asyncio.run(harness.rtpengine.detach_ws_bridge(call))
+        assert ("detach_ws_bridge", None) in harness.rtpengine.operations
+        recorded = harness.rtpengine.media_calls[-1]
+        assert recorded["op"] == "detach_ws_bridge"
+        assert recorded["call_id"] == "bridge-3@example.invalid"
+
+    def test_lifecycle_handlers_fire_with_filters(self, harness):
+        seen = []
+
+        @harness.rtpengine.on_ws_bridge_started
+        def started(call_id, from_tag, stream_id, ws_uri, sample_rate):
+            seen.append(("started", call_id, stream_id, ws_uri, sample_rate))
+
+        @harness.rtpengine.on_ws_bridge_ended(call_id="bridge-4@example.invalid")
+        def ended(call_id, from_tag, stream_id, reason):
+            seen.append(("ended", call_id, stream_id, reason))
+
+        assert harness.rtpengine.fire_ws_bridge_started(
+            "bridge-4@example.invalid", "tag-a", "s-1",
+            "wss://ai.example.com/s1", 16000,
+        ) == 1
+        # The filter must exclude a different call.
+        assert harness.rtpengine.fire_ws_bridge_ended(
+            "other@example.invalid", "tag-a", "s-1", "server_closed",
+        ) == 0
+        assert harness.rtpengine.fire_ws_bridge_ended(
+            "bridge-4@example.invalid", "tag-a", "s-1", "server_closed",
+        ) == 1
+
+        assert seen == [
+            ("started", "bridge-4@example.invalid", "s-1",
+             "wss://ai.example.com/s1", 16000),
+            ("ended", "bridge-4@example.invalid", "s-1", "server_closed"),
+        ]

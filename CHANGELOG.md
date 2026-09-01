@@ -66,6 +66,33 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   a peer that meant the second.
 
 ### Added
+- **Attach, re-point and detach a WebSocket *takeover* bridge on a live call.**
+  The tee (`attach_ws_tee`) streams a copy while the call keeps relaying; a
+  takeover makes the WebSocket server the leg's far side and unwires A↔B. Until
+  now a takeover could only be negotiated at offer/answer through `ws_uri` on
+  the media profile, so there was no way to point a live bridged leg at a
+  different server without dropping the call. New `rtpengine.attach_ws_bridge()`
+  / `detach_ws_bridge()` on the script API, `mode: tee|bridge` on the control
+  plane's `stream_start` / `stream_stop`, and `@rtpengine.on_ws_bridge_started`
+  / `on_ws_bridge_ended` plus `WsBridgeStarted` / `WsBridgeEnded` on the control
+  rail.
+
+  Attaching to a call that already has a bridge is a **re-point**, not an error,
+  and the media path never returns to the relay in between — a detach-then-attach
+  would hand the path back for as long as the next attach took to land, which the
+  other party hears as a gap.
+
+  `detach_ws_bridge` is deliberately *not* idempotent, unlike the tee's detach.
+  The engine refuses a detach where there is no relay to hand the call back to —
+  a `ws_uri`-negotiated bridge is the call's whole media path, and a single-leg
+  (`answer_local`) takeover has no second party to relay to — and siphon
+  surfaces that refusal rather than smoothing it into a success, because the
+  alternative is a live call with no audio path at all. Only `detached` is an
+  orderly end: every other `WsBridgeEnded` reason leaves both parties up and
+  hearing nothing, so an unexpected end is logged at WARN even with no handler
+  registered. Requires `media.backend: siphon-rtp` (rtpengine and rtpproxy
+  refuse the verbs rather than answering a hollow success) and
+  `siphon-rtp-proto` 0.4.0.
 - **`siphon_requests_without_branch_total`.** Counts inbound requests whose
   topmost Via carries no `branch` parameter (mandatory since RFC 3261 §8.1.1.7).
   siphon has no RFC 2543 legacy transaction matching, so these are processed
@@ -125,6 +152,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   than breaking an exhaustive `match`.
 
 ### Fixed
+- **A bridge no longer sends the wrong media detach, leaving the WebSocket
+  server owning a leg it was about to renegotiate.** `bridge` tears every
+  attachment off both legs before it re-points the media, but it decided what
+  was attached from `MediaSession.ws_uri` — which is the *takeover* URI, not the
+  tee. So a leg holding a takeover was sent `detach_ws_tee`, which is idempotent
+  and answers ok, and the plan then renegotiated a media path the WebSocket
+  server still owned: the bridge formed on paper and neither party heard the
+  other. The mirror image was true too — a leg with a real tee, attached through
+  the script or control API, was recorded nowhere, so its tee was never detached
+  and kept streaming across the bridge. The two are now tracked apart and each
+  gets its own verb.
 - **A request racing an in-flight copy of itself no longer forks the call
   twice.** The dispatcher checks `handle_server_retransmit` and then creates the
   server transaction, which is a check-then-act: when a request and its

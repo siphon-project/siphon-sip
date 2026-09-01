@@ -58,6 +58,18 @@ pub enum RtpEngineEvent {
     /// Emitted exactly once per started tee, so a script learns the stream died
     /// rather than silently losing audio.  `siphon-rtp` native backend only.
     WsTeeEnded(WsTeeEnded),
+    /// A WebSocket **takeover** bridge started on a live call — the engine
+    /// dialled the server and the leg's far side is now the WebSocket rather
+    /// than the other party.  Unlike [`Self::WsTeeStarted`] this *replaces* the
+    /// call's audio path rather than copying it.  `siphon-rtp` native backend
+    /// only.
+    WsBridgeStarted(WsBridgeStarted),
+    /// A WebSocket takeover bridge ended, for any reason including the *server*
+    /// ending it.  Emitted exactly once per started bridge.  An unexpected end
+    /// leaves a live call with no far side, so this is the event that lets a
+    /// script re-point or tear down rather than strand the parties in silence.
+    /// `siphon-rtp` native backend only.
+    WsBridgeEnded(WsBridgeEnded),
     /// A record tone (the "voicemail beep") was detected on a leg armed with
     /// `beep_detection` — the media half of answering-machine detection.
     /// Emitted once per leg per call.  `siphon-rtp` native backend only.
@@ -311,6 +323,90 @@ impl WsTeeEndReason {
     /// `detached` is the only orderly end — every other reason means audio
     /// stopped reaching the consumer while the call was still up, which is the
     /// silent-failure case a handler exists to catch.
+    pub fn is_unexpected(self) -> bool {
+        !matches!(self, Self::Detached)
+    }
+}
+
+/// A WebSocket **takeover** bridge started on a live call, carried by
+/// [`RtpEngineEvent::WsBridgeStarted`].
+///
+/// Distinct from [`WsTeeStarted`] in what it does to the call, not just in
+/// name: a tee is *additive* (the call keeps relaying and a copy is streamed
+/// out), while a bridge is a *takeover* — the WebSocket server becomes the
+/// leg's far side and A↔B is unwired for the bridge's lifetime.  A consumer
+/// that treats the two alike will happily report a call as relaying while both
+/// parties are actually talking to the media server.
+#[derive(Debug, Clone)]
+pub struct WsBridgeStarted {
+    /// SIP Call-ID the media session is keyed on.
+    pub call_id: String,
+    /// The bridged leg's from-tag.
+    pub from_tag: String,
+    /// The bridge's stream id, matching the `start` frame on the WebSocket —
+    /// the correlator between this control event and the media stream.
+    pub stream_id: String,
+    /// The URI the engine dialled.
+    pub ws_uri: String,
+    /// Wire sample rate in Hz (L16, little-endian).
+    pub sample_rate: u32,
+}
+
+/// A WebSocket takeover bridge ended, carried by
+/// [`RtpEngineEvent::WsBridgeEnded`].
+///
+/// Emitted exactly once per started bridge, including when the *server* ends
+/// it.  On a bridge this matters more than on a tee: a dead tee costs a
+/// consumer its copy of the audio, whereas a dead bridge costs the *call* its
+/// far side, so an unexpected end here is a live call with no audio path.
+#[derive(Debug, Clone)]
+pub struct WsBridgeEnded {
+    pub call_id: String,
+    pub from_tag: String,
+    /// The stream id from the matching [`WsBridgeStarted`].
+    pub stream_id: String,
+    /// Why the bridge ended.
+    pub reason: WsBridgeEndReason,
+}
+
+/// Why a WebSocket takeover bridge ended.  A siphon-side mirror of the native
+/// backend's `siphon_rtp_proto::WsBridgeEndReason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsBridgeEndReason {
+    /// The script detached it, or re-pointed it at a different server.  The
+    /// only orderly end.
+    Detached,
+    /// The WebSocket server closed the connection.
+    ServerClosed,
+    /// The WebSocket server sent a `stop` control frame.
+    ServerStopped,
+    /// The call was torn down, so the bridge went with it.
+    CallEnded,
+    /// A WebSocket/transport error ended it.
+    TransportError,
+    /// A reason this build of siphon does not know — a newer engine.  Carries
+    /// the wire spelling so a script can still act on it.
+    Other(&'static str),
+}
+
+impl WsBridgeEndReason {
+    /// The wire spelling, as handed to Python handlers.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Detached => "detached",
+            Self::ServerClosed => "server_closed",
+            Self::ServerStopped => "server_stopped",
+            Self::CallEnded => "call_ended",
+            Self::TransportError => "transport_error",
+            Self::Other(reason) => reason,
+        }
+    }
+
+    /// Whether the bridge ended for a reason the script did not ask for.
+    ///
+    /// `detached` is the only orderly end — and unlike a tee, every other
+    /// reason leaves a live call whose far side has gone away, so a handler
+    /// that does nothing here strands both parties in silence.
     pub fn is_unexpected(self) -> bool {
         !matches!(self, Self::Detached)
     }

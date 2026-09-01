@@ -1,0 +1,48 @@
+# siphon config for the re-INVITE renegotiation test on the siphon-rtp backend.
+#
+# Used with: sipp/docker-compose.yaml (reoffer profile)
+# Script:    examples/proxy_rtpengine.py — its in-dialog branch calls
+#            rtpengine.offer() on a re-INVITE, which is the script-facing site
+#            that must go out as `reoffer` once the call is anchored.
+#
+# The sibling rtpengine-backed run (sipp/rtpengine/siphon-rtpengine.yaml, the
+# --reinvite mode) exercises the same scenario against a backend where a repeat
+# offer IS the re-offer, so it cannot see the difference. This one can.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+advertised_address: "172.20.0.117"
+
+domain:
+  local:
+    - "siphon.test"
+    - "172.20.0.117"
+    - "127.0.0.1"
+
+script:
+  path: "/etc/siphon/sipp-scripts/ws_bridge_lifecycle.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+  max_expires: 7200
+
+auth:
+  realm: "siphon.test"
+  backend: static
+  users:
+    alice: "secret"
+    bob: "secret"
+
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "172.20.0.116:8080"
+    timeout_ms: 2000
+
+log:
+  level: debug
+  format: pretty

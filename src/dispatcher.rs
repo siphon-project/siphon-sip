@@ -1374,6 +1374,157 @@ pub async fn run(
                         })
                         .await;
                     }
+                    crate::rtpengine::events::RtpEngineEvent::WsBridgeStarted(bridge) => {
+                        tracing::debug!(
+                            call_id = %bridge.call_id,
+                            from_tag = %bridge.from_tag,
+                            stream_id = %bridge.stream_id,
+                            ws_uri = %bridge.ws_uri,
+                            sample_rate = bridge.sample_rate,
+                            "media engine started a websocket takeover bridge"
+                        );
+                        // The media session is keyed on the leg's SIP Call-ID,
+                        // which is what the control rail addresses channels by.
+                        crate::control::notify_channel_event(
+                            &bridge.call_id,
+                            "WsBridgeStarted",
+                            serde_json::json!({
+                                "from_tag": bridge.from_tag,
+                                "stream_id": bridge.stream_id,
+                                "ws_uri": bridge.ws_uri,
+                                "sample_rate": bridge.sample_rate,
+                            }),
+                        );
+                        let engine_state = state_for_events.engine.state();
+                        let handlers = engine_state
+                            .ws_bridge_started_handlers(&bridge.call_id, &bridge.from_tag);
+                        if handlers.is_empty() {
+                            continue;
+                        }
+                        let state_ref = Arc::clone(&state_for_events);
+                        let bridge_clone = bridge.clone();
+                        let _ = crate::script::py_executor::try_run(move || {
+                            let engine_state = state_ref.engine.state();
+                            let handlers = engine_state.ws_bridge_started_handlers(
+                                &bridge_clone.call_id,
+                                &bridge_clone.from_tag,
+                            );
+                            pyo3::Python::attach(|python| {
+                                for handler in handlers {
+                                    let callable = handler.callable.bind(python);
+                                    let result = callable.call1((
+                                        bridge_clone.call_id.as_str(),
+                                        bridge_clone.from_tag.as_str(),
+                                        bridge_clone.stream_id.as_str(),
+                                        bridge_clone.ws_uri.as_str(),
+                                        bridge_clone.sample_rate,
+                                    ));
+                                    match result {
+                                        Ok(ret) => {
+                                            if handler.is_async {
+                                                if let Err(error) = run_coroutine(python, &ret) {
+                                                    tracing::error!(
+                                                        %error,
+                                                        "async rtpengine.on_ws_bridge_started handler error"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                %error,
+                                                "rtpengine.on_ws_bridge_started handler failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        })
+                        .await;
+                    }
+                    crate::rtpengine::events::RtpEngineEvent::WsBridgeEnded(bridge) => {
+                        // A bridge that ends for anything other than an explicit
+                        // detach or re-point leaves a *live call with no far
+                        // side* — worse than the tee case, where the call itself
+                        // was never in the streaming path.  WARN even with no
+                        // handler registered, so it is visible rather than
+                        // inferred from both parties going silent.
+                        if bridge.reason.is_unexpected() {
+                            tracing::warn!(
+                                call_id = %bridge.call_id,
+                                from_tag = %bridge.from_tag,
+                                stream_id = %bridge.stream_id,
+                                reason = %bridge.reason.as_str(),
+                                "websocket takeover bridge ended unexpectedly (call still up, no media far side)"
+                            );
+                        } else {
+                            tracing::debug!(
+                                call_id = %bridge.call_id,
+                                from_tag = %bridge.from_tag,
+                                stream_id = %bridge.stream_id,
+                                reason = %bridge.reason.as_str(),
+                                "websocket takeover bridge ended"
+                            );
+                        }
+                        crate::control::notify_channel_event(
+                            &bridge.call_id,
+                            "WsBridgeEnded",
+                            serde_json::json!({
+                                "from_tag": bridge.from_tag,
+                                "stream_id": bridge.stream_id,
+                                "reason": bridge.reason.as_str(),
+                                // Only `detached` is orderly. A controller that
+                                // branches on nothing else still has to be able
+                                // to see that this one needs acting on.
+                                "unexpected": bridge.reason.is_unexpected(),
+                            }),
+                        );
+                        let engine_state = state_for_events.engine.state();
+                        let handlers = engine_state
+                            .ws_bridge_ended_handlers(&bridge.call_id, &bridge.from_tag);
+                        if handlers.is_empty() {
+                            continue;
+                        }
+                        let state_ref = Arc::clone(&state_for_events);
+                        let bridge_clone = bridge.clone();
+                        let _ = crate::script::py_executor::try_run(move || {
+                            let engine_state = state_ref.engine.state();
+                            let handlers = engine_state.ws_bridge_ended_handlers(
+                                &bridge_clone.call_id,
+                                &bridge_clone.from_tag,
+                            );
+                            pyo3::Python::attach(|python| {
+                                for handler in handlers {
+                                    let callable = handler.callable.bind(python);
+                                    let result = callable.call1((
+                                        bridge_clone.call_id.as_str(),
+                                        bridge_clone.from_tag.as_str(),
+                                        bridge_clone.stream_id.as_str(),
+                                        bridge_clone.reason.as_str(),
+                                    ));
+                                    match result {
+                                        Ok(ret) => {
+                                            if handler.is_async {
+                                                if let Err(error) = run_coroutine(python, &ret) {
+                                                    tracing::error!(
+                                                        %error,
+                                                        "async rtpengine.on_ws_bridge_ended handler error"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                %error,
+                                                "rtpengine.on_ws_bridge_ended handler failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        })
+                        .await;
+                    }
                     crate::rtpengine::events::RtpEngineEvent::WsTeeEnded(tee) => {
                         // A tee that ends for anything other than an explicit
                         // detach means audio stopped reaching the consumer while
@@ -13840,6 +13991,8 @@ fn answer_first_anchor(
             to_tag: None,
             profile: plan.profile_name.clone(),
             ws_uri: plan.flags.ws_uri.clone(),
+            ws_tee: plan.flags.ws_tee.clone(),
+            ws_bridge_attached: false,
             created_at: std::time::Instant::now(),
         });
     }
@@ -19745,6 +19898,30 @@ pub fn b2bua_media_target(
     ))
 }
 
+/// Record (or clear) the WebSocket **tee** attached to a control-plane channel's
+/// media session.
+///
+/// The control rail reaches the session store through the B2BUA control handle
+/// rather than holding one, so the tracking the script API does inline needs
+/// this door. Keyed on the SIP Call-ID, which is the store key.
+pub fn b2bua_media_set_ws_tee(sip_call_id: &str, ws_tee: Option<String>) {
+    if let Some(control) = B2BUA_CONTROL.get() {
+        if let Some(sessions) = control.state.rtpengine_sessions.as_ref() {
+            sessions.set_ws_tee(sip_call_id, ws_tee);
+        }
+    }
+}
+
+/// Record (or clear) a mid-call WebSocket **takeover bridge** on a control-plane
+/// channel's media session.  The twin of [`b2bua_media_set_ws_tee`].
+pub fn b2bua_media_set_ws_bridge_attached(sip_call_id: &str, attached: bool) {
+    if let Some(control) = B2BUA_CONTROL.get() {
+        if let Some(sessions) = control.state.rtpengine_sessions.as_ref() {
+            sessions.set_ws_bridge_attached(sip_call_id, attached);
+        }
+    }
+}
+
 /// Build and send a UAS response (final 2xx or provisional 1xx) for a B2BUA call
 /// from an imperative `call.answer()` / `call.progress()`.
 ///
@@ -20756,6 +20933,8 @@ fn originate_anchor_2xx(
             to_tag: None,
             profile: anchor.profile.clone(),
             ws_uri: flags.ws_uri.clone(),
+            ws_tee: flags.ws_tee.clone(),
+            ws_bridge_attached: false,
             created_at: std::time::Instant::now(),
         });
     }
@@ -21059,7 +21238,12 @@ fn bridge_leg_snapshot(
             // A session with a second party is a relay and can be renegotiated
             // in place; one the engine answered itself has only the caller.
             relaying: session.to_tag.is_some(),
-            has_tee: session.ws_uri.is_some(),
+            // The *tee*, not the takeover: `ws_uri` is the profile-negotiated
+            // bridge and reading it here sent `detach_ws_tee` at a leg holding
+            // a takeover — which answers ok, because it is idempotent — while
+            // the real tee on a leg that had one was never detached at all.
+            has_tee: session.ws_tee.is_some(),
+            has_ws_bridge: session.ws_bridge_attached,
             has_playback: crate::rtpengine::MediaBackend::playback_started(
                 session.rtpengine_id(),
                 &session.from_tag,
@@ -21139,6 +21323,13 @@ async fn bridge_run_media_step(
             from_tag,
         } => backend
             .detach_ws_tee(media_call_id, from_tag)
+            .await
+            .map(|()| None),
+        MediaStep::DetachBridge {
+            media_call_id,
+            from_tag,
+        } => backend
+            .detach_ws_bridge(media_call_id, from_tag)
             .await
             .map(|()| None),
         MediaStep::DeleteSession {
@@ -21335,6 +21526,8 @@ pub async fn b2bua_bridge_calls(
                     to_tag: None,
                     profile: media.profile.clone(),
                     ws_uri: None,
+                    ws_tee: None,
+                    ws_bridge_attached: false,
                     created_at: std::time::Instant::now(),
                 });
             }
@@ -23803,6 +23996,8 @@ fn b2bua_bridge_inbound_replaces(
                 // A fresh engine call-id: any WebSocket bridge the old anchor
                 // held belonged to the call-id that just went away.
                 ws_uri: None,
+                ws_tee: None,
+                ws_bridge_attached: false,
                 created_at: std::time::Instant::now(),
             });
             store.remove(old_key);
@@ -24462,8 +24657,12 @@ fn b2bua_complete_terminated_transfer(
                         // pair, and any WebSocket bridge the pre-transfer anchor
                         // held died with the old call-id.  Copying the URI here
                         // would make a later `answer` on this Call-ID resolve a
-                        // bridge that was never established for it.
+                        // bridge that was never established for it.  The tee
+                        // and the mid-call takeover flag go the same way and
+                        // for the same reason.
                         ws_uri: None,
+                        ws_tee: None,
+                        ws_bridge_attached: false,
                         created_at: std::time::Instant::now(),
                     });
                     store.remove(old_key);
@@ -30186,6 +30385,8 @@ a=rtpmap:8 PCMA/8000\r\n";
             to_tag: None,
             profile: "srtp_to_rtp".to_string(),
             ws_uri: None,
+            ws_tee: None,
+            ws_bridge_attached: false,
             created_at: std::time::Instant::now(),
         }
     }

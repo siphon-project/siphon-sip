@@ -310,10 +310,23 @@ pub struct LegMedia {
     /// engine answered itself (`answer_local`) has one, and cannot be
     /// renegotiated into a relay — see the module docs.
     pub relaying: bool,
-    /// Whether a WebSocket tee is attached to this session. The detach only runs
-    /// when there is one: a backend that cannot hold a tee, or a session that
-    /// never had one, has nothing to confirm.
+    /// Whether a WebSocket **tee** is attached to this session. The detach only
+    /// runs when there is one: a backend that cannot hold a tee, or a session
+    /// that never had one, has nothing to confirm.
     pub has_tee: bool,
+    /// Whether a WebSocket **takeover bridge** was attached to this session
+    /// mid-call and is therefore detachable.
+    ///
+    /// Tracked apart from [`LegMedia::has_tee`] because the two need different
+    /// verbs and the wrong one *succeeds*: `detach_ws_tee` on a leg holding a
+    /// takeover answers ok (it is idempotent), so a conflated flag would let
+    /// the plan renegotiate a media path the WebSocket server still owns.
+    ///
+    /// A bridge negotiated through the profile's `ws_uri` is not counted here:
+    /// it cannot be detached, and it does not need to be — such a session is
+    /// not `relaying`, so the plan already deletes it and offers the leg onto a
+    /// fresh call-id, which ends the bridge with it.
+    pub has_ws_bridge: bool,
     /// Whether siphon started a playback on this leg and has not stopped it.
     /// The stop only runs when it did: on an idle leg the engine answers
     /// "this call has no active media playback", and it counts that answer as a
@@ -337,6 +350,20 @@ pub enum MediaStep {
     /// Detach this leg's WebSocket tee. Ordered after the playback stop so the
     /// tee is not torn down mid-prompt.
     DetachTee {
+        /// Engine call-id.
+        media_call_id: String,
+        /// The leg's engine tag.
+        from_tag: String,
+    },
+    /// Detach this leg's WebSocket **takeover bridge**, handing its media path
+    /// back to the relay. Ordered after the tee detach: the tee is a copy of
+    /// the audio and comes off first, then the path itself is returned, and
+    /// only then is the leg renegotiated into the new bridge.
+    ///
+    /// Without this the leg would be re-INVITEd while the WebSocket server is
+    /// still its far side — the bridge would form on paper and neither party
+    /// would hear the other.
+    DetachBridge {
         /// Engine call-id.
         media_call_id: String,
         /// The leg's engine tag.
@@ -417,6 +444,12 @@ pub fn bridge_media_plan(
         }
         if leg.has_tee {
             steps.push(MediaStep::DetachTee {
+                media_call_id: leg.media_call_id.clone(),
+                from_tag: leg.from_tag.clone(),
+            });
+        }
+        if leg.has_ws_bridge {
+            steps.push(MediaStep::DetachBridge {
                 media_call_id: leg.media_call_id.clone(),
                 from_tag: leg.from_tag.clone(),
             });
@@ -578,6 +611,7 @@ mod tests {
             profile: "rtp_passthrough".to_string(),
             relaying: false,
             has_tee: false,
+            has_ws_bridge: false,
             has_playback: false,
         }
     }
@@ -591,12 +625,23 @@ mod tests {
         }
     }
 
+    /// A relaying session with a mid-call WebSocket takeover bridge attached —
+    /// a leg whose far side is a media server rather than the other party.
+    fn bridged_leg(call_id: &str, tag: &str) -> LegMedia {
+        LegMedia {
+            relaying: true,
+            has_ws_bridge: true,
+            ..local_leg(call_id, tag)
+        }
+    }
+
     fn kinds(steps: &[MediaStep]) -> Vec<&'static str> {
         steps
             .iter()
             .map(|step| match step {
                 MediaStep::StopPlayback { .. } => "stop",
                 MediaStep::DetachTee { .. } => "detach",
+                MediaStep::DetachBridge { .. } => "detach_bridge",
                 MediaStep::DeleteSession { .. } => "delete",
                 MediaStep::Offer { .. } => "offer",
                 MediaStep::Reoffer { .. } => "reoffer",
@@ -741,6 +786,91 @@ mod tests {
     // -----------------------------------------------------------------------
     // Media-failure classification
     // -----------------------------------------------------------------------
+
+    /// A takeover bridge must come off before the leg is renegotiated. Without
+    /// the detach the re-INVITE forms a bridge on paper while the WebSocket
+    /// server is still the leg's far side, and neither party hears the other.
+    #[test]
+    fn a_leg_holding_a_takeover_bridge_has_it_detached_before_renegotiation() {
+        let anchor = bridged_leg("call-a", "tag-a");
+        let peer = relaying_leg("call-b", "tag-b");
+        let steps = bridge_media_plan(Some(&anchor), Some(&peer), b"v=0\r\n", "fresh");
+        let kinds = kinds(&steps);
+
+        let detach = kinds
+            .iter()
+            .position(|kind| *kind == "detach_bridge")
+            .expect("a leg with a takeover bridge must have it detached");
+        let renegotiate = kinds
+            .iter()
+            .position(|kind| *kind == "reoffer" || *kind == "offer")
+            .expect("the bridge must renegotiate the anchor");
+        assert!(
+            detach < renegotiate,
+            "the takeover must be handed back before the leg is renegotiated, got {kinds:?}"
+        );
+    }
+
+    /// The bug this pair of flags exists to prevent: a leg holding a *takeover*
+    /// used to be read as holding a *tee*, so the plan sent `detach_ws_tee` —
+    /// which is idempotent and answers ok — and then renegotiated a media path
+    /// the WebSocket server still owned. A takeover must produce the bridge
+    /// detach and never the tee detach.
+    #[test]
+    fn a_takeover_bridge_is_never_mistaken_for_a_tee() {
+        let anchor = bridged_leg("call-a", "tag-a");
+        let steps = bridge_media_plan(Some(&anchor), None, b"v=0\r\n", "fresh");
+        let kinds = kinds(&steps);
+        assert!(
+            kinds.contains(&"detach_bridge"),
+            "a takeover must be detached as a bridge, got {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&"detach"),
+            "a takeover must not be detached as a tee, got {kinds:?}"
+        );
+    }
+
+    /// The other half of the same bug: a leg with a real tee and no takeover
+    /// must still get the tee detach.
+    #[test]
+    fn a_tee_is_still_detached_as_a_tee() {
+        let anchor = LegMedia {
+            relaying: true,
+            has_tee: true,
+            ..local_leg("call-a", "tag-a")
+        };
+        let steps = bridge_media_plan(Some(&anchor), None, b"v=0\r\n", "fresh");
+        let kinds = kinds(&steps);
+        assert!(
+            kinds.contains(&"detach"),
+            "a tee must be detached as a tee, got {kinds:?}"
+        );
+        assert!(
+            !kinds.contains(&"detach_bridge"),
+            "a tee must not be detached as a bridge, got {kinds:?}"
+        );
+    }
+
+    /// A leg holding both a copy and a takeover peels the copy off first, then
+    /// hands the path back — the tee is a consumer of the audio, so detaching
+    /// it after the path has already moved would stream from a leg that is
+    /// mid-renegotiation.
+    #[test]
+    fn a_tee_comes_off_before_the_takeover_it_sits_on() {
+        let anchor = LegMedia {
+            has_tee: true,
+            ..bridged_leg("call-a", "tag-a")
+        };
+        let steps = bridge_media_plan(Some(&anchor), None, b"v=0\r\n", "fresh");
+        let kinds = kinds(&steps);
+        let tee = kinds.iter().position(|k| *k == "detach").expect("tee detach");
+        let bridge = kinds
+            .iter()
+            .position(|k| *k == "detach_bridge")
+            .expect("bridge detach");
+        assert!(tee < bridge, "tee must come off first, got {kinds:?}");
+    }
 
     #[test]
     fn a_backend_with_no_tee_is_a_leg_with_no_tee_not_a_failed_bridge() {

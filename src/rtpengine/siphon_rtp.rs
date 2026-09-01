@@ -30,7 +30,8 @@ use futures_util::future::join_all;
 use siphon_rtp_proto::{
     frame, CmdResult, Command, Event, LegSummary as ProtoLegSummary, PlayEndReason,
     PlayMediaSource as ProtoPlayMediaSource, ProfileFlags, Request, Response,
-    WsTeeDirection as ProtoWsTeeDirection, WsTeeEndReason as ProtoWsTeeEndReason,
+    WsBridgeEndReason as ProtoWsBridgeEndReason, WsTeeDirection as ProtoWsTeeDirection,
+    WsTeeEndReason as ProtoWsTeeEndReason,
     WsVadEngine as ProtoWsVadEngine, X3EndReason, X3TargetLeg, Xid,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -43,7 +44,8 @@ use super::client::PlayMediaSource;
 use super::error::RtpEngineError;
 use super::events::{
     BeepDetectedEvent, CallLegSummary, CallSummary, DtmfEvent, RtpEngineEvent, TextEvent,
-    TextStreamStats, WsTeeEndReason, WsTeeStarted, WsTeeEnded, X3EndedEvent, X3LossEvent, X3StartedEvent,
+    TextStreamStats, WsBridgeEndReason, WsBridgeEnded, WsBridgeStarted, WsTeeEndReason,
+    WsTeeStarted, WsTeeEnded, X3EndedEvent, X3LossEvent, X3StartedEvent,
 };
 use super::profile::{NgFlags, WsTeeDirection, WsVadEngine};
 
@@ -856,6 +858,56 @@ impl SiphonRtpClient {
         )
     }
 
+    /// Attach a WebSocket **takeover** bridge to a live call, or re-point an
+    /// existing one at a different server.
+    ///
+    /// The opposite of [`Self::attach_ws_tee`] in what it does to the call: the
+    /// WebSocket server becomes the leg's far side and A↔B is unwired for the
+    /// bridge's lifetime, rather than the call relaying on with a copy streamed
+    /// out.  Attaching to a call that already has a bridge is a **re-point**,
+    /// not an error — the media path never drops, which is what lets one party
+    /// be handed from one media server to another without the other party
+    /// hearing a gap.
+    pub async fn attach_ws_bridge(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        ws_uri: &str,
+    ) -> Result<(), RtpEngineError> {
+        expect_ok(
+            self.request(Command::AttachWsBridge {
+                call_id: call_id.to_string(),
+                from_tag: from_tag.to_string(),
+                ws_uri: ws_uri.to_string(),
+            })
+            .await?,
+        )
+    }
+
+    /// Detach a call's WebSocket takeover bridge, returning its media path to
+    /// relaying.
+    ///
+    /// Refused by the engine — rather than answered — when there is no relay to
+    /// return the call to: a bridge negotiated through `ws_uri` on the media
+    /// profile *is* the call's media path, and a single-leg (`answer_local`)
+    /// takeover has no second party that could ever be relayed to.  Detaching
+    /// either would leave a live call with no audio path at all, so the refusal
+    /// is surfaced instead of being smoothed into an `Ok(())`.  Re-point such a
+    /// bridge with [`Self::attach_ws_bridge`], or end the call.
+    pub async fn detach_ws_bridge(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        expect_ok(
+            self.request(Command::DetachWsBridge {
+                call_id: call_id.to_string(),
+                from_tag: from_tag.to_string(),
+            })
+            .await?,
+        )
+    }
+
     /// Begin ETSI TS 103 221-2 X3 content delivery for a call.
     ///
     /// The engine frames every packet it *accepted* — after SRTP decryption and
@@ -1305,6 +1357,28 @@ impl SiphonRtpClientSet {
         self.select(call_id).detach_ws_tee(call_id, from_tag).await
     }
 
+    /// Attach or re-point a WebSocket takeover bridge on the instance owning
+    /// this call.
+    pub async fn attach_ws_bridge(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        ws_uri: &str,
+    ) -> Result<(), RtpEngineError> {
+        self.select(call_id)
+            .attach_ws_bridge(call_id, from_tag, ws_uri)
+            .await
+    }
+
+    /// Detach the WebSocket takeover bridge on the instance owning this call.
+    pub async fn detach_ws_bridge(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        self.select(call_id).detach_ws_bridge(call_id, from_tag).await
+    }
+
     /// Begin X3 content delivery on the instance owning this call.
     pub async fn attach_x3(
         &self,
@@ -1550,6 +1624,30 @@ fn convert_event(event: Event) -> RtpEngineEvent {
             frames_sent,
             frames_dropped,
         }),
+        Event::WsBridgeStarted {
+            call_id,
+            from_tag,
+            stream_id,
+            ws_uri,
+            sample_rate,
+        } => RtpEngineEvent::WsBridgeStarted(WsBridgeStarted {
+            call_id,
+            from_tag,
+            stream_id,
+            ws_uri,
+            sample_rate,
+        }),
+        Event::WsBridgeEnded {
+            call_id,
+            from_tag,
+            stream_id,
+            reason,
+        } => RtpEngineEvent::WsBridgeEnded(WsBridgeEnded {
+            call_id,
+            from_tag,
+            stream_id,
+            reason: ws_bridge_end_reason_from_proto(reason),
+        }),
         Event::BeepDetected {
             call_id,
             from_tag,
@@ -1654,6 +1752,26 @@ fn ws_tee_end_reason_from_proto(reason: ProtoWsTeeEndReason) -> WsTeeEndReason {
         ProtoWsTeeEndReason::CallEnded => WsTeeEndReason::CallEnded,
         ProtoWsTeeEndReason::TransportError => WsTeeEndReason::TransportError,
         _ => WsTeeEndReason::TransportError,
+    }
+}
+
+/// Map the proto bridge end-reason onto siphon's own enum.
+///
+/// `WsBridgeEndReason` is `#[non_exhaustive]` upstream. The wildcard maps to
+/// [`WsBridgeEndReason::TransportError`] rather than a silent
+/// [`WsBridgeEndReason::Detached`], for the same reason
+/// [`ws_tee_end_reason_from_proto`] does and with more at stake: `Detached` is
+/// the only orderly end, and a bridge is the call's *whole* media path, so
+/// reading an unknown reason as orderly hides a live call whose far side has
+/// gone away.
+fn ws_bridge_end_reason_from_proto(reason: ProtoWsBridgeEndReason) -> WsBridgeEndReason {
+    match reason {
+        ProtoWsBridgeEndReason::Detached => WsBridgeEndReason::Detached,
+        ProtoWsBridgeEndReason::ServerClosed => WsBridgeEndReason::ServerClosed,
+        ProtoWsBridgeEndReason::ServerStopped => WsBridgeEndReason::ServerStopped,
+        ProtoWsBridgeEndReason::CallEnded => WsBridgeEndReason::CallEnded,
+        ProtoWsBridgeEndReason::TransportError => WsBridgeEndReason::TransportError,
+        _ => WsBridgeEndReason::TransportError,
     }
 }
 
@@ -2845,6 +2963,97 @@ mod tests {
         })
         .expect("serialize attach_ws_tee");
         assert_eq!(json["sample_rate"], 16_000);
+    }
+
+    #[test]
+    fn attach_ws_bridge_carries_the_ws_uri() {
+        let json = serde_json::to_value(Command::AttachWsBridge {
+            call_id: "call-bridge".into(),
+            from_tag: "leg-a".into(),
+            ws_uri: "wss://ai.invalid/session-1".into(),
+        })
+        .expect("serialize attach_ws_bridge");
+        assert_eq!(json["command"], "attach_ws_bridge");
+        assert_eq!(json["ws_uri"], "wss://ai.invalid/session-1");
+        assert_eq!(json["call_id"], "call-bridge");
+        assert_eq!(json["from_tag"], "leg-a");
+    }
+
+    #[test]
+    fn detach_ws_bridge_carries_the_call_and_leg() {
+        let json = serde_json::to_value(Command::DetachWsBridge {
+            call_id: "call-bridge".into(),
+            from_tag: "leg-a".into(),
+        })
+        .expect("serialize detach_ws_bridge");
+        assert_eq!(json["command"], "detach_ws_bridge");
+        assert_eq!(json["call_id"], "call-bridge");
+        assert_eq!(json["from_tag"], "leg-a");
+    }
+
+    /// The whole point of the mapping: every reason the engine can state maps to
+    /// its own value, so `is_unexpected` can tell an orderly detach from a dead
+    /// bridge.
+    #[test]
+    fn bridge_end_reasons_map_one_for_one() {
+        for (proto, expected) in [
+            (ProtoWsBridgeEndReason::Detached, WsBridgeEndReason::Detached),
+            (ProtoWsBridgeEndReason::ServerClosed, WsBridgeEndReason::ServerClosed),
+            (ProtoWsBridgeEndReason::ServerStopped, WsBridgeEndReason::ServerStopped),
+            (ProtoWsBridgeEndReason::CallEnded, WsBridgeEndReason::CallEnded),
+            (ProtoWsBridgeEndReason::TransportError, WsBridgeEndReason::TransportError),
+        ] {
+            assert_eq!(ws_bridge_end_reason_from_proto(proto), expected);
+        }
+        // Only `detached` is orderly — everything else left a live call with no
+        // far side, which is what the WARN and the handler exist for.
+        assert!(!WsBridgeEndReason::Detached.is_unexpected());
+        for reason in [
+            WsBridgeEndReason::ServerClosed,
+            WsBridgeEndReason::ServerStopped,
+            WsBridgeEndReason::CallEnded,
+            WsBridgeEndReason::TransportError,
+        ] {
+            assert!(reason.is_unexpected(), "{} must read as unexpected", reason.as_str());
+        }
+    }
+
+    /// A bridge event from a newer engine must never read as an orderly detach:
+    /// that would silently hide a call whose media far side has gone away.
+    #[test]
+    fn an_unmodelled_bridge_end_reason_is_never_orderly() {
+        let mapped = convert_event(Event::WsBridgeEnded {
+            call_id: "c".into(),
+            from_tag: "t".into(),
+            stream_id: "s".into(),
+            reason: ProtoWsBridgeEndReason::TransportError,
+        });
+        match mapped {
+            RtpEngineEvent::WsBridgeEnded(ended) => {
+                assert!(ended.reason.is_unexpected());
+                assert_eq!(ended.stream_id, "s");
+            }
+            other => panic!("expected a bridge-ended event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bridge_started_carries_the_negotiated_wire_shape() {
+        let mapped = convert_event(Event::WsBridgeStarted {
+            call_id: "c".into(),
+            from_tag: "t".into(),
+            stream_id: "s".into(),
+            ws_uri: "wss://ai.invalid/one".into(),
+            sample_rate: 16_000,
+        });
+        match mapped {
+            RtpEngineEvent::WsBridgeStarted(started) => {
+                assert_eq!(started.ws_uri, "wss://ai.invalid/one");
+                assert_eq!(started.sample_rate, 16_000);
+                assert_eq!(started.stream_id, "s");
+            }
+            other => panic!("expected a bridge-started event, got {other:?}"),
+        }
     }
 
     /// `carry_received_from` is siphon-side policy, not a wire field: on its own

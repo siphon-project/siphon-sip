@@ -54,7 +54,7 @@ it nowhere, with nothing logged and silence on the line.
 two different shapes. They look similar in config and are not interchangeable —
 picking the wrong one is the most likely way to get this wrong.
 
-| | `ws_uri` — **bridge** | `ws_tee` / `attach_ws_tee` — **tee** |
+| | `ws_uri` / `attach_ws_bridge` — **bridge** | `ws_tee` / `attach_ws_tee` — **tee** |
 |---|---|---|
 | The WS server is | leg A's far side | an extra listener |
 | A↔B relay | **not wired** | stays wired |
@@ -67,6 +67,41 @@ far end: it receives the caller's audio as L16 and what it sends back is encoded
 toward the caller. There is no second SIP leg. This is the voice-AI
 answer-the-call shape, usually paired with `rtpengine.answer_local(...)` and the
 built-in `voice_ai` profile.
+
+A bridge can also be attached to a call that is already **relaying**, rather
+than negotiated at offer/answer — the engine takes the live relay over, and
+gives it back on detach:
+
+```python
+# Take the call over mid-call; the WS server is now this leg's far side.
+await rtpengine.attach_ws_bridge(call, "wss://ai.internal/session-1")
+
+# Move the same party to a different session. One verb, and the media path
+# never returns to the relay in between.
+await rtpengine.attach_ws_bridge(call, "wss://ai.internal/session-2")
+
+# Hand the media path back to the relay.
+await rtpengine.detach_ws_bridge(call)
+```
+
+Attaching to a call that already has a bridge is a **re-point**, not an error.
+That is the point of it: a detach followed by an attach would hand the path back
+to the relay for as long as the next attach took to land, and the other party
+hears that as a gap.
+
+`detach_ws_bridge` is **not** idempotent, unlike `detach_ws_tee`. The engine
+refuses a detach where there is no relay to hand the call back to — a
+`ws_uri`-negotiated bridge *is* the call's whole media path, and a single-leg
+`answer_local` takeover has no second party it could ever be relayed to — and
+siphon raises rather than answering success, because the alternative is a live
+call with no audio path at all. Re-point those instead, or end the call.
+
+Watch the lifecycle with `@rtpengine.on_ws_bridge_started` /
+`on_ws_bridge_ended`. Only `detached` is an orderly end; every other reason
+(`server_closed`, `server_stopped`, `call_ended`, `transport_error`) leaves both
+parties up and hearing nothing, which is why an unexpected end is logged at WARN
+even when no handler is registered. A re-point arrives as an `ended` with reason
+`detached` followed by a fresh `started`.
 
 **Tee (`ws_tee`).** The call relays or transcodes exactly as it otherwise would,
 *and* a copy of the decoded audio is streamed out. Additive: one decode feeds
