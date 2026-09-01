@@ -128,6 +128,13 @@ media:
     # PSTN -> Teams: carrier offers RTP, transcode up to SRTP for Teams.
     # The direction labels ("carrier"/"teams") must match the interface names
     # configured in rtpengine.conf.
+    # NOTE: a media profile controls transport, ICE, DTLS, direction and SDP
+    # rewriting — NOT codec selection. There is no `codec:` key here; one would
+    # be silently ignored. Restrict or reorder codecs from the script with the
+    # `sdp` namespace instead, e.g. in @b2bua.on_invite:
+    #     s = sdp.parse(call)
+    #     s.filter_codecs(["PCMA", "PCMU", "telephone-event"])
+    #     s.apply(call)
     # DIRECTION-BOUND, like its mirror below — do not inherit it across a
     # transfer or a Replaces takeover.
     rtp_to_srtp:

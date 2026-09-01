@@ -43,12 +43,15 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 - **`examples/teams_sbc.yaml` no longer shows a config key that does nothing.**
   Both profiles carried `codec: ["offer", "PCMA,PCMU"]`; there is no `codec`
   field on a media profile and nothing encodes it, so the line was silently
-  ignored while implying siphon transcodes on the operator's behalf. Removed,
-  the two direction-bound profiles are labelled as such, and the example gains a
+  ignored while implying siphon restricts codecs on the operator's behalf — it
+  looks like a real rtpengine NG flag, but `NgFlagsConfig` has no such field and
+  no `deny_unknown_fields`, so serde dropped it and nothing ever reached the
+  engine. Removed, with a note pointing at the mechanism that does work: codec
+  selection is done from a script through the `sdp` namespace
+  (`filter_codecs`/`remove_codecs`), not through a media profile. Both
+  direction-bound profiles are now labelled as such, and the example gains a
   `@b2bua.on_refer` handler showing the `profile=` a Teams SBC needs — the exact
-  topology where getting this wrong costs you the audio. Codec selection in
-  siphon is done from a script through the `sdp` namespace, not through a media
-  profile.
+  topology where getting this wrong costs you the audio.
 
 ## [1.7.0] — 2026-08-31
 

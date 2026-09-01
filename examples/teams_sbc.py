@@ -70,29 +70,22 @@ async def route(call):
 async def on_refer(call):
     """A party transfers the call away — pick the profile for the pair that REMAINS.
 
-    This is the trap at a mixed edge, and it is silent when you get it wrong.
     Every call here is anchored with a DIRECTION-BOUND profile: ``srtp_to_rtp``
     means "the offerer speaks SRTP, the answerer speaks plain RTP". A transfer
-    takes one of those two parties out of the call, so the profile that was right
-    for the original pairing is usually wrong for the new one — the surviving leg
-    gets re-INVITEd with a transport it never spoke, answers ``m=audio 0``, and
-    you are left with a connected call carrying no audio in either direction
-    while the SIP trace looks perfectly healthy.
+    takes one of those two parties out of the call, so the profile that suited
+    the original pairing is usually wrong for the new one — and the failure is
+    silent, a connected call with no audio in either direction.
 
-    The rule is: **the survivor is the peer of the referrer**, and the profile
+    The rule: **the survivor is the peer of the referrer**, and the profile
     describes survivor -> target.
 
-      Teams refers    -> Teams leaves, a carrier leg survives, the target is on
-                         the carrier side too: plain RTP on both ends, so the
-                         symmetric ``rtp_passthrough``.
-      Carrier refers  -> the carrier party leaves and the TEAMS leg survives, so
-                         the new pair is still SRTP -> plain RTP: ``srtp_to_rtp``,
-                         whose offer half is written for a Teams-side offerer.
+      Teams refers   -> Teams leaves, a carrier leg survives and the target is
+                        carrier-side too: plain RTP both ends, ``rtp_passthrough``.
+      Carrier refers -> the TEAMS leg survives, so the new pair is still
+                        SRTP -> plain RTP: keep ``srtp_to_rtp``.
 
-    ``call.refer_side`` says which leg sent the REFER ("a"/"b"); combined with
-    which leg is the Teams one, that gives the referrer. In practice Teams is
-    almost always the transferor — carriers rarely send REFER — but the SBC
-    should not fall over the day one does.
+    ``call.refer_side`` ("a"/"b") says which leg referred. In practice Teams is
+    almost always the transferor, but the SBC should not fall over otherwise.
     """
     if not call.refer_to:
         call.reject_refer(400, "Bad Request")
@@ -103,20 +96,13 @@ async def on_refer(call):
     a_leg_is_teams = call.from_gateway("teams")
     referrer_is_teams = a_leg_is_teams == (call.refer_side == "a")
 
-    if referrer_is_teams:
-        # Teams drops out. Both remaining ends are plain RTP on the carrier side.
-        profile = "rtp_passthrough"
-        destination = gateway.select("carrier")
-        group = "carrier"
-    else:
-        # The carrier party drops out and the Teams leg survives, so the
-        # surviving pair is still SRTP <-> RTP and keeps the asymmetric profile.
-        profile = "srtp_to_rtp"
-        destination = gateway.select("carrier")
-        group = "carrier"
+    # Teams leaving leaves two plain-RTP ends behind; Teams surviving keeps the
+    # asymmetric pairing.
+    profile = "rtp_passthrough" if referrer_is_teams else "srtp_to_rtp"
 
+    destination = gateway.select("carrier")
     if not destination:
-        log.error(f"[{call.id}] no healthy {group} gateway for transfer")
+        log.error(f"[{call.id}] no healthy carrier gateway for transfer")
         call.reject_refer(503, "Service Unavailable")
         return
 
