@@ -227,6 +227,24 @@ struct DispatcherState {
     /// CANCELs. The entry's `Notify` is fired by the late-ACK handler when the
     /// caller's ACK arrives; the retransmit task otherwise gives up at 64×T1.
     uas_2xx_retransmits: Arc<DashMap<String, Arc<tokio::sync::Notify>>>,
+    /// INVITE server transactions whose CANCEL has already been accepted,
+    /// keyed by the INVITE's transaction key.
+    ///
+    /// RFC 3261 §9.2: a CANCEL is a request with its own server transaction, so
+    /// a retransmitted CANCEL must be absorbed and answered from that
+    /// transaction. siphon intercepts CANCEL *before* transaction creation (see
+    /// `handle_cancel`), so no such transaction exists and nothing absorbs the
+    /// retransmission — the proxy path removed the session on the first CANCEL,
+    /// and the second fell through to `481 Call/Transaction Does Not Exist`
+    /// even though the CANCEL had been accepted and the INVITE already 487'd.
+    /// Over UDP that is the ordinary case, not an edge: Timer E retransmits the
+    /// CANCEL at 500 ms whenever the 200 is lost.
+    ///
+    /// Entries live for 64×T1 (Timer J, 32 s) — the window a CANCEL's own NIST
+    /// would have held its cached response — and are then dropped.
+    /// The B2BUA path needs no entry: it already answers 200 to a CANCEL for a
+    /// call that is no longer Calling/Ringing.
+    cancelled_invites: Arc<DashMap<TransactionKey, ()>>,
     /// Shared drain state — the server flips `drain.is_draining` on
     /// SIGTERM/SIGINT. While set, new INVITEs are rejected with 503 Service
     /// Unavailable; in-dialog requests (ACK, BYE, PRACK, re-INVITE) and
@@ -739,6 +757,7 @@ pub async fn run(
         call_event_receivers: Arc::new(DashMap::new()),
         reliable_provisionals: Arc::new(DashMap::new()),
         uas_2xx_retransmits: Arc::new(DashMap::new()),
+        cancelled_invites: Arc::new(DashMap::new()),
         is_draining: drain.clone(),
         rf_charger,
         rf_sessions: Arc::new(DashMap::new()),
@@ -11721,6 +11740,19 @@ fn handle_cancel(
     // CANCEL shares the same Via branch as the INVITE it cancels.
     // Build the server key for the original INVITE transaction.
     let invite_server_key = TransactionKey::new(uac_branch.to_string(), crate::sip::message::Method::Invite, uac_sent_by.to_string());
+
+    // Already accepted a CANCEL for this INVITE — this is a retransmission
+    // (RFC 3261 §9.2). Answer 200 as the CANCEL's own server transaction would
+    // have, and do nothing else: the downstream branches were cancelled and the
+    // 487 sent on the first copy, and repeating either would put a second final
+    // response on one INVITE server transaction (§17.2.1).
+    if state.cancelled_invites.contains_key(&invite_server_key) {
+        debug!(uac_branch = %uac_branch, "CANCEL retransmission — answering 200, side effects already done");
+        let response = build_response(&message, 200, "OK", state.server_header.as_deref(), &[]);
+        send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+        return;
+    }
+
     if let Some(session_arc) = state.session_store.get_by_server_key(&invite_server_key) {
         handle_cancel_via_session(inbound, message, &invite_server_key, session_arc, state);
         return;
@@ -11730,6 +11762,18 @@ fn handle_cancel(
     debug!(uac_branch = %uac_branch, "CANCEL for unknown transaction");
     let response = build_response(&message, 481, "Call/Transaction Does Not Exist", state.server_header.as_deref(), &[]);
     send_message_from(response, inbound.transport, inbound.remote_addr, inbound.connection_id, Some(inbound.local_addr), state);
+}
+
+/// Remember that a CANCEL was accepted for `key`, for the 64×T1 window a
+/// CANCEL's own server transaction would have held its cached response
+/// (RFC 3261 Timer J). Mirrors [`schedule_zombie_cancelled_cleanup`].
+fn remember_cancelled_invite(store: &Arc<DashMap<TransactionKey, ()>>, key: TransactionKey) {
+    store.insert(key.clone(), ());
+    let store = Arc::clone(store);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(32)).await;
+        store.remove(&key);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -12069,6 +12113,9 @@ fn handle_cancel_via_session(
     }
 
     state.session_store.remove_by_server_key(&server_key);
+    // Removing the session is what makes a retransmitted CANCEL unmatchable, so
+    // record the acceptance in the same breath (RFC 3261 §9.2).
+    remember_cancelled_invite(&state.cancelled_invites, server_key);
 }
 
 // ---------------------------------------------------------------------------
@@ -29284,6 +29331,95 @@ a=rtpmap:8 PCMA/8000\r\n";
         let store = store_after_teardown("ue-call-id@10.0.0.1");
         let ack = in_dialog_request(Method::Ack, "ue-call-id@10.0.0.1", Some("bob-tag"));
         assert!(!terminated_dialog_needs_481("ACK", &ack, &store));
+    }
+
+    // -----------------------------------------------------------------------
+    // CANCEL retransmission (RFC 3261 §9.2)
+    // -----------------------------------------------------------------------
+    //
+    // A CANCEL is a request with its own server transaction, which absorbs
+    // retransmissions and answers them from its cached response. siphon
+    // intercepts CANCEL before transaction creation, so that transaction never
+    // exists — `cancelled_invites` is what stands in for it. These pin the
+    // three dispositions `handle_cancel` can reach for the proxy path.
+
+    fn cancel_key(branch: &str) -> TransactionKey {
+        TransactionKey::new(
+            branch.to_string(),
+            Method::Invite,
+            "10.0.0.1:5060".to_string(),
+        )
+    }
+
+    /// The key a CANCEL resolves to is the *INVITE's*, not the CANCEL's — that
+    /// is what makes it find the INVITE's session (RFC 3261 §9.1: same branch).
+    #[test]
+    fn cancel_resolves_to_the_invites_transaction_key() {
+        let invite = cancel_key("z9hG4bK-abc");
+        assert_eq!(invite.method, Method::Invite);
+        // And a CANCEL's *own* key is distinct, so recording one never shadows
+        // the other (`transaction::key::tests::cancel_has_own_transaction`).
+        let own = TransactionKey::new(
+            "z9hG4bK-abc".to_string(),
+            Method::Cancel,
+            "10.0.0.1:5060".to_string(),
+        );
+        assert_ne!(invite, own);
+    }
+
+    /// The first CANCEL is not a retransmission, so it does the real work.
+    #[test]
+    fn a_first_cancel_is_not_treated_as_a_retransmission() {
+        let store: Arc<DashMap<TransactionKey, ()>> = Arc::new(DashMap::new());
+        assert!(!store.contains_key(&cancel_key("z9hG4bK-first")));
+    }
+
+    /// After acceptance, a second CANCEL on the same branch is a retransmission
+    /// — answered 200, with none of the side effects repeated. Before this, the
+    /// session had already been removed so the second copy fell through to 481,
+    /// and a copy arriving *before* the removal repeated the downstream CANCEL
+    /// and put a second 487 on one INVITE server transaction (§17.2.1).
+    #[test]
+    fn a_cancel_after_acceptance_is_a_retransmission() {
+        let store: Arc<DashMap<TransactionKey, ()>> = Arc::new(DashMap::new());
+        let key = cancel_key("z9hG4bK-dup");
+        store.insert(key.clone(), ());
+        assert!(store.contains_key(&key));
+    }
+
+    /// Acceptance is per-transaction: a CANCEL for a different INVITE is
+    /// unaffected and still reaches the session lookup.
+    #[test]
+    fn acceptance_does_not_leak_across_transactions() {
+        let store: Arc<DashMap<TransactionKey, ()>> = Arc::new(DashMap::new());
+        store.insert(cancel_key("z9hG4bK-one"), ());
+        assert!(!store.contains_key(&cancel_key("z9hG4bK-two")));
+
+        // Same branch, different sent-by is also a different transaction
+        // (§17.2.3) — two UAs can pick the same branch.
+        let elsewhere = TransactionKey::new(
+            "z9hG4bK-one".to_string(),
+            Method::Invite,
+            "10.0.0.2:5060".to_string(),
+        );
+        assert!(!store.contains_key(&elsewhere));
+    }
+
+    /// The entry is recorded and reaped, so the map cannot grow without bound
+    /// under a CANCEL flood. 32 s is Timer J (64×T1) — the window a CANCEL's own
+    /// NIST would have held its cached response.
+    #[tokio::test(start_paused = true)]
+    async fn an_accepted_cancel_is_forgotten_after_timer_j() {
+        let store: Arc<DashMap<TransactionKey, ()>> = Arc::new(DashMap::new());
+        let key = cancel_key("z9hG4bK-reaped");
+        remember_cancelled_invite(&store, key.clone());
+        assert!(store.contains_key(&key), "recorded immediately");
+
+        tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+        assert!(store.contains_key(&key), "still inside the 64xT1 window");
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert!(!store.contains_key(&key), "reaped after Timer J");
     }
 
     #[test]
