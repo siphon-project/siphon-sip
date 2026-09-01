@@ -7,6 +7,18 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Fixed
+- **The B-leg INVITE no longer carries the session-timer headers twice.** The
+  B-leg INVITE is cloned from the caller's, so whatever it asked for is already
+  on it — a Teams INVITE arrives with `Session-Expires: 3600`, `Min-SE: 300` and
+  `Supported: histinfo,timer`. siphon then *appended* its own, and the callee saw
+  both. `Session-Expires` and `Min-SE` are single-value headers (RFC 4028 §4,
+  §5): siphon's `Min-SE: 90` next to the caller's `Min-SE: 300` is not a longer
+  list, it is two contradictory floors, and which one the far end honours is
+  undefined — take the lower and the session refreshes below the interval the
+  caller demanded. They are replaced now. `Supported` genuinely is a list header
+  (RFC 3261 §7.3.1), so the option tag is merged into the value already there
+  instead of arriving as a second `Supported:` line. The refresh-re-INVITE path
+  always did this correctly; only the B-leg builder did not.
 - **A transfer offered the target the survivor's *original* media, not its
   current media.** siphon tracked the SDP of whichever leg **offered** a
   re-INVITE or UPDATE, never of the leg that merely **answered** one. So a leg

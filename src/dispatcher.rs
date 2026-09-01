@@ -14011,6 +14011,32 @@ fn build_b_leg_contact(
     }
 }
 
+/// Advertise an option tag in `Supported` without repeating one already there.
+///
+/// `Supported` is a comma-separated list header, so the tag belongs *inside* the
+/// existing value. Adding a second `Supported:` line is legal per RFC 3261
+/// §7.3.1 and still wrong-looking on the wire — a peer sees
+/// `Supported: histinfo,timer` followed by `Supported: timer`.
+fn advertise_option_tag(headers: &mut crate::sip::headers::SipHeaders, tag: &str) {
+    match headers.get("Supported") {
+        Some(existing) => {
+            if existing
+                .split(',')
+                .any(|option| option.trim().eq_ignore_ascii_case(tag))
+            {
+                return;
+            }
+            let merged = if existing.trim().is_empty() {
+                tag.to_string()
+            } else {
+                format!("{},{tag}", existing.trim())
+            };
+            headers.set("Supported", merged);
+        }
+        None => headers.set("Supported", tag.to_string()),
+    }
+}
+
 /// Send a B-leg INVITE for a B2BUA call.
 ///
 /// `target_uri` drives the new INVITE's R-URI (so the called party's IMPU
@@ -14441,22 +14467,34 @@ fn b2bua_send_b_leg_invite(
 
     // Inject RFC 4028 session timer headers if configured.
     // Per-call override (from call.session_timer()) takes precedence over global config.
-    if let Some(ref override_config) = per_call_override {
-        b_leg_invite.headers.add("Supported", "timer".to_string());
-        b_leg_invite.headers.add(
-            "Session-Expires",
-            format!("{};refresher=uac", override_config.session_expires),
-        );
-        b_leg_invite.headers.add("Min-SE", override_config.min_se.to_string());
-    } else if let Some(ref timer_config) = state.session_timer_config {
-        if timer_config.enabled {
-            b_leg_invite.headers.add("Supported", "timer".to_string());
-            b_leg_invite.headers.add(
-                "Session-Expires",
-                format!("{};refresher=uac", timer_config.session_expires),
-            );
-            b_leg_invite.headers.add("Min-SE", timer_config.min_se.to_string());
-        }
+    //
+    // REPLACE, never append. This INVITE is a clone of the A-leg's, so whatever
+    // the caller asked for is already on it — a Teams INVITE arrives carrying
+    // `Session-Expires: 3600` and `Min-SE: 300`. `Session-Expires` and `Min-SE`
+    // are single-value headers (RFC 4028 §4, §5), so appending emitted two of
+    // each and left the callee to pick: siphon's `Min-SE: 90` next to the
+    // caller's `Min-SE: 300` is not a longer list, it is two contradictory
+    // floors, and which one the far end honours is undefined. Getting the lower
+    // one through negotiates a refresh below the interval the caller demanded.
+    let session_timer = per_call_override
+        .as_ref()
+        .map(|override_config| (override_config.session_expires, override_config.min_se))
+        .or_else(|| {
+            state
+                .session_timer_config
+                .as_ref()
+                .filter(|timer_config| timer_config.enabled)
+                .map(|timer_config| (timer_config.session_expires, timer_config.min_se))
+        });
+    if let Some((session_expires, min_se)) = session_timer {
+        b_leg_invite
+            .headers
+            .set("Session-Expires", format!("{session_expires};refresher=uac"));
+        b_leg_invite.headers.set("Min-SE", min_se.to_string());
+        // `Supported` *is* a list header (RFC 3261 §7.3.1), so a second line is
+        // legal — but it is still the same option tag twice on the wire. Merge
+        // the tag into what the caller already advertised instead.
+        advertise_option_tag(&mut b_leg_invite.headers, "timer");
     }
 
     // Sanitize SDP: mask A-leg identity in o= and s= lines, and rewrite
@@ -24337,6 +24375,41 @@ mod tests {
     use crate::sip::parser::parse_sip_message;
     use crate::sip::uri::SipUri;
     use crate::sip::builder::SipMessageBuilder;
+
+    /// `Supported` is a list header: the option tag goes *inside* the value the
+    /// caller already advertised, never on a second line.
+    #[test]
+    fn option_tag_merges_into_the_callers_supported() {
+        let mut headers = crate::sip::headers::SipHeaders::new();
+
+        // Absent → set.
+        advertise_option_tag(&mut headers, "timer");
+        assert_eq!(headers.get("Supported").map(String::as_str), Some("timer"));
+
+        // Already advertised → untouched, and NOT repeated.
+        advertise_option_tag(&mut headers, "timer");
+        assert_eq!(headers.get_all("Supported").map(|v| v.len()), Some(1));
+
+        // Present without the tag → merged into the same line, caller's tags kept.
+        let mut headers = crate::sip::headers::SipHeaders::new();
+        headers.set("Supported", "histinfo".to_string());
+        advertise_option_tag(&mut headers, "timer");
+        assert_eq!(
+            headers.get("Supported").map(String::as_str),
+            Some("histinfo,timer")
+        );
+        assert_eq!(headers.get_all("Supported").map(|v| v.len()), Some(1));
+
+        // Case-insensitive per RFC 3261 §7.3.1, and whitespace-tolerant.
+        let mut headers = crate::sip::headers::SipHeaders::new();
+        headers.set("Supported", "histinfo, TIMER".to_string());
+        advertise_option_tag(&mut headers, "timer");
+        assert_eq!(
+            headers.get("Supported").map(String::as_str),
+            Some("histinfo, TIMER"),
+            "an option tag already present in any case must not be repeated"
+        );
+    }
 
     /// A B-leg response is classified by its own status line and nothing else.
     ///
