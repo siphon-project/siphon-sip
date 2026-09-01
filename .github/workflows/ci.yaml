@@ -1532,6 +1532,9 @@ jobs:
       - name: Run fuzz target — stream framing (60s)
         run: PYO3_PYTHON=python3.14 cargo +nightly fuzz run stream_framing_fuzz -- -max_total_time=60
 
+      - name: Run fuzz target — framer/parser agreement (60s)
+        run: PYO3_PYTHON=python3.14 cargo +nightly fuzz run framing_parser_agreement_fuzz -- -max_total_time=60
+
   # ── SIPp IPsec VoLTE test (self-hosted) ────────────────────────────────
   # IPsec XFRM SA installation needs CAP_NET_ADMIN, which GitHub-hosted runners
   # don't grant. Runs on the self-hosted `ipsec` runner (real xfrm) on trusted

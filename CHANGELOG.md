@@ -7,6 +7,45 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Security
+- **Refused bare CR/LF in a SIP header block, and closed five framer/parser
+  disagreements it was hiding.** siphon's header-value scan runs to the next
+  CRLF, so a line ended with a bare LF was absorbed into the *previous* header's
+  value — while the stream framer's `Content-Length` scan split on LF and read
+  that same line as a header of its own. `X-Pad: a\nContent-Length: 4` +
+  `Content-Length: 0` framed as two different messages depending on which half
+  of siphon you asked, and an upstream proxy or load balancer that treats bare
+  LF as a terminator made a third reading. That is the shape request smuggling
+  is built out of. RFC 3261 §7.5 makes CRLF the only terminator, so a header
+  block containing a bare CR or LF is now refused; bodies are untouched.
+
+  A new fuzz target asserts the general invariant — *for any bytes the parser
+  accepts, the framer must compute the same message length* — and found four
+  more divergences, all fixed:
+
+  - A **folded continuation line carrying a `Content-Length`** was a header to
+    the framer and part of the previous value to the parser (133 bytes against
+    232).
+  - The reverse: a **folded `Content-Length` value** the parser read and the
+    framer did not.
+  - A **continuation line with nothing to continue** (the header section opening
+    with a fold) was promoted to a header by the parser and skipped as a fold by
+    the framer. Now refused.
+  - A **vertical tab in a header name**: `str::trim` is Unicode-aware and
+    stripped it, so `content-length\x0b` became `Content-Length` to the parser,
+    while the framer's ASCII trim left it alone. Header names are ASCII tokens
+    (§25.1), so the parser now trims ASCII too.
+
+### Fixed
+- **A header with an empty value no longer swallows the next header line.**
+  RFC 3261 §25.1 has `SWS = [LWS]` and `LWS = [*WSP CRLF] 1*WSP` — a CRLF after
+  the header colon is only whitespace when a space or tab follows it. siphon
+  accepted a bare one, so `X:\r\nContent-Length: 5\r\n\r\n` parsed as a single
+  header `X` with the value `Content-Length: 5` and no `Content-Length` at all.
+- **A UDP datagram prefixed with a stray CRLF is no longer dropped as a parse
+  error** (RFC 3261 §7.5). The stream transports drain keepalives in their own
+  read tasks, but the parser searched for the header/body boundary before
+  skipping the prefix and so found the prefix itself.
+
 - **Bounded stream message size (`security.max_message_bytes`).** A peer on a
   stream transport (TCP/TLS/WS/WSS) could declare an arbitrarily large
   `Content-Length`, send only the header block, and make the reader buffer

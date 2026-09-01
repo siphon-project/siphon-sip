@@ -24,3 +24,10 @@ path = "fuzz_targets/stream_framing_fuzz.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "framing_parser_agreement_fuzz"
+path = "fuzz_targets/framing_parser_agreement_fuzz.rs"
+test = false
+doc = false
+bench = false
