@@ -12284,8 +12284,15 @@ fn handle_b2bua_cancel(
     // the same teardown the answered/failed paths hook — emit StasisEnd + drop
     // the ControlBus channel so the owning app learns to abort and no owner
     // entry leaks (keyed on the A-leg Call-ID == this CANCEL's Call-ID; no-op for
-    // an uncontrolled call).
-    control_notify_terminated(&sip_call_id, "cancelled");
+    // an uncontrolled call). The cause is 487: RFC 3261 §9.2 has the UAS answer
+    // the CANCELled INVITE `487 Request Terminated`, which is the status the
+    // caller saw — an app that branches on the code must read the same one.
+    control_notify_terminated_with_cause(
+        &sip_call_id,
+        "cancelled",
+        Some(487),
+        Some("Request Terminated"),
+    );
 
     // CDR: the caller CANCELled before answer (cdr.auto_emit) → 487.
     cdr_finalize_b2bua_fail(state, &call_id, 487);
@@ -12933,8 +12940,15 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
     // RTPEngine safety-net cleanup (mirrors the B-leg failure path).
     let a_sip_call_id = a_leg.dialog.call_id.clone();
     // Control plane: emit StasisEnd for a controlled call that failed (no-op
-    // otherwise).
-    control_notify_terminated(&a_sip_call_id, "failed");
+    // otherwise), carrying the `408 Request Timeout` this path just sent the
+    // A-leg (RFC 3261 §16.8) — "failed" alone does not say whether nobody
+    // answered or the callee refused, and an app branches on the difference.
+    control_notify_terminated_with_cause(
+        &a_sip_call_id,
+        "failed",
+        Some(408),
+        Some("Request Timeout"),
+    );
     if let (Some(rtpengine_set), Some(media_sessions)) =
         (&state.rtpengine_set, &state.rtpengine_sessions)
     {
@@ -18850,7 +18864,12 @@ pub fn b2bua_reject_call(internal_call_id: &str, code: u16, reason: &str) -> boo
     if crate::cdr::auto_emit_enabled() {
         cdr_finalize_b2bua_fail(state, internal_call_id, code);
     }
-    control_notify_terminated(&sip_call_id, reason);
+    // The final non-2xx this path just sent *is* the cause, and it is the only
+    // record of it: nothing else reports which status ended a call the app
+    // declined, the handoff deadline degraded (503), or an unanswered hangup
+    // closed (603). RFC 3261 §8.1.3.4 leaves the meaning to the code plus the
+    // reason phrase, so both go out.
+    control_notify_terminated_with_cause(&sip_call_id, reason, Some(code), Some(reason));
     state.call_actors.remove_call(internal_call_id);
     state.call_event_receivers.remove(internal_call_id);
     true
@@ -20773,7 +20792,16 @@ pub fn b2bua_cancel_originated_call(sip_call_id: &str, reason: Option<&str>) -> 
     if crate::cdr::auto_emit_enabled() {
         cdr_finalize_b2bua_fail(state, &internal_call_id, 487);
     }
-    control_notify_terminated(sip_call_id, reason.unwrap_or("cancelled"));
+    // RFC 3261 §9.1: the callee answers a CANCELled INVITE `487 Request
+    // Terminated`. We abandoned this leg before it was answered, so 487 is the
+    // status that ends it — reported here because a controller driving a leg
+    // siphon placed has no response frame of its own to read it off.
+    control_notify_terminated_with_cause(
+        sip_call_id,
+        reason.unwrap_or("cancelled"),
+        Some(487),
+        Some("Request Terminated"),
+    );
     // Keep the leg alive as a zombie so a 2xx that raced our CANCEL is still
     // ACKed + BYEd (RFC 3261 §9.1 glare) rather than left ringing on the callee.
     if state.call_actors.remove_call_after_cancel(&internal_call_id) {

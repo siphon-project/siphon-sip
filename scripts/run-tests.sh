@@ -201,7 +201,7 @@ if [[ "$RUN_VOICE_AI" == true ]]; then
 fi
 
 # ── Step 7a1: External control plane — the application rail (optional) ────
-# Five cases against one siphon, both connection modes at once. Each SIPp
+# Six cases against one siphon, both connection modes at once. Each SIPp
 # scenario is the decider for its own step (--exit-code-from), and the parts the
 # SIP wire cannot show — which connection was given the call, whether a media
 # verb was performed or merely accepted, what `resync` handed back — are
@@ -264,6 +264,13 @@ if [[ "$RUN_CONTROL" == true ]]; then
   docker compose -f "$COMPOSE_FILE" --profile control rm -sf sipp-control-handover-uac 2>/dev/null || true
   control_dump_logs
   assert_control_verdict handover control-app-edge.log
+
+  echo "--- ring then early media: two verbs, a body-less 180 then a 183 with SDP ---"
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile control up \
+    --abort-on-container-exit --exit-code-from sipp-control-progress-uac sipp-control-progress-uac
+  docker compose -f "$COMPOSE_FILE" --profile control rm -sf sipp-control-progress-uac 2>/dev/null || true
+  control_dump_logs
+  assert_control_verdict progress control-app-edge.log
 
   echo "--- handoff deadline: the controller never acts, siphon applies its default ---"
   run_sipp docker compose -f "$COMPOSE_FILE" --profile control up \

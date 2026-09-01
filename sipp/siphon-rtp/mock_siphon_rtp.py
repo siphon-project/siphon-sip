@@ -93,6 +93,9 @@ def answer_sdp_for(offer: str, port: int) -> str:
 CALLS: dict = {}
 CALLS_LOCK = threading.Lock()
 NEXT_PORT = [int(MOCK_MEDIA_PORT)]
+# Starts at 1: a play_id of 0 is a real handle in the contract, so a test that
+# saw 0 could not tell it from a field the mock forgot to set.
+NEXT_PLAY_ID = [1]
 
 
 def allocate_port() -> int:
@@ -100,6 +103,14 @@ def allocate_port() -> int:
     port = NEXT_PORT[0]
     NEXT_PORT[0] += 2
     return port
+
+
+def next_play_id() -> int:
+    """Hand out the next playback handle, as the engine's play_media accept does."""
+    with CALLS_LOCK:
+        play_id = NEXT_PLAY_ID[0]
+        NEXT_PLAY_ID[0] += 1
+    return play_id
 
 
 def primary_codec(sdp: str) -> str:
@@ -158,7 +169,13 @@ def handle_command(command: dict) -> dict:
         with CALLS_LOCK:
             CALLS.pop(call_id, None)
         return {"result": "ok"}
-    if verb in ("attach_ws_tee", "detach_ws_tee", "play_media", "stop_media"):
+    if verb == "play_media":
+        # The contract answers play_media accept-on-start with a `play_id` — the
+        # handle a targeted stop / a gain change addresses, and the value a
+        # completion correlates against. A mock that omitted it would let siphon
+        # ship a play whose accept carries no handle without anything noticing.
+        return {"result": "ok", "play_id": next_play_id(), "duration_ms": 1500}
+    if verb in ("attach_ws_tee", "detach_ws_tee", "stop_media"):
         return {"result": "ok"}
     # Unknown verbs are an explicit error, never a silent ok — a mock that
     # answers ok to everything hides exactly the bugs this exists to catch.

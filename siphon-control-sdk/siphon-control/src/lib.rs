@@ -246,6 +246,24 @@ impl Call {
         })
     }
 
+    /// Send ``180 Ringing``: alerting only, no early media.
+    ///
+    /// RFC 3261 §13.2.1 makes the 180 the "callee is being alerted" signal, and
+    /// RFC 3960 §3.1 puts early media on a response that carries SDP — two
+    /// different acts, so two verbs. Ring for as long as your own policy says,
+    /// then ``answer()``; open an early-media path with ``progress_with()``.
+    #[pyo3(signature = (reason=None))]
+    fn ring<'py>(&self, py: Python<'py>, reason: Option<String>) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match reason {
+                Some(reason) => call.ring_with_reason(&reason).await,
+                None => call.ring().await,
+            }
+            .map_err(to_pyerr)
+        })
+    }
+
     fn progress<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {

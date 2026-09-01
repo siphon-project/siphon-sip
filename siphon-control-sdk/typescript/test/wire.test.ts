@@ -46,6 +46,8 @@ describe("command wire bytes (byte-identical to the server)", () => {
 describe("SipVerb wire tokens + event names", () => {
   it("maps verbs to the exact wire tokens", () => {
     expect(SipVerb.Answer).toBe("answer");
+    expect(SipVerb.Ring).toBe("ring");
+    expect(SipVerb.Progress).toBe("progress");
     expect(SipVerb.Hangup).toBe("hangup");
     expect(SipVerb.Route).toBe("route");
     expect(SipVerb.SetHeader).toBe("set_header");
@@ -129,6 +131,27 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
       { module: MODULE_SIP, verb: "answer", target: { channel: "ch1" }, args: { code: 200, reason: "OK" } },
       { module: MODULE_SIP, verb: "progress", target: { channel: "ch1" }, args: {} },
       { module: MODULE_SIP, verb: "reject", target: { channel: "ch1" }, args: { code: 486, reason: "Busy Here" } },
+    ]);
+  });
+
+  // Alerting and early media are two verbs on the wire, not one verb plus a
+  // status code the app has to know: `ring` emits its own token and carries no
+  // body, `progress` is the one that can (RFC 3960 §3.1).
+  it("ring and progress are separate verbs", async () => {
+    const transport = new RecordingTransport();
+    const call = makeCall(transport);
+    await call.ring();
+    await call.ring("Alerting");
+    await call.progress({ code: 183, body: "v=0\r\n", contentType: "application/sdp" });
+    expect(transport.calls).toEqual([
+      { module: MODULE_SIP, verb: "ring", target: { channel: "ch1" }, args: {} },
+      { module: MODULE_SIP, verb: "ring", target: { channel: "ch1" }, args: { reason: "Alerting" } },
+      {
+        module: MODULE_SIP,
+        verb: "progress",
+        target: { channel: "ch1" },
+        args: { code: 183, body: "v=0\r\n", content_type: "application/sdp" },
+      },
     ]);
   });
 

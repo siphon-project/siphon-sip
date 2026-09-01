@@ -8,6 +8,9 @@ The dialled user selects the case, and the case is echoed into the handover's
 `vars` so the app knows what to do without a second channel of coordination:
 
   handover@ — deferred handover to the per-call-connect app; the app answers.
+  progress@ — deferred handover; the app rings, holds the ring on its own clock,
+              then opens early media, then answers — so a plain 180 and a
+              183-with-SDP are two separate verbs on the wire.
   media@    — answer-first (AI-park) handover; the app drives media verbs on the
               already-connected channel.
   deadline@ — deferred handover to an app that deliberately never acts, so the
@@ -64,6 +67,12 @@ def route(call):
             PER_CALL_CONNECT_APP,
             deadline_ms=GENEROUS_DEADLINE_MS,
             vars={"case": "handover"},
+        )
+    elif user == "progress":
+        call.handover(
+            PER_CALL_CONNECT_APP,
+            deadline_ms=GENEROUS_DEADLINE_MS,
+            vars={"case": "progress"},
         )
     elif user == "media":
         call.handover(

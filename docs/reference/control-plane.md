@@ -50,7 +50,7 @@ async def handle(call):
 asyncio.run(client.run())                     # connect, dispatch, reconnect + resync
 ```
 
-`Call` verbs: `answer()` / `answer_with(code, …)`, `progress()`,
+`Call` verbs: `answer()` / `answer_with(code, …)`, `ring(reason=None)`, `progress()`,
 `reject(code, reason)`, `hangup(reason=None)`, `refer(to)` / `transfer(to)`,
 `set_header(name, value)` / `get_header(name)`, `set_var(key, value)` /
 `get_var(key)`, plus the generic `command(verb, args=None)` escape hatch and
@@ -208,7 +208,8 @@ chunk, so logs join Homer and billing with no mapping table.
 |---|---|---|---|
 | `originate` | sip | `{channel, to, from?, from_display?, to_display?, next_hop?, p_asserted_identity?, privacy?, headers?, sdp \| media, profile?, ws_uri?, timeout?, on_lost?, vars?}` | place an outbound call under a **caller-supplied** channel id; returns as soon as the INVITE is on the wire |
 | `answer` | sip | `{code, reason?, body?, content_type?}` | UAS 2xx to the parked A-leg |
-| `progress` | sip | `{code, reason?, body?, content_type?}` | 1xx / early media |
+| `ring` | sip | `{reason?}` | `180 Ringing` — alerting only (RFC 3261 §13.2.1); a body is refused |
+| `progress` | sip | `{code, reason?, body?, content_type?}` | a UAS 1xx, optionally opening an early-media path with SDP (RFC 3960 §3.1); defaults to `183 Session Progress` |
 | `reject` | sip | `{code, reason?}` | final non-2xx + tear down |
 | `hangup` | sip | `{reason?}` | BYE an answered call, or reject an unanswered one |
 | `refer` | sip | `{to, replaces?}` | in-dialog REFER on the A-leg |
@@ -216,7 +217,7 @@ chunk, so logs join Homer and billing with no mapping table.
 | `reject_refer` | sip | `{code?, reason?}` | reject a pending inbound REFER with a final non-2xx (default `603 Decline`) |
 | `route` | sip | `{targets, strategy?, headers?}` | return control to siphon: un-park the call and dial the B-leg via LCR sequential failover |
 | `set_header` / `remove_header` / `get_header` | sip | `{name, value?}` | on the stored A-leg INVITE |
-| `play` | sip | `{file\|db_id\|blob, repeat?, start_ms?, duration_ms?, to_tag?}` | play an announcement on the A-leg media (fire-and-forget) |
+| `play` | sip | `{file\|db_id\|blob\|tone\|url, repeat?, start_ms?, duration_ms?, gain_decibels?, to_tag?}` | play an announcement on the A-leg media (fire-and-forget); the reply and a `PlayStarted` event carry the `play_id` |
 | `stop` | sip | — | stop the announcement currently playing |
 | `dtmf` | sip | `{digits, duration_ms?, volume_dbm0?, pause_ms?, to_tag?}` | inject DTMF digits toward the A-leg |
 | `hold` / `unhold` | sip | — | media hold via silence |
@@ -241,15 +242,50 @@ failover. `continue` (bare hand-back, siphon re-decides routing through the
 script's `@b2bua.on_*` handlers) is a follow-up, pending the control-loss
 `fallback` re-dispatch path.
 
+**Ringing and early media are two verbs, not one.** RFC 3261 §13.2.1 makes the
+`180 Ringing` the "callee is being alerted" signal and §21.1.2 gives it no
+session semantics; RFC 3960 §3.1 puts early media on the response that carries
+the SDP. So `ring` sends a plain 180 and refuses a body — an application rings
+for an interval of its **own** policy's choosing, then answers — and `progress`
+is the one that opens an early-media path. A provisional's reply names which it
+was: `{state: "ringing"|"progress", code, early_media}`, the same vocabulary as
+the callee-side `ChannelStateChange` on an originated leg, so there is one
+mapping to learn rather than two.
+
+**`StasisEnd` carries the hangup cause and, where a final response was involved,
+the SIP status.** `reason` is always present and says why siphon ended the call
+(`bye`, `cancelled`, `failed`, `rejected`, `media_failed`, `transfer_failed`,
+`routed`, or a hangup reason the app supplied); `code` and `response` ride
+alongside it whenever a SIP final response was part of the teardown — `487` on a
+CANCEL either way round, `408` on the answer timeout, the callee's own status on
+a rejected originated leg, and the status siphon sent on a `reject` / an
+unanswered `hangup` / the handoff deadline (`503`). A teardown with no SIP
+response — an ordinary BYE, a script-driven terminate — omits both keys rather
+than inventing one, so `code` present always means a real status was on the wire.
+
 The media verbs (`play` / `stop` / `dtmf` / `hold` / `unhold` / `stream_start` /
 `stream_stop`) act on the controlled A-leg's anchored media session. They are
 resolved against the configured media backend and answer with a typed reply the
 same way every other verb does — never a hang:
 
 - `play` is **fire-and-forget**: the reply confirms the backend *accepted* the
-  command (`{state: "playing"}`), it does not wait for the prompt to finish. The
-  source is exactly one of `file` (a path on the media host), `db_id` (a prompt
-  in the engine's DB), or `blob` (base64-encoded audio, since the wire is JSON).
+  command (`{state: "playing", play_id?, duration_ms?}`), it does not wait for
+  the prompt to finish. The source is exactly one of `file` (a path on the media
+  host), `db_id` (a prompt in the engine's DB), `blob` (base64-encoded audio,
+  since the wire is JSON), `tone` (a synthesised call-progress tone) or `url`
+  (a WAV the engine fetches). The accept is also pushed as a **`PlayStarted`**
+  event, payload `{source, play_id?, duration_ms?}`, so a controller that runs
+  its playback logic off the event stream — a watchdog on a source that may
+  never produce audio, a gain ramp on a prompt — has one ordered place to hang
+  it. `play_id` is the same value in both, and is what a targeted `stop`
+  addresses; it is **omitted** on backends that assign no handle (rtpengine /
+  rtpproxy) rather than faked. The reply and the event travel on different paths
+  and either may land first — correlate on `play_id`, not on arrival order. The media contract answers `play`
+  *accept-on-start*, so `PlayStarted` means the engine armed the playback, not
+  that audio has reached the wire: a `url` source accepts before its body has
+  arrived, which is why `duration_ms` can be absent. A play the backend refuses
+  answers with a typed error and pushes **no** `PlayStarted`, so "no start event
+  yet" always reads as "not started".
 - `hold` maps to the engine's *silence* (comfort-noise) mode and `unhold`
   restores it — a gentle hold that keeps the media path up. Dropping packets
   outright (`block`/`unblock`) is a separate future gate verb.
@@ -340,6 +376,7 @@ events on your id:
 | `ChannelStateChange` | `{state:"ringing"\|"progress", code, early_media, sdp?}` | a 1xx from the callee (`progress` when it carried SDP) |
 | `ChannelStateChange` | `{state:"answered", code, sdp?}` | the callee answered; siphon has ACKed |
 | `StasisEnd` | `{reason:"rejected", code, response}` | the callee rejected it — the SIP cause, since there is no A-leg it was relayed to |
+| `StasisEnd` | `{reason:"cancelled", code:487, response}` | the leg was abandoned before answer (RFC 3261 §9.1) |
 | `StasisEnd` | `{reason:"bye"}` / `{reason:"ring timeout"}` / `{reason:<hangup reason>}` | the call ended |
 
 **Media.** Exactly one plan is required, because an INVITE with no offer and no
