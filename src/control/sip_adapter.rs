@@ -39,6 +39,10 @@ impl ControlAdapter for SipControlAdapter {
             if command.verb == "originate" {
                 // Module-level: it creates the channel rather than addressing one.
                 originate(command)
+            } else if is_bridge_verb(&command.verb) {
+                // Addresses two channels and confirms the media teardown with
+                // the backend before it answers, so it runs on the async path.
+                apply_bridge_verb(command).await
             } else if is_media_verb(&command.verb) {
                 apply_media_verb(command).await
             } else {
@@ -60,6 +64,8 @@ impl ControlAdapter for SipControlAdapter {
                 verb("refer", "Send an in-dialog REFER on the A-leg; the reply reports only that it was sent, the far end's verdict arrives as TransferProgress then TransferCompleted / TransferFailed (args: to, replaces)"),
                 verb("accept_refer", "Accept a pending inbound REFER (from a TransferRequested event) and run the transfer (args: target, next_hop, mode)"),
                 verb("reject_refer", "Reject a pending inbound REFER with a final non-2xx (args: code, reason)"),
+                verb("bridge", "Join this channel to another the app owns, so the two parties hear each other; the reply says the media was re-pointed and the first re-INVITE is on the wire, ChannelBridged says the audio meets (args: with, on_peer_hangup)"),
+                verb("unbridge", "Break a bridge — both legs stay answered, owned and held; the reply says the hold offers went out, ChannelUnbridged on each leg says it is parted and safe to bridge again (args: reason)"),
                 verb("route", "Return control to siphon with a routing decision: un-park the call and dial the B-leg via LCR sequential failover (args: targets, strategy, headers)"),
                 verb("set_header", "Set a header on the stored A-leg INVITE (args: name, value)"),
                 verb("remove_header", "Remove a header from the stored A-leg INVITE (args: name)"),
@@ -93,6 +99,14 @@ impl ControlAdapter for SipControlAdapter {
                 "TransferProgress".to_string(),
                 "TransferCompleted".to_string(),
                 "TransferFailed".to_string(),
+                // The verdict on a `bridge`. The reply to the verb reports only
+                // that the media was re-pointed and the first re-INVITE went
+                // out; a bridge is two RFC 3261 §14 re-INVITEs and is not formed
+                // until both are answered, so the outcome is an event on both
+                // channels — exactly one ChannelBridged / BridgeFailed.
+                "ChannelBridged".to_string(),
+                "BridgeFailed".to_string(),
+                "ChannelUnbridged".to_string(),
             ],
         }
     }
@@ -113,6 +127,13 @@ fn is_media_verb(verb: &str) -> bool {
         verb,
         "play" | "stop" | "dtmf" | "hold" | "unhold" | "stream_start" | "stream_stop"
     )
+}
+
+/// The verbs that join or part two channels. Split out so `apply` and the tests
+/// agree on which verbs take the async path (they confirm the media teardown
+/// with the backend before answering).
+fn is_bridge_verb(verb: &str) -> bool {
+    matches!(verb, "bridge" | "unbridge")
 }
 
 /// Resolve the command's channel target and mark the controller as having acted
@@ -716,6 +737,198 @@ fn originate_with_bus(bus: &std::sync::Arc<ControlBus>, command: AdapterCommand)
         "sip_call_id": prepared.sip_call_id,
         "state": "calling",
     }))
+}
+
+
+/// Dispatch `bridge` / `unbridge`.
+///
+/// `bridge` is the one verb that addresses **two** channels: the substrate
+/// resolves and ownership-checks the target, and the second is named in
+/// `args.with` and checked here against the same connection — a controller can
+/// only bridge two legs it owns, or one app could join another app's call to
+/// its own.
+async fn apply_bridge_verb(command: AdapterCommand) -> ControlResult {
+    let channel = match controlled_channel(&command) {
+        Ok(channel) => channel,
+        Err(result) => return result,
+    };
+    match command.verb.as_str() {
+        "bridge" => bridge(&channel, &command).await,
+        "unbridge" => unbridge(&channel, &command.args).await,
+        other => ControlResult::error(
+            ControlErrorCode::UnsupportedVerb,
+            format!("sip adapter does not implement verb '{other}' in this build"),
+        ),
+    }
+}
+
+/// Join the target channel to the one named in `args.with`.
+///
+/// The reply reports the **local** action only, the same rule every verb on this
+/// rail follows: the media has been re-pointed and the first re-INVITE is on the
+/// wire. A bridge is two RFC 3261 §14 re-INVITEs across two dialogs, and whether
+/// the far ends accept them is a far-end outcome — it arrives as exactly one
+/// `ChannelBridged` / `BridgeFailed` on both channels.
+async fn bridge(channel: &ChannelRef, command: &AdapterCommand) -> ControlResult {
+    let Some(bus) = ControlBus::global() else {
+        return ControlResult::error(
+            ControlErrorCode::Unavailable,
+            "control plane is not installed",
+        );
+    };
+    bridge_with_bus(&bus, channel, command).await
+}
+
+/// [`bridge`] with the bus injected, so the argument and ownership rules are
+/// testable without a process-global control plane.
+async fn bridge_with_bus(
+    bus: &std::sync::Arc<ControlBus>,
+    channel: &ChannelRef,
+    command: &AdapterCommand,
+) -> ControlResult {
+    let args = &command.args;
+    let Some(with_channel_id) = args.get("with").and_then(|value| value.as_str()) else {
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "bridge requires args.with — the channel id of the other leg to join",
+        );
+    };
+    if with_channel_id.trim().is_empty() {
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "bridge args.with must not be empty",
+        );
+    }
+    if with_channel_id == channel.channel_id {
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            format!(
+                "cannot bridge channel '{}' to itself — name two different channels",
+                channel.channel_id
+            ),
+        );
+    }
+    let on_peer_hangup = match args.get("on_peer_hangup") {
+        None => crate::b2bua::bridge::PeerHangupPolicy::default(),
+        Some(value) if value.is_null() => crate::b2bua::bridge::PeerHangupPolicy::default(),
+        Some(value) => {
+            let Some(text) = value.as_str() else {
+                return ControlResult::error(
+                    ControlErrorCode::BadRequest,
+                    "bridge args.on_peer_hangup must be a string",
+                );
+            };
+            match crate::b2bua::bridge::PeerHangupPolicy::parse(text) {
+                Some(policy) => policy,
+                None => {
+                    return ControlResult::error(
+                        ControlErrorCode::BadRequest,
+                        format!(
+                            "bridge args.on_peer_hangup must be \"hangup\" or \"hold\", got '{text}'"
+                        ),
+                    )
+                }
+            }
+        }
+    };
+
+    // Ownership on the second leg is checked here, not by the substrate: it only
+    // resolves `target`. Same exactly-one-owner rule, same typed answers.
+    let with = match bus.owns(with_channel_id, &command.origin.app, command.origin.conn_id) {
+        crate::control::Ownership::Owned(reference) => reference,
+        crate::control::Ownership::Forbidden => {
+            return ControlResult::error(
+                ControlErrorCode::Forbidden,
+                format!("channel '{with_channel_id}' is not yours to bridge"),
+            )
+        }
+        crate::control::Ownership::Unknown => {
+            return ControlResult::error(
+                ControlErrorCode::NotFound,
+                format!("no such channel '{with_channel_id}'"),
+            )
+        }
+    };
+
+    let params = crate::dispatcher::BridgeParams {
+        anchor_sip_call_id: channel.sip_call_id.clone(),
+        peer_sip_call_id: with.sip_call_id.clone(),
+        on_peer_hangup,
+    };
+    match crate::dispatcher::b2bua_bridge_calls(params).await {
+        Ok(accepted) => {
+            // Which of the two legs kept its media. Normally the target, but
+            // the other one when only it had a session to keep.
+            let anchor_channel = if accepted.anchor_sip_call_id == channel.sip_call_id {
+                channel.channel_id.clone()
+            } else {
+                with.channel_id.clone()
+            };
+            ControlResult::Ok(serde_json::json!({
+                "channel": channel.channel_id,
+                "with": with.channel_id,
+                "anchor": anchor_channel,
+                "call_id": accepted.anchor_call_id,
+                "peer_call_id": accepted.peer_call_id,
+                "anchored": accepted.anchored,
+                "on_peer_hangup": on_peer_hangup.as_str(),
+                "state": "bridging",
+            }))
+        }
+        Err(error) => bridge_error(error),
+    }
+}
+
+/// Break the target channel's bridge. Both legs stay answered, owned and held.
+async fn unbridge(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
+    let reason = args
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unbridged")
+        .to_string();
+    match crate::dispatcher::b2bua_unbridge_call(&channel.sip_call_id, &reason).await {
+        Ok((_peer_call_id, peer_sip_call_id)) => {
+            let peer_channel = ControlBus::global()
+                .and_then(|bus| bus.channel_id_for_sip_call_id(&peer_sip_call_id));
+            ControlResult::Ok(serde_json::json!({
+                "channel": channel.channel_id,
+                "with": peer_channel,
+                "reason": reason,
+                "state": "unbridging",
+            }))
+        }
+        Err(error) => bridge_error(error),
+    }
+}
+
+/// Map a [`crate::b2bua::bridge::BridgeError`] onto its own wire code, so a
+/// caller can tell an unknown leg from a leg in the wrong state from a backend
+/// that cannot express the bridge — and never gets a hollow success.
+fn bridge_error(error: crate::b2bua::bridge::BridgeError) -> ControlResult {
+    use crate::b2bua::bridge::BridgeError;
+    let message = error.to_string();
+    match error {
+        // The leg is not there to bridge.
+        BridgeError::UnknownLeg { .. } => ControlResult::error(ControlErrorCode::NotFound, message),
+        // The frame named the same leg twice — well formed, but not a bridge.
+        BridgeError::SameLeg(_) => ControlResult::error(ControlErrorCode::BadRequest, message),
+        // The leg exists and is addressable, but is in the wrong state for this
+        // verb. Distinct from not_found, and distinct from a malformed frame:
+        // the fix is to wait (or unbridge first), not to change the request.
+        BridgeError::NotAnswered { .. }
+        | BridgeError::AlreadyBridged { .. }
+        | BridgeError::NotBridged { .. }
+        | BridgeError::Glare { .. }
+        | BridgeError::NoMediaDescription { .. } => {
+            ControlResult::error(ControlErrorCode::InvalidState, message)
+        }
+        // The configured media backend cannot express this bridge.
+        BridgeError::Unsupported(_) => {
+            ControlResult::error(ControlErrorCode::UnsupportedVerb, message)
+        }
+        BridgeError::Unavailable(_) => ControlResult::error(ControlErrorCode::Unavailable, message),
+    }
 }
 
 /// Read an optional non-empty string argument.
@@ -1816,6 +2029,8 @@ mod tests {
             "unhold",
             "stream_start",
             "stream_stop",
+            "bridge",
+            "unbridge",
         ] {
             assert!(verbs.contains(&expected), "missing verb {expected}");
         }
@@ -1910,6 +2125,224 @@ mod tests {
             result,
             ControlResult::Error { code: ControlErrorCode::UnsupportedVerb, .. }
         ));
+    }
+
+
+    // -----------------------------------------------------------------------
+    // bridge / unbridge
+    // -----------------------------------------------------------------------
+
+    fn bridge_command(args: serde_json::Value) -> AdapterCommand {
+        AdapterCommand {
+            verb: "bridge".to_string(),
+            args,
+            target: ResolvedTarget::Channel(channel()),
+            origin: test_origin(),
+        }
+    }
+
+    /// A bus with `ch1` (the target) and `ch2` (the `with` leg) both owned by
+    /// the commanding connection.
+    fn bus_with_two_owned_channels() -> (std::sync::Arc<ControlBus>, u64) {
+        let bus = test_bus();
+        let conn = bus.register_connection("ivr-app");
+        bus.register_channel("ch1", &conn, "call-uuid", "sipcid@host", "hangup", HashMap::new());
+        bus.register_channel("ch2", &conn, "call-uuid-2", "sipcid2@host", "hangup", HashMap::new());
+        let conn_id = conn.id;
+        (bus, conn_id)
+    }
+
+    fn error_code(result: &ControlResult) -> Option<ControlErrorCode> {
+        match result {
+            ControlResult::Error { code, .. } => Some(*code),
+            ControlResult::Ok(_) => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_without_a_second_leg_is_a_bad_request() {
+        let (bus, conn_id) = bus_with_two_owned_channels();
+        let mut command = bridge_command(serde_json::json!({}));
+        command.origin.conn_id = conn_id;
+        let result = bridge_with_bus(&bus, &channel(), &command).await;
+        assert_eq!(error_code(&result), Some(ControlErrorCode::BadRequest));
+
+        let mut command = bridge_command(serde_json::json!({ "with": "   " }));
+        command.origin.conn_id = conn_id;
+        let result = bridge_with_bus(&bus, &channel(), &command).await;
+        assert_eq!(error_code(&result), Some(ControlErrorCode::BadRequest));
+    }
+
+    #[tokio::test]
+    async fn bridging_a_channel_to_itself_is_a_bad_request_not_a_not_found() {
+        // Naming the same leg twice is a well-formed frame that is not a bridge.
+        // It must read differently from "no such leg" and from "wrong state".
+        let (bus, conn_id) = bus_with_two_owned_channels();
+        let mut command = bridge_command(serde_json::json!({ "with": "ch1" }));
+        command.origin.conn_id = conn_id;
+        let result = bridge_with_bus(&bus, &channel(), &command).await;
+        assert_eq!(error_code(&result), Some(ControlErrorCode::BadRequest));
+        match result {
+            ControlResult::Error { message, .. } => {
+                assert!(message.contains("itself"), "{message}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bridging_to_an_unknown_channel_is_not_found() {
+        let (bus, conn_id) = bus_with_two_owned_channels();
+        let mut command = bridge_command(serde_json::json!({ "with": "ch-nope" }));
+        command.origin.conn_id = conn_id;
+        let result = bridge_with_bus(&bus, &channel(), &command).await;
+        assert_eq!(error_code(&result), Some(ControlErrorCode::NotFound));
+    }
+
+    #[tokio::test]
+    async fn bridging_to_another_apps_channel_is_forbidden() {
+        // One app must never be able to join another app's call to its own.
+        let bus = test_bus();
+        let mine = bus.register_connection("ivr-app");
+        let theirs = bus.register_connection("edge-app");
+        bus.register_channel("ch1", &mine, "call-uuid", "sipcid@host", "hangup", HashMap::new());
+        bus.register_channel("ch2", &theirs, "other-uuid", "other@host", "hangup", HashMap::new());
+        let mut command = bridge_command(serde_json::json!({ "with": "ch2" }));
+        command.origin.conn_id = mine.id;
+        let result = bridge_with_bus(&bus, &channel(), &command).await;
+        assert_eq!(error_code(&result), Some(ControlErrorCode::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn an_unrecognised_peer_hangup_policy_is_refused_never_defaulted() {
+        // Guessing at a teardown policy is how a survivor gets stranded (or
+        // hung up when the controller wanted to keep it).
+        let (bus, conn_id) = bus_with_two_owned_channels();
+        for bad in [serde_json::json!("continue"), serde_json::json!(7)] {
+            let mut command =
+                bridge_command(serde_json::json!({ "with": "ch2", "on_peer_hangup": bad }));
+            command.origin.conn_id = conn_id;
+            let result = bridge_with_bus(&bus, &channel(), &command).await;
+            assert_eq!(error_code(&result), Some(ControlErrorCode::BadRequest));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_well_formed_bridge_reaches_the_dispatcher_and_never_answers_ok_without_one() {
+        // Both legs resolve and are owned, so the verb gets past every argument
+        // gate and calls into the B2BUA. With no dispatcher installed in a unit
+        // -test binary that is a typed `unavailable` — never a hollow ok.
+        let (bus, conn_id) = bus_with_two_owned_channels();
+        for policy in [
+            serde_json::json!("hangup"),
+            serde_json::json!("hold"),
+            serde_json::Value::Null,
+        ] {
+            let mut command =
+                bridge_command(serde_json::json!({ "with": "ch2", "on_peer_hangup": policy }));
+            command.origin.conn_id = conn_id;
+            let result = bridge_with_bus(&bus, &channel(), &command).await;
+            assert_eq!(error_code(&result), Some(ControlErrorCode::Unavailable));
+        }
+    }
+
+    #[tokio::test]
+    async fn unbridge_without_a_dispatcher_is_unavailable_not_a_hang() {
+        let result = unbridge(&channel(), &serde_json::json!({})).await;
+        assert_eq!(error_code(&result), Some(ControlErrorCode::Unavailable));
+    }
+
+    #[test]
+    fn is_bridge_verb_splits_the_two_leg_verbs_from_the_rest() {
+        for verb in ["bridge", "unbridge"] {
+            assert!(is_bridge_verb(verb), "{verb} should route to the bridge path");
+        }
+        for verb in ["answer", "hangup", "play", "originate", "refer", "route"] {
+            assert!(!is_bridge_verb(verb), "{verb} should NOT route to the bridge path");
+        }
+        // The bridge verbs must not also be classified as media verbs, or they
+        // would run through the single-channel media dispatch.
+        assert!(!is_media_verb("bridge"));
+        assert!(!is_media_verb("unbridge"));
+    }
+
+    #[test]
+    fn every_bridge_refusal_has_its_own_wire_code_and_matches_the_shared_token() {
+        use crate::b2bua::bridge::BridgeError;
+        let cases = [
+            (
+                BridgeError::UnknownLeg {
+                    which: "with",
+                    id: "ch2".to_string(),
+                },
+                ControlErrorCode::NotFound,
+            ),
+            (
+                BridgeError::SameLeg("ch1".to_string()),
+                ControlErrorCode::BadRequest,
+            ),
+            (
+                BridgeError::NotAnswered {
+                    id: "ch1".to_string(),
+                    state: "ringing".to_string(),
+                },
+                ControlErrorCode::InvalidState,
+            ),
+            (
+                BridgeError::AlreadyBridged {
+                    id: "ch1".to_string(),
+                },
+                ControlErrorCode::InvalidState,
+            ),
+            (
+                BridgeError::NotBridged {
+                    id: "ch1".to_string(),
+                },
+                ControlErrorCode::InvalidState,
+            ),
+            (
+                BridgeError::Glare {
+                    id: "ch1".to_string(),
+                },
+                ControlErrorCode::InvalidState,
+            ),
+            (
+                BridgeError::NoMediaDescription {
+                    id: "ch1".to_string(),
+                },
+                ControlErrorCode::InvalidState,
+            ),
+            (
+                BridgeError::Unsupported("no reoffer".to_string()),
+                ControlErrorCode::UnsupportedVerb,
+            ),
+            (
+                BridgeError::Unavailable("gone".to_string()),
+                ControlErrorCode::Unavailable,
+            ),
+        ];
+        for (error, expected) in cases {
+            // The token the in-process rail prefixes its ValueError with has to
+            // name the same cause as the wire code, or the two rails disagree
+            // about what went wrong.
+            let token = error.code();
+            let wire = serde_json::to_string(&expected).unwrap_or_default();
+            assert_eq!(
+                format!("\"{token}\""),
+                wire,
+                "{error:?}: token {token} vs wire code {wire}"
+            );
+            assert_eq!(error_code(&bridge_error(error.clone())), Some(expected), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn describe_lists_the_bridge_events() {
+        let schema = SipControlAdapter::new().describe();
+        let events: Vec<&str> = schema.events.iter().map(String::as_str).collect();
+        for expected in ["ChannelBridged", "BridgeFailed", "ChannelUnbridged"] {
+            assert!(events.contains(&expected), "missing event {expected}");
+        }
     }
 
     #[test]

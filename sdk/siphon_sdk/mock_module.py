@@ -596,6 +596,12 @@ class MockB2bua:
           context (records onto ``terminates`` for test assertions)
         - ``b2bua.refer(call_id, target)`` — transfer a call by SIP Call-ID
           from any context (records onto ``refers`` for test assertions)
+        - ``await b2bua.bridge(call_id, with_call_id)`` — join two answered
+          calls so the two parties hear each other (records onto ``bridges``
+          for test assertions)
+        - ``await b2bua.unbridge(call_id)`` — break a bridge, leaving both
+          legs answered, owned and held (records onto ``unbridges`` for test
+          assertions)
     """
 
     def __init__(self) -> None:
@@ -605,6 +611,10 @@ class MockB2bua:
         self.refers: list[dict] = []
         # Records b2bua.originate(...) calls for test assertions.
         self.originates: list[dict] = []
+        # Records b2bua.bridge(...) calls for test assertions.
+        self.bridges: list[dict] = []
+        # Records b2bua.unbridge(...) calls for test assertions.
+        self.unbridges: list[dict] = []
         # Sequence counter for the mock's synthetic originated Call-IDs.
         self._originate_seq = 0
 
@@ -613,6 +623,8 @@ class MockB2bua:
         self.terminates.clear()
         self.refers.clear()
         self.originates.clear()
+        self.bridges.clear()
+        self.unbridges.clear()
         self._originate_seq = 0
 
     def originate(
@@ -737,6 +749,106 @@ class MockB2bua:
             "timeout": timeout,
         })
         return call_id
+
+    async def bridge(self, call_id: str, with_call_id: str,
+                     on_peer_hangup: str = "hangup") -> bool:
+        """Join two answered calls siphon owns, so the two parties hear each other.
+
+        The primitive under callback-and-connect and attended hand-off: every
+        other B2BUA verb acts on one call, this one joins two. Both legs are
+        named by SIP Call-ID, so it works from an event callback or a timer
+        where no ``call`` object is in scope.
+
+        **Awaitable.** It resolves once the media has been re-pointed and the
+        first re-INVITE is on the wire — the same "the local action was
+        performed" contract :meth:`originate` has. A bridge is two RFC 3261 §14
+        re-INVITEs across two dialogs; whether the far ends accept them is a
+        far-end outcome, delivered on the control rail as ``ChannelBridged`` /
+        ``BridgeFailed``.
+
+        Args:
+            call_id: SIP Call-ID of the leg that keeps its media anchor — its
+                ports, and anything attached to them, survive the bridge.
+            with_call_id: SIP Call-ID of the leg joined to it. Its own media
+                session is deleted; it becomes the second party on the first's.
+            on_peer_hangup: what happens to the survivor when one party leaves.
+                ``"hangup"`` (default) tears it down too; ``"hold"`` keeps it up
+                and held so it can be bridged to somebody else.
+
+        Returns:
+            bool: True once the bridge has been accepted and put in motion.
+
+        Raises:
+            ValueError: an ``on_peer_hangup`` that is neither ``"hangup"`` nor
+                ``"hold"`` — guessing at a teardown policy is how calls get
+                stranded. Live siphon also raises when a leg is unknown, has not
+                answered, is already bridged, has a re-INVITE outstanding,
+                carries no media description, or the media backend cannot
+                express the bridge. The message is prefixed with the stable
+                cause token (``not_found``, ``invalid_state``, ``bad_request``,
+                ``unsupported_verb``, ``unavailable``) — never a hollow success.
+
+        In the mock, records ``{"call_id", "with_call_id", "on_peer_hangup"}``
+        on ``bridges`` and returns True. Inspect via
+        ``siphon.get_b2bua().bridges``.
+
+        Usage::
+
+            # Callback-and-connect: join the parked caller to the leg siphon
+            # placed for them, once that leg has answered.
+            @b2bua.on_answer
+            async def connect(call, reply):
+                parked = await cache.fetch("callbacks", call.call_id)
+                if parked:
+                    await b2bua.bridge(parked, call.call_id)
+        """
+        if on_peer_hangup not in ("hangup", "hold"):
+            raise ValueError(
+                "b2bua.bridge(on_peer_hangup=…) must be 'hangup' or 'hold' "
+                f"(got '{on_peer_hangup}')"
+            )
+        self.bridges.append({
+            "call_id": call_id,
+            "with_call_id": with_call_id,
+            "on_peer_hangup": on_peer_hangup,
+        })
+        return True
+
+    async def unbridge(self, call_id: str, reason: str = "unbridged") -> bool:
+        """Break a bridge, leaving both legs answered, owned and held.
+
+        Each leg falls back to exactly the state a freshly answered, unbridged
+        leg is in — siphon re-offers it ``a=sendonly`` (RFC 3264 §8.4; RFC 6337
+        §3.1 prefers that to ``c=0.0.0.0``), so the endpoint stops sending and
+        hears nothing. Neither leg is hung up: that would make ``unbridge``
+        indistinguishable from two :meth:`terminate` calls. A later
+        :meth:`bridge` re-offers ``sendrecv``.
+
+        **Awaitable.**
+
+        Args:
+            call_id: SIP Call-ID of either leg of the bridge.
+            reason: carried on the control-plane ``ChannelUnbridged`` event.
+
+        Returns:
+            bool: True once both legs have been held and the bridge dropped.
+
+        Raises:
+            ValueError: live siphon raises when the leg is unknown, is not
+                bridged, or its bridge is still forming. The message carries the
+                same stable cause token as :meth:`bridge`.
+
+        In the mock, records ``{"call_id", "reason"}`` on ``unbridges`` and
+        returns True. Inspect via ``siphon.get_b2bua().unbridges``.
+
+        Usage::
+
+            @b2bua.on_bye
+            async def split(call, initiator):
+                await b2bua.unbridge(call.call_id, reason="supervisor split")
+        """
+        self.unbridges.append({"call_id": call_id, "reason": reason})
+        return True
 
     def terminate(self, call_id: str, reason: str = "Normal Clearing") -> bool:
         """Imperatively end a B2BUA call by its SIP Call-ID.

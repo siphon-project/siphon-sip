@@ -35,6 +35,7 @@ RUN_RTPENGINE=false
 RUN_RTPPROXY=false
 RUN_VOICE_AI=false
 RUN_CONTROL=false
+RUN_BRIDGE=false
 RUN_REFER_SINGLE_LEG=false
 RUN_REINVITE=false
 RUN_REOFFER=false
@@ -66,6 +67,7 @@ for arg in "$@"; do
     --rtpproxy)   RUN_RTPPROXY=true;   SELECTED_MODES+=("$arg") ;;
     --voice-ai)   RUN_VOICE_AI=true;   SELECTED_MODES+=("$arg") ;;
     --control)    RUN_CONTROL=true;    SELECTED_MODES+=("$arg") ;;
+    --bridge)     RUN_BRIDGE=true;     SELECTED_MODES+=("$arg") ;;
     --refer-single-leg) RUN_REFER_SINGLE_LEG=true; SELECTED_MODES+=("$arg") ;;
     --reinvite)   RUN_REINVITE=true;   SELECTED_MODES+=("$arg") ;;
     --reoffer)    RUN_REOFFER=true;    SELECTED_MODES+=("$arg") ;;
@@ -87,7 +89,7 @@ for arg in "$@"; do
       echo
       echo "Scenario modes (pick at most ONE per run):"
       echo "  --ipsec --charging --call --presence --rtpengine --rtpproxy --reinvite"
-      echo "  --voice-ai --refer-single-leg --reoffer --control"
+      echo "  --voice-ai --refer-single-leg --reoffer --control --bridge"
       echo "  --b2bua --b2bua-auth --b2bua-invite-auth --gateway --auto100 --http-auth"
       echo "  --wedge --banscan"
       echo "  --security --rfc4475 --webrtc"
@@ -130,7 +132,11 @@ fi
 
 cleanup() {
   echo "--- Cleaning up ---"
-  docker compose -f "$COMPOSE_FILE" down --remove-orphans 2>/dev/null || true
+  # -v drops the named volumes too. The bridge mode shares siphon's CDR file
+  # with its assertion container through one, and a record left over from an
+  # earlier run would be exactly what makes that assertion pass without the
+  # current run having carried any audio.
+  docker compose -f "$COMPOSE_FILE" down --remove-orphans -v 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -305,6 +311,76 @@ if [[ "$RUN_CONTROL" == true ]]; then
   assert_control_verdict resync control-app-ivr.log
 
   echo "Control-plane logs: $CONTROL_LOG_DIR"
+fi
+
+# ── Step 7a2: `bridge` — joining two legs siphon already owns (optional) ────
+# One call, three oracles. The SIPp scenarios decide the run (each asserts what
+# landed on its own wire); the application's verdict covers the verb contract
+# the wire cannot show; and the MEDIA CDR is the only thing that can say audio
+# actually flowed BOTH ways between the two parties rather than the command
+# having returned ok.
+if [[ "$RUN_BRIDGE" == true ]]; then
+  echo "=== SIPp bridge test (two owned legs, joined, parted, joined again) ==="
+  # --wait on the application too: siphon parks a handed-over call only while a
+  # controller is connected, so a caller that dials before the app is up gets
+  # the handoff default and the run fails for the wrong reason.
+  # The engine is recreated too: its Prometheus counters are cumulative for the
+  # life of the container, and a re-run against a warm one would read another
+  # run's numbers.
+  docker compose -f "$COMPOSE_FILE" --profile bridge up -d --force-recreate --wait \
+    siphon-rtp-engine siphon-bridge bridge-app
+  docker compose -f "$COMPOSE_FILE" --profile bridge up -d --force-recreate sipp-bridge-uas
+
+  # Exactly one foreground container, and it is the one that finishes LAST. The
+  # callee's own assertion (the BYE the peer-hangup policy sends it) and the
+  # application's verdict both land while the caller is still in its trailing
+  # pause; making either of those the decider would abort the set on whichever
+  # finished first and cut the others off mid-assertion.
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile bridge up \
+    --abort-on-container-exit --exit-code-from sipp-bridge-uac sipp-bridge-uac
+
+  # The callee ran detached, so nothing has looked at its result yet. Without
+  # this its scenario — including the survivor's BYE — could fail or be killed
+  # and the run would still be green.
+  BRIDGE_UAS_CODE="$(docker wait sipp-bridge-uas)"
+  if [[ "$BRIDGE_UAS_CODE" != "0" ]]; then
+    echo "FAILED: the callee scenario exited $BRIDGE_UAS_CODE"
+    docker compose -f "$COMPOSE_FILE" logs sipp-bridge-uas | tail -60
+    exit 1
+  fi
+  echo "  ✓ callee scenario passed"
+
+  BRIDGE_LOG_DIR="$(mktemp -d)"
+  docker compose -f "$COMPOSE_FILE" logs bridge-app > "$BRIDGE_LOG_DIR/bridge-app.log" 2>&1 || true
+  docker compose -f "$COMPOSE_FILE" logs sipp-bridge-uas > "$BRIDGE_LOG_DIR/sipp-bridge-uas.log" 2>&1 || true
+  docker compose -f "$COMPOSE_FILE" logs siphon-bridge > "$BRIDGE_LOG_DIR/siphon-bridge.log" 2>&1 || true
+
+  # A verdict that never appeared is a failure too — it is what an application
+  # that was never handed the call looks like.
+  if ! grep -q 'BRIDGE-VERDICT' "$BRIDGE_LOG_DIR/bridge-app.log"; then
+    echo "FAILED: no BRIDGE-VERDICT — the control application never completed"
+    exit 1
+  fi
+  if grep -q '"pass": false' "$BRIDGE_LOG_DIR/bridge-app.log"; then
+    echo "FAILED: bridge acceptance checks:"
+    grep 'BRIDGE-VERDICT' "$BRIDGE_LOG_DIR/bridge-app.log"
+    exit 1
+  fi
+  grep 'BRIDGE-VERDICT' "$BRIDGE_LOG_DIR/bridge-app.log"
+
+  echo "--- audio across the bridge (the engine's per-leg counters) ---"
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile bridge run --rm bridge-cdr-assert
+
+  echo "--- the engine accepted every command the bridge sent ---"
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile bridge run --rm \
+    --entrypoint python3 bridge-cdr-assert /app/assert_media.py metrics \
+      --url http://172.20.0.130:9091/metrics \
+      --min-offers 1 --min-answers 1 --max-offers 1 --min-deletes 1 \
+      --max-control-errors 0 --max-sessions 0
+
+  docker compose -f "$COMPOSE_FILE" --profile bridge rm -sf \
+    sipp-bridge-uac sipp-bridge-uas bridge-app 2>/dev/null || true
+  echo "Bridge logs: $BRIDGE_LOG_DIR"
 fi
 
 # ── Step 7a2: Single-leg cold transfer (optional) ─────────────────────────

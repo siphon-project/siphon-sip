@@ -178,6 +178,60 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   dialog, which is why it went unnoticed on every hold and resume. The Contact is
   now captured before the rewrite. The siphon-originated path was already safe,
   but only because its response skips sanitize entirely.
+
+### Added
+- **Framing fuzz target (`stream_framing_fuzz`).** Fuzzes the stream framer's
+  invariants — a framed length never exceeds the buffer or the ceiling, and a
+  refused message's header block stays inside the buffer — alongside the
+  existing parser target in CI.
+### Added
+- **`bridge` — joining two legs siphon already owns.** `originate` shipped the
+  ability to place a call; nothing could connect one to another, which is what a
+  transfer, a callback-and-connect and an attended hand-off all need. The verb
+  is on the external control rail (`bridge` / `unbridge`, addressing two
+  channels the same application owns) with an in-process twin
+  (`await b2bua.bridge(call_id, with_call_id)` / `b2bua.unbridge(call_id)`).
+
+  A bridge is two RFC 3261 §14 re-INVITEs across two confirmed dialogs, because
+  siphon is a B2BUA and each leg is its own offer/answer context (RFC 3264 §8):
+  the named `with` leg is re-offered first with the anchor's current media, then
+  the anchor with the answer that came back. That order is the one where a
+  failure costs least — a peer that refuses leaves the anchor untouched and both
+  calls exactly as they were.
+
+  Media attachments come off **both** legs before anything is re-pointed, and
+  each teardown is awaited and its reply checked: an announcement still playing
+  replaces a leg's outgoing audio, and a WebSocket bridge makes the engine its
+  far side, so either one still live when the bridge forms is one-way audio. An
+  anchor already relaying between two parties is then renegotiated with
+  `reoffer` on the ports it already holds; one the engine answered itself
+  (`answer_local`, which is how every controller-owned leg starts) has no far
+  leg to answer and is instead deleted and offered onto a fresh engine call-id,
+  with the store key staying the leg's SIP Call-ID so every media verb still
+  resolves.
+
+  `unbridge` parts the pair without ending it — both legs stay answered, owned
+  and held (`a=sendonly`, RFC 3264 §8.4; RFC 6337 §3.1 prefers that to
+  `c=0.0.0.0`) — and `on_peer_hangup` (`hangup` by default, or `hold`) decides
+  what becomes of the survivor when the other party leaves.
+
+  Refusals are typed and separately actionable rather than one generic error:
+  `not_found` (no such leg), `invalid_state` (not answered, already bridged,
+  re-INVITE outstanding per RFC 3261 §14.1, no media description, or an
+  `unbridge` of a leg that never was), `bad_request` (the same leg twice, or an
+  unknown `on_peer_hangup`), `forbidden` (the other leg belongs to another
+  application) and `unsupported_verb` (the media backend refused a step). The
+  reply reports only that the media was re-pointed and the first re-INVITE is on
+  the wire; the verdict arrives as `ChannelBridged` / `BridgeFailed` on both
+  channels, and `ChannelUnbridged` when the pair is parted.
+
+  Covered by a SIPp mode (`scripts/run-tests.sh --bridge`, CI job `sipp-bridge`)
+  that joins two legs, parts them, joins them again and asserts on three
+  independent oracles — the SIP wire, the application's own verdict, and the
+  media engine's per-leg packet counters, the last of which is what says audio
+  actually flowed in both directions rather than the command having returned ok.
+
+### Fixed
 - **The B-leg INVITE no longer carries the session-timer headers twice.** The
   B-leg INVITE is cloned from the caller's, so whatever it asked for is already
   on it — a Teams INVITE arrives with `Session-Expires: 3600`, `Min-SE: 300` and

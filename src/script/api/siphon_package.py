@@ -288,6 +288,81 @@ class _B2buaNamespace:
             timeout,
         )
 
+    def bridge(self, call_id, with_call_id, on_peer_hangup="hangup"):
+        """Join two answered calls siphon owns, so the two parties hear each other.
+
+        The primitive under callback-and-connect and attended hand-off: every
+        other B2BUA verb acts on one call, this one joins two. Both legs are
+        named by SIP Call-ID, so it works from an event callback or a timer
+        where no ``call`` object exists.
+
+        Awaitable. It resolves once the media has been re-pointed and the first
+        re-INVITE is on the wire — the same contract ``b2bua.originate`` has. A
+        bridge is two RFC 3261 §14 re-INVITEs across two dialogs; whether the
+        far ends accept them is a far-end outcome, delivered on the control
+        rail as ``ChannelBridged`` / ``BridgeFailed``.
+
+        Args:
+            call_id: SIP Call-ID of the leg that keeps its media anchor — its
+                ports, and anything attached to them, survive the bridge.
+            with_call_id: SIP Call-ID of the leg joined to it. Its own media
+                session is deleted; it becomes the second party on the first's.
+            on_peer_hangup: what happens to the survivor when one party leaves.
+                ``"hangup"`` (default) tears it down too; ``"hold"`` keeps it
+                up and held so it can be bridged to somebody else.
+
+        Returns:
+            bool: True once the bridge has been accepted and put in motion.
+
+        Raises:
+            ValueError: a leg is unknown, has not answered, is already bridged,
+                has a re-INVITE outstanding, carries no media description, or
+                the media backend cannot express the bridge. The message is
+                prefixed with the stable cause token (``not_found``,
+                ``invalid_state``, ``bad_request``, ``unsupported_verb``,
+                ``unavailable``) — never a hollow success.
+
+        Usage:
+            @b2bua.on_answer
+            async def connect(call):
+                callee = b2bua.originate(to="sip:+15550142@example.com",
+                                         media=True)
+                await b2bua.bridge(call.call_id, callee)
+        """
+        control = object.__getattribute__(self, "__dict__").get("_control")
+        if control is None:
+            raise ValueError("b2bua.bridge requires a running siphon B2BUA")
+        return control.bridge(call_id, with_call_id, on_peer_hangup)
+
+    def unbridge(self, call_id, reason="unbridged"):
+        """Break a bridge, leaving both legs answered, owned and held.
+
+        Each leg falls back to exactly the state a freshly answered, unbridged
+        leg is in — siphon re-offers it ``a=sendonly`` (RFC 3264 §8.4; RFC 6337
+        §3.1 prefers that to ``c=0.0.0.0``), so the endpoint stops sending and
+        hears nothing. Neither leg is hung up: that would make ``unbridge``
+        indistinguishable from two ``terminate`` calls. A later ``bridge``
+        re-offers ``sendrecv``.
+
+        Awaitable.
+
+        Args:
+            call_id: SIP Call-ID of either leg of the bridge.
+            reason: carried on the control-plane ``ChannelUnbridged`` event.
+
+        Returns:
+            bool: True once both legs have been held and the bridge dropped.
+
+        Raises:
+            ValueError: the leg is unknown, is not bridged, or its bridge is
+                still forming. The message carries the same stable cause token
+                as :meth:`bridge`.
+        """
+        control = object.__getattribute__(self, "__dict__").get("_control")
+        if control is None:
+            raise ValueError("b2bua.unbridge requires a running siphon B2BUA")
+        return control.unbridge(call_id, reason)
+
     def refer(self, call_id, target, replaces=None):
         """Imperatively send an outbound REFER on a live B2BUA call by SIP Call-ID.
 

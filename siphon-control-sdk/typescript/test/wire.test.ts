@@ -11,12 +11,19 @@ import { AsyncQueue } from "../src/internal";
 import {
   Call,
   encodeCommand,
+  isBridgeFinal,
   isTransferFinal,
   sipEventKind,
   SipVerb,
   MODULE_SIP,
 } from "../src/index";
-import type { CallEvent, TransferOutcomePayload } from "../src/index";
+import type {
+  BridgeFailedPayload,
+  CallEvent,
+  ChannelBridgedPayload,
+  ChannelUnbridgedPayload,
+  TransferOutcomePayload,
+} from "../src/index";
 import type { CommandTransport } from "../src/session";
 
 describe("command wire bytes (byte-identical to the server)", () => {
@@ -55,6 +62,8 @@ describe("SipVerb wire tokens + event names", () => {
     expect(SipVerb.RemoveHeader).toBe("remove_header");
     expect(SipVerb.AcceptRefer).toBe("accept_refer");
     expect(SipVerb.RejectRefer).toBe("reject_refer");
+    expect(SipVerb.Bridge).toBe("bridge");
+    expect(SipVerb.Unbridge).toBe("unbridge");
     expect(SipVerb.Play).toBe("play");
     expect(SipVerb.Stop).toBe("stop");
     expect(SipVerb.Dtmf).toBe("dtmf");
@@ -71,6 +80,9 @@ describe("SipVerb wire tokens + event names", () => {
     expect(sipEventKind("TransferProgress")).toBe("TransferProgress");
     expect(sipEventKind("TransferCompleted")).toBe("TransferCompleted");
     expect(sipEventKind("TransferFailed")).toBe("TransferFailed");
+    expect(sipEventKind("ChannelBridged")).toBe("ChannelBridged");
+    expect(sipEventKind("BridgeFailed")).toBe("BridgeFailed");
+    expect(sipEventKind("ChannelUnbridged")).toBe("ChannelUnbridged");
     expect(sipEventKind("SomethingNew")).toBe("SomethingNew");
   });
 
@@ -82,6 +94,38 @@ describe("SipVerb wire tokens + event names", () => {
     expect(isTransferFinal("TransferProgress")).toBe(false);
     expect(isTransferFinal("TransferRequested")).toBe(false);
     expect(isTransferFinal("StasisEnd")).toBe(false);
+  });
+
+  it("marks exactly the terminal bridge verdicts as final", () => {
+    // A bridge is two RFC 3261 §14 re-INVITEs, so the command reply is only the
+    // local action; exactly one of these two ends the wait. An unbridge ends a
+    // bridge that already formed, so it is not a verdict on forming one.
+    expect(isBridgeFinal("ChannelBridged")).toBe(true);
+    expect(isBridgeFinal("BridgeFailed")).toBe(true);
+    expect(isBridgeFinal("ChannelUnbridged")).toBe(false);
+    expect(isBridgeFinal("StasisEnd")).toBe(false);
+  });
+
+  it("decodes the bridge event payloads", () => {
+    // Byte-identical to what the server pushes on both bridged channels.
+    const bridged: ChannelBridgedPayload = JSON.parse(
+      '{"peer_call_id":"call-b","peer_sip_call_id":"b@host",' +
+        '"role":"anchor","anchored":true}',
+    );
+    expect(bridged.role).toBe("anchor");
+    expect(bridged.anchored).toBe(true);
+    expect(bridged.peer_sip_call_id).toBe("b@host");
+
+    const failed: BridgeFailedPayload = JSON.parse(
+      '{"stage":"offering_peer","code":488,"peer_sip_call_id":"b@host"}',
+    );
+    expect(failed.stage).toBe("offering_peer");
+    expect(failed.code).toBe(488);
+
+    const unbridged: ChannelUnbridgedPayload = JSON.parse(
+      '{"peer_call_id":"call-b","peer_sip_call_id":"b@host","reason":"supervisor took over"}',
+    );
+    expect(unbridged.reason).toBe("supervisor took over");
   });
 
   it("decodes a transfer verdict payload", () => {
@@ -322,6 +366,42 @@ describe("Call verbs map to the in-process-mirrored wire verbs", () => {
       { module: MODULE_SIP, verb: "unhold", target: { channel: "ch1" }, args: {} },
       { module: MODULE_SIP, verb: "stream_start", target: { channel: "ch1" }, args: { ws_uri: "ws://ai:9000/stream", direction: "both", channels: 2 } },
       { module: MODULE_SIP, verb: "stream_stop", target: { channel: "ch1" }, args: {} },
+    ]);
+  });
+
+  it("bridge / unbridge — the policy rides the frame, an unset one is omitted", async () => {
+    const transport = new RecordingTransport({
+      channel: "ch1",
+      with: "ch2",
+      call_id: "call-a",
+      peer_call_id: "call-b",
+      anchored: true,
+      on_peer_hangup: "hold",
+      state: "bridging",
+    });
+    const call = makeCall(transport);
+    const result = await call.bridge("ch2", { onPeerHangup: "hold" });
+    // The reply is the local action; the audio meeting is the event.
+    expect(result).toMatchObject({ with: "ch2", state: "bridging" });
+    await call.bridge("ch3");
+    await call.unbridge("supervisor took over");
+    await call.unbridge();
+    expect(transport.calls).toEqual([
+      {
+        module: MODULE_SIP,
+        verb: "bridge",
+        target: { channel: "ch1" },
+        args: { with: "ch2", on_peer_hangup: "hold" },
+      },
+      // Absent, not null — so the server's "hangup" default is what applies.
+      { module: MODULE_SIP, verb: "bridge", target: { channel: "ch1" }, args: { with: "ch3" } },
+      {
+        module: MODULE_SIP,
+        verb: "unbridge",
+        target: { channel: "ch1" },
+        args: { reason: "supervisor took over" },
+      },
+      { module: MODULE_SIP, verb: "unbridge", target: { channel: "ch1" }, args: {} },
     ]);
   });
 

@@ -48,6 +48,41 @@ control plane's [`originate` verb](control-plane.md#placing-a-call-originate).
 
 ::: siphon_sdk.mock_module.MockB2bua.originate
 
+## Joining two calls: `b2bua.bridge`
+
+`b2bua.originate` gives a script a second call; `b2bua.bridge` connects it to the
+first. Both legs are named by SIP Call-ID, so it works from a timer or an event
+callback where no `Call` object exists.
+
+The leg named first is the **anchor**: it keeps its media session, and the other
+joins it. The call resolves once the media has been re-pointed and the first
+re-INVITE is on the wire — a bridge is two RFC 3261 §14 re-INVITEs across two
+dialogs, and the far ends' verdict arrives on the control rail as
+`ChannelBridged` / `BridgeFailed`.
+
+```python
+from siphon import b2bua
+
+@b2bua.on_answer
+async def connect_the_supervisor(call):
+    supervisor = b2bua.originate(
+        to="sip:+15550142@example.com",
+        media=True,                 # siphon anchors the leg
+    )
+    # ... wait for it to answer (a @b2bua.on_answer for that leg) ...
+    await b2bua.bridge(call.call_id, supervisor, on_peer_hangup="hold")
+```
+
+`unbridge` parts them without ending either call: both legs stay answered, owned
+and held (`a=sendonly`, RFC 3264 §8.4), so either can be bridged again or hung
+up. Every refusal raises `ValueError` prefixed with a stable cause token rather
+than returning a hollow success. The out-of-process twin is the control plane's
+[`bridge` verb](control-plane.md#joining-two-legs-bridge).
+
+::: siphon_sdk.mock_module.MockB2bua.bridge
+
+::: siphon_sdk.mock_module.MockB2bua.unbridge
+
 ## `MediaHandle`
 
 Returned by `call.media` — controls RTP anchoring for the call.

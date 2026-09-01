@@ -42,7 +42,34 @@ pub enum MediaBackend {
     RtpProxy(Arc<RtpProxyClientSet>),
 }
 
+/// Legs with a playback siphon started and has not stopped, keyed
+/// `(engine call-id, leg tag)`. Read through
+/// [`MediaBackend::playback_started`]; written only by `play_media` /
+/// `stop_media` / `delete` below, so every path that ends a session also drops
+/// its entry and the set cannot outgrow the calls it describes.
+static ACTIVE_PLAYBACKS: std::sync::LazyLock<dashmap::DashSet<(String, String)>> =
+    std::sync::LazyLock::new(dashmap::DashSet::new);
+
 impl MediaBackend {
+    /// Whether siphon started a playback on this leg and has not stopped it.
+    ///
+    /// For a caller that only needs the *guarantee* that nothing is playing —
+    /// the bridge, before it re-points a leg's media — so it can skip a stop
+    /// that would otherwise be the engine answering "this call has no active
+    /// media playback". The engine counts that answer in
+    /// `control_errors_total`, a counter operators alert on; a verb that bumps
+    /// it every time it runs on an idle leg trains them to ignore it.
+    ///
+    /// Conservative in one direction only. The entry is written before the
+    /// caller sees its `play_media` return, so this never says "nothing is
+    /// playing" while something is. It can say the opposite: a prompt that ends
+    /// on its own leaves its entry, because siphon does not subscribe to the
+    /// engine's end-of-playback event. The cost is one redundant stop on a
+    /// session that really did play something — the safe direction.
+    pub fn playback_started(call_id: &str, from_tag: &str) -> bool {
+        ACTIVE_PLAYBACKS.contains(&(call_id.to_string(), from_tag.to_string()))
+    }
+
     /// Which engine this is, as the `media.backend` config spells it.
     pub fn kind(&self) -> crate::config::MediaBackendKind {
         use crate::config::MediaBackendKind;
@@ -132,6 +159,10 @@ impl MediaBackend {
 
     /// Tear down a media session.
     pub async fn delete(&self, call_id: &str, from_tag: &str) -> Result<(), RtpEngineError> {
+        // Unconditional, and before the engine round trip: the session is going
+        // away either way, and a playback record that outlived its call would
+        // be the one way `ACTIVE_PLAYBACKS` could grow without bound.
+        ACTIVE_PLAYBACKS.remove(&(call_id.to_string(), from_tag.to_string()));
         match self {
             Self::RtpEngine(set) => set.delete(call_id, from_tag).await,
             Self::SiphonRtp(client) => client.delete(call_id, from_tag).await,
@@ -147,6 +178,42 @@ impl MediaBackend {
     /// ignore `wait` and return on accept (fire-and-forget) as before.
     #[allow(clippy::too_many_arguments)]
     pub async fn play_media(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        source: &PlayMediaSource,
+        repeat_times: Option<u64>,
+        start_pos_ms: Option<u64>,
+        duration_ms: Option<u64>,
+        to_tag: Option<&str>,
+        overlay: bool,
+        gain_decibels: Option<i32>,
+        wait: bool,
+    ) -> Result<PlayMediaOutcome, RtpEngineError> {
+        let outcome = self
+            .play_media_inner(
+                call_id,
+                from_tag,
+                source,
+                repeat_times,
+                start_pos_ms,
+                duration_ms,
+                to_tag,
+                overlay,
+                gain_decibels,
+                wait,
+            )
+            .await;
+        if outcome.is_ok() {
+            ACTIVE_PLAYBACKS.insert((call_id.to_string(), from_tag.to_string()));
+        }
+        outcome
+    }
+
+    /// The backend dispatch behind [`Self::play_media`], split out so the
+    /// playback bookkeeping wraps every arm rather than being repeated in each.
+    #[allow(clippy::too_many_arguments)]
+    async fn play_media_inner(
         &self,
         call_id: &str,
         from_tag: &str,
@@ -251,7 +318,7 @@ impl MediaBackend {
         from_tag: &str,
         play_id: Option<u64>,
     ) -> Result<(), RtpEngineError> {
-        match self {
+        let outcome = match self {
             Self::RtpEngine(set) => {
                 if play_id.is_some() {
                     return Err(RtpEngineError::Unsupported {
@@ -271,7 +338,14 @@ impl MediaBackend {
                 }
                 client.stop_media(call_id, from_tag).await
             }
+        };
+        // A blanket stop ends everything on the leg, so the leg is no longer
+        // playing. A targeted one (`play_id`) leaves whatever else is running,
+        // so the record stands.
+        if play_id.is_none() && outcome.is_ok() {
+            ACTIVE_PLAYBACKS.remove(&(call_id.to_string(), from_tag.to_string()));
         }
+        outcome
     }
 
     /// Retune a running playback's gain — how a controller ducks a music bed
@@ -682,6 +756,96 @@ mod tests {
     /// `echo` synchronously before any I/O.
     fn dead_address() -> SocketAddr {
         "127.0.0.1:1".parse().unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // Playback bookkeeping (`ACTIVE_PLAYBACKS`)
+    // -----------------------------------------------------------------------
+    //
+    // The set is process-global, so these use call-ids of their own and assert
+    // against the *starting* length rather than zero — a parallel test binary
+    // has other entries in flight.
+
+    /// How many records this test's own call-ids hold. The set is
+    /// process-global and the test binary is parallel, so a bare `len()` is
+    /// other tests' noise; counting one prefix is exact.
+    fn playback_records_for(prefix: &str) -> usize {
+        ACTIVE_PLAYBACKS
+            .iter()
+            .filter(|entry| entry.key().0.starts_with(prefix))
+            .count()
+    }
+
+    /// A backend pointed at nothing: `play_media` and `stop_media` reach the
+    /// client and time out, which is enough to prove the bookkeeping is keyed
+    /// on the outcome and not on the attempt.
+    fn dead_native_backend() -> MediaBackend {
+        let (event_tx, _event_rx) = mpsc::channel::<RtpEngineEvent>(16);
+        let set =
+            SiphonRtpClientSet::new(vec![(dead_address(), 200, 1)], None, 200, event_tx).unwrap();
+        MediaBackend::SiphonRtp(set)
+    }
+
+    #[tokio::test]
+    async fn a_playback_that_never_started_is_not_recorded() {
+        // The engine never answered, so nothing is playing and a later bridge
+        // must not send a stop that the engine would reject.
+        let backend = dead_native_backend();
+        let outcome = backend
+            .play_media(
+                "leak-never-started",
+                "tag-a",
+                &PlayMediaSource::File("/prompts/x.wav".to_string()),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                false,
+            )
+            .await;
+        assert!(outcome.is_err(), "the dead address must not answer");
+        assert!(!MediaBackend::playback_started("leak-never-started", "tag-a"));
+        assert_eq!(playback_records_for("leak-never-started"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_call_leaves_no_playback_record_behind() {
+        // The leak gate: `delete` is the one path every session ends through,
+        // so an entry that survived it would grow the set for the life of the
+        // process. Driven over a batch, so a single stale entry shows up as a
+        // length that did not return to where it started.
+        let backend = dead_native_backend();
+        for index in 0..64 {
+            let call_id = format!("leak-delete-{index}");
+            ACTIVE_PLAYBACKS.insert((call_id.clone(), "tag-a".to_string()));
+            assert!(MediaBackend::playback_started(&call_id, "tag-a"));
+            // The engine is unreachable — the record still has to go, because
+            // the call is over either way.
+            let _ = backend.delete(&call_id, "tag-a").await;
+            assert!(!MediaBackend::playback_started(&call_id, "tag-a"));
+        }
+        assert_eq!(
+            playback_records_for("leak-delete-"),
+            0,
+            "a playback record outlived its call"
+        );
+    }
+
+    #[test]
+    fn a_targeted_stop_leaves_the_leg_playing() {
+        // `stop_media(play_id=…)` ends one playback of several, so the leg is
+        // still playing and a bridge still has something to stop. Only a
+        // blanket stop clears the record — asserted through the same helper the
+        // bridge reads.
+        let key = ("leak-targeted".to_string(), "tag-a".to_string());
+        ACTIVE_PLAYBACKS.insert(key.clone());
+        assert!(MediaBackend::playback_started("leak-targeted", "tag-a"));
+        assert_eq!(playback_records_for("leak-targeted"), 1);
+        ACTIVE_PLAYBACKS.remove(&key);
+        assert!(!MediaBackend::playback_started("leak-targeted", "tag-a"));
+        assert_eq!(playback_records_for("leak-targeted"), 0);
     }
 
     #[tokio::test]

@@ -45,6 +45,14 @@ pub enum SipVerb {
     AcceptRefer,
     /// Reject a pending inbound REFER with a final non-2xx.
     RejectRefer,
+    /// Join this channel to another the app owns, so the two parties hear each
+    /// other. The reply reports the local action only (the media is re-pointed
+    /// and the first re-INVITE is on the wire); the outcome arrives as
+    /// `ChannelBridged` / `BridgeFailed`.
+    Bridge,
+    /// Break a bridge. Both legs stay answered, owned and held — neither is
+    /// hung up.
+    Unbridge,
     /// Un-park the call and dial the B-leg via LCR sequential failover.
     Route,
     /// Set a header on the stored A-leg INVITE.
@@ -82,6 +90,8 @@ impl SipVerb {
             SipVerb::Refer => "refer",
             SipVerb::AcceptRefer => "accept_refer",
             SipVerb::RejectRefer => "reject_refer",
+            SipVerb::Bridge => "bridge",
+            SipVerb::Unbridge => "unbridge",
             SipVerb::Route => "route",
             SipVerb::SetHeader => "set_header",
             SipVerb::RemoveHeader => "remove_header",
@@ -109,9 +119,10 @@ impl std::fmt::Display for SipVerb {
 /// [`SipEvent::Other`] rather than failing, so a newer server that adds events
 /// never breaks an older client.
 /// `#[non_exhaustive]`: the server's event set grows (this release adds the
-/// three outbound-REFER verdicts), and every such addition would otherwise
-/// break any downstream `match` that had an arm per variant. With it, a
-/// wildcard arm is required once and every future event is purely additive.
+/// three bridge verdicts on top of the three outbound-REFER ones), and every
+/// such addition would otherwise break any downstream `match` that had an arm
+/// per variant. With it, a wildcard arm is required once and every future event
+/// is purely additive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "String", into = "String")]
 #[non_exhaustive]
@@ -147,6 +158,17 @@ pub enum SipEvent {
     /// A transfer this app asked for failed — refused, rejected, unauthorized,
     /// or ended without an outcome ([`TransferOutcomePayload`]).
     TransferFailed,
+    /// A bridge this app asked for formed: both legs renegotiated and the audio
+    /// meets ([`ChannelBridgedPayload`]). Pushed on **both** bridged channels,
+    /// each naming the other.
+    ChannelBridged,
+    /// A bridge this app asked for was refused at one of its two re-INVITEs
+    /// ([`BridgeFailedPayload`]). Both legs are left exactly as they were.
+    /// Pushed on both channels.
+    BridgeFailed,
+    /// A bridge was broken ([`ChannelUnbridgedPayload`]). Both legs stay
+    /// answered, owned and held — neither was hung up. Pushed on both channels.
+    ChannelUnbridged,
     /// Any other event name (forward-compatible catch-all).
     Other(String),
 }
@@ -165,6 +187,9 @@ impl SipEvent {
             SipEvent::TransferProgress => "TransferProgress",
             SipEvent::TransferCompleted => "TransferCompleted",
             SipEvent::TransferFailed => "TransferFailed",
+            SipEvent::ChannelBridged => "ChannelBridged",
+            SipEvent::BridgeFailed => "BridgeFailed",
+            SipEvent::ChannelUnbridged => "ChannelUnbridged",
             SipEvent::Other(name) => name.as_str(),
         }
     }
@@ -183,6 +208,9 @@ impl From<&str> for SipEvent {
             "TransferProgress" => SipEvent::TransferProgress,
             "TransferCompleted" => SipEvent::TransferCompleted,
             "TransferFailed" => SipEvent::TransferFailed,
+            "ChannelBridged" => SipEvent::ChannelBridged,
+            "BridgeFailed" => SipEvent::BridgeFailed,
+            "ChannelUnbridged" => SipEvent::ChannelUnbridged,
             other => SipEvent::Other(other.to_string()),
         }
     }
@@ -406,6 +434,223 @@ pub struct TransferOutcomePayload {
     pub attempt: Option<u32>,
 }
 
+/// What happens to the surviving leg when its bridge partner hangs up — the
+/// `on_peer_hangup` argument of the `bridge` verb.
+///
+/// A closed set, deliberately: an unrecognised token is refused by the server
+/// with `bad_request` rather than defaulted, because guessing at a teardown
+/// policy is how calls get stranded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerHangupPolicy {
+    /// Tear the survivor down too (the default): a bridged pair behaves like one
+    /// call, so when one party leaves the other has nobody to talk to.
+    #[default]
+    Hangup,
+    /// Keep the survivor up and held (RFC 3264 §8.4), still owned and still
+    /// addressable, so the app can bridge it to somebody else. The supervisor /
+    /// attended-hand-off case.
+    Hold,
+}
+
+impl PeerHangupPolicy {
+    /// The exact wire token.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            PeerHangupPolicy::Hangup => "hangup",
+            PeerHangupPolicy::Hold => "hold",
+        }
+    }
+
+    /// Parse a wire token. `None` for anything else — never a silent default.
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "hangup" => Some(PeerHangupPolicy::Hangup),
+            "hold" => Some(PeerHangupPolicy::Hold),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for PeerHangupPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Which side of a bridge a leg is — the `role` of a [`ChannelBridgedPayload`].
+///
+/// Unrecognised tokens map to [`BridgeRole::Other`] rather than failing, so a
+/// newer server never breaks an older client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+#[non_exhaustive]
+pub enum BridgeRole {
+    /// The leg the `bridge` was addressed to. It keeps its media session — its
+    /// ports and everything attached to them survive the bridge.
+    Anchor,
+    /// The leg named by `with`. Its own media session was deleted; it joined the
+    /// anchor's as the second party.
+    Peer,
+    /// Any other role token (forward-compatible catch-all).
+    Other(String),
+}
+
+impl BridgeRole {
+    /// The exact wire token.
+    pub fn as_str(&self) -> &str {
+        match self {
+            BridgeRole::Anchor => "anchor",
+            BridgeRole::Peer => "peer",
+            BridgeRole::Other(token) => token.as_str(),
+        }
+    }
+}
+
+impl From<&str> for BridgeRole {
+    fn from(token: &str) -> Self {
+        match token {
+            "anchor" => BridgeRole::Anchor,
+            "peer" => BridgeRole::Peer,
+            other => BridgeRole::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<String> for BridgeRole {
+    fn from(token: String) -> Self {
+        BridgeRole::from(token.as_str())
+    }
+}
+
+impl From<BridgeRole> for String {
+    fn from(role: BridgeRole) -> Self {
+        role.as_str().to_string()
+    }
+}
+
+impl std::fmt::Display for BridgeRole {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Which of a bridge's two re-INVITEs was refused — the `stage` of a
+/// [`BridgeFailedPayload`].
+///
+/// Unrecognised tokens map to [`BridgeStage::Other`] rather than failing, so a
+/// newer server never breaks an older client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+#[non_exhaustive]
+pub enum BridgeStage {
+    /// The `with` leg refused the anchor's media. The anchor was never touched,
+    /// so both calls are exactly as they were.
+    OfferingPeer,
+    /// The peer answered, but the anchor refused the answer it was re-offered.
+    /// Both halves are dropped and neither leg is torn down.
+    OfferingAnchor,
+    /// Any other stage token (forward-compatible catch-all).
+    Other(String),
+}
+
+impl BridgeStage {
+    /// The exact wire token.
+    pub fn as_str(&self) -> &str {
+        match self {
+            BridgeStage::OfferingPeer => "offering_peer",
+            BridgeStage::OfferingAnchor => "offering_anchor",
+            BridgeStage::Other(token) => token.as_str(),
+        }
+    }
+}
+
+impl From<&str> for BridgeStage {
+    fn from(token: &str) -> Self {
+        match token {
+            "offering_peer" => BridgeStage::OfferingPeer,
+            "offering_anchor" => BridgeStage::OfferingAnchor,
+            other => BridgeStage::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<String> for BridgeStage {
+    fn from(token: String) -> Self {
+        BridgeStage::from(token.as_str())
+    }
+}
+
+impl From<BridgeStage> for String {
+    fn from(stage: BridgeStage) -> Self {
+        stage.as_str().to_string()
+    }
+}
+
+impl std::fmt::Display for BridgeStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The `payload` of a [`SipEvent::ChannelBridged`] event: the bridge formed and
+/// the two parties can hear each other.
+///
+/// A bridge is two RFC 3261 §14 re-INVITEs across two dialogs, so the `bridge`
+/// command reply reports only the local action (the media re-pointed, the first
+/// re-INVITE on the wire). This event is the outcome, and it is pushed on
+/// **both** bridged channels — each copy names the other leg.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelBridgedPayload {
+    /// The internal `CallActor` id of the leg on the other side.
+    pub peer_call_id: String,
+    /// That leg's SIP `Call-ID` — the CDR / HEP join key for the other party.
+    #[serde(default)]
+    pub peer_sip_call_id: String,
+    /// Which side *this* channel is: the anchor keeps its media session, the
+    /// peer joined it.
+    pub role: BridgeRole,
+    /// Whether the bridged pair lives on the media engine (the anchor's session)
+    /// rather than being a raw SDP crossing.
+    #[serde(default)]
+    pub anchored: bool,
+}
+
+/// The `payload` of a [`SipEvent::BridgeFailed`] event: one of the bridge's two
+/// re-INVITEs was refused, and both legs were left exactly as they were.
+///
+/// Never a teardown — the app still owns both calls and can retry, bridge
+/// elsewhere, or hang up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BridgeFailedPayload {
+    /// Which re-INVITE was refused.
+    pub stage: BridgeStage,
+    /// The SIP status the refusing leg answered with (`488`, `491`, `500`, …).
+    #[serde(default)]
+    pub code: Option<u16>,
+    /// The SIP `Call-ID` of the other leg in the attempt.
+    #[serde(default)]
+    pub peer_sip_call_id: Option<String>,
+}
+
+/// The `payload` of a [`SipEvent::ChannelUnbridged`] event: the bridge was
+/// broken.
+///
+/// Both legs stay answered, owned and held (RFC 3264 §8.4 `a=sendonly`) —
+/// neither is hung up, because that would be indistinguishable from two
+/// hangups. Pushed on both channels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelUnbridgedPayload {
+    /// The internal `CallActor` id of the leg that was on the other side.
+    pub peer_call_id: String,
+    /// That leg's SIP `Call-ID`.
+    #[serde(default)]
+    pub peer_sip_call_id: String,
+    /// The reason the `unbridge` carried (default `"unbridged"`).
+    #[serde(default)]
+    pub reason: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +668,8 @@ mod tests {
         assert_eq!(SipVerb::RejectRefer.as_str(), "reject_refer");
         assert_eq!(SipVerb::Ring.as_str(), "ring");
         assert_eq!(SipVerb::Progress.as_str(), "progress");
+        assert_eq!(SipVerb::Bridge.as_str(), "bridge");
+        assert_eq!(SipVerb::Unbridge.to_string(), "unbridge");
         assert_eq!(SipVerb::Play.as_str(), "play");
         assert_eq!(SipVerb::Stop.as_str(), "stop");
         assert_eq!(SipVerb::Dtmf.as_str(), "dtmf");
@@ -461,6 +708,17 @@ mod tests {
             SipEvent::TransferCompleted
         );
         assert_eq!(SipEvent::from("TransferFailed"), SipEvent::TransferFailed);
+        for name in ["ChannelBridged", "BridgeFailed", "ChannelUnbridged"] {
+            let parsed = SipEvent::from(name);
+            assert_eq!(parsed.as_str(), name);
+            assert_eq!(serde_json::to_string(&parsed).unwrap(), format!("\"{name}\""));
+        }
+        assert_eq!(SipEvent::from("ChannelBridged"), SipEvent::ChannelBridged);
+        assert_eq!(SipEvent::from("BridgeFailed"), SipEvent::BridgeFailed);
+        assert_eq!(
+            SipEvent::from("ChannelUnbridged"),
+            SipEvent::ChannelUnbridged
+        );
         assert_eq!(
             SipEvent::from("SomethingNew"),
             SipEvent::Other("SomethingNew".to_string())
@@ -595,5 +853,103 @@ mod tests {
         assert_eq!(replaces.call_id, "abc");
         assert!(replaces.early_only);
         assert_eq!(parsed.from_tag.as_deref(), Some("referrer-tag"));
+    }
+
+    #[test]
+    fn peer_hangup_policy_round_trips_and_refuses_an_unknown_token() {
+        for (token, policy) in [
+            ("hangup", PeerHangupPolicy::Hangup),
+            ("hold", PeerHangupPolicy::Hold),
+        ] {
+            assert_eq!(PeerHangupPolicy::parse(token), Some(policy));
+            assert_eq!(policy.as_str(), token);
+            assert_eq!(policy.to_string(), token);
+            assert_eq!(
+                serde_json::to_string(&policy).unwrap(),
+                format!("\"{token}\"")
+            );
+        }
+        // Never a silent default — the server refuses the same token.
+        assert_eq!(PeerHangupPolicy::parse("park"), None);
+        // Omitting the argument is what selects the default.
+        assert_eq!(PeerHangupPolicy::default(), PeerHangupPolicy::Hangup);
+    }
+
+    #[test]
+    fn bridge_role_and_stage_round_trip_known_and_unknown() {
+        for (token, role) in [("anchor", BridgeRole::Anchor), ("peer", BridgeRole::Peer)] {
+            assert_eq!(BridgeRole::from(token), role);
+            assert_eq!(role.as_str(), token);
+            assert_eq!(role.to_string(), token);
+            assert_eq!(serde_json::to_string(&role).unwrap(), format!("\"{token}\""));
+        }
+        let novel: BridgeRole = serde_json::from_str("\"observer\"").unwrap();
+        assert_eq!(novel, BridgeRole::Other("observer".to_string()));
+
+        for (token, stage) in [
+            ("offering_peer", BridgeStage::OfferingPeer),
+            ("offering_anchor", BridgeStage::OfferingAnchor),
+        ] {
+            assert_eq!(BridgeStage::from(token), stage);
+            assert_eq!(stage.as_str(), token);
+            assert_eq!(stage.to_string(), token);
+            assert_eq!(
+                serde_json::to_string(&stage).unwrap(),
+                format!("\"{token}\"")
+            );
+        }
+        let novel: BridgeStage = serde_json::from_str("\"something_new\"").unwrap();
+        assert_eq!(novel, BridgeStage::Other("something_new".to_string()));
+    }
+
+    #[test]
+    fn bridge_payloads_parse_every_server_shape() {
+        // ChannelBridged is pushed on both channels; each copy names the other
+        // leg and says which side this one is.
+        let anchor: ChannelBridgedPayload = serde_json::from_value(serde_json::json!({
+            "peer_call_id": "call-b",
+            "peer_sip_call_id": "b@host",
+            "role": "anchor",
+            "anchored": true,
+        }))
+        .unwrap();
+        assert_eq!(anchor.peer_call_id, "call-b");
+        assert_eq!(anchor.role, BridgeRole::Anchor);
+        assert!(anchor.anchored);
+
+        let peer: ChannelBridgedPayload = serde_json::from_value(serde_json::json!({
+            "peer_call_id": "call-a",
+            "peer_sip_call_id": "a@host",
+            "role": "peer",
+            "anchored": false,
+        }))
+        .unwrap();
+        assert_eq!(peer.role, BridgeRole::Peer);
+        assert!(!peer.anchored);
+
+        // The peer refused the anchor's media: the anchor was never touched.
+        let failed: BridgeFailedPayload = serde_json::from_value(serde_json::json!({
+            "stage": "offering_peer",
+            "code": 488,
+            "peer_sip_call_id": "b@host",
+        }))
+        .unwrap();
+        assert_eq!(failed.stage, BridgeStage::OfferingPeer);
+        assert_eq!(failed.code, Some(488));
+        assert_eq!(failed.peer_sip_call_id.as_deref(), Some("b@host"));
+
+        let glare: BridgeFailedPayload =
+            serde_json::from_value(serde_json::json!({ "stage": "offering_anchor" })).unwrap();
+        assert_eq!(glare.stage, BridgeStage::OfferingAnchor);
+        assert_eq!(glare.code, None);
+
+        let unbridged: ChannelUnbridgedPayload = serde_json::from_value(serde_json::json!({
+            "peer_call_id": "call-b",
+            "peer_sip_call_id": "b@host",
+            "reason": "supervisor took over",
+        }))
+        .unwrap();
+        assert_eq!(unbridged.peer_call_id, "call-b");
+        assert_eq!(unbridged.reason, "supervisor took over");
     }
 }

@@ -25,6 +25,7 @@ import {
 import type {
   ChannelSnapshot,
   EventFrame,
+  PeerHangupPolicy,
   SipEventKind,
 } from "./protocol";
 import type { ControlServer, ServerConfig } from "./server";
@@ -37,11 +38,15 @@ import type { CommandTransport } from "./session";
 
 /** One event delivered to a call's stream (`ChannelStateChange`,
  * `ChannelHangupRequest`, `ChannelDtmfReceived`, `TransferRequested`,
- * `TransferProgress`, `TransferCompleted`, `TransferFailed`, `StasisEnd`, …).
+ * `TransferProgress`, `TransferCompleted`, `TransferFailed`, `ChannelBridged`,
+ * `BridgeFailed`, `ChannelUnbridged`, `StasisEnd`, …).
  * Cast `payload` to
  * {@link import("./protocol").ChannelDtmfPayload} /
  * {@link import("./protocol").TransferRequestedPayload} /
- * {@link import("./protocol").TransferOutcomePayload} by `kind`. */
+ * {@link import("./protocol").TransferOutcomePayload} /
+ * {@link import("./protocol").ChannelBridgedPayload} /
+ * {@link import("./protocol").BridgeFailedPayload} /
+ * {@link import("./protocol").ChannelUnbridgedPayload} by `kind`. */
 export interface CallEvent {
   /** The parsed event kind. */
   kind: SipEventKind;
@@ -109,6 +114,17 @@ export interface AcceptReferOptions {
    * symmetric.
    */
   profile?: string;
+}
+
+/** Options for {@link Call.bridge}. */
+export interface BridgeOptions {
+  /**
+   * What happens to the surviving leg when its bridge partner hangs up —
+   * `"hangup"` (the default) tears it down too, `"hold"` keeps it up, held and
+   * still owned so it can be bridged to somebody else. See
+   * {@link import("./protocol").PeerHangupPolicy}.
+   */
+  onPeerHangup?: PeerHangupPolicy;
 }
 
 /** A {@link Call.route} target carrying per-target overrides. */
@@ -429,6 +445,63 @@ export class Call {
     await this.sip(SipVerb.RejectRefer, args);
   }
 
+  /**
+   * Join this call to another leg the app owns, so the two parties hear each
+   * other.
+   *
+   * **This call is the anchor.** It keeps its media session — its ports and
+   * everything attached to them; the `withChannel` leg's own media session is
+   * deleted and it becomes the second party on this one's. So bridge *into* the
+   * leg whose media you want to keep (the one being recorded, teed, or carrying
+   * the prompt).
+   *
+   * Both legs must already be answered. `options.onPeerHangup` says what happens
+   * to the survivor when its partner hangs up (see
+   * {@link import("./protocol").PeerHangupPolicy}); omitted means `"hangup"`.
+   *
+   * Resolves as soon as the media has been re-pointed and the first re-INVITE is
+   * on the wire — that is *offered*, not *bridged*. A bridge is two RFC 3261 §14
+   * re-INVITEs across two dialogs, so the outcome arrives on {@link Call.events}
+   * instead: exactly one `ChannelBridged`
+   * ({@link import("./protocol").ChannelBridgedPayload}) / `BridgeFailed`
+   * ({@link import("./protocol").BridgeFailedPayload}), on **both** channels.
+   * {@link import("./protocol").isBridgeFinal} says when to stop waiting.
+   *
+   * Resolves to the reply `result` (`{channel, with, call_id, peer_call_id,
+   * anchored, on_peer_hangup, state: "bridging"}`). Rejects with a `code` a
+   * caller can act on: `"not_found"` (no such leg), `"invalid_state"` (a leg has
+   * not answered, is already bridged, has a re-INVITE outstanding, or carries no
+   * media description), `"bad_request"` (the same leg named twice, or a bad
+   * `onPeerHangup`), `"forbidden"` (the other channel belongs to another app),
+   * `"unsupported_verb"` (the media backend cannot express it).
+   */
+  async bridge(withChannel: string, options?: BridgeOptions): Promise<unknown> {
+    const args: Record<string, unknown> = { with: withChannel };
+    if (options?.onPeerHangup !== undefined) {
+      args.on_peer_hangup = options.onPeerHangup;
+    }
+    return this.sip(SipVerb.Bridge, args);
+  }
+
+  /**
+   * Break this call's bridge.
+   *
+   * Both legs stay answered, owned and held — re-offered `a=sendonly`
+   * (RFC 3264 §8.4, which RFC 6337 §3.1 prefers to `c=0.0.0.0`). Neither is hung
+   * up: that would be indistinguishable from two hangups and would take away the
+   * calls the app still owns. A later {@link Call.bridge} re-offers `sendrecv`.
+   *
+   * `reason` is free text carried on the `ChannelUnbridged`
+   * ({@link import("./protocol").ChannelUnbridgedPayload}) event both channels
+   * receive; omitted means `"unbridged"`. Resolves to the reply `result`
+   * (`{channel, with, reason, state: "unbridged"}`), where `with` is the channel
+   * id of the leg that was on the other side. A call that is not bridged rejects
+   * with `code === "invalid_state"`.
+   */
+  async unbridge(reason?: string): Promise<unknown> {
+    return this.sip(SipVerb.Unbridge, reason !== undefined ? { reason } : {});
+  }
+
   /** Set a header on the stored A-leg INVITE. */
   async setHeader(name: string, value: string): Promise<void> {
     await this.sip(SipVerb.SetHeader, { name, value });
@@ -528,7 +601,8 @@ export class Call {
 
   /**
    * Await the next event for this call (`ChannelStateChange`,
-   * `ChannelHangupRequest`, `StasisEnd`). `null` once the stream closes.
+   * `ChannelHangupRequest`, `ChannelBridged`, `BridgeFailed`,
+   * `ChannelUnbridged`, `StasisEnd`). `null` once the stream closes.
    */
   nextEvent(): Promise<CallEvent | null> {
     return this.eventQueue.next();

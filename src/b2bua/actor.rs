@@ -1053,6 +1053,11 @@ pub struct CallActor {
     /// answer on the ACK (RFC 3261 §13.2.2.4). `None` for a call originated with
     /// a controller-supplied offer, and for every inbound call.
     pub originate_anchor: Option<OriginateAnchor>,
+    /// This call's half of a bridge with another call this process owns, set
+    /// while a `bridge` is forming and for as long as it holds. Mirrored on the
+    /// peer's actor, so either side's teardown finds the other
+    /// ([`super::bridge`]).
+    pub bridge: Option<super::bridge::BridgeContext>,
 }
 
 /// The media plan of an offerless originate, resolved when the callee's 2xx
@@ -1106,6 +1111,7 @@ impl CallActor {
             handoff_pending: false,
             originated: false,
             originate_anchor: None,
+            bridge: None,
         }
     }
 
@@ -2139,6 +2145,47 @@ impl CallActorStore {
         self.calls
             .get(call_id)
             .and_then(|call| call.originate_anchor.clone())
+    }
+
+    /// Attach one half of a bridge to a call. Overwrites any previous half —
+    /// the caller has already refused a leg that is `AlreadyBridged`.
+    pub fn set_bridge(&self, call_id: &str, context: super::bridge::BridgeContext) -> bool {
+        match self.calls.get_mut(call_id) {
+            Some(mut call) => {
+                call.bridge = Some(context);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// This call's half of a bridge, if it has one.
+    pub fn bridge(&self, call_id: &str) -> Option<super::bridge::BridgeContext> {
+        self.calls.get(call_id).and_then(|call| call.bridge.clone())
+    }
+
+    /// Advance this call's bridge to `stage`. Returns `false` when the call is
+    /// gone or was never bridged, so a response arriving after teardown is a
+    /// clean no-op rather than a resurrection.
+    pub fn set_bridge_stage(&self, call_id: &str, stage: super::bridge::BridgeStage) -> bool {
+        match self.calls.get_mut(call_id) {
+            Some(mut call) => match call.bridge.as_mut() {
+                Some(bridge) => {
+                    bridge.stage = stage;
+                    true
+                }
+                None => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Detach and return this call's half of a bridge. Idempotent: `None` when
+    /// the call is gone or was not bridged.
+    pub fn take_bridge(&self, call_id: &str) -> Option<super::bridge::BridgeContext> {
+        self.calls
+            .get_mut(call_id)
+            .and_then(|mut call| call.bridge.take())
     }
 
     /// Get a call by internal ID.

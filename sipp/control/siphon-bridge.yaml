@@ -1,0 +1,74 @@
+# siphon config for the `bridge` acceptance harness
+# (sipp/control/bridge_app.py + sipp/control/bridge_routes.py +
+# sipp/bridge_uac.xml + sipp/bridge_uas.xml).
+#
+# Unlike the `control` profile this runs against the REAL siphon-rtp engine, not
+# the recording mock, because the thing under test is whether audio actually
+# meets: after the bridge both parties send RTP through the engine, and the
+# engine's own per-leg counters — carried out as siphon's media CDR — are what
+# says it arrived in both directions. A mock that only records commands cannot
+# tell a formed bridge from an accepted one.
+#
+# One application, persistent inbound: it answers the inbound leg, places the
+# second one, joins them, parts them and joins them again.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "bridge.test"
+    - "172.20.0.170"
+
+advertised_address: "172.20.0.170"
+
+script:
+  path: "/etc/siphon/scripts/bridge_routes.py"
+
+media:
+  backend: siphon-rtp
+  siphon_rtp:
+    address: "172.20.0.130:8080"
+    timeout_ms: 2000
+
+  profiles:
+    # Both legs anchor on this: the inbound one through the answer-first
+    # handover, the originated one through `media: true`. Plain RTP, no ICE and
+    # no DTLS, so the SDP the engine writes is one SIPp answers without help.
+    bridge_relay:
+      offer: &bridge_flags
+        transport_protocol: "RTP/AVP"
+        ice: "remove"
+        dtls: "off"
+        replace: ["origin"]
+      answer: *bridge_flags
+
+# The media CDR is the audio oracle: the engine reports per-leg packets_in /
+# packets_out in its end-of-call summary and siphon writes them out as a
+# `MEDIA` record. Both legs non-zero in both directions is what "the audio
+# meets" means, and nothing on the SIP wire can show it.
+cdr:
+  enabled: true
+  # Without this nothing is written on a lifecycle event — including the MEDIA
+  # record, which is gated on the same flag as the proxy/b2bua ones.
+  auto_emit: true
+  backend: file
+  file:
+    path: "/var/log/siphon/cdr.jsonl"
+
+control:
+  listen: "0.0.0.0:9092"
+  apps:
+    - name: "bridge-app"
+      token: "bridge-app-token"
+      per_call_connect: false
+      on_lost: "hangup"
+  limits:
+    event_queue_depth: 256
+    slow_consumer: drop_oldest
+    reattach_grace_secs: 10
+    handoff_deadline_ms: 20000
+
+log:
+  level: info

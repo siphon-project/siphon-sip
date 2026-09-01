@@ -7,6 +7,9 @@
 //!
 //! - [`actor`]: Core actor types — `LegActor`, `CallActor`, `LegHandle`,
 //!   `LegRegistry`, dialog state, and intercommunication messages.
+//! - [`bridge`]: Joining two answered legs this process already owns — the
+//!   3PCC re-negotiation, the media re-anchor across two call actors, and the
+//!   glare rules.
 //! - [`fork`]: Forking state machine (parallel/sequential B-leg strategies).
 //! - [`transfer`]: REFER/Replaces call transfer handling.
 //! - [`header_policy`]: Versioned per-call header policy (which headers
@@ -17,6 +20,7 @@
 //!   transaction layer).
 
 pub mod actor;
+pub mod bridge;
 pub mod fork;
 pub mod header_policy;
 pub mod retransmit;

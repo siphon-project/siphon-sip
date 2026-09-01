@@ -134,6 +134,8 @@ def test_module_surface():
         "remove_header",
         "accept_refer",
         "reject_refer",
+        "bridge",
+        "unbridge",
     ):
         assert hasattr(Call, verb), f"Call is missing {verb}"
     assert issubclass(ControlError, Exception)
@@ -297,7 +299,7 @@ def test_route_verb_roundtrip():
 
 
 def test_media_header_refer_verbs_roundtrip():
-    """The new media / header / REFER verbs emit the exact server-side frames."""
+    """The media / header / REFER / bridge verbs emit the exact server-side frames."""
 
     async def scenario():
         recorded = []
@@ -359,6 +361,17 @@ def test_media_header_refer_verbs_roundtrip():
                     target="sip:c@pbx", next_hop="sip:sbc", mode="terminate"
                 )
                 await call.reject_refer(603, "Decline")
+                # `with` is a Python keyword, so the wire's `with` is passed as
+                # `with_channel`; an unset policy is omitted so the server's
+                # "hangup" default applies.
+                await call.bridge("ch2", on_peer_hangup="hold")
+                await call.bridge("ch3")
+                await call.unbridge("supervisor took over")
+                await call.unbridge()
+                # A policy the server would refuse is refused locally instead,
+                # before anything touches the two live calls.
+                with pytest.raises(ValueError):
+                    await call.bridge("ch2", on_peer_hangup="park")
                 if not done.done():
                     done.set_result(True)
 
@@ -393,6 +406,12 @@ def test_media_header_refer_verbs_roundtrip():
                 "mode": "terminate",
             }
             assert by_verb["reject_refer"] == {"code": 603, "reason": "Decline"}
+            bridge_args = [f["args"] for f in recorded if f["verb"] == "bridge"]
+            assert bridge_args[0] == {"with": "ch2", "on_peer_hangup": "hold"}
+            assert bridge_args[1] == {"with": "ch3"}
+            unbridge_args = [f["args"] for f in recorded if f["verb"] == "unbridge"]
+            assert unbridge_args[0] == {"reason": "supervisor took over"}
+            assert unbridge_args[1] == {}
             for frame in recorded:
                 assert frame["module"] == "sip"
                 assert frame["target"]["channel"] == "ch1"

@@ -215,6 +215,8 @@ chunk, so logs join Homer and billing with no mapping table.
 | `refer` | sip | `{to, replaces?}` | in-dialog REFER on the A-leg |
 | `accept_refer` | sip | `{target?, next_hop?, mode?}` | accept a pending inbound REFER (from a `TransferRequested` event) and run the transfer |
 | `reject_refer` | sip | `{code?, reason?}` | reject a pending inbound REFER with a final non-2xx (default `603 Decline`) |
+| `bridge` | sip | `{with, on_peer_hangup?}` | join this channel to another the app owns; the reply says the media was re-pointed, `ChannelBridged` says the audio meets |
+| `unbridge` | sip | `{reason?}` | break a bridge — both legs stay answered, owned and held |
 | `route` | sip | `{targets, strategy?, headers?}` | return control to siphon: un-park the call and dial the B-leg via LCR sequential failover |
 | `set_header` / `remove_header` / `get_header` | sip | `{name, value?}` | on the stored A-leg INVITE |
 | `play` | sip | `{file\|db_id\|blob\|tone\|url, repeat?, start_ms?, duration_ms?, gain_decibels?, to_tag?}` | play an announcement on the A-leg media (fire-and-forget); the reply and a `PlayStarted` event carry the `play_id` |
@@ -417,10 +419,119 @@ In-process, the same primitive is
 new leg's SIP Call-ID and drives the ordinary `@b2bua.on_answer` / `on_failure` /
 `on_bye` handlers.
 
-The `bridge` verb — joining two legs this process already owns — arrives in a
-later phase over the same envelope. The client SDK facade methods for the media,
-transfer and originate verbs land alongside it (until then, reach the verbs
-through the generic `command(verb, args)` escape hatch).
+## Joining two legs: `bridge`
+
+`originate` gives a controller a second call. `bridge` is what connects it to
+the first — the primitive under callback-and-connect, an attended hand-off, and
+a controller-driven transfer:
+
+```json
+{ "id":"c-9", "type":"command", "module":"sip", "verb":"bridge",
+  "target": { "channel": "ch_caller" },
+  "args": { "with": "cb-7f3a", "on_peer_hangup": "hangup" } }
+```
+
+```json
+{ "id":"c-9", "type":"reply", "status":"ok",
+  "result": { "channel":"ch_caller", "with":"cb-7f3a", "call_id":"<uuid>",
+              "peer_call_id":"<uuid>", "anchored":true,
+              "on_peer_hangup":"hangup", "state":"bridging" } }
+```
+
+**Both legs must be yours.** The target channel is resolved and
+ownership-checked by the substrate; `args.with` is checked the same way here, so
+one application can never join another's call to its own (`forbidden`).
+
+**The target is the anchor.** It is the leg that keeps its media session — its
+ports, and anything still attached to them. The `with` leg's own session is
+deleted and it joins the anchor's as the second party. Which one you address is
+therefore a real choice, not a formality.
+
+**Both legs get re-offered, and in that order.** siphon is a B2BUA, so each leg
+is its own offer/answer context (RFC 3264 §8) and siphon is the offerer on both
+— the two parties never share a dialog and neither ever offers to the other. A
+bridge is two RFC 3261 §14 re-INVITEs run back to back: the `with` leg first,
+carrying the anchor's current media, then the anchor carrying the answer that
+came back. The `with` leg goes first because that is the order in which a
+failure costs least — a peer that answers `488` leaves the anchor untouched and
+both calls exactly as they were.
+
+**The reply is the local action, not the outcome.** It comes back once the media
+has been re-pointed and the first re-INVITE is on the wire. The verdict arrives
+as an event, and on **both** channels, because either party can refuse:
+
+| event | payload | when |
+|---|---|---|
+| `ChannelBridged` | `{peer_call_id, peer_sip_call_id, role:"anchor"\|"peer", anchored}` | both legs answered their re-INVITE — the media meets |
+| `BridgeFailed` | `{stage:"offering_peer"\|"offering_anchor", code, peer_sip_call_id}` | a leg refused; both calls are left as they were |
+| `ChannelUnbridged` | `{peer_call_id, peer_sip_call_id, reason}` | this leg is parted **and** held — its hold offer has been answered. That is the point at which bridging it again is safe |
+
+**Media attachments come off first, and the teardown is confirmed.** An
+announcement still playing on a leg *replaces that leg's outgoing audio*, and a
+WebSocket bridge makes the engine the far side of it — either one still live
+when the bridge forms is one-way audio. So every attachment on both legs is torn
+down before anything is re-pointed, each step awaited and its reply checked
+against the engine. A step the backend refuses fails the command rather than
+forming half a bridge. Each teardown runs only where there is something to tear
+down — the detach where a tee is attached, the stop where siphon started a
+prompt — because firing them blind makes the engine reject a command it had
+nothing to do, into the counter that means siphon sent it something wrong.
+
+**Re-negotiation, not replacement.** An anchor that is already relaying between
+two parties (a pair that was bridged, unbridged and joined again) is renegotiated
+with `reoffer` on the call-id it already holds, so its ports and everything on
+them survive. A repeat `offer` there would be a *replacement* on the native
+backend. An anchor the engine answered itself (`answer_local` — which is how
+every controller-owned leg starts, both `handover(answer=True)` and
+`originate(media=true)`) has one party and no far leg, and the engine refuses an
+`answer` on it; that pair is therefore deleted, attachments and all, and offered
+onto a **fresh** engine call-id. The store key stays the leg's SIP Call-ID, so
+every media verb still resolves against it afterwards.
+
+**`unbridge` parts without ending.** Both legs stay answered, owned and
+addressable, and are put on hold: siphon re-offers each `a=sendonly` (RFC 3264
+§8.4; RFC 6337 §3.1 prefers that to the `c=0.0.0.0` of RFC 2543, and §5.1 warns
+against it). Ending both would make `unbridge` indistinguishable from two
+`hangup`s and throw away the state the controller wanted to keep. A later
+`bridge` re-offers `sendrecv`. The reply says the hold offers are on the wire
+(`state: "unbridging"`); the `ChannelUnbridged` on each leg says that leg is
+parted and held. Wait for it before bridging again, or the new bridge collides
+with the hold's own re-INVITE and is refused `invalid_state` (RFC 3261 §14.1).
+
+**When one leg hangs up.** `on_peer_hangup` decides, and it is fixed when the
+bridge is formed:
+
+- `"hangup"` (default) — the survivor goes too. A bridged pair behaves like one
+  call, so when one party leaves the other has nobody to talk to.
+- `"hold"` — the survivor stays up, held and still owned, and gets a
+  `ChannelUnbridged{reason: "peer_hangup"}`. Use it for a supervisor or an
+  attended hand-off, where the controller has somewhere else to send it. Note
+  that if the survivor was the `with` leg of an anchored bridge, the engine
+  session went with the anchor: it is still a live SIP dialog and can be bridged
+  again, but it no longer has media of its own for `play` / `stream_start`.
+
+Refusals are typed and separately actionable — the point is that a controller can
+tell them apart without parsing prose:
+
+| code | when |
+|---|---|
+| `bad_request` | no `args.with`, the same channel named twice, or an `on_peer_hangup` that is not `hangup` / `hold` |
+| `not_found` | no such channel, or the call is already gone |
+| `forbidden` | the `with` channel belongs to another application |
+| `invalid_state` | a leg has not answered, is already bridged, has a re-INVITE outstanding (RFC 3261 §14.1 glare), or carries no media description; and for `unbridge`, a leg that is not bridged |
+| `unsupported_verb` | the configured media backend refused one of the bridge's media steps |
+| `unavailable` | the B2BUA is not running, or the media backend failed |
+
+siphon does not retry a `491 Request Pending`. It reports the glare and leaves
+the pairing to the controller, which by then may want a different one.
+
+**Known limitation.** While a pair is bridged, a re-INVITE *from* one of the
+endpoints (a hold from the handset, say) is answered `491 Request Pending`
+rather than relayed across the bridge. That is today's behaviour for every
+control-owned leg, bridged or not.
+
+In-process, the same primitives are
+[`b2bua.bridge(...)` / `b2bua.unbridge(...)`](call.md#joining-two-calls-b2buabridge).
 
 An **outbound REFER** — the `refer` verb, where the app asks siphon to transfer a
 call — reports its far-end verdict as events, never in the command reply. The
@@ -455,11 +566,6 @@ is distinguishable from one that refuses (`TransferFailed{stage: "unauthorized"}
 even though both carry the same 407. Exactly one terminal event
 (`TransferCompleted` / `TransferFailed`) is emitted per `refer`, including when
 the call dies mid-transfer — a transfer is never left pending.
-
-`bridge` / `originate` verbs arrive in later phases over the same envelope. The
-client SDK facade methods for the media verbs and the transfer verbs land
-alongside them (until then, reach the verbs through the generic
-`command(verb, args)` escape hatch).
 
 The complete wire reference, both connection modes end to end, and two
 low-level example clients (one Python, one TypeScript) that drive calls with no

@@ -17,9 +17,11 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tracing::{debug, warn};
 
 use siphon_control_proto::sip::{
-    ChannelDtmfPayload, PlayStartedPayload, SipEvent, SipVerb, TransferOutcomePayload,
-    TransferRequestedPayload,
+    BridgeFailedPayload, ChannelBridgedPayload, ChannelDtmfPayload, ChannelUnbridgedPayload, PlayStartedPayload, SipEvent, SipVerb, TransferOutcomePayload, TransferRequestedPayload,
 };
+// The `bridge` verb's teardown policy is an argument of this facade, so it is
+// re-exported here rather than reached for through the proto crate.
+pub use siphon_control_proto::sip::PeerHangupPolicy;
 use siphon_control_proto::verbs::MODULE_SIP;
 use siphon_control_proto::{ChannelSnapshot, EventFrame};
 
@@ -307,6 +309,48 @@ impl CallEvent {
             SipEvent::TransferCompleted | SipEvent::TransferFailed
         )
     }
+
+    /// The typed [`ChannelBridgedPayload`] when this is a
+    /// [`SipEvent::ChannelBridged`] event, else `None`.
+    ///
+    /// This — not the `bridge` call's return value — is where a bridge's outcome
+    /// lives: [`Call::bridge`] resolves once the first re-INVITE is on the wire,
+    /// and the audio does not meet until both have been answered.
+    pub fn channel_bridged(&self) -> Option<ChannelBridgedPayload> {
+        if self.kind != SipEvent::ChannelBridged {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+
+    /// The typed [`BridgeFailedPayload`] when this is a
+    /// [`SipEvent::BridgeFailed`] event, else `None`. Both legs are left exactly
+    /// as they were — the app still owns them.
+    pub fn bridge_failed(&self) -> Option<BridgeFailedPayload> {
+        if self.kind != SipEvent::BridgeFailed {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+
+    /// The typed [`ChannelUnbridgedPayload`] when this is a
+    /// [`SipEvent::ChannelUnbridged`] event, else `None`. Both legs stay
+    /// answered, owned and held.
+    pub fn channel_unbridged(&self) -> Option<ChannelUnbridgedPayload> {
+        if self.kind != SipEvent::ChannelUnbridged {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+
+    /// Whether this event ends a bridge this app asked for — exactly one such
+    /// event arrives per `bridge`, so this is the signal to stop waiting.
+    pub fn is_bridge_final(&self) -> bool {
+        matches!(
+            self.kind,
+            SipEvent::ChannelBridged | SipEvent::BridgeFailed
+        )
+    }
 }
 
 struct CallInner {
@@ -571,6 +615,68 @@ impl Call {
         self.sip(SipVerb::RejectRefer, args).await.map(drop)
     }
 
+    /// Join this call to another leg the app owns, so the two parties hear each
+    /// other.
+    ///
+    /// **This call is the anchor.** It keeps its media session — its ports and
+    /// everything attached to them; the `with` channel's own media session is
+    /// deleted and it becomes the second party on this one's. So bridge *into*
+    /// the leg whose media you want to keep (the one being recorded, teed, or
+    /// carrying the prompt).
+    ///
+    /// Both legs must already be answered. `on_peer_hangup` says what happens to
+    /// the survivor when its partner hangs up: [`PeerHangupPolicy::Hangup`] (the
+    /// default when `None`) tears it down too, [`PeerHangupPolicy::Hold`] keeps
+    /// it up, held and still owned so it can be bridged to somebody else.
+    ///
+    /// Resolves as soon as the media has been re-pointed and the first re-INVITE
+    /// is on the wire — that is *offered*, not *bridged*. A bridge is two
+    /// RFC 3261 §14 re-INVITEs across two dialogs, so the outcome arrives on the
+    /// event stream instead: exactly one `ChannelBridged` / `BridgeFailed`, on
+    /// **both** channels. [`CallEvent::channel_bridged`] /
+    /// [`CallEvent::bridge_failed`] decode them.
+    ///
+    /// The returned value is the reply `result`
+    /// (`{channel, with, call_id, peer_call_id, anchored, on_peer_hangup,
+    /// state: "bridging"}`). Typed refusals, each of which a caller can act on
+    /// differently: `not_found` (no such leg), `invalid_state` (a leg has not
+    /// answered, is already bridged, has a re-INVITE outstanding, or carries no
+    /// media description), `bad_request` (the same leg named twice, or a bad
+    /// `on_peer_hangup`), `forbidden` (the `with` channel belongs to another
+    /// app), `unsupported_verb` (the media backend cannot express it).
+    pub async fn bridge(
+        &self,
+        with: &str,
+        on_peer_hangup: Option<PeerHangupPolicy>,
+    ) -> Result<serde_json::Value, ControlError> {
+        let mut args = json!({ "with": with });
+        if let Some(policy) = on_peer_hangup {
+            args["on_peer_hangup"] = json!(policy.as_str());
+        }
+        self.sip(SipVerb::Bridge, args).await
+    }
+
+    /// Break this call's bridge.
+    ///
+    /// Both legs stay answered, owned and held — re-offered `a=sendonly`
+    /// (RFC 3264 §8.4, which RFC 6337 §3.1 prefers to `c=0.0.0.0`). Neither is
+    /// hung up: that would be indistinguishable from two hangups and would take
+    /// away the calls the app still owns. A later [`Call::bridge`] re-offers
+    /// `sendrecv`.
+    ///
+    /// `reason` is free text carried on the `ChannelUnbridged` event both
+    /// channels receive (`None` → `"unbridged"`). The returned value is the
+    /// reply `result` (`{channel, with, reason, state: "unbridged"}`), where
+    /// `with` is the channel id of the leg that was on the other side. A call
+    /// that is not bridged resolves to `invalid_state`.
+    pub async fn unbridge(&self, reason: Option<&str>) -> Result<serde_json::Value, ControlError> {
+        let mut args = json!({});
+        if let Some(reason) = reason {
+            args["reason"] = json!(reason);
+        }
+        self.sip(SipVerb::Unbridge, args).await
+    }
+
     /// Un-park this controlled call and dial the B-leg via siphon's LCR
     /// sequential-failover engine, returning control to siphon.
     ///
@@ -744,10 +850,12 @@ impl Call {
 
     /// Await the next event for this call (`ChannelStateChange`,
     /// `ChannelHangupRequest`, `ChannelDtmfReceived`, `TransferRequested`,
-    /// `TransferProgress`, `TransferCompleted`, `TransferFailed`, `StasisEnd`).
+    /// `TransferProgress`, `TransferCompleted`, `TransferFailed`,
+    /// `ChannelBridged`, `BridgeFailed`, `ChannelUnbridged`, `StasisEnd`).
     /// `None` once the stream closes. Use [`CallEvent::dtmf`] /
-    /// [`CallEvent::transfer_requested`] / [`CallEvent::transfer_outcome`] to
-    /// decode the payload.
+    /// [`CallEvent::transfer_requested`] / [`CallEvent::transfer_outcome`] /
+    /// [`CallEvent::channel_bridged`] / [`CallEvent::bridge_failed`] /
+    /// [`CallEvent::channel_unbridged`] to decode the payload.
     pub async fn next_event(&self) -> Option<CallEvent> {
         self.inner.events.lock().await.recv().await
     }
@@ -1085,7 +1193,7 @@ impl SipServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use siphon_control_proto::sip::TransferStage;
+    use siphon_control_proto::sip::{BridgeRole, BridgeStage, TransferStage};
     use siphon_control_proto::ChannelSnapshot;
     use std::collections::HashMap;
 
@@ -1375,6 +1483,113 @@ mod tests {
             json!({ "source": "file", "play_id": 7, "duration_ms": 1500 }),
         ));
         assert!(other.play_started().is_none());
+    }
+
+    #[tokio::test]
+    async fn bridge_and_unbridge_emit_expected_frames() {
+        let recorder = Arc::new(RecordingTransport {
+            calls: Mutex::new(Vec::new()),
+            result: json!({
+                "channel": "ch1",
+                "with": "ch2",
+                "call_id": "call-a",
+                "peer_call_id": "call-b",
+                "anchored": true,
+                "on_peer_hangup": "hold",
+                "state": "bridging",
+            }),
+        });
+        let call = make_call(recorder.clone());
+
+        let result = call
+            .bridge("ch2", Some(PeerHangupPolicy::Hold))
+            .await
+            .expect("bridge ok");
+        // The reply is the local action; the audio meeting is the event.
+        assert_eq!(result["state"], "bridging");
+        assert_eq!(result["with"], "ch2");
+        assert_eq!(result["anchored"], true);
+
+        // An omitted policy is absent from the frame rather than sent as null,
+        // so the server's "hangup" default is what applies.
+        call.bridge("ch3", None).await.expect("bridge ok");
+        call.unbridge(Some("supervisor took over"))
+            .await
+            .expect("unbridge ok");
+        call.unbridge(None).await.expect("unbridge ok");
+
+        let recorded = lock(&recorder.calls).clone();
+        for frame in &recorded {
+            assert_eq!(frame.module.as_deref(), Some("sip"));
+            assert_eq!(frame.target, json!({ "channel": "ch1" }));
+        }
+        assert_eq!(recorded[0].verb, "bridge");
+        assert_eq!(
+            recorded[0].args,
+            json!({ "with": "ch2", "on_peer_hangup": "hold" })
+        );
+        assert_eq!(recorded[1].args, json!({ "with": "ch3" }));
+        assert_eq!(recorded[2].verb, "unbridge");
+        assert_eq!(recorded[2].args, json!({ "reason": "supervisor took over" }));
+        assert_eq!(recorded[3].args, json!({}));
+    }
+
+    #[test]
+    fn bridge_verdicts_parse_from_frames() {
+        let frame = |event: &str, payload: serde_json::Value| {
+            CallEvent::from_frame(EventFrame::new(
+                event, "ch1", "ivr-app", "call-uuid", "sip@host", payload,
+            ))
+        };
+
+        // The anchor's copy: it keeps its media session, the peer joined it.
+        let bridged = frame(
+            "ChannelBridged",
+            json!({
+                "peer_call_id": "call-b",
+                "peer_sip_call_id": "b@host",
+                "role": "anchor",
+                "anchored": true
+            }),
+        );
+        assert_eq!(bridged.kind, SipEvent::ChannelBridged);
+        let payload = bridged.channel_bridged().expect("bridged payload");
+        assert_eq!(payload.peer_call_id, "call-b");
+        assert_eq!(payload.role, BridgeRole::Anchor);
+        assert!(payload.anchored);
+        assert!(bridged.is_bridge_final());
+        // Wrong-kind accessors stay None.
+        assert!(bridged.bridge_failed().is_none());
+        assert!(bridged.transfer_outcome().is_none());
+
+        // The peer refused the anchor's media, so the anchor was never touched.
+        let failed = frame(
+            "BridgeFailed",
+            json!({ "stage": "offering_peer", "code": 488, "peer_sip_call_id": "b@host" }),
+        );
+        assert_eq!(failed.kind, SipEvent::BridgeFailed);
+        let payload = failed.bridge_failed().expect("failed payload");
+        assert_eq!(payload.stage, BridgeStage::OfferingPeer);
+        assert_eq!(payload.code, Some(488));
+        assert!(failed.is_bridge_final());
+        assert!(failed.channel_bridged().is_none());
+
+        // Unbridge is not a hangup: both legs stay answered and held.
+        let unbridged = frame(
+            "ChannelUnbridged",
+            json!({
+                "peer_call_id": "call-b",
+                "peer_sip_call_id": "b@host",
+                "reason": "supervisor took over"
+            }),
+        );
+        assert_eq!(unbridged.kind, SipEvent::ChannelUnbridged);
+        let payload = unbridged.channel_unbridged().expect("unbridged payload");
+        assert_eq!(payload.peer_sip_call_id, "b@host");
+        assert_eq!(payload.reason, "supervisor took over");
+        // It ends the bridge, but it is not a verdict on forming one.
+        assert!(!unbridged.is_bridge_final());
+        assert!(unbridged.dtmf().is_none());
     }
 
     #[test]

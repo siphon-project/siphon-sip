@@ -188,6 +188,8 @@ export const SipVerb = {
   RemoveHeader: "remove_header",
   AcceptRefer: "accept_refer",
   RejectRefer: "reject_refer",
+  Bridge: "bridge",
+  Unbridge: "unbridge",
   Play: "play",
   Stop: "stop",
   Dtmf: "dtmf",
@@ -212,6 +214,9 @@ export type SipEventKind =
   | "TransferProgress"
   | "TransferCompleted"
   | "TransferFailed"
+  | "ChannelBridged"
+  | "BridgeFailed"
+  | "ChannelUnbridged"
   | (string & {});
 
 /** Parse a wire event name; unknown names pass through verbatim (forward-compatible). */
@@ -344,4 +349,94 @@ export interface TransferOutcomePayload {
  */
 export function isTransferFinal(name: string): boolean {
   return name === "TransferCompleted" || name === "TransferFailed";
+}
+
+/**
+ * What happens to the surviving leg when its bridge partner hangs up — the
+ * `onPeerHangup` option of {@link import("./sip").Call.bridge}.
+ *
+ * `"hangup"` (the default) tears the survivor down too: a bridged pair behaves
+ * like one call. `"hold"` keeps it up, held (RFC 3264 §8.4) and still owned, so
+ * the app can bridge it to somebody else — the supervisor / attended-hand-off
+ * case. A closed set: the server refuses anything else with
+ * `code === "bad_request"` rather than guessing at a teardown policy.
+ */
+export type PeerHangupPolicy = "hangup" | "hold";
+
+/**
+ * Which side of a bridge a leg is — the `role` of a
+ * {@link ChannelBridgedPayload}. The `anchor` is the channel the `bridge` was
+ * addressed to and keeps its media session; the `peer` is the one named by
+ * `with`, whose own media session was deleted when it joined. Unknown tokens
+ * pass through verbatim (forward-compatible).
+ */
+export type BridgeRole = "anchor" | "peer" | (string & {});
+
+/**
+ * Which of a bridge's two re-INVITEs was refused — the `stage` of a
+ * {@link BridgeFailedPayload}. `offering_peer` means the `with` leg refused the
+ * anchor's media and the anchor was never touched; `offering_anchor` means the
+ * peer answered but the anchor refused what it was re-offered. Unknown tokens
+ * pass through verbatim (forward-compatible).
+ */
+export type BridgeStage = "offering_peer" | "offering_anchor" | (string & {});
+
+/**
+ * The `payload` of a `ChannelBridged` event — the bridge formed and the two
+ * parties can hear each other.
+ *
+ * A bridge is two RFC 3261 §14 re-INVITEs across two dialogs, so the `bridge`
+ * command reply reports only the local action (the media re-pointed, the first
+ * re-INVITE on the wire) and this event is the outcome. It is pushed on **both**
+ * bridged channels, each copy naming the other leg. Cast a
+ * {@link import("./sip").CallEvent}'s `payload` to this when
+ * `kind === "ChannelBridged"`.
+ */
+export interface ChannelBridgedPayload {
+  /** The internal `CallActor` id of the leg on the other side. */
+  peer_call_id: string;
+  /** That leg's SIP `Call-ID` — the CDR / HEP join key for the other party. */
+  peer_sip_call_id: string;
+  /** Which side *this* channel is. */
+  role: BridgeRole;
+  /** Whether the bridged pair lives on the media engine (the anchor's session). */
+  anchored: boolean;
+}
+
+/**
+ * The `payload` of a `BridgeFailed` event — one of the bridge's two re-INVITEs
+ * was refused and both legs were left exactly as they were. Never a teardown:
+ * the app still owns both calls and can retry, bridge elsewhere, or hang up.
+ */
+export interface BridgeFailedPayload {
+  /** Which re-INVITE was refused. */
+  stage: BridgeStage;
+  /** The SIP status the refusing leg answered with (`488`, `491`, `500`, …). */
+  code?: number | null;
+  /** The SIP `Call-ID` of the other leg in the attempt. */
+  peer_sip_call_id?: string | null;
+}
+
+/**
+ * The `payload` of a `ChannelUnbridged` event — the bridge was broken. Both legs
+ * stay answered, owned and held (RFC 3264 §8.4 `a=sendonly`); neither is hung
+ * up, because that would be indistinguishable from two hangups. Pushed on both
+ * channels.
+ */
+export interface ChannelUnbridgedPayload {
+  /** The internal `CallActor` id of the leg that was on the other side. */
+  peer_call_id: string;
+  /** That leg's SIP `Call-ID`. */
+  peer_sip_call_id: string;
+  /** The reason the `unbridge` carried (default `"unbridged"`). */
+  reason: string;
+}
+
+/**
+ * Whether an event name ends a bridge this app asked for. Exactly one such event
+ * arrives per `bridge`, so this is the signal to stop waiting. `ChannelUnbridged`
+ * is not one of them — it ends a bridge that already formed.
+ */
+export function isBridgeFinal(name: string): boolean {
+  return name === "ChannelBridged" || name === "BridgeFailed";
 }
