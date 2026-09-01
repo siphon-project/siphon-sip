@@ -29,7 +29,7 @@ use tracing::{debug, error, warn};
 
 use crate::transport::crlf_keepalive::{drain_leading_crlf_keepalives, CrlfPongTracker};
 use crate::transport::pool::ConnectionPool;
-use crate::transport::tcp::{classify_incomplete_stream, extract_sip_message_length, StreamVerdict};
+use crate::transport::tcp::{frame_sip_message, FrameVerdict};
 use crate::transport::{
     ConnectionId, InboundMessage, OutboundMessage, StreamConnections, Transport,
     CONNECTION_IDLE_TIMEOUT,
@@ -225,22 +225,57 @@ pub(crate) async fn serve_sip_stream<R, W>(
                 if accumulator.is_empty() {
                     break;
                 }
-                let message_len = match extract_sip_message_length(&accumulator) {
-                    Some(len) if len <= accumulator.len() => len,
-                    // Header block complete, body still arriving — wait.
-                    Some(_) => break,
-                    None => match classify_incomplete_stream(&accumulator) {
-                        // SIP still arriving — need more data.
-                        StreamVerdict::MaybeSip => break,
-                        StreamVerdict::Garbage => {
-                            warn!("non-SIP bytes from {remote_addr} on {transport} {connection_id:?}; dropping connection");
-                            crate::security::record_malformed_message(
-                                remote_addr.ip(),
-                                &transport.to_string(),
-                            );
-                            return; // close the connection
+                let message_len = match frame_sip_message(
+                    &accumulator,
+                    crate::security::max_message_bytes(),
+                ) {
+                    FrameVerdict::Complete { len } => len,
+                    // Still arriving (or header block done, body in flight).
+                    FrameVerdict::NeedMore => break,
+                    // RFC 3261 §21.4.11 — the peer declared more than we will
+                    // buffer. The header block is already complete, so answer
+                    // 513 rather than resetting the connection out from under
+                    // a peer that would otherwise have no idea why: a legit
+                    // oversized body (large SIPREC metadata, say) is then an
+                    // obvious configuration problem instead of a mystery RST.
+                    // The connection still closes, because the body we refuse
+                    // to buffer is exactly what we would have to read to find
+                    // the next message boundary.
+                    FrameVerdict::Oversized { declared, header_len } => {
+                        warn!(
+                            declared,
+                            limit = crate::security::max_message_bytes(),
+                            "message from {remote_addr} on {transport} {connection_id:?} exceeds \
+                             security.max_message_bytes; answering 513 and dropping connection"
+                        );
+                        if let Ok(request) =
+                            crate::sip::parser::parse_sip_headers_only(&accumulator[..header_len])
+                        {
+                            if request.is_request() {
+                                let reject = crate::sip::builder::build_response_skeleton(
+                                    &request,
+                                    513,
+                                    "Message Too Large",
+                                );
+                                let _ = keepalive_writer
+                                    .send(Bytes::from(reject.to_bytes()))
+                                    .await;
+                            }
                         }
-                    },
+                        crate::security::record_malformed_message(
+                            remote_addr.ip(),
+                            &transport.to_string(),
+                        );
+                        return; // close the connection
+                    }
+                    FrameVerdict::Garbage => {
+                        warn!("non-SIP bytes from {remote_addr} on {transport} {connection_id:?}; dropping connection");
+                        crate::security::record_malformed_message(
+                            remote_addr.ip(),
+                            &transport.to_string(),
+                        );
+                        return; // close the connection
+                    }
                 };
                 let data = accumulator.split_to(message_len).freeze();
                 let message = InboundMessage {
@@ -289,7 +324,7 @@ pub(crate) async fn serve_sip_stream<R, W>(
     });
 
     // Write task.
-    let write_task = tokio::spawn(async move {
+    let mut write_task = tokio::spawn(async move {
         while let Some(data) = outbound_rx.recv().await {
             if let Err(error) = writer.write_all(&data).await {
                 warn!("{transport} write error on {connection_id:?}: {error}");
@@ -300,8 +335,17 @@ pub(crate) async fn serve_sip_stream<R, W>(
 
     // Wait for either half to close, then clean up.
     tokio::select! {
-        _ = read_task => {}
-        _ = write_task => {}
+        _ = read_task => {
+            // The read half can queue a final response on its way out — a 513
+            // for an oversized declaration, say. Dropping the write half here
+            // would discard it and the peer would see a bare connection reset
+            // with no idea why, so instead close the channel (the read half's
+            // sender went with the task; this drops the map's copy) and give
+            // the writer a bounded window to flush what is already queued.
+            connection_map.remove(&connection_id);
+            let _ = tokio::time::timeout(FINAL_WRITE_GRACE, &mut write_task).await;
+        }
+        _ = &mut write_task => {}
     }
 
     connection_map.remove(&connection_id);
@@ -319,6 +363,12 @@ pub(crate) async fn serve_sip_stream<R, W>(
 // ---------------------------------------------------------------------------
 // Protocol sniffing — raw SIP vs SIP-over-WebSocket on one socket
 // ---------------------------------------------------------------------------
+
+/// How long the write half may take to flush a response the read half queued
+/// immediately before closing the connection. Bounded so a peer that has
+/// stopped reading cannot pin the task open, but generous enough for one small
+/// response on a live socket.
+const FINAL_WRITE_GRACE: Duration = Duration::from_secs(1);
 
 /// How long a freshly accepted connection may stay silent before it is assumed
 /// to be raw SIP.
@@ -581,6 +631,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::tcp::extract_sip_message_length;
 
     const INVITE: &[u8] = concat!(
         "INVITE sip:bob@biloxi.com SIP/2.0\r\n",

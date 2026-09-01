@@ -6,6 +6,33 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Security
+- **Bounded stream message size (`security.max_message_bytes`).** A peer on a
+  stream transport (TCP/TLS/WS/WSS) could declare an arbitrarily large
+  `Content-Length`, send only the header block, and make the reader buffer
+  toward the declared size. The existing 64 KB guard covers only a header block
+  with no end-of-headers marker, so it did not apply once `\r\n\r\n` had been
+  seen — roughly 200 bytes on one connection was enough to drive multi-GB
+  growth, before any parsing, authentication or rate limiting ran. Framing now
+  enforces a ceiling (default 256 KB, minimum 4096, configurable) across the
+  inbound listeners *and* the outbound connection pool, which had no guard at
+  all. An over-sized request is answered `513 Message Too Large` (RFC 3261
+  §21.4.11) and the connection is closed, so a legitimately over-sized body is
+  a diagnosable configuration problem rather than an unexplained reset.
+- **Fixed a wrapping length calculation in the stream framer.** A
+  `Content-Length` near `usize::MAX` overflowed the headers-plus-body sum.
+  Release builds do not enable overflow checks, so it wrapped silently to one
+  byte short of the header block: the framer sliced a truncated message and
+  desynchronised the stream on a value the peer chose. The sum now saturates,
+  so an unrepresentable declaration is refused as over-sized. Found by the new
+  framing fuzz target.
+
+### Added
+- **Framing fuzz target (`stream_framing_fuzz`).** Fuzzes the stream framer's
+  invariants — a framed length never exceeds the buffer or the ceiling, and a
+  refused message's header block stays inside the buffer — alongside the
+  existing parser target in CI.
+
 ### Fixed
 - **Two tests that failed at random, both for reasons unrelated to what they
   assert.** `free_port()` bound port 0, read the address and dropped the socket:

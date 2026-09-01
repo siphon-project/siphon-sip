@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use pyo3::prelude::*;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{self, Config};
 use crate::hep::HepSender;
@@ -1127,6 +1127,19 @@ impl SiphonServer {
 
         // --- Build transport ACL ---
         let transport_acl = build_transport_acl(&config, kernel_firewall.clone());
+
+        // --- Stream message-size ceiling ---
+        // Always installed (unlike the opt-in guards below): a stream reader
+        // that trusts a peer's declared Content-Length has no upper bound on
+        // what one connection can make it buffer, so the ceiling has to hold
+        // even when no `security:` block is configured at all.
+        let max_message_bytes = config
+            .security
+            .as_ref()
+            .and_then(|sec| sec.max_message_bytes)
+            .unwrap_or(crate::security::DEFAULT_MAX_MESSAGE_BYTES);
+        crate::security::set_max_message_bytes(max_message_bytes);
+        debug!(max_message_bytes, "stream message-size ceiling installed");
 
         // --- Auto-ban (failed_auth_ban scanner protection) ---
         // Opt-in: only installed when configured. Once installed, the auth path

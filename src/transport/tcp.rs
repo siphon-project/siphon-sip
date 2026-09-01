@@ -128,7 +128,7 @@ pub async fn listen(
 /// Returns `None` if the headers are not yet complete or if
 /// Content-Length is missing (assumes 0-length body in that case once
 /// the header block is complete).
-pub(crate) fn extract_sip_message_length(buffer: &[u8]) -> Option<usize> {
+pub fn extract_sip_message_length(buffer: &[u8]) -> Option<usize> {
     // Find end of headers
     let header_end = buffer
         .windows(4)
@@ -139,7 +139,15 @@ pub(crate) fn extract_sip_message_length(buffer: &[u8]) -> Option<usize> {
     let header_block = &buffer[..header_end];
     let content_length = extract_content_length(header_block).unwrap_or(0);
 
-    Some(headers_len + content_length)
+    // Saturate rather than wrap. `Content-Length: 18446744073709551615` parses
+    // as a valid `usize`, and `headers_len + content_length` then overflows —
+    // which panics in debug but *wraps* in release (the release profile does
+    // not enable overflow-checks), reporting a length one byte short of the
+    // header block. The framer would hand the parser a truncated header block
+    // and leave the tail of the `\r\n\r\n` in the accumulator, desynchronising
+    // the stream from a value the peer chose. Saturating puts the result above
+    // any ceiling instead, so the message is refused as oversized.
+    Some(headers_len.saturating_add(content_length))
 }
 
 /// Maximum bytes of an incomplete (no `\r\n\r\n` yet) stream message before it
@@ -202,6 +210,58 @@ pub(crate) fn classify_incomplete_stream(buffer: &[u8]) -> StreamVerdict {
         // First line still arriving and free of control bytes — keep reading
         // (bounded by the size cap above and the connection idle timeout).
         None => StreamVerdict::MaybeSip,
+    }
+}
+
+/// Verdict for one framing attempt over a stream accumulator.
+///
+/// Replaces the old "`Option<usize>` plus a separate garbage classification"
+/// pair so that every stream reader — inbound listeners and the outbound
+/// connection pool alike — goes through one place that also enforces the
+/// message-size ceiling. Without that ceiling a peer can declare a huge
+/// `Content-Length`, send only the header block, and make the reader buffer
+/// toward the declared size: the end-of-headers marker has already been seen,
+/// so [`MAX_INCOMPLETE_HEADER_BYTES`] no longer applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameVerdict {
+    /// A complete SIP message occupies the first `len` bytes of the buffer.
+    Complete { len: usize },
+    /// Not a complete message yet, and still plausibly SIP — keep reading.
+    NeedMore,
+    /// The header block is complete but the declared total exceeds the
+    /// ceiling. `header_len` bounds the (already buffered) header block so the
+    /// caller can parse it and answer 513 before closing the connection.
+    Oversized { declared: usize, header_len: usize },
+    /// Definitely not SIP, or an over-long header block — drop the connection.
+    Garbage,
+}
+
+/// Frame one SIP message out of a stream accumulator, refusing anything whose
+/// declared total exceeds `max_message_bytes`.
+///
+/// The caller must have already drained leading CRLF keepalives (RFC 5626
+/// §4.4.1) and confirmed the buffer is non-empty.
+pub fn frame_sip_message(buffer: &[u8], max_message_bytes: usize) -> FrameVerdict {
+    let Some(len) = extract_sip_message_length(buffer) else {
+        return match classify_incomplete_stream(buffer) {
+            StreamVerdict::MaybeSip => FrameVerdict::NeedMore,
+            StreamVerdict::Garbage => FrameVerdict::Garbage,
+        };
+    };
+    if len > max_message_bytes {
+        // Safe: `extract_sip_message_length` returned `Some`, so `\r\n\r\n`
+        // is present and the header block is fully buffered.
+        let header_len = buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|end| end + 4)
+            .unwrap_or(buffer.len());
+        return FrameVerdict::Oversized { declared: len, header_len };
+    }
+    if len <= buffer.len() {
+        FrameVerdict::Complete { len }
+    } else {
+        FrameVerdict::NeedMore
     }
 }
 
@@ -390,6 +450,124 @@ mod tests {
         assert_eq!(extract_content_length(headers), Some(200));
     }
 
+    // --- message-size ceiling (frame_sip_message) ---------------------------
+
+    const CEILING: usize = 256 * 1024;
+
+    /// The shape this ceiling exists to stop: a peer sends a ~200 byte header
+    /// block declaring a body far larger than anything SIP carries, then
+    /// dribbles it. Before the ceiling the reader saw `\r\n\r\n` (so the
+    /// over-long-header guard no longer applied) and buffered toward the
+    /// declared size, so one connection could drive multi-GB growth.
+    #[test]
+    fn oversized_declared_content_length_is_refused_not_buffered() {
+        let attack = b"INVITE sip:bob@example.com SIP/2.0\r\n\
+                       Via: SIP/2.0/TCP host;branch=z9hG4bK1\r\n\
+                       Content-Length: 4000000000\r\n\
+                       \r\n";
+        match frame_sip_message(attack, CEILING) {
+            FrameVerdict::Oversized { declared, header_len } => {
+                assert_eq!(declared, 4_000_000_000 + attack.len());
+                // The whole header block is buffered, so the caller can parse
+                // it and answer 513 before closing.
+                assert_eq!(header_len, attack.len());
+            }
+            other => panic!("expected Oversized, got {other:?}"),
+        }
+    }
+
+    /// A `Content-Length` near `usize::MAX` must not wrap the headers+body sum.
+    /// Found by the framing fuzz target: the sum overflowed, and because the
+    /// release profile leaves overflow-checks off it wrapped silently to
+    /// `headers_len - 1`, so the framer sliced a truncated header block and
+    /// desynchronised the stream on a value the peer controls.
+    #[test]
+    fn absurd_content_length_saturates_instead_of_wrapping() {
+        let attack = b"INVITE sip:bob@example.com SIP/2.0\r\n\
+                       Content-Length: 18446744073709551615\r\n\
+                       \r\n";
+        assert_eq!(extract_sip_message_length(attack), Some(usize::MAX));
+        assert!(
+            matches!(frame_sip_message(attack, CEILING), FrameVerdict::Oversized { .. }),
+            "an unrepresentable declaration must be refused, never framed short"
+        );
+    }
+
+    /// A message exactly at the ceiling is still accepted — the check is
+    /// "greater than", so the documented limit is inclusive.
+    #[test]
+    fn message_exactly_at_the_ceiling_is_accepted() {
+        let headers = b"INVITE sip:bob@example.com SIP/2.0\r\nContent-Length: 10\r\n\r\n";
+        let mut message = headers.to_vec();
+        message.extend_from_slice(b"0123456789");
+        let limit = message.len();
+        assert_eq!(
+            frame_sip_message(&message, limit),
+            FrameVerdict::Complete { len: message.len() }
+        );
+        assert!(matches!(
+            frame_sip_message(&message, limit - 1),
+            FrameVerdict::Oversized { .. }
+        ));
+    }
+
+    /// An ordinary message still frames, and a partially-arrived body still
+    /// asks for more rather than being mistaken for an attack.
+    #[test]
+    fn ordinary_message_frames_and_partial_body_waits() {
+        let headers = b"INVITE sip:bob@example.com SIP/2.0\r\nContent-Length: 4\r\n\r\n";
+        let mut complete = headers.to_vec();
+        complete.extend_from_slice(b"AAAA");
+        assert_eq!(
+            frame_sip_message(&complete, CEILING),
+            FrameVerdict::Complete { len: complete.len() }
+        );
+
+        let mut partial = headers.to_vec();
+        partial.extend_from_slice(b"AA");
+        assert_eq!(frame_sip_message(&partial, CEILING), FrameVerdict::NeedMore);
+    }
+
+    /// The pre-existing `classify_incomplete_stream` guards still fire through
+    /// the new entry point, unchanged: they apply only while the header block
+    /// is incomplete (a buffer that already holds `\r\n\r\n` frames as a
+    /// message and is judged further up the stack).
+    #[test]
+    fn frame_sip_message_preserves_garbage_classification() {
+        // A complete non-SIP first line, still mid-header-block.
+        assert_eq!(
+            frame_sip_message(b"GET /index.html HTTP/1.1\r\nHost: example", CEILING),
+            FrameVerdict::Garbage
+        );
+        // A binary probe (TLS ClientHello on the plaintext port).
+        assert_eq!(
+            frame_sip_message(&[0x16, 0x03, 0x01, 0x00, 0x2f], CEILING),
+            FrameVerdict::Garbage
+        );
+        // A genuine SIP message still arriving is not garbage.
+        assert_eq!(
+            frame_sip_message(b"INVITE sip:bob@example.com SIP/2.0\r\nVia: SIP", CEILING),
+            FrameVerdict::NeedMore
+        );
+        // Over-long header block with no end-of-headers is still refused.
+        let mut flood = b"INVITE sip:bob@example.com SIP/2.0\r\n".to_vec();
+        flood.resize(MAX_INCOMPLETE_HEADER_BYTES + 1, b'x');
+        assert_eq!(frame_sip_message(&flood, CEILING), FrameVerdict::Garbage);
+    }
+
+    /// The ceiling counts headers *and* body, so a message whose header block
+    /// alone is under the incomplete-header cap can still be refused on its
+    /// declared total.
+    #[test]
+    fn ceiling_covers_headers_plus_body() {
+        let message = b"INVITE sip:bob@example.com SIP/2.0\r\nContent-Length: 5000\r\n\r\n";
+        assert!(message.len() < MAX_INCOMPLETE_HEADER_BYTES);
+        assert!(matches!(
+            frame_sip_message(message, 4096),
+            FrameVerdict::Oversized { .. }
+        ));
+    }
+
     // --- end to end: the listener only serves connections that speak SIP ----
 
     /// Bind a port, release it, and start a TCP SIP listener on it.
@@ -448,6 +626,51 @@ mod tests {
         .unwrap();
         assert_eq!(read, 0, "a SIP port must not answer a probe");
         assert!(inbound_rx.is_empty(), "the probe must never reach the dispatcher");
+    }
+
+    /// End to end on a real listener: an oversized declaration is answered
+    /// 513, never dispatched, and the connection is closed — so the body the
+    /// peer promised is never buffered.
+    #[tokio::test]
+    async fn listener_answers_513_and_closes_on_an_oversized_declaration() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (addr, inbound_rx) = spawn_listener().await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let attack = concat!(
+            "INVITE sip:bob@example.com SIP/2.0\r\n",
+            "Via: SIP/2.0/TCP 10.0.0.1:5060;branch=z9hG4bK-oversize\r\n",
+            "From: <sip:alice@example.com>;tag=abc123\r\n",
+            "To: <sip:bob@example.com>\r\n",
+            "Call-ID: oversize-test@example.com\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Content-Length: 4000000000\r\n",
+            "\r\n",
+        );
+        client.write_all(attack.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read_to_end(&mut response),
+        )
+        .await
+        .expect("the connection must be closed, not held open buffering")
+        .unwrap();
+
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with("SIP/2.0 513 "),
+            "expected a 513, got: {response}"
+        );
+        assert!(
+            response.contains("branch=z9hG4bK-oversize"),
+            "the 513 must be routable back to the sender: {response}"
+        );
+        assert!(
+            inbound_rx.try_recv().is_err(),
+            "an oversized message must never reach the dispatcher"
+        );
     }
 
     #[tokio::test]

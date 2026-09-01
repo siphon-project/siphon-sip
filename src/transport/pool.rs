@@ -29,7 +29,7 @@ use crate::transport::{
     configure_tcp_socket, next_connection_id,
 };
 use crate::transport::crlf_keepalive::{drain_leading_crlf_keepalives, CrlfPongTracker};
-use crate::transport::tcp::extract_sip_message_length;
+use crate::transport::tcp::{frame_sip_message, FrameVerdict};
 
 /// Idle timeout for pooled outbound connections (shorter than inbound).
 ///
@@ -570,9 +570,36 @@ impl ConnectionPool {
                             if accumulator.is_empty() {
                                 break;
                             }
-                            let message_len = match extract_sip_message_length(&accumulator) {
-                                Some(len) if len <= accumulator.len() => len,
-                                _ => break, // incomplete — wait for more bytes
+                            // Same ceiling as the inbound listeners: an
+                            // upstream that declares a huge Content-Length (or
+                            // never terminates its header block) would
+                            // otherwise grow this accumulator without bound.
+                            // No 513 here — the pool reads responses, and a
+                            // response is not something to answer.
+                            let message_len = match frame_sip_message(
+                                &accumulator,
+                                crate::security::max_message_bytes(),
+                            ) {
+                                FrameVerdict::Complete { len } => len,
+                                FrameVerdict::NeedMore => break,
+                                FrameVerdict::Oversized { declared, .. } => {
+                                    warn!(
+                                        declared,
+                                        limit = crate::security::max_message_bytes(),
+                                        "pool: {} peer {} declared an oversized message; dropping connection",
+                                        "TCP",
+                                        destination
+                                    );
+                                    break;
+                                }
+                                FrameVerdict::Garbage => {
+                                    warn!(
+                                        "pool: non-SIP bytes from {} peer {}; dropping connection",
+                                        "TCP",
+                                        destination
+                                    );
+                                    break;
+                                }
                             };
                             let data = accumulator.split_to(message_len).freeze();
                             let message = InboundMessage {
@@ -826,9 +853,36 @@ impl ConnectionPool {
                             if accumulator.is_empty() {
                                 break;
                             }
-                            let message_len = match extract_sip_message_length(&accumulator) {
-                                Some(len) if len <= accumulator.len() => len,
-                                _ => break,
+                            // Same ceiling as the inbound listeners: an
+                            // upstream that declares a huge Content-Length (or
+                            // never terminates its header block) would
+                            // otherwise grow this accumulator without bound.
+                            // No 513 here — the pool reads responses, and a
+                            // response is not something to answer.
+                            let message_len = match frame_sip_message(
+                                &accumulator,
+                                crate::security::max_message_bytes(),
+                            ) {
+                                FrameVerdict::Complete { len } => len,
+                                FrameVerdict::NeedMore => break,
+                                FrameVerdict::Oversized { declared, .. } => {
+                                    warn!(
+                                        declared,
+                                        limit = crate::security::max_message_bytes(),
+                                        "pool: {} peer {} declared an oversized message; dropping connection",
+                                        "TLS",
+                                        destination
+                                    );
+                                    break;
+                                }
+                                FrameVerdict::Garbage => {
+                                    warn!(
+                                        "pool: non-SIP bytes from {} peer {}; dropping connection",
+                                        "TLS",
+                                        destination
+                                    );
+                                    break;
+                                }
                             };
                             let data = accumulator.split_to(message_len).freeze();
                             let message = InboundMessage {

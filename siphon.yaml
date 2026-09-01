@@ -402,6 +402,14 @@ auth:
 #   trusted_cidrs:              # never rate-limited and never auto-banned
 #     - "10.0.0.0/8"            # own infra: AS, BGCF, trunks, monitoring
 #
+#   max_message_bytes: 262144   # largest single SIP message on a stream
+#                               # transport (TCP/TLS/WS/WSS). A peer declaring a
+#                               # larger Content-Length is answered 513 Message
+#                               # Too Large and disconnected, so no single
+#                               # connection can drive unbounded memory growth.
+#                               # Default 262144 (256 KB); minimum 4096. Applies
+#                               # even with no security block configured.
+#
 #   failed_auth_ban:            # auto-ban scanners at accept (TCP/TLS/UDP/WS/SCTP)
 #     threshold: 10             # weighted failures within window_secs before a ban
 #     window_secs: 600          # sliding window for counting failures (default 600)

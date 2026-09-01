@@ -1,5 +1,7 @@
 /target
 fuzz/target/
+fuzz/artifacts/
+fuzz/corpus/
 sbom.spdx.json
 sbom.cdx.json
 __pycache__/
