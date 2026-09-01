@@ -14011,14 +14011,6 @@ fn build_b_leg_contact(
     }
 }
 
-/// Send a B-leg INVITE for a B2BUA call.
-///
-/// `target_uri` drives the new INVITE's R-URI (so the called party's IMPU
-/// shape is preserved on the wire).  `next_hop`, when set, is used for the
-/// wire destination instead of `target_uri` — IMS edge use-case where the
-/// R-URI must carry the canonical home-domain IMPU but the message has to
-/// be routed via a fixed next-hop (BGCF, I-CSCF, outbound proxy, …).
-#[allow(clippy::too_many_arguments)]
 /// Advertise an option tag in `Supported` without repeating one already there.
 ///
 /// `Supported` is a comma-separated list header, so the tag belongs *inside* the
@@ -14045,6 +14037,14 @@ fn advertise_option_tag(headers: &mut crate::sip::headers::SipHeaders, tag: &str
     }
 }
 
+/// Send a B-leg INVITE for a B2BUA call.
+///
+/// `target_uri` drives the new INVITE's R-URI (so the called party's IMPU
+/// shape is preserved on the wire).  `next_hop`, when set, is used for the
+/// wire destination instead of `target_uri` — IMS edge use-case where the
+/// R-URI must carry the canonical home-domain IMPU but the message has to
+/// be routed via a fixed next-hop (BGCF, I-CSCF, outbound proxy, …).
+#[allow(clippy::too_many_arguments)]
 fn b2bua_send_b_leg_invite(
     call_id: &str,
     target_uri: &str,
