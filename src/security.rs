@@ -62,6 +62,32 @@ pub fn security_filter() -> Option<&'static Arc<SecurityFilter>> {
     SECURITY_FILTER.get()
 }
 
+/// Default ceiling on a single SIP message over a stream transport, in bytes.
+///
+/// Comfortably above anything legitimate — a VoLTE INVITE with a full P-header
+/// set is a few KB, and even SIPREC metadata (RFC 7865) runs to tens of KB —
+/// while bounding what one connection can make siphon buffer. Raise it with
+/// `security.max_message_bytes` if a deployment genuinely carries larger
+/// bodies.
+pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 256 * 1024;
+
+/// Process-wide stream message-size ceiling. Unset until startup installs the
+/// configured value, so every read-path check is a cheap `OnceLock` read that
+/// falls back to [`DEFAULT_MAX_MESSAGE_BYTES`]. Mirrors [`AUTO_BAN`].
+static MAX_MESSAGE_BYTES: OnceLock<usize> = OnceLock::new();
+
+/// Install the process-wide message-size ceiling (idempotent — a second call is
+/// a no-op). Called once at server startup before any traffic is accepted.
+pub fn set_max_message_bytes(limit: usize) {
+    let _ = MAX_MESSAGE_BYTES.set(limit);
+}
+
+/// The configured stream message-size ceiling, or [`DEFAULT_MAX_MESSAGE_BYTES`]
+/// when none was installed. Read on every stream framing attempt.
+pub fn max_message_bytes() -> usize {
+    MAX_MESSAGE_BYTES.get().copied().unwrap_or(DEFAULT_MAX_MESSAGE_BYTES)
+}
+
 /// Record one failed/timed-out transport handshake (TLS / WSS TLS / WS upgrade)
 /// from `source` as an auto-ban signal, and bump the handshake-failure metric.
 ///
@@ -749,6 +775,7 @@ mod tests {
         trusted_cidrs: Vec<&str>,
     ) -> SecurityConfig {
         SecurityConfig {
+            max_message_bytes: None,
             rate_limit,
             scanner_block: if user_agents.is_empty() {
                 None

@@ -1476,7 +1476,18 @@ pub struct SecurityConfig {
     /// abusive traffic never reaches siphon's socket (Linux only, needs
     /// `CAP_NET_ADMIN`). Falls back to the userspace ACL when unavailable.
     pub firewall: Option<FirewallConfig>,
+    /// Largest single SIP message accepted on a stream transport (TCP/TLS/WS/
+    /// WSS), in bytes. A peer that declares a larger `Content-Length` is
+    /// answered 513 and disconnected rather than buffered, so one connection
+    /// cannot drive unbounded memory growth. Defaults to
+    /// [`crate::security::DEFAULT_MAX_MESSAGE_BYTES`] (256 KB).
+    pub max_message_bytes: Option<usize>,
 }
+
+/// Smallest accepted `security.max_message_bytes`. A REGISTER or INVITE with a
+/// digest challenge, a Route set and a modest SDP body sits comfortably under
+/// 4 KB; anything below this is an operator typo, not a policy.
+pub const MIN_MAX_MESSAGE_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct FirewallConfig {
@@ -4031,7 +4042,30 @@ impl Config {
             .map_err(|e| SiphonError::Config(format!("invalid siphon.yaml: {e}")))?;
         config.validate_media_profiles()?;
         config.validate_lawful_intercept()?;
+        config.validate_max_message_bytes()?;
         Ok(config)
+    }
+
+    /// Reject a message-size ceiling too small to carry a SIP message.
+    ///
+    /// The ceiling bounds what one stream connection can make siphon buffer,
+    /// so it is load-bearing for availability. A value below
+    /// [`MIN_MAX_MESSAGE_BYTES`] would refuse ordinary INVITEs — an operator
+    /// typo that turns into a total outage — so it is refused at load rather
+    /// than answering 513 to every call.
+    fn validate_max_message_bytes(&self) -> Result<()> {
+        let Some(limit) = self.security.as_ref().and_then(|sec| sec.max_message_bytes) else {
+            return Ok(());
+        };
+        if limit < MIN_MAX_MESSAGE_BYTES {
+            return Err(SiphonError::Config(format!(
+                "security.max_message_bytes is {limit}, below the {MIN_MAX_MESSAGE_BYTES} byte \
+                 floor — a SIP INVITE with authentication and SDP does not fit, so every call \
+                 would be answered 513 Message Too Large. Raise it or remove the field to take \
+                 the default."
+            )));
+        }
+        Ok(())
     }
 
     /// Reject an X3 content-delivery configuration the media backend cannot honour.

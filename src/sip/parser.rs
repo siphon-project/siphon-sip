@@ -31,13 +31,12 @@ pub fn parse_sip_message(input: &str) -> IResult<&str, SipMessage> {
     }))
 }
 
-/// Parse a SIP message from raw bytes, supporting binary bodies.
+/// Parse the start line and header block out of raw message bytes.
 ///
-/// Headers are ASCII/UTF-8 per RFC 3261. The body after the blank line
-/// (`\r\n\r\n`) is treated as opaque bytes — not validated as UTF-8.
-/// This supports binary content types like `application/vnd.3gpp.sms`.
-pub fn parse_sip_message_bytes(input: &[u8]) -> Result<SipMessage, String> {
-    // Find the header/body boundary
+/// Returns the parsed start line, the headers, and the index of the `\r\n\r\n`
+/// boundary. Shared by [`parse_sip_message_bytes`] and
+/// [`parse_sip_headers_only`], which differ only in how they treat the body.
+fn parse_header_block(input: &[u8]) -> Result<(StartLine, SipHeaders, usize), String> {
     let boundary = find_header_boundary(input)
         .ok_or_else(|| "no header/body boundary (\\r\\n\\r\\n) found".to_string())?;
 
@@ -60,6 +59,31 @@ pub fn parse_sip_message_bytes(input: &[u8]) -> Result<SipMessage, String> {
         .unwrap_or("");
     let (_, headers) = parse_headers(after_start_line)
         .map_err(|error| format!("header parse error: {error}"))?;
+
+    Ok((start_line, headers, boundary))
+}
+
+/// Parse only the header block, ignoring `Content-Length` entirely. The
+/// returned message always has an empty body.
+///
+/// [`parse_sip_message_bytes`] rejects a `Content-Length` larger than the body
+/// actually received (RFC 4475 §3.1.2.2), which is right for a message on its
+/// way upstream but wrong for the one caller that has deliberately refused to
+/// read the body: the stream framer rejecting an over-sized declaration still
+/// needs the Via / From / To / Call-ID / CSeq set to address its 513 response
+/// back at the sender.
+pub fn parse_sip_headers_only(input: &[u8]) -> Result<SipMessage, String> {
+    let (start_line, headers, _) = parse_header_block(input)?;
+    Ok(SipMessage { start_line, headers, body: Vec::new() })
+}
+
+/// Parse a SIP message from raw bytes, supporting binary bodies.
+///
+/// Headers are ASCII/UTF-8 per RFC 3261. The body after the blank line
+/// (`\r\n\r\n`) is treated as opaque bytes — not validated as UTF-8.
+/// This supports binary content types like `application/vnd.3gpp.sms`.
+pub fn parse_sip_message_bytes(input: &[u8]) -> Result<SipMessage, String> {
+    let (start_line, headers, boundary) = parse_header_block(input)?;
 
     // Body is raw bytes after the \r\n\r\n boundary
     let body_start = boundary + 4;

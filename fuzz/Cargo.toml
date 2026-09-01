@@ -17,3 +17,10 @@ path = "fuzz_targets/sip_parser_fuzz.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "stream_framing_fuzz"
+path = "fuzz_targets/stream_framing_fuzz.rs"
+test = false
+doc = false
+bench = false
