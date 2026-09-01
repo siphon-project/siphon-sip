@@ -6,6 +6,33 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Added
+- **Interoperability tests against an independent SIP proxy (`interop/`).** The
+  SIPp suite proves siphon does what siphon intends: every message on the wire
+  is siphon's own, and SIPp is a message generator rather than a SIP element —
+  it builds no route set, matches no CANCEL to a transaction, and has no opinion
+  about a Record-Route it did not write. A header that is subtly wrong but
+  self-consistent passes.
+
+  Kamailio is now the oracle. Two chains run in CI, both proxies Record-Routing
+  so every call builds a route set jointly:
+
+  ```
+  forward:  SIPp UAC -> siphon -> Kamailio -> SIPp UAS
+  reverse:  SIPp UAC -> Kamailio -> siphon -> SIPp UAS
+  ```
+
+  Forward proves siphon's Record-Route is loose-routable by Kamailio; reverse
+  proves siphon can loose-route Kamailio's; a third chain CANCELs an alerting
+  call across both hops. The scenarios assert no header text — the ACK and BYE
+  are addressed at the remote target carrying the jointly-built route set, so a
+  Record-Route the other proxy cannot read shows up as a BYE that never arrives.
+
+  `interop/run.sh` requires each chain to report at least one *successful* call
+  rather than just a zero exit code, because SIPp exits 0 when no call failed —
+  including when no call ever completed. Verified by negative control.
+
+
 ### Security
 - **Bounded stream message size (`security.max_message_bytes`).** A peer on a
   stream transport (TCP/TLS/WS/WSS) could declare an arbitrarily large

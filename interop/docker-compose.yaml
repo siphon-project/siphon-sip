@@ -1,0 +1,223 @@
+# interop/docker-compose.yaml — siphon against an independent SIP proxy.
+#
+# Two chains, both directions, because the bug classes differ by position:
+#
+#   forward:  SIPp UAC -> siphon -> Kamailio -> SIPp UAS
+#   reverse:  SIPp UAC -> Kamailio -> siphon -> SIPp UAS
+#
+# Both proxies Record-Route, so every call builds a route set jointly. In the
+# forward chain siphon's Record-Route has to be loose-routable by Kamailio; in
+# the reverse chain siphon has to loose-route Kamailio's. Only running both
+# proves both halves.
+#
+# Usage:
+#   docker compose -f interop/docker-compose.yaml build
+#   docker compose -f interop/docker-compose.yaml --profile forward up \
+#     --abort-on-container-exit --exit-code-from interop-uac-forward
+#   docker compose -f interop/docker-compose.yaml --profile reverse up \
+#     --abort-on-container-exit --exit-code-from interop-uac-reverse
+#   docker compose -f interop/docker-compose.yaml down -v
+#
+# The subnet is deliberately its own, so this stack can run alongside the
+# functional one in sipp/ (172.20.0.0/24) and the MTU one (172.30.0.0/24).
+
+x-kamailio-entrypoint: &kamailio-entrypoint
+  # kamailio.cfg is mounted read-only and carries a placeholder next hop, so one
+  # config serves both chain directions. Substituted into a writable copy at
+  # start rather than templated at build time, which keeps the file in the repo
+  # readable as a config rather than as a template.
+  entrypoint:
+    - /bin/sh
+    - -c
+    - |
+      sed "s|INTEROP_NEXT_HOP|$${INTEROP_NEXT_HOP}|" /etc/kamailio/kamailio.cfg.in > /tmp/kamailio.cfg
+      exec kamailio -DD -E -f /tmp/kamailio.cfg
+
+services:
+  # ── Chain: SIPp -> siphon -> Kamailio -> SIPp ─────────────────────────────
+  siphon-forward:
+    image: interop-siphon
+    build:
+      context: ..
+    container_name: interop-siphon-forward
+    environment:
+      SIPHON_ADVERTISED_ADDRESS: "172.28.0.10"
+      INTEROP_NEXT_HOP: "sip:172.28.0.20:5060"
+    volumes:
+      - ./configs/siphon.interop.yaml:/etc/siphon/siphon.yaml:ro
+      - ./scripts:/etc/siphon/interop:ro
+    networks:
+      interop:
+        ipv4_address: 172.28.0.10
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.interop SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.interop>;tag=hc\\r\\nTo: <sip:siphon.interop>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles: ["forward", "cancel"]
+
+  kamailio-forward:
+    image: ghcr.io/kamailio/kamailio-ci:5.8-alpine
+    container_name: interop-kamailio-forward
+    environment:
+      INTEROP_NEXT_HOP: "172.28.0.31:5060"
+    volumes:
+      - ./kamailio/kamailio.cfg:/etc/kamailio/kamailio.cfg.in:ro
+    <<: *kamailio-entrypoint
+    networks:
+      interop:
+        ipv4_address: 172.28.0.20
+    profiles: ["forward", "cancel"]
+
+  interop-uas-forward:
+    image: ctaloi/sipp:latest
+    container_name: interop-uas-forward
+    volumes:
+      - ./scenarios:/scenarios:ro
+    command: >
+      -sf /scenarios/uas_invite_bye.xml
+      -i 172.28.0.31 -p 5060 -m 1 -timeout 90s -timeout_error
+      -trace_err -error_file /dev/stderr
+    networks:
+      interop:
+        ipv4_address: 172.28.0.31
+    profiles: ["forward"]
+
+  interop-uac-forward:
+    image: ctaloi/sipp:latest
+    container_name: interop-uac-forward
+    depends_on:
+      siphon-forward:
+        condition: service_healthy
+      kamailio-forward:
+        condition: service_started
+      interop-uas-forward:
+        condition: service_started
+    volumes:
+      - ./scenarios:/scenarios:ro
+    command: >
+      -sf /scenarios/uac_invite_bye.xml
+      172.28.0.10:5060
+      -i 172.28.0.30 -p 5060 -m 1 -r 1 -timeout 30s -timeout_error
+      -trace_err -error_file /dev/stderr
+    networks:
+      interop:
+        ipv4_address: 172.28.0.30
+    profiles: ["forward"]
+
+  # ── Chain: SIPp -> Kamailio -> siphon -> SIPp ─────────────────────────────
+  kamailio-reverse:
+    image: ghcr.io/kamailio/kamailio-ci:5.8-alpine
+    container_name: interop-kamailio-reverse
+    environment:
+      INTEROP_NEXT_HOP: "172.28.0.11:5060"
+    volumes:
+      - ./kamailio/kamailio.cfg:/etc/kamailio/kamailio.cfg.in:ro
+    <<: *kamailio-entrypoint
+    networks:
+      interop:
+        ipv4_address: 172.28.0.21
+    profiles: ["reverse"]
+
+  siphon-reverse:
+    image: interop-siphon
+    build:
+      context: ..
+    container_name: interop-siphon-reverse
+    environment:
+      SIPHON_ADVERTISED_ADDRESS: "172.28.0.11"
+      INTEROP_NEXT_HOP: "sip:172.28.0.41:5060"
+    volumes:
+      - ./configs/siphon.interop.yaml:/etc/siphon/siphon.yaml:ro
+      - ./scripts:/etc/siphon/interop:ro
+    networks:
+      interop:
+        ipv4_address: 172.28.0.11
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.interop SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.interop>;tag=hc\\r\\nTo: <sip:siphon.interop>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles: ["reverse"]
+
+  interop-uas-reverse:
+    image: ctaloi/sipp:latest
+    container_name: interop-uas-reverse
+    volumes:
+      - ./scenarios:/scenarios:ro
+    command: >
+      -sf /scenarios/uas_invite_bye.xml
+      -i 172.28.0.41 -p 5060 -m 1 -timeout 90s -timeout_error
+      -trace_err -error_file /dev/stderr
+    networks:
+      interop:
+        ipv4_address: 172.28.0.41
+    profiles: ["reverse"]
+
+  interop-uac-reverse:
+    image: ctaloi/sipp:latest
+    container_name: interop-uac-reverse
+    depends_on:
+      siphon-reverse:
+        condition: service_healthy
+      kamailio-reverse:
+        condition: service_started
+      interop-uas-reverse:
+        condition: service_started
+    volumes:
+      - ./scenarios:/scenarios:ro
+    command: >
+      -sf /scenarios/uac_invite_bye.xml
+      172.28.0.21:5060
+      -i 172.28.0.40 -p 5060 -m 1 -r 1 -timeout 30s -timeout_error
+      -trace_err -error_file /dev/stderr
+    networks:
+      interop:
+        ipv4_address: 172.28.0.40
+    profiles: ["reverse"]
+
+  # ── CANCEL across the forward chain ───────────────────────────────────────
+  interop-uas-cancel:
+    image: ctaloi/sipp:latest
+    container_name: interop-uas-cancel
+    volumes:
+      - ./scenarios:/scenarios:ro
+    command: >
+      -sf /scenarios/uas_cancel.xml
+      -i 172.28.0.31 -p 5060 -m 1 -timeout 90s -timeout_error
+      -trace_err -error_file /dev/stderr
+    networks:
+      interop:
+        ipv4_address: 172.28.0.31
+    profiles: ["cancel"]
+
+  interop-uac-cancel:
+    image: ctaloi/sipp:latest
+    container_name: interop-uac-cancel
+    depends_on:
+      siphon-forward:
+        condition: service_healthy
+      kamailio-forward:
+        condition: service_started
+      interop-uas-cancel:
+        condition: service_started
+    volumes:
+      - ./scenarios:/scenarios:ro
+    command: >
+      -sf /scenarios/uac_cancel.xml
+      172.28.0.10:5060
+      -i 172.28.0.30 -p 5060 -m 1 -r 1 -timeout 30s -timeout_error
+      -trace_err -error_file /dev/stderr
+    networks:
+      interop:
+        ipv4_address: 172.28.0.30
+    profiles: ["cancel"]
+
+networks:
+  interop:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

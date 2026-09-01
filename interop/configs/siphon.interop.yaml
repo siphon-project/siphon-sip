@@ -1,0 +1,38 @@
+# siphon.interop.yaml — siphon as one hop of a two-proxy interop chain.
+#
+# Used with: interop/docker-compose.yaml
+# Script:    interop/scripts/interop_proxy.py
+#
+# `domain.local` deliberately holds only the served domain, not siphon's own IP.
+# That is what an operator actually writes, and it is the shape that catches a
+# proxy which fails to recognise its own Record-Route — the same reasoning as
+# sipp/configs/siphon.routing-test.yaml. Here it matters more: the route set is
+# built jointly with a proxy that shares none of siphon's code, so a
+# self-identity bug shows up as a BYE that never arrives rather than as a
+# header that merely looks odd.
+
+listen:
+  udp:
+    - "0.0.0.0:5060"
+  tcp:
+    - "0.0.0.0:5060"
+
+domain:
+  local:
+    - "siphon.interop"
+
+# Pinned so the Record-Route siphon writes is reachable from the other
+# container, rather than carrying 0.0.0.0.
+advertised_address: "${SIPHON_ADVERTISED_ADDRESS}"
+
+script:
+  path: "/etc/siphon/interop/interop_proxy.py"
+  reload: auto
+
+registrar:
+  backend: memory
+  default_expires: 3600
+
+log:
+  level: info
+  format: pretty
