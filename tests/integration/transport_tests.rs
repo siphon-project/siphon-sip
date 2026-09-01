@@ -28,9 +28,45 @@ fn test_acl() -> Arc<TransportAcl> {
 }
 
 /// Helper: find a free port by binding and releasing.
+/// A loopback address reserved for this test, on a port the kernel will not
+/// hand to anything else.
+///
+/// The obvious version — bind port 0, read the address, drop the socket — looks
+/// fine and is why these tests flapped. Two things go wrong:
+///
+/// * the kernel auto-assigns from the ephemeral range (32768-60999 on Linux),
+///   so between the probe closing and the real bind, any outbound socket in this
+///   process can take that exact port, and
+/// * `listen()` binds on a **spawned task** and merely logs on failure, so the
+///   caller never learns. The test then waits on a listener that was never
+///   created and fails as a connect timeout, pointing at the wrong thing.
+///
+/// Handing out ports from a counter *below* the ephemeral range removes the
+/// collision at its source: nothing is auto-assigned there, so only an explicit
+/// bind can take one, and the counter guarantees no two callers in this process
+/// get the same port. The probe then confirms it really is free.
+///
+/// (The in-crate twin lives in `transport::testutil`; `tests/` is a separate
+/// crate and cannot see `#[cfg(test)]` items.)
 fn free_port() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+    use std::sync::atomic::{AtomicU16, Ordering};
+    // A different base from the in-crate helper: both binaries can run at once.
+    static NEXT: AtomicU16 = AtomicU16::new(24000);
+
+    for _ in 0..2048 {
+        let port = NEXT.fetch_add(1, Ordering::Relaxed);
+        assert!(port < 32000, "exhausted the reserved test port range");
+        // TCP and UDP are separate namespaces and these tests bind either, so a
+        // port is only free when it is free on both.
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+            continue;
+        }
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_err() {
+            continue;
+        }
+        return SocketAddr::from(([127, 0, 0, 1], port));
+    }
+    panic!("no free loopback port in the reserved test range");
 }
 
 /// Standard SIP OPTIONS request used across tests.
@@ -63,6 +99,36 @@ fn sip_200_ok() -> &'static str {
 
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Retry a connect while the listener is still coming up.
+///
+/// `listen()` returns once it has bound, but the accept loop is a spawned task
+/// that may not be scheduled yet. The fixed `SETTLE` sleep that used to cover
+/// that gap is a guess about scheduler latency, and on a loaded test binary the
+/// guess expires first — the connect is refused and the test fails for reasons
+/// that have nothing to do with what it asserts. Retrying against `TIMEOUT`
+/// removes the guess: a listener that never comes up still fails, and one that
+/// is merely slow no longer does.
+async fn connect_with_retry<F, Fut, T, E>(what: &str, mut attempt: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    loop {
+        match attempt().await {
+            Ok(value) => return value,
+            Err(error) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{what} never became connectable within {TIMEOUT:?}: {error}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // UDP round-trip
@@ -132,7 +198,7 @@ async fn tcp_roundtrip() {
     tokio::time::sleep(SETTLE).await;
 
     // Client: connect and send OPTIONS
-    let mut client = TcpStream::connect(addr).await.unwrap();
+    let mut client = connect_with_retry("tcp listener", || TcpStream::connect(addr)).await;
     client.write_all(sip_options_request().as_bytes()).await.unwrap();
 
     // Verify inbound arrives
@@ -202,7 +268,7 @@ async fn tcp_close_notifies_flow_failure() {
     tokio::time::sleep(SETTLE).await;
 
     // Connect and send a request so we learn the assigned ConnectionId.
-    let mut client = TcpStream::connect(addr).await.unwrap();
+    let mut client = connect_with_retry("tcp listener", || TcpStream::connect(addr)).await;
     client.write_all(sip_options_request().as_bytes()).await.unwrap();
     let inbound = tokio::time::timeout(TIMEOUT, inbound_rx.recv_async())
         .await
@@ -368,7 +434,7 @@ async fn tcp_responds_to_peer_crlf_ping_with_pong() {
     .await;
     tokio::time::sleep(SETTLE).await;
 
-    let mut client = TcpStream::connect(addr).await.unwrap();
+    let mut client = connect_with_retry("tcp listener", || TcpStream::connect(addr)).await;
 
     // 1) Peer ping → expect single-CRLF pong back.
     client.write_all(b"\r\n\r\n").await.unwrap();
@@ -433,7 +499,7 @@ async fn tls_roundtrip() {
     // Build a TLS client that trusts our self-signed cert
     let tls_connector = build_test_tls_connector(&tls_config);
 
-    let tcp_stream = TcpStream::connect(addr).await.unwrap();
+    let tcp_stream = connect_with_retry("tcp listener", || TcpStream::connect(addr)).await;
     let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
     let mut tls_stream = tls_connector.connect(server_name, tcp_stream).await.unwrap();
 
@@ -496,7 +562,8 @@ async fn ws_roundtrip() {
 
     // Client: connect via WebSocket
     let url = format!("ws://127.0.0.1:{}", addr.port());
-    let (mut ws_stream, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (mut ws_stream, _) =
+        connect_with_retry("ws listener", || tokio_tungstenite::connect_async(&url)).await;
 
     // Send OPTIONS as text frame
     ws_stream.send(Message::text(sip_options_request())).await.unwrap();
@@ -562,7 +629,7 @@ async fn wss_roundtrip() {
 
     // Manual TLS connect then WebSocket upgrade
     let tls_connector = build_test_tls_connector(&tls_config);
-    let tcp_stream = TcpStream::connect(addr).await.unwrap();
+    let tcp_stream = connect_with_retry("tcp listener", || TcpStream::connect(addr)).await;
     let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
     let tls_stream = tls_connector.connect(server_name, tcp_stream).await.unwrap();
 
@@ -648,12 +715,13 @@ async fn multi_transport_shared_inbound_channel() {
     udp_client.send_to(b"OPTIONS sip:udp SIP/2.0\r\n\r\n", udp_addr).await.unwrap();
 
     // Send via TCP
-    let mut tcp_client = TcpStream::connect(tcp_addr).await.unwrap();
+    let mut tcp_client = connect_with_retry("tcp listener", || TcpStream::connect(tcp_addr)).await;
     tcp_client.write_all(b"OPTIONS sip:tcp SIP/2.0\r\n\r\n").await.unwrap();
 
     // Send via WS
     let url = format!("ws://127.0.0.1:{}", ws_addr.port());
-    let (mut ws_client, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let (mut ws_client, _) =
+        connect_with_retry("ws listener", || tokio_tungstenite::connect_async(&url)).await;
     ws_client.send(Message::text("OPTIONS sip:ws SIP/2.0\r\n\r\n")).await.unwrap();
 
     // Collect three messages from the shared channel

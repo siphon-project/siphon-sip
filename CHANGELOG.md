@@ -6,6 +6,29 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Fixed
+- **Two tests that failed at random, both for reasons unrelated to what they
+  assert.** `free_port()` bound port 0, read the address and dropped the socket:
+  the kernel auto-assigns from the ephemeral range, so between the probe closing
+  and the real bind any outbound socket in the process could take that port. And
+  `listen()` binds on a spawned task and only *logs* a bind failure, so the test
+  never learned — it waited on a listener that was never created and failed as a
+  connect timeout, pointing at the wrong thing. Ports now come from a counter
+  below the ephemeral range, where nothing is auto-assigned, and are probed on
+  both TCP and UDP (separate namespaces; these tests bind either). The three
+  copies of the helper are down to two — one shared inside the crate, one for
+  `tests/`, which is a separate crate. Measured 4 failures in 20 runs before, 0
+  in 25 after.
+- **The Python thread-state leak guard now owns the process.** It compares glibc
+  in-use bytes across thread-churn batches, but that counter is process-global
+  and the parallel test binary allocates on the same order as the signal — it
+  failed about one run in four, including a release cut. It gains a control arm
+  (spawn/join without touching Python) so the ambient cost is measured and
+  subtracted rather than guessed at, and is `#[ignore]`d with a CI step that runs
+  it alone, as the CAP_NET_ADMIN tests already are. Alone it is exact: ambient
+  0 B, 241664 B leaked, 0 B retained, every run. The guard is unchanged in what
+  it proves.
+
 ## [1.7.1] — 2026-09-01
 
 ### Added

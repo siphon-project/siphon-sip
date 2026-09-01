@@ -3460,15 +3460,40 @@ mod tests {
     ///
     /// Two arms so the test cannot pass vacuously: the unpaired pin (the old
     /// behaviour) must visibly grow the C-side pool, and the paired
-    /// pin/unpin must not. Comparing the two also makes the assertion immune to
-    /// whatever unrelated allocation noise the harness contributes.
+    /// pin/unpin must not.
+    ///
+    /// `read_stats` reports the whole **process**, and the harness runs other
+    /// tests on other threads throughout, so every window also measures
+    /// whatever they allocated while it was open. That is not an occasional
+    /// outlier a median would absorb — it is a steady background of roughly
+    /// 50-140 KB per window, comparable to the ~240 KB signal, and it made the
+    /// bare `retained * 4 < leaked` comparison fail by fractions of a percent.
+    ///
+    /// So a third arm measures it. The **control** spawns and joins the same
+    /// threads without touching Python at all, which is exactly the ambient
+    /// cost of the window plus the neighbours' noise and none of the leak.
+    /// Subtracting it from both real arms leaves the thread-state allocation on
+    /// its own. The three arms are interleaved and taken on the median, so a
+    /// slow stretch of the suite biases all three alike rather than one.
     ///
     /// glibc-only: `malloc_info` is what `read_stats` reads.
+    ///
+    /// `#[ignore]`d because it must own the process, not because it is
+    /// optional. `read_stats` reports the whole process, and inside the parallel
+    /// test binary the neighbours allocate on the same order as the signal — the
+    /// control arm below subtracts the average of that, but not its variance,
+    /// and the test failed roughly one run in four. Alone it is exact: ambient
+    /// 0 B, 241664 B leaked, 0 B retained, every time. CI runs it on its own
+    /// (see the "Python thread-state leak guard" step), the same way the
+    /// CAP_NET_ADMIN tests are run.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
+    #[ignore = "process-global glibc measurement — run alone: cargo test --lib -- --ignored --exact server::tests::reaped_thread_releases_its_python_thread_state --test-threads=1"]
     fn reaped_thread_releases_its_python_thread_state() {
         const WARM: usize = 32;
         const BATCH: usize = 256;
+        // Odd, so the median is a real sample rather than an average of two.
+        const ROUNDS: usize = 3;
 
         pyo3::Python::initialize();
 
@@ -3478,12 +3503,25 @@ mod tests {
             return;
         };
 
-        // `paired` mirrors the runtime hooks; `!paired` reproduces the leak.
-        let churn = |count: usize, paired: bool| {
+        /// Which of the three arms a batch runs.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Arm {
+            /// Spawn + join only — the ambient cost of the window.
+            Control,
+            /// Pin without unpinning: the old behaviour, which leaks.
+            Leaky,
+            /// Pin and unpin, as the runtime hooks do.
+            Paired,
+        }
+
+        let churn = |count: usize, arm: Arm| {
             for _ in 0..count {
                 std::thread::spawn(move || {
+                    if arm == Arm::Control {
+                        return;
+                    }
                     pin_python_thread_state();
-                    if paired {
+                    if arm == Arm::Paired {
                         unpin_python_thread_state();
                     }
                 })
@@ -3492,22 +3530,40 @@ mod tests {
             }
         };
 
-        // Warm up both paths so first-touch arena growth lands outside the
+        // Warm up every path so first-touch arena growth lands outside the
         // measured batches.
-        churn(WARM, true);
-        churn(WARM, false);
+        churn(WARM, Arm::Control);
+        churn(WARM, Arm::Paired);
+        churn(WARM, Arm::Leaky);
 
-        let before_leaky = in_use().unwrap_or(0);
-        churn(BATCH, false);
-        let leaked = in_use().unwrap_or(0).saturating_sub(before_leaky);
+        let measure = |arm: Arm| {
+            let before = in_use().unwrap_or(0);
+            churn(BATCH, arm);
+            in_use().unwrap_or(0).saturating_sub(before)
+        };
 
-        let before_fixed = in_use().unwrap_or(0);
-        churn(BATCH, true);
-        let retained = in_use().unwrap_or(0).saturating_sub(before_fixed);
+        let mut control_samples = Vec::with_capacity(ROUNDS);
+        let mut leaky_samples = Vec::with_capacity(ROUNDS);
+        let mut paired_samples = Vec::with_capacity(ROUNDS);
+        for _ in 0..ROUNDS {
+            control_samples.push(measure(Arm::Control));
+            leaky_samples.push(measure(Arm::Leaky));
+            paired_samples.push(measure(Arm::Paired));
+        }
+        let median = |samples: &[u64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_unstable();
+            sorted[sorted.len() / 2]
+        };
+        let ambient = median(&control_samples);
+        // What the pin cost beyond simply running the window.
+        let leaked = median(&leaky_samples).saturating_sub(ambient);
+        let retained = median(&paired_samples).saturating_sub(ambient);
 
         eprintln!(
-            "unpaired pin: {leaked} B over {BATCH} threads ({:.1} B/thread); \
-             paired pin/unpin: {retained} B ({:.1} B/thread)",
+            "ambient {ambient} B {control_samples:?}; \
+             unpaired pin: {leaked} B net over {BATCH} threads ({:.1} B/thread) {leaky_samples:?}; \
+             paired pin/unpin: {retained} B net ({:.1} B/thread) {paired_samples:?}",
             leaked as f64 / BATCH as f64,
             retained as f64 / BATCH as f64,
         );
@@ -3515,14 +3571,15 @@ mod tests {
         // The leak must be visible, else the test proves nothing.
         assert!(
             leaked > BATCH as u64 * 64,
-            "unpaired pin did not reproduce the leak ({leaked} B over {BATCH} threads) — \
-             the guard cannot prove the fix"
+            "unpaired pin did not reproduce the leak ({leaked} B net over {BATCH} threads, \
+             ambient {ambient} B) — the guard cannot prove the fix"
         );
         // ...and pairing must remove essentially all of it.
         assert!(
             retained * 4 < leaked,
             "pairing pin with unpin did not release the thread state: \
-             {retained} B retained vs {leaked} B leaked over {BATCH} threads"
+             {retained} B retained vs {leaked} B leaked over {BATCH} threads \
+             (ambient {ambient} B subtracted from both)"
         );
     }
 

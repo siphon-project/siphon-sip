@@ -330,11 +330,7 @@ mod tests {
         Arc::new(TransportAcl::new(vec![], vec![]))
     }
 
-    /// Helper: find a free port by binding and releasing.
-    fn free_port() -> SocketAddr {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap()
-    }
+    use crate::transport::testutil::free_port;
 
     #[tokio::test]
     async fn ws_connection_lifecycle() {
