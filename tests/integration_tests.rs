@@ -36,6 +36,17 @@ mod transport_tests;
 #[path = "integration/li_tests.rs"]
 mod li_tests;
 
+// Independent XSD validation of what X1 emits, via xmllint. Separate from
+// li_tests because it shells out to a third-party tool and skips when it is
+// absent.
+#[path = "integration/li_xmllint_tests.rs"]
+mod li_xmllint_tests;
+
+// The network-element-to-ADMF direction against a mock ADMF that captures what
+// siphon actually sends.
+#[path = "integration/li_admf_client_tests.rs"]
+mod li_admf_client_tests;
+
 #[path = "integration/admin_tests.rs"]
 mod admin_tests;
 

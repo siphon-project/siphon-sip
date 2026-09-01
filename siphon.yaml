@@ -1134,44 +1134,126 @@ auth:
 # ---------------------------------------------------------------------------
 # Implements the three ETSI LI interfaces:
 #   X1 (TS 103 221-1) — Admin: provision/modify/deactivate intercept targets
-#   X2 (TS 102 232-5) — IRI: real-time signaling events (ASN.1/BER over TCP/TLS)
-#   X3 (TS 102 232-1) — CC: media content (RTPEngine recording + encapsulation)
+#   X2 (TS 103 221-2) — IRI: signalling records to the Mediation Function
+#   X3 (TS 103 221-2) — CC: media content, framed and delivered by the engine
 #   SIPREC (RFC 7866) — SIP-based media recording to SRS
 #
-# LI is triggered per-call from the Python script:
+# X2 and X3 are the interfaces into the Mediation and Delivery Function, and
+# both carry TS 103 221-2 PDUs. TS 102 232 is the *handover* format the MDF
+# emits onwards to the LEMF, which is a different interface and not one siphon
+# sits on — an element that spoke it here would be talking a peer's language.
+#
+# Interception is NOT triggered from the Python script. The dispatcher matches
+# every SIP message, on every leg, against the warrants the ADMF provisioned
+# over X1 — a warrant applies whether or not a script cooperates. The `li.*`
+# namespace is for visibility and for operator-driven SIPREC recording:
 #   from siphon import li
-#   if li.is_target(request):            # check against X1-provisioned targets
-#       li.intercept(request)            # start IRI + CC for this call
-#   li.intercept(call)                   # B2BUA variant
+#   if li.is_target(request):            # informational: is this call warranted?
+#       ...                              # e.g. avoid a local reject that would
+#                                        # defeat the intercept
+#   li.record(call)                      # SIPREC recording (not a warrant)
 #
 # lawful_intercept:
 #   enabled: false                       # master switch (disabled by default)
 #   audit_log: "/var/log/siphon/li-audit.log"  # mandatory audit trail
 #
-#   # X1: ETSI TS 103 221-1 — admin interface for intercept provisioning
+#   # X1: ETSI TS 103 221-1 — the ADMF provisioning interface.
+#   #
+#   # Built to v1.23.1 with the TS 103 280 v2.19.1 dictionary. The ETSI XSDs
+#   # ship in schemas/etsi/ and every message is validated against them in both
+#   # directions. One endpoint, `application/xml`, mutual TLS.
 #   x1:
-#     listen: "127.0.0.1:8443"           # separate HTTPS listener (not main admin)
+#     listen: "0.0.0.0:8443"             # dedicated HTTPS listener (not the admin API)
+#     path: "/X1/NE"                     # the single X1 endpoint (default shown).
+#                                        # TS 103 221-1 mandates one endpoint but
+#                                        # does not name it — confirm with the
+#                                        # mediation partner.
+#     ne_identifier: "siphon-ne-1"       # this element's `neIdentifier` (required)
+#     admf_identifier: "admf-id"         # the ADMF we serve. When set, a message
+#                                        # naming a different one is refused 1040.
+#                                        # Required to use the `admf:` block below.
+#     version: "v1.23.1"                 # the `version` every message declares.
+#                                        # Only change it if the partner pins an
+#                                        # older one; the message set is identical
+#                                        # across the published v1.x range.
+#     bind_admf_identifier_to_certificate: true   # default. Refuses 1030 when
+#                                        # `admfIdentifier` does not match the
+#                                        # client certificate's subject CN.
 #     tls:
-#       certificate: "/etc/siphon/li/x1.crt"
+#       certificate: "/etc/siphon/li/x1.pem"
 #       private_key: "/etc/siphon/li/x1.key"
-#       verify_client: true              # mTLS required for LEA authentication
-#     auth_token: "warrant-auth-xyz"     # additional bearer token
+#       client_ca: "/etc/siphon/li/admf-ca.pem"   # REQUIRED. Mutual TLS is the
+#                                        # authentication on X1; without it the
+#                                        # listener would accept anyone, so a
+#                                        # missing client_ca is a startup error.
 #
-#   # X2: ETSI TS 102 232-5 — IRI (signaling events) delivery
+#     # The network-element-to-ADMF direction (clause 6.5). Optional: without it
+#     # siphon answers X1 but never speaks first — no issue reports, no
+#     # keepalives, and no reconciliation after a restart.
+#     admf:
+#       endpoint: "https://admf.example/X1/ADMF"
+#       client_certificate: "/etc/siphon/li/ne.pem"
+#       client_private_key: "/etc/siphon/li/ne.key"
+#       server_ca: "/etc/siphon/li/admf-server-ca.pem"  # verify the ADMF. Absent
+#                                        # falls back to the public roots, which
+#                                        # is wrong for the private CA most ADMF
+#                                        # deployments use — set it.
+#       keepalive_secs: 30               # 0 disables keepalives
+#       request_timeout_secs: 10
+#       reconcile_on_start: true         # issue GetAllDetails at startup so the
+#                                        # two sides agree after a bounce
+#
+#   # X2: ETSI TS 103 221-2 — signalling records to the Mediation Function.
+#   #
+#   # Each record is a TS 103 221-2 PDU carrying the SIP message verbatim
+#   # (payload format 9), under the task's XID and the session's correlation.
+#   # Direction is measured against the target, so it follows which party the
+#   # warrant named rather than which socket the message arrived on.
+#   #
+#   # `delivery_address` is the fallback for a deployment that provisions no
+#   # destinations over X1; when a task names destinations, its records go to
+#   # exactly those, and to all of them.
 #   x2:
-#     delivery_address: "10.0.0.50:6543" # mediation device IRI collector
+#     delivery_address: "192.0.2.50:6543" # mediation device IRI collector
 #     transport: tcp                      # tcp | tls
 #     reconnect_interval_secs: 5
 #     channel_size: 10000
+#     # TLS is refused rather than downgraded: if any of this is wrong the
+#     # delivery task stops and says so, because quietly sending a warrant's
+#     # contents in the clear is the worst available outcome.
 #     # tls:
-#     #   ca_cert: "/etc/siphon/li/mediation-ca.pem"
+#     #   ca_cert: "/etc/siphon/li/mediation-ca.pem"   # REQUIRED for tls. The
+#     #                                    # MDF is on a private PKI, so there is
+#     #                                    # no fallback to the public roots.
+#     #   certificate: "/etc/siphon/li/ne.pem"         # this element's client
+#     #   private_key: "/etc/siphon/li/ne.key"         # certificate, if the MDF
+#     #                                    # authenticates us (it usually does)
+#     #   server_name: "mdf.example"       # the name the MDF's certificate is
+#     #                                    # verified against. Set it when the
+#     #                                    # delivery address is a literal, which
+#     #                                    # an X1-provisioned destination always
+#     #                                    # is (TS 103 280 `IPAddressPort`).
 #
-#   # X3: ETSI TS 102 232-1 — CC (media content) delivery
+#   # X3: content of communication.
+#   #
+#   # REQUIRES `media.backend: siphon-rtp`. TS 103 221-2 content framing is
+#   # implemented in the media engine, so rtpengine and rtpproxy cannot deliver
+#   # X3 at all — configuring this block on either is a startup error naming the
+#   # backend. X1 provisioning and X2 IRI delivery work on every backend.
+#   #
+#   # A task whose `deliveryType` is X3Only or X2andX3 is refused at
+#   # ActivateTask (error 3040) on a node that cannot deliver content, rather
+#   # than accepted and silently delivering nothing.
+#   # One setting, and it is deliberately the only one. The engine frames the
+#   # content and delivers it straight to the destinations the ADMF provisioned
+#   # over X1, so this process has no collector to dial, no transport to choose
+#   # and no encapsulation to pick.
 #   x3:
-#     listen_udp: "127.0.0.1:0"          # local UDP for RTPEngine mirror reception
-#     delivery_address: "10.0.0.50:6544"  # mediation device CC collector
-#     transport: udp                       # udp | tcp
-#     encapsulation: etsi                  # etsi (TS 102 232 CC-PDU) | raw_ip
+#     enabled: true                      # required. true needs
+#                                        # media.backend: siphon-rtp and is
+#                                        # refused at load on anything else;
+#                                        # false is the same as leaving the
+#                                        # block out
 #
 #   # SIPREC: RFC 7866 — SIP-based media recording
 #   siprec:

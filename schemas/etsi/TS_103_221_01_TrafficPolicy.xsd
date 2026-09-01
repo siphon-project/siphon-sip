@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns="http://uri.etsi.org/03221/X1/2023/02/TrafficPolicy" xmlns:x1="http://uri.etsi.org/03221/X1/2017/10" xmlns:etsi103280="http://uri.etsi.org/03280/common/2017/07" xmlns:hi1Policy="http://uri.etsi.org/03120/common/2022/07/TrafficPolicy" targetNamespace="http://uri.etsi.org/03221/X1/2023/02/TrafficPolicy" elementFormDefault="qualified" version="1.10.1">
+    <xs:import namespace="http://uri.etsi.org/03280/common/2017/07"/>
+    <xs:import namespace="http://uri.etsi.org/03221/X1/2017/10"/>
+    <xs:import namespace="http://uri.etsi.org/03120/common/2022/07/TrafficPolicy"/>
+    <!-- Message containers -->
+    <xs:complexType name="TrafficPolicyObject">
+        <xs:complexContent>
+            <xs:extension base="x1:GenericObject">
+                <xs:sequence>
+                    <xs:group ref="hi1Policy:TrafficPolicyObjectGroup"></xs:group>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="TrafficRuleObject">
+        <xs:complexContent>
+            <xs:extension base="x1:GenericObject">
+                <xs:sequence>
+                    <xs:group ref="hi1Policy:TrafficRuleObjectGroup"></xs:group>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+</xs:schema>

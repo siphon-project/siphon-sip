@@ -28,6 +28,9 @@ use super::error::RtpEngineError;
 use super::profile::{NgFlags, WsTeeDirection};
 use super::rtpproxy::RtpProxyClientSet;
 use super::siphon_rtp::{PlayMediaOutcome, SiphonRtpClientSet};
+// The X3 target-leg selector is the engine contract's own type; re-deriving a
+// local twin would only add a conversion that could be wrong.
+pub use siphon_rtp_proto::X3TargetLeg;
 
 /// The configured media-control backend.
 pub enum MediaBackend {
@@ -562,6 +565,61 @@ impl MediaBackend {
             }),
             Self::RtpProxy(_) => Err(RtpEngineError::Unsupported {
                 operation: "detach_ws_tee",
+                backend: "rtpproxy",
+            }),
+        }
+    }
+
+    /// Begin ETSI TS 103 221-2 X3 content delivery for a call.
+    ///
+    /// Native `siphon-rtp` only, and refused rather than hollow-successful on
+    /// the others. Content framing lives in the media engine, so rtpengine and
+    /// rtpproxy cannot deliver X3 at all — an `Ok(())` here would read as "the
+    /// warrant is being serviced" while no product ever reaches the agency,
+    /// which is the worst available outcome for an intercept. The same refusal
+    /// is applied earlier, at config load and at `ActivateTask`, so this is the
+    /// last of three rather than the only one.
+    pub async fn attach_x3(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        delivery: &str,
+        xid: [u8; 16],
+        correlation_id: u64,
+        target_leg: X3TargetLeg,
+    ) -> Result<(), RtpEngineError> {
+        match self {
+            Self::SiphonRtp(client) => {
+                client
+                    .attach_x3(call_id, from_tag, delivery, xid, correlation_id, target_leg)
+                    .await
+            }
+            Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
+                operation: "attach_x3",
+                backend: "rtpengine",
+            }),
+            Self::RtpProxy(_) => Err(RtpEngineError::Unsupported {
+                operation: "attach_x3",
+                backend: "rtpproxy",
+            }),
+        }
+    }
+
+    /// Stop X3 content delivery. Idempotent on `siphon-rtp`; unsupported on the
+    /// other backends for the same reason as [`Self::attach_x3`].
+    pub async fn detach_x3(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        match self {
+            Self::SiphonRtp(client) => client.detach_x3(call_id, from_tag).await,
+            Self::RtpEngine(_) => Err(RtpEngineError::Unsupported {
+                operation: "detach_x3",
+                backend: "rtpengine",
+            }),
+            Self::RtpProxy(_) => Err(RtpEngineError::Unsupported {
+                operation: "detach_x3",
                 backend: "rtpproxy",
             }),
         }

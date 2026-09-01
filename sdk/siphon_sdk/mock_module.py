@@ -3959,6 +3959,19 @@ class MockCdr:
 class MockLi:
     """Mock ``li`` namespace — lawful intercept operations for testing.
 
+    .. note::
+        **Interception is not triggered from a script.** siphon matches every
+        SIP message against the warrants the ADMF provisioned over ETSI X1, in
+        the dispatcher, on every leg — a warrant applies whether or not a
+        script calls anything here. This namespace is for *visibility* (is this
+        call warranted?) and for operator-driven SIPREC recording, which is not
+        a warrant.
+
+        ``intercept()`` and ``stop_intercept()`` are kept so existing scripts
+        keep working, but they only **report** whether a warrant matched. If
+        they still triggered, a script that called them would produce duplicate
+        IRI records for one event.
+
     Pre-configure targets for testing::
 
         from siphon_sdk.mock_module import get_li
@@ -3969,19 +3982,21 @@ class MockLi:
 
         from siphon import li
         if li.is_target(request):
-            li.intercept(request)
+            log.info("this call is subject to a warrant")
 
     Test assertions::
 
         li = get_li()
-        assert len(li.events) == 1
-        assert li.events[0] == ("intercept", "sip:alice@example.com")
+        assert li.is_target(request)
+        assert li.events == [("record", "call-1@example.com")]
     """
 
     def __init__(self) -> None:
         self._enabled: bool = True
         self._targets: list[str] = []
         self._events: list[tuple[str, str]] = []
+        self._task_count: int = 0
+        self._destination_count: int = 0
 
     @property
     def is_enabled(self) -> bool:
@@ -4013,27 +4028,21 @@ class MockLi:
         return any(t in uris for t in self._targets)
 
     def intercept(self, request: Any) -> bool:
-        """Trigger interception for a matching request (emit IRI-BEGIN + start media capture).
+        """Report whether this request is being intercepted.
 
         Args:
             request: The SIP request object.
 
         Returns:
-            ``True`` if interception was triggered for at least one matching target.
+            ``True`` if a provisioned warrant matches.
+
+        .. note::
+            Retained for compatibility. This does **not** trigger
+            interception — the dispatcher has already emitted the IRI record
+            for any matching message before a script handler runs. Calling it
+            is harmless and changes nothing.
         """
-        if not self._enabled:
-            return False
-        uris = [
-            str(getattr(request, "from_uri", "")),
-            str(getattr(request, "to_uri", "")),
-            str(getattr(request, "ruri", "")),
-        ]
-        matched = [t for t in self._targets if t in uris]
-        if not matched:
-            return False
-        for target in matched:
-            self._events.append(("intercept", target))
-        return True
+        return self.is_target(request)
 
     def record(self, target: Any) -> bool:
         """Start SIPREC recording for a request or call.
@@ -4041,6 +4050,9 @@ class MockLi:
         Accepts either a ``Request`` (proxy mode) or ``Call`` (B2BUA mode).
         In B2BUA mode, the dispatcher will start SIPREC recording on answer
         using the SRS URI from ``lawful_intercept.siprec.srs_uri`` config.
+
+        SIPREC is a recording feature, not lawful interception: it produces no
+        X2 record and is not tied to a provisioned warrant.
 
         Args:
             target: A ``Request`` or ``Call`` object.
@@ -4067,27 +4079,41 @@ class MockLi:
         return True
 
     def stop_intercept(self, request: Any) -> bool:
-        """Stop interception for a request (emit IRI-END).
+        """Report whether this request is being intercepted.
 
         Args:
             request: The SIP request object.
 
         Returns:
-            ``True`` if a stop event was emitted for at least one matching target.
+            ``True`` if a provisioned warrant matches.
+
+        .. note::
+            Retained for compatibility. Session teardown records are emitted by
+            the dispatcher when the dialog ends; this does not emit one.
         """
-        if not self._enabled:
-            return False
-        uris = [
-            str(getattr(request, "from_uri", "")),
-            str(getattr(request, "to_uri", "")),
-            str(getattr(request, "ruri", "")),
-        ]
-        matched = [t for t in self._targets if t in uris]
-        if not matched:
-            return False
-        for target in matched:
-            self._events.append(("stop_intercept", target))
-        return True
+        return self.is_target(request)
+
+    @property
+    def task_count(self) -> int:
+        """How many intercept tasks the ADMF has provisioned over X1.
+
+        Read-only: warrants are provisioned by the ADMF, never by a script.
+        """
+        return self._task_count
+
+    @property
+    def destination_count(self) -> int:
+        """How many delivery destinations the ADMF has provisioned over X1."""
+        return self._destination_count
+
+    def set_provisioned_counts(self, tasks: int, destinations: int) -> None:
+        """Test helper: set what ``task_count`` / ``destination_count`` report.
+
+        Not part of the siphon API — the real counts come from what the ADMF
+        provisioned.
+        """
+        self._task_count = tasks
+        self._destination_count = destinations
 
     def stop_recording(self, target: Any) -> bool:
         """Stop SIPREC recording for a request or call.

@@ -1,22 +1,28 @@
-//! Python `li` namespace — lawful intercept operations from scripts.
+//! The `li` Python namespace.
 //!
-//! Allows Python scripts to check intercept targets and trigger LI/SIPREC:
-//! ```python
-//! from siphon import li
+//! # This is no longer the gate
 //!
-//! if li.is_target(request):
-//!     li.intercept(request)    # emit IRI + start X3/SIPREC
+//! Interception is enforced in the dispatcher, against the tasks the ADMF
+//! provisioned over X1, for every message on every leg. A warrant applies
+//! whether or not a script calls anything here.
 //!
-//! li.record(request)           # start SIPREC recording (proxy mode)
-//! li.record(call)              # start SIPREC recording (B2BUA mode)
-//! li.stop_recording(request)   # stop SIPREC for this call
-//! li.stop_recording(call)      # stop SIPREC for this call
-//! ```
+//! What remains is:
+//!
+//! * **Visibility** — [`PyLiNamespace::is_target`] lets a script know a warrant
+//!   applies, so it can avoid behaviour that would defeat it (a local reject, a
+//!   media release) without having to trigger the intercept itself.
+//! * **Operator-driven recording** — `record` / `stop_recording` drive SIPREC,
+//!   which is a recording feature, not a warrant.
+//!
+//! `intercept` and `stop_intercept` are kept so existing scripts keep working,
+//! but they **report** rather than act: the dispatcher has already emitted the
+//! IRI for any matching message by the time a handler runs. If they still
+//! emitted, every script that calls them would produce duplicate IRI records
+//! for one event.
 
 use pyo3::prelude::*;
 
-use crate::li::{self, IriEvent, IriEventType, LiManager};
-use crate::li::target::DeliveryType;
+use crate::li::{AuditOperation, LiManager};
 
 /// Python-facing LI namespace.
 #[pyclass(name = "LiNamespace")]
@@ -25,186 +31,133 @@ pub struct PyLiNamespace {
 }
 
 impl PyLiNamespace {
+    /// Wrap the LI subsystem for Python.
     pub fn new(manager: LiManager) -> Self {
         Self { manager }
     }
 
-    /// Emit an IRI-Report event for recording start.
-    fn emit_recording_iri(
-        &self,
-        call_id: String,
-        method: String,
-        from_uri: Option<String>,
-        to_uri: Option<String>,
-        ruri: Option<String>,
-        source_ip: Option<std::net::IpAddr>,
-    ) {
-        let event = IriEvent {
-            liid: format!("SIPREC-{call_id}"),
-            correlation_id: call_id,
-            event_type: IriEventType::Report,
-            timestamp: std::time::SystemTime::now(),
-            sip_method: method,
-            status_code: None,
-            from_uri: from_uri.unwrap_or_default(),
-            to_uri: to_uri.unwrap_or_default(),
-            request_uri: ruri,
-            source_ip,
-            destination_ip: None,
-            delivery_type: DeliveryType::IriAndCc,
-            raw_message: None,
-        };
-        self.manager.emit_iri(event);
-    }
-
-    /// Emit an IRI-End event for recording stop.
-    fn emit_stop_recording_iri(
-        &self,
-        call_id: String,
-        method: String,
-        from_uri: Option<String>,
-        to_uri: Option<String>,
-        ruri: Option<String>,
-        source_ip: Option<std::net::IpAddr>,
-    ) {
-        let event = IriEvent {
-            liid: format!("SIPREC-{call_id}"),
-            correlation_id: call_id,
-            event_type: IriEventType::End,
-            timestamp: std::time::SystemTime::now(),
-            sip_method: method,
-            status_code: None,
-            from_uri: from_uri.unwrap_or_default(),
-            to_uri: to_uri.unwrap_or_default(),
-            request_uri: ruri,
-            source_ip,
-            destination_ip: None,
-            delivery_type: DeliveryType::IriAndCc,
-            raw_message: None,
-        };
-        self.manager.emit_iri(event);
+    /// Whether any provisioned warrant covers this request.
+    ///
+    /// Asked of the *session*, not the message, so this answers the same
+    /// question enforcement did. Matching the message on its own identities
+    /// would disagree with the dispatcher on any request whose identities have
+    /// moved since the session opened — a re-INVITE from the far end, an
+    /// in-dialog REFER, a BYE from either side — and a script told "not a
+    /// target" about a call that is being intercepted is worse than no answer
+    /// at all.
+    ///
+    /// The dispatcher decides before any handler runs, so by the time this is
+    /// asked the decision already exists and this is a lookup.
+    fn matches(&self, request: &super::request::PyRequest) -> bool {
+        !self
+            .manager
+            .check_session(
+                &request.li_call_id(),
+                request.li_ruri().as_deref(),
+                request.li_from_uri().as_deref(),
+                request.li_to_uri().as_deref(),
+                request.li_source_ip(),
+            )
+            .is_empty()
     }
 }
 
 #[pymethods]
 impl PyLiNamespace {
-    /// Check if a request matches an active intercept target.
+    /// Check whether an active intercept target matches this request.
     ///
     /// Args:
     ///     request: The SIP request object.
     ///
     /// Returns:
-    ///     True if the request's From, To, or RURI matches an active target.
+    ///     True if a provisioned warrant matches the request's Request-URI,
+    ///     From, To or source address.
+    ///
+    /// Note:
+    ///     This is informational. Interception happens in the dispatcher
+    ///     regardless of what the script does with the answer.
     fn is_target(&self, request: &super::request::PyRequest) -> bool {
         if !self.manager.is_enabled() {
             return false;
         }
-        let matches = self.manager.check_message(
-            request.li_ruri().as_deref(),
-            request.li_from_uri().as_deref(),
-            request.li_to_uri().as_deref(),
-            request.li_source_ip(),
-        );
-        !matches.is_empty()
+        self.matches(request)
     }
 
-    /// Trigger interception for a matching request (emit IRI-BEGIN + start media capture).
+    /// Report whether this request is being intercepted.
     ///
     /// Args:
     ///     request: The SIP request object.
     ///
     /// Returns:
-    ///     True if interception was triggered for at least one matching target.
+    ///     True if a provisioned warrant matches.
+    ///
+    /// Note:
+    ///     Retained for compatibility. This does **not** trigger interception:
+    ///     the dispatcher has already emitted the IRI record for any matching
+    ///     message before a script handler runs. Calling it is harmless and
+    ///     changes nothing.
     fn intercept(&self, request: &super::request::PyRequest) -> bool {
         if !self.manager.is_enabled() {
             return false;
         }
-        let matches = self.manager.check_message(
-            request.li_ruri().as_deref(),
-            request.li_from_uri().as_deref(),
-            request.li_to_uri().as_deref(),
-            request.li_source_ip(),
-        );
+        self.matches(request)
+    }
 
-        if matches.is_empty() {
+    /// Report whether this request is being intercepted.
+    ///
+    /// Args:
+    ///     request: The SIP request object.
+    ///
+    /// Returns:
+    ///     True if a provisioned warrant matches.
+    ///
+    /// Note:
+    ///     Retained for compatibility. Session teardown records are emitted by
+    ///     the dispatcher when the dialog ends; this does not emit one.
+    fn stop_intercept(&self, request: &super::request::PyRequest) -> bool {
+        if !self.manager.is_enabled() {
             return false;
         }
-
-        for target in &matches {
-            let event = IriEvent {
-                liid: target.liid.clone(),
-                correlation_id: request.li_call_id(),
-                event_type: IriEventType::Begin,
-                timestamp: std::time::SystemTime::now(),
-                sip_method: request.li_method(),
-                status_code: None,
-                from_uri: request.li_from_uri().unwrap_or_default(),
-                to_uri: request.li_to_uri().unwrap_or_default(),
-                request_uri: request.li_ruri(),
-                source_ip: request.li_source_ip(),
-                destination_ip: None,
-                delivery_type: target.delivery_type,
-                raw_message: None,
-            };
-            self.manager.emit_iri(event);
-
-            // Targets with IRI+CC need media capture — register the call with
-            // the X3 manager so subsequent mirrored RTP for this Call-ID is
-            // encapsulated and forwarded to the LEMF.
-            self.manager.start_media_capture(target, &request.li_call_id());
-
-            self.manager.audit(
-                li::AuditOperation::InterceptMatch,
-                Some(&target.liid),
-                format!(
-                    "intercept triggered: method={} call_id={} delivery={:?}",
-                    request.li_method(),
-                    request.li_call_id(),
-                    target.delivery_type,
-                ),
-            );
-        }
-
-        true
+        self.matches(request)
     }
 
     /// Start SIPREC recording for a request or call.
     ///
-    /// Accepts either a Request (proxy mode) or Call (B2BUA mode).
-    /// In B2BUA mode, sets the li_record flag on the call so that the
-    /// dispatcher will start SIPREC recording on answer.
+    /// Accepts either a Request (proxy mode) or Call (B2BUA mode). In B2BUA
+    /// mode, sets the recording flag on the call so the dispatcher starts
+    /// SIPREC on answer.
     ///
     /// Args:
     ///     target: A Request or Call object.
     ///
     /// Returns:
     ///     True if recording was initiated.
+    ///
+    /// Note:
+    ///     SIPREC is a recording feature, not lawful interception. It produces
+    ///     no X2 record and is not tied to a provisioned warrant.
     fn record(&self, target: &Bound<'_, PyAny>) -> PyResult<bool> {
         if !self.manager.is_enabled() {
             return Ok(false);
         }
 
-        // Try PyCall first (B2BUA mode).
         if let Ok(mut call) = target.cast::<super::call::PyCall>().map(|c| c.borrow_mut()) {
             let call_id = call.li_call_id();
-            let from_uri = call.li_from_uri();
-            let to_uri = call.li_to_uri();
-            let ruri = call.li_ruri();
-            let source_ip = call.li_source_ip();
             call.set_li_record();
-            self.emit_recording_iri(call_id, "INVITE".to_string(), from_uri, to_uri, ruri, source_ip);
+            self.manager.audit(
+                AuditOperation::MediaCaptureStarted,
+                Some(&call_id),
+                format!("SIPREC recording started for call {call_id}"),
+            );
             return Ok(true);
         }
 
-        // Try PyRequest (proxy mode).
         if let Ok(request) = target.cast::<super::request::PyRequest>().map(|r| r.borrow()) {
-            self.emit_recording_iri(
-                request.li_call_id(),
-                request.li_method(),
-                request.li_from_uri(),
-                request.li_to_uri(),
-                request.li_ruri(),
-                request.li_source_ip(),
+            let call_id = request.li_call_id();
+            self.manager.audit(
+                AuditOperation::MediaCaptureStarted,
+                Some(&call_id),
+                format!("SIPREC recording started for call {call_id}"),
             );
             return Ok(true);
         }
@@ -214,100 +167,53 @@ impl PyLiNamespace {
         ))
     }
 
-    /// Stop interception for a request.
-    ///
-    /// Args:
-    ///     request: The SIP request object.
-    ///
-    /// Returns:
-    ///     True if a stop event was emitted.
-    fn stop_intercept(&self, request: &super::request::PyRequest) -> bool {
-        if !self.manager.is_enabled() {
-            return false;
-        }
-        let matches = self.manager.check_message(
-            request.li_ruri().as_deref(),
-            request.li_from_uri().as_deref(),
-            request.li_to_uri().as_deref(),
-            request.li_source_ip(),
-        );
-
-        if matches.is_empty() {
-            return false;
-        }
-
-        for target in &matches {
-            let event = IriEvent {
-                liid: target.liid.clone(),
-                correlation_id: request.li_call_id(),
-                event_type: IriEventType::End,
-                timestamp: std::time::SystemTime::now(),
-                sip_method: request.li_method(),
-                status_code: None,
-                from_uri: request.li_from_uri().unwrap_or_default(),
-                to_uri: request.li_to_uri().unwrap_or_default(),
-                request_uri: request.li_ruri(),
-                source_ip: request.li_source_ip(),
-                destination_ip: None,
-                delivery_type: target.delivery_type,
-                raw_message: None,
-            };
-            self.manager.emit_iri(event);
-        }
-        // Idempotent — covers the IRI-only case and any straggling capture.
-        self.manager.stop_media_capture(&request.li_call_id());
-
-        true
-    }
-
     /// Stop SIPREC recording for a request or call.
-    ///
-    /// Accepts either a Request or Call object.
     ///
     /// Args:
     ///     target: A Request or Call object.
     ///
     /// Returns:
-    ///     True if a stop event was emitted.
+    ///     True if the stop was recorded.
     fn stop_recording(&self, target: &Bound<'_, PyAny>) -> PyResult<bool> {
         if !self.manager.is_enabled() {
             return Ok(false);
         }
 
-        // Try PyCall first.
-        if let Ok(call) = target.cast::<super::call::PyCall>().map(|c| c.borrow()) {
-            self.emit_stop_recording_iri(
-                call.li_call_id(),
-                "BYE".to_string(),
-                call.li_from_uri(),
-                call.li_to_uri(),
-                call.li_ruri(),
-                call.li_source_ip(),
-            );
-            return Ok(true);
-        }
+        let call_id = if let Ok(call) = target.cast::<super::call::PyCall>().map(|c| c.borrow()) {
+            call.li_call_id()
+        } else if let Ok(request) = target.cast::<super::request::PyRequest>().map(|r| r.borrow()) {
+            request.li_call_id()
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "stop_recording() expects a Request or Call object",
+            ));
+        };
 
-        // Try PyRequest.
-        if let Ok(request) = target.cast::<super::request::PyRequest>().map(|r| r.borrow()) {
-            self.emit_stop_recording_iri(
-                request.li_call_id(),
-                request.li_method(),
-                request.li_from_uri(),
-                request.li_to_uri(),
-                request.li_ruri(),
-                request.li_source_ip(),
-            );
-            return Ok(true);
-        }
-
-        Err(pyo3::exceptions::PyTypeError::new_err(
-            "stop_recording() expects a Request or Call object",
-        ))
+        self.manager.audit(
+            AuditOperation::MediaCaptureStopped,
+            Some(&call_id),
+            format!("SIPREC recording stopped for call {call_id}"),
+        );
+        Ok(true)
     }
 
     /// Check if the LI subsystem is enabled.
     #[getter]
     fn is_enabled(&self) -> bool {
         self.manager.is_enabled()
+    }
+
+    /// How many intercept tasks the ADMF has provisioned over X1.
+    ///
+    /// Read-only: warrants are provisioned by the ADMF, never by a script.
+    #[getter]
+    fn task_count(&self) -> usize {
+        self.manager.tasks().len()
+    }
+
+    /// How many delivery destinations the ADMF has provisioned over X1.
+    #[getter]
+    fn destination_count(&self) -> usize {
+        self.manager.destinations().len()
     }
 }

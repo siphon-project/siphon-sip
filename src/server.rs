@@ -1927,7 +1927,7 @@ impl SiphonServer {
         }
 
         // --- LI tasks ---
-        spawn_li_tasks(li_state, &config);
+        spawn_li_tasks(li_state, &config).await;
 
         // The IPsec SA manager + singleton are wired earlier (before
         // `ScriptEngine::new`) so user scripts can `from siphon import
@@ -2666,6 +2666,15 @@ type LiState = (
 /// hand the X3 manager into it once X3 has been constructed.
 static LI_MANAGER: std::sync::OnceLock<crate::li::LiManager> = std::sync::OnceLock::new();
 
+/// The lawful-intercept subsystem, if `lawful_intercept.enabled` is set.
+///
+/// The dispatcher takes a clone at construction so it can match every message
+/// against the provisioned warrants without reaching through a global on the
+/// hot path.
+pub fn li_manager() -> Option<crate::li::LiManager> {
+    LI_MANAGER.get().cloned()
+}
+
 fn init_li(config: &Config) -> Option<LiState> {
     let li_config = config.lawful_intercept.as_ref()?;
     if !li_config.enabled {
@@ -2675,8 +2684,17 @@ fn init_li(config: &Config) -> Option<LiState> {
     let channel_size = li_config.x2.as_ref()
         .map(|x2| x2.channel_size)
         .unwrap_or(10_000);
+    // Whether a content warrant can be provisioned at all depends on the media
+    // backend: X1 and X2 work on every backend, but TS 103 221-2 content
+    // framing lives in the native media engine. Config load already refuses a
+    // configured `lawful_intercept.x3` on a backend that cannot deliver it;
+    // this carries the same fact to `ActivateTask`, which can arrive long after
+    // boot.
+    let content_capability = crate::li::LiManager::content_capability_for(
+        config.media.as_ref().map(|media| media.backend).unwrap_or_default(),
+    );
     let (li_manager, iri_rx, audit_rx) =
-        crate::li::LiManager::new(li_config.clone(), channel_size);
+        crate::li::LiManager::new(li_config.clone(), channel_size, content_capability);
 
     let py_li_manager = li_manager.clone();
     pyo3::Python::attach(|python| {
@@ -3052,11 +3070,11 @@ fn init_registrant(
     // `serve()` (before ScriptEngine::new) using this same manager.
 }
 
-fn spawn_li_tasks(
+async fn spawn_li_tasks(
     li_state: Option<LiState>,
     config: &Config,
 ) {
-    let (_, iri_rx, audit_rx) = match li_state {
+    let (li_manager, iri_rx, audit_rx) = match li_state {
         Some(state) => state,
         None => return,
     };
@@ -3068,6 +3086,95 @@ fn spawn_li_tasks(
             return;
         }
     };
+
+    // --- X1 provisioning listener ---
+    //
+    // Bind it here, from the same place X2 and X3 are started. The previous
+    // X1 module had no caller outside its own tests, so `lawful_intercept.x1`
+    // was parsed and drove nothing: the interface was configured, reported as
+    // present, and never listened. A configured X1 that cannot be bound is a
+    // startup failure, not a warning — an ADMF that cannot provision a warrant
+    // must find out immediately, not when the warrant is needed.
+    if let Some(ref x1_config) = li_config.x1 {
+        let audit_manager = li_manager.clone();
+        let audit_hook: crate::li::x1::server::AuditHook =
+            Arc::new(move |operation, subject, detail| {
+                audit_manager.audit(
+                    crate::li::AuditOperation::Provisioning(operation.to_string()),
+                    subject,
+                    detail,
+                );
+            });
+
+        let x1_server = match crate::li::x1::server::X1Server::new(
+            x1_config,
+            li_manager.tasks().clone(),
+            li_manager.destinations().clone(),
+            audit_hook,
+        ) {
+            Ok(server) => Arc::new(server),
+            Err(error) => {
+                eprintln!("Failed to build the ETSI X1 server: {error}");
+                std::process::exit(1);
+            }
+        };
+
+        match crate::li::x1::server::serve(Arc::new(x1_config.clone()), x1_server).await {
+            Ok(address) => {
+                info!(address = %address, "ETSI X1 provisioning interface listening");
+            }
+            Err(error) => {
+                eprintln!("Failed to start the ETSI X1 listener: {error}");
+                std::process::exit(1);
+            }
+        }
+
+        // --- the network-element-to-ADMF direction ---
+        //
+        // Optional: without it siphon answers X1 but never speaks first. With
+        // it, the ADMF is told the node started, gets keepalives, hears about
+        // task and destination faults, and — the reason this direction exists —
+        // has its view of what is provisioned reconciled against ours after a
+        // restart.
+        //
+        // A misconfigured block (unreadable certificate, no admf_identifier to
+        // put in the envelope) is a startup error: an operator who asked for
+        // this must not get a node that silently never reports.
+        if let Some(ref admf_config) = x1_config.admf {
+            let schema = match crate::li::x1::X1Schema::compile() {
+                Ok(schema) => Arc::new(schema),
+                Err(error) => {
+                    eprintln!("Failed to compile the X1 schemas: {error}");
+                    std::process::exit(1);
+                }
+            };
+            match crate::li::x1::client::X1Client::new(x1_config, admf_config, schema) {
+                Ok(client) => {
+                    let client = Arc::new(client);
+                    // The delivery path needs it too: an X3 content-loss event
+                    // has to become a destination-level report toward the ADMF,
+                    // not just a log line.
+                    li_manager.set_x1_client(Arc::clone(&client));
+                    crate::li::x1::client::spawn(
+                        client,
+                        admf_config,
+                        li_manager.tasks().clone(),
+                        li_manager.destinations().clone(),
+                    );
+                    info!(
+                        endpoint = %admf_config.endpoint,
+                        keepalive_secs = admf_config.keepalive_secs,
+                        reconcile = admf_config.reconcile_on_start,
+                        "ETSI X1 network-element-to-ADMF direction started"
+                    );
+                }
+                Err(error) => {
+                    eprintln!("Failed to build the ETSI X1 ADMF client: {error}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
 
     // Spawn X2 IRI delivery task
     if let Some(ref x2_config) = li_config.x2 {
@@ -3081,30 +3188,13 @@ fn spawn_li_tasks(
         });
     }
 
-    // Spawn X3 media capture task
-    if let Some(ref x3_config) = li_config.x3 {
-        match crate::li::x3::X3Manager::new(x3_config) {
-            Ok(x3_manager) => {
-                // Hand a clone to LiManager so intercept() can register and
-                // stop_intercept() can deregister capture sessions.
-                if let Some(li) = LI_MANAGER.get() {
-                    li.set_x3_manager(x3_manager.clone());
-                }
-                let listen_address = x3_config.listen_udp.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = crate::li::x3::receive_and_forward_task(
-                        &listen_address, x3_manager,
-                    ).await {
-                        error!("X3 receive task failed: {error}");
-                    }
-                });
-                info!("X3 media capture task started");
-            }
-            Err(error) => {
-                error!("failed to create X3 manager: {error}");
-            }
-        }
-    }
+    // No X3 task here, deliberately.
+    //
+    // Content is framed as TS 103 221-2 and delivered by the media engine,
+    // straight to the destinations the ADMF provisioned over X1. siphon's part
+    // is the warrant and the `AttachX3` that starts it, both of which live on
+    // the dispatcher's interception path. There is nothing for this process to
+    // receive, encapsulate or forward.
 
     // Spawn audit log writer
     let audit_log_path = li_config.audit_log.clone();
@@ -3129,7 +3219,7 @@ fn spawn_li_tasks(
                     "{:?} {:?} liid={} {}\n",
                     entry.timestamp,
                     entry.operation,
-                    entry.liid.as_deref().unwrap_or("-"),
+                    entry.subject.as_deref().unwrap_or("-"),
                     entry.detail,
                 );
                 let _ = file.write_all(line.as_bytes()).await;

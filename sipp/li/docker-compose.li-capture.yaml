@@ -1,0 +1,121 @@
+# Packet-capture overlay for the ETSI interop profile.
+#
+#   scripts/validate_li_capture.sh
+#
+# Layered over docker-compose.li.yaml to capture X2 and X3 on the wire and read
+# them back with a third-party dissector, rather than trusting either end's
+# account of what it sent.
+#
+# ## Why there is a TLS tap
+#
+# The media engine's X3 delivery is TLS-only — it refuses the interception
+# outright without a client certificate, key and CA, which is the right
+# behaviour for an interface carrying warranted content and not something to
+# work around. A capture of that connection is therefore ciphertext, and the
+# certificates are ECDHE, so it cannot be decrypted after the fact from the
+# server key either.
+#
+# So the mediation function is fronted by a TLS-terminating tap. The outer hop
+# is exactly what production is — siphon and the engine both dial TLS, present
+# the network-element certificate, and verify the mediation function against its
+# CA — and the inner hop, tap to simulator, is plaintext on a private address
+# where it can be dissected. What is captured is the same PDU stream, one TCP
+# hop later.
+#
+# The destination provisioned over X1 points at the tap, so both X2 and X3
+# arrive there: one tap covers both interfaces, because the specification puts
+# them on one delivery address.
+
+services:
+  # The mediation function moves to a plaintext port. Nothing outside this
+  # network can reach it; the tap in front of it is what the estate dials.
+  simulator:
+    environment:
+      SIPGATE_LI_SIMULATOR_X2X3SERVER_SSLENABLED: "false"
+      SIPGATE_LI_SIMULATOR_X2X3SERVER_PORT: "42070"
+
+  # TLS in, plaintext out.
+  #
+  # Presents the simulator's own certificate, so siphon and the engine verify
+  # exactly what they would verify without the tap, and requires a client
+  # certificate signed by the network-element CA, so the mutual authentication
+  # is still real rather than skipped for the capture.
+  x3-tap:
+    image: li-test-driver
+    build:
+      context: .
+      dockerfile: Dockerfile.driver
+    container_name: li-x3-tap
+    depends_on:
+      init-admf-certs:
+        condition: service_completed_successfully
+      init-ne-certs:
+        condition: service_completed_successfully
+    volumes:
+      - "mutual-tls-stores:/mutual-tls-stores:ro"
+    command:
+      - socat
+      - "-d"
+      - "OPENSSL-LISTEN:42069,reuseaddr,fork,cert=/mutual-tls-stores/certs/simulator.crt,key=/mutual-tls-stores/keys/simulator.pk8.key,cafile=/mutual-tls-stores/ca-certs/network-element-ca.crt,verify=1"
+      - "TCP:simulator:42070"
+    networks:
+      li-net:
+        ipv4_address: 172.29.0.50
+
+  # tcpdump in the mediation function's own network namespace, which is where
+  # the tap's plaintext output lands. `network_mode: service:` rather than a
+  # network of its own because a bridge only shows a container its own traffic.
+  capture-x2x3:
+    image: li-test-driver
+    build:
+      context: .
+      dockerfile: Dockerfile.driver
+    container_name: li-capture-x2x3
+    depends_on:
+      simulator:
+        condition: service_healthy
+    network_mode: "service:simulator"
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    volumes:
+      - "./captures:/captures"
+    command:
+      - tcpdump
+      - "-i"
+      - "any"
+      - "-s"
+      - "0"
+      - "-U"
+      - "-w"
+      - "/captures/x2x3.pcap"
+      - "tcp port 42070"
+
+  # And in the engine's namespace, for the RTP the content records are copies
+  # of. Counting those against the delivered X3 records is what says the packet
+  # count is right rather than merely non-zero.
+  capture-rtp:
+    image: li-test-driver
+    build:
+      context: .
+      dockerfile: Dockerfile.driver
+    container_name: li-capture-rtp
+    depends_on:
+      siphon-rtp-ready:
+        condition: service_completed_successfully
+    network_mode: "service:siphon-rtp"
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    volumes:
+      - "./captures:/captures"
+    command:
+      - tcpdump
+      - "-i"
+      - "any"
+      - "-s"
+      - "0"
+      - "-U"
+      - "-w"
+      - "/captures/rtp.pcap"
+      - "udp portrange 30000-30200"

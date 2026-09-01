@@ -31,7 +31,7 @@ use siphon_rtp_proto::{
     frame, CmdResult, Command, Event, LegSummary as ProtoLegSummary, PlayEndReason,
     PlayMediaSource as ProtoPlayMediaSource, ProfileFlags, Request, Response,
     WsTeeDirection as ProtoWsTeeDirection, WsTeeEndReason as ProtoWsTeeEndReason,
-    WsVadEngine as ProtoWsVadEngine,
+    WsVadEngine as ProtoWsVadEngine, X3EndReason, X3TargetLeg, Xid,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -43,7 +43,7 @@ use super::client::PlayMediaSource;
 use super::error::RtpEngineError;
 use super::events::{
     BeepDetectedEvent, CallLegSummary, CallSummary, DtmfEvent, RtpEngineEvent, TextEvent,
-    TextStreamStats, WsTeeEndReason, WsTeeStarted, WsTeeEnded,
+    TextStreamStats, WsTeeEndReason, WsTeeStarted, WsTeeEnded, X3EndedEvent, X3LossEvent, X3StartedEvent,
 };
 use super::profile::{NgFlags, WsTeeDirection, WsVadEngine};
 
@@ -848,6 +848,55 @@ impl SiphonRtpClient {
         )
     }
 
+    /// Begin ETSI TS 103 221-2 X3 content delivery for a call.
+    ///
+    /// The engine frames every packet it *accepted* — after SRTP decryption and
+    /// after the authentication and replay checks — and ships it to the
+    /// Mediation Function over its own connection. Additive, like the
+    /// WebSocket tee: the call keeps relaying and recording exactly as it was.
+    ///
+    /// `target_leg` decides which end of the call the PDU direction is measured
+    /// against (TS 103 221-2 §5.2.6). The engine knows which leg is the caller;
+    /// only the warrant knows which is the *target*, so getting this wrong
+    /// inverts the direction on every delivered packet.
+    pub async fn attach_x3(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        delivery: &str,
+        xid: [u8; 16],
+        correlation_id: u64,
+        target_leg: X3TargetLeg,
+    ) -> Result<(), RtpEngineError> {
+        expect_ok(
+            self.request(Command::AttachX3 {
+                call_id: call_id.to_string(),
+                from_tag: from_tag.to_string(),
+                delivery: delivery.to_string(),
+                xid: Xid::from_bytes(xid),
+                correlation_id,
+                target_leg,
+            })
+            .await?,
+        )
+    }
+
+    /// Stop X3 content delivery for a call. Idempotent — the engine does not
+    /// treat detaching a call with no interception as an error.
+    pub async fn detach_x3(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        expect_ok(
+            self.request(Command::DetachX3 {
+                call_id: call_id.to_string(),
+                from_tag: from_tag.to_string(),
+            })
+            .await?,
+        )
+    }
+
     /// Liveness check — `Ping` → `Pong`.
     pub async fn ping(&self) -> Result<(), RtpEngineError> {
         match self.request(Command::Ping).await? {
@@ -1248,6 +1297,30 @@ impl SiphonRtpClientSet {
         self.select(call_id).detach_ws_tee(call_id, from_tag).await
     }
 
+    /// Begin X3 content delivery on the instance owning this call.
+    pub async fn attach_x3(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+        delivery: &str,
+        xid: [u8; 16],
+        correlation_id: u64,
+        target_leg: X3TargetLeg,
+    ) -> Result<(), RtpEngineError> {
+        self.select(call_id)
+            .attach_x3(call_id, from_tag, delivery, xid, correlation_id, target_leg)
+            .await
+    }
+
+    /// Stop X3 content delivery on the instance owning this call.
+    pub async fn detach_x3(
+        &self,
+        call_id: &str,
+        from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
+        self.select(call_id).detach_x3(call_id, from_tag).await
+    }
+
     /// Ping any one instance (the first). For quick health checks.
     pub async fn ping(&self) -> Result<(), RtpEngineError> {
         match self.clients.first() {
@@ -1483,6 +1556,56 @@ fn convert_event(event: Event) -> RtpEngineEvent {
             frequency_hz,
             duration_ms,
             offset_ms,
+        }),
+        Event::X3Started {
+            call_id,
+            from_tag,
+            delivery,
+            xid,
+            correlation_id,
+            // The target leg is what siphon told the engine, so it carries no
+            // information back; the compliance record already has it.
+            target_leg: _,
+        } => RtpEngineEvent::X3Started(X3StartedEvent {
+            call_id,
+            from_tag,
+            delivery,
+            xid: *xid.as_bytes(),
+            correlation_id,
+        }),
+        Event::X3Loss {
+            call_id,
+            from_tag,
+            dropped,
+            delivered,
+            dropped_since_ms,
+        } => RtpEngineEvent::X3Loss(X3LossEvent {
+            call_id,
+            from_tag,
+            dropped,
+            delivered,
+            dropped_since_ms,
+        }),
+        Event::X3Ended {
+            call_id,
+            from_tag,
+            reason,
+            delivered,
+            dropped,
+        } => RtpEngineEvent::X3Ended(X3EndedEvent {
+            call_id,
+            from_tag,
+            // `X3EndReason` is `#[non_exhaustive]`, so it is rendered rather
+            // than mirrored: a reason this build has not heard of still means
+            // delivery stopped, and the counts are what the record needs.
+            reason: format!("{reason:?}"),
+            // Only a controller-driven detach is an orderly end. A reason this
+            // build does not recognise is treated as *not* orderly, because
+            // assuming otherwise would silently downgrade a new failure mode
+            // into a clean shutdown and skip the report the agency is owed.
+            orderly: matches!(reason, X3EndReason::Detached),
+            delivered,
+            dropped,
         }),
         Event::Unknown => RtpEngineEvent::Unknown {
             event: "unknown".to_string(),
@@ -2550,6 +2673,154 @@ mod tests {
         })
         .expect("serialize stop_media");
         assert!(plain_stop.get("play_id").is_none());
+    }
+
+    // -- ETSI TS 103 221-2 X3 content delivery ---------------------------
+
+    /// The XID goes on the wire as a canonical UUID string, which is the form
+    /// an X1 provisioning system hands out — so the value siphon read from
+    /// `ActivateTask` reaches the engine unchanged.
+    #[test]
+    fn attach_x3_carries_the_xid_as_a_canonical_uuid() {
+        let xid = [
+            0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, 0x44, 0x44, 0x55, 0x55, 0x55, 0x55,
+            0x55, 0x55,
+        ];
+        let json = serde_json::to_value(Command::AttachX3 {
+            call_id: "call-x3".into(),
+            from_tag: "leg-a".into(),
+            delivery: "192.0.2.50:42069".into(),
+            xid: Xid::from_bytes(xid),
+            correlation_id: 0xf9e6_e6ef_197c_2b25,
+            target_leg: X3TargetLeg::Caller,
+        })
+        .expect("serialize attach_x3");
+
+        assert_eq!(json["xid"], "11111111-2222-3333-4444-555555555555");
+        assert_eq!(json["delivery"], "192.0.2.50:42069");
+        assert_eq!(json["target_leg"], "caller");
+        // Serde renders a u64 as a JSON number; it must survive intact rather
+        // than being truncated through an f64.
+        assert_eq!(json["correlation_id"].as_u64(), Some(0xf9e6_e6ef_197c_2b25));
+    }
+
+    /// The target leg is what TS 103 221-2 §5.2.6 measures packet direction
+    /// against, so both values have to reach the wire distinctly.
+    #[test]
+    fn attach_x3_distinguishes_the_target_leg() {
+        let build = |leg| {
+            serde_json::to_value(Command::AttachX3 {
+                call_id: "call-x3".into(),
+                from_tag: "leg-a".into(),
+                delivery: "192.0.2.50:42069".into(),
+                xid: Xid::from_bytes([0u8; 16]),
+                correlation_id: 1,
+                target_leg: leg,
+            })
+            .expect("serialize attach_x3")
+        };
+        assert_eq!(build(X3TargetLeg::Caller)["target_leg"], "caller");
+        assert_eq!(build(X3TargetLeg::Callee)["target_leg"], "callee");
+    }
+
+    #[test]
+    fn detach_x3_carries_the_call_and_leg() {
+        let json = serde_json::to_value(Command::DetachX3 {
+            call_id: "call-x3".into(),
+            from_tag: "leg-a".into(),
+        })
+        .expect("serialize detach_x3");
+        assert_eq!(json["call_id"], "call-x3");
+        assert_eq!(json["from_tag"], "leg-a");
+    }
+
+    #[test]
+    fn x3_started_converts_with_its_identifiers_intact() {
+        let xid = [
+            0xaa, 0xaa, 0xaa, 0xaa, 0xbb, 0xbb, 0xcc, 0xcc, 0xdd, 0xdd, 0xee, 0xee, 0xee, 0xee,
+            0xee, 0xee,
+        ];
+        let converted = convert_event(Event::X3Started {
+            call_id: "call-x3".into(),
+            from_tag: "leg-a".into(),
+            delivery: "192.0.2.50:42069".into(),
+            xid: Xid::from_bytes(xid),
+            correlation_id: 4242,
+            target_leg: X3TargetLeg::Callee,
+        });
+        match converted {
+            RtpEngineEvent::X3Started(started) => {
+                assert_eq!(started.call_id, "call-x3");
+                assert_eq!(started.xid, xid);
+                assert_eq!(started.correlation_id, 4242);
+                assert_eq!(started.delivery, "192.0.2.50:42069");
+            }
+            other => panic!("expected X3Started, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn x3_loss_converts_with_its_counts() {
+        let converted = convert_event(Event::X3Loss {
+            call_id: "call-x3".into(),
+            from_tag: "leg-a".into(),
+            dropped: 17,
+            delivered: 900,
+            dropped_since_ms: 5_000,
+        });
+        match converted {
+            RtpEngineEvent::X3Loss(loss) => {
+                assert_eq!(loss.dropped, 17);
+                assert_eq!(loss.delivered, 900);
+                assert_eq!(loss.dropped_since_ms, 5_000);
+            }
+            other => panic!("expected X3Loss, got {other:?}"),
+        }
+    }
+
+    /// Only a controller-driven detach is an orderly end. Every other reason
+    /// means delivery stopped for something the agency should hear about, so
+    /// the conversion must not flatten them into "finished".
+    #[test]
+    fn only_a_detach_counts_as_an_orderly_x3_end() {
+        let ended = |reason| match convert_event(Event::X3Ended {
+            call_id: "call-x3".into(),
+            from_tag: "leg-a".into(),
+            reason,
+            delivered: 1_000,
+            dropped: 0,
+        }) {
+            RtpEngineEvent::X3Ended(ended) => ended,
+            other => panic!("expected X3Ended, got {other:?}"),
+        };
+
+        assert!(ended(X3EndReason::Detached).orderly);
+        assert!(!ended(X3EndReason::CallEnded).orderly);
+        assert!(!ended(X3EndReason::MediationClosed).orderly);
+        assert!(!ended(X3EndReason::TransportError).orderly);
+    }
+
+    #[test]
+    fn an_x3_end_carries_the_delivery_counts_for_the_record() {
+        match convert_event(Event::X3Ended {
+            call_id: "call-x3".into(),
+            from_tag: "leg-a".into(),
+            reason: X3EndReason::TransportError,
+            delivered: 812,
+            dropped: 44,
+        }) {
+            RtpEngineEvent::X3Ended(ended) => {
+                assert_eq!(ended.delivered, 812);
+                assert_eq!(ended.dropped, 44);
+                assert!(!ended.orderly);
+                assert!(
+                    ended.reason.to_lowercase().contains("transport"),
+                    "the reason should survive for the record, got {:?}",
+                    ended.reason
+                );
+            }
+            other => panic!("expected X3Ended, got {other:?}"),
+        }
     }
 
     /// The WS tee's wire rate is a distinct knob from the takeover bridge's.

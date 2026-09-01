@@ -1,515 +1,972 @@
-//! Intercept target store — provisioned via X1, matched against SIP traffic.
+//! The intercept matching index.
 //!
-//! Each target represents a lawful intercept warrant with a unique LIID
-//! (Lawful Intercept Identifier). Targets are stored in a `DashMap` keyed
-//! by normalized identity for O(1) lookup on every SIP message.
+//! This is the lookup that decides, for every SIP message, whether a
+//! provisioned warrant applies to it. It is deliberately separate from the
+//! provisioning store in [`crate::li::x1::store`]: that store owns *what* is
+//! provisioned, this owns *how it is found*, and [`crate::li::x1::TaskStore`]
+//! keeps the two in step so there is one source of truth.
+//!
+//! # What changed, and why
+//!
+//! The previous index keyed tasks on a free-text LIID and matched three
+//! identifier kinds (`sip_uri`, `phone_number`, `ip_address`). Neither
+//! survives contact with ETSI TS 103 221-1:
+//!
+//! * The task key is the **XID**, a UUID, because that same value goes into
+//!   the 16-byte XID field of every X2 and X3 PDU delivered for the task. A
+//!   LIID is a *mediation* attribute and lives in `mediationDetails`; several
+//!   tasks can share one, and a task can have none.
+//! * The identifier set is the dictionary's. An IMS keys on `impu` and `impi`
+//!   as much as on `sipUri`, and neither existed here before.
+//!
+//! # Normalisation
+//!
+//! Every identifier is reduced to a canonical key before it is indexed or
+//! looked up, so that `sip:Alice@Example.COM;transport=tcp` in a Request-URI
+//! matches a warrant provisioned as `sip:alice@example.com`. Getting this
+//! wrong makes a warrant silently match nothing, so each rule is tested.
 
-use dashmap::DashMap;
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::SystemTime;
 
-/// Unique identifier for an intercept (LIID per ETSI TS 102 232).
-pub type Liid = String;
+use dashmap::DashMap;
 
-/// What the intercept matches against.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum TargetIdentity {
-    /// Full SIP URI match (e.g. "sip:alice@example.com").
-    SipUri(String),
-    /// Phone number / user-part match (e.g. "+1234567890").
-    /// Matches against RURI user, From user, and To user.
-    PhoneNumber(String),
-    /// Source IP address match.
-    IpAddress(IpAddr),
-}
+use crate::li::x1::types::{TargetIdentifier, XId};
 
-/// What to deliver for this intercept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeliveryType {
-    /// X2 only — signaling metadata (IRI).
-    IriOnly,
-    /// X2 + X3 — signaling metadata + media content (IRI + CC).
-    IriAndCc,
-}
-
-impl DeliveryType {
-    /// Whether this delivery type requires X3 content capture.
-    pub fn includes_content(self) -> bool {
-        matches!(self, Self::IriAndCc)
+/// Reduce a target identifier to the key it is indexed under.
+///
+/// Returns `None` for an identifier siphon cannot match SIP traffic against,
+/// which the provisioning layer has already refused.
+fn index_key(identifier: &TargetIdentifier) -> Option<String> {
+    match identifier {
+        TargetIdentifier::SipUri(uri) | TargetIdentifier::Impu(uri) => Some(normalize_uri(uri)),
+        TargetIdentifier::TelUri(uri) => Some(normalize_tel(uri)),
+        TargetIdentifier::E164Number(number) => Some(normalize_digits(number)),
+        TargetIdentifier::Impi(impi) => Some(impi.to_ascii_lowercase()),
+        TargetIdentifier::Imsi(imsi) => Some(format!("imsi:{}", normalize_digits(imsi))),
+        TargetIdentifier::Imei(imei) => Some(format!("imei:{}", normalize_digits(imei))),
+        TargetIdentifier::Ipv4Address(address) => Some(IpAddr::V4(*address).to_string()),
+        TargetIdentifier::Ipv6Address(address) => Some(IpAddr::V6(*address).to_string()),
+        TargetIdentifier::Unsupported(_) => None,
     }
 }
 
-/// A single intercept target provisioned via X1.
-#[derive(Debug, Clone)]
-pub struct InterceptTarget {
-    /// LIID — unique intercept identifier assigned by LEA.
-    pub liid: Liid,
-    /// What to match against.
-    pub target_identity: TargetIdentity,
-    /// IRI-only or IRI+CC delivery.
-    pub delivery_type: DeliveryType,
-    /// Whether this intercept is currently active.
-    pub active: bool,
-    /// When this intercept was activated.
-    pub activated_at: SystemTime,
-    /// Opaque warrant reference (for audit trail).
-    pub warrant_ref: Option<String>,
-    /// Optional mediation device identifier (when multiple LEAs).
-    pub mediation_id: Option<String>,
+/// Canonicalise a SIP/SIPS URI for matching.
+///
+/// Lowercased, with URI parameters and any `<...>` / display name stripped.
+/// Parameters carry transport and routing detail that has nothing to do with
+/// who the party is, and a warrant provisioned without them must still match a
+/// message that carries them.
+pub fn normalize_uri(uri: &str) -> String {
+    let trimmed = uri.trim();
+    // Strip a display name and angle brackets: `"Alice" <sip:a@b>;tag=1`.
+    let inner = match (trimmed.find('<'), trimmed.find('>')) {
+        (Some(start), Some(end)) if end > start => &trimmed[start + 1..end],
+        _ => trimmed,
+    };
+    // Drop URI parameters and headers.
+    let without_params = inner
+        .split(';')
+        .next()
+        .unwrap_or(inner)
+        .split('?')
+        .next()
+        .unwrap_or(inner);
+    without_params.trim().to_ascii_lowercase()
 }
 
-/// Normalized key for fast DashMap lookup.
+/// Canonicalise a `tel:` URI to `tel:` plus its digits.
+fn normalize_tel(uri: &str) -> String {
+    let normalized = normalize_uri(uri);
+    let body = normalized.strip_prefix("tel:").unwrap_or(&normalized);
+    format!("tel:{}", normalize_digits(body))
+}
+
+/// Keep only digits, dropping `+`, spaces and punctuation.
 ///
-/// We normalize identities to a canonical form so that matching is consistent:
-/// - SIP URIs are lowercased
-/// - Phone numbers have non-digit prefix stripped (keep leading +)
-/// - IP addresses use their canonical representation
-fn normalize_key(identity: &TargetIdentity) -> String {
-    match identity {
-        TargetIdentity::SipUri(uri) => uri.to_lowercase(),
-        TargetIdentity::PhoneNumber(number) => {
-            // Keep leading + and digits only
-            let cleaned: String = number.chars()
-                .filter(|c| c.is_ascii_digit() || *c == '+')
-                .collect();
-            cleaned
+/// `+1-555-123-4567`, `+15551234567` and `15551234567` are the same subscriber,
+/// and a warrant must match however the number was written. Note the
+/// dictionary's `InternationalE164` is digits-only with no leading `+`, so the
+/// canonical form drops it.
+fn normalize_digits(value: &str) -> String {
+    value.chars().filter(char::is_ascii_digit).collect()
+}
+
+/// Every key a SIP URI could match a warrant on.
+///
+/// One URI yields several candidates: the URI itself, and the user part as a
+/// bare number (so a warrant on `e164Number` matches `sip:15551234567@carrier`)
+/// and as a `tel:` URI.
+fn candidate_keys(uri: &str) -> Vec<String> {
+    let normalized = normalize_uri(uri);
+    let mut keys = vec![normalized.clone()];
+
+    // The user part, for number-shaped warrants.
+    let scheme_stripped = normalized
+        .strip_prefix("sip:")
+        .or_else(|| normalized.strip_prefix("sips:"))
+        .or_else(|| normalized.strip_prefix("tel:"))
+        .unwrap_or(&normalized);
+    if let Some(user) = scheme_stripped.split('@').next() {
+        if !user.is_empty() {
+            let digits = normalize_digits(user);
+            if !digits.is_empty() {
+                keys.push(digits.clone());
+                keys.push(format!("tel:{digits}"));
+            }
+            // An IMPI is a bare user@realm with no scheme, so the
+            // scheme-stripped form is itself a candidate.
+            keys.push(scheme_stripped.to_string());
         }
-        TargetIdentity::IpAddress(ip) => ip.to_string(),
     }
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
-/// Thread-safe intercept target store.
+/// Which party to a call a warrant matched.
 ///
-/// Keyed by normalized identity string for O(1) lookup.
-/// Multiple targets can match the same identity (different LIIDs from different LEAs).
-#[derive(Debug, Clone)]
+/// Not a detail: ETSI TS 103 221-2 §5.2.6 defines a delivered packet's
+/// direction *relative to the target*, so the delivery path has to know which
+/// end of the call the warrant names. Getting it wrong inverts the direction on
+/// every packet delivered for that intercept, which is worse than delivering
+/// nothing — a mediation function would render the call backwards and nothing
+/// would look broken.
+///
+/// Derived from the dialog's `From` and `To`, not from the direction of the
+/// individual message, so it stays stable across requests and responses for the
+/// life of the dialog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchedParty {
+    /// The warrant names the party that originated the dialog (the `From`).
+    Originating,
+    /// The warrant names the party the dialog is addressed to (the `To` or
+    /// Request-URI).
+    Terminating,
+}
+
+/// One warrant matching one message, and which party it matched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Match {
+    /// The task whose warrant matched.
+    pub x_id: XId,
+    /// Which end of the call it names.
+    pub party: MatchedParty,
+}
+
+/// The matching index: canonical identifier key to the tasks provisioned on it.
+///
+/// Several warrants may target the same identity, so a key maps to a list.
+#[derive(Debug, Clone, Default)]
 pub struct TargetStore {
-    /// Primary index: normalized identity → list of targets.
-    by_identity: Arc<DashMap<String, Vec<InterceptTarget>>>,
-    /// Secondary index: LIID → normalized identity key (for X1 CRUD by LIID).
-    by_liid: Arc<DashMap<Liid, String>>,
+    by_identity: Arc<DashMap<String, Vec<XId>>>,
+    /// The keys each task was indexed under, so removal is exact.
+    by_task: Arc<DashMap<XId, Vec<String>>>,
 }
 
 impl TargetStore {
+    /// An empty index.
     pub fn new() -> Self {
-        Self {
-            by_identity: Arc::new(DashMap::new()),
-            by_liid: Arc::new(DashMap::new()),
+        Self::default()
+    }
+
+    /// Index a task's identifiers, replacing any previous entry for it.
+    pub fn index(&self, x_id: XId, identifiers: &[TargetIdentifier]) {
+        self.remove(x_id);
+
+        let mut keys: Vec<String> = identifiers.iter().filter_map(index_key).collect();
+        keys.sort();
+        keys.dedup();
+
+        for key in &keys {
+            self.by_identity.entry(key.clone()).or_default().push(x_id);
+        }
+        if !keys.is_empty() {
+            self.by_task.insert(x_id, keys);
         }
     }
 
-    /// Add or replace an intercept target. Returns `true` if this is a new target.
-    pub fn activate(&self, target: InterceptTarget) -> bool {
-        let key = normalize_key(&target.target_identity);
-        let liid = target.liid.clone();
-        let is_new = !self.by_liid.contains_key(&liid);
-
-        // Remove existing entry for this LIID if it exists (ModifyTask).
-        if !is_new {
-            self.deactivate(&liid);
+    /// Drop a task from the index.
+    pub fn remove(&self, x_id: XId) {
+        let Some((_, keys)) = self.by_task.remove(&x_id) else {
+            return;
+        };
+        for key in keys {
+            let now_empty = match self.by_identity.get_mut(&key) {
+                Some(mut tasks) => {
+                    tasks.retain(|candidate| *candidate != x_id);
+                    tasks.is_empty()
+                }
+                None => false,
+            };
+            if now_empty {
+                self.by_identity.remove(&key);
+            }
         }
+    }
 
-        self.by_liid.insert(liid.clone(), key.clone());
+    /// Empty the index.
+    pub fn clear(&self) {
+        self.by_identity.clear();
+        self.by_task.clear();
+    }
+
+    /// Tasks provisioned on an exact canonical key.
+    fn tasks_for_key(&self, key: &str) -> Vec<XId> {
         self.by_identity
-            .entry(key)
-            .or_default()
-            .push(target);
-
-        is_new
+            .get(key)
+            .map(|tasks| tasks.clone())
+            .unwrap_or_default()
     }
 
-    /// Remove an intercept target by LIID. Returns the removed target if found.
-    pub fn deactivate(&self, liid: &str) -> Option<InterceptTarget> {
-        if let Some((_, key)) = self.by_liid.remove(liid) {
-            if let Some(mut targets) = self.by_identity.get_mut(&key) {
-                if let Some(position) = targets.iter().position(|t| t.liid == liid) {
-                    let removed = targets.remove(position);
-                    // Clean up empty vec
-                    if targets.is_empty() {
-                        drop(targets);
-                        self.by_identity.remove(&key);
-                    }
-                    return Some(removed);
+    /// Tasks whose warrant matches a SIP URI.
+    ///
+    /// Deduplicated, because one URI yields several candidate keys and a single
+    /// warrant can be indexed under more than one of them — an IMS subscriber
+    /// provisioned by both IMPU and IMPI is the ordinary case. Returning it
+    /// twice would mean two IRI records for one message.
+    pub fn match_uri(&self, uri: &str) -> Vec<XId> {
+        let mut seen = HashSet::new();
+        let mut matched = Vec::new();
+        for key in candidate_keys(uri) {
+            for x_id in self.tasks_for_key(&key) {
+                if seen.insert(x_id) {
+                    matched.push(x_id);
                 }
             }
         }
-        None
+        matched
     }
 
-    /// Look up a target by LIID (for X1 GET/status).
-    pub fn get_by_liid(&self, liid: &str) -> Option<InterceptTarget> {
-        let key = self.by_liid.get(liid)?;
-        let targets = self.by_identity.get(key.value())?;
-        targets.iter().find(|t| t.liid == liid).cloned()
+    /// Tasks whose warrant matches a source address.
+    pub fn match_ip(&self, address: IpAddr) -> Vec<XId> {
+        self.tasks_for_key(&address.to_string())
     }
 
-    /// List all active intercepts (for X1 listing). Returns (liid, target) pairs.
-    pub fn list_all(&self) -> Vec<InterceptTarget> {
-        self.by_identity
-            .iter()
-            .flat_map(|entry| entry.value().clone())
-            .collect()
+    /// Tasks whose warrant matches an IMSI.
+    pub fn match_imsi(&self, imsi: &str) -> Vec<XId> {
+        self.tasks_for_key(&format!("imsi:{}", normalize_digits(imsi)))
     }
 
-    /// Match a SIP URI against the target store. Returns all matching targets.
-    pub fn match_sip_uri(&self, uri: &str) -> Vec<InterceptTarget> {
-        let key = uri.to_lowercase();
-        self.by_identity
-            .get(&key)
-            .map(|targets| targets.clone())
-            .unwrap_or_default()
+    /// Tasks whose warrant matches an IMEI.
+    pub fn match_imei(&self, imei: &str) -> Vec<XId> {
+        self.tasks_for_key(&format!("imei:{}", normalize_digits(imei)))
     }
 
-    /// Match a phone number / user-part against the target store.
-    pub fn match_phone_number(&self, number: &str) -> Vec<InterceptTarget> {
-        let key: String = number.chars()
-            .filter(|c| c.is_ascii_digit() || *c == '+')
-            .collect();
-        self.by_identity
-            .get(&key)
-            .map(|targets| targets.clone())
-            .unwrap_or_default()
-    }
-
-    /// Match a source IP against the target store.
-    pub fn match_ip(&self, ip: IpAddr) -> Vec<InterceptTarget> {
-        let key = ip.to_string();
-        self.by_identity
-            .get(&key)
-            .map(|targets| targets.clone())
-            .unwrap_or_default()
-    }
-
-    /// Check if any intercept matches the given SIP message fields.
-    /// Returns all matching targets (may be from different LEAs).
+    /// Every task matching any identity carried by one SIP message, with the
+    /// party each one matched.
     ///
-    /// Checks against: RURI, From URI, To URI, and source IP.
+    /// Deduplicated: a warrant matching both the From and the To of the same
+    /// message is one intercept, not two. When a warrant matches both ends —
+    /// a target calling themselves, or a forwarded leg where both parties are
+    /// the same identity — the originating side wins, because that is the end
+    /// the dialog is anchored on and it keeps the answer stable for the life of
+    /// the call.
     pub fn match_message(
         &self,
         request_uri: Option<&str>,
         from_uri: Option<&str>,
         to_uri: Option<&str>,
         source_ip: Option<IpAddr>,
-    ) -> Vec<InterceptTarget> {
-        let mut matches = Vec::new();
-        let mut seen_liids = std::collections::HashSet::new();
+    ) -> Vec<Match> {
+        let mut seen = HashSet::new();
+        let mut matched = Vec::new();
 
-        // Check SIP URIs
-        for uri in [request_uri, from_uri, to_uri].into_iter().flatten() {
-            for target in self.match_sip_uri(uri) {
-                if seen_liids.insert(target.liid.clone()) {
-                    matches.push(target);
-                }
-            }
-            // Also try matching user-part as phone number
-            if let Some(user) = extract_user_part(uri) {
-                for target in self.match_phone_number(&user) {
-                    if seen_liids.insert(target.liid.clone()) {
-                        matches.push(target);
-                    }
-                }
-            }
-        }
-
-        // Check source IP
-        if let Some(ip) = source_ip {
-            for target in self.match_ip(ip) {
-                if seen_liids.insert(target.liid.clone()) {
-                    matches.push(target);
+        // Ordered so the originating side is considered first and therefore
+        // wins the deduplication.
+        let candidates = [
+            (from_uri, MatchedParty::Originating),
+            (request_uri, MatchedParty::Terminating),
+            (to_uri, MatchedParty::Terminating),
+        ];
+        for (uri, party) in candidates {
+            let Some(uri) = uri else { continue };
+            for x_id in self.match_uri(uri) {
+                if seen.insert(x_id) {
+                    matched.push(Match { x_id, party });
                 }
             }
         }
 
-        matches
+        // A source address identifies the sender, which for a request is the
+        // originating side.
+        if let Some(address) = source_ip {
+            for x_id in self.match_ip(address) {
+                if seen.insert(x_id) {
+                    matched.push(Match {
+                        x_id,
+                        party: MatchedParty::Originating,
+                    });
+                }
+            }
+        }
+        matched
     }
 
-    /// Number of active intercept targets.
-    pub fn count(&self) -> usize {
-        self.by_liid.len()
+    /// How many distinct tasks are indexed.
+    pub fn len(&self) -> usize {
+        self.by_task.len()
     }
-}
 
-impl Default for TargetStore {
-    fn default() -> Self {
-        Self::new()
+    /// Whether the index is empty.
+    pub fn is_empty(&self) -> bool {
+        self.by_task.is_empty()
     }
-}
 
-/// Extract user-part from a SIP URI (e.g. "sip:+1234@example.com" → "+1234").
-fn extract_user_part(uri: &str) -> Option<String> {
-    let uri = uri.strip_prefix("sip:").or_else(|| uri.strip_prefix("sips:"))?;
-    let user_part = uri.split('@').next()?;
-    if user_part.is_empty() || user_part == uri {
-        return None; // No @ found or empty user
+    /// How many distinct identifier keys are indexed.
+    ///
+    /// Used by the leak guard: this must drain to its baseline alongside
+    /// [`Self::len`], because an orphaned key would grow without bound.
+    pub fn key_count(&self) -> usize {
+        self.by_identity.len()
     }
-    Some(user_part.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
-    fn make_target(liid: &str, identity: TargetIdentity, delivery: DeliveryType) -> InterceptTarget {
-        InterceptTarget {
-            liid: liid.to_string(),
-            target_identity: identity,
-            delivery_type: delivery,
-            active: true,
-            activated_at: SystemTime::now(),
-            warrant_ref: Some("W-2026-001".to_string()),
-            mediation_id: None,
+    fn sip(uri: &str) -> TargetIdentifier {
+        TargetIdentifier::SipUri(uri.to_string())
+    }
+
+    // -- normalisation ---------------------------------------------------
+
+    #[test]
+    fn uri_normalisation_lowercases_and_strips_parameters() {
+        assert_eq!(
+            normalize_uri("sip:Alice@Example.COM;transport=tcp"),
+            "sip:alice@example.com"
+        );
+        assert_eq!(normalize_uri("  sip:a@b.com  "), "sip:a@b.com");
+        assert_eq!(normalize_uri("sip:a@b.com?subject=x"), "sip:a@b.com");
+    }
+
+    #[test]
+    fn uri_normalisation_strips_display_names_and_angle_brackets() {
+        assert_eq!(
+            normalize_uri("\"Alice Smith\" <sip:alice@example.com>;tag=abc"),
+            "sip:alice@example.com"
+        );
+        assert_eq!(normalize_uri("<sip:bob@example.com>"), "sip:bob@example.com");
+    }
+
+    #[test]
+    fn digit_normalisation_drops_formatting_and_plus() {
+        assert_eq!(normalize_digits("+1-555-123-4567"), "15551234567");
+        assert_eq!(normalize_digits("+15551234567"), "15551234567");
+        assert_eq!(normalize_digits("15551234567"), "15551234567");
+        assert_eq!(normalize_digits("(555) 123 4567"), "5551234567");
+    }
+
+    #[test]
+    fn tel_normalisation_is_scheme_plus_digits() {
+        assert_eq!(normalize_tel("tel:+1-555-123-4567"), "tel:15551234567");
+        assert_eq!(normalize_tel("TEL:+15551234567"), "tel:15551234567");
+    }
+
+    // -- indexing and matching --------------------------------------------
+
+    #[test]
+    fn a_sip_warrant_matches_its_uri() {
+        let store = TargetStore::new();
+        let x_id = XId::generate();
+        store.index(x_id, &[sip("sip:alice@example.com")]);
+
+        assert_eq!(store.match_uri("sip:alice@example.com"), vec![x_id]);
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn matching_is_case_and_parameter_insensitive() {
+        let store = TargetStore::new();
+        let x_id = XId::generate();
+        store.index(x_id, &[sip("sip:alice@example.com")]);
+
+        // All of these are the same subscriber on the wire.
+        for candidate in [
+            "sip:Alice@Example.COM",
+            "sip:alice@example.com;transport=tls",
+            "\"Alice\" <sip:alice@example.com>;tag=99",
+        ] {
+            assert_eq!(
+                store.match_uri(candidate),
+                vec![x_id],
+                "{candidate} should match"
+            );
         }
     }
 
     #[test]
-    fn activate_and_lookup_by_liid() {
+    fn an_e164_warrant_matches_a_sip_uri_carrying_the_number() {
+        // The common IMS case: the warrant names a number, the traffic names
+        // sip:<number>@carrier.
         let store = TargetStore::new();
-        let target = make_target(
-            "LI-001",
-            TargetIdentity::SipUri("sip:alice@example.com".to_string()),
-            DeliveryType::IriAndCc,
+        let x_id = XId::generate();
+        store.index(x_id, &[TargetIdentifier::E164Number("15551234567".into())]);
+
+        assert_eq!(store.match_uri("sip:15551234567@carrier.example"), vec![x_id]);
+        assert_eq!(store.match_uri("sip:+15551234567@carrier.example"), vec![x_id]);
+        assert_eq!(store.match_uri("tel:+1-555-123-4567"), vec![x_id]);
+    }
+
+    #[test]
+    fn a_tel_warrant_matches_however_the_number_is_written() {
+        let store = TargetStore::new();
+        let x_id = XId::generate();
+        store.index(x_id, &[TargetIdentifier::TelUri("tel:+15551234567".into())]);
+
+        assert_eq!(store.match_uri("tel:+15551234567"), vec![x_id]);
+        assert_eq!(store.match_uri("sip:15551234567@carrier.example"), vec![x_id]);
+    }
+
+    #[test]
+    fn an_impu_warrant_matches_like_a_sip_uri() {
+        let store = TargetStore::new();
+        let x_id = XId::generate();
+        store.index(
+            x_id,
+            &[TargetIdentifier::Impu("sip:alice@ims.example.com".into())],
         );
-        assert!(store.activate(target));
-        assert_eq!(store.count(), 1);
-
-        let found = store.get_by_liid("LI-001").unwrap();
-        assert_eq!(found.liid, "LI-001");
-        assert_eq!(found.delivery_type, DeliveryType::IriAndCc);
+        assert_eq!(store.match_uri("sip:alice@ims.example.com"), vec![x_id]);
     }
 
     #[test]
-    fn deactivate_removes_target() {
+    fn an_impi_warrant_matches_a_bare_user_at_realm() {
+        // An IMPI has no scheme; the scheme-stripped form of the URI is the
+        // candidate that matches it.
         let store = TargetStore::new();
-        store.activate(make_target(
-            "LI-001",
-            TargetIdentity::SipUri("sip:alice@example.com".to_string()),
-            DeliveryType::IriOnly,
-        ));
-        assert_eq!(store.count(), 1);
-
-        let removed = store.deactivate("LI-001").unwrap();
-        assert_eq!(removed.liid, "LI-001");
-        assert_eq!(store.count(), 0);
-        assert!(store.get_by_liid("LI-001").is_none());
+        let x_id = XId::generate();
+        store.index(
+            x_id,
+            &[TargetIdentifier::Impi("alice@ims.example.com".into())],
+        );
+        assert_eq!(store.match_uri("sip:alice@ims.example.com"), vec![x_id]);
     }
 
     #[test]
-    fn deactivate_nonexistent_returns_none() {
+    fn an_ip_warrant_matches_a_source_address() {
         let store = TargetStore::new();
-        assert!(store.deactivate("LI-999").is_none());
+        let x_id = XId::generate();
+        store.index(
+            x_id,
+            &[TargetIdentifier::Ipv4Address(Ipv4Addr::new(198, 51, 100, 7))],
+        );
+        assert_eq!(
+            store.match_ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))),
+            vec![x_id]
+        );
+        assert!(store
+            .match_ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8)))
+            .is_empty());
     }
 
     #[test]
-    fn match_sip_uri_case_insensitive() {
+    fn an_ipv6_warrant_matches_regardless_of_written_form() {
+        // The warrant arrives expanded (the schema requires it); the message's
+        // source address is a parsed Ipv6Addr. Both normalise through
+        // Ipv6Addr's own Display, so they meet.
         let store = TargetStore::new();
-        store.activate(make_target(
-            "LI-001",
-            TargetIdentity::SipUri("sip:Alice@Example.COM".to_string()),
-            DeliveryType::IriOnly,
-        ));
-
-        let matches = store.match_sip_uri("sip:alice@example.com");
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].liid, "LI-001");
+        let x_id = XId::generate();
+        let address: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        store.index(x_id, &[TargetIdentifier::Ipv6Address(address)]);
+        assert_eq!(store.match_ip(IpAddr::V6(address)), vec![x_id]);
     }
 
     #[test]
-    fn match_phone_number_strips_formatting() {
+    fn imsi_and_imei_warrants_do_not_collide() {
+        // Both are bare digit strings, so they are namespaced in the index.
         let store = TargetStore::new();
-        store.activate(make_target(
-            "LI-002",
-            TargetIdentity::PhoneNumber("+1-234-567-8900".to_string()),
-            DeliveryType::IriAndCc,
-        ));
+        let imsi_task = XId::generate();
+        let imei_task = XId::generate();
+        store.index(imsi_task, &[TargetIdentifier::Imsi("001010000000001".into())]);
+        store.index(imei_task, &[TargetIdentifier::Imei("01234567890123".into())]);
 
-        // Match with different formatting
-        let matches = store.match_phone_number("+12345678900");
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].liid, "LI-002");
+        assert_eq!(store.match_imsi("001010000000001"), vec![imsi_task]);
+        assert_eq!(store.match_imei("01234567890123"), vec![imei_task]);
+        assert!(store.match_imsi("01234567890123").is_empty());
+        // And neither is reachable through URI matching, which would be a
+        // cross-namespace false positive.
+        assert!(store.match_uri("sip:001010000000001@ims.example").is_empty());
     }
 
     #[test]
-    fn match_ip_address() {
+    fn an_unsupported_identifier_is_not_indexed() {
         let store = TargetStore::new();
-        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        store.activate(make_target(
-            "LI-003",
-            TargetIdentity::IpAddress(ip),
-            DeliveryType::IriOnly,
-        ));
-
-        let matches = store.match_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
-        assert_eq!(matches.len(), 1);
-
-        let no_match = store.match_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
-        assert!(no_match.is_empty());
+        store.index(
+            XId::generate(),
+            &[TargetIdentifier::Unsupported("gtpuTunnelId".into())],
+        );
+        assert!(store.is_empty());
+        assert_eq!(store.key_count(), 0);
     }
 
-    #[test]
-    fn match_message_checks_all_fields() {
-        let store = TargetStore::new();
-        store.activate(make_target(
-            "LI-001",
-            TargetIdentity::SipUri("sip:bob@biloxi.com".to_string()),
-            DeliveryType::IriAndCc,
-        ));
+    // -- message matching --------------------------------------------------
 
-        // Match via To URI
-        let matches = store.match_message(
-            Some("sip:target@other.com"),
-            Some("sip:alice@atlanta.com"),
-            Some("sip:bob@biloxi.com"),
+    #[test]
+    fn match_message_checks_every_identity_on_the_message() {
+        let store = TargetStore::new();
+        let ruri_task = XId::generate();
+        let from_task = XId::generate();
+        let to_task = XId::generate();
+        store.index(ruri_task, &[sip("sip:target@example.com")]);
+        store.index(from_task, &[sip("sip:caller@example.com")]);
+        store.index(to_task, &[sip("sip:callee@example.com")]);
+
+        let matched = store.match_message(
+            Some("sip:target@example.com"),
+            Some("sip:caller@example.com"),
+            Some("sip:callee@example.com"),
             None,
         );
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].liid, "LI-001");
-    }
-
-    #[test]
-    fn match_message_via_phone_number_in_uri() {
-        let store = TargetStore::new();
-        store.activate(make_target(
-            "LI-004",
-            TargetIdentity::PhoneNumber("+15551234567".to_string()),
-            DeliveryType::IriOnly,
-        ));
-
-        // Phone number appears as user-part of From URI
-        let matches = store.match_message(
-            None,
-            Some("sip:+15551234567@carrier.com"),
-            None,
-            None,
+        assert_eq!(matched.len(), 3);
+        let found = |x_id| matched.iter().find(|entry| entry.x_id == x_id);
+        // Which party each warrant names follows from where it matched, and it
+        // is what the delivered packets' direction is defined against.
+        assert_eq!(
+            found(from_task).map(|entry| entry.party),
+            Some(MatchedParty::Originating)
         );
-        assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].liid, "LI-004");
+        assert_eq!(
+            found(ruri_task).map(|entry| entry.party),
+            Some(MatchedParty::Terminating)
+        );
+        assert_eq!(
+            found(to_task).map(|entry| entry.party),
+            Some(MatchedParty::Terminating)
+        );
     }
 
     #[test]
-    fn match_message_deduplicates_across_fields() {
+    fn a_warrant_matching_both_ends_resolves_to_the_originating_side() {
+        // A target calling themselves, or a leg where both parties are the
+        // same identity. The answer has to be stable for the life of the call,
+        // so the originating side wins rather than whichever field was read
+        // first.
         let store = TargetStore::new();
-        store.activate(make_target(
-            "LI-001",
-            TargetIdentity::SipUri("sip:alice@example.com".to_string()),
-            DeliveryType::IriOnly,
-        ));
+        let x_id = XId::generate();
+        store.index(x_id, &[sip("sip:alice@example.com")]);
 
-        // Same URI appears in both From and To — should only match once
-        let matches = store.match_message(
-            None,
+        let matched = store.match_message(
             Some("sip:alice@example.com"),
             Some("sip:alice@example.com"),
+            Some("sip:alice@example.com"),
             None,
         );
-        assert_eq!(matches.len(), 1);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].party, MatchedParty::Originating);
     }
 
     #[test]
-    fn multiple_targets_same_identity() {
+    fn a_source_address_match_names_the_originating_side() {
+        use std::net::Ipv4Addr;
         let store = TargetStore::new();
-        // Two LEAs targeting the same person
-        store.activate(make_target(
-            "LI-001",
-            TargetIdentity::SipUri("sip:alice@example.com".to_string()),
-            DeliveryType::IriOnly,
-        ));
-        store.activate(make_target(
-            "LI-002",
-            TargetIdentity::SipUri("sip:alice@example.com".to_string()),
-            DeliveryType::IriAndCc,
-        ));
+        let x_id = XId::generate();
+        store.index(
+            x_id,
+            &[TargetIdentifier::Ipv4Address(Ipv4Addr::new(198, 51, 100, 7))],
+        );
 
-        assert_eq!(store.count(), 2);
-        let matches = store.match_sip_uri("sip:alice@example.com");
-        assert_eq!(matches.len(), 2);
+        let matched = store.match_message(
+            None,
+            None,
+            None,
+            Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))),
+        );
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].x_id, x_id);
+        assert_eq!(matched[0].party, MatchedParty::Originating);
     }
 
     #[test]
-    fn modify_target_replaces_existing() {
+    fn match_message_deduplicates_one_warrant_hit_twice() {
+        // A warrant matching both From and To is one intercept.
         let store = TargetStore::new();
-        store.activate(make_target(
-            "LI-001",
-            TargetIdentity::SipUri("sip:alice@example.com".to_string()),
-            DeliveryType::IriOnly,
-        ));
+        let x_id = XId::generate();
+        store.index(x_id, &[sip("sip:alice@example.com")]);
 
-        // Modify: same LIID, upgrade to IRI+CC
-        store.activate(make_target(
-            "LI-001",
-            TargetIdentity::SipUri("sip:alice@example.com".to_string()),
-            DeliveryType::IriAndCc,
-        ));
-
-        assert_eq!(store.count(), 1);
-        let found = store.get_by_liid("LI-001").unwrap();
-        assert_eq!(found.delivery_type, DeliveryType::IriAndCc);
+        let matched = store.match_message(
+            Some("sip:alice@example.com"),
+            Some("sip:alice@example.com"),
+            Some("sip:alice@example.com"),
+            None,
+        );
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].x_id, x_id);
     }
 
     #[test]
-    fn list_all_returns_every_target() {
+    fn several_warrants_can_target_one_identity() {
         let store = TargetStore::new();
-        store.activate(make_target(
-            "LI-001",
-            TargetIdentity::SipUri("sip:alice@example.com".to_string()),
-            DeliveryType::IriOnly,
-        ));
-        store.activate(make_target(
-            "LI-002",
-            TargetIdentity::PhoneNumber("+15551234567".to_string()),
-            DeliveryType::IriAndCc,
-        ));
+        let first = XId::generate();
+        let second = XId::generate();
+        store.index(first, &[sip("sip:alice@example.com")]);
+        store.index(second, &[sip("sip:alice@example.com")]);
 
-        let all = store.list_all();
-        assert_eq!(all.len(), 2);
+        let matched = store.match_uri("sip:alice@example.com");
+        assert_eq!(matched.len(), 2);
+        assert!(matched.contains(&first));
+        assert!(matched.contains(&second));
     }
 
     #[test]
-    fn extract_user_part_works() {
-        assert_eq!(extract_user_part("sip:alice@example.com"), Some("alice".to_string()));
-        assert_eq!(extract_user_part("sips:+1234@example.com"), Some("+1234".to_string()));
-        assert_eq!(extract_user_part("sip:example.com"), None); // no @
-        assert_eq!(extract_user_part("tel:+1234"), None); // not sip:
+    fn a_warrant_with_several_identifiers_matches_on_any_of_them() {
+        let store = TargetStore::new();
+        let x_id = XId::generate();
+        store.index(
+            x_id,
+            &[
+                sip("sip:alice@example.com"),
+                TargetIdentifier::E164Number("15551234567".into()),
+            ],
+        );
+        assert_eq!(store.match_uri("sip:alice@example.com"), vec![x_id]);
+        assert_eq!(store.match_uri("sip:15551234567@carrier.example"), vec![x_id]);
     }
 
     #[test]
-    fn concurrent_access() {
-        use std::sync::Arc;
+    fn an_unmatched_message_matches_nothing() {
+        let store = TargetStore::new();
+        store.index(XId::generate(), &[sip("sip:alice@example.com")]);
+        assert!(store
+            .match_message(
+                Some("sip:bob@example.com"),
+                Some("sip:carol@example.com"),
+                None,
+                None
+            )
+            .is_empty());
+    }
+
+    // -- every identifier type the profile supports -----------------------
+
+    /// A realistic SIP message that each identifier type should match, so the
+    /// table below is about *matching* rather than about parsing.
+    struct Case {
+        identifier: TargetIdentifier,
+        /// Request-URI, From, To, source address.
+        message: (Option<&'static str>, Option<&'static str>, Option<&'static str>, Option<IpAddr>),
+        expect: MatchedParty,
+    }
+
+    /// Exhaustive over `TargetIdentifier`.
+    ///
+    /// The `match` is the point: adding a variant without deciding how it is
+    /// indexed and matched breaks this build. Without it, a new identifier type
+    /// would be accepted at `ActivateTask` and then silently match nothing —
+    /// a warrant that reads as provisioned and intercepts no traffic, which is
+    /// the failure mode this whole module exists to prevent.
+    fn coverage_case(identifier: &TargetIdentifier) -> Option<Case> {
+        use TargetIdentifier as T;
+        let case = match identifier {
+            T::SipUri(_) => Case {
+                identifier: T::SipUri("sip:alice@example.com".into()),
+                message: (
+                    Some("sip:bob@example.com"),
+                    Some("\"Alice\" <sip:Alice@Example.COM>;tag=1"),
+                    Some("sip:bob@example.com"),
+                    None,
+                ),
+                expect: MatchedParty::Originating,
+            },
+            T::TelUri(_) => Case {
+                identifier: T::TelUri("tel:+15551234567".into()),
+                message: (
+                    Some("tel:+1-555-123-4567"),
+                    Some("sip:carol@example.com"),
+                    Some("tel:+1-555-123-4567"),
+                    None,
+                ),
+                expect: MatchedParty::Terminating,
+            },
+            T::E164Number(_) => Case {
+                identifier: T::E164Number("15551234567".into()),
+                message: (
+                    Some("sip:+15551234567@carrier.example;user=phone"),
+                    Some("sip:carol@example.com"),
+                    Some("sip:+15551234567@carrier.example"),
+                    None,
+                ),
+                expect: MatchedParty::Terminating,
+            },
+            T::Impu(_) => Case {
+                identifier: T::Impu("sip:alice@ims.example.com".into()),
+                message: (
+                    Some("sip:alice@ims.example.com"),
+                    Some("sip:bob@ims.example.com"),
+                    Some("sip:alice@ims.example.com"),
+                    None,
+                ),
+                expect: MatchedParty::Terminating,
+            },
+            T::Impi(_) => Case {
+                identifier: T::Impi("alice@ims.example.com".into()),
+                message: (
+                    None,
+                    Some("<sip:alice@ims.example.com>;tag=9"),
+                    Some("sip:bob@ims.example.com"),
+                    None,
+                ),
+                expect: MatchedParty::Originating,
+            },
+            T::Imsi(_) => Case {
+                // An IMSI never appears in a SIP header, so it is matched
+                // through its own namespaced lookup rather than off a URI.
+                identifier: T::Imsi("001010000000001".into()),
+                message: (None, None, None, None),
+                expect: MatchedParty::Originating,
+            },
+            T::Imei(_) => Case {
+                identifier: T::Imei("01234567890123".into()),
+                message: (None, None, None, None),
+                expect: MatchedParty::Originating,
+            },
+            T::Ipv4Address(_) => Case {
+                identifier: T::Ipv4Address(Ipv4Addr::new(198, 51, 100, 7)),
+                message: (
+                    Some("sip:bob@example.com"),
+                    Some("sip:carol@example.com"),
+                    Some("sip:bob@example.com"),
+                    Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))),
+                ),
+                expect: MatchedParty::Originating,
+            },
+            T::Ipv6Address(_) => Case {
+                identifier: T::Ipv6Address("2001:db8::1".parse().unwrap()),
+                message: (
+                    Some("sip:bob@example.com"),
+                    Some("sip:carol@example.com"),
+                    Some("sip:bob@example.com"),
+                    Some(IpAddr::V6("2001:db8::1".parse().unwrap())),
+                ),
+                expect: MatchedParty::Originating,
+            },
+            // Not a target type — the provisioning layer refuses these by name
+            // (error 3010) rather than indexing them, which
+            // `an_unsupported_identifier_is_not_indexed` covers.
+            T::Unsupported(_) => return None,
+        };
+        Some(case)
+    }
+
+    /// Every supported identifier type matches realistic SIP traffic.
+    #[test]
+    fn every_supported_identifier_type_matches_traffic() {
+        // One representative of each variant, so `coverage_case`'s exhaustive
+        // match is actually reached for all of them.
+        let variants = [
+            TargetIdentifier::SipUri(String::new()),
+            TargetIdentifier::TelUri(String::new()),
+            TargetIdentifier::E164Number(String::new()),
+            TargetIdentifier::Impu(String::new()),
+            TargetIdentifier::Impi(String::new()),
+            TargetIdentifier::Imsi(String::new()),
+            TargetIdentifier::Imei(String::new()),
+            TargetIdentifier::Ipv4Address(Ipv4Addr::UNSPECIFIED),
+            TargetIdentifier::Ipv6Address(Ipv6Addr::UNSPECIFIED),
+            TargetIdentifier::Unsupported(String::new()),
+        ];
+
+        let mut covered = 0;
+        for variant in &variants {
+            let Some(case) = coverage_case(variant) else {
+                continue;
+            };
+            covered += 1;
+
+            let store = TargetStore::new();
+            let x_id = XId::generate();
+            store.index(x_id, std::slice::from_ref(&case.identifier));
+            assert_eq!(
+                store.len(),
+                1,
+                "{} was not indexed at all",
+                case.identifier.element_name()
+            );
+
+            let (ruri, from, to, source) = case.message;
+            let matched = match &case.identifier {
+                // The two subscriber-equipment identifiers are looked up
+                // directly; they are not carried in SIP headers.
+                TargetIdentifier::Imsi(value) => store.match_imsi(value),
+                TargetIdentifier::Imei(value) => store.match_imei(value),
+                _ => store
+                    .match_message(ruri, from, to, source)
+                    .into_iter()
+                    .map(|entry| entry.x_id)
+                    .collect(),
+            };
+            assert_eq!(
+                matched,
+                vec![x_id],
+                "{} did not match its own traffic",
+                case.identifier.element_name()
+            );
+
+            // And the party, where the match came off a message.
+            if !matches!(
+                case.identifier,
+                TargetIdentifier::Imsi(_) | TargetIdentifier::Imei(_)
+            ) {
+                let entries = store.match_message(ruri, from, to, source);
+                assert_eq!(
+                    entries[0].party,
+                    case.expect,
+                    "{} matched the wrong party",
+                    case.identifier.element_name()
+                );
+            }
+        }
+
+        assert_eq!(
+            covered, 9,
+            "every supported identifier type must be exercised; add the new one to \
+             `coverage_case` rather than letting it match nothing"
+        );
+    }
+
+    /// One warrant naming several identifier kinds matches on any of them —
+    /// the ordinary IMS case, where a subscriber has an IMPU, an IMPI and a
+    /// number and traffic may carry whichever.
+    #[test]
+    fn a_multi_identifier_warrant_matches_on_every_one() {
+        let store = TargetStore::new();
+        let x_id = XId::generate();
+        store.index(
+            x_id,
+            &[
+                TargetIdentifier::SipUri("sip:alice@example.com".into()),
+                TargetIdentifier::Impu("sip:alice@ims.example.com".into()),
+                TargetIdentifier::Impi("alice@ims.example.com".into()),
+                TargetIdentifier::E164Number("15551234567".into()),
+                TargetIdentifier::TelUri("tel:+15551234567".into()),
+                TargetIdentifier::Ipv4Address(Ipv4Addr::new(198, 51, 100, 7)),
+            ],
+        );
+
+        for uri in [
+            "sip:alice@example.com",
+            "sip:alice@ims.example.com",
+            "sip:15551234567@carrier.example",
+            "sip:+1-555-123-4567@carrier.example",
+            "tel:+15551234567",
+        ] {
+            assert_eq!(store.match_uri(uri), vec![x_id], "{uri} should match");
+        }
+        assert_eq!(
+            store.match_ip(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))),
+            vec![x_id]
+        );
+
+        // And it is still one warrant, however many of its identifiers the
+        // message happens to carry.
+        let matched = store.match_message(
+            Some("sip:alice@example.com"),
+            Some("sip:15551234567@carrier.example"),
+            Some("sip:alice@ims.example.com"),
+            Some(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7))),
+        );
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].x_id, x_id);
+    }
+
+    // -- lifecycle ----------------------------------------------------------
+
+    #[test]
+    fn removing_a_task_stops_it_matching() {
+        let store = TargetStore::new();
+        let x_id = XId::generate();
+        store.index(x_id, &[sip("sip:alice@example.com")]);
+        assert!(!store.match_uri("sip:alice@example.com").is_empty());
+
+        store.remove(x_id);
+        assert!(store.match_uri("sip:alice@example.com").is_empty());
+        assert!(store.is_empty());
+        assert_eq!(store.key_count(), 0, "the identity key must be reclaimed");
+    }
+
+    #[test]
+    fn removing_one_of_two_warrants_leaves_the_other_matching() {
+        let store = TargetStore::new();
+        let kept = XId::generate();
+        let removed = XId::generate();
+        store.index(kept, &[sip("sip:alice@example.com")]);
+        store.index(removed, &[sip("sip:alice@example.com")]);
+
+        store.remove(removed);
+        assert_eq!(store.match_uri("sip:alice@example.com"), vec![kept]);
+    }
+
+    #[test]
+    fn reindexing_replaces_the_previous_identifiers() {
+        // A ModifyTask that changes the target must stop the old one matching.
+        let store = TargetStore::new();
+        let x_id = XId::generate();
+        store.index(x_id, &[sip("sip:alice@example.com")]);
+        store.index(x_id, &[sip("sip:bob@example.com")]);
+
+        assert!(store.match_uri("sip:alice@example.com").is_empty());
+        assert_eq!(store.match_uri("sip:bob@example.com"), vec![x_id]);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.key_count(), 1);
+    }
+
+    #[test]
+    fn clear_empties_the_index() {
+        let store = TargetStore::new();
+        for _ in 0..10 {
+            store.index(XId::generate(), &[sip("sip:alice@example.com")]);
+        }
+        store.clear();
+        assert!(store.is_empty());
+        assert_eq!(store.key_count(), 0);
+    }
+
+    #[test]
+    fn removing_an_unknown_task_is_a_no_op() {
+        let store = TargetStore::new();
+        store.remove(XId::generate());
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn index_drains_to_baseline_after_a_full_lifecycle() {
+        // Per-module leak guard. Both maps must return to empty: an orphaned
+        // identity key would grow without bound across warrant churn.
+        let store = TargetStore::new();
+        for _ in 0..1000 {
+            let x_id = XId::generate();
+            store.index(
+                x_id,
+                &[
+                    sip("sip:alice@example.com"),
+                    TargetIdentifier::E164Number("15551234567".into()),
+                    TargetIdentifier::Ipv4Address(Ipv4Addr::new(198, 51, 100, 7)),
+                ],
+            );
+            store.remove(x_id);
+        }
+        assert_eq!(store.len(), 0, "task index did not drain");
+        assert_eq!(store.key_count(), 0, "identity index did not drain");
+    }
+
+    #[test]
+    fn concurrent_indexing_is_safe() {
         use std::thread;
 
-        let store = Arc::new(TargetStore::new());
+        let store = TargetStore::new();
         let mut handles = Vec::new();
-
-        // Spawn writers
-        for i in 0..10 {
-            let store = Arc::clone(&store);
+        for index in 0..16 {
+            let store = store.clone();
             handles.push(thread::spawn(move || {
-                store.activate(make_target(
-                    &format!("LI-{i:03}"),
-                    TargetIdentity::SipUri(format!("sip:user{i}@example.com")),
-                    DeliveryType::IriOnly,
-                ));
+                store.index(XId::generate(), &[sip(&format!("sip:user{index}@example.com"))]);
             }));
         }
-
         for handle in handles {
             handle.join().unwrap();
         }
-
-        assert_eq!(store.count(), 10);
-
-        // Concurrent reads
-        let mut read_handles = Vec::new();
-        for i in 0..10 {
-            let store = Arc::clone(&store);
-            read_handles.push(thread::spawn(move || {
-                store.get_by_liid(&format!("LI-{i:03}")).is_some()
-            }));
-        }
-
-        for handle in read_handles {
-            assert!(handle.join().unwrap());
-        }
+        assert_eq!(store.len(), 16);
     }
 }

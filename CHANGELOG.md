@@ -33,6 +33,191 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   at a mixed edge the right profile flips depending on which side transferred.
   `examples/teams_sbc.py` shows the full rule.
 
+- **A conformant ETSI TS 103 221-1 X1 network element, and the
+  network-element-to-ADMF direction that did not exist at all.** The previous
+  `lawful_intercept.x1` module was a bespoke REST API — resource routes under
+  `/x1/targets`, an invented `urn:etsi:xml:ns:li:task` namespace, XML produced
+  by splicing an `xmlns` onto the first `>` of a serde document, a free-text
+  LIID as the task key, three target identifier types, and errors as HTTP
+  statuses with ad-hoc bodies. None of that is X1, and it had no caller outside
+  its own tests: `lawful_intercept.x1` was parsed and drove nothing, so the
+  interface was configured, reported as present, and never listened.
+
+  What replaces it is built to **v1.23.1** with the **TS 103 280 v2.19.1**
+  dictionary. The ETSI schemas ship verbatim in [`schemas/etsi/`](schemas/etsi/)
+  and every message is validated against them **in both directions at runtime** —
+  a malformed response of ours fails here rather than at the ADMF. One
+  `application/xml` endpoint (`/X1/NE`, configurable) on its own listener with
+  mutual TLS and a mandatory `client_ca`; messages dispatched by `xsi:type` out
+  of `X1Request` containers and answered one-for-one in an `X1Response`
+  container correlated by `x1TransactionId`; a per-message `ErrorResponse`
+  carrying a clause 6.7 code, with `X1TopLevelErrorResponse` reserved for a
+  container too broken to answer per-message, so one bad message never costs the
+  ADMF the answers to its siblings. Because the listener is ours, the handler
+  sees the peer certificate: `admfIdentifier` is bound to its subject CN and a
+  mismatch is refused `1030`.
+
+  Tasks now key on the **XID** — a UUID, and the same 16 bytes every X2/X3 PDU
+  carries — rather than a free-text LIID (which is a *mediation* attribute, and
+  lives in `mediationDetails` where several tasks may share one). Target
+  identifiers are the dictionary's: `sipUri`, `telUri`, `e164Number`, `impu`,
+  `impi`, `imsi`, `imei` and both IP forms, with matching that normalises case,
+  URI parameters, display names and number formatting. An identifier type this
+  element cannot intercept on is refused `3010` **by name** rather than ignored,
+  because an ignored identifier is a warrant that silently matches nothing.
+
+  Destinations are modelled at all, which they were not: `CreateDestination`
+  provisions a sink, a task delivers **only** to the DIDs it names, and a
+  destination a task still references cannot be removed (`7010`). Delivery is
+  scoped per interface, so an `X2Only` collector never receives content and an
+  `X3Only` one never receives IRI.
+
+  The outbound direction is new: `ReportNEIssue`, `ReportTaskIssue` and
+  `ReportDestinationIssue` (the last is what closes the loop with the X2/X3 loss
+  policies — a mediation outage has to be *reported*, not merely survived),
+  `Keepalive` on a timer, and `GetAllDetails` reconciliation at startup so a
+  restart does not silently diverge the ADMF's view of what is provisioned from
+  the element's.
+
+  The clause 6.7 error-code table is cross-checked against sipgate's independent
+  MIT implementation of the same specification, and everything siphon emits is
+  validated by `xmllint` in CI as a third-party decoder — a round-trip through
+  our own reader would pass a shared encode/decode bug.
+- **X3 content delivery is wired to the media engine.** On
+  `media.backend: siphon-rtp` (and `siphon-rtp-proto` >= 0.3.1) siphon issues
+  `AttachX3` when a content warrant matches a dialog-forming request, and
+  `DetachX3` at teardown. Each attachment carries the task's XID, the session's
+  non-zero Correlation ID — the same value the session's X2 records carry, which
+  clause 6 requires and which is now an invariant spanning two binaries — and
+  the **target leg**. That last one is derived from which party the warrant
+  matched rather than assumed, because TS 103 221-2 §5.2.6 defines a delivered
+  packet's direction *relative to the target*: naming the wrong leg inverts the
+  direction on every packet and produces a recording that looks fine and is
+  backwards.
+
+  The engine's `X3Loss` and any unclean `X3Ended` are raised to the
+  Administration Function as destination-level reports. That is what closes the
+  loop the specification asks for: warranted content that did not reach the
+  agency is a reportable failure, not a degraded recording to be survived
+  quietly.
+
+- **An interop test against a real ADMF.** `scripts/run-tests.sh --li` runs
+  siphon as a network element against sipgate's `li-simulator-x1x2x3`, which
+  plays both the Administration Function and the Mediation and Delivery
+  Function, over real mutual TLS with certificates from the simulator's own
+  bootstrap. It provisions a destination and a task, reads the task back, and
+  checks the refusals (a duplicate XID → 2010, and removing a destination a live
+  task still delivers to → 7010) — because a network element that accepted
+  everything would pass a success-only test.
+
+  The peer declares `v1.6.1` on the wire while siphon is built to v1.23.1, and
+  they interoperate: the message set is identical across the published v1.x
+  range, so only the declared string differs. That is the version analysis being
+  confirmed rather than assumed.
+
+- **A packet capture of the delivery interface, read back by a third-party
+  dissector.** `scripts/validate_li_capture.sh` places a warranted SIPp call,
+  captures X2 and X3 with `tcpdump`, and hands the capture to the third-party
+  `x2x3PduDissector` plus Wireshark's own SIP and RTP dissectors. It asserts the
+  PDU counts, that Wireshark parses SIP inside every X2 record and finds the
+  INVITE, the 200, the ACK and the BYE, that every X3 record carries RTP, and
+  that the delivered RTP sequence numbers are **contiguous** — the check that
+  says the packet count is right rather than merely non-zero, since a gap is a
+  lost packet and a repeat is a duplicated one and either leaves a total looking
+  healthy. The relayed packets are counted independently from a second capture
+  taken in the media engine's own network namespace.
+
+  The estate's delivery interface is fronted by a TLS-terminating tap for this,
+  because the engine's X3 is TLS-only with ECDHE certificates and therefore
+  cannot be decrypted after the fact. The outer hop stays exactly what
+  production is, mutual TLS included; the capture is taken one hop later.
+  `scripts/validate_x2_pdu.sh` remains the cheap check on a single encoded PDU
+  and needs no estate.
+- **A load profile with interception actually switched on**, and the metric to
+  watch it with. Every other measurement in this repo — the 16-row baseline and
+  the memory-leak soak both — runs with `lawful_intercept` absent, so the
+  enforcement path had never been under load despite running on every message
+  of every leg of every call. `sipp/li/li_load_test.py` places calls at a rate
+  through a node with a live warrant, reports the throughput against the same
+  scenario unwarranted, and asserts that the per-session state falls back to
+  zero after each cycle rather than climbing. The new
+  `siphon_li_remembered_sessions` gauge is what it watches, and is worth
+  alerting on in production for the same reason: it is keyed on a value the
+  peer chooses, so it must track live dialogs and fall back, and sitting at the
+  cap is the signature of a Call-ID flood.
+- **Per-target-type detection coverage.** A warrant can be accepted and then
+  match nothing, which no provisioning test can catch — provisioning succeeded.
+  So `sipp/li/li_target_types_test.py` provisions a warrant on each identifier
+  type an IMS can name (`sipUri`, `telUri`, `e164Number`, `impu`, `impi`, on
+  both the originating and terminating side), places a real call carrying that
+  identity through siphon with SIPp, and checks IRI actually reached the
+  mediation function. The matching layer additionally has an exhaustive
+  compile-time guard: adding a `TargetIdentifier` variant without deciding how
+  it is indexed now fails the build rather than silently matching nothing.
+
+- **`lawful_intercept.x1.admf`** — the network-element-to-ADMF client block
+  (`endpoint`, `client_certificate`, `client_private_key`, `server_ca`,
+  `keepalive_secs`, `request_timeout_secs`, `reconcile_on_start`). Absent means
+  siphon answers X1 but never speaks first.
+
+### Changed
+- **Interception is enforced in the dispatcher, not by the Python script.** This
+  is a behavioural change and a compliance fix. Interception used to be opt-in:
+  the only callers of the matching code were the `li.*` script API, so a script
+  that omitted a call on one path silently intercepted nothing there. For a
+  warranted intercept a missed leg is a reportable failure, and it must not
+  depend on the operator's code being right. siphon now matches every SIP
+  message, on every leg, on every path, against the tasks the ADMF provisioned,
+  before any handler runs.
+
+  `li.is_target()` still answers the same question. `li.intercept()` and
+  `li.stop_intercept()` are kept so existing scripts keep working, but they now
+  **report** rather than act — had they kept emitting, every script that calls
+  them would produce duplicate IRI records. `li.record()` / `li.stop_recording()`
+  are unchanged in purpose (operator-driven SIPREC, which is not a warrant) but
+  no longer push a synthetic `SIPREC-<call-id>` record onto the X2 channel; a
+  recording is not lawful-intercept product and does not belong on a mediation
+  function's warrant feed. Two new read-only properties, `li.task_count` and
+  `li.destination_count`, report what the ADMF has provisioned.
+- **X2 records carry the task's XID and a non-zero per-session Correlation ID.**
+  TS 103 221-2 clause 6 requires that a session's X2 and X3 records share a
+  correlation, and since X3 is emitted by the media engine and X2 by this
+  process, that is an invariant spanning two binaries. A `correlationID` the
+  ADMF provisioned is honoured; otherwise one is derived deterministically from
+  the Call-ID (FNV-1a, forced non-zero) so both sides reach the same value
+  without exchanging it.
+- **`lawful_intercept.x1` configuration.** `auth_token` is **removed** — a
+  bearer token is not part of TS 103 221-1 and mutual TLS is the authentication.
+  `tls.client_ca` is now **required**: a listener without one would accept
+  anyone, so a missing or empty CA bundle is a startup error rather than a
+  silent downgrade. New: `ne_identifier` (required), `admf_identifier`, `path`,
+  `version`, `bind_admf_identifier_to_certificate`.
+- **The X1 listener is bound at startup.** A configured `lawful_intercept.x1`
+  that cannot be bound now fails startup instead of coming up with an interface
+  that is not listening.
+
+### Removed
+- **`lawful_intercept.x3` loses every field it had**, because not one of them
+  did anything. `listen_udp` bound a UDP socket to receive RTP mirrored by
+  rtpengine, and nothing ever asked any backend to mirror there — nor could it,
+  since the block is refused at config load on every backend except
+  `siphon-rtp`, and on that one the engine frames the content and delivers it
+  straight to the destinations the ADMF provisioned over X1. `delivery_address`,
+  `transport` and `encapsulation` described the same path.
+
+  What the block actually did was gate content against `media.backend` and make
+  `ActivateTask` refuse a content warrant `3040` on a node that cannot deliver
+  one. So it is now a single required `enabled`, and `src/li/x3.rs` — the
+  receive-and-forward path none of the removed fields reached — is gone.
+  `enabled: true` requires `media.backend: siphon-rtp` and is refused at load on
+  anything else; `enabled: false` is the same as leaving the block out, so
+  content can be switched off without deleting configuration. Required rather
+  than defaulted, so writing the block is a statement rather than an empty
+  gesture.
+
+  These fields never functioned in any released version, so nothing that worked
+  before stops working; a configuration that still sets them is simply ignored.
+
 ### Fixed
 - **A transfer no longer silently inherits a direction-bound media profile.**
   When one is inherited with no `profile=` override, siphon now logs a `WARN`
@@ -52,6 +237,152 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   direction-bound profiles are now labelled as such, and the example gains a
   `@b2bua.on_refer` handler showing the `profile=` a Teams SBC needs — the exact
   topology where getting this wrong costs you the audio.
+- **A per-dialog map leaked one entry for every call the node completed.** The
+  per-session matching decision was released on the `BYE`, which is one message
+  too early: the `200` to that BYE then found nothing remembered, re-derived a
+  decision that still matched — the `To` header carries the target whichever
+  way the BYE travelled — and put it straight back, where nothing would ever
+  remove it again. It reached ~27000 entries over 27000 calls, on a map keyed
+  by a value the peer chooses.
+
+  The last message of a dialog is the response to its `BYE` or `CANCEL`, not
+  the request, and the terminal test now says so. Release happens once per
+  message after processing rather than inside the per-warrant loop, because a
+  session is one thing however many warrants cover it.
+
+  Found by `sipp/li/li_load_test.py` rather than by a unit test, which is the
+  point of adding it: the predicate was self-consistent, so only watching the
+  gauge across thousands of generated calls showed it. The tell was counter-
+  intuitive — a number that sat perfectly still rather than one that climbed.
+- **A retransmission produced a second copy of a record the mediation function
+  already had.** Interception is placed before transaction matching, so that a
+  script cannot drop a message before it is intercepted, and the cost of that
+  placement was that RFC 3261's timers — which resend an unanswered INVITE up
+  to seven times — delivered seven IRI records for one INVITE. Worse than the
+  duplication, each resend re-ran the session's lifecycle, restarting content
+  capture on a call already being captured.
+
+  A message instance is now recorded once per session, keyed on the top `Via`
+  branch (§8.1.1.7 requires a new branch for a new transaction, so a resend
+  keeps its branch and anything genuinely new does not) plus the CSeq, method
+  and status, which separate the messages *within* a transaction — an ACK on
+  the INVITE's own branch, a second provisional and a final response all key
+  differently. The record is held on the session's own entry, so it is released
+  with the session, and past a per-session bound de-duplication stops rather
+  than starts dropping: a duplicated record is recoverable at the mediation
+  function and a missing one is not.
+- **Matching ran per message, which could intercept a call's opening and miss
+  its end.** Deciding each message on its own identities assumes every message
+  of a dialog carries the target in matchable form, and they do not — a
+  re-INVITE from the far end swaps `From` and `To`, an in-dialog REFER or
+  NOTIFY carries whoever sent it, and a BYE can come from either side. The
+  decision is now taken once per session and keyed on the Call-ID, so a
+  warranted session is intercepted in full.
+
+  Three things make that safe. A provisioning generation, bumped by every
+  change that alters what matches, so an `ActivateTask` still takes effect on
+  calls already in progress rather than being shadowed by a decision taken
+  before it arrived. A hard cap, because the Call-ID is chosen by the peer and
+  an unbounded map keyed on it is a remote way to exhaust memory; on overflow
+  it is cleared, so the degraded mode is the old per-message behaviour and
+  never a missed interception. And release at dialog end, so the cap is only
+  ever reached by traffic that never terminates. The decision stores XIDs
+  rather than the tasks themselves, so a `ModifyTask` is honoured on the next
+  message instead of being shadowed by a cached copy. `li.is_target()` asks the
+  same question, so the script API can no longer contradict enforcement.
+- **X2 delivered the wrong interface's PDUs.** The records siphon sent to the
+  Mediation Function were ETSI TS 102 232 PS-PDUs behind a four-octet length
+  prefix. TS 102 232 is the *handover* format — what the MDF emits onwards to
+  the LEMF — so the network element was speaking a peer's language on its own
+  interface. X2 into an MDF is TS 103 221-2, and no conformant mediation
+  function could read a byte of what we sent.
+
+  X2 now emits TS 103 221-2 clause 5 PDUs: the 40-octet mandatory header, the
+  conditional attribute TLVs, and the SIP message carried **verbatim** as
+  payload format 9 rather than a re-serialisation, so the MDF derives whatever
+  its handover format needs from the bytes that were actually on the wire
+  instead of inheriting the subset of headers this element thought to copy.
+  Each record carries the task's XID and the session's correlation — the same
+  eight octets the engine puts on that session's X3 content, which is what lets
+  the MDF tie the two together — and a direction taken from the matched party,
+  because clause 5.2.6 measures direction against the target and the same
+  INVITE is "to" or "from" depending on which end the warrant named.
+
+  The encoder refuses rather than emitting anything a peer would reject (a
+  payload format on the wrong interface, an over-long attribute), because a
+  malformed frame does not lose one record: the receiver reads the next PDU's
+  header out of the middle of this one and the connection never recovers.
+  Validated against a third-party dissector via `scripts/validate_x2_pdu.sh`,
+  and end-to-end against sipgate's mediation function, which decodes and
+  validates every PDU it accepts.
+- **One failed connection attempt lost a warrant's first record.** The X2
+  delivery task dropped a record outright if the connection could not be opened
+  on the first try, and that record is the least affordable one to lose: the
+  first message of a matched warrant is its Begin, so a mediation function that
+  never receives it has a session it cannot open. The attempt that opens the
+  connection is also the one most likely to fail — the collector may start
+  accepting a moment after the call that triggered it, and anything in front of
+  it forks per connection. It now retries, bounded so a collector that is
+  genuinely gone cannot stall delivery to the other destinations behind it.
+- **`lawful_intercept.x2.transport: tls` did nothing.** The delivery task
+  logged the configured transport and then opened a plain `TcpStream`
+  regardless, and the `x2.tls` block was read by nothing at all — so an
+  operator who configured TLS got cleartext IRI and no indication of it. TLS is
+  now wired: a rustls client with the configured CA, a client certificate for
+  the mediation function to authenticate the element, and `server_name` for the
+  common case where the delivery address is a literal (an X1-provisioned
+  destination always is — TS 103 280's `IPAddressPort` carries an
+  `IPv4Address`). If any of it is missing or unreadable the delivery task
+  refuses to start and says so, rather than falling back to plaintext; a silent
+  downgrade on this interface is the worst outcome available.
+- **X2 delivered only to the configured address, ignoring the warrant's own
+  destinations.** A task's records now go to exactly the X2-capable DIDs it
+  names, and to all of them; the configured `delivery_address` remains the
+  fallback for a deployment that provisions no destinations over X1.
+- **X3 content delivery is refused rather than silently accepted where it cannot
+  be performed.** ETSI TS 103 221-2 content framing lives in the media engine,
+  so `rtpengine` and `rtpproxy` cannot deliver X3 at all. Configuring
+  `lawful_intercept.x3` on either is now refused at config load, naming the
+  backend and the remedy; and an `ActivateTask` whose `deliveryType` is
+  `X3Only` or `X2andX3` is refused `3040` at the message, because a task can be
+  provisioned long after boot. Accepting a warrant and then delivering no
+  content is the worst available outcome — it reads as provisioned at the ADMF,
+  satisfies every acknowledgement, and the absence only surfaces when someone
+  goes looking for product that was never sent.
+- **A peer's own XML namespace prefixes survived per-message isolation.**
+  Schema-validating each message on its own means extracting it into a
+  container of its own, and that wrapper carried a *fixed* prefix list while
+  the serialiser emits prefixed names without re-emitting the declarations that
+  bound them. Against a peer that happens to choose the same prefixes this is
+  invisible; against JAXB, which generates `ns2` for the TS 103 280 dictionary,
+  every message carrying a delivery address failed to parse — so no destination
+  could be created at all. The wrapper now carries the source document's own
+  declarations. Found by running against a real ADMF rather than a test double.
+
+- **A peer that renders milliseconds can now provision warrants.** TS 103 280's
+  `QualifiedMicrosecondDateTime` requires exactly six fractional digits, and
+  siphon enforced it. Java's `XMLGregorianCalendar` renders three, so every
+  message from an ADMF built on it — sipgate's library among them — was refused
+  `1010` on `messageTimestamp` before anything else was read, and no warrant
+  could be provisioned. Strictness that prevents all provisioning is worse than
+  the deviation it rejects, so inbound date-times are now accepted with one to
+  nine fractional digits and **normalised to six**, keeping everything siphon
+  emits conformant. The deviation is logged at `WARN` each time rather than
+  absorbed silently: it is the peer's bug, and the operator should be able to
+  raise it. See `src/li/x1/compat.rs`, which is the only place this leniency
+  lives.
+
+- **An `ErrorResponse` is now correlatable even when the envelope is what
+  failed.** A message whose `messageTimestamp` did not parse previously lost its
+  `admfIdentifier` and `x1TransactionId` too, so the ADMF got an error it could
+  not tie to any request it had sent. The envelope is now salvaged field by
+  field and the message type read from `xsi:type` independently, so only the
+  genuinely unreadable fields are substituted.
+
+- **`docs/feature-readiness-matrix.md` claimed X1, X2 and X3 were implemented.**
+  Those rows described behaviour that was not in the binary; an operator reading
+  the table during vendor selection would reasonably have concluded the ETSI
+  work was done. Corrected, including the media-backend constraint on X3.
 
 ## [1.7.0] — 2026-08-31
 

@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns="urn:etsi:li:103221-1:configuration-details:v1" targetNamespace="urn:etsi:li:103221-1:configuration-details:v1" xmlns:etsi104000="urn:etsi:li:104000:xsdns:v2" xmlns:etsi103221="http://uri.etsi.org/03221/X1/2017/10" elementFormDefault="qualified" attributeFormDefault="unqualified">
+<xs:import namespace="urn:etsi:li:104000:xsdns:v2"/>
+<xs:import namespace="http://uri.etsi.org/03221/X1/2017/10"/>
+    <xs:complexType name="X1ConfigurationDetails">
+        <xs:complexContent>
+            <xs:extension base="etsi104000:ConfigurationDetails">
+                <xs:sequence>
+                    <xs:element name="neIdentifier" type="etsi103221:NeIdentifier"/>
+                    <xs:element name="time1RequestTimeout" type="Time1RequestTimeout"/>
+                    <xs:element name="time2RequesterTimeout" type="Time2RequesterTimeout"/>
+                    <xs:element name="x1KeepaliveDetails" type="X1KeepaliveDetails"/>
+                    <xs:element name="deactivateAllTasksEnabled" type="xs:boolean"/>
+                    <xs:element name="removeAllDestinationsEnabled" type="xs:boolean"/>
+                    <xs:element name="deleteAllObjectsEnabled" type="xs:boolean"/>
+                </xs:sequence>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>    
+    <xs:complexType name="X1KeepaliveDetails">
+        <xs:sequence>
+            <xs:element name="keepaliveEnabled" type="xs:boolean"/>
+            <xs:element name="keepaliveTimeP1" type="KeepaliveTimeP1" minOccurs="0"/>
+            <xs:element name="keepaliveTimeP2" type="KeepaliveTimeP2" minOccurs="0"/>
+            <xs:element name="keepaliveTimeP3" type="KeepaliveTimeP3" minOccurs="0"/>
+        </xs:sequence>
+    </xs:complexType>
+    <xs:simpleType name="Time1RequestTimeout">
+        <xs:restriction base="xs:integer">
+            <xs:minInclusive value="1"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="Time2RequesterTimeout">
+        <xs:restriction base="xs:integer">
+            <xs:minInclusive value="2"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="KeepaliveTimeP1">
+        <xs:restriction base="xs:integer">
+            <xs:minInclusive value="1"/>
+        </xs:restriction>
+    </xs:simpleType>
+    <xs:simpleType name="KeepaliveTimeP2">
+        <xs:restriction base="xs:integer">
+            <xs:minInclusive value="1"/>
+        </xs:restriction>
+    </xs:simpleType>        
+    <xs:simpleType name="KeepaliveTimeP3">
+        <xs:restriction base="xs:integer">
+            <xs:minInclusive value="0"/>
+        </xs:restriction>
+    </xs:simpleType>        
+</xs:schema>
+    

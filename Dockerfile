@@ -93,6 +93,9 @@ COPY src/ src/
 # tests/), so the manifest won't parse without them even though the image never
 # runs them.
 COPY benches/ benches/
+# The ETSI X1 schemas are `include_str!`-embedded by src/li/x1/schema.rs,
+# so they are build inputs, not runtime data.
+COPY schemas/ schemas/
 RUN cargo chef prepare --recipe-path recipe.json
 
 # ── Build dependencies (cached until Cargo.toml/lock change) ─────────────────
@@ -119,6 +122,9 @@ RUN cargo chef cook --release --features ui --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY benches/ benches/
+# The ETSI X1 schemas are `include_str!`-embedded by src/li/x1/schema.rs,
+# so they are build inputs, not runtime data.
+COPY schemas/ schemas/
 COPY ui/ ui/
 COPY siphon-bin/ siphon-bin/
 COPY scripts/ scripts/

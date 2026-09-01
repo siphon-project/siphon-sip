@@ -19,3 +19,7 @@ sipp/ipsec/
 
 # mkdocs build output
 /site/
+
+# Packet captures from the lawful-intercept capture profile
+# (scripts/validate_li_capture.sh) — build artefacts, never committed.
+sipp/li/captures/
