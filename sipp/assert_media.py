@@ -13,7 +13,10 @@ Oracles:
              interesting one: it counts commands the engine rejected, so a call
              that completes with a non-zero value means siphon sent something
              the engine refused and the SIP leg never noticed. That is exactly
-             the failure a green call flow hides.
+             the failure a green call flow hides. `--max-offers` is the other:
+             a `reoffer` does not bump `offers_total` and a replacement `offer`
+             does, so an exact count is how a caller proves a live call was
+             renegotiated rather than replaced.
 
   ng       — rtpengine's `statistics` command over NG/bencode. Same idea via
              `rejectedsessions`. Note the two engines differ in strictness:
@@ -30,11 +33,22 @@ Oracles:
              the bridge silently never being dialled is caught rather than
              passing by absence.
 
+  cdr      — siphon's own `MEDIA` CDR records, which carry the engine's
+             end-of-call per-leg counters. This is the only oracle that can say
+             audio flowed *both ways between two parties*: `near_packets_in` and
+             `far_packets_in` are what each leg's peer actually put on the wire,
+             so requiring all four of in/out on both legs is a bidirectional
+             assertion no SIP scenario and no command log can make. A record
+             where one direction is zero is a connected call with one-way audio,
+             which is exactly what a bridge gets wrong when it leaves an
+             attachment on or re-points only one leg.
+
 Usage:
     assert_media.py metrics --url http://172.20.0.130:9091/metrics \
         --min-offers 1 --min-deletes 1 --max-control-errors 0
     assert_media.py ng --address 172.20.0.44:22222 --min-sessions 1 --max-rejected 0
     assert_media.py rtpproxy --address 172.20.0.144:22222 --min-sessions 1
+    assert_media.py cdr --path /var/log/siphon/cdr.jsonl --min-packets 20
     docker compose logs mock-ai-ws | assert_media.py ws
 """
 
@@ -89,6 +103,19 @@ def check_metrics(args: argparse.Namespace) -> int:
         got = metrics.get(name, 0.0)
         if got < floor:
             failures.append(f"{name}={got:g}, expected >= {floor}")
+
+    # A ceiling on the offers as well as a floor, because the two answer
+    # different questions. `reoffer` renegotiates a live call and does not count
+    # here; a replacement `offer` on that same call does. An exact expected count
+    # is therefore what tells a re-negotiation apart from a replacement — the one
+    # that frees the ports and drops the bridge, tee or recording riding on them,
+    # and which no SIP scenario can see because both produce a re-INVITE.
+    offers = metrics.get("siphon_rtp_offers_total", 0.0)
+    if offers > args.max_offers:
+        failures.append(
+            f"siphon_rtp_offers_total={offers:g}, expected <= {args.max_offers} "
+            f"— a live call was replaced rather than renegotiated"
+        )
 
     errors = metrics.get("siphon_rtp_control_errors_total", 0.0)
     if errors > args.max_control_errors:
@@ -386,6 +413,84 @@ def check_rtpproxy(args: argparse.Namespace) -> int:
     return report("rtpproxy info", counters, failures)
 
 
+# ---------------------------------------------------------------------------
+# siphon's MEDIA CDR — the engine's per-leg counters, as siphon writes them out
+# ---------------------------------------------------------------------------
+
+
+def check_cdr(args) -> int:
+    """Require one MEDIA record whose two legs each sent AND received audio.
+
+    The engine emits a per-call summary when the media session is deleted, and
+    siphon turns it into a `method: "MEDIA"` CDR carrying `near_*` / `far_*`
+    packet counts. A bridged pair leaves one such record with all four counters
+    up; a call whose media was only ever terminated on the engine leaves records
+    with a single leg, and a half-formed bridge leaves one with a zero.
+
+    Records are read fresh on each poll because the file is appended to as calls
+    end — the summary for the bridged call is the last one written, not the
+    first.
+    """
+    path = args.path
+    floor = args.min_packets
+
+    def sample():
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        except OSError as error:
+            return {}, [f"cannot read {path}: {error}"]
+
+        media = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("method") == "MEDIA":
+                media.append(record)
+
+        if not media:
+            return {"media_records": 0}, [
+                f"no MEDIA CDR in {path} — the engine never summarised a call, "
+                f"so nothing here says audio flowed"
+            ]
+
+        wanted = ["near_packets_in", "near_packets_out",
+                  "far_packets_in", "far_packets_out"]
+        best = None
+        best_total = -1
+        for record in media:
+            try:
+                counts = {key: int(record.get(key, 0)) for key in wanted}
+            except (TypeError, ValueError):
+                continue
+            total = min(counts.values())
+            if total > best_total:
+                best_total = total
+                best = counts
+        if best is None:
+            return {"media_records": len(media)}, [
+                "every MEDIA CDR is missing the per-leg packet counters"
+            ]
+
+        counters = dict(best)
+        counters["media_records"] = len(media)
+        failures = [
+            f"{key}={best[key]}, expected >= {floor} — "
+            f"that direction carried no audio across the bridge"
+            for key in wanted
+            if best[key] < floor
+        ]
+        return counters, failures
+
+    counters, failures = settle(sample, args.settle_secs)
+    return report("media CDR", counters, failures)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="mode", required=True)
@@ -394,6 +499,7 @@ def main() -> int:
     metrics.add_argument("--url", default="http://172.20.0.130:9091/metrics")
     metrics.add_argument("--timeout", type=float, default=5.0)
     metrics.add_argument("--min-offers", type=float, default=0)
+    metrics.add_argument("--max-offers", type=float, default=float("inf"))
     metrics.add_argument("--min-answers", type=float, default=0)
     metrics.add_argument("--min-deletes", type=float, default=0)
     metrics.add_argument("--max-control-errors", type=float, default=0)
@@ -422,6 +528,15 @@ def main() -> int:
     rtpproxy.add_argument("--min-sessions", type=int, default=1)
     rtpproxy.add_argument("--max-active", type=int, default=0)
     rtpproxy.set_defaults(func=check_rtpproxy)
+
+    cdr = sub.add_parser("cdr", help="assert on siphon's MEDIA CDR per-leg counters")
+    cdr.add_argument("--path", default="/var/log/siphon/cdr.jsonl")
+    cdr.add_argument("--settle-secs", type=float, default=20.0)
+    # A floor rather than "> 0": one stray packet is not audio, and the sample
+    # SIPp streams is 30 ms per packet, so a couple of seconds of talking is
+    # dozens either way.
+    cdr.add_argument("--min-packets", type=int, default=10)
+    cdr.set_defaults(func=check_cdr)
 
     args = parser.parse_args()
     return args.func(args)

@@ -177,6 +177,85 @@ impl PyB2buaControl {
             .map_err(|error| PyValueError::new_err(error.to_string()))
     }
 
+    /// Join two answered calls this process owns, so the two parties hear each
+    /// other — the primitive under callback-and-connect and attended hand-off.
+    ///
+    /// `call_id` is the leg that keeps its media anchor (its ports, and anything
+    /// attached to them); `with_call_id` is the leg joined to it. Both are SIP
+    /// Call-IDs, so this works from an event callback or a timer where no `Call`
+    /// object exists.
+    ///
+    /// Awaitable. It resolves once the media has been re-pointed and the first
+    /// re-INVITE is on the wire — the same "the local action was performed"
+    /// contract `originate` has. A bridge is two RFC 3261 §14 re-INVITEs across
+    /// two dialogs, and whether the far ends accept them is a far-end outcome;
+    /// on the control rail that arrives as `ChannelBridged` / `BridgeFailed`.
+    ///
+    /// `on_peer_hangup` decides what happens to the survivor when one party
+    /// leaves: `"hangup"` (default) tears it down too, `"hold"` keeps it up and
+    /// held so it can be bridged to somebody else.
+    ///
+    /// Raises `ValueError` — never a hollow success — when a leg is unknown, has
+    /// not answered, is already bridged, has a re-INVITE outstanding, or the
+    /// media backend cannot express the bridge. The message is prefixed with the
+    /// stable cause token (`not_found`, `invalid_state`, `bad_request`,
+    /// `unsupported_verb`, `unavailable`).
+    #[pyo3(signature = (call_id, with_call_id, on_peer_hangup="hangup"))]
+    fn bridge<'py>(
+        &self,
+        python: Python<'py>,
+        call_id: &str,
+        with_call_id: &str,
+        on_peer_hangup: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        use pyo3::exceptions::PyValueError;
+        let Some(policy) = crate::b2bua::bridge::PeerHangupPolicy::parse(on_peer_hangup) else {
+            return Err(PyValueError::new_err(format!(
+                "b2bua.bridge(on_peer_hangup=…) must be 'hangup' or 'hold' (got '{on_peer_hangup}')"
+            )));
+        };
+        let params = crate::dispatcher::BridgeParams {
+            anchor_sip_call_id: call_id.to_string(),
+            peer_sip_call_id: with_call_id.to_string(),
+            on_peer_hangup: policy,
+        };
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            crate::dispatcher::b2bua_bridge_calls(params)
+                .await
+                .map(|_| true)
+                .map_err(|error| {
+                    PyValueError::new_err(format!("{}: {error}", error.code()))
+                })
+        })
+    }
+
+    /// Break a bridge. Both legs stay answered, owned and held (RFC 3264 §8.4),
+    /// so either can be bridged again or ended — an unbridge that hung both up
+    /// would be indistinguishable from two `terminate` calls.
+    ///
+    /// Awaitable. Raises `ValueError` when the leg is unknown, is not bridged,
+    /// or its bridge is still forming; the message carries the same stable cause
+    /// token as `bridge`.
+    #[pyo3(signature = (call_id, reason="unbridged"))]
+    fn unbridge<'py>(
+        &self,
+        python: Python<'py>,
+        call_id: &str,
+        reason: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        use pyo3::exceptions::PyValueError;
+        let call_id = call_id.to_string();
+        let reason = reason.to_string();
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            crate::dispatcher::b2bua_unbridge_call(&call_id, &reason)
+                .await
+                .map(|_| true)
+                .map_err(|error| {
+                    PyValueError::new_err(format!("{}: {error}", error.code()))
+                })
+        })
+    }
+
     #[pyo3(signature = (call_id, target, replaces=None))]
     fn refer(
         &self,

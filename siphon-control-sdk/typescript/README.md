@@ -108,6 +108,8 @@ await client.command("sip", "answer", { channel: "ch1" }, { code: 200 });
 | `removeHeader(name)` | `remove_header` (`sip`) | ‡ |
 | `acceptRefer(options?)` | `accept_refer` (`sip`) | ‡ |
 | `rejectRefer(code, reason?)` | `reject_refer` (`sip`) | ‡ |
+| `bridge(withChannel, options?)` | `bridge` (`sip`) | join two answered legs; the verdict arrives as `ChannelBridged` / `BridgeFailed` |
+| `unbridge(reason?)` | `unbridge` (`sip`) | break the bridge — both legs stay answered, owned and held |
 | `playFile(file)` | `play` (`sip`) | ‡ media |
 | `dtmf(digits)` | `dtmf` (`sip`) | ‡ media |
 | `command(verb, args?)` | (`sip`) | arbitrary SIP-adapter verb |

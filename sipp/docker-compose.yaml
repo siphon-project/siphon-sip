@@ -4847,6 +4847,7 @@ services:
       - siphon-rtp-native
       - siphon-rtp-ng
       - voice-ai-real
+      - bridge
 
   # Readiness gate for the distroless engine: exits 0 once /readyz answers.
   siphon-rtp-engine-ready:
@@ -4876,6 +4877,7 @@ services:
       - siphon-rtp-native
       - siphon-rtp-ng
       - voice-ai-real
+      - bridge
 
   # ── Native JSON control plane (media.backend: siphon-rtp) ─────────────────
   siphon-rtp-native:
@@ -5836,6 +5838,181 @@ services:
       - -trace_err
     profiles:
       - control
+
+  # ── `bridge`: joining two legs siphon already owns ─────────────────────────
+  # A controller takes an inbound call, places a second one, joins the two,
+  # parts them and joins them again. Three oracles, because no single one can
+  # see the whole thing:
+  #
+  #   * the SIPp scenarios assert what landed on the SIP wire — the media moved
+  #     to the engine, the unbridge held the leg with a=sendonly, the re-bridge
+  #     lifted it, and the survivor got a BYE nobody sent it explicitly;
+  #   * the application asserts the verb contract — seven typed refusals, and
+  #     the reply being the local action while ChannelBridged is the outcome;
+  #   * the MEDIA CDR asserts the audio. The engine counts packets per leg, so
+  #     all four of in/out on both legs is the only evidence that the two
+  #     parties actually heard each other rather than the command returning ok.
+  #
+  # This runs against the REAL engine (172.20.0.130) for exactly that reason: a
+  # mock that records commands cannot relay RTP, and the point is the audio.
+  #
+  # IP map: .170 siphon  .171 app  .172 UAS (callee)  .173 UAC (caller)
+  #         .174 the CDR assertion one-shot
+  siphon-bridge:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
+    build:
+      context: ..
+    container_name: sipp-siphon-bridge
+    depends_on:
+      siphon-rtp-engine-ready:
+        condition: service_completed_successfully
+    volumes:
+      - ./control/siphon-bridge.yaml:/etc/siphon/siphon.yaml:ro
+      - ./control:/etc/siphon/scripts:ro
+      - bridge-cdr:/var/log/siphon
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.170
+    # Probe the control listener as well as SIP: a siphon that answers OPTIONS
+    # but never bound :9092 would let the application hang instead of failing.
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; t=socket.create_connection(('127.0.0.1',9092),2); t.close(); s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:bridge.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@bridge.test>;tag=hc\\r\\nTo: <sip:bridge.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    profiles:
+      - bridge
+
+  bridge-app:
+    image: python:3.12-slim
+    container_name: sipp-bridge-app
+    depends_on:
+      siphon-bridge:
+        condition: service_healthy
+    working_dir: /app
+    volumes:
+      - ./control:/app:ro
+    environment:
+      CONTROL_URL: "ws://172.20.0.170:9092/control/ws"
+      CONTROL_TOKEN: "bridge-app-token"
+      CONTROL_APP: "bridge-app"
+      BRIDGE_PEER_TO: "sip:+15551000002@172.20.0.172:5060"
+      CONTROL_READY_FILE: "/tmp/bridge-app.ready"
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.171
+    command:
+      - sh
+      - -c
+      - "pip install --quiet --no-cache-dir websockets && exec python3 bridge_app.py"
+    # The application writes this once it is connected and has said hello. The
+    # caller is gated on it: a handed-over INVITE that arrives before a
+    # controller is there gets the handoff default, not a parked call, and the
+    # whole run then fails for a reason that has nothing to do with bridging.
+    # Existence, not freshness — the app is a one-shot that blocks on events
+    # rather than heartbeating.
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/bridge-app.ready"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+    profiles:
+      - bridge
+
+  # The callee. Started detached, before the caller: it must be listening when
+  # the application places its leg, and it must be free to outlive the caller —
+  # the BYE it asserts on is the peer-hangup policy acting *after* the caller
+  # has gone. Its exit code is checked explicitly afterwards, so its assertions
+  # are not silently skipped.
+  sipp-bridge-uas:
+    image: ctaloi/sipp:latest
+    container_name: sipp-bridge-uas
+    depends_on:
+      siphon-bridge:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.172
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/bridge_uas.xml
+      - -p
+      - "5060"
+      - -mi
+      - "172.20.0.172"
+      - -m
+      - "1"
+      - -timeout
+      - "70"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - bridge
+
+  sipp-bridge-uac:
+    image: ctaloi/sipp:latest
+    container_name: sipp-bridge-uac
+    depends_on:
+      siphon-bridge:
+        condition: service_healthy
+      bridge-app:
+        condition: service_healthy
+      sipp-bridge-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.173
+    entrypoint:
+      - sipp
+      - "172.20.0.170:5060"
+      - -sf
+      - /sipp/scenarios/bridge_uac.xml
+      - -mi
+      - "172.20.0.173"
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "70"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - bridge
+
+  # Reads the MEDIA CDR siphon wrote into the shared volume. A one-shot: run it
+  # after the call, never as part of the `up` set.
+  bridge-cdr-assert:
+    image: python:3.12-slim
+    container_name: sipp-bridge-cdr-assert
+    volumes:
+      - .:/app:ro
+      - bridge-cdr:/var/log/siphon:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.174
+    entrypoint:
+      - python3
+      - /app/assert_media.py
+      - cdr
+      - --path
+      - /var/log/siphon/cdr.jsonl
+    profiles:
+      - bridge
+
+# ── Volumes ────────────────────────────────────────────────────────────────
+volumes:
+  # siphon's CDR file, shared with the assertion one-shot. Removed by
+  # `down -v` between runs so a stale record from an earlier run can never be
+  # what makes the assertion pass.
+  bridge-cdr:
 
 # ── Network ────────────────────────────────────────────────────────────────
 networks:

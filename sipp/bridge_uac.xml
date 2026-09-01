@@ -1,0 +1,241 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Caller side of the `bridge` acceptance test — the leg siphon parks and hands
+  to the control application.
+
+  INVITE -> 200 (held answer from the controller) -> ACK
+         -> re-INVITE #1 (the bridge)   -> 200 -> ACK -> [RTP]
+         -> re-INVITE #2 (the unbridge) -> 200 -> ACK
+         -> re-INVITE #3 (the re-bridge)-> 200 -> ACK
+         -> BYE -> 200
+
+  Three re-INVITEs, and each one is an assertion:
+
+    #1  the media moved to the engine's relay address. This leg had no media
+        session at all — the application answered it held — so the bridge had to
+        anchor on the leg it placed and re-offer this one onto the engine.
+    #2  `a=sendonly` (RFC 3264 §8.4; RFC 6337 §3.1 prefers it to c=0.0.0.0).
+        That is what "unbridge leaves the leg answered and held" looks like on
+        the wire, and it is the only place it is visible.
+    #3  the hold is lifted — no `a=sendonly` — and the leg is back on the
+        engine. A re-bridge that quietly left the leg held would still emit
+        every event the application checks.
+
+  Audio starts only after #1, deliberately: before the bridge this leg's media
+  was terminated on the engine, and what the test needs to measure is the audio
+  that crosses the *bridge*. A-law at ptime 30 because that is what SIPp's
+  bundled pcap carries (see voice_ai_real_uac.xml) — offering anything else
+  would put the wrong bytes on the wire.
+
+  The trailing pause after the BYE is load-bearing. `--exit-code-from` on this
+  container tears the whole set down the moment it exits, and the callee still
+  has a BYE of its own to receive (the peer-hangup policy) and the application
+  still has a verdict to print. Without it this scenario can pass while the two
+  assertions that matter never run.
+-->
+<scenario name="bridge UAC">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:bridge@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550000003@bridge.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bridge@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/bridge-uac
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 8 101
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+a=ptime:30
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+
+  <!-- The application answers, held: there is nobody on the other side yet, so
+       an answer promising audio would be a lie (RFC 3264 §8.4). -->
+  <recv response="200" rtd="true" crlf="true" rrs="true">
+    <action>
+      <ereg regexp="a=inactive"
+            search_in="body" check_it="true" assign_to="held_answer" />
+      <log message="the controller answered held: [$held_answer]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+ACK [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550000003@bridge.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bridge@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <!-- #1: the bridge. The application first runs its refusal checks and places
+       the second leg (which rings for two seconds), so this waits a while. -->
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp="c=IN IP4 172\.20\.0\.130"
+            search_in="body" check_it="true" assign_to="bridge_anchored" />
+      <ereg regexp="a=sendonly"
+            search_in="body" check_it_inverse="true" assign_to="bridge_not_held" />
+      <log message="bridge re-INVITE: anchored=[$bridge_anchored] not_held=[$bridge_not_held]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 53655765 2353687638 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 8
+a=rtpmap:8 PCMA/8000
+a=ptime:30
+]]>
+  </send>
+
+  <recv request="ACK" rtd="true" />
+
+  <!-- The audio the bridge is supposed to carry. The engine's per-leg counters
+       (siphon's MEDIA CDR) are what say it arrived at the other party. -->
+  <nop>
+    <action>
+      <exec play_pcap_audio="/sipp/g711a.pcap" />
+    </action>
+  </nop>
+
+  <!-- #2: the unbridge holds this leg rather than ending it. -->
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp="a=sendonly"
+            search_in="body" check_it="true" assign_to="held" />
+      <log message="unbridge re-INVITE holds the leg: [$held]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 53655765 2353687639 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 8
+a=rtpmap:8 PCMA/8000
+a=ptime:30
+a=recvonly
+]]>
+  </send>
+
+  <recv request="ACK" rtd="true" />
+
+  <!-- #3: joined again — still on the engine, and no longer held. -->
+  <recv request="INVITE" crlf="true">
+    <action>
+      <ereg regexp="c=IN IP4 172\.20\.0\.130"
+            search_in="body" check_it="true" assign_to="rebridge_anchored" />
+      <ereg regexp="a=sendonly"
+            search_in="body" check_it_inverse="true" assign_to="rebridge_not_held" />
+      <log message="re-bridge re-INVITE: anchored=[$rebridge_anchored] not_held=[$rebridge_not_held]" />
+    </action>
+  </recv>
+
+  <send>
+    <![CDATA[
+SIP/2.0 200 OK
+[last_Via:]
+[last_From:]
+[last_To:]
+[last_Call-ID:]
+[last_CSeq:]
+Contact: <sip:caller@[local_ip]:[local_port];transport=[transport]>
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=caller 53655765 2353687640 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 8
+a=rtpmap:8 PCMA/8000
+a=ptime:30
+]]>
+  </send>
+
+  <recv request="ACK" rtd="true" />
+
+  <!-- Talk across the re-formed bridge, then hang up. -->
+  <pause milliseconds="3500" />
+
+  <send retrans="500">
+    <![CDATA[
+BYE [next_url] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:+15550000003@bridge.test>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bridge@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 2 BYE
+[routes]
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+  <recv response="200" rtd="true" />
+
+  <!-- Insurance, not the guard. `--exit-code-from` on this container tears the
+       set down the moment it exits, and the callee still has a BYE of its own
+       to receive (the peer-hangup policy) while the application still has a
+       verdict to print. Both currently land before the 200 to the BYE above is
+       even processed, so removing this pause does not fail the run on a quiet
+       machine — which is exactly why it stays: the margin is microseconds and a
+       loaded runner is not owed it. What actually catches a cut-off callee is
+       the explicit exit-code check on it in the runner, and a verdict that
+       never appeared. -->
+  <pause milliseconds="4000" />
+
+</scenario>

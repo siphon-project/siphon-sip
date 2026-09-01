@@ -59,6 +59,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyList;
 use pyo3_async_runtimes::TaskLocals;
 
+use siphon_control_client::proto::sip::PeerHangupPolicy;
 use siphon_control_client::proto::ControlErrorCode;
 use siphon_control_client::sip::{
     Call as RustCall, DtmfOptions, PlayOptions, PlaySource, RouteTarget, SipClient, SipServer,
@@ -165,6 +166,19 @@ fn build_play_source(
         _ => Err(PyValueError::new_err(
             "play requires exactly one of file (str), db_id (int), or blob (bytes)",
         )),
+    }
+}
+
+/// Parse the `on_peer_hangup` argument of `bridge`. Refused here rather than at
+/// the server, so a typo raises before anything touches the two live calls.
+fn parse_peer_hangup(policy: Option<String>) -> PyResult<Option<PeerHangupPolicy>> {
+    match policy {
+        None => Ok(None),
+        Some(token) => PeerHangupPolicy::parse(&token).map(Some).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "on_peer_hangup must be \"hangup\" or \"hold\", got {token:?}"
+            ))
+        }),
     }
 }
 
@@ -354,6 +368,78 @@ impl Call {
         let call = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             call.reject_refer(code, reason.as_deref()).await.map_err(to_pyerr)
+        })
+    }
+
+    /// Join this call to another leg the app owns, so the two parties hear each
+    /// other.
+    ///
+    /// **This call is the anchor.** It keeps its media session — its ports and
+    /// everything attached to them; the `with_channel` leg's own media session
+    /// is deleted and it becomes the second party on this one's. So bridge
+    /// *into* the leg whose media you want to keep (the one being recorded,
+    /// teed, or carrying the prompt). The argument is named `with_channel`
+    /// because `with` is a Python keyword; on the wire it is `with`.
+    ///
+    /// Both legs must already be answered. `on_peer_hangup` is `"hangup"` (the
+    /// default) to tear the survivor down when its partner leaves, or `"hold"`
+    /// to keep it up, held and still owned so it can be bridged to somebody
+    /// else; anything else raises `ValueError`.
+    ///
+    /// Returns as soon as the media has been re-pointed and the first re-INVITE
+    /// is on the wire — that is *offered*, not *bridged*. A bridge is two
+    /// RFC 3261 §14 re-INVITEs across two dialogs, so the outcome arrives on the
+    /// event stream instead: exactly one `ChannelBridged` / `BridgeFailed`, on
+    /// **both** channels.
+    ///
+    /// The return value is the reply `result` (`{"channel", "with", "call_id",
+    /// "peer_call_id", "anchored", "on_peer_hangup", "state": "bridging"}`).
+    /// Raises `ControlError` with a `code` a caller can act on: `"not_found"`
+    /// (no such leg), `"invalid_state"` (a leg has not answered, is already
+    /// bridged, has a re-INVITE outstanding, or carries no media description),
+    /// `"bad_request"` (the same leg named twice), `"forbidden"` (the other
+    /// channel belongs to another app), `"unsupported_verb"` (the media backend
+    /// cannot express it).
+    #[pyo3(signature = (with_channel, on_peer_hangup=None))]
+    fn bridge<'py>(
+        &self,
+        py: Python<'py>,
+        with_channel: String,
+        on_peer_hangup: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let policy = parse_peer_hangup(on_peer_hangup)?;
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let value = call
+                .bridge(&with_channel, policy)
+                .await
+                .map_err(to_pyerr)?;
+            Python::attach(|py| json_to_py(py, &value))
+        })
+    }
+
+    /// Break this call's bridge.
+    ///
+    /// Both legs stay answered, owned and held — re-offered `a=sendonly`
+    /// (RFC 3264 §8.4, which RFC 6337 §3.1 prefers to `c=0.0.0.0`). Neither is
+    /// hung up: that would be indistinguishable from two hangups and would take
+    /// away the calls the app still owns. A later `bridge` re-offers `sendrecv`.
+    ///
+    /// `reason` is free text carried on the `ChannelUnbridged` event both
+    /// channels receive (default `"unbridged"`). Returns the reply `result`
+    /// (`{"channel", "with", "reason", "state": "unbridged"}`), where `"with"`
+    /// is the channel id of the leg that was on the other side. A call that is
+    /// not bridged raises `ControlError` with `code == "invalid_state"`.
+    #[pyo3(signature = (reason=None))]
+    fn unbridge<'py>(
+        &self,
+        py: Python<'py>,
+        reason: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let call = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let value = call.unbridge(reason.as_deref()).await.map_err(to_pyerr)?;
+            Python::attach(|py| json_to_py(py, &value))
         })
     }
 

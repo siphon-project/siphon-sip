@@ -17,7 +17,8 @@ use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 
 use siphon_control_client::{
-    ClientConfig, ControlClient, ControlError, ControlErrorCode, ServerConfig, SipClient, SipServer,
+    ClientConfig, ControlClient, ControlError, ControlErrorCode, PeerHangupPolicy, ServerConfig,
+    SipClient, SipServer,
 };
 
 const APP: &str = "ivr-app";
@@ -120,6 +121,39 @@ async fn drive_stub(mut socket: WebSocket, stub: Arc<Stub>) {
             }
             "get_header" | "get_var" => {
                 send_ok(&mut socket, &id, serde_json::json!({ "value": "203.0.113.7" })).await;
+            }
+            // A bridge reply reports the LOCAL action only — the media is
+            // re-pointed and the first re-INVITE is on the wire. Whether the two
+            // far ends accept theirs arrives later as ChannelBridged /
+            // BridgeFailed, so the reply never says "bridged".
+            "bridge" => {
+                send_ok(
+                    &mut socket,
+                    &id,
+                    serde_json::json!({
+                        "channel": frame["target"]["channel"],
+                        "with": frame["args"]["with"],
+                        "call_id": "call-a",
+                        "peer_call_id": "call-b",
+                        "anchored": true,
+                        "on_peer_hangup": frame["args"]["on_peer_hangup"],
+                        "state": "bridging",
+                    }),
+                )
+                .await;
+            }
+            "unbridge" => {
+                send_ok(
+                    &mut socket,
+                    &id,
+                    serde_json::json!({
+                        "channel": frame["target"]["channel"],
+                        "with": "ch2",
+                        "reason": frame["args"]["reason"],
+                        "state": "unbridged",
+                    }),
+                )
+                .await;
             }
             // Test trigger: push a StasisStart, then ack.
             "test_push_stasis" => {
@@ -258,6 +292,19 @@ async fn stasis_start_dispatches_a_call_and_verbs_round_trip() {
     call.answer().await.expect("answer ok");
     assert_eq!(call.get_header("P-Asserted-Identity").await.unwrap().as_deref(), Some("203.0.113.7"));
     call.transfer("sip:agent@pbx").await.expect("refer ok");
+
+    // Bridging this leg to another the app owns: the reply is the local action,
+    // and the policy rides the frame the server validates.
+    let bridged = call
+        .bridge("ch2", Some(PeerHangupPolicy::Hold))
+        .await
+        .expect("bridge ok");
+    assert_eq!(bridged["with"], "ch2");
+    assert_eq!(bridged["on_peer_hangup"], "hold");
+    assert_eq!(bridged["state"], "bridging");
+    let unbridged = call.unbridge(Some("agent hung up")).await.expect("unbridge ok");
+    assert_eq!(unbridged["state"], "unbridged");
+    assert_eq!(unbridged["reason"], "agent hung up");
 
     // A backend-gated verb (ws_tee is siphon-rtp-only) surfaces the server's
     // unsupported_verb as a typed error.

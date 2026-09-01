@@ -829,6 +829,99 @@ jobs:
             originate-app.log
             *.log
 
+  # ── `bridge`: joining two legs siphon already owns ─────────────────────
+  # A controller answers an inbound call, places a second one, joins the two,
+  # parts them and joins them again. Three oracles, because none of them can see
+  # the whole thing on its own:
+  #
+  #   * the SIPp scenarios decide the run and assert the SIP wire — the media
+  #     moved onto the engine, the unbridge held each leg with `a=sendonly`
+  #     (RFC 3264 §8.4), the re-bridge lifted it, and the surviving leg got a
+  #     BYE nobody sent it explicitly (the peer-hangup policy);
+  #   * the application's verdict covers the verb contract — seven typed
+  #     refusals, each with its own code, and `ChannelBridged` on BOTH channels
+  #     rather than the reply pretending to be the outcome;
+  #   * the MEDIA CDR carries the engine's per-leg packet counters, and all four
+  #     of in/out on both legs is the only evidence that the two parties heard
+  #     each other. Everything else here passes just as happily on a bridge that
+  #     connected and carries no audio.
+  #
+  # This runs against the real siphon-rtp engine on purpose: the mock records
+  # commands but relays no RTP, and the audio is the point.
+  sipp-bridge:
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      # --wait on the application as well: siphon parks a handed-over call only
+      # while a controller is connected, so a caller that dials before the app
+      # is up gets the handoff default and the run fails for the wrong reason.
+      - name: Start the media engine, siphon and the control application
+        run: docker compose -f sipp/docker-compose.yaml --profile bridge up -d --force-recreate --wait siphon-rtp-engine siphon-bridge bridge-app
+
+      - name: Start the callee
+        run: docker compose -f sipp/docker-compose.yaml --profile bridge up -d --force-recreate sipp-bridge-uas
+
+      # Exactly one foreground container, and it is the one that finishes last:
+      # the callee's BYE assertion and the application's verdict both land while
+      # the caller is still in its trailing pause.
+      - name: Join two owned legs, part them, join them again
+        run: docker compose -f sipp/docker-compose.yaml --profile bridge up --abort-on-container-exit --exit-code-from sipp-bridge-uac sipp-bridge-uac
+
+      # The callee ran detached, so without this its scenario could fail and the
+      # job would still be green.
+      - name: Assert the callee scenario passed
+        run: |
+          code="$(docker wait sipp-bridge-uas)"
+          if [ "$code" != "0" ]; then
+            echo "the callee scenario exited $code"
+            docker compose -f sipp/docker-compose.yaml logs sipp-bridge-uas | tail -60
+            exit 1
+          fi
+
+      - name: Assert the control application's verdict
+        if: always()
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs bridge-app > bridge-app.log 2>&1 || true
+          grep -q 'BRIDGE-VERDICT' bridge-app.log || { echo "no verdict — the control application never completed"; exit 1; }
+          if grep -q '"pass": false' bridge-app.log; then
+            echo "bridge acceptance checks failed:"; grep 'BRIDGE-VERDICT' bridge-app.log; exit 1
+          fi
+          grep 'BRIDGE-VERDICT' bridge-app.log
+
+      - name: Assert audio flowed both ways across the bridge
+        run: docker compose -f sipp/docker-compose.yaml --profile bridge run --rm bridge-cdr-assert
+
+      - name: Assert the engine accepted every command the bridge sent
+        run: docker compose -f sipp/docker-compose.yaml --profile bridge run --rm --entrypoint python3 bridge-cdr-assert /app/assert_media.py metrics --url http://172.20.0.130:9091/metrics --min-offers 1 --min-answers 1 --max-offers 1 --min-deletes 1 --max-control-errors 0 --max-sessions 0
+
+      - name: Collect logs
+        if: always()
+        run: |
+          docker compose -f sipp/docker-compose.yaml logs siphon-bridge > siphon-bridge.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs sipp-bridge-uas > sipp-bridge-uas.log 2>&1 || true
+          docker compose -f sipp/docker-compose.yaml logs siphon-rtp-engine > siphon-rtp-engine.log 2>&1 || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile bridge down --remove-orphans -v
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sipp-bridge-logs
+          path: |
+            siphon-bridge.log
+            bridge-app.log
+            sipp-bridge-uas.log
+            siphon-rtp-engine.log
+            *.log
+
   # ── Control plane: the external application rail ────────────────────────
   # An out-of-process application drives real calls over a real WebSocket. Five
   # cases against one siphon, both connection modes at once (per-call-connect,

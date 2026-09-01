@@ -62,6 +62,7 @@ export {
   SipVerb,
   sipEventKind,
   isTransferFinal,
+  isBridgeFinal,
   encodeCommand,
   parseInboundFrame,
 } from "./protocol";
@@ -83,6 +84,12 @@ export type {
   TransferRequestedPayload,
   TransferStage,
   TransferOutcomePayload,
+  PeerHangupPolicy,
+  BridgeRole,
+  BridgeStage,
+  ChannelBridgedPayload,
+  BridgeFailedPayload,
+  ChannelUnbridgedPayload,
 } from "./protocol";
 
 export { ControlClient, EventStream } from "./client";
@@ -100,6 +107,7 @@ export type {
   ResponseOptions,
   ReferReplaces,
   AcceptReferOptions,
+  BridgeOptions,
   RouteTarget,
   RouteTargetObject,
   PlaySource,
