@@ -15526,6 +15526,28 @@ fn handle_b2bua_response(
             sanitize_b2bua_response(message, state, resp_transport, if is_a2b { a_leg_local_addr } else { None }, a_leg_supports_100rel, call_id);
         }
 
+        // Track the ANSWERER's own endpoint SDP — raw, before the rtpengine
+        // rewrite just below — so a later siphon-terminated transfer offers this
+        // leg's *current* media if it turns out to be the survivor.
+        //
+        // The offer side of a re-INVITE was already tracked, but only for the leg
+        // that offered (`handle_b2bua_reinvite`). A leg that merely *answers* kept
+        // whatever it had answered the ORIGINAL INVITE with, which goes wrong the
+        // moment the two disagree: a call that starts `a=recvonly` and is later
+        // re-INVITEd to `sendrecv` leaves the answering leg still remembered as
+        // `sendonly`, and the transfer then offers the target that stale
+        // direction. Both surviving parties end up half-duplex — one able only to
+        // send, the other only to receive — with no hold signalled anywhere for
+        // either of them to display.
+        //
+        // Which leg goes stale depends on who offered the re-INVITE, which is why
+        // this only broke transfers initiated from one side.
+        if (200..300).contains(&status_code) && !message.body.is_empty() {
+            state
+                .call_actors
+                .set_leg_last_sdp(call_id, !is_a2b, &message.body);
+        }
+
         // RTPEngine: rewrite re-INVITE 2xx response SDP through answer.
         // Mirrors the offer processing done on the request side.
         if (200..300).contains(&status_code) && !message.body.is_empty() {

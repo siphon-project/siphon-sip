@@ -7,6 +7,20 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Fixed
+- **A transfer offered the target the survivor's *original* media, not its
+  current media.** siphon tracked the SDP of whichever leg **offered** a
+  re-INVITE or UPDATE, never of the leg that merely **answered** one. So a leg
+  that only ever answers stayed frozen at whatever it answered the first INVITE
+  with. On a Teams trunk that call is set up `a=recvonly`, the carrier answers
+  `a=sendonly`, and a re-INVITE a couple of minutes later takes both sides to
+  `sendrecv` — but the carrier leg was still remembered as `sendonly`. Transfer
+  then, and the target is offered that stale direction: it answers `recvonly`,
+  the survivor is re-INVITEd `recvonly` in turn, and both remaining parties sit
+  half-duplex — one able only to send, the other only to receive — with no hold
+  signalled anywhere for either of them to display. Which leg went stale depended
+  on who offered the re-INVITE, which is why this only broke transfers initiated
+  from one side of the call. The answerer's own SDP is now tracked too, raw and
+  before any rewrite, exactly as the offerer's already was.
 - **Two tests that failed at random, both for reasons unrelated to what they
   assert.** `free_port()` bound port 0, read the address and dropped the socket:
   the kernel auto-assigns from the ephemeral range, so between the probe closing

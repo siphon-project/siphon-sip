@@ -2225,6 +2225,52 @@ fn promoting_the_transfer_target_retires_the_referrers_call_id() {
     assert!(store.get_call(&call_id).is_some());
 }
 
+/// The media a transfer hands to its target must be the survivor's CURRENT
+/// media, not whatever it answered the original INVITE with.
+///
+/// The shape that broke a live Teams trunk: the call is set up `recvonly`, so
+/// the callee answers `sendonly`; a re-INVITE later takes it to `sendrecv`, and
+/// the callee answers that too. If only the *offerer's* SDP is tracked, the
+/// callee is still remembered as `sendonly` — and a transfer then offers the
+/// target that stale direction, leaving both survivors half-duplex with no hold
+/// signalled for either of them to show.
+#[test]
+fn a_leg_that_only_answers_still_tracks_its_current_media() {
+    const ORIGINAL_ANSWER: &[u8] = b"v=0\r\no=callee 1 1 IN IP4 192.0.2.2\r\nm=audio 5000 RTP/AVP 0\r\na=sendonly\r\n";
+    const REINVITE_ANSWER: &[u8] = b"v=0\r\no=callee 1 2 IN IP4 192.0.2.2\r\nm=audio 5000 RTP/AVP 0\r\na=sendrecv\r\n";
+
+    let store = CallActorStore::new();
+    let call_id = store.create_call(make_a_leg("stale-sdp@test"));
+    store.add_b_leg(&call_id, make_b_leg("10.0.0.2:5060"));
+    store.set_winner(&call_id, 0);
+
+    // The callee answers the initial INVITE `sendonly` (mirroring a `recvonly`
+    // offer) — that is its media at the time and is recorded.
+    store.set_leg_last_sdp(&call_id, false, ORIGINAL_ANSWER);
+    assert_eq!(
+        store.clone_leg(&call_id, false).and_then(|leg| leg.last_sdp),
+        Some(ORIGINAL_ANSWER.to_vec())
+    );
+
+    // The caller re-INVITEs to `sendrecv`; the callee ANSWERS. It never offered,
+    // so tracking only offers would leave it frozen at `sendonly`.
+    store.set_leg_last_sdp(&call_id, false, REINVITE_ANSWER);
+
+    let survivor_sdp = store
+        .clone_leg(&call_id, false)
+        .and_then(|leg| leg.last_sdp)
+        .expect("the survivor must have media to hand to a transfer target");
+    assert_eq!(
+        survivor_sdp,
+        REINVITE_ANSWER.to_vec(),
+        "a transfer would offer the target the survivor's stale direction"
+    );
+    assert!(
+        String::from_utf8_lossy(&survivor_sdp).contains("a=sendrecv"),
+        "the survivor is two-way by now and the target must be offered that"
+    );
+}
+
 #[test]
 fn transfer_referrer_bye_is_recognised_and_flags_the_subscription() {
     // The Teams blind-transfer shape: A REFERs, siphon dials the target, and A
