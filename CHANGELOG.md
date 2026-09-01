@@ -7,6 +7,41 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
+- **Codec manipulation on a media profile (`codec:`).** A profile
+  half can now restrict, reorder, drop or transcode codecs through rtpengine's
+  `codec` dictionary — `strip`, `offer`, `transcode`, `mask`, `consume`,
+  `accept`, `except`, `ignore` and `set`, each a list of RTP payload names:
+
+  ```yaml
+  offer:
+    transport_protocol: "RTP/AVP"
+    codec:
+      strip: ["SILK"]                             # the carrier cannot take it
+      offer: ["PCMA", "PCMU", "telephone-event"]  # and in this order
+  ```
+
+  Put it on the `offer:` half — rtpengine applies codec manipulation to the offer
+  and ignores most of it on an answer. It reaches the engine as its own nested
+  dict, not as tokens in `flags`, which the engine would drop.
+
+  **One block, both real engines.** rtpengine takes the NG `codec` dictionary;
+  the native `siphon-rtp` engine already implements the same model but reads it
+  off its flag list, so siphon flattens the block to `codec-<op>-<NAME>` for it
+  — the policy is written once. `ignore` and `set` have no native equivalent and
+  are refused on that backend; `rtpproxy` is a plain relay with no transcoder and
+  refuses the block outright. Refused at config load, never silently dropped.
+  Codecs can also still be shaped from a script with the `sdp` namespace.
+
+  An asymmetric codec policy also makes a profile **direction-bound**: it was
+  chosen for the party on the far side of that half, so it is not inherited
+  across a transfer without an explicit `accept_refer(profile=…)`.
+
+  The `codec: ["offer", "PCMA,PCMU"]` line that `examples/teams_sbc.yaml` used to
+  carry was not this shape and never did anything. That form now **fails the
+  config load** instead of being silently ignored, and the example carries a real
+  codec block.
+
+### Added
 - **`call.accept_refer(profile=…)` — the media profile for the pairing a
   transfer creates.** A media profile has two halves, and when they differ
   (`srtp_to_rtp` and every other SRTP/DTLS edge) they describe *specific sides*

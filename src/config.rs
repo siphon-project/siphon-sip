@@ -2151,6 +2151,23 @@ impl MediaBackendKind {
             }
         }
 
+        // Codec manipulation works on both real engines. rtpengine takes it as
+        // its NG `codec` dict; the native engine implements the same model but
+        // reads it off the flag list, so siphon flattens the block for it
+        // (`CodecFlags::to_native_flags`). Only the two ops with no native
+        // equivalent are refused there — the alternative is a config that reads
+        // as "restricted to PCMA/PCMU" while every offered codec crosses
+        // untouched, which is the failure this feature replaces.
+        if matches!(self, Self::SiphonRtp) {
+            for op in flags.codec.native_unsupported_ops() {
+                unsupported.push(op);
+            }
+        }
+        // rtpproxy is a plain relay with no transcoder and no codec control.
+        if matches!(self, Self::Rtpproxy) && !flags.codec.is_empty() {
+            unsupported.push("codec");
+        }
+
         unsupported
     }
 }
@@ -2564,11 +2581,106 @@ pub struct MediaProfileConfig {
     pub answer: NgFlagsConfig,
 }
 
+/// rtpengine `codec` dictionary — which codecs cross, in what order, and what
+/// gets transcoded. Modelled on the rtpengine NG `codec` sub-dict, which the
+/// native engine implements too.
+///
+/// Every field is a list of RTP payload names (`PCMA`, `opus`, `AMR-WB`), and
+/// an empty one is omitted from the wire entirely.
+///
+/// Works on both real engines from one block: rtpengine takes it as its NG
+/// `codec` dictionary, and the native `siphon-rtp` engine implements the same
+/// model but reads it off its flag list, so siphon flattens the block to
+/// `codec-<op>-<NAME>` for it.
+///
+/// `ignore` and `set` have no native equivalent and are refused on that backend;
+/// `rtpproxy` is a plain relay with no transcoder and refuses the block outright.
+/// Refused at config load, never silently dropped — a codec policy that reads as
+/// applied but is not is the failure this exists to remove.
+///
+/// **Honoured on `offer:`.** Both engines apply codec manipulation to the offer
+/// and ignore most of it on an answer, so put it under the `offer:` half.
+///
+/// ```yaml
+/// offer:
+///   codec:
+///     strip: ["SILK", "G722"]
+///     offer: ["PCMA", "PCMU", "telephone-event"]
+/// ```
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CodecFlagsConfig {
+    /// Remove these from the outgoing SDP. Accepts the wildcards `all` / `full`.
+    #[serde(default)]
+    pub strip: Vec<String>,
+    /// The only codecs to offer, in this order (rtpengine `offer`) — like
+    /// `except` but also fixes preference order.
+    #[serde(default)]
+    pub offer: Vec<String>,
+    /// Add these to the offer even when the offerer did not list them, engaging
+    /// the transcoder.
+    #[serde(default)]
+    pub transcode: Vec<String>,
+    /// Hide these from the far side but keep accepting them from the offerer,
+    /// transcoding on its behalf.
+    #[serde(default)]
+    pub mask: Vec<String>,
+    /// Like `mask`, but engages the transcoder even with no other codec option set.
+    #[serde(default)]
+    pub consume: Vec<String>,
+    /// Like `mask`/`consume` but leaves the codec in the offered list.
+    #[serde(default)]
+    pub accept: Vec<String>,
+    /// Allow only these through, blocking every other offered codec.
+    #[serde(default)]
+    pub except: Vec<String>,
+    /// Treat these as though the offer never contained them.
+    #[serde(default)]
+    pub ignore: Vec<String>,
+    /// Options for implicitly accepted transcoding codecs — bitrate, clock rate,
+    /// channels (e.g. `opus/48000/2/16000`).
+    #[serde(default)]
+    pub set: Vec<String>,
+}
+
+impl CodecFlagsConfig {
+    /// The ops the native `siphon-rtp` engine has no equivalent for. It
+    /// implements the rest of the rtpengine codec model, so only these are
+    /// refused on that backend.
+    pub fn native_unsupported_ops(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if !self.ignore.is_empty() {
+            out.push("codec.ignore");
+        }
+        if !self.set.is_empty() {
+            out.push("codec.set");
+        }
+        out
+    }
+
+    /// True when nothing is set, so nothing is emitted on the wire.
+    pub fn is_empty(&self) -> bool {
+        self.strip.is_empty()
+            && self.offer.is_empty()
+            && self.transcode.is_empty()
+            && self.mask.is_empty()
+            && self.consume.is_empty()
+            && self.accept.is_empty()
+            && self.except.is_empty()
+            && self.ignore.is_empty()
+            && self.set.is_empty()
+    }
+}
+
 /// NG protocol flags for one direction (offer or answer).
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct NgFlagsConfig {
     /// Transport protocol override (e.g. "RTP/AVP", "RTP/SAVPF").
     pub transport_protocol: Option<String>,
+    /// Codec manipulation — see [`CodecFlagsConfig`]. Honoured by rtpengine and
+    /// the native `siphon-rtp` engine; refused on `rtpproxy`.
+    #[serde(default)]
+    pub codec: CodecFlagsConfig,
     /// ICE handling: "remove", "force", or "force-relay".
     pub ice: Option<String>,
     /// DTLS mode: "passive", "active", or "off".
@@ -4356,6 +4468,102 @@ fn default_lcr_cache_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Codec manipulation is an rtpengine NG capability. The native engine's
+    /// `ProfileFlags` has no codec fields and rtpproxy is a plain relay, so a
+    /// profile asking for it there is refused at load rather than reading as
+    /// "restricted to PCMA/PCMU" while every offered codec crosses untouched.
+    #[test]
+    fn codec_flags_are_rtpengine_only() {
+        let flags = NgFlagsConfig {
+            codec: CodecFlagsConfig {
+                offer: vec!["PCMA".to_string(), "PCMU".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(
+            MediaBackendKind::Rtpengine
+                .unsupported_profile_fields(&flags)
+                .is_empty(),
+            "rtpengine speaks the codec dict"
+        );
+        // The native engine implements the same codec model, reading it off the
+        // flag list — so an `offer` list is honoured there, not refused.
+        assert!(
+            MediaBackendKind::SiphonRtp
+                .unsupported_profile_fields(&flags)
+                .is_empty(),
+            "siphon-rtp implements codec manipulation and must accept it"
+        );
+        // rtpproxy is a plain relay: no transcoder, no codec control.
+        assert!(
+            MediaBackendKind::Rtpproxy
+                .unsupported_profile_fields(&flags)
+                .contains(&"codec"),
+            "rtpproxy cannot express codec manipulation and must refuse it"
+        );
+
+        // The two ops with no native equivalent ARE refused on siphon-rtp,
+        // rather than silently dropped when the block is flattened to flags.
+        let unmappable = NgFlagsConfig {
+            codec: CodecFlagsConfig {
+                ignore: vec!["G729".to_string()],
+                set: vec!["opus/48000/2".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let native = MediaBackendKind::SiphonRtp.unsupported_profile_fields(&unmappable);
+        assert!(native.contains(&"codec.ignore"), "got {native:?}");
+        assert!(native.contains(&"codec.set"), "got {native:?}");
+        assert!(
+            MediaBackendKind::Rtpengine
+                .unsupported_profile_fields(&unmappable)
+                .is_empty(),
+            "rtpengine takes every op"
+        );
+
+        // An unset codec block is inert on every backend.
+        let bare = NgFlagsConfig::default();
+        for backend in [
+            MediaBackendKind::Rtpengine,
+            MediaBackendKind::SiphonRtp,
+            MediaBackendKind::Rtpproxy,
+        ] {
+            assert!(!backend.unsupported_profile_fields(&bare).contains(&"codec"));
+        }
+    }
+
+    /// The codec block is a DICT of named lists. The shape that shipped in the
+    /// Teams example (`codec: ["offer", "PCMA,PCMU"]`) is not it, and now fails
+    /// the config load instead of being silently dropped — which is how it went
+    /// unnoticed while implying siphon was restricting codecs.
+    #[test]
+    fn codec_block_parses_as_a_dict_and_rejects_the_old_list_form() {
+        let good: NgFlagsConfig = serde_yaml_ng::from_str(
+            r#"
+transport_protocol: "RTP/AVP"
+codec:
+  strip: ["SILK", "G722"]
+  offer: ["PCMA", "PCMU", "telephone-event"]
+"#,
+        )
+        .expect("the dict form must parse");
+        assert_eq!(good.codec.strip, vec!["SILK", "G722"]);
+        assert_eq!(good.codec.offer, vec!["PCMA", "PCMU", "telephone-event"]);
+        assert!(good.codec.transcode.is_empty());
+
+        assert!(
+            serde_yaml_ng::from_str::<NgFlagsConfig>("codec: [\"offer\", \"PCMA,PCMU\"]").is_err(),
+            "the old list form must be rejected, not ignored"
+        );
+        assert!(
+            serde_yaml_ng::from_str::<NgFlagsConfig>("codec:\n  bogus: [\"PCMA\"]").is_err(),
+            "an unknown codec key must be rejected, not ignored"
+        );
+    }
 
     /// The `Replaces` takeover is a capability, not a default: an upgrade must
     /// never hand every party that can reach this node the ability to

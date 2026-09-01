@@ -75,7 +75,15 @@ pub(crate) fn profile_flags_from_ng(flags: &NgFlags) -> ProfileFlags {
         dtls: flags.dtls.clone(),
         replace: flags.replace.clone(),
         address_family: flags.address_family.clone(),
-        flags: flags.flags.clone(),
+        // The native engine implements the same rtpengine codec model but reads
+        // it from the flag list (`codec-<op>-<NAME>`) rather than a nested dict,
+        // so the profile's `codec:` block is flattened onto the flags here and
+        // one profile drives both engines.
+        flags: {
+            let mut merged = flags.flags.clone();
+            merged.extend(flags.codec.to_native_flags());
+            merged
+        },
         direction: flags.direction.clone(),
         record_call: flags.record_call,
         record_path: flags.record_path.clone(),
@@ -2418,6 +2426,7 @@ mod tests {
     fn profile_flags_from_ng_maps_every_field() {
         let ng = NgFlags {
             transport_protocol: Some("RTP/SAVPF".into()),
+            codec: Default::default(),
             ice: Some("force".into()),
             dtls: Some("passive".into()),
             replace: vec!["origin".into()],

@@ -3377,7 +3377,7 @@ services:
     entrypoint:
       - sipp
       - -sf
-      - /sipp/scenarios/b2bua_refer_terminate_bob_uas.xml
+      - /sipp/scenarios/b2bua_refer_anchored_bob_uas.xml
       - -p
       - "5060"
       - -m
@@ -4886,6 +4886,8 @@ services:
     depends_on:
       siphon-rtp-engine-ready:
         condition: service_completed_successfully
+    environment:
+      MEDIA_PROFILE: "codec_restricted"
     volumes:
       - ./siphon-rtp/siphon-rtp-native.yaml:/etc/siphon/siphon.yaml:ro
       - ./siphon-rtp/proxy_rtp_passthrough.py:/etc/siphon/scripts/proxy_rtp_passthrough.py:ro
@@ -4941,7 +4943,7 @@ services:
     entrypoint:
       - sipp
       - -sf
-      - /sipp/scenarios/rtpengine_uas.xml
+      - /sipp/scenarios/media_codec_policy_uas.xml
       - -p
       - "5060"
       - -m
@@ -4991,6 +4993,8 @@ services:
     depends_on:
       siphon-rtp-engine-ready:
         condition: service_completed_successfully
+    environment:
+      MEDIA_PROFILE: "codec_restricted"
     volumes:
       - ./siphon-rtp/siphon-rtp-ng.yaml:/etc/siphon/siphon.yaml:ro
       - ./siphon-rtp/proxy_rtp_passthrough.py:/etc/siphon/scripts/proxy_rtp_passthrough.py:ro
@@ -5046,7 +5050,7 @@ services:
     entrypoint:
       - sipp
       - -sf
-      - /sipp/scenarios/rtpengine_uas.xml
+      - /sipp/scenarios/media_codec_policy_uas.xml
       - -p
       - "5060"
       - -m

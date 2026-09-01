@@ -29,6 +29,116 @@ pub struct ProfileEntry {
     pub answer: NgFlags,
 }
 
+/// Runtime form of [`CodecFlagsConfig`](crate::config::CodecFlagsConfig) — the
+/// rtpengine `codec` sub-dict.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodecFlags {
+    pub strip: Vec<String>,
+    pub offer: Vec<String>,
+    pub transcode: Vec<String>,
+    pub mask: Vec<String>,
+    pub consume: Vec<String>,
+    pub accept: Vec<String>,
+    pub except: Vec<String>,
+    pub ignore: Vec<String>,
+    pub set: Vec<String>,
+}
+
+impl CodecFlags {
+    /// True when nothing is set — the `codec` key is then omitted entirely
+    /// rather than sent as an empty dict.
+    pub fn is_empty(&self) -> bool {
+        self.strip.is_empty()
+            && self.offer.is_empty()
+            && self.transcode.is_empty()
+            && self.mask.is_empty()
+            && self.consume.is_empty()
+            && self.accept.is_empty()
+            && self.except.is_empty()
+            && self.ignore.is_empty()
+            && self.set.is_empty()
+    }
+
+    fn from_config(config: &crate::config::CodecFlagsConfig) -> Self {
+        Self {
+            strip: config.strip.clone(),
+            offer: config.offer.clone(),
+            transcode: config.transcode.clone(),
+            mask: config.mask.clone(),
+            consume: config.consume.clone(),
+            accept: config.accept.clone(),
+            except: config.except.clone(),
+            ignore: config.ignore.clone(),
+            set: config.set.clone(),
+        }
+    }
+
+    /// The ops the native `siphon-rtp` engine understands, flattened to the
+    /// `codec-<op>-<NAME>` flag strings its `ProfileFlags.flags` carries.
+    ///
+    /// The engine implements the same rtpengine codec model but reads it off the
+    /// flag list rather than a nested dict, so one profile drives both engines.
+    /// `ignore` and `set` have no native equivalent and are deliberately not
+    /// emitted here — the config gate refuses them on that backend rather than
+    /// letting them look applied.
+    pub fn to_native_flags(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (op, list) in [
+            ("strip", &self.strip),
+            ("mask", &self.mask),
+            ("consume", &self.consume),
+            ("except", &self.except),
+            ("accept", &self.accept),
+            ("offer", &self.offer),
+            ("transcode", &self.transcode),
+        ] {
+            for name in list {
+                out.push(format!("codec-{op}-{name}"));
+            }
+        }
+        out
+    }
+
+    /// The ops with no native equivalent, for the backend capability gate.
+    pub fn native_unsupported_ops(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if !self.ignore.is_empty() {
+            out.push("codec.ignore");
+        }
+        if !self.set.is_empty() {
+            out.push("codec.set");
+        }
+        out
+    }
+
+    /// The `codec` sub-dict, or `None` when nothing is set. Keys are emitted in
+    /// a fixed order so a command is byte-stable for a given profile.
+    fn to_bencode(&self) -> Option<super::bencode::BencodeValue> {
+        use super::bencode::BencodeValue;
+        if self.is_empty() {
+            return None;
+        }
+        let mut pairs: Vec<(&str, BencodeValue)> = Vec::new();
+        for (key, list) in [
+            ("strip", &self.strip),
+            ("offer", &self.offer),
+            ("transcode", &self.transcode),
+            ("mask", &self.mask),
+            ("consume", &self.consume),
+            ("accept", &self.accept),
+            ("except", &self.except),
+            ("ignore", &self.ignore),
+            ("set", &self.set),
+        ] {
+            if !list.is_empty() {
+                let items: Vec<&str> = list.iter().map(|s| s.as_str()).collect();
+                pairs.push((key, BencodeValue::string_list(&items)));
+            }
+        }
+        Some(BencodeValue::dict(pairs))
+    }
+}
+
 impl ProfileEntry {
     /// True when this profile's two halves are not interchangeable — the offer
     /// and answer flags describe *specific sides* of the call rather than a
@@ -48,6 +158,10 @@ impl ProfileEntry {
             || !self.offer.direction.is_empty()
             || !self.answer.direction.is_empty()
             || self.offer.dtls != self.answer.dtls
+            // Codec manipulation is chosen for the party on the far side of
+            // this half — strip SILK because *that* carrier cannot take it —
+            // so it is as side-specific as the transport is.
+            || self.offer.codec != self.answer.codec
     }
 }
 
@@ -420,6 +534,9 @@ pub fn validate_ws_sample_rate(rate: u32) -> Result<(), String> {
 pub struct NgFlags {
     /// Transport protocol override (e.g. "RTP/AVP", "RTP/SAVPF").
     pub transport_protocol: Option<String>,
+    /// Codec manipulation — see [`CodecFlags`]. Honoured by rtpengine (as its NG
+    /// `codec` dict) and by the native engine (flattened onto its flag list).
+    pub codec: CodecFlags,
     /// ICE handling: "remove", "force", or "force-relay".
     pub ice: Option<String>,
     /// DTLS mode: "passive", "active", or "off".
@@ -633,6 +750,7 @@ impl NgFlags {
     pub fn from_config(config: &NgFlagsConfig) -> Self {
         Self {
             transport_protocol: config.transport_protocol.clone(),
+            codec: CodecFlags::from_config(&config.codec),
             ice: config.ice.clone(),
             dtls: config.dtls.clone(),
             replace: config.replace.clone(),
@@ -675,6 +793,11 @@ impl NgFlags {
                 "transport-protocol",
                 BencodeValue::string(transport_protocol),
             ));
+        }
+        // rtpengine takes codec manipulation as a nested dict under `codec`,
+        // not as tokens in `flags`.
+        if let Some(codec) = self.codec.to_bencode() {
+            pairs.push(("codec", codec));
         }
         if let Some(ice) = &self.ice {
             pairs.push(("ICE", BencodeValue::string(ice)));
@@ -773,6 +896,154 @@ mod tests {
             !passthrough.is_direction_bound(),
             "rtp_passthrough is symmetric and survives a re-pairing"
         );
+    }
+
+    /// The `codec` dict must reach rtpengine as a NESTED DICT under `codec`,
+    /// not as tokens in `flags` — a codec list smuggled into `flags` is
+    /// silently dropped by the engine, which is the failure mode this whole
+    /// feature exists to remove.
+    #[test]
+    fn codec_flags_encode_as_a_nested_dict() {
+        let flags = NgFlags {
+            transport_protocol: Some("RTP/AVP".into()),
+            codec: CodecFlags {
+                strip: vec!["SILK".into(), "G722".into()],
+                offer: vec!["PCMA".into(), "PCMU".into()],
+                transcode: vec!["PCMA".into()],
+                ..CodecFlags::default()
+            },
+            ..NgFlags::default()
+        };
+
+        let pairs = flags.to_bencode_pairs();
+        let (_, codec) = pairs
+            .iter()
+            .find(|(key, _)| *key == "codec")
+            .expect("codec must be its own dict key");
+
+        let encoded =
+            String::from_utf8_lossy(&crate::rtpengine::bencode::encode(codec)).to_string();
+        // Bencode dict of three string lists, keys in the order emitted.
+        assert!(encoded.contains("strip"), "strip missing: {encoded}");
+        assert!(encoded.contains("SILK"), "SILK missing: {encoded}");
+        assert!(encoded.contains("offer"), "offer missing: {encoded}");
+        assert!(encoded.contains("PCMA"), "PCMA missing: {encoded}");
+        assert!(encoded.contains("transcode"), "transcode missing: {encoded}");
+
+        // Empty lists never reach the wire.
+        assert!(!encoded.contains("mask"), "an unset key leaked: {encoded}");
+        assert!(!encoded.contains("ignore"), "an unset key leaked: {encoded}");
+
+        // And it is NOT folded into `flags`.
+        let flags_pair = pairs.iter().find(|(key, _)| *key == "flags");
+        assert!(
+            flags_pair.is_none(),
+            "codec manipulation must not be smuggled into the flags list"
+        );
+    }
+
+    /// The native engine takes the same codec model off its flag list, so the
+    /// block is flattened to `codec-<op>-<NAME>` for it. One profile, two
+    /// engines — an operator does not write the policy twice.
+    #[test]
+    fn codec_flags_flatten_for_the_native_engine() {
+        let codec = CodecFlags {
+            strip: vec!["SILK".into()],
+            offer: vec!["PCMA".into(), "PCMU".into()],
+            transcode: vec!["PCMA".into()],
+            except: vec!["telephone-event".into()],
+            ..CodecFlags::default()
+        };
+        let flat = codec.to_native_flags();
+
+        assert!(flat.contains(&"codec-strip-SILK".to_string()), "{flat:?}");
+        assert!(flat.contains(&"codec-offer-PCMA".to_string()), "{flat:?}");
+        assert!(flat.contains(&"codec-offer-PCMU".to_string()), "{flat:?}");
+        assert!(flat.contains(&"codec-transcode-PCMA".to_string()), "{flat:?}");
+        assert!(
+            flat.contains(&"codec-except-telephone-event".to_string()),
+            "{flat:?}"
+        );
+        // Order within `offer` is the operator's stated preference and must survive.
+        let offer_positions: Vec<usize> = ["codec-offer-PCMA", "codec-offer-PCMU"]
+            .iter()
+            .map(|needle| flat.iter().position(|f| f == needle).expect("present"))
+            .collect();
+        assert!(
+            offer_positions[0] < offer_positions[1],
+            "codec-offer order is the preference order: {flat:?}"
+        );
+
+        // The two ops the engine has no equivalent for are never emitted...
+        let unmappable = CodecFlags {
+            ignore: vec!["G729".into()],
+            set: vec!["opus/48000/2".into()],
+            ..CodecFlags::default()
+        };
+        assert!(
+            unmappable.to_native_flags().is_empty(),
+            "unmappable ops must not be flattened into something meaningless"
+        );
+        // ...and are reported so the config gate can refuse them.
+        assert_eq!(
+            unmappable.native_unsupported_ops(),
+            vec!["codec.ignore", "codec.set"]
+        );
+    }
+
+    /// Nothing set means no `codec` key at all, rather than an empty dict the
+    /// engine would have to interpret.
+    #[test]
+    fn absent_codec_flags_emit_no_key() {
+        let flags = NgFlags {
+            transport_protocol: Some("RTP/AVP".into()),
+            ..NgFlags::default()
+        };
+        assert!(
+            !flags
+                .to_bencode_pairs()
+                .iter()
+                .any(|(key, _)| *key == "codec"),
+            "an empty codec dict must not be sent"
+        );
+        assert!(CodecFlags::default().is_empty());
+    }
+
+    /// Codec policy is chosen for the party on the far side of that half, so a
+    /// profile that strips one way and not the other is as side-specific as an
+    /// SRTP edge — and equally wrong to inherit across a transfer.
+    #[test]
+    fn asymmetric_codec_policy_is_direction_bound() {
+        let entry = ProfileEntry {
+            offer: NgFlags {
+                codec: CodecFlags {
+                    offer: vec!["PCMA".into(), "PCMU".into()],
+                    ..CodecFlags::default()
+                },
+                ..NgFlags::default()
+            },
+            answer: NgFlags::default(),
+        };
+        assert!(entry.is_direction_bound());
+
+        // The same policy on both halves re-pairs safely.
+        let symmetric = ProfileEntry {
+            offer: NgFlags {
+                codec: CodecFlags {
+                    strip: vec!["SILK".into()],
+                    ..CodecFlags::default()
+                },
+                ..NgFlags::default()
+            },
+            answer: NgFlags {
+                codec: CodecFlags {
+                    strip: vec!["SILK".into()],
+                    ..CodecFlags::default()
+                },
+                ..NgFlags::default()
+            },
+        };
+        assert!(!symmetric.is_direction_bound());
     }
 
     /// A `direction` pair is direction-bound by definition, even when both

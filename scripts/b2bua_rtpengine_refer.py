@@ -10,7 +10,7 @@ rtpengine so the offer/answer/delete command sequence is exercised end to end.
 from siphon import b2bua, proxy, registrar, rtpengine, auth, log
 
 DOMAIN = "siphon.test"
-PROFILE = "rtp_passthrough"
+PROFILE = "codec_restricted"
 
 
 @proxy.on_request("REGISTER")
