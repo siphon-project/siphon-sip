@@ -47,6 +47,19 @@ jobs:
       - name: Run tests
         run: PYO3_PYTHON=python3.14 cargo test ${{ matrix.flags }}
 
+      # Runs alone because it measures a process-global counter: glibc in-use
+      # bytes. Inside the parallel binary the other tests allocate on the same
+      # order as the signal, so it is `#[ignore]`d there and gated here, where
+      # nothing else is running and the numbers are exact. Skipping it would
+      # let the reaped-thread PyThreadState leak back in — it orphans CPython
+      # thread states on the glibc heap, invisible to jemalloc and to
+      # `siphon_memory_*`.
+      - name: Python thread-state leak guard (needs the process to itself)
+        run: |
+          PYO3_PYTHON=python3.14 cargo test --lib ${{ matrix.flags }} -- --ignored --exact \
+            server::tests::reaped_thread_releases_its_python_thread_state \
+            --test-threads=1 --nocapture
+
   # ── Clippy lint gate ────────────────────────────────────────────────────
   # Mirrors the rust-tests build env (free-threaded Python 3.14 + libsctp-dev
   # are needed for the crate to compile at all). `-D warnings` turns any

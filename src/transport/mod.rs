@@ -15,6 +15,54 @@ pub mod acl;
 pub mod flow;
 pub mod crlf_keepalive;
 
+/// Test-only helpers shared by this module's unit tests.
+#[cfg(test)]
+pub(crate) mod testutil {
+    use std::net::SocketAddr;
+
+    /// A loopback address reserved for this test, on a port the kernel will not
+    /// hand to anything else.
+    ///
+    /// The obvious version — bind port 0, read the address, drop the socket —
+    /// looks fine and is the reason these tests flapped. Two things go wrong:
+    ///
+    /// * the kernel auto-assigns from the ephemeral range (32768-60999 here),
+    ///   so between the probe closing and the real bind, any outbound socket in
+    ///   this process can take that exact port, and
+    /// * `listen()` binds on a **spawned task** and merely logs on failure, so
+    ///   the caller never learns. The test then sits waiting on a listener that
+    ///   was never created and fails as a connect timeout, pointing at the
+    ///   wrong thing entirely.
+    ///
+    /// Handing out ports from a counter *below* the ephemeral range removes the
+    /// collision at its source: nothing is auto-assigned there, so only an
+    /// explicit bind can take one, and the counter guarantees no two callers in
+    /// this process are given the same port. The probe then confirms the port is
+    /// actually free before it is used.
+    pub(crate) fn free_port() -> SocketAddr {
+        use std::sync::atomic::{AtomicU16, Ordering};
+        // Below 32768 (`/proc/sys/net/ipv4/ip_local_port_range`), above the
+        // privileged range and clear of the SIP defaults these tests also use.
+        static NEXT: AtomicU16 = AtomicU16::new(21000);
+
+        for _ in 0..2048 {
+            let port = NEXT.fetch_add(1, Ordering::Relaxed);
+            assert!(port < 32000, "exhausted the reserved test port range");
+            // TCP and UDP are separate namespaces and these tests bind either,
+            // so a port is only free when it is free on both.
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+                continue;
+            }
+            if std::net::UdpSocket::bind(("127.0.0.1", port)).is_err() {
+                continue;
+            }
+            return SocketAddr::from(([127, 0, 0, 1], port));
+        }
+        panic!("no free loopback port in the reserved test range");
+    }
+}
+
+
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
