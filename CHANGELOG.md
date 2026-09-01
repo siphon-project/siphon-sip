@@ -7,7 +7,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Added
-- **Codec manipulation on a media profile (`codec:`), rtpengine only.** A profile
+- **Codec manipulation on a media profile (`codec:`).** A profile
   half can now restrict, reorder, drop or transcode codecs through rtpengine's
   `codec` dictionary — `strip`, `offer`, `transcode`, `mask`, `consume`,
   `accept`, `except`, `ignore` and `set`, each a list of RTP payload names:

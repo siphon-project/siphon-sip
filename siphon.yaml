@@ -649,15 +649,16 @@ auth:
 # Symmetric (safe to inherit): rtp_passthrough.
 #
 # ---------------------------------------------------------------------------
-# CODEC MANIPULATION (rtpengine only)
+# CODEC MANIPULATION
 # ---------------------------------------------------------------------------
-# A profile half can restrict, reorder, drop or transcode codecs through the
-# rtpengine `codec` dictionary. Every key is a list of RTP payload names:
+# A profile half can restrict, reorder, drop or transcode codecs. Every key is a
+# list of RTP payload names:
 #
 #   strip      remove these from the outgoing SDP (`all` / `full` wildcards)
 #   offer      the only codecs to offer, in this order (also fixes preference)
 #   transcode  add these even if the offerer did not list them (engages the
-#              transcoder — rtpengine must be built --with-transcoding)
+#              transcoder — on rtpengine that needs a --with-transcoding build;
+#              the native engine transcodes what its codec set supports)
 #   mask       hide from the far side but keep accepting from the offerer
 #   consume    like mask, but engages the transcoder on its own
 #   accept     like mask/consume but leaves the codec in the offered list
@@ -665,8 +666,8 @@ auth:
 #   ignore     treat as though the offer never contained them
 #   set        options for accepted transcoding codecs (bitrate/rate/channels)
 #
-# Put it on the OFFER half — rtpengine applies codec manipulation to the offer
-# and ignores most of it on an answer:
+# Put it on the OFFER half — both engines apply codec manipulation to the offer
+# and ignore most of it on an answer:
 #
 #   media:
 #     profiles:
@@ -677,10 +678,10 @@ auth:
 #             strip: ["SILK"]                             # carrier cannot take it
 #             offer: ["PCMA", "PCMU", "telephone-event"]  # and in this order
 #
-# Works on BOTH real engines from the same block. rtpengine takes it as its NG
-# `codec` dictionary; the native siphon-rtp engine implements the same model but
-# reads it off its flag list, so siphon flattens the block to `codec-<op>-<NAME>`
-# for it — you write the policy once.
+# BOTH real engines honour this from the same block — you write the policy once.
+# rtpengine takes it as its NG `codec` dictionary; the native siphon-rtp engine
+# implements the same model but reads it off its flag list, so siphon flattens
+# the block to `codec-<op>-<NAME>` for it.
 #
 # Two exceptions, refused at config load rather than left looking applied:
 #   * `ignore:` and `set:` have no native equivalent — rtpengine only.

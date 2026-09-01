@@ -2582,7 +2582,8 @@ pub struct MediaProfileConfig {
 }
 
 /// rtpengine `codec` dictionary — which codecs cross, in what order, and what
-/// gets transcoded (rtpengine NG `codec` sub-dict).
+/// gets transcoded. Modelled on the rtpengine NG `codec` sub-dict, which the
+/// native engine implements too.
 ///
 /// Every field is a list of RTP payload names (`PCMA`, `opus`, `AMR-WB`), and
 /// an empty one is omitted from the wire entirely.
@@ -2597,8 +2598,8 @@ pub struct MediaProfileConfig {
 /// Refused at config load, never silently dropped — a codec policy that reads as
 /// applied but is not is the failure this exists to remove.
 ///
-/// **Honoured on `offer:`.** rtpengine applies codec manipulation to the offer;
-/// most of it is ignored on an answer, so put it under the `offer:` half.
+/// **Honoured on `offer:`.** Both engines apply codec manipulation to the offer
+/// and ignore most of it on an answer, so put it under the `offer:` half.
 ///
 /// ```yaml
 /// offer:
@@ -2676,7 +2677,8 @@ impl CodecFlagsConfig {
 pub struct NgFlagsConfig {
     /// Transport protocol override (e.g. "RTP/AVP", "RTP/SAVPF").
     pub transport_protocol: Option<String>,
-    /// Codec manipulation (rtpengine only) — see [`CodecFlagsConfig`].
+    /// Codec manipulation — see [`CodecFlagsConfig`]. Honoured by rtpengine and
+    /// the native `siphon-rtp` engine; refused on `rtpproxy`.
     #[serde(default)]
     pub codec: CodecFlagsConfig,
     /// ICE handling: "remove", "force", or "force-relay".

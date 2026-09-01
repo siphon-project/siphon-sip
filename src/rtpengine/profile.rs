@@ -534,7 +534,8 @@ pub fn validate_ws_sample_rate(rate: u32) -> Result<(), String> {
 pub struct NgFlags {
     /// Transport protocol override (e.g. "RTP/AVP", "RTP/SAVPF").
     pub transport_protocol: Option<String>,
-    /// Codec manipulation (rtpengine only) — see [`CodecFlags`].
+    /// Codec manipulation — see [`CodecFlags`]. Honoured by rtpengine (as its NG
+    /// `codec` dict) and by the native engine (flattened onto its flag list).
     pub codec: CodecFlags,
     /// ICE handling: "remove", "force", or "force-relay".
     pub ice: Option<String>,
