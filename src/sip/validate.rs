@@ -37,6 +37,29 @@ const ADDRESS_HEADERS: &[&str] = &[
 /// unsigned integer and MUST be less than 2**31".
 const MAX_CSEQ: u64 = 1 << 31;
 
+/// Header fields RFC 3261 §8.1.1 defines as single-instance. A second copy has
+/// no defined meaning and implementations disagree about which one wins, so a
+/// message carrying one is ambiguous rather than merely unusual.
+/// Content-Length is here for a second reason on top of ambiguity: it is the
+/// field the stream framer reads to decide where the *next* message starts, so
+/// two of them is the classic message-smuggling shape. siphon's framer and
+/// parser both take the first, but an upstream that takes the last then reads a
+/// different message out of the same bytes (RFC 4475 §3.3.9).
+const SINGLE_INSTANCE_HEADERS: &[&str] =
+    &["To", "From", "Call-ID", "CSeq", "Max-Forwards", "Content-Length"];
+
+/// Most header fields one message may carry. A VoLTE INVITE with a full IMS
+/// P-header set runs to about forty; this is an order of magnitude of headroom
+/// and still bounds the per-hop cost of forwarding a message built to be
+/// expensive.
+const MAX_HEADER_FIELDS: usize = 256;
+
+/// Deepest Via stack accepted. Max-Forwards bounds the hops a request may
+/// *take*; nothing bounds the stack a peer simply asserts it already took, and
+/// every one of them is re-serialized on each forward. Comfortably above the
+/// default Max-Forwards of 70.
+const MAX_VIA_DEPTH: usize = 100;
+
 /// A parseable message that must still be refused, with the status RFC 3261
 /// requires the element to answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +80,15 @@ impl Rejection {
             detail: detail.into(),
         }
     }
+
+    /// RFC 3261 §21.4.11 — the message exceeded what this element will process.
+    fn too_large(detail: impl Into<String>) -> Self {
+        Self {
+            status: 513,
+            reason: "Message Too Large",
+            detail: detail.into(),
+        }
+    }
 }
 
 /// Validate a parsed message against RFC 3261.
@@ -65,12 +97,65 @@ impl Rejection {
 /// the element owes the peer; a response that fails validation is discarded
 /// rather than answered, since there is nothing to answer.
 pub fn validate_message(message: &SipMessage) -> Result<(), Rejection> {
+    validate_message_shape(message)?;
     validate_version(message)?;
     validate_cseq(message)?;
     validate_date(message)?;
     validate_request_uri(message)?;
     validate_address_headers(message)?;
     validate_parameters(message)?;
+    Ok(())
+}
+
+/// Reject a message whose *shape* is abusive or ambiguous, before any check
+/// that reads a particular field.
+///
+/// Two different concerns, both cheap and both absent until now:
+///
+/// **Ambiguity.** RFC 3261 §8.1.1 lists To, From, Call-ID, CSeq and
+/// Max-Forwards as single-instance header fields. A message carrying two of one
+/// of them has no defined meaning, and worse, no two implementations agree on
+/// which one wins — siphon reads the first, and an upstream that reads the last
+/// routes, bills or authorizes the same message against a different identity.
+/// A proxy is exactly the place that must not paper over it.
+///
+/// **Cost.** Nothing bounded how many headers a message could carry or how deep
+/// a Via stack could be, so a single well-formed message could be built to make
+/// every downstream hop allocate and re-serialize an arbitrary amount of work.
+/// `security.max_message_bytes` bounds the octets on a stream transport, but a
+/// 256 KB message is still ~8000 one-byte headers, and Max-Forwards bounds hops
+/// rather than the Via stack a peer may simply assert.
+fn validate_message_shape(message: &SipMessage) -> Result<(), Rejection> {
+    for name in SINGLE_INSTANCE_HEADERS {
+        if let Some(values) = message.headers.get_all(name) {
+            if values.len() > 1 {
+                return Err(Rejection::bad_request(format!(
+                    "{name} appears {} times; RFC 3261 §8.1.1 makes it single-instance, so \
+                     which one applies is undefined and implementations disagree",
+                    values.len()
+                )));
+            }
+        }
+    }
+
+    let header_count: usize = message.headers.iter().map(|(_, values)| values.len()).sum();
+    if header_count > MAX_HEADER_FIELDS {
+        return Err(Rejection::too_large(format!(
+            "{header_count} header fields exceeds the {MAX_HEADER_FIELDS} limit"
+        )));
+    }
+
+    if let Some(vias) = message.headers.get_all("Via") {
+        // One header line may carry several comma-separated Via values
+        // (§7.3.1), so count the values, not the lines.
+        let depth: usize = vias.iter().map(|value| value.matches(',').count() + 1).sum();
+        if depth > MAX_VIA_DEPTH {
+            return Err(Rejection::too_large(format!(
+                "Via stack is {depth} deep, over the {MAX_VIA_DEPTH} limit"
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -298,6 +383,84 @@ mod tests {
     #[test]
     fn well_formed_request_passes() {
         assert_eq!(validate(WELL_FORMED), Ok(()));
+    }
+
+    // --- message shape ------------------------------------------------------
+
+    /// RFC 4475 §3.3.8 — "an element receiving this request should respond with
+    /// a 400 (Bad Request)". Which copy applies is undefined, and siphon
+    /// reading the first while an upstream reads the last means the same
+    /// message is routed, billed or authorized against two identities.
+    #[test]
+    fn a_duplicated_single_instance_header_is_400() {
+        for name in SINGLE_INSTANCE_HEADERS {
+            let line = match *name {
+                "To" => "To: <sip:other@example.net>\r\n",
+                "From" => "From: <sip:other@example.net>;tag=2\r\n",
+                "Call-ID" => "Call-ID: second@example.com\r\n",
+                "CSeq" => "CSeq: 2 INVITE\r\n",
+                "Max-Forwards" => "Max-Forwards: 5\r\n",
+                "Content-Length" => "Content-Length: 0\r\n",
+                other => panic!("no fixture line for {other}"),
+            };
+            let raw = WELL_FORMED.replace("Via:", &format!("{line}Via:"));
+            let rejection = validate(&raw)
+                .expect_err(&format!("a second {name} must be refused"));
+            assert_eq!(rejection.status, 400, "{name}: {}", rejection.detail);
+            assert!(rejection.detail.contains(name), "{}", rejection.detail);
+        }
+    }
+
+    /// The Via stack a peer asserts it already traversed is not bounded by
+    /// Max-Forwards (which bounds hops still to come), and every entry is
+    /// re-serialized on each forward.
+    #[test]
+    fn an_over_deep_via_stack_is_513() {
+        let stack: String = (0..MAX_VIA_DEPTH + 1)
+            .map(|n| format!("Via: SIP/2.0/UDP host{n}.example.com;branch=z9hG4bK{n}\r\n"))
+            .collect();
+        let raw = WELL_FORMED.replace("Via: SIP/2.0/UDP host.example.com;branch=z9hG4bK1\r\n", &stack);
+        let rejection = validate(&raw).expect_err("an over-deep Via stack must be refused");
+        assert_eq!(rejection.status, 513);
+
+        // Comma-separated values on one line count the same (RFC 3261 §7.3.1).
+        let folded: String = (0..MAX_VIA_DEPTH + 1)
+            .map(|n| format!("SIP/2.0/UDP host{n}.example.com;branch=z9hG4bK{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let raw = WELL_FORMED.replace(
+            "Via: SIP/2.0/UDP host.example.com;branch=z9hG4bK1\r\n",
+            &format!("Via: {folded}\r\n"),
+        );
+        assert_eq!(
+            validate(&raw).expect_err("comma-separated Vias count too").status,
+            513
+        );
+    }
+
+    #[test]
+    fn too_many_header_fields_is_513() {
+        let padding: String = (0..MAX_HEADER_FIELDS)
+            .map(|n| format!("X-Pad-{n}: x\r\n"))
+            .collect();
+        let raw = WELL_FORMED.replace("Via:", &format!("{padding}Via:"));
+        let rejection = validate(&raw).expect_err("a message of pure padding must be refused");
+        assert_eq!(rejection.status, 513);
+    }
+
+    /// The limits have to sit far enough above real traffic that ordinary
+    /// messages cannot trip them — an IMS INVITE with a full P-header set and a
+    /// realistic Via stack passes with room to spare.
+    #[test]
+    fn ordinary_traffic_is_nowhere_near_the_limits() {
+        let vias: String = (0..8)
+            .map(|n| format!("Via: SIP/2.0/UDP p{n}.ims.example.com;branch=z9hG4bK{n}\r\n"))
+            .collect();
+        let p_headers: String = (0..30)
+            .map(|n| format!("P-Header-{n}: value\r\n"))
+            .collect();
+        let raw = WELL_FORMED.replace("Via:", &format!("{vias}{p_headers}Via:"));
+        assert_eq!(validate(&raw), Ok(()));
     }
 
     #[test]
