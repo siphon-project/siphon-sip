@@ -7,6 +7,17 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Fixed
+- **The ACK for a bridged re-INVITE was addressed to siphon itself.** RFC 3261
+  §13.2.2.4 puts the responder's own remote target in the ACK's Request-URI, and
+  siphon read it from the 200 OK — but only *after* `sanitize_b2bua_response` had
+  rewritten that response's `Contact` to point at siphon, which is correct for
+  the copy forwarded to the other leg and wrong for the ACK going back to the
+  responder. The far end therefore did not accept the ACK and retransmitted its
+  200 until the retransmission handler sent a second, correct one. The call
+  survived, so this cost a retransmit and the delay before it rather than the
+  dialog, which is why it went unnoticed on every hold and resume. The Contact is
+  now captured before the rewrite. The siphon-originated path was already safe,
+  but only because its response skips sanitize entirely.
 - **The B-leg INVITE no longer carries the session-timer headers twice.** The
   B-leg INVITE is cloned from the caller's, so whatever it asked for is already
   on it — a Teams INVITE arrives with `Session-Expires: 3600`, `Min-SE: 300` and
