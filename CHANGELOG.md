@@ -34,6 +34,36 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
     stripped it, so `content-length\x0b` became `Content-Length` to the parser,
     while the framer's ASCII trim left it alone. Header names are ASCII tokens
     (§25.1), so the parser now trims ASCII too.
+- **Refused ambiguous and abusive message shapes.** `validate_message` now
+  checks a message's shape before any check that reads a particular field:
+  - **A duplicated single-instance header field is `400 Bad Request`** (To,
+    From, Call-ID, CSeq, Max-Forwards, Content-Length). RFC 3261 §8.1.1 defines
+    these as single-instance, and RFC 4475 names the response rather than leaving
+    it to the application layer: §3.3.8 "would respond with a 400 Bad Request
+    error", §3.3.9 "should respond with an error". Which copy applies is undefined and implementations
+    disagree — siphon reads the first, and an upstream that reads the last
+    routes, bills or authorizes the same message against a different identity.
+    Content-Length matters twice over: it is what the stream framer reads to
+    decide where the *next* message starts, which is the classic
+    message-smuggling shape.
+  - **A Via stack over 100 deep, or a message with over 256 header fields, is
+    `513 Message Too Large`.** Nothing bounded either. `security.max_message_bytes`
+    bounds the octets, but 256 KB is still ~8000 one-byte headers, and
+    Max-Forwards bounds the hops a request may still take, not the stack a peer
+    simply asserts it already traversed — every entry of which is re-serialized
+    on each forward. The limits sit an order of magnitude above real traffic (an
+    IMS INVITE with a full P-header set runs to about forty headers).
+
+  The two RFC 4475 fixtures for these cases (`TC_MULTI01_I`, `TC_MCL01_I`) were
+  classified as "parses" because siphon had no such check; they are now
+  classified as the RFC classifies them.
+
+  Known gap: §3.3.9 also says that over TCP "the framing error is not
+  recoverable, and the connection should be closed". siphon answers 400 and
+  leaves the connection open — the dispatcher has no way to close an inbound
+  stream connection. Its own framing stays consistent (framer and parser both
+  read the first Content-Length); what is unrecoverable is the disagreement with
+  a peer that meant the second.
 
 ### Added
 - **`siphon_requests_without_branch_total`.** Counts inbound requests whose
@@ -43,13 +73,10 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   script again. Previously this degradation was invisible outside a debug log.
   The gap is now stated in the feature-readiness matrix; the `transaction::key`
   module documentation had claimed a fallback that was never implemented.
-
-
 - **Framing fuzz target (`stream_framing_fuzz`).** Fuzzes the stream framer's
   invariants — a framed length never exceeds the buffer or the ceiling, and a
   refused message's header block stays inside the buffer — alongside the
   existing parser target in CI.
-
 - **Control plane: `ring` is its own verb, split from `progress`.** RFC 3261
   §13.2.1 makes the `180 Ringing` the "callee is being alerted" signal and
   §21.1.2 gives it no session semantics; RFC 3960 §3.1 puts early media on the
@@ -70,6 +97,13 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   that audio has reached the wire — a `url` source accepts before its body has
   arrived. A play the backend refuses pushes **no** event, so "no `PlayStarted`
   yet" always reads as "not started".
+- **`siphon_udp_datagrams_at_buffer_limit_total`.** `recv_from` reports the
+  bytes it copied, not the datagram's length, so a datagram that exactly fills
+  the receive buffer is indistinguishable from one the kernel truncated.
+  Previously this was invisible and surfaced only as an obscure parse error.
+  The message is still processed — a genuinely truncated one is refused by the
+  parser's Content-Length check — but a non-zero counter means a peer is sending
+  UDP well past the point RFC 3261 §18.1.1 requires it to switch to TCP.
 
 ### Changed
 - **Control plane: `StasisEnd` now carries the SIP status on every teardown that
@@ -105,7 +139,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   live one.** siphon picks its own branch, so a collision is not a peer
   retransmission — a blind `insert` destroyed a running transaction's timers and
   left its request unanswered.
-
 - **A header with an empty value no longer swallows the next header line.**
   RFC 3261 §25.1 has `SWS = [LWS]` and `LWS = [*WSP CRLF] 1*WSP` — a CRLF after
   the header colon is only whitespace when a space or tab follows it. siphon
@@ -115,7 +148,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   error** (RFC 3261 §7.5). The stream transports drain keepalives in their own
   read tasks, but the parser searched for the header/body boundary before
   skipping the prefix and so found the prefix itself.
-
 - **Bounded stream message size (`security.max_message_bytes`).** A peer on a
   stream transport (TCP/TLS/WS/WSS) could declare an arbitrarily large
   `Content-Length`, send only the header block, and make the reader buffer
@@ -135,7 +167,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   desynchronised the stream on a value the peer chose. The sum now saturates,
   so an unrepresentable declaration is refused as over-sized. Found by the new
   framing fuzz target.
-
 - **The ACK for a bridged re-INVITE was addressed to siphon itself.** RFC 3261
   §13.2.2.4 puts the responder's own remote target in the ACK's Request-URI, and
   siphon read it from the 200 OK — but only *after* `sanitize_b2bua_response` had
@@ -194,7 +225,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   it alone, as the CAP_NET_ADMIN tests already are. Alone it is exact: ambient
   0 B, 241664 B leaked, 0 B retained, every run. The guard is unchanged in what
   it proves.
-
 ## [1.7.1] — 2026-09-01
 
 ### Added

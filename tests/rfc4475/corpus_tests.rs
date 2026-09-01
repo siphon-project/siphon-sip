@@ -26,8 +26,12 @@
 //! * **§3.2 / §3.3 / §3.4** — `Expect::Parse`. §3.3 is explicitly
 //!   "Application-Layer Semantics": these messages parse and validate, and the
 //!   torture is above both (missing required header fields, unknown schemes,
-//!   multiple Content-Length, RFC 2543 syntax, ...). Refusing them here would
-//!   be wrong — the application layer decides the response.
+//!   RFC 2543 syntax, ...). Refusing them here would be wrong — the application
+//!   layer decides the response. The two exceptions are §3.3.8 and §3.3.9,
+//!   where the RFC names the response itself ("would respond with a 400 Bad
+//!   Request error" / "should respond with an error") rather than leaving it to
+//!   the application: a header field that may appear once appearing twice is
+//!   ambiguous to every hop, not just to this one, so it is refused.
 //!
 //! Note that this classification is *not* the same as the `_V` / `_I` suffix
 //! carried by the upstream filenames. That suffix records whether the source
@@ -48,7 +52,9 @@ use siphon::sip::validate::validate_message;
 enum Expect {
     /// Syntactically well-formed: the parser must accept it.
     Parse,
-    /// Syntactically invalid: the parser must reject it with an error.
+    /// Must not reach routing: refused either by the parser (syntactically
+    /// invalid) or by `validate_message` (parseable but invalid, which RFC 4475
+    /// §3.3 answers with a status rather than a parse failure).
     Reject,
 }
 
@@ -384,18 +390,41 @@ const CORPUS: &[Case] = &[
         expect: Expect::Parse,
         bytes: include_bytes!("corpus/TC_REGAUT01_V.dat"),
     },
+    // The two §3.3 cases where the RFC names a response rather than leaving it
+    // to the application layer, so the blanket "§3.3 → Parse" rule above does
+    // not hold for them. Both messages parse, and are then refused for carrying
+    // two of a header field that may only appear once:
+    //
+    //   §3.3.8 "An element receiving this request would respond with a 400 Bad
+    //           Request error."
+    //   §3.3.9 "An element receiving this message should respond with an error.
+    //           This request appeared over UDP, so the remainder of the datagram
+    //           can simply be discarded. If a request like this arrives over
+    //           TCP, the framing error is not recoverable, and the connection
+    //           should be closed."
+    //
+    // siphon answers 400 for both. It does NOT yet close the connection on the
+    // §3.3.9 TCP case — the dispatcher has no way to close an inbound stream
+    // connection, so that half of §3.3.9 is an open gap (the framing itself is
+    // consistent, since siphon's framer and parser both read the first
+    // Content-Length; what is unrecoverable is the disagreement with a peer
+    // that meant the second).
+    //
+    // Both were classified `Parse` while siphon had no duplicate check at all;
+    // the check now exists, so the classification follows the RFC rather than
+    // the implementation.
     Case {
         file: "TC_MULTI01_I.dat",
         section: "3.3.8",
         title: "Multiple Values in Single Value Required Fields",
-        expect: Expect::Parse,
+        expect: Expect::Reject,
         bytes: include_bytes!("corpus/TC_MULTI01_I.dat"),
     },
     Case {
         file: "TC_MCL01_I.dat",
         section: "3.3.9",
         title: "Multiple Content-Length Values",
-        expect: Expect::Parse,
+        expect: Expect::Reject,
         bytes: include_bytes!("corpus/TC_MCL01_I.dat"),
     },
     Case {

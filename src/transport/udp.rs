@@ -61,6 +61,32 @@ pub async fn listen(
                                 if !acl.is_allowed(remote_addr.ip()) {
                                     continue;
                                 }
+                                if size == buffer.len() {
+                                    // `recv_from` reports the bytes it copied,
+                                    // not the datagram's length, so a datagram
+                                    // that exactly fills the buffer is
+                                    // indistinguishable from one the kernel
+                                    // truncated. Say so rather than leaving an
+                                    // operator to work backwards from a parse
+                                    // error: RFC 3261 §18.1.1 requires a UAC to
+                                    // move to a congestion-controlled transport
+                                    // well below this size, so either way the
+                                    // peer is doing something it should not.
+                                    // The message is still processed — a
+                                    // genuinely truncated one is refused by the
+                                    // parser's Content-Length check (RFC 4475
+                                    // §3.1.2.2) rather than acted on.
+                                    warn!(
+                                        remote = %remote_addr,
+                                        bytes = size,
+                                        "UDP datagram filled the receive buffer — it may have been \
+                                         truncated by the kernel; the peer should be using TCP \
+                                         (RFC 3261 §18.1.1)"
+                                    );
+                                    if let Some(metrics) = crate::metrics::try_metrics() {
+                                        metrics.udp_datagrams_at_buffer_limit_total.inc();
+                                    }
+                                }
                                 buffer.truncate(size);
                                 let data = buffer.freeze();
 
