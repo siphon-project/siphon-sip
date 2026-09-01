@@ -15570,6 +15570,25 @@ fn handle_b2bua_response(
             message.headers.set("CSeq", cseq.clone());
         }
 
+        // The responder's OWN Contact, taken before the sanitize below overwrites
+        // it. That rewrite points Contact at siphon, which is right for the copy
+        // forwarded to the other leg — in-dialog requests have to come back here
+        // — but the ACK goes back to the responder, and RFC 3261 §13.2.2.4 wants
+        // its Request-URI to be that party's remote target. Reading it afterwards
+        // addressed the ACK to siphon's own URI, so the responder did not accept
+        // it and retransmitted its 200 until the retransmission handler above
+        // sent a second, correct ACK. Self-correcting, at the cost of a
+        // retransmit and the delay before it.
+        //
+        // The siphon-originated case was safe only because its response skips
+        // sanitize entirely; the bridged case — every ordinary hold and resume —
+        // was not.
+        let responder_contact = message
+            .headers
+            .get("Contact")
+            .or_else(|| message.headers.get("m"))
+            .cloned();
+
         // A-facing (is_a2b) response: anchor Contact to the A-leg's arrival socket;
         // B-facing: leave it to via_port (the B-side advertised address). Skipped
         // for a siphon-originated re-INVITE — its response is absorbed, not
@@ -15685,11 +15704,12 @@ fn handle_b2bua_response(
                     let cseq_num = responder_cseq_num.clone();
                     let from = message.headers.from().cloned().unwrap_or_default();
                     let to = message.headers.to().cloned().unwrap_or_default();
-                    // RURI: extract Contact from the 200 OK message directly
-                    // (RFC 3261 §12.2.1.1), with fallback to stored remote_contact.
-                    let ack_uri = message.headers.get("Contact")
-                        .or_else(|| message.headers.get("m"))
-                        .map(|c| crate::b2bua::actor::extract_contact_uri(c))
+                    // RURI: the responder's own Contact as it arrived (RFC 3261
+                    // §12.2.1.1), captured above before sanitize rewrote it to
+                    // siphon's address — reading `message` here addressed the ACK
+                    // to ourselves. Falls back to the stored remote_contact.
+                    let ack_uri = responder_contact.as_deref()
+                        .map(crate::b2bua::actor::extract_contact_uri)
                         .and_then(|u| parse_uri_standalone(&u).ok())
                         .or_else(|| if is_a2b {
                             b_leg_remote_contact.as_deref()
