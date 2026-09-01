@@ -6,11 +6,13 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.7.1] — 2026-09-01
+
 ### Added
-- **Codec manipulation on a media profile (`codec:`).** A profile
-  half can now restrict, reorder, drop or transcode codecs through rtpengine's
-  `codec` dictionary — `strip`, `offer`, `transcode`, `mask`, `consume`,
-  `accept`, `except`, `ignore` and `set`, each a list of RTP payload names:
+- **Codec manipulation on a media profile (`codec:`).** A profile half can now
+  restrict, reorder, drop or transcode codecs — `strip`, `offer`, `transcode`,
+  `mask`, `consume`, `accept`, `except`, `ignore` and `set`, each a list of RTP
+  payload names:
 
   ```yaml
   offer:
@@ -20,9 +22,9 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
       offer: ["PCMA", "PCMU", "telephone-event"]  # and in this order
   ```
 
-  Put it on the `offer:` half — rtpengine applies codec manipulation to the offer
-  and ignores most of it on an answer. It reaches the engine as its own nested
-  dict, not as tokens in `flags`, which the engine would drop.
+  Put it on the `offer:` half — both engines apply codec manipulation to the
+  offer and ignore most of it on an answer. It reaches rtpengine as its own
+  nested dict, not as tokens in `flags`, which the engine would drop.
 
   **One block, both real engines.** rtpengine takes the NG `codec` dictionary;
   the native `siphon-rtp` engine already implements the same model but reads it
@@ -40,8 +42,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   carry was not this shape and never did anything. That form now **fails the
   config load** instead of being silently ignored, and the example carries a real
   codec block.
-
-### Added
 - **`call.accept_refer(profile=…)` — the media profile for the pairing a
   transfer creates.** A media profile has two halves, and when they differ
   (`srtp_to_rtp` and every other SRTP/DTLS edge) they describe *specific sides*
