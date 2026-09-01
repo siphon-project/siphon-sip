@@ -1,14 +1,24 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  RTPEngine proxy UAS scenario:
+  Receive INVITE → 180 → 200 OK with SDP → ACK → BYE → 200
+
+  The INVITE SDP should have been rewritten by RTPEngine (offer direction).
+  We just answer normally — the proxy will rewrite our 200 OK SDP too (answer direction).
+-->
 <!--
   UAS for the control-plane A/B (siphon-rtp-native / siphon-rtp-ng): identical to
   rtpengine_uas.xml plus an assertion that the profile's `codec:` block was
   applied by the engine.
 
   The UAC offers `0 8 101` (PCMU, PCMA, telephone-event); the profile strips PCMA
-  and restricts the offer. rtpengine takes that as its NG `codec` dict and the
-  native engine reads it off the flag list siphon flattens it onto — both must
-  land here as the same restricted offer. A control plane that drops the policy
-  relays all three codecs and fails the run, which is the point: an unapplied
-  codec policy is otherwise invisible.
+  and restricts the offer. rtpengine takes that as its NG `codec` dict; the
+  native engine reads the same policy off the flag list siphon flattens it onto.
+  Both must land here as the same restricted offer — a control plane that drops
+  the policy relays all three codecs and fails the run, which is the point: an
+  unapplied codec policy is otherwise invisible.
 -->
 <scenario name="Media codec-policy UAS">
 
