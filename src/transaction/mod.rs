@@ -14,6 +14,7 @@ pub mod state;
 pub mod timer;
 
 use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 
 use crate::sip::headers::via::Via;
 use crate::sip::message::{Method, SipMessage, StartLine};
@@ -28,6 +29,21 @@ pub enum Transaction {
     Nict(Nict),
     Ist(Ist),
     Nist(Nist),
+}
+
+/// What [`TransactionManager::new_server_transaction`] did with a request.
+#[derive(Debug)]
+pub struct ServerTransactionOutcome {
+    /// The transaction key, whether or not this call created the transaction.
+    pub key: TransactionKey,
+    /// Initial actions (start timers, pass to the TU). Empty when `is_new` is
+    /// false — the worker that won the race already emitted them.
+    pub actions: Vec<Action>,
+    /// `false` when a transaction for this key already existed, i.e. another
+    /// worker is already processing this exact request. The caller must absorb
+    /// its copy: passing it to the TU as well runs the script twice and forks
+    /// the call twice downstream.
+    pub is_new: bool,
 }
 
 /// The transaction manager — holds all active transactions.
@@ -99,7 +115,7 @@ impl TransactionManager {
         &self,
         request: &SipMessage,
         transport: Transport,
-    ) -> Result<(TransactionKey, Vec<Action>), String> {
+    ) -> Result<ServerTransactionOutcome, String> {
         let key = Self::key_from_message(request)?;
 
         let method = match &request.start_line {
@@ -115,7 +131,7 @@ impl TransactionManager {
             Method::Ack => {
                 // ACK doesn't create its own transaction — it's matched to
                 // the existing INVITE transaction. Return empty actions.
-                return Ok((key, vec![]));
+                return Ok(ServerTransactionOutcome { key, actions: vec![], is_new: true });
             }
             _ => {
                 let (nist, mut actions) = Nist::new(request.clone(), transport, self.timers);
@@ -124,8 +140,25 @@ impl TransactionManager {
             }
         };
 
-        self.transactions.insert(key.clone(), transaction);
-        Ok((key, actions))
+        // Create atomically. The caller reaches here only after
+        // `handle_server_retransmit` reported no existing transaction, which
+        // makes the pair a check-then-act: two dispatcher workers handling the
+        // original and its retransmission concurrently both see "no
+        // transaction" and both get here. A blind `insert` let the second one
+        // overwrite the first's live state — dropping its cached response and
+        // timers — and, worse, both then passed the request to the TU, so the
+        // script ran twice and forked downstream twice on a fresh branch each
+        // time. Whoever inserts first owns the transaction; the loser is a
+        // duplicate of a request already in flight and must be absorbed.
+        match self.transactions.entry(key.clone()) {
+            Entry::Vacant(slot) => {
+                slot.insert(transaction);
+                Ok(ServerTransactionOutcome { key, actions, is_new: true })
+            }
+            Entry::Occupied(_) => {
+                Ok(ServerTransactionOutcome { key, actions: vec![], is_new: false })
+            }
+        }
     }
 
     /// Handle an incoming ACK by matching it to an existing INVITE server
@@ -238,8 +271,20 @@ impl TransactionManager {
             }
         };
 
-        self.transactions.insert(key.clone(), transaction);
-        Ok((key, actions))
+        // Same atomicity rule as the server side, but a collision here means
+        // something different: siphon picks its own branch (a fresh UUID), so
+        // an occupied slot is not a peer retransmission — it is a live
+        // transaction that a blind `insert` would silently destroy, losing its
+        // timers and leaving the request unanswered. Surface it instead.
+        match self.transactions.entry(key.clone()) {
+            Entry::Vacant(slot) => {
+                slot.insert(transaction);
+                Ok((key, actions))
+            }
+            Entry::Occupied(_) => Err(format!(
+                "a client transaction already exists for {key} — refusing to replace it"
+            )),
+        }
     }
 
     /// Pass an event to an existing server transaction.
@@ -395,7 +440,7 @@ mod tests {
     #[test]
     fn new_nist_server_transaction() {
         let manager = TransactionManager::default();
-        let (key, actions) = manager
+        let ServerTransactionOutcome { key, actions, .. } = manager
             .new_server_transaction(&options_request(), Transport::Udp)
             .unwrap();
         assert_eq!(key.method, Method::Options);
@@ -406,7 +451,7 @@ mod tests {
     #[test]
     fn new_ist_server_transaction() {
         let manager = TransactionManager::default();
-        let (key, actions) = manager
+        let ServerTransactionOutcome { key, actions, .. } = manager
             .new_server_transaction(&invite_request(), Transport::Udp)
             .unwrap();
         assert_eq!(key.method, Method::Invite);
@@ -417,7 +462,7 @@ mod tests {
     #[test]
     fn nist_full_lifecycle_via_manager() {
         let manager = TransactionManager::default();
-        let (key, _) = manager
+        let ServerTransactionOutcome { key, .. } = manager
             .new_server_transaction(&options_request(), Transport::Reliable)
             .unwrap();
         assert_eq!(manager.count(), 1);
@@ -466,16 +511,87 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_transaction_replaced() {
+    /// The first creation owns the transaction; a second one for the same key
+    /// is reported as a duplicate rather than replacing it.
+    ///
+    /// This used to assert the opposite ("same key → replaces"), which is the
+    /// wrong invariant for the race it models: replacing means the second
+    /// caller destroys the first's live state — cached response and running
+    /// timers — and both then pass the request to the TU.
+    fn duplicate_transaction_is_reported_not_replaced() {
+        let manager = TransactionManager::default();
+        let first = manager
+            .new_server_transaction(&options_request(), Transport::Udp)
+            .unwrap();
+        assert!(first.is_new);
+        assert!(!first.actions.is_empty(), "the winner emits the initial actions");
+        assert_eq!(manager.count(), 1);
+
+        let second = manager
+            .new_server_transaction(&options_request(), Transport::Udp)
+            .unwrap();
+        assert!(!second.is_new, "the second caller must not own the transaction");
+        assert!(
+            second.actions.is_empty(),
+            "a duplicate must emit no actions — the TU already has this request"
+        );
+        assert_eq!(second.key, first.key);
+        assert_eq!(manager.count(), 1);
+    }
+
+    /// The dispatcher checks `handle_server_retransmit` and then creates, which
+    /// is a check-then-act: two workers handling a request and its
+    /// retransmission concurrently both see "no transaction". Exactly one may
+    /// come back as the owner, however the threads interleave — otherwise the
+    /// script runs twice and the call forks twice downstream.
+    #[test]
+    fn concurrent_creation_yields_exactly_one_owner() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for _ in 0..200 {
+            let manager = Arc::new(TransactionManager::default());
+            let owners = Arc::new(AtomicUsize::new(0));
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let manager = Arc::clone(&manager);
+                    let owners = Arc::clone(&owners);
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        let outcome = manager
+                            .new_server_transaction(&invite_request(), Transport::Udp)
+                            .unwrap();
+                        if outcome.is_new {
+                            owners.fetch_add(1, Ordering::Relaxed);
+                        }
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+
+            assert_eq!(owners.load(Ordering::Relaxed), 1, "exactly one owner");
+            assert_eq!(manager.count(), 1, "exactly one transaction");
+        }
+    }
+
+    /// siphon picks its own branch, so a client-side key collision is not a
+    /// peer retransmission — it is a live transaction a blind insert would
+    /// silently destroy, leaving its request unanswered. Surfaced, not swallowed.
+    #[test]
+    fn duplicate_client_transaction_is_refused() {
         let manager = TransactionManager::default();
         manager
-            .new_server_transaction(&options_request(), Transport::Udp)
+            .new_client_transaction(options_request(), Transport::Udp)
             .unwrap();
-        assert_eq!(manager.count(), 1);
-        // Same message → same key → replaces
-        manager
-            .new_server_transaction(&options_request(), Transport::Udp)
-            .unwrap();
+        let error = manager
+            .new_client_transaction(options_request(), Transport::Udp)
+            .expect_err("a colliding client transaction must not replace the live one");
+        assert!(error.contains("already exists"), "unexpected error: {error}");
         assert_eq!(manager.count(), 1);
     }
 
@@ -524,7 +640,7 @@ mod tests {
         let manager = TransactionManager::default();
 
         // Create IST for INVITE
-        let (key, _) = manager
+        let ServerTransactionOutcome { key, .. } = manager
             .new_server_transaction(&invite_request(), Transport::Udp)
             .unwrap();
         assert_eq!(manager.count(), 1);
@@ -552,7 +668,7 @@ mod tests {
         // On reliable transport, Timer I is 0 → immediate termination
         let manager = TransactionManager::default();
 
-        let (key, _) = manager
+        let ServerTransactionOutcome { key, .. } = manager
             .new_server_transaction(&invite_request(), Transport::Reliable)
             .unwrap();
 
@@ -585,7 +701,7 @@ mod tests {
     fn handle_ack_retransmit_in_confirmed() {
         let manager = TransactionManager::default();
 
-        let (key, _) = manager
+        let ServerTransactionOutcome { key, .. } = manager
             .new_server_transaction(&invite_request(), Transport::Udp)
             .unwrap();
 
@@ -630,7 +746,7 @@ mod tests {
     #[test]
     fn handle_server_retransmit_nist_in_completed() {
         let manager = TransactionManager::default();
-        let (key, _) = manager
+        let ServerTransactionOutcome { key, .. } = manager
             .new_server_transaction(&options_request(), Transport::Udp)
             .unwrap();
         // Send a final response to move to Completed
@@ -650,7 +766,7 @@ mod tests {
     #[test]
     fn handle_server_retransmit_ist_in_proceeding() {
         let manager = TransactionManager::default();
-        let (key, _) = manager
+        let ServerTransactionOutcome { key, .. } = manager
             .new_server_transaction(&invite_request(), Transport::Udp)
             .unwrap();
         // Send 100 Trying

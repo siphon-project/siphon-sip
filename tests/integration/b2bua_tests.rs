@@ -734,7 +734,7 @@ fn server_transaction_lifecycle_options() {
         .unwrap();
 
     // Create server transaction
-    let (key, actions) = manager.new_server_transaction(&request, TxnTransport::Udp).unwrap();
+    let siphon::transaction::ServerTransactionOutcome { key, actions, .. } = manager.new_server_transaction(&request, TxnTransport::Udp).unwrap();
     assert_eq!(manager.count(), 1);
     assert!(actions.iter().any(|a| matches!(a, Action::PassToTu(_))));
 

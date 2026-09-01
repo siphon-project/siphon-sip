@@ -208,6 +208,13 @@ pub struct SiphonMetrics {
     /// (TCP/TLS) and dropped, each recorded toward the auto-ban. Excludes
     /// incomplete-but-plausible frames, empty connections, and CRLF keepalives.
     pub malformed_messages_total: IntCounter,
+    /// Total inbound requests whose topmost Via carried no `branch` parameter,
+    /// so no server transaction could be keyed for them (RFC 3261 §8.1.1.7
+    /// makes it mandatory). siphon has no RFC 2543 legacy matching, so these
+    /// are processed statelessly: their retransmissions are not absorbed and
+    /// each one runs the script again. A non-zero rate means a legacy or
+    /// broken peer is on the network.
+    pub requests_without_branch_total: IntCounter,
     /// Total inbound requests dropped because the source's User-Agent matched a
     /// `security.scanner_block` signature (sipvicious, friendly-scanner, …).
     pub scanner_blocked_total: IntCounter,
@@ -467,6 +474,11 @@ impl SiphonMetrics {
             "Total non-SIP / unparseable messages received on a stream transport (TCP/TLS) and dropped, each recorded toward the auto-ban",
         )?;
 
+        let requests_without_branch_total = IntCounter::new(
+            "siphon_requests_without_branch_total",
+            "Total inbound requests with no branch parameter in the topmost Via, processed statelessly because no server transaction can be keyed for them (no RFC 2543 legacy matching)",
+        )?;
+
         let scanner_blocked_total = IntCounter::new(
             "siphon_scanner_blocked_total",
             "Total inbound requests dropped because the source User-Agent matched a security.scanner_block signature",
@@ -641,6 +653,7 @@ impl SiphonMetrics {
         registry.register(Box::new(handshake_failures_total.clone()))?;
         registry.register(Box::new(credential_failures_total.clone()))?;
         registry.register(Box::new(malformed_messages_total.clone()))?;
+        registry.register(Box::new(requests_without_branch_total.clone()))?;
         registry.register(Box::new(scanner_blocked_total.clone()))?;
         registry.register(Box::new(rate_limited_total.clone()))?;
         registry.register(Box::new(firewall_commands_dropped_total.clone()))?;
@@ -699,6 +712,7 @@ impl SiphonMetrics {
             handshake_failures_total,
             credential_failures_total,
             malformed_messages_total,
+            requests_without_branch_total,
             scanner_blocked_total,
             rate_limited_total,
             firewall_commands_dropped_total,
