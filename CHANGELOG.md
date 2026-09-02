@@ -6,6 +6,25 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Fixed
+- **A retransmitted CANCEL is absorbed and answered 200, not 481.** RFC 3261
+  §9.2 makes a CANCEL a request with its own server transaction, which absorbs
+  retransmissions and answers them from its cached response. siphon intercepts
+  CANCEL *before* transaction creation, so that transaction never exists and
+  nothing absorbed the retransmission. On the proxy path the first CANCEL
+  removed the session, so the second fell through to `481 Call/Transaction Does
+  Not Exist` — for a CANCEL that had in fact been accepted, on a call already
+  487'd. Over UDP that is the ordinary case rather than an edge: Timer E
+  retransmits the CANCEL at 500 ms whenever the 200 is lost.
+
+  Worse in the narrow window before the session is removed, where a second copy
+  repeated the whole thing — re-forwarding the CANCEL downstream and putting a
+  **second 487 on one INVITE server transaction**, which §17.2.1 does not allow.
+  Acceptance is now recorded for 64×T1 (Timer J), the window that transaction
+  would have held its cached response. The B2BUA path already answered 200 to a
+  CANCEL for a call no longer Calling/Ringing and is unchanged.
+
+
 ### Security
 - **Refused bare CR/LF in a SIP header block, and closed five framer/parser
   disagreements it was hiding.** siphon's header-value scan runs to the next
