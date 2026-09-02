@@ -26,11 +26,7 @@ pub struct MediaSubComponent {
     #[serde(rename = "fStatus", default, skip_serializing_if = "Option::is_none")]
     pub f_status: Option<String>,
     /// Flow usage (`flowUsage`): "NO_INFO", "RTCP", "AF_SIGNALLING".
-    #[serde(
-        rename = "flowUsage",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "flowUsage", default, skip_serializing_if = "Option::is_none")]
     pub flow_usage: Option<String>,
 }
 
@@ -370,7 +366,10 @@ impl NpcfClient {
         let mut request = self
             .client
             .patch(&url)
-            .header(reqwest::header::CONTENT_TYPE, "application/merge-patch+json")
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/merge-patch+json",
+            )
             .body(patch_body);
         if let Some(ref apiroot) = target_apiroot {
             request = request.header(TARGET_APIROOT_HEADER, apiroot);
@@ -571,8 +570,14 @@ mod tests {
         // ueIpv4 lives under ascReqData, not at the top level.
         assert!(value.get("ueIpv4").is_none(), "{value}");
         let asc = value.get("ascReqData").expect("ascReqData envelope");
-        assert_eq!(asc.get("ueIpv4").and_then(|v| v.as_str()), Some("100.65.0.4"));
-        assert_eq!(asc.get("afAppId").and_then(|v| v.as_str()), Some("IMS Services"));
+        assert_eq!(
+            asc.get("ueIpv4").and_then(|v| v.as_str()),
+            Some("100.65.0.4")
+        );
+        assert_eq!(
+            asc.get("afAppId").and_then(|v| v.as_str()),
+            Some("IMS Services")
+        );
         assert_eq!(
             asc.get("supi").and_then(|v| v.as_str()),
             Some("imsi-001010000000001")
@@ -690,7 +695,9 @@ mod tests {
         assert!(is_absolute_http_url("http://pcf/x"));
         assert!(is_absolute_http_url("https://pcf/x"));
         assert!(!is_absolute_http_url("sess-abc-123"));
-        assert!(!is_absolute_http_url("/npcf-policyauthorization/v1/app-sessions/1"));
+        assert!(!is_absolute_http_url(
+            "/npcf-policyauthorization/v1/app-sessions/1"
+        ));
     }
 
     #[test]
@@ -806,9 +813,7 @@ mod tests {
         // Location resolved against the target base.
         assert_eq!(
             created.location.as_deref(),
-            Some(
-                format!("{base}/npcf-policyauthorization/v1/app-sessions/sess-xyz").as_str()
-            )
+            Some(format!("{base}/npcf-policyauthorization/v1/app-sessions/sess-xyz").as_str())
         );
     }
 
@@ -823,9 +828,7 @@ mod tests {
         assert!(created.authorized);
         assert_eq!(
             created.location.as_deref(),
-            Some(
-                format!("{base}/npcf-policyauthorization/v1/app-sessions/sess-xyz").as_str()
-            )
+            Some(format!("{base}/npcf-policyauthorization/v1/app-sessions/sess-xyz").as_str())
         );
     }
 
@@ -968,7 +971,9 @@ mod tests {
         let med = asc.get("medComponents").expect("medComponents present");
         assert!(med.is_object(), "medComponents must be a map: {body}");
         assert_eq!(
-            med.get("1").and_then(|c| c.get("medCompN")).and_then(|v| v.as_u64()),
+            med.get("1")
+                .and_then(|c| c.get("medCompN"))
+                .and_then(|v| v.as_u64()),
             Some(1),
             "component keyed by medCompN: {body}"
         );

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use siphon::presence::pidf::{BasicStatus, PresenceBody, Tuple, compose};
+use siphon::presence::pidf::{compose, BasicStatus, PresenceBody, Tuple};
 use siphon::presence::{PresenceDocument, PresenceStore, Subscription, SubscriptionState};
 
 // ---------------------------------------------------------------------------
@@ -44,7 +44,8 @@ fn make_short_lived_subscription(id: &str, resource: &str, expires: Duration) ->
 
 #[test]
 fn subscription_init_to_active_to_terminated() {
-    let mut subscription = make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
+    let mut subscription =
+        make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
     assert_eq!(subscription.state, SubscriptionState::Init);
 
     subscription.activate();
@@ -56,7 +57,8 @@ fn subscription_init_to_active_to_terminated() {
 
 #[test]
 fn subscription_activate_after_terminated_is_noop() {
-    let mut subscription = make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
+    let mut subscription =
+        make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
     subscription.terminate();
     subscription.activate();
     assert_eq!(subscription.state, SubscriptionState::Terminated);
@@ -64,7 +66,8 @@ fn subscription_activate_after_terminated_is_noop() {
 
 #[test]
 fn subscription_refresh_resets_timer_and_duration() {
-    let mut subscription = make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
+    let mut subscription =
+        make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
     subscription.activate();
 
     let before = std::time::Instant::now();
@@ -76,7 +79,8 @@ fn subscription_refresh_resets_timer_and_duration() {
 
 #[test]
 fn subscription_refresh_after_terminated_is_noop() {
-    let mut subscription = make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
+    let mut subscription =
+        make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
     subscription.terminate();
     let original_expires = subscription.expires;
     subscription.refresh(Duration::from_secs(7200));
@@ -96,7 +100,8 @@ fn subscription_not_expired_when_fresh() {
 
 #[test]
 fn subscription_expired_with_zero_duration() {
-    let subscription = make_short_lived_subscription("sub-1", "sip:bob@example.com", Duration::ZERO);
+    let subscription =
+        make_short_lived_subscription("sub-1", "sip:bob@example.com", Duration::ZERO);
     assert!(subscription.is_expired());
     assert_eq!(subscription.remaining_seconds(), 0);
 }
@@ -156,7 +161,11 @@ fn store_subscriptions_for_excludes_terminated() {
     let mut sub1 = make_subscription("sub-active", "sip:alice@example.com", resource);
     sub1.activate();
     store.add_subscription(sub1);
-    store.add_subscription(make_subscription("sub-terminated", "sip:carol@example.com", resource));
+    store.add_subscription(make_subscription(
+        "sub-terminated",
+        "sip:carol@example.com",
+        resource,
+    ));
 
     store.terminate_subscription("sub-terminated");
 
@@ -291,14 +300,26 @@ fn expire_stale_removes_expired_and_terminated() {
     let resource = "sip:bob@example.com";
 
     // Expired subscription (zero duration).
-    store.add_subscription(make_short_lived_subscription("sub-expired", resource, Duration::ZERO));
+    store.add_subscription(make_short_lived_subscription(
+        "sub-expired",
+        resource,
+        Duration::ZERO,
+    ));
 
     // Terminated subscription.
-    store.add_subscription(make_subscription("sub-terminated", "sip:term@example.com", resource));
+    store.add_subscription(make_subscription(
+        "sub-terminated",
+        "sip:term@example.com",
+        resource,
+    ));
     store.terminate_subscription("sub-terminated");
 
     // Living subscription.
-    store.add_subscription(make_subscription("sub-alive", "sip:alice@example.com", resource));
+    store.add_subscription(make_subscription(
+        "sub-alive",
+        "sip:alice@example.com",
+        resource,
+    ));
 
     // Expired document.
     store.publish(
@@ -361,7 +382,10 @@ fn pidf_xml_generation_and_parse_roundtrip() {
     assert_eq!(parsed.tuples.len(), 1);
     assert_eq!(parsed.tuples[0].id, "t1");
     assert_eq!(parsed.tuples[0].status, BasicStatus::Open);
-    assert_eq!(parsed.tuples[0].contact.as_deref(), Some("sip:alice@10.0.0.1"));
+    assert_eq!(
+        parsed.tuples[0].contact.as_deref(),
+        Some("sip:alice@10.0.0.1")
+    );
     assert_eq!(parsed.tuples[0].note.as_deref(), Some("Online"));
 }
 

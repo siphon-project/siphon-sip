@@ -5,16 +5,19 @@
 
 use std::time::Duration;
 
-use crate::sip::message::{SipMessage, Method, StartLine};
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::headers::nameaddr::NameAddr;
+use crate::sip::message::{Method, SipMessage, StartLine};
 use crate::transaction::timer::TimerConfig;
 
 /// Generate a random URL-safe To-tag for UAS-built responses
 /// (RFC 3261 §19.3 — token chars; §8.2.6.2 — UAS-stamped on all responses
 /// except 100 Trying).
 pub fn generate_uas_to_tag() -> String {
-    format!("siphon-{}", &uuid::Uuid::new_v4().as_simple().to_string()[..12])
+    format!(
+        "siphon-{}",
+        &uuid::Uuid::new_v4().as_simple().to_string()[..12]
+    )
 }
 
 /// Stamp a UAS-side `tag=` onto the response's `To:` header if it is missing,
@@ -37,8 +40,12 @@ fn stamp_uas_to_tag(response: &mut SipMessage, cache: &mut Option<String>) {
         return;
     }
 
-    let Some(to_value) = response.headers.to().cloned() else { return; };
-    let Ok(mut name_addr) = NameAddr::parse(&to_value) else { return; };
+    let Some(to_value) = response.headers.to().cloned() else {
+        return;
+    };
+    let Ok(mut name_addr) = NameAddr::parse(&to_value) else {
+        return;
+    };
     if name_addr.tag.is_some() {
         return;
     }
@@ -95,13 +102,16 @@ pub enum Action {
 /// Named timers used across all state machines.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TimerName {
-    A, B,       // ICT
-    D,          // ICT
-    E, F,       // NICT
-    K,          // NICT
-    G, H,       // IST
-    I,          // IST
-    J,          // NIST
+    A,
+    B, // ICT
+    D, // ICT
+    E,
+    F, // NICT
+    K, // NICT
+    G,
+    H, // IST
+    I, // IST
+    J, // NIST
     /// Auto-100 Trying delay for the non-INVITE server transaction (NIST).
     /// Not in RFC 3261, but mirrors §17.2.1's 200 ms IST timer to suppress
     /// UAC retransmits on slow non-INVITE relays (§17.1.2).
@@ -437,7 +447,10 @@ impl Ist {
                     Transport::Udp => self.timers.timer_i_udp(),
                     Transport::Reliable => self.timers.timer_i_tcp(),
                 };
-                let mut actions = vec![Action::CancelTimer(TimerName::G), Action::CancelTimer(TimerName::H)];
+                let mut actions = vec![
+                    Action::CancelTimer(TimerName::G),
+                    Action::CancelTimer(TimerName::H),
+                ];
                 if timer_i.is_zero() {
                     self.state = IstState::Terminated;
                     actions.push(Action::Terminated);
@@ -510,7 +523,11 @@ pub struct Nict {
 
 impl Nict {
     /// Create and start a new NICT. Returns the initial actions (send request, start timers).
-    pub fn new(request: SipMessage, transport: Transport, timers: TimerConfig) -> (Self, Vec<Action>) {
+    pub fn new(
+        request: SipMessage,
+        transport: Transport,
+        timers: TimerConfig,
+    ) -> (Self, Vec<Action>) {
         let timer_e_interval = timers.timer_e_initial();
         let nict = Self {
             state: NictState::Trying,
@@ -542,7 +559,11 @@ impl Nict {
             }
             (NictState::Trying, NictEvent::TimerF) => {
                 self.state = NictState::Terminated;
-                vec![Action::CancelTimer(TimerName::E), Action::Timeout, Action::Terminated]
+                vec![
+                    Action::CancelTimer(TimerName::E),
+                    Action::Timeout,
+                    Action::Terminated,
+                ]
             }
             (NictState::Trying, NictEvent::Provisional(response)) => {
                 self.state = NictState::Proceeding;
@@ -578,7 +599,11 @@ impl Nict {
             }
             (NictState::Proceeding, NictEvent::TimerF) => {
                 self.state = NictState::Terminated;
-                vec![Action::CancelTimer(TimerName::E), Action::Timeout, Action::Terminated]
+                vec![
+                    Action::CancelTimer(TimerName::E),
+                    Action::Timeout,
+                    Action::Terminated,
+                ]
             }
             (NictState::Proceeding, NictEvent::Provisional(response)) => {
                 vec![Action::PassToTu(response)]
@@ -669,7 +694,11 @@ pub struct Ict {
 
 impl Ict {
     /// Create and start a new ICT. Returns the initial actions.
-    pub fn new(request: SipMessage, transport: Transport, timers: TimerConfig) -> (Self, Vec<Action>) {
+    pub fn new(
+        request: SipMessage,
+        transport: Transport,
+        timers: TimerConfig,
+    ) -> (Self, Vec<Action>) {
         let timer_a_interval = timers.timer_a_initial();
         let ict = Self {
             state: IctState::Calling,
@@ -767,12 +796,19 @@ impl Ict {
             }
             (IctState::Calling, IctEvent::TimerB) => {
                 self.state = IctState::Terminated;
-                vec![Action::CancelTimer(TimerName::A), Action::Timeout, Action::Terminated]
+                vec![
+                    Action::CancelTimer(TimerName::A),
+                    Action::Timeout,
+                    Action::Terminated,
+                ]
             }
             (IctState::Calling, IctEvent::Provisional(response)) => {
                 // RFC 3261 §17.1.1.2: provisional response stops retransmissions
                 self.state = IctState::Proceeding;
-                vec![Action::CancelTimer(TimerName::A), Action::PassToTu(response)]
+                vec![
+                    Action::CancelTimer(TimerName::A),
+                    Action::PassToTu(response),
+                ]
             }
             (IctState::Calling, IctEvent::Response2xx(response)) => {
                 // 2xx to INVITE: transaction layer steps aside
@@ -923,7 +959,10 @@ mod tests {
 
     fn dummy_invite() -> SipMessage {
         SipMessageBuilder::new()
-            .request(Method::Invite, SipUri::new("biloxi.com".to_string()).with_user("bob".to_string()))
+            .request(
+                Method::Invite,
+                SipUri::new("biloxi.com".to_string()).with_user("bob".to_string()),
+            )
             .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-inv".to_string())
             .to("<sip:bob@biloxi.com>".to_string())
             .from("<sip:alice@atlanta.com>;tag=xyz".to_string())
@@ -968,11 +1007,17 @@ mod tests {
     }
 
     fn has_timer(actions: &[Action], name: TimerName) -> bool {
-        has_action(actions, |a| matches!(a, Action::StartTimer(n, _) if *n == name))
+        has_action(
+            actions,
+            |a| matches!(a, Action::StartTimer(n, _) if *n == name),
+        )
     }
 
     fn has_cancel_timer(actions: &[Action], name: TimerName) -> bool {
-        has_action(actions, |a| matches!(a, Action::CancelTimer(n) if *n == name))
+        has_action(
+            actions,
+            |a| matches!(a, Action::CancelTimer(n) if *n == name),
+        )
     }
 
     // =======================================================================
@@ -1119,10 +1164,13 @@ mod tests {
         let (mut nist, _) = nist_auto_100(Transport::Udp);
         let actions = nist.process(NistEvent::Trying100Fired);
         assert_eq!(nist.state, NistState::Proceeding);
-        let response = actions.iter().find_map(|a| match a {
-            Action::SendMessage(message) => Some(message),
-            _ => None,
-        }).expect("expected SendMessage");
+        let response = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::SendMessage(message) => Some(message),
+                _ => None,
+            })
+            .expect("expected SendMessage");
         match &response.start_line {
             StartLine::Response(status_line) => {
                 assert_eq!(status_line.status_code, 100);
@@ -1174,9 +1222,10 @@ mod tests {
     /// Extract `;tag=` from the To header of the most recent `SendMessage`.
     fn sent_to_tag(actions: &[Action]) -> Option<String> {
         actions.iter().rev().find_map(|a| match a {
-            Action::SendMessage(message) => message.headers.to().and_then(|to| {
-                NameAddr::parse(to).ok().and_then(|na| na.tag)
-            }),
+            Action::SendMessage(message) => message
+                .headers
+                .to()
+                .and_then(|to| NameAddr::parse(to).ok().and_then(|na| na.tag)),
             _ => None,
         })
     }
@@ -1195,7 +1244,9 @@ mod tests {
     fn nist_uas_to_tag_preserves_existing_tag() {
         let mut nist = nist_no_auto_100(Transport::Udp);
         let mut response = dummy_response(200, "OK");
-        response.headers.set("To", "<sip:example.com>;tag=preset-tag-123".to_string());
+        response
+            .headers
+            .set("To", "<sip:example.com>;tag=preset-tag-123".to_string());
         let actions = nist.process(NistEvent::TuFinal(response));
         assert_eq!(sent_to_tag(&actions).as_deref(), Some("preset-tag-123"));
         // Cache stays empty — script supplied the tag, we never generated one.
@@ -1209,7 +1260,10 @@ mod tests {
         let final_actions = nist.process(NistEvent::TuFinal(dummy_response(200, "OK")));
         let prov_tag = sent_to_tag(&prov_actions).expect("provisional must have tag");
         let final_tag = sent_to_tag(&final_actions).expect("final must have tag");
-        assert_eq!(prov_tag, final_tag, "RFC 3261 §8.2.6.2: same tag across all responses");
+        assert_eq!(
+            prov_tag, final_tag,
+            "RFC 3261 §8.2.6.2: same tag across all responses"
+        );
     }
 
     #[test]
@@ -1277,7 +1331,9 @@ mod tests {
     fn ist_uas_to_tag_preserves_existing_tag() {
         let mut ist = Ist::new(Transport::Udp, TimerConfig::default());
         let mut response = dummy_response(200, "OK");
-        response.headers.set("To", "<sip:bob@biloxi.com>;tag=script-set-tag".to_string());
+        response
+            .headers
+            .set("To", "<sip:bob@biloxi.com>;tag=script-set-tag".to_string());
         let actions = ist.process(IstEvent::Tu2xx(response));
         assert_eq!(sent_to_tag(&actions).as_deref(), Some("script-set-tag"));
         assert!(ist.uas_to_tag.is_none());
@@ -1464,7 +1520,10 @@ mod tests {
         let actions = nict.process(NictEvent::TimerE);
         // In Proceeding, Timer E fires at T2 interval
         assert!(has_send(&actions));
-        assert!(has_action(&actions, |a| matches!(a, Action::StartTimer(TimerName::E, d) if *d == Duration::from_secs(4))));
+        assert!(has_action(
+            &actions,
+            |a| matches!(a, Action::StartTimer(TimerName::E, d) if *d == Duration::from_secs(4))
+        ));
     }
 
     // =======================================================================
@@ -1532,7 +1591,10 @@ mod tests {
         let (mut ict, _) = Ict::new(dummy_invite(), Transport::Udp, TimerConfig::default());
         let actions = ict.process(IctEvent::ResponseNon2xx(dummy_response(486, "Busy Here")));
         assert_eq!(ict.state, IctState::Completed);
-        assert!(has_send(&actions), "ICT must generate ACK for non-2xx (RFC 3261 §17.1.1.3)");
+        assert!(
+            has_send(&actions),
+            "ICT must generate ACK for non-2xx (RFC 3261 §17.1.1.3)"
+        );
         assert!(has_pass_to_tu(&actions));
         assert!(has_timer(&actions, TimerName::D));
     }
@@ -1542,7 +1604,10 @@ mod tests {
         let (mut ict, _) = Ict::new(dummy_invite(), Transport::Reliable, TimerConfig::default());
         let actions = ict.process(IctEvent::ResponseNon2xx(dummy_response(486, "Busy Here")));
         assert_eq!(ict.state, IctState::Terminated);
-        assert!(has_send(&actions), "ICT must generate ACK for non-2xx (RFC 3261 §17.1.1.3)");
+        assert!(
+            has_send(&actions),
+            "ICT must generate ACK for non-2xx (RFC 3261 §17.1.1.3)"
+        );
         assert!(has_pass_to_tu(&actions));
         assert!(has_terminated(&actions));
     }
@@ -1594,7 +1659,10 @@ mod tests {
         let actions = ict.process(IctEvent::ResponseNon2xx(response));
 
         assert_eq!(ict.state, IctState::Completed);
-        assert!(has_send(&actions), "ACK with fallback To must still be sent");
+        assert!(
+            has_send(&actions),
+            "ACK with fallback To must still be sent"
+        );
         assert!(!has_protocol_error(&actions));
     }
 
@@ -1614,7 +1682,10 @@ mod tests {
         ict.process(IctEvent::ResponseNon2xx(dummy_response(486, "Busy Here")));
         let actions = ict.process(IctEvent::ResponseNon2xx(dummy_response(486, "Busy Here")));
         assert_eq!(actions.len(), 1);
-        assert!(has_send(&actions), "retransmitted non-2xx must trigger ACK retransmission");
+        assert!(
+            has_send(&actions),
+            "retransmitted non-2xx must trigger ACK retransmission"
+        );
     }
 
     #[test]
@@ -1633,7 +1704,10 @@ mod tests {
         ict.process(IctEvent::Provisional(dummy_response(180, "Ringing")));
         let actions = ict.process(IctEvent::ResponseNon2xx(dummy_response(603, "Decline")));
         assert_eq!(ict.state, IctState::Completed);
-        assert!(has_send(&actions), "ICT must generate ACK for non-2xx from Proceeding");
+        assert!(
+            has_send(&actions),
+            "ICT must generate ACK for non-2xx from Proceeding"
+        );
         assert!(has_pass_to_tu(&actions));
     }
 
@@ -1680,7 +1754,10 @@ mod tests {
 
         // Stale Timer A fire should produce no actions (no retransmit)
         let actions = ict.process(IctEvent::TimerA);
-        assert!(actions.is_empty(), "Timer A in Proceeding must not retransmit");
+        assert!(
+            actions.is_empty(),
+            "Timer A in Proceeding must not retransmit"
+        );
     }
 
     /// Verify Timer A is cancelled when a non-2xx final response arrives

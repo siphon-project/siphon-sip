@@ -296,16 +296,23 @@ mod tests {
         let addr: SocketAddr = "10.0.0.5:5000".parse().unwrap();
 
         // Client asserts the WRONG Origin-Host.
-        client_side.write_all(&client_cer("spoofed.example.org")).await.unwrap();
+        client_side
+            .write_all(&client_cer("spoofed.example.org"))
+            .await
+            .unwrap();
 
-        let result = handshake.run(server_side, addr, incoming_tx, accept_resolver).await;
+        let result = handshake
+            .run(server_side, addr, incoming_tx, accept_resolver)
+            .await;
         assert!(matches!(
             result,
             Err(HandshakeError::OriginHostMismatch { .. })
         ));
 
         // A CEA with 3010 must have been written back.
-        let cea_bytes = codec::read_diameter_message(&mut client_side).await.unwrap();
+        let cea_bytes = codec::read_diameter_message(&mut client_side)
+            .await
+            .unwrap();
         let cea = codec::decode_diameter(&cea_bytes).unwrap();
         assert!(!cea.is_request);
         assert_eq!(
@@ -324,7 +331,10 @@ mod tests {
         let (incoming_tx, mut incoming_rx) = mpsc::channel(8);
         let addr: SocketAddr = "10.0.0.7:5000".parse().unwrap();
 
-        client_side.write_all(&client_cer("mme.epc.example.org")).await.unwrap();
+        client_side
+            .write_all(&client_cer("mme.epc.example.org"))
+            .await
+            .unwrap();
 
         let (peer, acl_match) = handshake
             .run(server_side, addr, incoming_tx, accept_resolver)
@@ -336,7 +346,9 @@ mod tests {
         assert_eq!(peer.config().origin_host, "diam.epc.example.org");
 
         // Read the success CEA off the wire.
-        let cea_bytes = codec::read_diameter_message(&mut client_side).await.unwrap();
+        let cea_bytes = codec::read_diameter_message(&mut client_side)
+            .await
+            .unwrap();
         let cea = codec::decode_diameter(&cea_bytes).unwrap();
         assert_eq!(
             cea.avps.get("Result-Code").and_then(|v| v.as_u64()),
@@ -372,13 +384,21 @@ mod tests {
         let (server_side, mut client_side) = tokio::io::duplex(8192);
         let (incoming_tx, _rx) = mpsc::channel(8);
         let addr: SocketAddr = "10.0.0.8:5000".parse().unwrap();
-        client_side.write_all(&client_cer("mme.epc.example.org")).await.unwrap();
+        client_side
+            .write_all(&client_cer("mme.epc.example.org"))
+            .await
+            .unwrap();
 
-        let reject = |_m: &AclMatch, _a: &str| CerDecision::Reject(dictionary::DIAMETER_UNABLE_TO_COMPLY);
+        let reject =
+            |_m: &AclMatch, _a: &str| CerDecision::Reject(dictionary::DIAMETER_UNABLE_TO_COMPLY);
         let result = handshake.run(server_side, addr, incoming_tx, reject).await;
-        assert!(matches!(result, Err(HandshakeError::Rejected(c)) if c == dictionary::DIAMETER_UNABLE_TO_COMPLY));
+        assert!(
+            matches!(result, Err(HandshakeError::Rejected(c)) if c == dictionary::DIAMETER_UNABLE_TO_COMPLY)
+        );
 
-        let cea_bytes = codec::read_diameter_message(&mut client_side).await.unwrap();
+        let cea_bytes = codec::read_diameter_message(&mut client_side)
+            .await
+            .unwrap();
         let cea = codec::decode_diameter(&cea_bytes).unwrap();
         assert_eq!(
             cea.avps.get("Result-Code").and_then(|v| v.as_u64()),

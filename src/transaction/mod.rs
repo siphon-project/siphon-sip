@@ -13,8 +13,8 @@ pub mod key;
 pub mod state;
 pub mod timer;
 
-use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
 
 use crate::sip::headers::via::Via;
 use crate::sip::message::{Method, SipMessage, StartLine};
@@ -126,12 +126,19 @@ impl TransactionManager {
         let (transaction, actions) = match method {
             Method::Invite => {
                 let ist = Ist::new(transport, self.timers);
-                (Transaction::Ist(ist), vec![Action::PassToTu(request.clone())])
+                (
+                    Transaction::Ist(ist),
+                    vec![Action::PassToTu(request.clone())],
+                )
             }
             Method::Ack => {
                 // ACK doesn't create its own transaction — it's matched to
                 // the existing INVITE transaction. Return empty actions.
-                return Ok(ServerTransactionOutcome { key, actions: vec![], is_new: true });
+                return Ok(ServerTransactionOutcome {
+                    key,
+                    actions: vec![],
+                    is_new: true,
+                });
             }
             _ => {
                 let (nist, mut actions) = Nist::new(request.clone(), transport, self.timers);
@@ -153,11 +160,17 @@ impl TransactionManager {
         match self.transactions.entry(key.clone()) {
             Entry::Vacant(slot) => {
                 slot.insert(transaction);
-                Ok(ServerTransactionOutcome { key, actions, is_new: true })
+                Ok(ServerTransactionOutcome {
+                    key,
+                    actions,
+                    is_new: true,
+                })
             }
-            Entry::Occupied(_) => {
-                Ok(ServerTransactionOutcome { key, actions: vec![], is_new: false })
-            }
+            Entry::Occupied(_) => Ok(ServerTransactionOutcome {
+                key,
+                actions: vec![],
+                is_new: false,
+            }),
         }
     }
 
@@ -183,9 +196,7 @@ impl TransactionManager {
         };
 
         let actions = match &mut *entry {
-            Transaction::Ist(ist) => {
-                ist.process(IstEvent::AckReceived(request.clone()))
-            }
+            Transaction::Ist(ist) => ist.process(IstEvent::AckReceived(request.clone())),
             _ => {
                 // Not an IST — nothing to absorb
                 return Ok(None);
@@ -223,12 +234,8 @@ impl TransactionManager {
         };
 
         let actions = match &mut *entry {
-            Transaction::Ist(ist) => {
-                ist.process(IstEvent::InviteRetransmit(request.clone()))
-            }
-            Transaction::Nist(nist) => {
-                nist.process(NistEvent::RequestRetransmit(request.clone()))
-            }
+            Transaction::Ist(ist) => ist.process(IstEvent::InviteRetransmit(request.clone())),
+            Transaction::Nist(nist) => nist.process(NistEvent::RequestRetransmit(request.clone())),
             _ => {
                 // Client transactions shouldn't be here for a server retransmit
                 return Ok(None);
@@ -346,7 +353,9 @@ impl TransactionManager {
 
     /// Remove a transaction (e.g. on cleanup).
     pub fn remove(&self, key: &TransactionKey) -> Option<Transaction> {
-        self.transactions.remove(key).map(|(_, transaction)| transaction)
+        self.transactions
+            .remove(key)
+            .map(|(_, transaction)| transaction)
     }
 }
 
@@ -469,10 +478,7 @@ mod tests {
 
         // TU sends 200 OK — TCP: immediate termination
         let actions = manager
-            .process_server_event(
-                &key,
-                ServerEvent::Nist(NistEvent::TuFinal(response_200())),
-            )
+            .process_server_event(&key, ServerEvent::Nist(NistEvent::TuFinal(response_200())))
             .unwrap();
 
         assert!(actions.iter().any(|a| matches!(a, Action::SendMessage(_))));
@@ -524,13 +530,19 @@ mod tests {
             .new_server_transaction(&options_request(), Transport::Udp)
             .unwrap();
         assert!(first.is_new);
-        assert!(!first.actions.is_empty(), "the winner emits the initial actions");
+        assert!(
+            !first.actions.is_empty(),
+            "the winner emits the initial actions"
+        );
         assert_eq!(manager.count(), 1);
 
         let second = manager
             .new_server_transaction(&options_request(), Transport::Udp)
             .unwrap();
-        assert!(!second.is_new, "the second caller must not own the transaction");
+        assert!(
+            !second.is_new,
+            "the second caller must not own the transaction"
+        );
         assert!(
             second.actions.is_empty(),
             "a duplicate must emit no actions — the TU already has this request"
@@ -546,8 +558,8 @@ mod tests {
     /// script runs twice and the call forks twice downstream.
     #[test]
     fn concurrent_creation_yields_exactly_one_owner() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
 
         for _ in 0..200 {
             let manager = Arc::new(TransactionManager::default());
@@ -591,18 +603,22 @@ mod tests {
         let error = manager
             .new_client_transaction(options_request(), Transport::Udp)
             .expect_err("a colliding client transaction must not replace the live one");
-        assert!(error.contains("already exists"), "unexpected error: {error}");
+        assert!(
+            error.contains("already exists"),
+            "unexpected error: {error}"
+        );
         assert_eq!(manager.count(), 1);
     }
 
     #[test]
     fn unknown_key_returns_error() {
         let manager = TransactionManager::default();
-        let key = TransactionKey::new("z9hG4bK-nonexistent".to_string(), Method::Options, "10.0.0.1:5060".to_string());
-        let result = manager.process_server_event(
-            &key,
-            ServerEvent::Nist(NistEvent::TimerJ),
+        let key = TransactionKey::new(
+            "z9hG4bK-nonexistent".to_string(),
+            Method::Options,
+            "10.0.0.1:5060".to_string(),
         );
+        let result = manager.process_server_event(&key, ServerEvent::Nist(NistEvent::TimerJ));
         assert!(result.is_err());
     }
 
@@ -720,13 +736,18 @@ mod tests {
         let result = manager.handle_ack(&ack_for_invite()).unwrap();
         assert!(result.is_some());
         let (_, actions) = result.unwrap();
-        assert!(actions.is_empty(), "ACK retransmit in Confirmed should be silently absorbed");
+        assert!(
+            actions.is_empty(),
+            "ACK retransmit in Confirmed should be silently absorbed"
+        );
     }
 
     #[test]
     fn handle_server_retransmit_no_existing_transaction() {
         let manager = TransactionManager::default();
-        let result = manager.handle_server_retransmit(&options_request()).unwrap();
+        let result = manager
+            .handle_server_retransmit(&options_request())
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -737,7 +758,9 @@ mod tests {
             .new_server_transaction(&options_request(), Transport::Udp)
             .unwrap();
         // Retransmit while in Trying: absorbed silently (no response cached yet)
-        let result = manager.handle_server_retransmit(&options_request()).unwrap();
+        let result = manager
+            .handle_server_retransmit(&options_request())
+            .unwrap();
         assert!(result.is_some());
         let (_key, actions) = result.unwrap();
         assert!(actions.is_empty()); // NIST in Trying absorbs retransmit
@@ -751,13 +774,12 @@ mod tests {
             .unwrap();
         // Send a final response to move to Completed
         manager
-            .process_server_event(
-                &key,
-                ServerEvent::Nist(NistEvent::TuFinal(response_200())),
-            )
+            .process_server_event(&key, ServerEvent::Nist(NistEvent::TuFinal(response_200())))
             .unwrap();
         // Now retransmit should resend the cached response
-        let result = manager.handle_server_retransmit(&options_request()).unwrap();
+        let result = manager
+            .handle_server_retransmit(&options_request())
+            .unwrap();
         assert!(result.is_some());
         let (_key, actions) = result.unwrap();
         assert!(actions.iter().any(|a| matches!(a, Action::SendMessage(_))));
@@ -781,10 +803,7 @@ mod tests {
             .build()
             .unwrap();
         manager
-            .process_server_event(
-                &key,
-                ServerEvent::Ist(IstEvent::TuProvisional(trying)),
-            )
+            .process_server_event(&key, ServerEvent::Ist(IstEvent::TuProvisional(trying)))
             .unwrap();
         // Retransmit of INVITE should resend the cached provisional
         let result = manager.handle_server_retransmit(&invite_request()).unwrap();

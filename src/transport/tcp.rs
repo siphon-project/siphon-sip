@@ -15,11 +15,17 @@ use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
-use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, configure_tcp_socket, next_connection_id};
 use crate::transport::acl::TransportAcl;
 use crate::transport::crlf_keepalive::CrlfPongTracker;
 use crate::transport::pool::ConnectionPool;
-use crate::transport::stream::{bind_tcp_listener, serve_sip_stream, sniff_sip_or_drop, spawn_outbound_distributor, StreamContext};
+use crate::transport::stream::{
+    bind_tcp_listener, serve_sip_stream, sniff_sip_or_drop, spawn_outbound_distributor,
+    StreamContext,
+};
+use crate::transport::{
+    configure_tcp_socket, next_connection_id, ConnectionId, InboundMessage, OutboundMessage,
+    Transport,
+};
 
 /// Spawn a TCP listener. For each accepted connection a task is spawned that:
 ///   1. Reads inbound SIP messages and sends them to `inbound_tx`
@@ -139,9 +145,7 @@ pub fn extract_sip_message_length(buffer: &[u8]) -> Option<usize> {
     let rest = &buffer[prefix..];
 
     // Find end of headers
-    let header_end = rest
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")?;
+    let header_end = rest.windows(4).position(|w| w == b"\r\n\r\n")?;
     let headers_len = prefix + header_end + 4; // include the \r\n\r\n
 
     // Parse Content-Length from header block
@@ -267,7 +271,10 @@ pub fn frame_sip_message(buffer: &[u8], max_message_bytes: usize) -> FrameVerdic
             .position(|window| window == b"\r\n\r\n")
             .map(|end| prefix + end + 4)
             .unwrap_or(buffer.len());
-        return FrameVerdict::Oversized { declared: len, header_len };
+        return FrameVerdict::Oversized {
+            declared: len,
+            header_len,
+        };
     }
     if len <= buffer.len() {
         FrameVerdict::Complete { len }
@@ -371,11 +378,21 @@ mod tests {
 
         // Send to conn_a
         let data_a = Bytes::from_static(b"SIP/2.0 200 OK for A\r\n\r\n");
-        connection_map.get(&conn_a).unwrap().send(data_a.clone()).await.unwrap();
+        connection_map
+            .get(&conn_a)
+            .unwrap()
+            .send(data_a.clone())
+            .await
+            .unwrap();
 
         // Send to conn_b
         let data_b = Bytes::from_static(b"SIP/2.0 200 OK for B\r\n\r\n");
-        connection_map.get(&conn_b).unwrap().send(data_b.clone()).await.unwrap();
+        connection_map
+            .get(&conn_b)
+            .unwrap()
+            .send(data_b.clone())
+            .await
+            .unwrap();
 
         // Verify A gets A's message
         let received_a = rx_a.recv().await.unwrap();
@@ -479,10 +496,7 @@ mod tests {
         // No end-of-headers within the cap — slow-loris / flood.
         let mut flood = Vec::from(&b"INVITE sip:x SIP/2.0\r\n"[..]);
         flood.resize(MAX_INCOMPLETE_HEADER_BYTES + 1, b'A');
-        assert_eq!(
-            classify_incomplete_stream(&flood),
-            StreamVerdict::Garbage
-        );
+        assert_eq!(classify_incomplete_stream(&flood), StreamVerdict::Garbage);
     }
 
     #[test]
@@ -518,7 +532,10 @@ mod tests {
                        Content-Length: 4000000000\r\n\
                        \r\n";
         match frame_sip_message(attack, CEILING) {
-            FrameVerdict::Oversized { declared, header_len } => {
+            FrameVerdict::Oversized {
+                declared,
+                header_len,
+            } => {
                 assert_eq!(declared, 4_000_000_000 + attack.len());
                 // The whole header block is buffered, so the caller can parse
                 // it and answer 513 before closing.
@@ -540,7 +557,10 @@ mod tests {
                        \r\n";
         assert_eq!(extract_sip_message_length(attack), Some(usize::MAX));
         assert!(
-            matches!(frame_sip_message(attack, CEILING), FrameVerdict::Oversized { .. }),
+            matches!(
+                frame_sip_message(attack, CEILING),
+                FrameVerdict::Oversized { .. }
+            ),
             "an unrepresentable declaration must be refused, never framed short"
         );
     }
@@ -572,7 +592,9 @@ mod tests {
         complete.extend_from_slice(b"AAAA");
         assert_eq!(
             frame_sip_message(&complete, CEILING),
-            FrameVerdict::Complete { len: complete.len() }
+            FrameVerdict::Complete {
+                len: complete.len()
+            }
         );
 
         let mut partial = headers.to_vec();
@@ -677,7 +699,10 @@ mod tests {
         .expect("connection must be closed, not held open")
         .unwrap();
         assert_eq!(read, 0, "a SIP port must not answer a probe");
-        assert!(inbound_rx.is_empty(), "the probe must never reach the dispatcher");
+        assert!(
+            inbound_rx.is_empty(),
+            "the probe must never reach the dispatcher"
+        );
     }
 
     /// End to end on a real listener: an oversized declaration is answered
@@ -746,13 +771,11 @@ mod tests {
         );
         client.write_all(register.as_bytes()).await.unwrap();
 
-        let inbound = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            inbound_rx.recv_async(),
-        )
-        .await
-        .expect("SIP must still be dispatched")
-        .unwrap();
+        let inbound =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .expect("SIP must still be dispatched")
+                .unwrap();
         assert_eq!(&inbound.data[..], register.as_bytes());
         assert_eq!(inbound.transport, Transport::Tcp);
     }

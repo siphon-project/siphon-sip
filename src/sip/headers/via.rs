@@ -93,7 +93,9 @@ impl Via {
         if !params_str.is_empty() {
             for param in split_params(params_str) {
                 let (name, value) = match param.split_once('=') {
-                    Some((name, value)) => (name.trim().to_lowercase(), Some(value.trim().to_string())),
+                    Some((name, value)) => {
+                        (name.trim().to_lowercase(), Some(value.trim().to_string()))
+                    }
                     None => (param.trim().to_lowercase(), None),
                 };
 
@@ -169,10 +171,7 @@ impl fmt::Display for Via {
 
 /// Split semicolon-delimited params, skipping the leading ';'.
 fn split_params(input: &str) -> Vec<&str> {
-    input
-        .split(';')
-        .filter(|s| !s.trim().is_empty())
-        .collect()
+    input.split(';').filter(|s| !s.trim().is_empty()).collect()
 }
 
 /// Split comma-separated Via values, respecting that params use ';' not ','.
@@ -233,8 +232,7 @@ mod tests {
 
     #[test]
     fn parse_rport_without_value() {
-        let via =
-            Via::parse("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-abc;rport").unwrap();
+        let via = Via::parse("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-abc;rport").unwrap();
         assert_eq!(via.rport, Some(None));
     }
 
@@ -255,13 +253,17 @@ mod tests {
 
     #[test]
     fn parse_extra_params() {
-        let via = Via::parse(
-            "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-abc;maddr=224.0.1.75;ttl=1",
-        )
-        .unwrap();
+        let via = Via::parse("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-abc;maddr=224.0.1.75;ttl=1")
+            .unwrap();
         assert_eq!(via.other_params.len(), 2);
-        assert_eq!(via.other_params[0], ("maddr".to_string(), Some("224.0.1.75".to_string())));
-        assert_eq!(via.other_params[1], ("ttl".to_string(), Some("1".to_string())));
+        assert_eq!(
+            via.other_params[0],
+            ("maddr".to_string(), Some("224.0.1.75".to_string()))
+        );
+        assert_eq!(
+            via.other_params[1],
+            ("ttl".to_string(), Some("1".to_string()))
+        );
     }
 
     #[test]
@@ -306,7 +308,8 @@ mod tests {
 
     #[test]
     fn case_insensitive_params() {
-        let via = Via::parse("SIP/2.0/UDP 10.0.0.1:5060;Branch=z9hG4bK-ci;Received=1.2.3.4").unwrap();
+        let via =
+            Via::parse("SIP/2.0/UDP 10.0.0.1:5060;Branch=z9hG4bK-ci;Received=1.2.3.4").unwrap();
         assert_eq!(via.branch.as_deref(), Some("z9hG4bK-ci"));
         assert_eq!(via.received.as_deref(), Some("1.2.3.4"));
     }

@@ -152,11 +152,23 @@ mod tests {
         assert_eq!(vias[0].branch.as_deref(), Some("z9hG4bK-proxytop"));
 
         // The other compact forms resolve to their long names too.
-        assert_eq!(message.headers.call_id().map(String::as_str), Some("call-abc@ua.example.com"));
-        assert_eq!(message.typed_from().unwrap().unwrap().uri.user.as_deref(), Some("alice"));
-        assert_eq!(message.typed_to().unwrap().unwrap().tag.as_deref(), Some("uastag123"));
+        assert_eq!(
+            message.headers.call_id().map(String::as_str),
+            Some("call-abc@ua.example.com")
+        );
+        assert_eq!(
+            message.typed_from().unwrap().unwrap().uri.user.as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            message.typed_to().unwrap().unwrap().tag.as_deref(),
+            Some("uastag123")
+        );
         assert_eq!(message.headers.content_length(), Some(0));
-        assert_eq!(message.headers.get("Supported").map(String::as_str), Some("timer,path,replaces"));
+        assert_eq!(
+            message.headers.get("Supported").map(String::as_str),
+            Some("timer,path,replaces")
+        );
     }
 
     #[test]
@@ -268,7 +280,10 @@ mod tests {
             reparsed.request_uri().map(|u| u.to_string())
         );
         assert_eq!(original.headers.call_id(), reparsed.headers.call_id());
-        assert_eq!(original.headers.max_forwards(), reparsed.headers.max_forwards());
+        assert_eq!(
+            original.headers.max_forwards(),
+            reparsed.headers.max_forwards()
+        );
 
         // Verify typed headers survive round-trip
         let orig_from = original.typed_from().unwrap().unwrap();

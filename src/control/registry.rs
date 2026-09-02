@@ -525,7 +525,10 @@ impl AppFanout {
     }
 
     fn get(&self, id: u64) -> Option<Arc<ConnHandle>> {
-        self.lock().iter().find(|conn| conn.id == id).map(Arc::clone)
+        self.lock()
+            .iter()
+            .find(|conn| conn.id == id)
+            .map(Arc::clone)
     }
 
     fn contains(&self, id: u64) -> bool {
@@ -695,7 +698,10 @@ impl ControlBus {
         let handle = Arc::new(ConnHandle {
             id,
             app: app.to_string(),
-            events: Arc::new(OutboundQueue::new(self.event_queue_depth, self.slow_consumer)),
+            events: Arc::new(OutboundQueue::new(
+                self.event_queue_depth,
+                self.slow_consumer,
+            )),
         });
         self.apps
             .entry(app.to_string())
@@ -713,7 +719,8 @@ impl ControlBus {
             fanout.remove(conn.id);
         }
         conn.events.close();
-        self.apps.remove_if(&conn.app, |_, fanout| fanout.is_empty());
+        self.apps
+            .remove_if(&conn.app, |_, fanout| fanout.is_empty());
 
         // Orphan every channel this connection owned + arm the grace timer.
         let orphaned: Vec<String> = self
@@ -831,7 +838,14 @@ impl ControlBus {
         };
         self.publish_to_channel(
             &channel_id,
-            EventFrame::new(event, &channel_id, &app, &call_actor_id, sip_call_id, payload),
+            EventFrame::new(
+                event,
+                &channel_id,
+                &app,
+                &call_actor_id,
+                sip_call_id,
+                payload,
+            ),
         )
     }
 
@@ -862,8 +876,11 @@ impl ControlBus {
             .entry(conn.app.clone())
             .or_default()
             .insert(channel_id.to_string());
-        crate::metrics::try_metrics()
-            .inspect(|m| m.control_controlled_calls.with_label_values(&[&conn.app]).inc());
+        crate::metrics::try_metrics().inspect(|m| {
+            m.control_controlled_calls
+                .with_label_values(&[&conn.app])
+                .inc()
+        });
     }
 
     /// Remove a channel and drop it from the app index. Returns whether it was
@@ -876,8 +893,11 @@ impl ControlBus {
                 }
                 self.app_calls
                     .remove_if(&entry.app, |_, set| set.is_empty());
-                crate::metrics::try_metrics()
-                    .inspect(|m| m.control_controlled_calls.with_label_values(&[&entry.app]).dec());
+                crate::metrics::try_metrics().inspect(|m| {
+                    m.control_controlled_calls
+                        .with_label_values(&[&entry.app])
+                        .dec()
+                });
                 true
             }
             None => false,
@@ -1460,11 +1480,25 @@ mod tests {
 
     fn test_bus(depth: usize, policy: SlowConsumerPolicy) -> Arc<ControlBus> {
         let (command_tx, _command_rx) = flume::unbounded();
-        ControlBus::new(command_tx, vec![app_cfg("ivr-app")], depth, policy, 10, 3000)
+        ControlBus::new(
+            command_tx,
+            vec![app_cfg("ivr-app")],
+            depth,
+            policy,
+            10,
+            3000,
+        )
     }
 
     fn stasis_start(channel: &str, app: &str) -> EventFrame {
-        EventFrame::new("StasisStart", channel, app, "call-uuid", "sipcid", serde_json::json!({}))
+        EventFrame::new(
+            "StasisStart",
+            channel,
+            app,
+            "call-uuid",
+            "sipcid",
+            serde_json::json!({}),
+        )
     }
 
     #[test]
@@ -1555,7 +1589,10 @@ mod tests {
         let owner = bus.register_connection("ivr-app");
         let intruder = bus.register_connection("other");
         bus.register_channel("ch1", &owner, "call", "sipcid", "hangup", HashMap::new());
-        assert!(matches!(bus.owns("ch1", "ivr-app", owner.id), Ownership::Owned(_)));
+        assert!(matches!(
+            bus.owns("ch1", "ivr-app", owner.id),
+            Ownership::Owned(_)
+        ));
         assert_eq!(bus.owns("ch1", "other", intruder.id), Ownership::Forbidden);
         assert_eq!(bus.owns("nope", "ivr-app", owner.id), Ownership::Unknown);
     }
@@ -1598,7 +1635,10 @@ mod tests {
 
         // Every per-call entry drained to baseline (no leak).
         assert_eq!(bus.channel_count(), 0, "channel leaked after CANCEL");
-        assert!(bus.owned_channels("ivr-app").is_empty(), "app_calls leaked after CANCEL");
+        assert!(
+            bus.owned_channels("ivr-app").is_empty(),
+            "app_calls leaked after CANCEL"
+        );
     }
 
     #[tokio::test]
@@ -1619,7 +1659,10 @@ mod tests {
             serde_json::json!({}),
         );
         assert_eq!(bus.channel_count(), 1);
-        assert_eq!(bus.channel_id_for_sip_call_id("sipcid@h").as_deref(), Some("ch1"));
+        assert_eq!(
+            bus.channel_id_for_sip_call_id("sipcid@h").as_deref(),
+            Some("ch1")
+        );
 
         assert!(bus.release_channel("ch1", "routed"));
 
@@ -1636,7 +1679,10 @@ mod tests {
 
         // Every per-call entry drained to baseline (no leak).
         assert_eq!(bus.channel_count(), 0, "channel leaked after release");
-        assert!(bus.owned_channels("ivr-app").is_empty(), "app_calls leaked after release");
+        assert!(
+            bus.owned_channels("ivr-app").is_empty(),
+            "app_calls leaked after release"
+        );
         assert!(bus.channel_id_for_sip_call_id("sipcid@h").is_none());
         // Idempotent: a second release is a clean no-op.
         assert!(!bus.release_channel("ch1", "routed"));
@@ -1681,7 +1727,10 @@ mod tests {
 
             assert_eq!(bus.channel_count(), 0, "channels leaked on cycle {cycle}");
             assert_eq!(bus.app_count(), 0, "apps leaked on cycle {cycle}");
-            assert!(bus.app_calls.is_empty(), "app_calls index leaked on cycle {cycle}");
+            assert!(
+                bus.app_calls.is_empty(),
+                "app_calls index leaked on cycle {cycle}"
+            );
         }
     }
 
@@ -1723,7 +1772,11 @@ mod tests {
         assert_eq!(dtmf.payload["from_tag"], "ftag-a");
 
         // Additive: forwarding neither creates nor removes per-call state.
-        assert_eq!(bus.channel_count(), 1, "forward_dtmf must not touch channel state");
+        assert_eq!(
+            bus.channel_count(),
+            1,
+            "forward_dtmf must not touch channel state"
+        );
         assert_eq!(bus.owned_channels("ivr-app").len(), 1);
     }
 
@@ -1785,7 +1838,11 @@ mod tests {
 
         // Emitting the event neither creates nor removes per-call state (the
         // pending REFER lives in the dispatcher's store, not here).
-        assert_eq!(bus.channel_count(), 1, "forward_transfer_requested must not touch channel state");
+        assert_eq!(
+            bus.channel_count(),
+            1,
+            "forward_transfer_requested must not touch channel state"
+        );
     }
 
     #[test]
@@ -1819,11 +1876,15 @@ mod tests {
             .into_iter()
             .filter_map(|frame| match frame {
                 OutboundFrame::Event(event)
-                    if event.event.starts_with("Transfer") && event.event != "TransferRequested" =>
+                    if event.event.starts_with("Transfer")
+                        && event.event != "TransferRequested" =>
                 {
                     Some((
                         event.event.clone(),
-                        event.payload["stage"].as_str().unwrap_or_default().to_string(),
+                        event.payload["stage"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
                         event.payload["code"].as_u64(),
                         event.payload["attempt"].as_u64(),
                     ))
@@ -2126,7 +2187,10 @@ mod tests {
         );
         let events = transfer_events(&conn).await;
         assert_eq!(events.len(), 1);
-        assert_eq!((events[0].0.as_str(), events[0].1.as_str()), ("TransferFailed", "rejected"));
+        assert_eq!(
+            (events[0].0.as_str(), events[0].1.as_str()),
+            ("TransferFailed", "rejected")
+        );
         assert_eq!(events[0].2, Some(603));
     }
 
@@ -2165,7 +2229,10 @@ mod tests {
             .iter()
             .position(|name| name == "StasisEnd")
             .expect("StasisEnd still fires");
-        assert!(failed < ended, "the verdict must precede StasisEnd: {names:?}");
+        assert!(
+            failed < ended,
+            "the verdict must precede StasisEnd: {names:?}"
+        );
         // Everything drained — the flush marker lives on the channel entry.
         assert_eq!(bus.channel_count(), 0);
     }
@@ -2224,7 +2291,8 @@ mod tests {
                 // Arm (non-terminal), then end the call without a verdict.
                 bus.forward_transfer_outcome(
                     &sip_call_id,
-                    &TransferOutcome::new(TransferStage::Accepted).with_refer_to("sip:c@example.net"),
+                    &TransferOutcome::new(TransferStage::Accepted)
+                        .with_refer_to("sip:c@example.net"),
                 );
                 bus.on_call_terminated(&sip_call_id, "bye");
             }
@@ -2291,7 +2359,14 @@ mod tests {
         );
         bus.publish_to_channel(
             "ch1",
-            EventFrame::new("StasisEnd", "ch1", "ivr-app", "call", "sipcid", serde_json::json!({})),
+            EventFrame::new(
+                "StasisEnd",
+                "ch1",
+                "ivr-app",
+                "call",
+                "sipcid",
+                serde_json::json!({}),
+            ),
         );
         let drained = conn.events.recv_many().await;
         assert_eq!(drained.len(), 3);
@@ -2309,7 +2384,9 @@ mod tests {
         // Queue full of events; a reply must still get in (an event is dropped).
         queue.push_reply(ControlResult::Ok(serde_json::json!({})).into_reply("c-9".to_string()));
         let drained = queue.recv_many().await;
-        assert!(drained.iter().any(|frame| matches!(frame, OutboundFrame::Reply(_))));
+        assert!(drained
+            .iter()
+            .any(|frame| matches!(frame, OutboundFrame::Reply(_))));
         assert_eq!(queue.dropped_count(), 1);
     }
 
@@ -2364,7 +2441,10 @@ mod tests {
 
             assert_eq!(bus.channel_count(), 0, "channels leaked on cycle {cycle}");
             assert_eq!(bus.app_count(), 0, "apps leaked on cycle {cycle}");
-            assert!(bus.app_calls.is_empty(), "app_calls index leaked on cycle {cycle}");
+            assert!(
+                bus.app_calls.is_empty(),
+                "app_calls index leaked on cycle {cycle}"
+            );
         }
     }
 
@@ -2386,7 +2466,10 @@ mod tests {
         let queue = OutboundQueue::new(1, SlowConsumerPolicy::Disconnect);
         let event = || EventFrame::new("E", "c", "a", "call", "sip", serde_json::json!({}));
         assert_eq!(queue.try_push_event(event()), PushOutcome::Delivered);
-        assert_eq!(queue.try_push_event(event()), PushOutcome::OverflowDisconnect);
+        assert_eq!(
+            queue.try_push_event(event()),
+            PushOutcome::OverflowDisconnect
+        );
         assert!(queue.disconnect_requested());
         assert_eq!(queue.depth(), 1, "queue must stay bounded at capacity");
     }
@@ -2412,10 +2495,20 @@ mod tests {
         let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
         let conn = bus.register_connection("ivr-app");
         assert!(!bus.channel_exists("cb-1"));
-        bus.register_channel("cb-1", &conn, "call-uuid", "sipcid", "hangup", HashMap::new());
+        bus.register_channel(
+            "cb-1",
+            &conn,
+            "call-uuid",
+            "sipcid",
+            "hangup",
+            HashMap::new(),
+        );
         assert!(bus.channel_exists("cb-1"));
         bus.remove_channel("cb-1");
-        assert!(!bus.channel_exists("cb-1"), "the id must be free again after teardown");
+        assert!(
+            !bus.channel_exists("cb-1"),
+            "the id must be free again after teardown"
+        );
     }
 
     #[test]
@@ -2426,7 +2519,9 @@ mod tests {
             bus.connection_for_command("ivr-app", conn.id).map(|c| c.id),
             Some(conn.id)
         );
-        assert!(bus.connection_for_command("ivr-app", conn.id + 99).is_none());
+        assert!(bus
+            .connection_for_command("ivr-app", conn.id + 99)
+            .is_none());
         assert!(bus.connection_for_command("other-app", conn.id).is_none());
         bus.unregister_connection(&conn);
         assert!(
@@ -2439,7 +2534,14 @@ mod tests {
     fn forward_channel_event_reaches_the_owner_by_sip_call_id() {
         let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
         let conn = bus.register_connection("ivr-app");
-        bus.register_channel("cb-1", &conn, "call-uuid", "sipcid@host", "hangup", HashMap::new());
+        bus.register_channel(
+            "cb-1",
+            &conn,
+            "call-uuid",
+            "sipcid@host",
+            "hangup",
+            HashMap::new(),
+        );
 
         assert!(bus.forward_channel_event(
             "sipcid@host",
@@ -2459,14 +2561,25 @@ mod tests {
         assert_eq!(event.payload["state"], "ringing");
 
         // An uncontrolled call is a silent no-op, never a panic.
-        assert!(!bus.forward_channel_event("nobody@host", "ChannelStateChange", serde_json::json!({})));
+        assert!(!bus.forward_channel_event(
+            "nobody@host",
+            "ChannelStateChange",
+            serde_json::json!({})
+        ));
     }
 
     #[test]
     fn stasis_end_carries_the_sip_cause_when_one_is_known() {
         let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
         let conn = bus.register_connection("ivr-app");
-        bus.register_channel("cb-1", &conn, "call-uuid", "sipcid@host", "hangup", HashMap::new());
+        bus.register_channel(
+            "cb-1",
+            &conn,
+            "call-uuid",
+            "sipcid@host",
+            "hangup",
+            HashMap::new(),
+        );
 
         bus.on_call_terminated_with_cause("sipcid@host", "rejected", Some(486), Some("Busy Here"));
         let frames = futures_executor_block_on_recv(&conn);
@@ -2480,7 +2593,10 @@ mod tests {
         assert_eq!(event.payload["reason"], "rejected");
         assert_eq!(event.payload["code"], 486);
         assert_eq!(event.payload["response"], "Busy Here");
-        assert!(!bus.channel_exists("cb-1"), "the channel must drain with the call");
+        assert!(
+            !bus.channel_exists("cb-1"),
+            "the channel must drain with the call"
+        );
     }
 
     #[test]
@@ -2489,7 +2605,14 @@ mod tests {
         // ordinary BYE-driven teardown emits.
         let bus = test_bus(16, SlowConsumerPolicy::DropOldest);
         let conn = bus.register_connection("ivr-app");
-        bus.register_channel("cb-1", &conn, "call-uuid", "sipcid@host", "hangup", HashMap::new());
+        bus.register_channel(
+            "cb-1",
+            &conn,
+            "call-uuid",
+            "sipcid@host",
+            "hangup",
+            HashMap::new(),
+        );
         bus.on_call_terminated("sipcid@host", "bye");
         let frames = futures_executor_block_on_recv(&conn);
         let event = frames

@@ -356,8 +356,7 @@ impl PyAuth {
         };
         let now = now_unix_secs();
         // Stale (replayed) or implausibly future-dated (>60s clock skew).
-        if now.saturating_sub(timestamp) > self.nonce_ttl_secs
-            || timestamp.saturating_sub(now) > 60
+        if now.saturating_sub(timestamp) > self.nonce_ttl_secs || timestamp.saturating_sub(now) > 60
         {
             return false;
         }
@@ -520,7 +519,9 @@ impl PyAuth {
             let guard = message.lock().map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {e}"))
             })?;
-            let raw = guard.headers.get("P-Asserted-Identity")
+            let raw = guard
+                .headers
+                .get("P-Asserted-Identity")
                 .or_else(|| guard.headers.get("From"))
                 .cloned()
                 .unwrap_or_default();
@@ -562,15 +563,15 @@ impl PyAuth {
                                             "Digest-AKAv1-MD5",
                                             Some(&resync_data),
                                         ),
-                                    ).map_err(|error| {
-                                        pyo3::exceptions::PyRuntimeError::new_err(
-                                            format!("MAR resync failed: {error}")
-                                        )
+                                    )
+                                    .map_err(|error| {
+                                        pyo3::exceptions::PyRuntimeError::new_err(format!(
+                                            "MAR resync failed: {error}"
+                                        ))
                                     })?;
 
-                                    let resync_result = codec::extract_u32_avp(
-                                        &maa_resync.avps, avp::RESULT_CODE,
-                                    );
+                                    let resync_result =
+                                        codec::extract_u32_avp(&maa_resync.avps, avp::RESULT_CODE);
                                     if resync_result != Some(2001) {
                                         request.set_reply(403, "Forbidden".to_string());
                                         return Ok(false);
@@ -578,7 +579,9 @@ impl PyAuth {
 
                                     // HSS resynced SQN — extract fresh auth vector and challenge again
                                     return self.send_ims_challenge_from_maa(
-                                        request, realm, &maa_resync.avps,
+                                        request,
+                                        realm,
+                                        &maa_resync.avps,
                                     );
                                 }
                             }
@@ -589,25 +592,25 @@ impl PyAuth {
 
             // Normal verification: look up the stored XRES from the first MAR
             let nonce_str = extract_nonce_field(auth_value);
-            let found = nonce_str.as_ref().is_some_and(|n| ims_auth_store().contains_key(n));
+            let found = nonce_str
+                .as_ref()
+                .is_some_and(|n| ims_auth_store().contains_key(n));
             tracing::debug!(
                 nonce_prefix = nonce_str.as_ref().map(|n| &n[..n.len().min(16)]),
                 found,
                 store_size = ims_auth_store().len(),
                 "IMS auth: cache lookup",
             );
-            let stored = nonce_str.as_ref().and_then(|n| {
-                ims_auth_store().remove(n).map(|(_, v)| v)
-            });
+            let stored = nonce_str
+                .as_ref()
+                .and_then(|n| ims_auth_store().remove(n).map(|(_, v)| v));
 
             if let Some(vector) = stored {
                 // Per RFC 3310 §3.3: for AKAv1-MD5, raw XRES bytes are used
                 // directly as the "password" in HA1 = MD5(username:realm:XRES).
                 // Not hex-encoded, not base64-encoded — raw binary bytes.
                 if let Some(fields) = DigestFields::parse(auth_value) {
-                    let ha1 = md5_ha1_aka(
-                        &fields.username, realm, &vector.expected_response,
-                    );
+                    let ha1 = md5_ha1_aka(&fields.username, realm, &vector.expected_response);
                     let matches = fields.verify(&ha1, "REGISTER");
                     tracing::debug!(
                         response = %fields.response,
@@ -629,11 +632,13 @@ impl PyAuth {
         }
 
         // ── First REGISTER (no Authorization) or re-challenge — send MAR ──
-        let maa = crate::script::detach_block_on(
-            client.send_mar(&public_identity, 1, "SIP Digest", None),
-        ).map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("MAR failed: {e}"))
-        })?;
+        let maa = crate::script::detach_block_on(client.send_mar(
+            &public_identity,
+            1,
+            "SIP Digest",
+            None,
+        ))
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("MAR failed: {e}")))?;
 
         let result_code = codec::extract_u32_avp(&maa.avps, avp::RESULT_CODE);
         if result_code != Some(2001) {
@@ -684,7 +689,9 @@ impl PyAuth {
         };
 
         // Try lookup with full IMPI, then just username part
-        let credential = self.aka_credentials.get(&impi)
+        let credential = self
+            .aka_credentials
+            .get(&impi)
             .or_else(|| {
                 // Try without domain: "001010000000001" if IMPI is "001010000000001@ims.test"
                 let bare = impi.split('@').next().unwrap_or(&impi);
@@ -818,7 +825,9 @@ impl PyAuth {
             .or_else(|| message.headers.get("Proxy-Authorization"));
 
         match auth_header {
-            Some(value) => Ok(self.validate_credentials_with(value, realm, &method, supplied.as_ref())),
+            Some(value) => {
+                Ok(self.validate_credentials_with(value, realm, &method, supplied.as_ref()))
+            }
             None => Ok(false),
         }
     }
@@ -868,7 +877,13 @@ impl PyAuth {
 
     /// Challenge a B2BUA A-leg with 401 WWW-Authenticate (Rust API).
     pub fn challenge_www_call(&self, call: &mut PyCall, realm: Option<&str>) -> PyResult<bool> {
-        self.require_digest_inner(&mut AuthTarget::Call(call), realm, 401, "WWW-Authenticate", None)
+        self.require_digest_inner(
+            &mut AuthTarget::Call(call),
+            realm,
+            401,
+            "WWW-Authenticate",
+            None,
+        )
     }
 
     /// Verify credentials without sending a challenge (Rust API).
@@ -1100,13 +1115,17 @@ impl PyAuth {
         use crate::diameter::dictionary::avp;
 
         let auth_data = codec::extract_grouped_avp(maa_avps, avp::SIP_AUTH_DATA_ITEM);
-        let hss_nonce = auth_data.as_ref()
+        let hss_nonce = auth_data
+            .as_ref()
             .and_then(|a| codec::extract_octet_avp(a, avp::SIP_AUTHENTICATE));
-        let hss_expected = auth_data.as_ref()
+        let hss_expected = auth_data
+            .as_ref()
             .and_then(|a| codec::extract_octet_avp(a, avp::SIP_AUTHORIZATION));
-        let hss_ck = auth_data.as_ref()
+        let hss_ck = auth_data
+            .as_ref()
             .and_then(|a| codec::extract_octet_avp(a, avp::CONFIDENTIALITY_KEY));
-        let hss_ik = auth_data.as_ref()
+        let hss_ik = auth_data
+            .as_ref()
             .and_then(|a| codec::extract_octet_avp(a, avp::INTEGRITY_KEY));
 
         // Store the expected response (XRES) keyed by nonce so that the second
@@ -1118,14 +1137,20 @@ impl PyAuth {
                 xres_len = expected_bytes.len(),
                 "IMS auth: stored pending challenge",
             );
-            ims_auth_store().insert(nonce_str, ImsAuthVector {
-                expected_response: expected_bytes.clone(),
-            });
+            ims_auth_store().insert(
+                nonce_str,
+                ImsAuthVector {
+                    expected_response: expected_bytes.clone(),
+                },
+            );
         }
 
         self.send_ims_challenge(
-            request, realm, hss_nonce.as_deref(),
-            hss_ck.as_deref(), hss_ik.as_deref(),
+            request,
+            realm,
+            hss_nonce.as_deref(),
+            hss_ck.as_deref(),
+            hss_ik.as_deref(),
         )?;
         Ok(false)
     }
@@ -1140,7 +1165,6 @@ impl PyAuth {
         ik: Option<&[u8]>,
     ) -> PyResult<()> {
         request.set_reply(401, "Unauthorized".to_string());
-
 
         let nonce = match hss_nonce {
             Some(bytes) => base64_encode(bytes),
@@ -1316,11 +1340,11 @@ impl PyAuth {
                 cached
             }
             None => {
-                let fetched = match self.fetch_http_credential(http_config, client, &fields.username)
-                {
-                    Some(body) => body,
-                    None => return false,
-                };
+                let fetched =
+                    match self.fetch_http_credential(http_config, client, &fields.username) {
+                        Some(body) => body,
+                        None => return false,
+                    };
                 self.store_credential(&fields.username, &fetched);
                 fetched
             }
@@ -1481,10 +1505,7 @@ impl DigestFields {
                 format!("{}:{}:{}:{}:auth:{}", ha1, self.nonce, nc, cnonce, ha2).as_bytes(),
             )
         } else {
-            crate::auth::hash_hex_public(
-                alg,
-                format!("{}:{}:{}", ha1, self.nonce, ha2).as_bytes(),
-            )
+            crate::auth::hash_hex_public(alg, format!("{}:{}:{}", ha1, self.nonce, ha2).as_bytes())
         };
 
         expected.eq_ignore_ascii_case(&self.response)
@@ -1498,7 +1519,9 @@ impl DigestFields {
 /// (and reject) than panic.
 fn parse_algorithm(value: Option<&str>) -> crate::auth::DigestAlgorithm {
     use crate::auth::DigestAlgorithm;
-    let Some(raw) = value else { return DigestAlgorithm::Md5 };
+    let Some(raw) = value else {
+        return DigestAlgorithm::Md5;
+    };
     match raw.to_uppercase().replace('_', "-").as_str() {
         "MD5" | "" => DigestAlgorithm::Md5,
         "MD5-SESS" => DigestAlgorithm::Md5Sess,
@@ -1709,7 +1732,12 @@ fn extract_sip_uri(header_value: &str) -> String {
         }
     }
     // No angle brackets — strip ;tag= and other header-level params
-    header_value.split(';').next().unwrap_or(header_value).trim().to_string()
+    header_value
+        .split(';')
+        .next()
+        .unwrap_or(header_value)
+        .trim()
+        .to_string()
 }
 
 fn extract_username_from_uri(header_value: &str) -> Option<String> {
@@ -1722,7 +1750,8 @@ fn extract_username_from_uri(header_value: &str) -> Option<String> {
     };
 
     // Strip "sip:" or "sips:" prefix
-    let after_scheme = uri_str.strip_prefix("sip:")
+    let after_scheme = uri_str
+        .strip_prefix("sip:")
         .or_else(|| uri_str.strip_prefix("sips:"))?;
 
     // Get user part (before @)
@@ -1830,7 +1859,10 @@ mod tests {
     #[test]
     fn encode_url_path_segment_passes_through_plain_username() {
         assert_eq!(encode_url_path_segment("alice"), "alice");
-        assert_eq!(encode_url_path_segment("user.name-1_a~b"), "user.name-1_a~b");
+        assert_eq!(
+            encode_url_path_segment("user.name-1_a~b"),
+            "user.name-1_a~b"
+        );
     }
 
     #[test]
@@ -1985,11 +2017,7 @@ mod tests {
 
     /// H(A1) for the given credential, as a deployment holding hashes would
     /// have stored it.
-    fn ha1_for(
-        username: &str,
-        password: &str,
-        algorithm: crate::auth::DigestAlgorithm,
-    ) -> String {
+    fn ha1_for(username: &str, password: &str, algorithm: crate::auth::DigestAlgorithm) -> String {
         crate::auth::hash_hex_public(
             algorithm,
             format!("{username}:example.com:{password}").as_bytes(),
@@ -2297,7 +2325,10 @@ mod tests {
                 .call_method0("generate_nonce")
                 .and_then(|value| value.extract())
                 .expect("auth.generate_nonce() must be callable from Python");
-            assert!(nonce.contains('.'), "nonce shape is {{ts}}.{{tag}}: {nonce}");
+            assert!(
+                nonce.contains('.'),
+                "nonce shape is {{ts}}.{{tag}}: {nonce}"
+            );
 
             // A freshly minted nonce validates through the Python surface.
             let fresh: bool = bound
@@ -2455,10 +2486,14 @@ mod tests {
         // After successful auth, Authorization must be stripped
         let msg = request.message();
         let guard = msg.lock().unwrap();
-        assert!(guard.headers.get("Authorization").is_none(),
-            "Authorization header should be stripped after successful verification");
-        assert!(guard.headers.get("Proxy-Authorization").is_none(),
-            "Proxy-Authorization header should be stripped after successful verification");
+        assert!(
+            guard.headers.get("Authorization").is_none(),
+            "Authorization header should be stripped after successful verification"
+        );
+        assert!(
+            guard.headers.get("Proxy-Authorization").is_none(),
+            "Proxy-Authorization header should be stripped after successful verification"
+        );
     }
 
     #[test]
@@ -2696,11 +2731,19 @@ mod tests {
             // Anything else is a clear TypeError naming both accepted types,
             // not a silent pass.
             let bogus = pyo3::types::PyString::new(python, "not a request or call");
-            let error = auth.require_proxy_digest(bogus.as_any(), None, None, None).unwrap_err();
+            let error = auth
+                .require_proxy_digest(bogus.as_any(), None, None, None)
+                .unwrap_err();
             assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(python));
-            assert!(auth.require_www_digest(bogus.as_any(), None, None, None).is_err());
-            assert!(auth.require_digest(bogus.as_any(), None, None, None).is_err());
-            assert!(auth.verify_digest(bogus.as_any(), None, None, None).is_err());
+            assert!(auth
+                .require_www_digest(bogus.as_any(), None, None, None)
+                .is_err());
+            assert!(auth
+                .require_digest(bogus.as_any(), None, None, None)
+                .is_err());
+            assert!(auth
+                .verify_digest(bogus.as_any(), None, None, None)
+                .is_err());
         });
     }
 
@@ -2744,7 +2787,8 @@ mod tests {
         let auth = make_auth();
         let mut request = make_register_request();
 
-        auth.challenge_www(&mut request, Some("custom.realm")).unwrap();
+        auth.challenge_www(&mut request, Some("custom.realm"))
+            .unwrap();
 
         let message = request.message();
         let message = message.lock().unwrap();
@@ -2764,7 +2808,9 @@ mod tests {
     #[test]
     fn extract_sip_uri_strips_angle_brackets_and_tag() {
         assert_eq!(
-            extract_sip_uri("<sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>;tag=yfJqzFRBS1"),
+            extract_sip_uri(
+                "<sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org>;tag=yfJqzFRBS1"
+            ),
             "sip:001010000000001@ims.mnc001.mcc001.3gppnetwork.org"
         );
     }
@@ -2825,7 +2871,10 @@ mod tests {
     fn extract_nonce_field_skips_cnonce() {
         // Must extract nonce, not cnonce
         let value = r#"Digest username="alice",realm="test",cnonce="1d15e5dd",nc=00000001,qop=auth,uri="sip:test",nonce="realNonce123=",response="abc",algorithm=AKAv1-MD5"#;
-        assert_eq!(extract_nonce_field(value), Some("realNonce123=".to_string()));
+        assert_eq!(
+            extract_nonce_field(value),
+            Some("realNonce123=".to_string())
+        );
     }
 
     #[test]
@@ -2851,9 +2900,12 @@ mod tests {
         let store = ims_auth_store();
         let nonce = "test-ims-nonce-123".to_string();
 
-        store.insert(nonce.clone(), ImsAuthVector {
-            expected_response: vec![0xAA; 16],
-        });
+        store.insert(
+            nonce.clone(),
+            ImsAuthVector {
+                expected_response: vec![0xAA; 16],
+            },
+        );
 
         // Verify it exists
         assert!(store.get(&nonce).is_some());
@@ -2891,12 +2943,11 @@ mod tests {
     fn auts_resync_data_concatenation() {
         // Simulate RAND(16) from nonce and AUTS(14) from Authorization header
         let rand: [u8; 16] = [
-            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-            0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
         ];
         let auts: [u8; 14] = [
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-            0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
         ];
 
         let mut resync_data = Vec::with_capacity(30);
@@ -2931,11 +2982,23 @@ mod tests {
     #[test]
     fn cache_freshness_boundary() {
         use std::time::Duration;
-        assert!(is_cache_fresh(Duration::from_secs(0), Duration::from_secs(300)));
-        assert!(is_cache_fresh(Duration::from_secs(299), Duration::from_secs(300)));
+        assert!(is_cache_fresh(
+            Duration::from_secs(0),
+            Duration::from_secs(300)
+        ));
+        assert!(is_cache_fresh(
+            Duration::from_secs(299),
+            Duration::from_secs(300)
+        ));
         // At and beyond the TTL the entry is stale.
-        assert!(!is_cache_fresh(Duration::from_secs(300), Duration::from_secs(300)));
-        assert!(!is_cache_fresh(Duration::from_secs(400), Duration::from_secs(300)));
+        assert!(!is_cache_fresh(
+            Duration::from_secs(300),
+            Duration::from_secs(300)
+        ));
+        assert!(!is_cache_fresh(
+            Duration::from_secs(400),
+            Duration::from_secs(300)
+        ));
     }
 
     #[test]

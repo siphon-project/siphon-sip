@@ -8,8 +8,8 @@
 //! and run once (often twice) per call. Gated by `scripts/bench_regression.sh`.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use std::hint::black_box;
 use siphon::media::sdp::SdpBody;
+use std::hint::black_box;
 
 /// A representative offer: G.711 + Opus + telephone-event, the common VoIP shape.
 const SAMPLE_SDP: &str = concat!(

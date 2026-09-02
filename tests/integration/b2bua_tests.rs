@@ -4,22 +4,21 @@
 //! registrar lookups for routing B2BUA calls, and transaction key handling.
 
 use siphon::b2bua::actor::{
-    CallActor, CallActorStore, CallEvent, CallState, Leg, LegActor, LegSide, ReferSubscription,
-    TransportInfo, SessionTimerState, generate_call_id, generate_tag,
+    generate_call_id, generate_tag, CallActor, CallActorStore, CallEvent, CallState, Leg, LegActor,
+    LegSide, ReferSubscription, SessionTimerState, TransportInfo,
+};
+use siphon::b2bua::header_policy::{
+    apply_to_request, apply_to_response, builtin_presets, validate_preset, DirectionPolicy,
+    HeaderPattern, PolicyContext, Preset, PresetError, ResolvedPolicy, RewriteOp, Verb,
 };
 use siphon::b2bua::transfer::TransferState;
-use siphon::b2bua::header_policy::{
-    apply_to_request, apply_to_response, builtin_presets, validate_preset,
-    DirectionPolicy, HeaderPattern, PolicyContext, Preset, PresetError,
-    ResolvedPolicy, RewriteOp, Verb,
-};
-use siphon::sip::message::SipMessage;
-use siphon::sip::parser::parse_sip_message;
-use siphon::dialog::{Dialog, DialogId, DialogStore, DialogState};
+use siphon::dialog::{Dialog, DialogId, DialogState, DialogStore};
 use siphon::registrar::Registrar;
 use siphon::sip::builder::SipMessageBuilder;
-use siphon::sip::uri::SipUri;
 use siphon::sip::message::Method;
+use siphon::sip::message::SipMessage;
+use siphon::sip::parser::parse_sip_message;
+use siphon::sip::uri::SipUri;
 use siphon::transaction::key::TransactionKey;
 use siphon::transport::{ConnectionId, Transport};
 use std::net::SocketAddr;
@@ -54,7 +53,11 @@ fn b2bua_two_leg_dialog_correlation() {
         "callee-tag".to_string(),
         1,
         vec![],
-        Some(SipUri::new("10.0.0.50".to_string()).with_user("bob".to_string()).with_port(5060)),
+        Some(
+            SipUri::new("10.0.0.50".to_string())
+                .with_user("bob".to_string())
+                .with_port(5060),
+        ),
         Some(SipUri::new("b2bua.example.com".to_string())),
         Some(SipUri::new("biloxi.com".to_string()).with_user("bob".to_string())),
     );
@@ -131,11 +134,19 @@ fn b2bua_routes_to_registered_contact() {
 fn b2bua_legs_have_independent_transaction_keys() {
     // Leg A: incoming INVITE
     let leg_a_branch = TransactionKey::generate_branch();
-    let leg_a_key = TransactionKey::new(leg_a_branch.clone(), Method::Invite, "10.0.0.1:5060".to_string());
+    let leg_a_key = TransactionKey::new(
+        leg_a_branch.clone(),
+        Method::Invite,
+        "10.0.0.1:5060".to_string(),
+    );
 
     // Leg B: outgoing INVITE (B2BUA generates a new branch)
     let leg_b_branch = TransactionKey::generate_branch();
-    let leg_b_key = TransactionKey::new(leg_b_branch.clone(), Method::Invite, "10.0.0.2:5060".to_string());
+    let leg_b_key = TransactionKey::new(
+        leg_b_branch.clone(),
+        Method::Invite,
+        "10.0.0.2:5060".to_string(),
+    );
 
     // The two legs must have different transaction keys
     assert_ne!(leg_a_key, leg_b_key);
@@ -403,11 +414,7 @@ fn b2bua_auth_retry_supersedes_failed_leg_for_single_cancel() {
         })
         .collect();
     assert_eq!(call.b_legs.len(), 1, "retry must supersede, not append");
-    assert_eq!(
-        cancelable_vias.len(),
-        1,
-        "exactly one CANCEL would be sent"
-    );
+    assert_eq!(cancelable_vias.len(), 1, "exactly one CANCEL would be sent");
     assert!(
         cancelable_vias[0].contains("z9hG4bK-cseq2-4a39"),
         "the single CANCEL must target the live CSeq-2 branch, got: {}",
@@ -512,7 +519,10 @@ fn uas_single_leg_call_is_resolvable_by_sip_call_id_for_terminate() {
     let call_id = store.create_call(make_a_leg(sip_call_id));
 
     // The SIP Call-ID resolves to the internal call id.
-    assert_eq!(store.find_by_sip_call_id(sip_call_id), Some(call_id.clone()));
+    assert_eq!(
+        store.find_by_sip_call_id(sip_call_id),
+        Some(call_id.clone())
+    );
 
     let call = store.get_call(&call_id).unwrap();
     // Single-leg UAS call: no B-leg / winner.
@@ -654,8 +664,10 @@ fn b2bua_multi_leg_forking() {
 #[test]
 fn cancel_transaction_key_differs_from_invite() {
     let branch = TransactionKey::generate_branch();
-    let invite_key = TransactionKey::new(branch.clone(), Method::Invite, "10.0.0.1:5060".to_string());
-    let cancel_key = TransactionKey::new(branch.clone(), Method::Cancel, "10.0.0.1:5060".to_string());
+    let invite_key =
+        TransactionKey::new(branch.clone(), Method::Invite, "10.0.0.1:5060".to_string());
+    let cancel_key =
+        TransactionKey::new(branch.clone(), Method::Cancel, "10.0.0.1:5060".to_string());
 
     // CANCEL creates its own transaction (same branch but different method)
     assert_ne!(invite_key, cancel_key);
@@ -668,10 +680,10 @@ fn cancel_transaction_key_differs_from_invite() {
 
 #[test]
 fn client_transaction_lifecycle_options() {
-    use siphon::transaction::TransactionManager;
-    use siphon::transaction::state::{Transport as TxnTransport, Action, TimerName};
-    use siphon::transaction::{ClientEvent};
     use siphon::transaction::state::NictEvent;
+    use siphon::transaction::state::{Action, TimerName, Transport as TxnTransport};
+    use siphon::transaction::ClientEvent;
+    use siphon::transaction::TransactionManager;
 
     let manager = TransactionManager::default();
 
@@ -687,11 +699,17 @@ fn client_transaction_lifecycle_options() {
         .unwrap();
 
     // Create client transaction
-    let (key, actions) = manager.new_client_transaction(request, TxnTransport::Udp).unwrap();
+    let (key, actions) = manager
+        .new_client_transaction(request, TxnTransport::Udp)
+        .unwrap();
     assert_eq!(manager.count(), 1);
     assert!(actions.iter().any(|a| matches!(a, Action::SendMessage(_))));
-    assert!(actions.iter().any(|a| matches!(a, Action::StartTimer(TimerName::F, _))));
-    assert!(actions.iter().any(|a| matches!(a, Action::StartTimer(TimerName::E, _))));
+    assert!(actions
+        .iter()
+        .any(|a| matches!(a, Action::StartTimer(TimerName::F, _))));
+    assert!(actions
+        .iter()
+        .any(|a| matches!(a, Action::StartTimer(TimerName::E, _))));
 
     // Receive 200 OK
     let response = SipMessageBuilder::new()
@@ -705,20 +723,19 @@ fn client_transaction_lifecycle_options() {
         .build()
         .unwrap();
 
-    let actions = manager.process_client_event(
-        &key,
-        ClientEvent::Nict(NictEvent::FinalResponse(response)),
-    ).unwrap();
+    let actions = manager
+        .process_client_event(&key, ClientEvent::Nict(NictEvent::FinalResponse(response)))
+        .unwrap();
     assert!(actions.iter().any(|a| matches!(a, Action::PassToTu(_))));
     // UDP: enters Completed with Timer K, then terminates
 }
 
 #[test]
 fn server_transaction_lifecycle_options() {
-    use siphon::transaction::TransactionManager;
-    use siphon::transaction::state::{Transport as TxnTransport, Action};
-    use siphon::transaction::ServerEvent;
     use siphon::transaction::state::NistEvent;
+    use siphon::transaction::state::{Action, Transport as TxnTransport};
+    use siphon::transaction::ServerEvent;
+    use siphon::transaction::TransactionManager;
 
     let manager = TransactionManager::default();
 
@@ -734,7 +751,9 @@ fn server_transaction_lifecycle_options() {
         .unwrap();
 
     // Create server transaction
-    let siphon::transaction::ServerTransactionOutcome { key, actions, .. } = manager.new_server_transaction(&request, TxnTransport::Udp).unwrap();
+    let siphon::transaction::ServerTransactionOutcome { key, actions, .. } = manager
+        .new_server_transaction(&request, TxnTransport::Udp)
+        .unwrap();
     assert_eq!(manager.count(), 1);
     assert!(actions.iter().any(|a| matches!(a, Action::PassToTu(_))));
 
@@ -750,10 +769,9 @@ fn server_transaction_lifecycle_options() {
         .build()
         .unwrap();
 
-    let actions = manager.process_server_event(
-        &key,
-        ServerEvent::Nist(NistEvent::TuFinal(response)),
-    ).unwrap();
+    let actions = manager
+        .process_server_event(&key, ServerEvent::Nist(NistEvent::TuFinal(response)))
+        .unwrap();
     assert!(actions.iter().any(|a| matches!(a, Action::SendMessage(_))));
     // UDP NIST: enters Completed with Timer J (not immediately terminated)
 }
@@ -795,9 +813,15 @@ fn b2bua_a_leg_invite_stored_and_available_through_lifecycle() {
     {
         let call = store.get_call(&call_id).unwrap();
         assert_eq!(call.state, CallState::Answered);
-        let stored_invite = call.a_leg_invite.as_ref().expect("a_leg_invite should be stored");
+        let stored_invite = call
+            .a_leg_invite
+            .as_ref()
+            .expect("a_leg_invite should be stored");
         let msg = stored_invite.lock().unwrap();
-        assert_eq!(msg.headers.get("From").map(|s| s.contains("store-tag")), Some(true));
+        assert_eq!(
+            msg.headers.get("From").map(|s| s.contains("store-tag")),
+            Some(true)
+        );
     }
 
     // A-leg INVITE should still be available at BYE time (for on_bye handler)
@@ -932,7 +956,6 @@ fn session_timer_state_lifecycle() {
     assert!(store.get_call(&call_id).is_none());
 }
 
-
 #[test]
 fn session_timer_per_call_override_on_call_actor_store() {
     use siphon::script::api::call::SessionTimerOverride;
@@ -1000,10 +1023,10 @@ async fn remove_call_terminates_actor_tasks() {
 
     // All actor tasks should terminate
     for join in joins {
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            join,
-        ).await.expect("actor task did not terminate").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), join)
+            .await
+            .expect("actor task did not terminate")
+            .unwrap();
     }
 }
 
@@ -1042,7 +1065,10 @@ fn reinvite_b_leg_non2xx_removed() {
     {
         let call = store.get_call(&call_id).unwrap();
         assert_eq!(call.b_legs.len(), 2);
-        assert_eq!(call.b_legs[1].dialog.target_uri.as_deref(), Some("reinvite:a2b"));
+        assert_eq!(
+            call.b_legs[1].dialog.target_uri.as_deref(),
+            Some("reinvite:a2b")
+        );
     }
 
     // Simulate non-2xx response → remove re-INVITE entry
@@ -1092,12 +1118,18 @@ fn reinvite_b_leg_2xx_marked_done() {
     {
         let call = store.get_call(&call_id).unwrap();
         assert_eq!(call.b_legs.len(), 2);
-        assert_eq!(call.b_legs[1].dialog.target_uri.as_deref(), Some("reinvite_done:b2a"));
+        assert_eq!(
+            call.b_legs[1].dialog.target_uri.as_deref(),
+            Some("reinvite_done:b2a")
+        );
         assert_eq!(call.b_legs[1].branch, reinvite_branch);
     }
 
     // The branch should still be resolvable to the call
-    assert_eq!(store.call_id_for_branch(&reinvite_branch), Some(call_id.clone()));
+    assert_eq!(
+        store.call_id_for_branch(&reinvite_branch),
+        Some(call_id.clone())
+    );
 
     // Winner index unaffected
     {
@@ -1143,9 +1175,15 @@ fn reinvite_done_entry_cleaned_on_call_removal() {
     assert!(store.call_id_for_branch(&reinvite_branch).is_none());
     // Zombie entry should exist for the re-INVITE B-leg
     let zombie = store.get_zombie_reinvite(&reinvite_sip_cid);
-    assert!(zombie.is_some(), "reinvite_done entry should become a zombie");
+    assert!(
+        zombie.is_some(),
+        "reinvite_done entry should become a zombie"
+    );
     let zombie = zombie.unwrap();
-    assert_eq!(zombie.destination, "10.0.0.2:5060".parse::<std::net::SocketAddr>().unwrap());
+    assert_eq!(
+        zombie.destination,
+        "10.0.0.2:5060".parse::<std::net::SocketAddr>().unwrap()
+    );
     assert_eq!(zombie.transport, Transport::Udp);
 }
 
@@ -1160,8 +1198,10 @@ fn zombie_reinvite_not_created_for_normal_bleg() {
     store.add_b_leg(&call_id, normal_leg);
 
     store.remove_call(&call_id);
-    assert!(store.get_zombie_reinvite(&normal_cid).is_none(),
-        "normal B-leg should not create a zombie entry");
+    assert!(
+        store.get_zombie_reinvite(&normal_cid).is_none(),
+        "normal B-leg should not create a zombie entry"
+    );
     assert!(store.zombie_reinvites.is_empty());
 }
 
@@ -1191,8 +1231,14 @@ fn zombie_reinvite_created_for_pending_reinvite() {
 
     store.remove_call(&call_id);
     let zombie = store.get_zombie_reinvite(&reinvite_cid);
-    assert!(zombie.is_some(), "pending reinvite entry should become a zombie");
-    assert_eq!(zombie.unwrap().destination, "10.0.0.5:5060".parse::<std::net::SocketAddr>().unwrap());
+    assert!(
+        zombie.is_some(),
+        "pending reinvite entry should become a zombie"
+    );
+    assert_eq!(
+        zombie.unwrap().destination,
+        "10.0.0.5:5060".parse::<std::net::SocketAddr>().unwrap()
+    );
 }
 
 #[test]
@@ -1260,7 +1306,10 @@ fn update_b_leg_non2xx_removed() {
     {
         let call = store.get_call(&call_id).unwrap();
         assert_eq!(call.b_legs.len(), 2);
-        assert_eq!(call.b_legs[1].dialog.target_uri.as_deref(), Some("update:a2b"));
+        assert_eq!(
+            call.b_legs[1].dialog.target_uri.as_deref(),
+            Some("update:a2b")
+        );
     }
 
     store.remove_b_leg(&call_id, 1);
@@ -1303,10 +1352,16 @@ fn update_b_leg_2xx_marked_done() {
     {
         let call = store.get_call(&call_id).unwrap();
         assert_eq!(call.b_legs.len(), 2);
-        assert_eq!(call.b_legs[1].dialog.target_uri.as_deref(), Some("update_done:b2a"));
+        assert_eq!(
+            call.b_legs[1].dialog.target_uri.as_deref(),
+            Some("update_done:b2a")
+        );
         assert_eq!(call.b_legs[1].branch, update_branch);
     }
-    assert_eq!(store.call_id_for_branch(&update_branch), Some(call_id.clone()));
+    assert_eq!(
+        store.call_id_for_branch(&update_branch),
+        Some(call_id.clone())
+    );
 }
 
 #[test]
@@ -1351,14 +1406,26 @@ fn update_concurrent_with_reinvite_distinct_slots() {
     store.add_b_leg(&call_id, update_leg);
 
     // Branches resolve independently
-    assert_eq!(store.call_id_for_branch(&reinvite_branch), Some(call_id.clone()));
-    assert_eq!(store.call_id_for_branch(&update_branch), Some(call_id.clone()));
+    assert_eq!(
+        store.call_id_for_branch(&reinvite_branch),
+        Some(call_id.clone())
+    );
+    assert_eq!(
+        store.call_id_for_branch(&update_branch),
+        Some(call_id.clone())
+    );
 
     {
         let call = store.get_call(&call_id).unwrap();
         assert_eq!(call.b_legs.len(), 3);
-        assert_eq!(call.b_legs[1].dialog.target_uri.as_deref(), Some("reinvite:a2b"));
-        assert_eq!(call.b_legs[2].dialog.target_uri.as_deref(), Some("update:b2a"));
+        assert_eq!(
+            call.b_legs[1].dialog.target_uri.as_deref(),
+            Some("reinvite:a2b")
+        );
+        assert_eq!(
+            call.b_legs[2].dialog.target_uri.as_deref(),
+            Some("update:b2a")
+        );
     }
 }
 
@@ -1408,7 +1475,12 @@ fn set_b_leg_target_uri_no_panic_on_invalid_index() {
     {
         let call = store.get_call(&call_id).unwrap();
         assert_eq!(call.b_legs.len(), 1);
-        assert!(call.b_legs[0].dialog.target_uri.as_deref().unwrap().starts_with("sip:"));
+        assert!(call.b_legs[0]
+            .dialog
+            .target_uri
+            .as_deref()
+            .unwrap()
+            .starts_with("sip:"));
     }
 }
 
@@ -1451,10 +1523,7 @@ fn rewrite_uri_authority_no_double_port_when_topology_hiding_to() {
     // rejected with `400 Wrong URI`.
     let to = "<sip:bob@pcscf.example.com:5061;user=phone>";
     let rewritten = rewrite_uri_authority(to, "trunk.example.com:5060");
-    assert_eq!(
-        rewritten,
-        "<sip:bob@trunk.example.com:5060;user=phone>"
-    );
+    assert_eq!(rewritten, "<sip:bob@trunk.example.com:5060;user=phone>");
     assert!(
         !rewritten.contains("5060:5061"),
         "double port must not appear: {rewritten}"
@@ -1506,7 +1575,11 @@ fn b2bua_cseq_independent_per_leg() {
     use siphon::b2bua::actor::Dialog;
 
     let mut a_dialog = Dialog::from_inbound("call-a@host".into(), "remote-tag".into());
-    let mut b_dialog = Dialog::new_outbound("b2b-call@host".into(), "local-tag".into(), "sip:bob@10.0.0.2".into());
+    let mut b_dialog = Dialog::new_outbound(
+        "b2b-call@host".into(),
+        "local-tag".into(),
+        "sip:bob@10.0.0.2".into(),
+    );
 
     // A-leg and B-leg start with independent CSeq = 1
     assert_eq!(a_dialog.local_cseq, 1);
@@ -1530,7 +1603,7 @@ fn b2bua_cseq_independent_per_leg() {
 
 #[test]
 fn dialog_local_and_remote_contact_storage() {
-    use siphon::b2bua::actor::{Dialog, extract_contact_uri};
+    use siphon::b2bua::actor::{extract_contact_uri, Dialog};
 
     let mut a_dialog = Dialog::from_inbound("call-a@host".into(), "remote-tag".into());
     let mut b_dialog = Dialog::new_outbound(
@@ -1547,19 +1620,25 @@ fn dialog_local_and_remote_contact_storage() {
 
     // Set A-leg contacts (siphon's Contact to caller + caller's Contact)
     a_dialog.local_contact = Some("<sip:203.0.113.1:5060;transport=udp>".to_string());
-    a_dialog.remote_contact = Some(
-        extract_contact_uri("<sip:alice@10.0.0.1:5060;transport=udp>;expires=3600"),
-    );
+    a_dialog.remote_contact = Some(extract_contact_uri(
+        "<sip:alice@10.0.0.1:5060;transport=udp>;expires=3600",
+    ));
 
     // Set B-leg contacts (siphon's Contact to callee + callee's Contact from 200 OK)
     b_dialog.local_contact = Some("<sip:203.0.113.1:5060;transport=tcp>".to_string());
-    b_dialog.remote_contact = Some(
-        extract_contact_uri("<sip:bob@192.168.1.100:5060;transport=tcp>"),
-    );
+    b_dialog.remote_contact = Some(extract_contact_uri(
+        "<sip:bob@192.168.1.100:5060;transport=tcp>",
+    ));
 
     // Verify extract_contact_uri strips angle brackets and header params
-    assert_eq!(a_dialog.remote_contact.as_deref().unwrap(), "sip:alice@10.0.0.1:5060;transport=udp");
-    assert_eq!(b_dialog.remote_contact.as_deref().unwrap(), "sip:bob@192.168.1.100:5060;transport=tcp");
+    assert_eq!(
+        a_dialog.remote_contact.as_deref().unwrap(),
+        "sip:alice@10.0.0.1:5060;transport=udp"
+    );
+    assert_eq!(
+        b_dialog.remote_contact.as_deref().unwrap(),
+        "sip:bob@192.168.1.100:5060;transport=tcp"
+    );
 
     // Each leg is independent — contacts don't leak between legs
     assert_ne!(a_dialog.local_contact, b_dialog.local_contact);
@@ -1629,13 +1708,25 @@ fn per_leg_contact_on_call_actor_store() {
     let call = store.get_call(&call_id).unwrap();
 
     // A-leg contacts
-    assert_eq!(call.a_leg.dialog.local_contact.as_deref(), Some("<sip:203.0.113.1:5060;transport=udp>"));
-    assert_eq!(call.a_leg.dialog.remote_contact.as_deref(), Some("sip:alice@10.0.0.1:5060"));
+    assert_eq!(
+        call.a_leg.dialog.local_contact.as_deref(),
+        Some("<sip:203.0.113.1:5060;transport=udp>")
+    );
+    assert_eq!(
+        call.a_leg.dialog.remote_contact.as_deref(),
+        Some("sip:alice@10.0.0.1:5060")
+    );
 
     // B-leg contacts
     let b = &call.b_legs[0];
-    assert_eq!(b.dialog.local_contact.as_deref(), Some("<sip:203.0.113.1:5060;transport=tcp>"));
-    assert_eq!(b.dialog.remote_contact.as_deref(), Some("sip:bob@192.168.1.100:5060;transport=tcp"));
+    assert_eq!(
+        b.dialog.local_contact.as_deref(),
+        Some("<sip:203.0.113.1:5060;transport=tcp>")
+    );
+    assert_eq!(
+        b.dialog.remote_contact.as_deref(),
+        Some("sip:bob@192.168.1.100:5060;transport=tcp")
+    );
 
     // For in-dialog re-INVITE A→B:
     //   RURI = B-leg remote_contact = "sip:bob@192.168.1.100:5060;transport=tcp"
@@ -1716,7 +1807,10 @@ fn call_actor_can_carry_resolved_header_policy() {
 
     assert!(call.resolved_header_policy.is_some());
     let attached = call.resolved_header_policy.as_ref().unwrap();
-    assert_eq!(attached.preset.qualified_name(), "ims-trust-domain-boundary@2026");
+    assert_eq!(
+        attached.preset.qualified_name(),
+        "ims-trust-domain-boundary@2026"
+    );
 }
 
 #[test]
@@ -1725,7 +1819,10 @@ fn bgcf_mtc_trace_headers_stripped_by_trust_boundary_preset() {
     // the BGCF/FreeSWITCH trace that motivated the opt-in policy work.
     let mut invite = make_invite(&[
         ("Alert-Info", "<urn:alert:service:call-waiting>"),
-        ("Diversion", "<sip:+3197010267609@sip.didww.com>;reason=unconditional"),
+        (
+            "Diversion",
+            "<sip:+3197010267609@sip.didww.com>;reason=unconditional",
+        ),
         ("P-Hint", "inbound"),
         ("X-FS-Support", "update_display,send_info"),
     ]);
@@ -1789,10 +1886,8 @@ fn intentional_proxy_authenticate_strip_works_for_every_preset() {
         "ims-trust-domain-boundary@2026",
         "sip-trunk-edge@2026",
     ] {
-        let mut response = make_response_200(&[(
-            "Proxy-Authenticate",
-            "Digest realm=\"b-leg.example.com\"",
-        )]);
+        let mut response =
+            make_response_200(&[("Proxy-Authenticate", "Digest realm=\"b-leg.example.com\"")]);
 
         let preset = builtin_presets().get(*preset_name).unwrap().clone();
         let policy = ResolvedPolicy::from_preset(preset);
@@ -1845,10 +1940,7 @@ fn framework_auto_100rel_strip_is_preset_independent() {
     assert!(!passed_through.headers.has("RSeq"));
 
     // 100rel-capable A-leg: the reliable provisional still flows end-to-end.
-    let mut for_capable_peer = make_response_200(&[
-        ("Require", "100rel"),
-        ("RSeq", "1"),
-    ]);
+    let mut for_capable_peer = make_response_200(&[("Require", "100rel"), ("RSeq", "1")]);
     apply_to_response(&mut for_capable_peer, &policy, &test_ctx());
     let removed = siphon::sip::headers::rseq::strip_100rel_for_unsupported_peer(
         &mut for_capable_peer.headers,
@@ -1922,12 +2014,13 @@ fn transparent_proxy_b2bua_can_opt_in_to_proxy_authenticate_passthrough() {
     // Rare transparent-proxy B2BUA case: A and C share auth domain and
     // the B2BUA wants A to handle the 401 itself.  Per-call delta restores
     // the header that every preset strips by default.
-    let mut response = make_response_200(&[(
-        "Proxy-Authenticate",
-        "Digest realm=\"trusted.example.com\"",
-    )]);
+    let mut response =
+        make_response_200(&[("Proxy-Authenticate", "Digest realm=\"trusted.example.com\"")]);
 
-    let preset = builtin_presets().get("transparent-b2bua@2026").unwrap().clone();
+    let preset = builtin_presets()
+        .get("transparent-b2bua@2026")
+        .unwrap()
+        .clone();
     let mut policy = ResolvedPolicy::from_preset(preset);
     policy.deltas_copy.push("Proxy-Authenticate".to_string());
 
@@ -1950,16 +2043,28 @@ fn per_call_delta_overrides_preset_strip_for_emergency_call() {
         ("X-Internal-Tag", "should-still-be-stripped"),
     ]);
 
-    let preset = builtin_presets().get("sip-trunk-edge@2026").unwrap().clone();
+    let preset = builtin_presets()
+        .get("sip-trunk-edge@2026")
+        .unwrap()
+        .clone();
     let mut policy = ResolvedPolicy::from_preset(preset);
     policy.deltas_copy.push("P-Asserted-Identity".to_string());
     policy.deltas_copy.push("Geolocation".to_string());
 
     apply_to_request(&mut invite, &policy, &test_ctx());
 
-    assert!(invite.headers.has("P-Asserted-Identity"), "delta copy should restore PAI");
-    assert!(invite.headers.has("Geolocation"), "delta copy should restore Geolocation");
-    assert!(!invite.headers.has("X-Internal-Tag"), "X-* still stripped by preset");
+    assert!(
+        invite.headers.has("P-Asserted-Identity"),
+        "delta copy should restore PAI"
+    );
+    assert!(
+        invite.headers.has("Geolocation"),
+        "delta copy should restore Geolocation"
+    );
+    assert!(
+        !invite.headers.has("X-Internal-Tag"),
+        "X-* still stripped by preset"
+    );
 }
 
 #[test]
@@ -1974,7 +2079,10 @@ fn validator_rejects_authorization_copy_combined_with_pai_rewrite() {
         request: DirectionPolicy {
             default: Verb::Copy,
             overrides: vec![
-                (HeaderPattern::Exact("Authorization".to_string()), Verb::Copy),
+                (
+                    HeaderPattern::Exact("Authorization".to_string()),
+                    Verb::Copy,
+                ),
                 (
                     HeaderPattern::Exact("P-Asserted-Identity".to_string()),
                     Verb::Rewrite(RewriteOp::HostToAdvertised),
@@ -1990,7 +2098,10 @@ fn validator_rejects_authorization_copy_combined_with_pai_rewrite() {
     let err = validate_preset(&bad_preset).expect_err("should reject");
     match err {
         PresetError::AuthorizationCopyWithDigestProtectedRewrite(name) => {
-            assert!(name.contains("bad"), "error should name the bad preset: {name}");
+            assert!(
+                name.contains("bad"),
+                "error should name the bad preset: {name}"
+            );
         }
         other => panic!("wrong error variant: {other:?}"),
     }
@@ -2002,14 +2113,20 @@ fn validator_accepts_intra_trust_with_per_call_authorization_copy() {
     // R-URI / PAI rewrites (ims-intra-trust-domain), then add Authorization
     // to deltas_copy at dial time.  Validator is preset-level so the
     // delta is fine; preset must still validate cleanly.
-    let preset = (**builtin_presets().get("ims-intra-trust-domain@2026").unwrap()).clone();
+    let preset = (**builtin_presets()
+        .get("ims-intra-trust-domain@2026")
+        .unwrap())
+    .clone();
     validate_preset(&preset).expect("intra-trust preset must validate clean");
 
     // And a ResolvedPolicy carrying the Authorization delta still works.
     let mut policy = ResolvedPolicy::from_preset(Arc::new(preset));
     policy.deltas_copy.push("Authorization".to_string());
 
-    let mut invite = make_invite(&[("Authorization", "Digest username=\"alice\", realm=\"c.example.com\"")]);
+    let mut invite = make_invite(&[(
+        "Authorization",
+        "Digest username=\"alice\", realm=\"c.example.com\"",
+    )]);
     apply_to_request(&mut invite, &policy, &test_ctx());
     // Authorization copied through (case-c transparent auth)
     assert!(invite.headers.has("Authorization"));
@@ -2067,7 +2184,10 @@ fn direction_unknown_call_id_is_none() {
     // than bridging to a guessed leg).
     let (store, call_id, _b_call_id, _b_tag) = make_answered_call("teams-cid");
     let call = store.get_call(&call_id).unwrap();
-    assert_eq!(call.request_direction("stranger-cid", Some("who-tag")), None);
+    assert_eq!(
+        call.request_direction("stranger-cid", Some("who-tag")),
+        None
+    );
 }
 
 #[test]
@@ -2083,10 +2203,19 @@ fn preserve_call_id_disambiguates_by_from_tag() {
     store.set_winner(&call_id, 0);
     let call = store.get_call(&call_id).unwrap();
 
-    assert_eq!(call.request_direction("shared-cid", Some("alice-tag")), Some(LegSide::A));
-    assert_eq!(call.request_direction("shared-cid", Some("bob-tag")), Some(LegSide::B));
+    assert_eq!(
+        call.request_direction("shared-cid", Some("alice-tag")),
+        Some(LegSide::A)
+    );
+    assert_eq!(
+        call.request_direction("shared-cid", Some("bob-tag")),
+        Some(LegSide::B)
+    );
     // Unknown tag or missing tag can't be disambiguated → None (safe 481).
-    assert_eq!(call.request_direction("shared-cid", Some("ghost-tag")), None);
+    assert_eq!(
+        call.request_direction("shared-cid", Some("ghost-tag")),
+        None
+    );
     assert_eq!(call.request_direction("shared-cid", None), None);
 }
 
@@ -2124,8 +2253,14 @@ fn early_update_from_unanswered_b_leg_is_from_b() {
     // No set_winner — call is still early.
 
     let call = store.get_call(&call_id).unwrap();
-    assert_eq!(call.request_direction("b-early-cid", None), Some(LegSide::B));
-    assert_eq!(call.request_direction("a-cid", Some("alice-tag")), Some(LegSide::A));
+    assert_eq!(
+        call.request_direction("b-early-cid", None),
+        Some(LegSide::B)
+    );
+    assert_eq!(
+        call.request_direction("a-cid", Some("alice-tag")),
+        Some(LegSide::A)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2146,7 +2281,9 @@ fn refer_call_matched_by_call_id_gates_loop_killer() {
         "a REFER on this Call-ID is intercepted, not proxy-relayed",
     );
     // A REFER on an unknown Call-ID doesn't match — it falls through (out-of-dialog).
-    assert!(store.find_by_sip_call_id("someone-elses-call@test").is_none());
+    assert!(store
+        .find_by_sip_call_id("someone-elses-call@test")
+        .is_none());
 }
 
 #[test]
@@ -2238,8 +2375,10 @@ fn promoting_the_transfer_target_retires_the_referrers_call_id() {
 /// signalled for either of them to show.
 #[test]
 fn a_leg_that_only_answers_still_tracks_its_current_media() {
-    const ORIGINAL_ANSWER: &[u8] = b"v=0\r\no=callee 1 1 IN IP4 192.0.2.2\r\nm=audio 5000 RTP/AVP 0\r\na=sendonly\r\n";
-    const REINVITE_ANSWER: &[u8] = b"v=0\r\no=callee 1 2 IN IP4 192.0.2.2\r\nm=audio 5000 RTP/AVP 0\r\na=sendrecv\r\n";
+    const ORIGINAL_ANSWER: &[u8] =
+        b"v=0\r\no=callee 1 1 IN IP4 192.0.2.2\r\nm=audio 5000 RTP/AVP 0\r\na=sendonly\r\n";
+    const REINVITE_ANSWER: &[u8] =
+        b"v=0\r\no=callee 1 2 IN IP4 192.0.2.2\r\nm=audio 5000 RTP/AVP 0\r\na=sendrecv\r\n";
 
     let store = CallActorStore::new();
     let call_id = store.create_call(make_a_leg("stale-sdp@test"));
@@ -2250,7 +2389,9 @@ fn a_leg_that_only_answers_still_tracks_its_current_media() {
     // offer) — that is its media at the time and is recorded.
     store.set_leg_last_sdp(&call_id, false, ORIGINAL_ANSWER);
     assert_eq!(
-        store.clone_leg(&call_id, false).and_then(|leg| leg.last_sdp),
+        store
+            .clone_leg(&call_id, false)
+            .and_then(|leg| leg.last_sdp),
         Some(ORIGINAL_ANSWER.to_vec())
     );
 
@@ -2729,7 +2870,9 @@ fn ue_port_us() -> SocketAddr {
     "192.0.2.10:6101".parse().expect("protected server port")
 }
 fn pcscf_port_ps() -> SocketAddr {
-    "192.0.2.20:5066".parse().expect("P-CSCF protected server port")
+    "192.0.2.20:5066"
+        .parse()
+        .expect("P-CSCF protected server port")
 }
 
 /// Build the retransmit target a flow-dialled B-leg produces: written to the
@@ -2746,10 +2889,7 @@ fn flow_pinned_target() -> siphon::b2bua::retransmit::RetransmitTarget {
 /// Push one due retransmit through the router exactly as the dispatcher's
 /// `send_outbound_from` does, so the assertion is about where the datagram
 /// actually lands rather than about the store's bookkeeping.
-fn route(
-    router: &siphon::transport::OutboundRouter,
-    event: &siphon::b2bua::retransmit::Due,
-) {
+fn route(router: &siphon::transport::OutboundRouter, event: &siphon::b2bua::retransmit::Due) {
     if let siphon::b2bua::retransmit::Due::Send { data, target, .. } = event {
         router
             .send(siphon::transport::OutboundMessage {
@@ -2886,7 +3026,9 @@ fn unpinned_b_leg_retransmit_uses_the_default_egress() {
         route(&router, event);
     }
 
-    let sent = plain.try_recv().expect("unpinned retransmit uses the default channel");
+    let sent = plain
+        .try_recv()
+        .expect("unpinned retransmit uses the default channel");
     assert_eq!(sent.source_local_addr, None);
     assert!(protected_client.try_recv().is_err());
 }

@@ -102,7 +102,6 @@ impl SipUri {
             .find(|(n, _)| n == name)
             .map(|(_, v)| v.as_deref().unwrap_or(""))
     }
-
 }
 
 impl fmt::Display for SipUri {
@@ -215,8 +214,14 @@ mod tests {
 
     #[test]
     fn split_host_port_hostname() {
-        assert_eq!(split_host_port("proxy.example.com:5061"), ("proxy.example.com", Some(5061)));
-        assert_eq!(split_host_port("proxy.example.com"), ("proxy.example.com", None));
+        assert_eq!(
+            split_host_port("proxy.example.com:5061"),
+            ("proxy.example.com", Some(5061))
+        );
+        assert_eq!(
+            split_host_port("proxy.example.com"),
+            ("proxy.example.com", None)
+        );
     }
 
     #[test]
@@ -256,8 +261,7 @@ mod tests {
 
     #[test]
     fn sip_uri_to_string_ipv6_bracketed_host() {
-        let uri = SipUri::new("[::1]".to_string())
-            .with_port(5060);
+        let uri = SipUri::new("[::1]".to_string()).with_port(5060);
         assert_eq!(uri.to_string(), "sip:[::1]:5060");
     }
 
@@ -271,8 +275,7 @@ mod tests {
 
     #[test]
     fn sip_uri_to_string_hostname_unchanged() {
-        let uri = SipUri::new("biloxi.com".to_string())
-            .with_user("bob".to_string());
+        let uri = SipUri::new("biloxi.com".to_string()).with_user("bob".to_string());
         assert_eq!(uri.to_string(), "sip:bob@biloxi.com");
     }
 
@@ -297,11 +300,16 @@ mod tests {
             user: Some("8367".to_string()),
             host: "ims.mnc001.mcc001.3gppnetwork.org".to_string(),
             port: None,
-            params: vec![("phone-context".to_string(), Some("ims.mnc001.mcc001.3gppnetwork.org".to_string()))],
+            params: vec![(
+                "phone-context".to_string(),
+                Some("ims.mnc001.mcc001.3gppnetwork.org".to_string()),
+            )],
             headers: Vec::new(),
             user_params: Vec::new(),
         };
-        assert_eq!(uri.to_string(), "tel:8367;phone-context=ims.mnc001.mcc001.3gppnetwork.org");
+        assert_eq!(
+            uri.to_string(),
+            "tel:8367;phone-context=ims.mnc001.mcc001.3gppnetwork.org"
+        );
     }
 }
-

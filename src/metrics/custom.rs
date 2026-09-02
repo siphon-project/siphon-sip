@@ -8,9 +8,7 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 use dashmap::DashMap;
-use prometheus::{
-    CounterVec, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry,
-};
+use prometheus::{CounterVec, GaugeVec, HistogramOpts, HistogramVec, Opts, Registry};
 use regex::Regex;
 
 /// Maximum number of distinct label-value combinations per metric.
@@ -42,12 +40,7 @@ impl CustomMetrics {
     }
 
     /// Register a new counter metric.
-    pub fn register_counter(
-        &self,
-        name: &str,
-        help: &str,
-        labels: &[&str],
-    ) -> Result<(), String> {
+    pub fn register_counter(&self, name: &str, help: &str, labels: &[&str]) -> Result<(), String> {
         validate_metric_name(name)?;
         validate_labels(labels)?;
         if self.is_registered(name) {
@@ -61,20 +54,17 @@ impl CustomMetrics {
             .map_err(|error| format!("failed to register counter '{name}': {error}"))?;
 
         self.counters.insert(name.to_owned(), counter);
-        self.label_names
-            .insert(name.to_owned(), labels.iter().map(|s| (*s).to_owned()).collect());
+        self.label_names.insert(
+            name.to_owned(),
+            labels.iter().map(|s| (*s).to_owned()).collect(),
+        );
         self.cardinality
             .insert(name.to_owned(), Mutex::new(HashSet::new()));
         Ok(())
     }
 
     /// Register a new gauge metric.
-    pub fn register_gauge(
-        &self,
-        name: &str,
-        help: &str,
-        labels: &[&str],
-    ) -> Result<(), String> {
+    pub fn register_gauge(&self, name: &str, help: &str, labels: &[&str]) -> Result<(), String> {
         validate_metric_name(name)?;
         validate_labels(labels)?;
         if self.is_registered(name) {
@@ -88,8 +78,10 @@ impl CustomMetrics {
             .map_err(|error| format!("failed to register gauge '{name}': {error}"))?;
 
         self.gauges.insert(name.to_owned(), gauge);
-        self.label_names
-            .insert(name.to_owned(), labels.iter().map(|s| (*s).to_owned()).collect());
+        self.label_names.insert(
+            name.to_owned(),
+            labels.iter().map(|s| (*s).to_owned()).collect(),
+        );
         self.cardinality
             .insert(name.to_owned(), Mutex::new(HashSet::new()));
         Ok(())
@@ -120,8 +112,10 @@ impl CustomMetrics {
             .map_err(|error| format!("failed to register histogram '{name}': {error}"))?;
 
         self.histograms.insert(name.to_owned(), histogram);
-        self.label_names
-            .insert(name.to_owned(), labels.iter().map(|s| (*s).to_owned()).collect());
+        self.label_names.insert(
+            name.to_owned(),
+            labels.iter().map(|s| (*s).to_owned()).collect(),
+        );
         self.cardinality
             .insert(name.to_owned(), Mutex::new(HashSet::new()));
         Ok(())
@@ -146,12 +140,7 @@ impl CustomMetrics {
     }
 
     /// Set a gauge value.
-    pub fn gauge_set(
-        &self,
-        name: &str,
-        labels: &[(&str, &str)],
-        value: f64,
-    ) -> Result<(), String> {
+    pub fn gauge_set(&self, name: &str, labels: &[(&str, &str)], value: f64) -> Result<(), String> {
         let gauge = self
             .gauges
             .get(name)
@@ -164,12 +153,7 @@ impl CustomMetrics {
     }
 
     /// Increment a gauge.
-    pub fn gauge_inc(
-        &self,
-        name: &str,
-        labels: &[(&str, &str)],
-        value: f64,
-    ) -> Result<(), String> {
+    pub fn gauge_inc(&self, name: &str, labels: &[(&str, &str)], value: f64) -> Result<(), String> {
         let gauge = self
             .gauges
             .get(name)
@@ -182,12 +166,7 @@ impl CustomMetrics {
     }
 
     /// Decrement a gauge.
-    pub fn gauge_dec(
-        &self,
-        name: &str,
-        labels: &[(&str, &str)],
-        value: f64,
-    ) -> Result<(), String> {
+    pub fn gauge_dec(&self, name: &str, labels: &[(&str, &str)], value: f64) -> Result<(), String> {
         let gauge = self
             .gauges
             .get(name)
@@ -244,9 +223,7 @@ impl CustomMetrics {
             let found = labels
                 .iter()
                 .find(|(key, _)| key == expected)
-                .ok_or_else(|| {
-                    format!("missing label '{expected}' for metric '{name}'")
-                })?;
+                .ok_or_else(|| format!("missing label '{expected}' for metric '{name}'"))?;
             values.push(found.1.to_owned());
         }
         Ok(values)
@@ -367,14 +344,8 @@ mod tests {
             .unwrap();
 
         let counter = custom.counters.get("test_calls_total").unwrap();
-        assert_eq!(
-            counter.with_label_values(&["inbound", "ok"]).get(),
-            1.0
-        );
-        assert_eq!(
-            counter.with_label_values(&["outbound", "ok"]).get(),
-            3.0
-        );
+        assert_eq!(counter.with_label_values(&["inbound", "ok"]).get(), 1.0);
+        assert_eq!(counter.with_label_values(&["outbound", "ok"]).get(), 3.0);
     }
 
     #[test]
@@ -427,15 +398,18 @@ mod tests {
             .unwrap();
 
         let histogram = custom.histograms.get("test_duration_seconds").unwrap();
-        assert_eq!(histogram.with_label_values(&[] as &[&str]).get_sample_count(), 2);
+        assert_eq!(
+            histogram
+                .with_label_values(&[] as &[&str])
+                .get_sample_count(),
+            2
+        );
     }
 
     #[test]
     fn duplicate_name_rejected() {
         let (_registry, custom) = test_registry();
-        custom
-            .register_counter("dup_total", "First", &[])
-            .unwrap();
+        custom.register_counter("dup_total", "First", &[]).unwrap();
         let result = custom.register_counter("dup_total", "Second", &[]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("already registered"));
@@ -504,20 +478,12 @@ mod tests {
         // Fill up to the limit.
         for i in 0..MAX_CARDINALITY {
             custom
-                .gauge_set(
-                    "cardinality_test",
-                    &[("id", &i.to_string())],
-                    1.0,
-                )
+                .gauge_set("cardinality_test", &[("id", &i.to_string())], 1.0)
                 .unwrap();
         }
 
         // Next one should fail.
-        let result = custom.gauge_set(
-            "cardinality_test",
-            &[("id", "overflow")],
-            1.0,
-        );
+        let result = custom.gauge_set("cardinality_test", &[("id", "overflow")], 1.0);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("cardinality limit"));
     }

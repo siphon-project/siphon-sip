@@ -115,13 +115,7 @@ impl PyPresence {
     /// Returns:
     ///     Subscription ID string.
     #[pyo3(signature = (subscriber, resource, event="presence", expires=3600))]
-    fn subscribe(
-        &self,
-        subscriber: &str,
-        resource: &str,
-        event: &str,
-        expires: u64,
-    ) -> String {
+    fn subscribe(&self, subscriber: &str, resource: &str, event: &str, expires: u64) -> String {
         let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
         let subscription = Subscription::new(
             subscription_id.clone(),
@@ -320,11 +314,7 @@ impl PyPresence {
     ///                                              "q": float|None}]}]}``.
     ///
     /// Raises ``ValueError`` on malformed XML or unknown attribute values.
-    fn parse_reginfo<'py>(
-        &self,
-        python: Python<'py>,
-        xml: &str,
-    ) -> PyResult<Bound<'py, PyDict>> {
+    fn parse_reginfo<'py>(&self, python: Python<'py>, xml: &str) -> PyResult<Bound<'py, PyDict>> {
         let body = crate::registrar::reginfo::parse_reginfo(xml).map_err(|error| {
             pyo3::exceptions::PyValueError::new_err(format!("invalid reginfo: {error}"))
         })?;
@@ -381,10 +371,15 @@ impl PyPresence {
         } = dialog;
 
         // Determine transport destination: first Route header, or subscriber URI
-        let resolve_target: String = route_set.first()
+        let resolve_target: String = route_set
+            .first()
             .map(|route: &String| {
                 // Strip angle brackets from Route value: <sip:pcscf:5060;lr> → sip:pcscf:5060;lr
-                route.trim().trim_start_matches('<').trim_end_matches('>').to_string()
+                route
+                    .trim()
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string()
             })
             .unwrap_or_else(|| subscriber.clone());
 
@@ -401,7 +396,9 @@ impl PyPresence {
             ))
         })?;
 
-        let transport_hint = resolve_uri.get_param("transport").map(|s: &str| s.to_string());
+        let transport_hint = resolve_uri
+            .get_param("transport")
+            .map(|s: &str| s.to_string());
         let resolver_clone = Arc::clone(resolver);
         let host = resolve_uri.host.clone();
         let port = resolve_uri.port;
@@ -420,11 +417,7 @@ impl PyPresence {
             ))
         })?;
 
-        let transport = match target
-            .transport
-            .as_deref()
-            .or(transport_hint.as_deref())
-        {
+        let transport = match target.transport.as_deref().or(transport_hint.as_deref()) {
             Some(hint) => match hint.to_lowercase().as_str() {
                 "tcp" => Transport::Tcp,
                 "tls" => Transport::Tls,
@@ -433,7 +426,13 @@ impl PyPresence {
                 "sctp" => Transport::Sctp,
                 _ => Transport::Udp,
             },
-            None => if scheme == "sips" { Transport::Tls } else { Transport::Udp },
+            None => {
+                if scheme == "sips" {
+                    Transport::Tls
+                } else {
+                    Transport::Udp
+                }
+            }
         };
 
         // Build in-dialog NOTIFY: same Call-ID, swapped From/To tags, Route set
@@ -678,7 +677,10 @@ mod tests {
         );
 
         let dialog = store.prepare_notify(&sub_id).expect("dialog state");
-        assert_eq!(dialog.subscriber, contact, "R-URI still targets the Contact");
+        assert_eq!(
+            dialog.subscriber, contact,
+            "R-URI still targets the Contact"
+        );
         assert_eq!(dialog.local_uri, aor, "From must be the dialog's local URI");
         assert_eq!(dialog.remote_uri, aor, "To must be the dialog's remote URI");
         // Display names / tags supplied by a script are stripped — a From URI
@@ -822,7 +824,9 @@ mod tests {
         let store = make_store();
         let presence = PyPresence::new(store);
 
-        let result = presence.terminate("sub-nonexistent", None, None, None).unwrap();
+        let result = presence
+            .terminate("sub-nonexistent", None, None, None)
+            .unwrap();
         assert!(!result);
     }
 
@@ -830,9 +834,15 @@ mod tests {
     fn is_terminated_subscription_state_recognizes_terminated_forms() {
         // RFC 6665 §4.1.3 forms:
         assert!(is_terminated_subscription_state("terminated"));
-        assert!(is_terminated_subscription_state("terminated;reason=timeout"));
-        assert!(is_terminated_subscription_state("terminated;reason=noresource"));
-        assert!(is_terminated_subscription_state("terminated;reason=deactivated;retry-after=60"));
+        assert!(is_terminated_subscription_state(
+            "terminated;reason=timeout"
+        ));
+        assert!(is_terminated_subscription_state(
+            "terminated;reason=noresource"
+        ));
+        assert!(is_terminated_subscription_state(
+            "terminated;reason=deactivated;retry-after=60"
+        ));
         // Tolerate leading whitespace and the SP separator some impls use:
         assert!(is_terminated_subscription_state(" terminated;reason=foo"));
         assert!(is_terminated_subscription_state("terminated reason=foo"));

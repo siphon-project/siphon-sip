@@ -11,10 +11,10 @@ use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::{error, info, warn};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, Mutex, Notify};
+use tracing::{error, info, warn};
 
 use crate::diameter::transport::DiameterStream;
 
@@ -173,7 +173,8 @@ impl DiameterPeer {
 
     /// Send a request and wait for the answer (default 10s timeout).
     pub async fn send_request(&self, msg: Vec<u8>) -> Result<DiameterMessage, String> {
-        self.send_request_timeout(msg, DEFAULT_REQUEST_TIMEOUT).await
+        self.send_request_timeout(msg, DEFAULT_REQUEST_TIMEOUT)
+            .await
     }
 
     /// Send a request and wait up to `timeout` for the answer. Used by the Diameter server
@@ -192,7 +193,10 @@ impl DiameterPeer {
         let command_label = codec::command_name(command_code, true);
 
         if let Some(metrics) = crate::metrics::try_metrics() {
-            metrics.diameter_requests_total.with_label_values(&[command_label]).inc();
+            metrics
+                .diameter_requests_total
+                .with_label_values(&[command_label])
+                .inc();
         }
 
         let start = std::time::Instant::now();
@@ -200,12 +204,16 @@ impl DiameterPeer {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(hbh, tx);
 
-        self.write_tx.send(msg).await.map_err(|e| format!("write channel closed: {}", e))?;
+        self.write_tx
+            .send(msg)
+            .await
+            .map_err(|e| format!("write channel closed: {}", e))?;
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(answer)) => {
                 if let Some(metrics) = crate::metrics::try_metrics() {
-                    metrics.diameter_request_duration_seconds
+                    metrics
+                        .diameter_request_duration_seconds
                         .with_label_values(&[command_label])
                         .observe(start.elapsed().as_secs_f64());
                 }
@@ -214,16 +222,20 @@ impl DiameterPeer {
             Ok(Err(_)) => {
                 self.pending.lock().await.remove(&hbh);
                 if let Some(metrics) = crate::metrics::try_metrics() {
-                    metrics.diameter_request_errors_total
-                        .with_label_values(&["channel_dropped"]).inc();
+                    metrics
+                        .diameter_request_errors_total
+                        .with_label_values(&["channel_dropped"])
+                        .inc();
                 }
                 Err("answer channel dropped".into())
             }
             Err(_) => {
                 self.pending.lock().await.remove(&hbh);
                 if let Some(metrics) = crate::metrics::try_metrics() {
-                    metrics.diameter_request_errors_total
-                        .with_label_values(&["timeout"]).inc();
+                    metrics
+                        .diameter_request_errors_total
+                        .with_label_values(&["timeout"])
+                        .inc();
                 }
                 Err(format!("request timed out ({}s)", timeout.as_secs()))
             }
@@ -232,7 +244,10 @@ impl DiameterPeer {
 
     /// Send a response (no answer expected).
     pub async fn send_response(&self, msg: Vec<u8>) -> Result<(), String> {
-        self.write_tx.send(msg).await.map_err(|e| format!("write channel closed: {}", e))
+        self.write_tx
+            .send(msg)
+            .await
+            .map_err(|e| format!("write channel closed: {}", e))
     }
 
     /// Shutdown the peer connection.
@@ -294,11 +309,20 @@ pub fn build_cer(config: &PeerConfig, hbh: u32, e2e: u32) -> Vec<u8> {
 
     avps.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, &config.origin_host));
     avps.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, &config.origin_realm));
-    avps.extend_from_slice(&encode_avp_address_ipv4(avp::HOST_IP_ADDRESS, config.local_ip));
+    avps.extend_from_slice(&encode_avp_address_ipv4(
+        avp::HOST_IP_ADDRESS,
+        config.local_ip,
+    ));
     avps.extend_from_slice(&encode_avp_u32(avp::VENDOR_ID, 0)); // IETF
     avps.extend_from_slice(&encode_avp_utf8(avp::PRODUCT_NAME, &config.product_name));
-    avps.extend_from_slice(&encode_avp_u32(avp::FIRMWARE_REVISION, config.firmware_revision));
-    avps.extend_from_slice(&encode_avp_u32(avp::SUPPORTED_VENDOR_ID, dictionary::VENDOR_3GPP));
+    avps.extend_from_slice(&encode_avp_u32(
+        avp::FIRMWARE_REVISION,
+        config.firmware_revision,
+    ));
+    avps.extend_from_slice(&encode_avp_u32(
+        avp::SUPPORTED_VENDOR_ID,
+        dictionary::VENDOR_3GPP,
+    ));
 
     encode_application_ids(&mut avps, &config.application_ids);
 
@@ -319,11 +343,20 @@ pub fn build_cea(config: &PeerConfig, result_code: u32, hbh: u32, e2e: u32) -> V
     avps.extend_from_slice(&encode_avp_u32(avp::RESULT_CODE, result_code));
     avps.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, &config.origin_host));
     avps.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, &config.origin_realm));
-    avps.extend_from_slice(&encode_avp_address_ipv4(avp::HOST_IP_ADDRESS, config.local_ip));
+    avps.extend_from_slice(&encode_avp_address_ipv4(
+        avp::HOST_IP_ADDRESS,
+        config.local_ip,
+    ));
     avps.extend_from_slice(&encode_avp_u32(avp::VENDOR_ID, 0));
     avps.extend_from_slice(&encode_avp_utf8(avp::PRODUCT_NAME, &config.product_name));
-    avps.extend_from_slice(&encode_avp_u32(avp::FIRMWARE_REVISION, config.firmware_revision));
-    avps.extend_from_slice(&encode_avp_u32(avp::SUPPORTED_VENDOR_ID, dictionary::VENDOR_3GPP));
+    avps.extend_from_slice(&encode_avp_u32(
+        avp::FIRMWARE_REVISION,
+        config.firmware_revision,
+    ));
+    avps.extend_from_slice(&encode_avp_u32(
+        avp::SUPPORTED_VENDOR_ID,
+        dictionary::VENDOR_3GPP,
+    ));
 
     encode_application_ids(&mut avps, &config.application_ids);
 
@@ -340,7 +373,10 @@ pub fn build_cea(config: &PeerConfig, result_code: u32, hbh: u32, e2e: u32) -> V
 /// Build a DWA (Device-Watchdog-Answer) for an incoming DWR.
 pub fn build_dwa(origin_host: &str, origin_realm: &str, hbh: u32, e2e: u32) -> Vec<u8> {
     let mut avps = Vec::new();
-    avps.extend_from_slice(&encode_avp_u32(avp::RESULT_CODE, dictionary::DIAMETER_SUCCESS));
+    avps.extend_from_slice(&encode_avp_u32(
+        avp::RESULT_CODE,
+        dictionary::DIAMETER_SUCCESS,
+    ));
     avps.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, origin_host));
     avps.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, origin_realm));
 
@@ -350,7 +386,10 @@ pub fn build_dwa(origin_host: &str, origin_realm: &str, hbh: u32, e2e: u32) -> V
 /// Build a DPA (Disconnect-Peer-Answer) for an incoming DPR (RFC 6733 §5.4).
 pub fn build_dpa(origin_host: &str, origin_realm: &str, hbh: u32, e2e: u32) -> Vec<u8> {
     let mut avps = Vec::new();
-    avps.extend_from_slice(&encode_avp_u32(avp::RESULT_CODE, dictionary::DIAMETER_SUCCESS));
+    avps.extend_from_slice(&encode_avp_u32(
+        avp::RESULT_CODE,
+        dictionary::DIAMETER_SUCCESS,
+    ));
     avps.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, origin_host));
     avps.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, origin_realm));
 
@@ -591,7 +630,10 @@ pub async fn connect_with_transport(
 
     // Send CER
     let cer = build_cer(&config, 1, 1);
-    stream.write_all(&cer).await.map_err(|e| format!("CER write failed: {}", e))?;
+    stream
+        .write_all(&cer)
+        .await
+        .map_err(|e| format!("CER write failed: {}", e))?;
     info!("Diameter: sent CER to {}", addr);
 
     // Read CEA
@@ -608,7 +650,11 @@ pub async fn connect_with_transport(
         ));
     }
 
-    let result_code = cea.avps.get("Result-Code").and_then(|v| v.as_u64()).unwrap_or(0);
+    let result_code = cea
+        .avps
+        .get("Result-Code")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     if result_code != dictionary::DIAMETER_SUCCESS as u64 {
         return Err(format!("CEA result code: {} (expected 2001)", result_code));
     }
@@ -647,7 +693,10 @@ pub async fn connect_with_retry(
                 return peer;
             }
             Err(e) => {
-                error!("Diameter: connection failed: {}. Retrying in {}s...", e, delay);
+                error!(
+                    "Diameter: connection failed: {}. Retrying in {}s...",
+                    e, delay
+                );
                 tokio::time::sleep(Duration::from_secs(delay)).await;
             }
         }
@@ -662,7 +711,10 @@ pub async fn accept(
     mut stream: DiameterStream,
     config: PeerConfig,
 ) -> Result<(Arc<DiameterPeer>, mpsc::Receiver<IncomingRequest>), String> {
-    let peer_addr = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
+    let peer_addr = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_default();
     info!("Diameter: accepting connection from {}", peer_addr);
 
     // Read CER from the connecting peer
@@ -680,12 +732,27 @@ pub async fn accept(
         ));
     }
 
-    let peer_origin = cer.avps.get("Origin-Host").and_then(|v| v.as_str()).unwrap_or("unknown");
-    info!("Diameter: received CER from {} ({})", peer_origin, peer_addr);
+    let peer_origin = cer
+        .avps
+        .get("Origin-Host")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    info!(
+        "Diameter: received CER from {} ({})",
+        peer_origin, peer_addr
+    );
 
     // Send CEA
-    let cea = build_cea(&config, dictionary::DIAMETER_SUCCESS, cer.hop_by_hop, cer.end_to_end);
-    stream.write_all(&cea).await.map_err(|e| format!("CEA write failed: {}", e))?;
+    let cea = build_cea(
+        &config,
+        dictionary::DIAMETER_SUCCESS,
+        cer.hop_by_hop,
+        cer.end_to_end,
+    );
+    stream
+        .write_all(&cea)
+        .await
+        .map_err(|e| format!("CEA write failed: {}", e))?;
     info!("Diameter: sent CEA to {} (result=2001)", peer_addr);
 
     let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingRequest>(32);
@@ -723,7 +790,10 @@ pub async fn listen(
             match accept(DiameterStream::from(stream), config).await {
                 Ok(pair) => {
                     if tx.send(pair).await.is_err() {
-                        warn!("Diameter: peer channel closed, dropping connection from {}", peer_addr);
+                        warn!(
+                            "Diameter: peer channel closed, dropping connection from {}",
+                            peer_addr
+                        );
                     }
                 }
                 Err(e) => {
@@ -830,7 +900,9 @@ mod tests {
 
         // Only the vendor-10415 app produces a Vendor-Specific-Application-Id;
         // the two base (vendor-0) apps must not be wrapped in one.
-        let vsai_count = tree.find_all(avp::VENDOR_SPECIFIC_APPLICATION_ID, 0).count();
+        let vsai_count = tree
+            .find_all(avp::VENDOR_SPECIFIC_APPLICATION_ID, 0)
+            .count();
         assert_eq!(vsai_count, 1, "exactly one VSAI (the vendor-10415 Cx app)");
     }
 
@@ -1058,11 +1130,12 @@ mod tests {
     async fn sctp_client_server_cer_cea_roundtrip() {
         // Loopback SCTP CER/CEA over the real transport. Skips gracefully when
         // SCTP is unavailable in the test environment.
-        let listener =
-            match crate::diameter::transport::DiameterListener::bind_sctp("127.0.0.1:0".parse().unwrap()) {
-                Ok(listener) => listener,
-                Err(_) => return,
-            };
+        let listener = match crate::diameter::transport::DiameterListener::bind_sctp(
+            "127.0.0.1:0".parse().unwrap(),
+        ) {
+            Ok(listener) => listener,
+            Err(_) => return,
+        };
         let addr = listener.local_addr().unwrap();
 
         let server_config = test_config();
@@ -1096,8 +1169,7 @@ mod tests {
         // "Diameter server" side: accept, complete CER/CEA, then send an AIR request.
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            if let Ok((server_peer, _rx)) =
-                accept(DiameterStream::Tcp(stream), test_config()).await
+            if let Ok((server_peer, _rx)) = accept(DiameterStream::Tcp(stream), test_config()).await
             {
                 let air = encode_diameter_message(
                     FLAG_REQUEST | FLAG_PROXIABLE,
@@ -1126,7 +1198,10 @@ mod tests {
             .await
             .expect("inbound request must arrive (not be dropped)")
             .expect("channel open");
-        assert_eq!(request.command_code, dictionary::CMD_AUTHENTICATION_INFORMATION);
+        assert_eq!(
+            request.command_code,
+            dictionary::CMD_AUTHENTICATION_INFORMATION
+        );
         assert_eq!(request.hop_by_hop, 0x4242);
     }
 

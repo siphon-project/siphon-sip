@@ -114,7 +114,9 @@ pub(crate) fn spawn_outbound_distributor(
                             break;
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
-                            warn!("{transport} outbound dropped: connection {connection_id:?} closed");
+                            warn!(
+                                "{transport} outbound dropped: connection {connection_id:?} closed"
+                            );
                             break;
                         }
                     }
@@ -127,7 +129,10 @@ pub(crate) fn spawn_outbound_distributor(
                 // connection per destination, so frames stay in order on it.
                 for frame in outbound.into_frames() {
                     let sent = match transport {
-                        Transport::Tls => pool.send_tls(destination, server_name.as_deref(), frame).await,
+                        Transport::Tls => {
+                            pool.send_tls(destination, server_name.as_deref(), frame)
+                                .await
+                        }
                         Transport::Tcp => pool.send_tcp(destination, frame).await,
                         // WS/WSS are client-initiated (RFC 7118 §5): there is no
                         // outbound-connect path, so a miss here is a dead UE.
@@ -194,7 +199,12 @@ pub(crate) async fn serve_sip_stream<R, W>(
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let StreamContext { transport, connection_id, local_addr, remote_addr } = context;
+    let StreamContext {
+        transport,
+        connection_id,
+        local_addr,
+        remote_addr,
+    } = context;
 
     // Per-connection outbound channel. Cloned for the read task so it can write
     // RFC 5626 §4.4.1 pong (`\r\n`) responses back over the same connection.
@@ -241,7 +251,10 @@ pub(crate) async fn serve_sip_stream<R, W>(
                     // The connection still closes, because the body we refuse
                     // to buffer is exactly what we would have to read to find
                     // the next message boundary.
-                    FrameVerdict::Oversized { declared, header_len } => {
+                    FrameVerdict::Oversized {
+                        declared,
+                        header_len,
+                    } => {
                         warn!(
                             declared,
                             limit = crate::security::max_message_bytes(),
@@ -257,9 +270,7 @@ pub(crate) async fn serve_sip_stream<R, W>(
                                     513,
                                     "Message Too Large",
                                 );
-                                let _ = keepalive_writer
-                                    .send(Bytes::from(reject.to_bytes()))
-                                    .await;
+                                let _ = keepalive_writer.send(Bytes::from(reject.to_bytes())).await;
                             }
                         }
                         crate::security::record_malformed_message(
@@ -309,7 +320,9 @@ pub(crate) async fn serve_sip_stream<R, W>(
                     break;
                 }
                 Ok(Err(error)) => {
-                    warn!("{transport} read error on {connection_id:?} from {remote_addr}: {error}");
+                    warn!(
+                        "{transport} read error on {connection_id:?} from {remote_addr}: {error}"
+                    );
                     break;
                 }
                 Err(_) => {
@@ -668,7 +681,10 @@ mod tests {
 
     #[test]
     fn sniffs_sip_request_line() {
-        assert_eq!(sniff_first_line(INVITE), Sniff::Decided(StreamProtocol::Sip));
+        assert_eq!(
+            sniff_first_line(INVITE),
+            Sniff::Decided(StreamProtocol::Sip)
+        );
     }
 
     #[test]
@@ -691,7 +707,10 @@ mod tests {
 
     #[test]
     fn sniffs_websocket_upgrade() {
-        assert_eq!(sniff_first_line(UPGRADE), Sniff::Decided(StreamProtocol::WebSocket));
+        assert_eq!(
+            sniff_first_line(UPGRADE),
+            Sniff::Decided(StreamProtocol::WebSocket)
+        );
     }
 
     #[test]
@@ -708,7 +727,10 @@ mod tests {
         // decision, and must stay in the buffer for the pong.
         let mut buffer = Vec::from(&b"\r\n\r\n"[..]);
         buffer.extend_from_slice(INVITE);
-        assert_eq!(sniff_first_line(&buffer), Sniff::Decided(StreamProtocol::Sip));
+        assert_eq!(
+            sniff_first_line(&buffer),
+            Sniff::Decided(StreamProtocol::Sip)
+        );
     }
 
     #[test]
@@ -722,7 +744,10 @@ mod tests {
     #[test]
     fn sniff_rejects_binary_probe() {
         // A TLS ClientHello arriving on a plaintext port.
-        assert_eq!(sniff_first_line(&[0x16, 0x03, 0x01, 0x00, 0x9c]), Sniff::Garbage);
+        assert_eq!(
+            sniff_first_line(&[0x16, 0x03, 0x01, 0x00, 0x9c]),
+            Sniff::Garbage
+        );
     }
 
     #[test]
@@ -744,7 +769,11 @@ mod tests {
         client.write_all(INVITE).await.unwrap();
         let (protocol, prefix) = sniff_stream(&mut server).await.unwrap();
         assert_eq!(protocol, StreamProtocol::Sip);
-        assert_eq!(&prefix[..], INVITE, "every consumed byte must be returned for replay");
+        assert_eq!(
+            &prefix[..],
+            INVITE,
+            "every consumed byte must be returned for replay"
+        );
     }
 
     #[tokio::test]
@@ -761,7 +790,10 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let sniff = tokio::spawn(async move { sniff_stream(&mut server).await.map(|(p, _)| p) });
         client.write_all(b"GET / HT").await.unwrap();
-        client.write_all(b"TP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        client
+            .write_all(b"TP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
         assert_eq!(sniff.await.unwrap().unwrap(), StreamProtocol::WebSocket);
     }
 
@@ -880,7 +912,10 @@ mod tests {
         let (inbound_tx, _inbound_rx) = flume::unbounded();
         let connection_map = Arc::new(DashMap::new());
         let registry = StreamConnections::new();
-        let context = StreamContext { transport: Transport::Tls, ..context() };
+        let context = StreamContext {
+            transport: Transport::Tls,
+            ..context()
+        };
         let (close_tx, close_rx) = flume::unbounded();
         let served = tokio::spawn(serve_sip_stream(
             reader,
@@ -905,7 +940,10 @@ mod tests {
 
         drop(client);
         served.await.unwrap();
-        assert!(registry.get(&context.remote_addr).is_none(), "flow must be unregistered on close");
+        assert!(
+            registry.get(&context.remote_addr).is_none(),
+            "flow must be unregistered on close"
+        );
         assert!(!connection_map.contains_key(&ConnectionId(42)));
         // RFC 5626 §4.2.2 flow failure is reported to the registrar.
         assert_eq!(close_rx.recv_async().await.unwrap(), 42);
@@ -935,7 +973,10 @@ mod tests {
             }
             tokio::task::yield_now().await;
         };
-        sender.send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n")).await.unwrap();
+        sender
+            .send(Bytes::from_static(b"SIP/2.0 200 OK\r\n\r\n"))
+            .await
+            .unwrap();
         let mut out = vec![0u8; 18];
         client.read_exact(&mut out).await.unwrap();
         assert_eq!(&out, b"SIP/2.0 200 OK\r\n\r\n");

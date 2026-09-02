@@ -319,10 +319,7 @@ impl RfChargingService {
 
         match rf::send_acr(&peer, &params).await {
             Ok(answer) => {
-                debug!(
-                    result_code = answer.result_code,
-                    "rf: ACR-EVENT sent"
-                );
+                debug!(result_code = answer.result_code, "rf: ACR-EVENT sent");
                 Some(answer)
             }
             Err(error) => {
@@ -620,8 +617,7 @@ pub fn rf_lookup_candidates(
 // startup; the CDR module calls [`lookup_rf_for_dialog`] without
 // caring how the lookup is implemented.
 
-type RfLookup =
-    Arc<dyn Fn(&str) -> Option<(String, Option<u32>)> + Send + Sync + 'static>;
+type RfLookup = Arc<dyn Fn(&str) -> Option<(String, Option<u32>)> + Send + Sync + 'static>;
 
 static RF_LOOKUP: OnceLock<RfLookup> = OnceLock::new();
 
@@ -730,9 +726,7 @@ pub fn lookup_rf_for_dialog(dialog_key: &str) -> Option<(String, Option<u32>)> {
 /// gets billed to whoever placed the call rather than whoever received it.
 pub fn served_party_identities(ims_data: &ImsChargingData) -> Vec<String> {
     match ims_data.role_of_node {
-        Some(NodeRole::TerminatingRole) => {
-            ims_data.called_party.iter().cloned().collect()
-        }
+        Some(NodeRole::TerminatingRole) => ims_data.called_party.iter().cloned().collect(),
         _ => ims_data.calling_party.clone(),
     }
 }
@@ -789,9 +783,7 @@ impl SipTimestamps {
     pub fn from_request_instant(request_received: std::time::Instant) -> Self {
         let now = SystemTime::now();
         Self {
-            request: now
-                .checked_sub(request_received.elapsed())
-                .unwrap_or(now),
+            request: now.checked_sub(request_received.elapsed()).unwrap_or(now),
             response: Some(now),
         }
     }
@@ -1018,8 +1010,7 @@ mod tests {
 
     #[test]
     fn storage_keys_with_icid_emit_both() {
-        let keys =
-            rf_session_storage_keys(Some("icid-X"), "call-1", "tag-A", RfRole::Originating);
+        let keys = rf_session_storage_keys(Some("icid-X"), "call-1", "tag-A", RfRole::Originating);
         assert_eq!(
             keys,
             vec![
@@ -1043,10 +1034,8 @@ mod tests {
         // generated key sets must NOT overlap, otherwise the second
         // arrival's dedupe gate hits the first record and the second
         // ACR-START is silently dropped.
-        let orig =
-            rf_session_storage_keys(Some("icid-X"), "call-mo", "tag-A", RfRole::Originating);
-        let term =
-            rf_session_storage_keys(Some("icid-X"), "call-mt", "tag-B", RfRole::Terminating);
+        let orig = rf_session_storage_keys(Some("icid-X"), "call-mo", "tag-A", RfRole::Originating);
+        let term = rf_session_storage_keys(Some("icid-X"), "call-mt", "tag-B", RfRole::Terminating);
         for orig_key in &orig {
             assert!(
                 !term.contains(orig_key),
@@ -1057,12 +1046,8 @@ mod tests {
 
     #[test]
     fn lookup_candidates_full_set() {
-        let keys = rf_lookup_candidates(
-            Some("icid-X"),
-            Some("call-1"),
-            Some("tag-A"),
-            Some("tag-B"),
-        );
+        let keys =
+            rf_lookup_candidates(Some("icid-X"), Some("call-1"), Some("tag-A"), Some("tag-B"));
         // Order matters — ICID-based first, then dialog-by-from-tag, then dialog-by-to-tag.
         assert_eq!(
             keys,
@@ -1079,12 +1064,7 @@ mod tests {
 
     #[test]
     fn lookup_candidates_skips_duplicate_when_tags_match() {
-        let keys = rf_lookup_candidates(
-            None,
-            Some("call-1"),
-            Some("tag-A"),
-            Some("tag-A"),
-        );
+        let keys = rf_lookup_candidates(None, Some("call-1"), Some("tag-A"), Some("tag-A"));
         assert_eq!(
             keys,
             vec![
@@ -1136,7 +1116,10 @@ mod tests {
     #[test]
     fn service_disabled_when_config_disabled() {
         let manager = Arc::new(DiameterManager::new());
-        let cfg = RfConfig { enabled: false, ..Default::default() };
+        let cfg = RfConfig {
+            enabled: false,
+            ..Default::default()
+        };
         let service = RfChargingService::new(manager, cfg);
         assert!(!service.auto_emit_proxy());
         assert!(!service.auto_emit_b2bua());
@@ -1146,7 +1129,10 @@ mod tests {
     #[test]
     fn service_emits_when_enabled() {
         let manager = Arc::new(DiameterManager::new());
-        let cfg = RfConfig { enabled: true, ..Default::default() };
+        let cfg = RfConfig {
+            enabled: true,
+            ..Default::default()
+        };
         let service = RfChargingService::new(manager, cfg);
         assert!(service.auto_emit_proxy());
         assert!(service.auto_emit_b2bua());
@@ -1199,9 +1185,17 @@ mod tests {
             "\r\n",
         );
         let msg = parse_test_sip(raw);
-        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |_| false, SipTimestamps::now());
+        let ims = ims_data_from_request(
+            &msg,
+            Some(NodeFunctionality::SCscf),
+            |_| false,
+            SipTimestamps::now(),
+        );
 
-        assert_eq!(ims.ims_charging_identifier.as_deref(), Some("icid-test-001"));
+        assert_eq!(
+            ims.ims_charging_identifier.as_deref(),
+            Some("icid-test-001")
+        );
         assert_eq!(ims.originating_ioi.as_deref(), Some("home1.net"));
         assert_eq!(ims.terminating_ioi.as_deref(), Some("home2.net"));
         assert_eq!(ims.user_session_id.as_deref(), Some("a84b4c76e66710"));
@@ -1224,7 +1218,12 @@ mod tests {
             "\r\n",
         );
         let msg = parse_test_sip(raw);
-        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |_| false, SipTimestamps::now());
+        let ims = ims_data_from_request(
+            &msg,
+            Some(NodeFunctionality::SCscf),
+            |_| false,
+            SipTimestamps::now(),
+        );
         assert_eq!(ims.role_of_node, Some(NodeRole::TerminatingRole));
     }
 
@@ -1276,8 +1275,16 @@ mod tests {
             "\r\n",
         );
         let msg = parse_test_sip(raw);
-        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::PCscf), |_| true, SipTimestamps::now());
-        assert_eq!(ims.visited_network_id.as_deref(), Some("visited.example.com"));
+        let ims = ims_data_from_request(
+            &msg,
+            Some(NodeFunctionality::PCscf),
+            |_| true,
+            SipTimestamps::now(),
+        );
+        assert_eq!(
+            ims.visited_network_id.as_deref(),
+            Some("visited.example.com")
+        );
     }
 
     #[test]
@@ -1294,7 +1301,12 @@ mod tests {
             "\r\n",
         );
         let msg = parse_test_sip(raw);
-        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |_| false, SipTimestamps::now());
+        let ims = ims_data_from_request(
+            &msg,
+            Some(NodeFunctionality::SCscf),
+            |_| false,
+            SipTimestamps::now(),
+        );
         assert_eq!(ims.calling_party, vec!["sip:alice@example.com".to_string()]);
         assert_eq!(ims.called_party.as_deref(), Some("sip:bob@example.com"));
     }
@@ -1314,14 +1326,18 @@ mod tests {
             "\r\n",
         );
         let msg = parse_test_sip(raw);
-        let ims = ims_data_from_request(&msg, Some(NodeFunctionality::SCscf), |_| false, SipTimestamps::now());
+        let ims = ims_data_from_request(
+            &msg,
+            Some(NodeFunctionality::SCscf),
+            |_| false,
+            SipTimestamps::now(),
+        );
         assert_eq!(
             ims.calling_party,
             vec!["sip:alice@home.example.com".to_string()],
             "P-Asserted-Identity should override From for Calling-Party-Address"
         );
     }
-
 
     // ── P-Asserted-Identity list handling (RFC 3325 §9.1) ───────────────
 
@@ -1502,10 +1518,8 @@ mod tests {
     fn subscription_ids_are_typed_by_uri_scheme() {
         let ids = subscription_ids_for(&ims_with_role(NodeRole::OriginatingRole));
         use crate::diameter::ro::SubscriberIdKind;
-        let rendered: Vec<(SubscriberIdKind, String)> = ids
-            .into_iter()
-            .map(|id| (id.kind, id.data))
-            .collect();
+        let rendered: Vec<(SubscriberIdKind, String)> =
+            ids.into_iter().map(|id| (id.kind, id.data)).collect();
         assert_eq!(
             rendered,
             vec![
@@ -1759,8 +1773,13 @@ mod tests {
             node_functionality: Some(NodeFunctionality::SCscf),
             ..Default::default()
         };
-        let session = service.acr_start(ims, Some("sip:alice@example.com".into())).await;
-        assert!(session.is_none(), "a rejected ACR-START must not open a session");
+        let session = service
+            .acr_start(ims, Some("sip:alice@example.com".into()))
+            .await;
+        assert!(
+            session.is_none(),
+            "a rejected ACR-START must not open a session"
+        );
         assert_eq!(
             service.active_session_count(),
             0,

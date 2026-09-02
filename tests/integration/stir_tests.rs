@@ -37,7 +37,9 @@ fn generate_chain() -> GeneratedChain {
     leaf_params
         .distinguished_name
         .push(DnType::CommonName, "Test SHAKEN Leaf");
-    let leaf_cert = leaf_params.signed_by(&leaf_key, &issuer).expect("leaf sign");
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &issuer)
+        .expect("leaf sign");
 
     GeneratedChain {
         anchor_pem,
@@ -145,13 +147,9 @@ async fn unreachable_x5u_is_failed_strict_but_no_validation_permissive() {
 
     // Strict mode: a fetch failure is a hard failure.
     let directory_strict = tempfile::tempdir().unwrap();
-    let strict = StirService::from_config(&build_config(
-        &chain,
-        &bad_x5u,
-        &directory_strict,
-        false,
-    ))
-    .unwrap();
+    let strict =
+        StirService::from_config(&build_config(&chain, &bad_x5u, &directory_strict, false))
+            .unwrap();
     let signed = strict
         .sign(Attestation::A, "12155550112", "12025550100", None, now)
         .unwrap();
@@ -167,13 +165,9 @@ async fn unreachable_x5u_is_failed_strict_but_no_validation_permissive() {
 
     // Permissive mode: the same fetch failure degrades to No-TN-Validation.
     let directory_permissive = tempfile::tempdir().unwrap();
-    let permissive = StirService::from_config(&build_config(
-        &chain,
-        &bad_x5u,
-        &directory_permissive,
-        true,
-    ))
-    .unwrap();
+    let permissive =
+        StirService::from_config(&build_config(&chain, &bad_x5u, &directory_permissive, true))
+            .unwrap();
     let verification = permissive
         .verify(
             &[signed.header_value],

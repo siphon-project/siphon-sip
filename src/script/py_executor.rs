@@ -39,10 +39,10 @@
 //!    handler.  It is safe here precisely because these threads are fixed.
 
 use std::any::Any;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -965,7 +965,11 @@ mod tests {
             let answer: i64 = run(|| {
                 pyo3::Python::attach(|python| {
                     let result = python
-                        .eval(std::ffi::CString::new("6 * 7").unwrap().as_c_str(), None, None)
+                        .eval(
+                            std::ffi::CString::new("6 * 7").unwrap().as_c_str(),
+                            None,
+                            None,
+                        )
                         .unwrap();
                     result.extract::<i64>().unwrap()
                 })
@@ -1276,8 +1280,14 @@ mod tests {
 
         assert!(matches!(r_b, SubmitResult::Submitted), "B should enqueue");
         assert!(matches!(r_c, SubmitResult::Submitted), "C should enqueue");
-        assert!(matches!(r_d, SubmitResult::Full), "D should shed (queue full)");
-        assert!(matches!(r_e, SubmitResult::Full), "E should shed (queue full)");
+        assert!(
+            matches!(r_d, SubmitResult::Full),
+            "D should shed (queue full)"
+        );
+        assert!(
+            matches!(r_e, SubmitResult::Full),
+            "E should shed (queue full)"
+        );
 
         drop(pool);
     }
@@ -1392,7 +1402,9 @@ mod tests {
         let shutdown_for_progress = Arc::clone(&shutdown);
         let progress = std::thread::spawn(move || {
             while !shutdown_for_progress.load(Ordering::Relaxed) {
-                metrics_for_progress.completed.fetch_add(1, Ordering::Relaxed);
+                metrics_for_progress
+                    .completed
+                    .fetch_add(1, Ordering::Relaxed);
                 std::thread::sleep(Duration::from_millis(20));
             }
         });
@@ -1746,14 +1758,20 @@ mod tests {
         let mut capped = false;
         for _ in 0..300 {
             let total = pool.size();
-            assert!(total <= 3, "pool must never exceed max_threads; saw {total}");
+            assert!(
+                total <= 3,
+                "pool must never exceed max_threads; saw {total}"
+            );
             if total == 3 {
                 capped = true;
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(capped, "pool should have grown to max_threads under heavy load");
+        assert!(
+            capped,
+            "pool should have grown to max_threads under heavy load"
+        );
 
         // Drain and confirm the pool does NOT shrink (no reaping → no leak).
         release.store(true, Ordering::Relaxed);

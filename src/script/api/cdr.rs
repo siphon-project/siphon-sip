@@ -136,7 +136,11 @@ impl PyCdrNamespace {
     /// billing with the corresponding Diameter accounting record.
     /// Manual `extra={"rf_session_id": ...}` values take precedence.
     #[pyo3(signature = (source, extra=None))]
-    fn write(&self, source: &Bound<'_, PyAny>, extra: Option<&Bound<'_, PyDict>>) -> PyResult<bool> {
+    fn write(
+        &self,
+        source: &Bound<'_, PyAny>,
+        extra: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<bool> {
         // Resolve the CDR fields from whichever object the script passed.
         // Type dispatch happens first so an unsupported object always raises a
         // clear TypeError, independent of whether the CDR system is enabled.

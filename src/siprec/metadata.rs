@@ -238,9 +238,10 @@ pub fn parse_recording_metadata(xml: &str) -> Result<RecordingMetadata, Metadata
 
                 match name {
                     "participant" => {
-                        if let (Some(participant_id), Some(aor)) =
-                            (current_participant_id.take(), current_participant_aor.take())
-                        {
+                        if let (Some(participant_id), Some(aor)) = (
+                            current_participant_id.take(),
+                            current_participant_aor.take(),
+                        ) {
                             participants.push(Participant {
                                 participant_id,
                                 aor,
@@ -272,7 +273,8 @@ pub fn parse_recording_metadata(xml: &str) -> Result<RecordingMetadata, Metadata
         buffer.clear();
     }
 
-    let session_id = session_id.ok_or_else(|| MetadataError::MissingElement("session".to_string()))?;
+    let session_id =
+        session_id.ok_or_else(|| MetadataError::MissingElement("session".to_string()))?;
 
     Ok(RecordingMetadata {
         session_id,
@@ -329,7 +331,9 @@ mod tests {
             "sip:bob@example.com",
             Some("original-call-id-from-invite@192.168.1.1"),
         );
-        assert!(xml.contains("<sipSessionID>original-call-id-from-invite@192.168.1.1</sipSessionID>"));
+        assert!(
+            xml.contains("<sipSessionID>original-call-id-from-invite@192.168.1.1</sipSessionID>")
+        );
         // session_id attribute should still be the recording session ID.
         assert!(xml.contains("session_id=\"abc12345-6789-0000-0000-000000000000\""));
     }
@@ -426,7 +430,10 @@ mod tests {
             None,
         );
         let metadata = parse_recording_metadata(&xml).unwrap();
-        assert_eq!(metadata.streams[0].session_id, "aaaabbbb-cccc-dddd-eeee-ffffffffffff");
+        assert_eq!(
+            metadata.streams[0].session_id,
+            "aaaabbbb-cccc-dddd-eeee-ffffffffffff"
+        );
     }
 
     #[test]
@@ -469,7 +476,10 @@ mod tests {
 
         let metadata = parse_recording_metadata(xml).unwrap();
         assert_eq!(metadata.session_id, "ext-sess-001");
-        assert_eq!(metadata.sip_session_ids, vec!["original-dialog-call-id@10.0.0.5"]);
+        assert_eq!(
+            metadata.sip_session_ids,
+            vec!["original-dialog-call-id@10.0.0.5"]
+        );
         assert_eq!(metadata.participants.len(), 2);
         assert_eq!(metadata.participants[0].aor, "sip:external@vendor.com");
         assert_eq!(metadata.participants[1].aor, "sip:customer@our.com");
@@ -490,7 +500,10 @@ mod tests {
             "</recording>",
         );
         let metadata = parse_recording_metadata(xml).unwrap();
-        assert_eq!(metadata.sip_session_ids, vec!["call-id-1@host1", "call-id-2@host2"]);
+        assert_eq!(
+            metadata.sip_session_ids,
+            vec!["call-id-1@host1", "call-id-2@host2"]
+        );
     }
 
     #[test]

@@ -242,7 +242,14 @@ async fn apply_media_verb(command: AdapterCommand) -> ControlResult {
 /// or the typed `not_found` result to return when no media session is anchored.
 fn media_target(
     channel: &ChannelRef,
-) -> Result<(std::sync::Arc<crate::rtpengine::MediaBackend>, String, String), ControlResult> {
+) -> Result<
+    (
+        std::sync::Arc<crate::rtpengine::MediaBackend>,
+        String,
+        String,
+    ),
+    ControlResult,
+> {
     crate::dispatcher::b2bua_media_target(&channel.sip_call_id).ok_or_else(|| {
         ControlResult::error(
             ControlErrorCode::NotFound,
@@ -412,7 +419,10 @@ fn play_source_kind(source: &crate::rtpengine::client::PlayMediaSource) -> &'sta
 fn play_accept(
     channel_id: &str,
     source: &crate::rtpengine::client::PlayMediaSource,
-    result: Result<crate::rtpengine::siphon_rtp::PlayMediaOutcome, crate::rtpengine::RtpEngineError>,
+    result: Result<
+        crate::rtpengine::siphon_rtp::PlayMediaOutcome,
+        crate::rtpengine::RtpEngineError,
+    >,
 ) -> (ControlResult, Option<serde_json::Value>) {
     let outcome = match result {
         Ok(outcome) => outcome,
@@ -671,7 +681,14 @@ async fn stream_start(channel: &ChannelRef, args: &serde_json::Value) -> Control
         Err(result) => return result,
     };
     match backend
-        .attach_ws_tee(&call_id, &from_tag, &ws_uri, direction, channels, sample_rate)
+        .attach_ws_tee(
+            &call_id,
+            &from_tag,
+            &ws_uri,
+            direction,
+            channels,
+            sample_rate,
+        )
         .await
     {
         Ok(()) => {
@@ -865,7 +882,6 @@ fn originate_with_bus(bus: &std::sync::Arc<ControlBus>, command: AdapterCommand)
     }))
 }
 
-
 /// Dispatch `bridge` / `unbridge`.
 ///
 /// `bridge` is the one verb that addresses **two** channels: the substrate
@@ -946,14 +962,12 @@ async fn bridge_with_bus(
             };
             match crate::b2bua::bridge::PeerHangupPolicy::parse(text) {
                 Some(policy) => policy,
-                None => {
-                    return ControlResult::error(
-                        ControlErrorCode::BadRequest,
-                        format!(
-                            "bridge args.on_peer_hangup must be \"hangup\" or \"hold\", got '{text}'"
-                        ),
-                    )
-                }
+                None => return ControlResult::error(
+                    ControlErrorCode::BadRequest,
+                    format!(
+                        "bridge args.on_peer_hangup must be \"hangup\" or \"hold\", got '{text}'"
+                    ),
+                ),
             }
         }
     };
@@ -1149,14 +1163,20 @@ fn originate_error(error: crate::dispatcher::OriginateError) -> ControlResult {
 }
 
 /// Fetch a clone of the stored A-leg INVITE Arc for a controlled call.
-fn stored_invite(call_actor_id: &str) -> Option<std::sync::Arc<std::sync::Mutex<crate::sip::message::SipMessage>>> {
+fn stored_invite(
+    call_actor_id: &str,
+) -> Option<std::sync::Arc<std::sync::Mutex<crate::sip::message::SipMessage>>> {
     let store = crate::b2bua::actor::global_call_store()?;
     let call = store.get_call(call_actor_id)?;
     call.a_leg_invite.clone()
 }
 
 /// Read `code`/`reason`/`body`/`content_type` from a verb's args.
-fn response_args(args: &serde_json::Value, default_code: u16, default_reason: &str) -> (u16, String, Option<Vec<u8>>, Option<String>) {
+fn response_args(
+    args: &serde_json::Value,
+    default_code: u16,
+    default_reason: &str,
+) -> (u16, String, Option<Vec<u8>>, Option<String>) {
     let code = args
         .get("code")
         .and_then(|v| v.as_u64())
@@ -1212,7 +1232,10 @@ fn send_uas_response(
     final_response: bool,
 ) -> Result<(), ControlResult> {
     let Some(invite_arc) = stored_invite(&channel.call_actor_id) else {
-        return Err(ControlResult::error(ControlErrorCode::NotFound, "call is gone"));
+        return Err(ControlResult::error(
+            ControlErrorCode::NotFound,
+            "call is gone",
+        ));
     };
     let Ok(invite) = invite_arc.lock() else {
         return Err(ControlResult::error(
@@ -1242,12 +1265,19 @@ fn send_uas_response(
     if sent {
         Ok(())
     } else {
-        Err(ControlResult::error(ControlErrorCode::NotFound, "call is gone"))
+        Err(ControlResult::error(
+            ControlErrorCode::NotFound,
+            "call is gone",
+        ))
     }
 }
 
 fn answer(channel: &ChannelRef, args: &serde_json::Value, final_response: bool) -> ControlResult {
-    let (default_code, default_reason) = if final_response { (200, "OK") } else { (183, "Session Progress") };
+    let (default_code, default_reason) = if final_response {
+        (200, "OK")
+    } else {
+        (183, "Session Progress")
+    };
     let (code, reason, body, content_type) = response_args(args, default_code, default_reason);
 
     if final_response && !(200..300).contains(&code) {
@@ -1258,9 +1288,14 @@ fn answer(channel: &ChannelRef, args: &serde_json::Value, final_response: bool) 
     }
 
     let has_body = body.as_ref().is_some_and(|bytes| !bytes.is_empty());
-    if let Err(result) =
-        send_uas_response(channel, code, &reason, body, content_type.as_deref(), final_response)
-    {
+    if let Err(result) = send_uas_response(
+        channel,
+        code,
+        &reason,
+        body,
+        content_type.as_deref(),
+        final_response,
+    ) {
         return result;
     }
     if final_response {
@@ -1319,10 +1354,15 @@ fn ring(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
 fn reject(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
     let (code, reason, _, _) = response_args(args, 603, "Decline");
     if !(300..700).contains(&code) {
-        return ControlResult::error(ControlErrorCode::BadRequest, "reject requires a 3xx-6xx code");
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "reject requires a 3xx-6xx code",
+        );
     }
     if crate::dispatcher::b2bua_reject_call(&channel.call_actor_id, code, &reason) {
-        ControlResult::Ok(serde_json::json!({ "channel": channel.channel_id, "state": "terminated", "code": code }))
+        ControlResult::Ok(
+            serde_json::json!({ "channel": channel.channel_id, "state": "terminated", "code": code }),
+        )
     } else {
         ControlResult::error(ControlErrorCode::NotFound, "call is gone")
     }
@@ -1355,10 +1395,16 @@ fn hangup(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
     } else {
         // Unanswered/parked: send a final non-2xx and tear down (no B-leg to CANCEL
         // in Phase 1's single-CallActor model).
-        crate::dispatcher::b2bua_reject_call(&channel.call_actor_id, 603, reason.unwrap_or("Decline"))
+        crate::dispatcher::b2bua_reject_call(
+            &channel.call_actor_id,
+            603,
+            reason.unwrap_or("Decline"),
+        )
     };
     if ok {
-        ControlResult::Ok(serde_json::json!({ "channel": channel.channel_id, "state": "terminated" }))
+        ControlResult::Ok(
+            serde_json::json!({ "channel": channel.channel_id, "state": "terminated" }),
+        )
     } else {
         ControlResult::error(ControlErrorCode::NotFound, "call is gone")
     }
@@ -1445,7 +1491,10 @@ fn accept_refer(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult
             serde_json::json!({ "channel": channel.channel_id, "transfer": "accepted" }),
         )
     } else {
-        ControlResult::error(ControlErrorCode::NotFound, "no pending transfer for this call")
+        ControlResult::error(
+            ControlErrorCode::NotFound,
+            "no pending transfer for this call",
+        )
     }
 }
 
@@ -1464,7 +1513,10 @@ fn reject_refer(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult
             serde_json::json!({ "channel": channel.channel_id, "transfer": "rejected", "code": code }),
         )
     } else {
-        ControlResult::error(ControlErrorCode::NotFound, "no pending transfer for this call")
+        ControlResult::error(
+            ControlErrorCode::NotFound,
+            "no pending transfer for this call",
+        )
     }
 }
 
@@ -1544,11 +1596,19 @@ fn route(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
             Err(message) => return ControlResult::error(ControlErrorCode::BadRequest, message),
         }
     }
-    let strategy = args.get("strategy").and_then(|v| v.as_str()).unwrap_or("sequential");
+    let strategy = args
+        .get("strategy")
+        .and_then(|v| v.as_str())
+        .unwrap_or("sequential");
     let extra_headers = parse_extra_headers(args.get("headers"));
     let target_count = targets.len();
 
-    match crate::dispatcher::b2bua_route_call(&channel.sip_call_id, targets, strategy, &extra_headers) {
+    match crate::dispatcher::b2bua_route_call(
+        &channel.sip_call_id,
+        targets,
+        strategy,
+        &extra_headers,
+    ) {
         Ok(true) => ControlResult::Ok(serde_json::json!({
             "channel": channel.channel_id,
             "state": "routing",
@@ -1579,15 +1639,25 @@ fn parse_route_target(item: &serde_json::Value) -> Result<crate::dispatcher::Rou
     }
     let Some(object) = item.as_object() else {
         return Err(
-            "each target must be a URI string or an object {uri, next_hop, headers, timeout}".to_string(),
+            "each target must be a URI string or an object {uri, next_hop, headers, timeout}"
+                .to_string(),
         );
     };
     let Some(uri) = object.get("uri").and_then(|v| v.as_str()) else {
         return Err("target object requires a string 'uri'".to_string());
     };
-    let next_hop = object.get("next_hop").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let headers = object.get("headers").map(parse_json_headers).unwrap_or_default();
-    let timeout_secs = object.get("timeout").and_then(|v| v.as_u64()).map(|t| t as u32);
+    let next_hop = object
+        .get("next_hop")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let headers = object
+        .get("headers")
+        .map(parse_json_headers)
+        .unwrap_or_default();
+    let timeout_secs = object
+        .get("timeout")
+        .and_then(|v| v.as_u64())
+        .map(|t| t as u32);
     Ok(crate::dispatcher::RouteTarget {
         uri: uri.to_string(),
         next_hop,
@@ -1651,12 +1721,17 @@ fn remove_header(channel: &ChannelRef, args: &serde_json::Value) -> ControlResul
     };
     let was_present = invite.headers.has(name);
     invite.headers.remove(name);
-    ControlResult::Ok(serde_json::json!({ "channel": channel.channel_id, "header": name, "removed": was_present }))
+    ControlResult::Ok(
+        serde_json::json!({ "channel": channel.channel_id, "header": name, "removed": was_present }),
+    )
 }
 
 fn get_header(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
     let Some(name) = args.get("name").and_then(|v| v.as_str()) else {
-        return ControlResult::error(ControlErrorCode::BadRequest, "get_header requires args.name");
+        return ControlResult::error(
+            ControlErrorCode::BadRequest,
+            "get_header requires args.name",
+        );
     };
     let Some(invite_arc) = stored_invite(&channel.call_actor_id) else {
         return ControlResult::error(ControlErrorCode::NotFound, "call is gone");
@@ -1665,7 +1740,9 @@ fn get_header(channel: &ChannelRef, args: &serde_json::Value) -> ControlResult {
         return ControlResult::error(ControlErrorCode::Unavailable, "call invite lock poisoned");
     };
     let value = invite.headers.get(name).cloned();
-    ControlResult::Ok(serde_json::json!({ "channel": channel.channel_id, "header": name, "value": value }))
+    ControlResult::Ok(
+        serde_json::json!({ "channel": channel.channel_id, "header": name, "value": value }),
+    )
 }
 
 #[cfg(test)]
@@ -1711,7 +1788,10 @@ mod tests {
                 panic!("ring with a body must be refused");
             };
             assert_eq!(code, ControlErrorCode::BadRequest);
-            assert!(message.contains("progress"), "the refusal must point at progress: {message}");
+            assert!(
+                message.contains("progress"),
+                "the refusal must point at progress: {message}"
+            );
         }
     }
 
@@ -1721,9 +1801,18 @@ mod tests {
         // would make `ring` unusable from a client that always sends the key.
         // With no dispatcher installed the call store is empty, so reaching
         // not_found proves the arg check let it through.
-        let result = sip_command("ring", serde_json::json!({ "body": null, "content_type": null }));
+        let result = sip_command(
+            "ring",
+            serde_json::json!({ "body": null, "content_type": null }),
+        );
         assert!(
-            matches!(result, ControlResult::Error { code: ControlErrorCode::NotFound, .. }),
+            matches!(
+                result,
+                ControlResult::Error {
+                    code: ControlErrorCode::NotFound,
+                    ..
+                }
+            ),
             "a null body must read as absent and let ring reach the call store"
         );
     }
@@ -1762,7 +1851,10 @@ mod tests {
             assert!(
                 matches!(
                     result,
-                    Err(ControlResult::Error { code: ControlErrorCode::BadRequest, .. })
+                    Err(ControlResult::Error {
+                        code: ControlErrorCode::BadRequest,
+                        ..
+                    })
                 ),
                 "{bad} must be refused, got {result:?}"
             );
@@ -1787,7 +1879,10 @@ mod tests {
         let (reply, started) = play_accept(
             "ch1",
             &PlayMediaSource::File("/prompts/welcome.wav".to_string()),
-            Ok(PlayMediaOutcome { play_id: Some(7), duration_ms: Some(1500) }),
+            Ok(PlayMediaOutcome {
+                play_id: Some(7),
+                duration_ms: Some(1500),
+            }),
         );
         let ControlResult::Ok(value) = reply else {
             panic!("an accepted play must reply ok");
@@ -1814,7 +1909,10 @@ mod tests {
         let (reply, started) = play_accept(
             "ch1",
             &PlayMediaSource::Http("https://example.com/prompt.wav".to_string()),
-            Ok(PlayMediaOutcome { play_id: None, duration_ms: None }),
+            Ok(PlayMediaOutcome {
+                play_id: None,
+                duration_ms: None,
+            }),
         );
         let ControlResult::Ok(value) = reply else {
             panic!("an accepted play must reply ok");
@@ -1846,17 +1944,32 @@ mod tests {
             matches!(reply, ControlResult::Error { .. }),
             "a refused play must answer with a typed error"
         );
-        assert!(started.is_none(), "a play that never started must publish no start event");
+        assert!(
+            started.is_none(),
+            "a play that never started must publish no start event"
+        );
     }
 
     #[test]
     fn play_source_kind_names_every_source() {
         use crate::rtpengine::client::PlayMediaSource;
-        assert_eq!(play_source_kind(&PlayMediaSource::File("/a.wav".into())), "file");
-        assert_eq!(play_source_kind(&PlayMediaSource::Blob(vec![0u8; 2])), "blob");
+        assert_eq!(
+            play_source_kind(&PlayMediaSource::File("/a.wav".into())),
+            "file"
+        );
+        assert_eq!(
+            play_source_kind(&PlayMediaSource::Blob(vec![0u8; 2])),
+            "blob"
+        );
         assert_eq!(play_source_kind(&PlayMediaSource::DbId(3)), "db_id");
-        assert_eq!(play_source_kind(&PlayMediaSource::Tone("ringback_eu".into())), "tone");
-        assert_eq!(play_source_kind(&PlayMediaSource::Http("https://h/x.wav".into())), "url");
+        assert_eq!(
+            play_source_kind(&PlayMediaSource::Tone("ringback_eu".into())),
+            "tone"
+        );
+        assert_eq!(
+            play_source_kind(&PlayMediaSource::Http("https://h/x.wav".into())),
+            "url"
+        );
     }
 
     fn originate_command(args: serde_json::Value) -> AdapterCommand {
@@ -1890,7 +2003,8 @@ mod tests {
     fn originate_without_a_channel_id_is_bad_request() {
         // The id is the caller's to choose; siphon never mints one, so its
         // absence is a malformed command rather than a defaulted call.
-        let result = originate_args(serde_json::json!({ "to": "sip:1@carrier.example", "media": true }));
+        let result =
+            originate_args(serde_json::json!({ "to": "sip:1@carrier.example", "media": true }));
         match result {
             ControlResult::Error { code, ref message } => {
                 assert_eq!(code, ControlErrorCode::BadRequest);
@@ -1909,7 +2023,10 @@ mod tests {
         }));
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
@@ -1918,7 +2035,10 @@ mod tests {
         let result = originate_args(serde_json::json!({ "channel": "cb-1", "media": true }));
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
@@ -1949,7 +2069,10 @@ mod tests {
         }));
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
@@ -1963,7 +2086,10 @@ mod tests {
         }));
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
@@ -1993,7 +2119,14 @@ mod tests {
         // silently re-pointing it at a second call would strand the first.
         let bus = test_bus();
         let conn = bus.register_connection("ivr-app");
-        bus.register_channel("cb-1", &conn, "call-uuid", "sipcid@host", "hangup", HashMap::new());
+        bus.register_channel(
+            "cb-1",
+            &conn,
+            "call-uuid",
+            "sipcid@host",
+            "hangup",
+            HashMap::new(),
+        );
 
         let mut command = originate_command(serde_json::json!({
             "channel": "cb-1",
@@ -2025,7 +2158,10 @@ mod tests {
         command.origin.conn_id = 99;
         assert!(matches!(
             originate_with_bus(&bus, command),
-            ControlResult::Error { code: ControlErrorCode::Unavailable, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::Unavailable,
+                ..
+            }
         ));
         assert!(
             !bus.channel_exists("cb-ghost"),
@@ -2046,7 +2182,10 @@ mod tests {
         }));
         command.origin.conn_id = conn.id;
         let result = originate_with_bus(&bus, command);
-        assert!(matches!(result, ControlResult::Error { .. }), "got {result:?}");
+        assert!(
+            matches!(result, ControlResult::Error { .. }),
+            "got {result:?}"
+        );
         assert!(!bus.channel_exists("cb-2"));
     }
 
@@ -2060,7 +2199,13 @@ mod tests {
             "media": true,
         })));
         assert!(
-            matches!(result, ControlResult::Error { code: ControlErrorCode::Unavailable, .. }),
+            matches!(
+                result,
+                ControlResult::Error {
+                    code: ControlErrorCode::Unavailable,
+                    ..
+                }
+            ),
             "got {result:?}"
         );
     }
@@ -2112,7 +2257,9 @@ mod tests {
         );
         assert!(parse_originate_media(&serde_json::json!({})).is_err());
         assert!(parse_originate_media(&serde_json::json!({ "sdp": "" })).is_err());
-        assert!(parse_originate_media(&serde_json::json!({ "sdp": "v=0", "media": true })).is_err());
+        assert!(
+            parse_originate_media(&serde_json::json!({ "sdp": "v=0", "media": true })).is_err()
+        );
     }
 
     #[test]
@@ -2142,23 +2289,38 @@ mod tests {
                 field: "to",
                 detail: "nope".to_string()
             }),
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
         assert!(matches!(
             originate_error(OriginateError::Unroutable("no route".to_string())),
-            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::NotFound,
+                ..
+            }
         ));
         assert!(matches!(
             originate_error(OriginateError::Unsupported("no answer_local".to_string())),
-            ControlResult::Error { code: ControlErrorCode::UnsupportedVerb, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::UnsupportedVerb,
+                ..
+            }
         ));
         assert!(matches!(
             originate_error(OriginateError::Unavailable("down".to_string())),
-            ControlResult::Error { code: ControlErrorCode::Unavailable, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::Unavailable,
+                ..
+            }
         ));
         assert!(matches!(
             originate_error(OriginateError::BuildFailed("bad".to_string())),
-            ControlResult::Error { code: ControlErrorCode::Unavailable, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::Unavailable,
+                ..
+            }
         ));
     }
 
@@ -2166,7 +2328,10 @@ mod tests {
     fn string_arg_treats_empty_as_absent() {
         let args = serde_json::json!({ "from": "", "from_display": "Support", "x": 7 });
         assert_eq!(string_arg(&args, "from"), None);
-        assert_eq!(string_arg(&args, "from_display"), Some("Support".to_string()));
+        assert_eq!(
+            string_arg(&args, "from_display"),
+            Some("Support".to_string())
+        );
         assert_eq!(string_arg(&args, "x"), None);
         assert_eq!(string_arg(&args, "missing"), None);
     }
@@ -2234,7 +2399,10 @@ mod tests {
                 .unwrap_or_default()
         };
         let ring = find("ring");
-        assert!(ring.contains("180"), "ring must name the status it sends: {ring}");
+        assert!(
+            ring.contains("180"),
+            "ring must name the status it sends: {ring}"
+        );
         assert!(
             ring.contains("no early media") || ring.contains("alerting only"),
             "ring must say it does not open early media: {ring}"
@@ -2259,8 +2427,7 @@ mod tests {
             .find(|verb| verb.verb == "refer")
             .expect("refer verb");
         assert!(
-            refer.summary.contains("TransferCompleted")
-                && refer.summary.contains("TransferFailed"),
+            refer.summary.contains("TransferCompleted") && refer.summary.contains("TransferFailed"),
             "the refer verb must point at its outcome events, got: {}",
             refer.summary
         );
@@ -2276,7 +2443,10 @@ mod tests {
         });
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
@@ -2290,10 +2460,12 @@ mod tests {
         });
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::UnsupportedVerb, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::UnsupportedVerb,
+                ..
+            }
         ));
     }
-
 
     // -----------------------------------------------------------------------
     // bridge / unbridge
@@ -2313,8 +2485,22 @@ mod tests {
     fn bus_with_two_owned_channels() -> (std::sync::Arc<ControlBus>, u64) {
         let bus = test_bus();
         let conn = bus.register_connection("ivr-app");
-        bus.register_channel("ch1", &conn, "call-uuid", "sipcid@host", "hangup", HashMap::new());
-        bus.register_channel("ch2", &conn, "call-uuid-2", "sipcid2@host", "hangup", HashMap::new());
+        bus.register_channel(
+            "ch1",
+            &conn,
+            "call-uuid",
+            "sipcid@host",
+            "hangup",
+            HashMap::new(),
+        );
+        bus.register_channel(
+            "ch2",
+            &conn,
+            "call-uuid-2",
+            "sipcid2@host",
+            "hangup",
+            HashMap::new(),
+        );
         let conn_id = conn.id;
         (bus, conn_id)
     }
@@ -2372,8 +2558,22 @@ mod tests {
         let bus = test_bus();
         let mine = bus.register_connection("ivr-app");
         let theirs = bus.register_connection("edge-app");
-        bus.register_channel("ch1", &mine, "call-uuid", "sipcid@host", "hangup", HashMap::new());
-        bus.register_channel("ch2", &theirs, "other-uuid", "other@host", "hangup", HashMap::new());
+        bus.register_channel(
+            "ch1",
+            &mine,
+            "call-uuid",
+            "sipcid@host",
+            "hangup",
+            HashMap::new(),
+        );
+        bus.register_channel(
+            "ch2",
+            &theirs,
+            "other-uuid",
+            "other@host",
+            "hangup",
+            HashMap::new(),
+        );
         let mut command = bridge_command(serde_json::json!({ "with": "ch2" }));
         command.origin.conn_id = mine.id;
         let result = bridge_with_bus(&bus, &channel(), &command).await;
@@ -2422,10 +2622,16 @@ mod tests {
     #[test]
     fn is_bridge_verb_splits_the_two_leg_verbs_from_the_rest() {
         for verb in ["bridge", "unbridge"] {
-            assert!(is_bridge_verb(verb), "{verb} should route to the bridge path");
+            assert!(
+                is_bridge_verb(verb),
+                "{verb} should route to the bridge path"
+            );
         }
         for verb in ["answer", "hangup", "play", "originate", "refer", "route"] {
-            assert!(!is_bridge_verb(verb), "{verb} should NOT route to the bridge path");
+            assert!(
+                !is_bridge_verb(verb),
+                "{verb} should NOT route to the bridge path"
+            );
         }
         // The bridge verbs must not also be classified as media verbs, or they
         // would run through the single-channel media dispatch.
@@ -2499,7 +2705,11 @@ mod tests {
                 wire,
                 "{error:?}: token {token} vs wire code {wire}"
             );
-            assert_eq!(error_code(&bridge_error(error.clone())), Some(expected), "{error:?}");
+            assert_eq!(
+                error_code(&bridge_error(error.clone())),
+                Some(expected),
+                "{error:?}"
+            );
         }
     }
 
@@ -2532,11 +2742,40 @@ mod tests {
 
     #[test]
     fn is_media_verb_splits_media_from_sip() {
-        for verb in ["play", "stop", "dtmf", "hold", "unhold", "stream_start", "stream_stop"] {
-            assert!(is_media_verb(verb), "{verb} should route to the async media path");
+        for verb in [
+            "play",
+            "stop",
+            "dtmf",
+            "hold",
+            "unhold",
+            "stream_start",
+            "stream_stop",
+        ] {
+            assert!(
+                is_media_verb(verb),
+                "{verb} should route to the async media path"
+            );
         }
-        for verb in ["answer", "ring", "progress", "reject", "hangup", "refer", "accept_refer", "reject_refer", "route", "set_header", "remove_header", "get_header", "collect_dtmf", "teleport"] {
-            assert!(!is_media_verb(verb), "{verb} should NOT route to the async media path");
+        for verb in [
+            "answer",
+            "ring",
+            "progress",
+            "reject",
+            "hangup",
+            "refer",
+            "accept_refer",
+            "reject_refer",
+            "route",
+            "set_header",
+            "remove_header",
+            "get_header",
+            "collect_dtmf",
+            "teleport",
+        ] {
+            assert!(
+                !is_media_verb(verb),
+                "{verb} should NOT route to the async media path"
+            );
         }
     }
 
@@ -2548,12 +2787,18 @@ mod tests {
         // never a fabricated call-id. Args are well-formed so resolution is
         // reached (not short-circuited on a bad_request).
         let cases = [
-            ("play", serde_json::json!({ "file": "/prompts/welcome.wav" })),
+            (
+                "play",
+                serde_json::json!({ "file": "/prompts/welcome.wav" }),
+            ),
             ("stop", serde_json::json!({})),
             ("dtmf", serde_json::json!({ "digits": "123#" })),
             ("hold", serde_json::json!({})),
             ("unhold", serde_json::json!({})),
-            ("stream_start", serde_json::json!({ "ws_uri": "ws://ai:9000/stream" })),
+            (
+                "stream_start",
+                serde_json::json!({ "ws_uri": "ws://ai:9000/stream" }),
+            ),
             ("stream_stop", serde_json::json!({})),
         ];
         let adapter = SipControlAdapter::new();
@@ -2567,7 +2812,13 @@ mod tests {
                 })
                 .await;
             assert!(
-                matches!(result, ControlResult::Error { code: ControlErrorCode::NotFound, .. }),
+                matches!(
+                    result,
+                    ControlResult::Error {
+                        code: ControlErrorCode::NotFound,
+                        ..
+                    }
+                ),
                 "media verb {verb} without a dispatcher should be not_found, got {result:?}"
             );
         }
@@ -2579,7 +2830,10 @@ mod tests {
         let result = play(&channel(), &serde_json::json!({})).await;
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
@@ -2592,7 +2846,10 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
@@ -2601,12 +2858,18 @@ mod tests {
         let missing = dtmf(&channel(), &serde_json::json!({})).await;
         assert!(matches!(
             missing,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
         let empty = dtmf(&channel(), &serde_json::json!({ "digits": "" })).await;
         assert!(matches!(
             empty,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
@@ -2615,7 +2878,10 @@ mod tests {
         let result = stream_start(&channel(), &serde_json::json!({})).await;
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
@@ -2628,7 +2894,10 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
@@ -2641,7 +2910,10 @@ mod tests {
         .await;
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
@@ -2673,9 +2945,18 @@ mod tests {
     #[test]
     fn parse_stream_channels_bounds() {
         assert_eq!(parse_stream_channels(None), Ok(None));
-        assert_eq!(parse_stream_channels(Some(&serde_json::Value::Null)), Ok(None));
-        assert_eq!(parse_stream_channels(Some(&serde_json::json!(1))), Ok(Some(1)));
-        assert_eq!(parse_stream_channels(Some(&serde_json::json!(2))), Ok(Some(2)));
+        assert_eq!(
+            parse_stream_channels(Some(&serde_json::Value::Null)),
+            Ok(None)
+        );
+        assert_eq!(
+            parse_stream_channels(Some(&serde_json::json!(1))),
+            Ok(Some(1))
+        );
+        assert_eq!(
+            parse_stream_channels(Some(&serde_json::json!(2))),
+            Ok(Some(2))
+        );
         assert!(parse_stream_channels(Some(&serde_json::json!(3))).is_err());
         assert!(parse_stream_channels(Some(&serde_json::json!(0))).is_err());
     }
@@ -2686,17 +2967,29 @@ mod tests {
         // Engine has no such call → not_found.
         assert!(matches!(
             media_error(RtpEngineError::EngineError("Unknown call-id".to_string())),
-            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::NotFound,
+                ..
+            }
         ));
         // Backend can't do it → unsupported_verb.
         assert!(matches!(
-            media_error(RtpEngineError::Unsupported { operation: "attach_ws_tee", backend: "rtpengine" }),
-            ControlResult::Error { code: ControlErrorCode::UnsupportedVerb, .. }
+            media_error(RtpEngineError::Unsupported {
+                operation: "attach_ws_tee",
+                backend: "rtpengine"
+            }),
+            ControlResult::Error {
+                code: ControlErrorCode::UnsupportedVerb,
+                ..
+            }
         ));
         // Anything else → unavailable.
         assert!(matches!(
             media_error(RtpEngineError::Timeout { timeout_ms: 1000 }),
-            ControlResult::Error { code: ControlErrorCode::Unavailable, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::Unavailable,
+                ..
+            }
         ));
     }
 
@@ -2705,7 +2998,10 @@ mod tests {
         let result = remove_header(&channel(), &serde_json::json!({}));
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
@@ -2722,7 +3018,10 @@ mod tests {
         });
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::NotFound,
+                ..
+            }
         ));
     }
 
@@ -2795,7 +3094,10 @@ mod tests {
         let result = answer(&channel(), &serde_json::json!({ "code": 486 }), true);
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
@@ -2804,7 +3106,10 @@ mod tests {
         let result = refer(&channel(), &serde_json::json!({}));
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
@@ -2816,7 +3121,10 @@ mod tests {
         let result = answer(&channel(), &serde_json::json!({ "code": 200 }), true);
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::NotFound,
+                ..
+            }
         ));
     }
 
@@ -2826,7 +3134,10 @@ mod tests {
         let result = route(&channel(), &serde_json::json!({}));
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
@@ -2835,7 +3146,10 @@ mod tests {
         let result = route(&channel(), &serde_json::json!({ "targets": [] }));
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
@@ -2847,7 +3161,10 @@ mod tests {
         );
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
@@ -2861,7 +3178,13 @@ mod tests {
             &serde_json::json!({ "targets": ["sip:1@carrier.example"], "strategy": "parallel" }),
         );
         assert!(
-            matches!(result, ControlResult::Error { code: ControlErrorCode::UnsupportedVerb, .. }),
+            matches!(
+                result,
+                ControlResult::Error {
+                    code: ControlErrorCode::UnsupportedVerb,
+                    ..
+                }
+            ),
             "unsupported strategy must be a typed UnsupportedVerb, got {result:?}"
         );
     }
@@ -2876,7 +3199,10 @@ mod tests {
         );
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::NotFound,
+                ..
+            }
         ));
     }
 
@@ -2892,14 +3218,18 @@ mod tests {
         });
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::NotFound,
+                ..
+            }
         ));
     }
 
     #[test]
     fn parse_route_target_string_and_object() {
         // Bare URI string form.
-        let string_target = parse_route_target(&serde_json::json!("sip:1@carrier.example")).unwrap();
+        let string_target =
+            parse_route_target(&serde_json::json!("sip:1@carrier.example")).unwrap();
         assert_eq!(string_target.uri, "sip:1@carrier.example");
         assert!(string_target.next_hop.is_none());
         assert!(string_target.headers.is_empty());
@@ -2914,7 +3244,10 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(object_target.uri, "sip:2@carrier.example");
-        assert_eq!(object_target.next_hop.as_deref(), Some("sip:gw@203.0.113.7:5060"));
+        assert_eq!(
+            object_target.next_hop.as_deref(),
+            Some("sip:gw@203.0.113.7:5060")
+        );
         assert_eq!(object_target.timeout_secs, Some(12));
         assert_eq!(
             object_target.headers,
@@ -2934,7 +3267,9 @@ mod tests {
         assert_eq!(replaces.call_id, "abc");
         assert!(replaces.early_only);
         assert!(parse_replaces_arg(None).unwrap().is_none());
-        assert!(parse_replaces_arg(Some(&serde_json::Value::Null)).unwrap().is_none());
+        assert!(parse_replaces_arg(Some(&serde_json::Value::Null))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -2961,7 +3296,10 @@ mod tests {
         let result = accept_refer(&channel(), &serde_json::json!({ "mode": "sideways" }));
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
@@ -2970,7 +3308,10 @@ mod tests {
         let result = accept_refer(&channel(), &serde_json::json!({ "target": "not a uri" }));
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
@@ -2981,7 +3322,10 @@ mod tests {
         let result = accept_refer(&channel(), &serde_json::json!({}));
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::NotFound,
+                ..
+            }
         ));
     }
 
@@ -2997,7 +3341,10 @@ mod tests {
         });
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::NotFound,
+                ..
+            }
         ));
     }
 
@@ -3006,16 +3353,25 @@ mod tests {
         let result = reject_refer(&channel(), &serde_json::json!({ "code": 200 }));
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::BadRequest, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::BadRequest,
+                ..
+            }
         ));
     }
 
     #[test]
     fn reject_refer_without_pending_is_not_found() {
-        let result = reject_refer(&channel(), &serde_json::json!({ "code": 486, "reason": "Busy" }));
+        let result = reject_refer(
+            &channel(),
+            &serde_json::json!({ "code": 486, "reason": "Busy" }),
+        );
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::NotFound,
+                ..
+            }
         ));
     }
 
@@ -3029,7 +3385,10 @@ mod tests {
         });
         assert!(matches!(
             result,
-            ControlResult::Error { code: ControlErrorCode::NotFound, .. }
+            ControlResult::Error {
+                code: ControlErrorCode::NotFound,
+                ..
+            }
         ));
     }
 }

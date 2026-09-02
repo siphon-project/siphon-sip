@@ -31,9 +31,7 @@ async fn spawn_mock_rtpengine() -> SocketAddr {
             let command_name = command.dict_get_str("command").unwrap_or("unknown");
 
             let response = match command_name {
-                "ping" => BencodeValue::dict(vec![
-                    ("result", BencodeValue::string("pong")),
-                ]),
+                "ping" => BencodeValue::dict(vec![("result", BencodeValue::string("pong"))]),
                 "offer" | "answer" => {
                     // Rewrite SDP: replace c-line IP and m-line port.
                     let rewritten_sdp = concat!(
@@ -52,17 +50,19 @@ async fn spawn_mock_rtpengine() -> SocketAddr {
                         ("sdp", BencodeValue::string(rewritten_sdp)),
                     ])
                 }
-                "delete" => BencodeValue::dict(vec![
-                    ("result", BencodeValue::string("ok")),
-                ]),
+                "delete" => BencodeValue::dict(vec![("result", BencodeValue::string("ok"))]),
                 "query" => BencodeValue::dict(vec![
                     ("result", BencodeValue::string("ok")),
-                    ("totals", BencodeValue::dict(vec![
-                        ("RTP", BencodeValue::dict(vec![
-                            ("packets", BencodeValue::from_integer(1000)),
-                            ("bytes", BencodeValue::from_integer(160000)),
-                        ])),
-                    ])),
+                    (
+                        "totals",
+                        BencodeValue::dict(vec![(
+                            "RTP",
+                            BencodeValue::dict(vec![
+                                ("packets", BencodeValue::from_integer(1000)),
+                                ("bytes", BencodeValue::from_integer(160000)),
+                            ]),
+                        )]),
+                    ),
                 ]),
                 _ => BencodeValue::dict(vec![
                     ("result", BencodeValue::string("error")),
@@ -164,14 +164,28 @@ async fn full_offer_answer_delete_flow() {
     let registry = ProfileRegistry::new();
     let offer_flags = &registry.get("srtp_to_rtp").unwrap().offer;
     let rewritten_sdp = client
-        .offer("call-rtpengine-test-1", "from-tag-1", original_sdp, offer_flags)
+        .offer(
+            "call-rtpengine-test-1",
+            "from-tag-1",
+            original_sdp,
+            offer_flags,
+        )
         .await
         .unwrap();
 
     let rewritten_str = std::str::from_utf8(&rewritten_sdp).unwrap();
-    assert!(rewritten_str.contains("203.0.113.1"), "SDP should be rewritten to RTPEngine IP");
-    assert!(rewritten_str.contains("30000"), "SDP should have RTPEngine port");
-    assert!(!rewritten_str.contains("10.0.0.1"), "Original IP should be gone");
+    assert!(
+        rewritten_str.contains("203.0.113.1"),
+        "SDP should be rewritten to RTPEngine IP"
+    );
+    assert!(
+        rewritten_str.contains("30000"),
+        "SDP should have RTPEngine port"
+    );
+    assert!(
+        !rewritten_str.contains("10.0.0.1"),
+        "Original IP should be gone"
+    );
 
     // Answer — extract SDP from 200 OK, send to RTPEngine.
     let ok_raw = make_200ok_with_sdp();
@@ -180,7 +194,13 @@ async fn full_offer_answer_delete_flow() {
 
     let answer_flags = &registry.get("srtp_to_rtp").unwrap().answer;
     let rewritten_answer = client
-        .answer("call-rtpengine-test-1", "from-tag-1", "to-tag-1", answer_sdp, answer_flags)
+        .answer(
+            "call-rtpengine-test-1",
+            "from-tag-1",
+            "to-tag-1",
+            answer_sdp,
+            answer_flags,
+        )
         .await
         .unwrap();
 
@@ -237,12 +257,9 @@ async fn multi_instance_weighted_round_robin() {
     let addr2 = spawn_mock_rtpengine().await;
 
     // Instance 1 has weight 3, instance 2 has weight 1.
-    let set = RtpEngineSet::new(vec![
-        (addr1, 2000, 3),
-        (addr2, 2000, 1),
-    ])
-    .await
-    .unwrap();
+    let set = RtpEngineSet::new(vec![(addr1, 2000, 3), (addr2, 2000, 1)])
+        .await
+        .unwrap();
 
     assert_eq!(set.instance_count(), 2);
 

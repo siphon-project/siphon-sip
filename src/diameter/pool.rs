@@ -31,7 +31,11 @@ pub struct PeerPool {
 }
 
 impl PeerPool {
-    pub fn new(tenant: impl Into<String>, manager: Arc<DiameterManager>, peers: Vec<String>) -> Self {
+    pub fn new(
+        tenant: impl Into<String>,
+        manager: Arc<DiameterManager>,
+        peers: Vec<String>,
+    ) -> Self {
         Self {
             tenant: tenant.into(),
             manager,
@@ -105,7 +109,10 @@ impl PeerPool {
         for (name, weight) in live {
             accumulated += weight;
             if tick < accumulated {
-                return self.manager.live_backend(&self.tenant, name).map(|client| (name.clone(), client));
+                return self
+                    .manager
+                    .live_backend(&self.tenant, name)
+                    .map(|client| (name.clone(), client));
             }
         }
         None
@@ -136,7 +143,8 @@ impl PeerPool {
         }
         // Stale, expired, or dead — re-pick and refresh the mapping.
         let (name, client) = self.pick_round_robin_named()?;
-        self.sticky.insert(key.to_string(), (name.clone(), now + ttl));
+        self.sticky
+            .insert(key.to_string(), (name.clone(), now + ttl));
         Some((name, client))
     }
 
@@ -245,10 +253,13 @@ mod tests {
 
         // First sticky pick records a mapping; subsequent picks for the same
         // key return the same peer name while live + within TTL.
-        let _first = pool.pick_sticky("session-1", Duration::from_secs(60)).unwrap();
+        let _first = pool
+            .pick_sticky("session-1", Duration::from_secs(60))
+            .unwrap();
         let mapped_name = pool.sticky.get("session-1").unwrap().value().0.clone();
         for _ in 0..5 {
-            pool.pick_sticky("session-1", Duration::from_secs(60)).unwrap();
+            pool.pick_sticky("session-1", Duration::from_secs(60))
+                .unwrap();
             assert_eq!(pool.sticky.get("session-1").unwrap().value().0, mapped_name);
         }
 

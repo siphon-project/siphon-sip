@@ -252,10 +252,7 @@ pub fn set_rtpengine_singleton(
 /// Store the CDR singleton for injection into the siphon module.
 ///
 /// Called at startup only when `cdr` is configured and enabled.
-pub fn set_cdr_singleton(
-    python: Python<'_>,
-    py_cdr: cdr::PyCdrNamespace,
-) -> Result<()> {
+pub fn set_cdr_singleton(python: Python<'_>, py_cdr: cdr::PyCdrNamespace) -> Result<()> {
     let cdr_py: Py<PyAny> = Py::new(python, py_cdr)
         .map_err(|error| SiphonError::Script(format!("Py::new(cdr): {error}")))?
         .into_any();
@@ -266,10 +263,7 @@ pub fn set_cdr_singleton(
 /// Store the gateway singleton for injection into the siphon module.
 ///
 /// Called at startup only when `gateway` is configured.
-pub fn set_gateway_singleton(
-    python: Python<'_>,
-    py_gateway: gateway::PyGateway,
-) -> Result<()> {
+pub fn set_gateway_singleton(python: Python<'_>, py_gateway: gateway::PyGateway) -> Result<()> {
     let gateway_py: Py<PyAny> = Py::new(python, py_gateway)
         .map_err(|error| SiphonError::Script(format!("Py::new(gateway): {error}")))?
         .into_any();
@@ -309,10 +303,7 @@ pub fn set_registration_singleton(
 /// Store the LI singleton for injection into the siphon module.
 ///
 /// Called at startup only when `lawful_intercept` is configured and enabled.
-pub fn set_li_singleton(
-    python: Python<'_>,
-    py_li: li::PyLiNamespace,
-) -> Result<()> {
+pub fn set_li_singleton(python: Python<'_>, py_li: li::PyLiNamespace) -> Result<()> {
     let li_py: Py<PyAny> = Py::new(python, py_li)
         .map_err(|error| SiphonError::Script(format!("Py::new(li): {error}")))?
         .into_any();
@@ -323,10 +314,7 @@ pub fn set_li_singleton(
 /// Store the Diameter singleton for injection into the siphon module.
 ///
 /// Called at startup only when `diameter` is configured.
-pub fn set_diameter_singleton(
-    python: Python<'_>,
-    py_diameter: diameter::PyDiameter,
-) -> Result<()> {
+pub fn set_diameter_singleton(python: Python<'_>, py_diameter: diameter::PyDiameter) -> Result<()> {
     let diameter_py: Py<PyAny> = Py::new(python, py_diameter)
         .map_err(|error| SiphonError::Script(format!("Py::new(diameter): {error}")))?
         .into_any();
@@ -337,10 +325,7 @@ pub fn set_diameter_singleton(
 /// Store the SBI singleton for injection into the siphon module.
 ///
 /// Called at startup only when `sbi` with `npcf_url` is configured.
-pub fn set_sbi_singleton(
-    python: Python<'_>,
-    py_sbi: sbi::PySbi,
-) -> Result<()> {
+pub fn set_sbi_singleton(python: Python<'_>, py_sbi: sbi::PySbi) -> Result<()> {
     let sbi_py: Py<PyAny> = Py::new(python, py_sbi)
         .map_err(|error| SiphonError::Script(format!("Py::new(sbi): {error}")))?
         .into_any();
@@ -392,10 +377,7 @@ pub fn wire_auth_diameter_manager(
 /// Store the presence singleton for injection into the siphon module.
 ///
 /// Called at startup when the presence subsystem is available.
-pub fn set_presence_singleton(
-    python: Python<'_>,
-    py_presence: presence::PyPresence,
-) -> Result<()> {
+pub fn set_presence_singleton(python: Python<'_>, py_presence: presence::PyPresence) -> Result<()> {
     let presence_py: Py<PyAny> = Py::new(python, py_presence)
         .map_err(|error| SiphonError::Script(format!("Py::new(presence): {error}")))?
         .into_any();
@@ -493,10 +475,7 @@ pub fn set_subscribe_state_singleton(
 /// Called at startup only when `ipsec` is configured (i.e. siphon is
 /// running as a P-CSCF).  Wires the existing `IpsecManager` and the
 /// configured shared protected ports into the Python ``ipsec`` namespace.
-pub fn set_ipsec_singleton(
-    python: Python<'_>,
-    py_ipsec: ipsec::PyIpsec,
-) -> Result<()> {
+pub fn set_ipsec_singleton(python: Python<'_>, py_ipsec: ipsec::PyIpsec) -> Result<()> {
     let ipsec_py: Py<PyAny> = Py::new(python, py_ipsec)
         .map_err(|error| SiphonError::Script(format!("Py::new(ipsec): {error}")))?
         .into_any();
@@ -638,9 +617,7 @@ pub fn ensure_registry(python: Python<'_>) -> Result<()> {
     let module_cname = CString::new(registry_name)
         .map_err(|error| SiphonError::Script(format!("registry module name CString: {error}")))?;
     let module = PyModule::from_code(python, &registry_source, &file_name, &module_cname)
-        .map_err(|error| {
-            SiphonError::Script(format!("registry module: {error}"))
-        })?;
+        .map_err(|error| SiphonError::Script(format!("registry module: {error}")))?;
 
     modules
         .set_item(registry_name, &module)
@@ -663,9 +640,7 @@ pub fn install_siphon_module(python: Python<'_>) -> Result<()> {
         .map_err(|error| SiphonError::Script(format!("siphon module name CString: {error}")))?;
 
     let module = PyModule::from_code(python, &source, &file_name, &module_name)
-        .map_err(|error| {
-            SiphonError::Script(format!("failed to create siphon module: {error}"))
-        })?;
+        .map_err(|error| SiphonError::Script(format!("failed to create siphon module: {error}")))?;
 
     // Register pyclasses as top-level attributes on the `siphon` module
     // so scripts can `from siphon import Transform, SecurityOffer, …`

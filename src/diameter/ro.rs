@@ -208,7 +208,10 @@ impl SubscriberId {
 
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut inner = Vec::new();
-        inner.extend_from_slice(&encode_avp_u32(avp::SUBSCRIPTION_ID_TYPE, self.kind.as_u32()));
+        inner.extend_from_slice(&encode_avp_u32(
+            avp::SUBSCRIPTION_ID_TYPE,
+            self.kind.as_u32(),
+        ));
         inner.extend_from_slice(&encode_avp_utf8(avp::SUBSCRIPTION_ID_DATA, &self.data));
         encode_avp_grouped(avp::SUBSCRIPTION_ID, &inner)
     }
@@ -309,50 +312,34 @@ impl ImsChargingData {
         if self.sip_method.is_some() || self.event.is_some() {
             let mut event_children = Vec::new();
             if let Some(ref method) = self.sip_method {
-                event_children.extend_from_slice(&encode_avp_utf8_3gpp(
-                    avp::SIP_METHOD_CHARGING,
-                    method,
-                ));
+                event_children
+                    .extend_from_slice(&encode_avp_utf8_3gpp(avp::SIP_METHOD_CHARGING, method));
             }
             if let Some(ref event) = self.event {
                 event_children.extend_from_slice(&encode_avp_utf8_3gpp(avp::EVENT, event));
             }
-            ims_inner.extend_from_slice(&encode_avp_grouped_3gpp(
-                avp::EVENT_TYPE,
-                &event_children,
-            ));
+            ims_inner.extend_from_slice(&encode_avp_grouped_3gpp(avp::EVENT_TYPE, &event_children));
         }
 
         if let Some(role) = self.role_of_node {
             ims_inner.extend_from_slice(&encode_avp_u32_3gpp(avp::ROLE_OF_NODE, role.as_u32()));
         }
         if let Some(func) = self.node_functionality {
-            ims_inner.extend_from_slice(&encode_avp_u32_3gpp(
-                avp::NODE_FUNCTIONALITY,
-                func.as_u32(),
-            ));
+            ims_inner
+                .extend_from_slice(&encode_avp_u32_3gpp(avp::NODE_FUNCTIONALITY, func.as_u32()));
         }
         if let Some(ref session_id) = self.user_session_id {
-            ims_inner.extend_from_slice(&encode_avp_utf8_3gpp(
-                avp::USER_SESSION_ID,
-                session_id,
-            ));
+            ims_inner.extend_from_slice(&encode_avp_utf8_3gpp(avp::USER_SESSION_ID, session_id));
         }
         // Calling-Party-Address is 0..n (TS 32.299 §7.2.33) — repeat the AVP
         // once per asserted identity.  Concatenating them into a single AVP
         // loses the boundaries and breaks the moment an identity contains the
         // separator.
         for caller in &self.calling_party {
-            ims_inner.extend_from_slice(&encode_avp_utf8_3gpp(
-                avp::CALLING_PARTY_ADDRESS,
-                caller,
-            ));
+            ims_inner.extend_from_slice(&encode_avp_utf8_3gpp(avp::CALLING_PARTY_ADDRESS, caller));
         }
         if let Some(ref callee) = self.called_party {
-            ims_inner.extend_from_slice(&encode_avp_utf8_3gpp(
-                avp::CALLED_PARTY_ADDRESS,
-                callee,
-            ));
+            ims_inner.extend_from_slice(&encode_avp_utf8_3gpp(avp::CALLED_PARTY_ADDRESS, callee));
         }
 
         // Time-Stamps grouped AVP (TS 32.299 §7.2.183)
@@ -362,13 +349,10 @@ impl ImsChargingData {
                 ts_children.extend_from_slice(&encode_avp_time_3gpp(avp::SIP_REQUEST_TIMESTAMP, t));
             }
             if let Some(t) = self.response_timestamp {
-                ts_children.extend_from_slice(&encode_avp_time_3gpp(
-                    avp::SIP_RESPONSE_TIMESTAMP,
-                    t,
-                ));
+                ts_children
+                    .extend_from_slice(&encode_avp_time_3gpp(avp::SIP_RESPONSE_TIMESTAMP, t));
             }
-            ims_inner
-                .extend_from_slice(&encode_avp_grouped_3gpp(avp::TIME_STAMPS, &ts_children));
+            ims_inner.extend_from_slice(&encode_avp_grouped_3gpp(avp::TIME_STAMPS, &ts_children));
         }
 
         // Application-Server-Information grouped AVP (TS 32.299 §7.2.5)
@@ -379,10 +363,7 @@ impl ImsChargingData {
         {
             let mut info = Vec::new();
             if let Some(ref server) = self.application_server {
-                info.extend_from_slice(&encode_avp_utf8_3gpp(
-                    avp::APPLICATION_SERVER,
-                    server,
-                ));
+                info.extend_from_slice(&encode_avp_utf8_3gpp(avp::APPLICATION_SERVER, server));
             }
             if let Some(ref addr) = self.application_provided_called_party_address {
                 info.extend_from_slice(&encode_avp_utf8_3gpp(
@@ -401,33 +382,22 @@ impl ImsChargingData {
         if self.incoming_trunk_group_id.is_some() || self.outgoing_trunk_group_id.is_some() {
             let mut tg = Vec::new();
             if let Some(ref id) = self.incoming_trunk_group_id {
-                tg.extend_from_slice(&encode_avp_utf8_3gpp(
-                    avp::INCOMING_TRUNK_GROUP_ID,
-                    id,
-                ));
+                tg.extend_from_slice(&encode_avp_utf8_3gpp(avp::INCOMING_TRUNK_GROUP_ID, id));
             }
             if let Some(ref id) = self.outgoing_trunk_group_id {
-                tg.extend_from_slice(&encode_avp_utf8_3gpp(
-                    avp::OUTGOING_TRUNK_GROUP_ID,
-                    id,
-                ));
+                tg.extend_from_slice(&encode_avp_utf8_3gpp(avp::OUTGOING_TRUNK_GROUP_ID, id));
             }
-            ims_inner.extend_from_slice(&encode_avp_grouped_3gpp(
-                avp::TRUNK_GROUP_ID,
-                &tg,
-            ));
+            ims_inner.extend_from_slice(&encode_avp_grouped_3gpp(avp::TRUNK_GROUP_ID, &tg));
         }
 
         // Inter-Operator-Identifier grouped AVP (TS 32.299 §7.2.71)
         if self.originating_ioi.is_some() || self.terminating_ioi.is_some() {
             let mut ioi_children = Vec::new();
             if let Some(ref orig) = self.originating_ioi {
-                ioi_children
-                    .extend_from_slice(&encode_avp_utf8_3gpp(avp::ORIGINATING_IOI, orig));
+                ioi_children.extend_from_slice(&encode_avp_utf8_3gpp(avp::ORIGINATING_IOI, orig));
             }
             if let Some(ref term) = self.terminating_ioi {
-                ioi_children
-                    .extend_from_slice(&encode_avp_utf8_3gpp(avp::TERMINATING_IOI, term));
+                ioi_children.extend_from_slice(&encode_avp_utf8_3gpp(avp::TERMINATING_IOI, term));
             }
             ims_inner.extend_from_slice(&encode_avp_grouped_3gpp(
                 avp::INTER_OPERATOR_IDENTIFIER,
@@ -436,10 +406,7 @@ impl ImsChargingData {
         }
 
         if let Some(ref icid) = self.ims_charging_identifier {
-            ims_inner.extend_from_slice(&encode_avp_utf8_3gpp(
-                avp::IMS_CHARGING_IDENTIFIER,
-                icid,
-            ));
+            ims_inner.extend_from_slice(&encode_avp_utf8_3gpp(avp::IMS_CHARGING_IDENTIFIER, icid));
         }
         if let Some(ref vnid) = self.visited_network_id {
             ims_inner.extend_from_slice(&encode_avp_utf8_3gpp(
@@ -619,10 +586,8 @@ impl SmsChargingData {
             sms_inner.extend_from_slice(&encode_avp_address_3gpp(avp::CLIENT_ADDRESS, addr));
         }
         if let Some(addr) = self.originator_sccp_address {
-            sms_inner.extend_from_slice(&encode_avp_address_3gpp(
-                avp::ORIGINATOR_SCCP_ADDRESS,
-                addr,
-            ));
+            sms_inner
+                .extend_from_slice(&encode_avp_address_3gpp(avp::ORIGINATOR_SCCP_ADDRESS, addr));
         }
         if let Some(dcs) = self.data_coding_scheme {
             sms_inner.extend_from_slice(&encode_avp_i32_3gpp(avp::DATA_CODING_SCHEME, dcs));
@@ -637,7 +602,8 @@ impl SmsChargingData {
             sms_inner.extend_from_slice(&encode_avp_octet_3gpp(avp::SM_PROTOCOL_ID, pid));
         }
         if let Some(reply_path) = self.reply_path_requested {
-            sms_inner.extend_from_slice(&encode_avp_u32_3gpp(avp::REPLY_PATH_REQUESTED, reply_path));
+            sms_inner
+                .extend_from_slice(&encode_avp_u32_3gpp(avp::REPLY_PATH_REQUESTED, reply_path));
         }
         if let Some(ref status) = self.sm_status {
             sms_inner.extend_from_slice(&encode_avp_octet_3gpp(avp::SM_STATUS, status));
@@ -655,16 +621,12 @@ impl SmsChargingData {
             let mut recipient_info = Vec::new();
             if let Some(ref addr) = self.recipient_address {
                 let children = Self::encode_party_address_children(addr);
-                recipient_info.extend_from_slice(&encode_avp_grouped_3gpp(
-                    avp::RECIPIENT_ADDRESS,
-                    &children,
-                ));
+                recipient_info
+                    .extend_from_slice(&encode_avp_grouped_3gpp(avp::RECIPIENT_ADDRESS, &children));
             }
             if let Some(sccp) = self.recipient_sccp_address {
-                recipient_info.extend_from_slice(&encode_avp_address_3gpp(
-                    avp::RECIPIENT_SCCP_ADDRESS,
-                    sccp,
-                ));
+                recipient_info
+                    .extend_from_slice(&encode_avp_address_3gpp(avp::RECIPIENT_SCCP_ADDRESS, sccp));
             }
             sms_inner.extend_from_slice(&encode_avp_grouped_3gpp(
                 avp::RECIPIENT_INFO,
@@ -698,14 +660,11 @@ impl SmsChargingData {
             sms_inner.extend_from_slice(&encode_avp_address_3gpp(avp::MTC_IWF_ADDRESS, addr));
         }
         if let Some(port) = self.application_port_identifier {
-            sms_inner.extend_from_slice(&encode_avp_u32_3gpp(
-                avp::APPLICATION_PORT_IDENTIFIER,
-                port,
-            ));
+            sms_inner
+                .extend_from_slice(&encode_avp_u32_3gpp(avp::APPLICATION_PORT_IDENTIFIER, port));
         }
         if let Some(ref ext_id) = self.external_identifier {
-            sms_inner
-                .extend_from_slice(&encode_avp_utf8_3gpp(avp::EXTERNAL_IDENTIFIER, ext_id));
+            sms_inner.extend_from_slice(&encode_avp_utf8_3gpp(avp::EXTERNAL_IDENTIFIER, ext_id));
         }
 
         // Inter-Operator-Identifier (838) grouped — same shape as inside
@@ -714,12 +673,10 @@ impl SmsChargingData {
         if self.originating_ioi.is_some() || self.terminating_ioi.is_some() {
             let mut ioi_children = Vec::new();
             if let Some(ref orig) = self.originating_ioi {
-                ioi_children
-                    .extend_from_slice(&encode_avp_utf8_3gpp(avp::ORIGINATING_IOI, orig));
+                ioi_children.extend_from_slice(&encode_avp_utf8_3gpp(avp::ORIGINATING_IOI, orig));
             }
             if let Some(ref term) = self.terminating_ioi {
-                ioi_children
-                    .extend_from_slice(&encode_avp_utf8_3gpp(avp::TERMINATING_IOI, term));
+                ioi_children.extend_from_slice(&encode_avp_utf8_3gpp(avp::TERMINATING_IOI, term));
             }
             sms_inner.extend_from_slice(&encode_avp_grouped_3gpp(
                 avp::INTER_OPERATOR_IDENTIFIER,
@@ -791,9 +748,9 @@ fn parse_cca(avps: &serde_json::Value) -> CreditControlAnswer {
 
     // MSCC may decode as an object or, with multiple instances, an array —
     // take the first.
-    let mscc = avps.get("Multiple-Services-Credit-Control").map(|m| {
-        m.as_array().and_then(|a| a.first()).unwrap_or(m)
-    });
+    let mscc = avps
+        .get("Multiple-Services-Credit-Control")
+        .map(|m| m.as_array().and_then(|a| a.first()).unwrap_or(m));
 
     // Prefer the MSCC-level value, fall back to the command level.
     let at_either = |name: &str| -> Option<&serde_json::Value> {
@@ -810,7 +767,12 @@ fn parse_cca(avps: &serde_json::Value) -> CreditControlAnswer {
         .and_then(|v| v.as_u64())
         .map(|n| n as u32)
     {
-        Some(rc) if command_result == dictionary::DIAMETER_SUCCESS && rc != dictionary::DIAMETER_SUCCESS => rc,
+        Some(rc)
+            if command_result == dictionary::DIAMETER_SUCCESS
+                && rc != dictionary::DIAMETER_SUCCESS =>
+        {
+            rc
+        }
         _ => command_result,
     };
 
@@ -906,22 +868,34 @@ pub async fn send_ccr(
 
     let mut payload = Vec::with_capacity(512);
     payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, session_id));
-    payload.extend_from_slice(&encode_avp_u32(avp::AUTH_APPLICATION_ID, dictionary::RO_APP_ID));
+    payload.extend_from_slice(&encode_avp_u32(
+        avp::AUTH_APPLICATION_ID,
+        dictionary::RO_APP_ID,
+    ));
     payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, &config.origin_host));
     payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, &config.origin_realm));
-    payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_REALM, &config.destination_realm));
+    payload.extend_from_slice(&encode_avp_utf8(
+        avp::DESTINATION_REALM,
+        &config.destination_realm,
+    ));
     if let Some(ref host) = config.destination_host {
         payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, host));
     }
 
     // Service-Context-Id (mandatory, RFC 8506 §8.42).
-    payload.extend_from_slice(&encode_avp_utf8(avp::SERVICE_CONTEXT_ID, params.service_context_id));
+    payload.extend_from_slice(&encode_avp_utf8(
+        avp::SERVICE_CONTEXT_ID,
+        params.service_context_id,
+    ));
 
     payload.extend_from_slice(&encode_avp_u32(
         avp::CC_REQUEST_TYPE,
         params.request_type.as_u32(),
     ));
-    payload.extend_from_slice(&encode_avp_u32(avp::CC_REQUEST_NUMBER, params.request_number));
+    payload.extend_from_slice(&encode_avp_u32(
+        avp::CC_REQUEST_NUMBER,
+        params.request_number,
+    ));
 
     // Subscription-Id
     payload.extend_from_slice(&params.subscriber.encode());
@@ -973,7 +947,10 @@ pub async fn send_ccr(
 
     // A single Service-Information carrying IMS-Information and/or
     // SMS-Information (IEC SMS/RCS).
-    payload.extend_from_slice(&encode_service_information(params.ims_data, params.sms_data));
+    payload.extend_from_slice(&encode_service_information(
+        params.ims_data,
+        params.sms_data,
+    ));
 
     let wire = encode_diameter_message(
         FLAG_REQUEST | FLAG_PROXIABLE,
@@ -1132,10 +1109,22 @@ mod tests {
 
     #[test]
     fn node_role_from_str() {
-        assert_eq!(NodeRole::from_str_ci("originating"), Some(NodeRole::OriginatingRole));
-        assert_eq!(NodeRole::from_str_ci("ORIG"), Some(NodeRole::OriginatingRole));
-        assert_eq!(NodeRole::from_str_ci("terminating"), Some(NodeRole::TerminatingRole));
-        assert_eq!(NodeRole::from_str_ci("term"), Some(NodeRole::TerminatingRole));
+        assert_eq!(
+            NodeRole::from_str_ci("originating"),
+            Some(NodeRole::OriginatingRole)
+        );
+        assert_eq!(
+            NodeRole::from_str_ci("ORIG"),
+            Some(NodeRole::OriginatingRole)
+        );
+        assert_eq!(
+            NodeRole::from_str_ci("terminating"),
+            Some(NodeRole::TerminatingRole)
+        );
+        assert_eq!(
+            NodeRole::from_str_ci("term"),
+            Some(NodeRole::TerminatingRole)
+        );
         assert_eq!(NodeRole::from_str_ci("proxy"), Some(NodeRole::ProxyRole));
         assert_eq!(NodeRole::from_str_ci("b2bua"), Some(NodeRole::B2buaRole));
         assert_eq!(NodeRole::from_str_ci("b2b-ua"), Some(NodeRole::B2buaRole));
@@ -1162,12 +1151,30 @@ mod tests {
 
     #[test]
     fn node_functionality_from_str() {
-        assert_eq!(NodeFunctionality::from_str_ci("scscf"), Some(NodeFunctionality::SCscf));
-        assert_eq!(NodeFunctionality::from_str_ci("S-CSCF"), Some(NodeFunctionality::SCscf));
-        assert_eq!(NodeFunctionality::from_str_ci("pcscf"), Some(NodeFunctionality::PCscf));
-        assert_eq!(NodeFunctionality::from_str_ci("as"), Some(NodeFunctionality::ApplicationServer));
-        assert_eq!(NodeFunctionality::from_str_ci("application-server"), Some(NodeFunctionality::ApplicationServer));
-        assert_eq!(NodeFunctionality::from_str_ci("mmtel"), Some(NodeFunctionality::Mmtel));
+        assert_eq!(
+            NodeFunctionality::from_str_ci("scscf"),
+            Some(NodeFunctionality::SCscf)
+        );
+        assert_eq!(
+            NodeFunctionality::from_str_ci("S-CSCF"),
+            Some(NodeFunctionality::SCscf)
+        );
+        assert_eq!(
+            NodeFunctionality::from_str_ci("pcscf"),
+            Some(NodeFunctionality::PCscf)
+        );
+        assert_eq!(
+            NodeFunctionality::from_str_ci("as"),
+            Some(NodeFunctionality::ApplicationServer)
+        );
+        assert_eq!(
+            NodeFunctionality::from_str_ci("application-server"),
+            Some(NodeFunctionality::ApplicationServer)
+        );
+        assert_eq!(
+            NodeFunctionality::from_str_ci("mmtel"),
+            Some(NodeFunctionality::Mmtel)
+        );
         assert_eq!(NodeFunctionality::from_str_ci("bogus"), None);
     }
 
@@ -1183,8 +1190,14 @@ mod tests {
         let wire = build_ccr_wire_for_test(CcRequestType::Event, 0, &sub, None, None, None);
         let decoded = decode_diameter(&wire).unwrap();
         let sub_id = decoded.avps.get("Subscription-Id").unwrap();
-        assert_eq!(sub_id.get("Subscription-Id-Type").and_then(|v| v.as_u64()), Some(0));
-        assert_eq!(sub_id.get("Subscription-Id-Data").and_then(|v| v.as_str()), Some("+15551234567"));
+        assert_eq!(
+            sub_id.get("Subscription-Id-Type").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            sub_id.get("Subscription-Id-Data").and_then(|v| v.as_str()),
+            Some("+15551234567")
+        );
     }
 
     #[test]
@@ -1415,11 +1428,15 @@ mod tests {
             .and_then(|i| i.get("Trunk-Group-Id"))
             .expect("Trunk-Group-Id grouped AVP missing");
         assert_eq!(
-            trunk.get("Incoming-Trunk-Group-Id").and_then(|v| v.as_str()),
+            trunk
+                .get("Incoming-Trunk-Group-Id")
+                .and_then(|v| v.as_str()),
             Some("trunk-in-001")
         );
         assert_eq!(
-            trunk.get("Outgoing-Trunk-Group-Id").and_then(|v| v.as_str()),
+            trunk
+                .get("Outgoing-Trunk-Group-Id")
+                .and_then(|v| v.as_str()),
             Some("carrier-A")
         );
     }
@@ -1439,7 +1456,9 @@ mod tests {
             .and_then(|i| i.get("Trunk-Group-Id"))
             .expect("Trunk-Group-Id grouped AVP missing");
         assert_eq!(
-            trunk.get("Outgoing-Trunk-Group-Id").and_then(|v| v.as_str()),
+            trunk
+                .get("Outgoing-Trunk-Group-Id")
+                .and_then(|v| v.as_str()),
             Some("carrier-A")
         );
         assert!(trunk.get("Incoming-Trunk-Group-Id").is_none());
@@ -1459,7 +1478,8 @@ mod tests {
             .and_then(|s| s.get("IMS-Information"))
             .unwrap();
         assert_eq!(
-            ims.get("IMS-Visited-Network-Identifier").and_then(|v| v.as_str()),
+            ims.get("IMS-Visited-Network-Identifier")
+                .and_then(|v| v.as_str()),
             Some("visited.example.com")
         );
     }
@@ -1559,7 +1579,11 @@ mod tests {
         });
         let answer = parse_cca(&json);
         assert!(answer.is_success());
-        assert_eq!(answer.granted_time, Some(30), "grant must be read from inside MSCC");
+        assert_eq!(
+            answer.granted_time,
+            Some(30),
+            "grant must be read from inside MSCC"
+        );
         assert_eq!(answer.validity_time, Some(60));
     }
 
@@ -1603,18 +1627,28 @@ mod tests {
             "Granted-Service-Unit"
         );
         assert_eq!(
-            code_of(&encode_avp_grouped(avp::MULTIPLE_SERVICES_CREDIT_CONTROL, &[])),
+            code_of(&encode_avp_grouped(
+                avp::MULTIPLE_SERVICES_CREDIT_CONTROL,
+                &[]
+            )),
             456,
             "Multiple-Services-Credit-Control (base, vendor 0)"
         );
-        assert_eq!(code_of(&encode_avp_u32(avp::RATING_GROUP, 1)), 432, "Rating-Group");
+        assert_eq!(
+            code_of(&encode_avp_u32(avp::RATING_GROUP, 1)),
+            432,
+            "Rating-Group"
+        );
         assert_eq!(
             code_of(&encode_avp_u32(avp::FINAL_UNIT_ACTION, 0)),
             449,
             "Final-Unit-Action"
         );
         assert_eq!(
-            code_of(&encode_avp_utf8(avp::SERVICE_CONTEXT_ID, SERVICE_CONTEXT_ID_IMS)),
+            code_of(&encode_avp_utf8(
+                avp::SERVICE_CONTEXT_ID,
+                SERVICE_CONTEXT_ID_IMS
+            )),
             461,
             "Service-Context-Id"
         );
@@ -1627,13 +1661,22 @@ mod tests {
         // send_ccr does and decode it back.
         let mut mscc = Vec::new();
         mscc.extend_from_slice(&encode_avp_u32(avp::RATING_GROUP, 100));
-        let rsu = ServiceUnit { time_seconds: Some(30), ..Default::default() };
+        let rsu = ServiceUnit {
+            time_seconds: Some(30),
+            ..Default::default()
+        };
         mscc.extend_from_slice(&rsu.encode_as(avp::REQUESTED_SERVICE_UNIT));
         let mut payload = Vec::new();
         payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "ro;kat;1"));
-        payload.extend_from_slice(&encode_avp_utf8(avp::SERVICE_CONTEXT_ID, SERVICE_CONTEXT_ID_IMS));
+        payload.extend_from_slice(&encode_avp_utf8(
+            avp::SERVICE_CONTEXT_ID,
+            SERVICE_CONTEXT_ID_IMS,
+        ));
         payload.extend_from_slice(&encode_avp_u32(avp::CC_REQUEST_TYPE, 1));
-        payload.extend_from_slice(&encode_avp_grouped(avp::MULTIPLE_SERVICES_CREDIT_CONTROL, &mscc));
+        payload.extend_from_slice(&encode_avp_grouped(
+            avp::MULTIPLE_SERVICES_CREDIT_CONTROL,
+            &mscc,
+        ));
         let wire = encode_diameter_message(
             FLAG_REQUEST | FLAG_PROXIABLE,
             dictionary::CMD_CREDIT_CONTROL,
@@ -1644,7 +1687,10 @@ mod tests {
         );
         let decoded = decode_diameter(&wire).unwrap();
         assert_eq!(
-            decoded.avps.get("Service-Context-Id").and_then(|v| v.as_str()),
+            decoded
+                .avps
+                .get("Service-Context-Id")
+                .and_then(|v| v.as_str()),
             Some(SERVICE_CONTEXT_ID_IMS)
         );
         // Units are inside the MSCC, not at command level.
@@ -1653,7 +1699,10 @@ mod tests {
             .avps
             .get("Multiple-Services-Credit-Control")
             .expect("MSCC present");
-        assert_eq!(mscc_decoded.get("Rating-Group").and_then(|v| v.as_u64()), Some(100));
+        assert_eq!(
+            mscc_decoded.get("Rating-Group").and_then(|v| v.as_u64()),
+            Some(100)
+        );
         assert_eq!(
             mscc_decoded
                 .get("Requested-Service-Unit")
@@ -1676,10 +1725,22 @@ mod tests {
     ) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "ro;test;sess;1"));
-        payload.extend_from_slice(&encode_avp_u32(avp::AUTH_APPLICATION_ID, dictionary::RO_APP_ID));
-        payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "scscf.ims.mnc001.mcc001.3gppnetwork.org"));
-        payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "ims.mnc001.mcc001.3gppnetwork.org"));
-        payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_REALM, "ims.mnc001.mcc001.3gppnetwork.org"));
+        payload.extend_from_slice(&encode_avp_u32(
+            avp::AUTH_APPLICATION_ID,
+            dictionary::RO_APP_ID,
+        ));
+        payload.extend_from_slice(&encode_avp_utf8(
+            avp::ORIGIN_HOST,
+            "scscf.ims.mnc001.mcc001.3gppnetwork.org",
+        ));
+        payload.extend_from_slice(&encode_avp_utf8(
+            avp::ORIGIN_REALM,
+            "ims.mnc001.mcc001.3gppnetwork.org",
+        ));
+        payload.extend_from_slice(&encode_avp_utf8(
+            avp::DESTINATION_REALM,
+            "ims.mnc001.mcc001.3gppnetwork.org",
+        ));
         payload.extend_from_slice(&encode_avp_u32(avp::CC_REQUEST_TYPE, request_type.as_u32()));
         payload.extend_from_slice(&encode_avp_u32(avp::CC_REQUEST_NUMBER, request_number));
         payload.extend_from_slice(&subscriber.encode());
@@ -1696,7 +1757,8 @@ mod tests {
             FLAG_REQUEST | FLAG_PROXIABLE,
             dictionary::CMD_CREDIT_CONTROL,
             dictionary::RO_APP_ID,
-            1, 2,
+            1,
+            2,
             &payload,
         )
     }
@@ -1704,7 +1766,10 @@ mod tests {
     #[test]
     fn ccr_initial_wire_roundtrip() {
         let sub = SubscriberId::msisdn("+15551234567");
-        let rsu = ServiceUnit { time_seconds: Some(3600), ..Default::default() };
+        let rsu = ServiceUnit {
+            time_seconds: Some(3600),
+            ..Default::default()
+        };
         let ims = ImsChargingData {
             calling_party: vec!["sip:alice@ims.mnc001.mcc001.3gppnetwork.org".into()],
             called_party: Some("sip:bob@ims.mnc001.mcc001.3gppnetwork.org".into()),
@@ -1716,16 +1781,33 @@ mod tests {
         };
 
         let wire = build_ccr_wire_for_test(
-            CcRequestType::Initial, 0, &sub, Some(&ims), Some(&rsu), None,
+            CcRequestType::Initial,
+            0,
+            &sub,
+            Some(&ims),
+            Some(&rsu),
+            None,
         );
         let decoded = decode_diameter(&wire).unwrap();
 
         assert!(decoded.is_request);
         assert_eq!(decoded.command_code, dictionary::CMD_CREDIT_CONTROL);
         assert_eq!(decoded.application_id, dictionary::RO_APP_ID);
-        assert_eq!(decoded.avps.get("Session-Id").and_then(|v| v.as_str()), Some("ro;test;sess;1"));
-        assert_eq!(decoded.avps.get("CC-Request-Type").and_then(|v| v.as_u64()), Some(1));
-        assert_eq!(decoded.avps.get("CC-Request-Number").and_then(|v| v.as_u64()), Some(0));
+        assert_eq!(
+            decoded.avps.get("Session-Id").and_then(|v| v.as_str()),
+            Some("ro;test;sess;1")
+        );
+        assert_eq!(
+            decoded.avps.get("CC-Request-Type").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            decoded
+                .avps
+                .get("CC-Request-Number")
+                .and_then(|v| v.as_u64()),
+            Some(0)
+        );
 
         // Verify nested Service-Information → IMS-Information
         let svc_info = decoded.avps.get("Service-Information").unwrap();
@@ -1745,13 +1827,21 @@ mod tests {
             ..Default::default()
         };
 
-        let wire = build_ccr_wire_for_test(
-            CcRequestType::Termination, 5, &sub, None, None, Some(&usu),
-        );
+        let wire =
+            build_ccr_wire_for_test(CcRequestType::Termination, 5, &sub, None, None, Some(&usu));
         let decoded = decode_diameter(&wire).unwrap();
 
-        assert_eq!(decoded.avps.get("CC-Request-Type").and_then(|v| v.as_u64()), Some(3));
-        assert_eq!(decoded.avps.get("CC-Request-Number").and_then(|v| v.as_u64()), Some(5));
+        assert_eq!(
+            decoded.avps.get("CC-Request-Type").and_then(|v| v.as_u64()),
+            Some(3)
+        );
+        assert_eq!(
+            decoded
+                .avps
+                .get("CC-Request-Number")
+                .and_then(|v| v.as_u64()),
+            Some(5)
+        );
     }
 
     #[test]
@@ -1760,9 +1850,15 @@ mod tests {
         let wire = build_ccr_wire_for_test(CcRequestType::Event, 0, &sub, None, None, None);
         let decoded = decode_diameter(&wire).unwrap();
 
-        assert_eq!(decoded.avps.get("CC-Request-Type").and_then(|v| v.as_u64()), Some(4));
+        assert_eq!(
+            decoded.avps.get("CC-Request-Type").and_then(|v| v.as_u64()),
+            Some(4)
+        );
         let sub_id = decoded.avps.get("Subscription-Id").unwrap();
-        assert_eq!(sub_id.get("Subscription-Id-Type").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(
+            sub_id.get("Subscription-Id-Type").and_then(|v| v.as_u64()),
+            Some(2)
+        );
     }
 
     // ── App ID and command code compliance ──────────────────────────────
@@ -1788,7 +1884,10 @@ mod tests {
         payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "scscf.example.com"));
         payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "example.com"));
         payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_REALM, "example.com"));
-        payload.extend_from_slice(&encode_avp_u32(avp::ACCT_APPLICATION_ID, dictionary::RF_APP_ID));
+        payload.extend_from_slice(&encode_avp_u32(
+            avp::ACCT_APPLICATION_ID,
+            dictionary::RF_APP_ID,
+        ));
         payload.extend_from_slice(&encode_avp_u32(avp::ACCOUNTING_RECORD_TYPE, 1));
         payload.extend_from_slice(&encode_avp_u32(avp::ACCOUNTING_RECORD_NUMBER, 0));
         payload.extend_from_slice(&data.encode_service_information());
@@ -1813,7 +1912,9 @@ mod tests {
             ..Default::default()
         };
         let avps = decode_sms_service_info(&data);
-        let svc_info = avps.get("Service-Information").expect("Service-Information");
+        let svc_info = avps
+            .get("Service-Information")
+            .expect("Service-Information");
         let sms_info = svc_info.get("SMS-Information").expect("SMS-Information");
 
         // SM-Message-Type lives flat under SMS-Information
@@ -1827,7 +1928,10 @@ mod tests {
         let orig_addr = sms_info
             .get("Originator-Received-Address")
             .expect("Originator-Received-Address");
-        assert_eq!(orig_addr.get("Address-Type").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(
+            orig_addr.get("Address-Type").and_then(|v| v.as_u64()),
+            Some(1)
+        );
         assert_eq!(
             orig_addr.get("Address-Data").and_then(|v| v.as_str()),
             Some("0015551234001")
@@ -1877,7 +1981,9 @@ mod tests {
             user_session_id: Some("call-id-abc-123".into()),
         };
         let avps = decode_sms_service_info(&data);
-        let svc_info = avps.get("Service-Information").expect("Service-Information");
+        let svc_info = avps
+            .get("Service-Information")
+            .expect("Service-Information");
         let sms_info = svc_info.get("SMS-Information").expect("SMS-Information");
 
         assert_eq!(sms_info.get("SMS-Node").and_then(|v| v.as_u64()), Some(1));
@@ -1886,7 +1992,9 @@ mod tests {
             Some("10.0.0.3")
         );
         assert_eq!(
-            sms_info.get("Originator-SCCP-Address").and_then(|v| v.as_str()),
+            sms_info
+                .get("Originator-SCCP-Address")
+                .and_then(|v| v.as_str()),
             Some("10.0.0.1")
         );
         assert_eq!(
@@ -1902,11 +2010,15 @@ mod tests {
             Some(0)
         );
         assert_eq!(
-            sms_info.get("Reply-Path-Requested").and_then(|v| v.as_u64()),
+            sms_info
+                .get("Reply-Path-Requested")
+                .and_then(|v| v.as_u64()),
             Some(0)
         );
         assert_eq!(
-            sms_info.get("Number-of-Messages-Sent").and_then(|v| v.as_u64()),
+            sms_info
+                .get("Number-of-Messages-Sent")
+                .and_then(|v| v.as_u64()),
             Some(1)
         );
         assert_eq!(

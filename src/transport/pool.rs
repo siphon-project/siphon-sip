@@ -24,12 +24,12 @@ use tokio_rustls::TlsConnector;
 use tracing::{debug, error, info, warn};
 
 use crate::config::TlsMethod;
-use crate::transport::{
-    ConnectionId, InboundMessage, StreamConnections, Transport,
-    configure_tcp_socket, next_connection_id,
-};
 use crate::transport::crlf_keepalive::{drain_leading_crlf_keepalives, CrlfPongTracker};
 use crate::transport::tcp::{frame_sip_message, FrameVerdict};
+use crate::transport::{
+    configure_tcp_socket, next_connection_id, ConnectionId, InboundMessage, StreamConnections,
+    Transport,
+};
 
 /// Idle timeout for pooled outbound connections (shorter than inbound).
 ///
@@ -174,18 +174,19 @@ pub fn load_outbound_client_identity(
             format!("failed to open outbound client private key '{private_key_path}': {error}"),
         )
     })?;
-    let key = PrivateKeyDer::from_pem_reader(&mut BufReader::new(key_file)).map_err(|error| {
-        match error {
-            tokio_rustls::rustls::pki_types::pem::Error::NoItemsFound => std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "outbound client private key file contains no private key",
-            ),
-            other => std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("failed to parse outbound client private key PEM: {other}"),
-            ),
-        }
-    })?;
+    let key =
+        PrivateKeyDer::from_pem_reader(&mut BufReader::new(key_file)).map_err(
+            |error| match error {
+                tokio_rustls::rustls::pki_types::pem::Error::NoItemsFound => std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "outbound client private key file contains no private key",
+                ),
+                other => std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("failed to parse outbound client private key PEM: {other}"),
+                ),
+            },
+        )?;
 
     Ok(OutboundClientIdentity { chain, key })
 }
@@ -265,7 +266,8 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerify {
         _server_name: &tokio_rustls::rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
         _now: tokio_rustls::rustls::pki_types::UnixTime,
-    ) -> Result<tokio_rustls::rustls::client::danger::ServerCertVerified, tokio_rustls::rustls::Error> {
+    ) -> Result<tokio_rustls::rustls::client::danger::ServerCertVerified, tokio_rustls::rustls::Error>
+    {
         Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -274,7 +276,10 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerify {
         _message: &[u8],
         _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
         _dss: &tokio_rustls::rustls::DigitallySignedStruct,
-    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+    ) -> Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
         Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
@@ -283,7 +288,10 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerify {
         _message: &[u8],
         _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
         _dss: &tokio_rustls::rustls::DigitallySignedStruct,
-    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+    ) -> Result<
+        tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+        tokio_rustls::rustls::Error,
+    > {
         Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
@@ -372,9 +380,7 @@ impl ConnectionPool {
         // Fast path: reuse a live pooled connection without taking the
         // per-destination establishment lock.
         if let Some(entry) = self.connections.get(&key) {
-            if !entry.sender.is_closed()
-                && entry.sender.send(data.clone()).await.is_ok()
-            {
+            if !entry.sender.is_closed() && entry.sender.send(data.clone()).await.is_ok() {
                 return Ok(entry.connection_id);
             }
             // Connection dead — remove and create new
@@ -397,9 +403,7 @@ impl ConnectionPool {
             // Re-check: a peer may have established the connection while we
             // were waiting for the lock.
             if let Some(entry) = self.connections.get(&key) {
-                if !entry.sender.is_closed()
-                    && entry.sender.send(data.clone()).await.is_ok()
-                {
+                if !entry.sender.is_closed() && entry.sender.send(data.clone()).await.is_ok() {
                     Ok(entry.connection_id)
                 } else {
                     drop(entry);
@@ -471,33 +475,32 @@ impl ConnectionPool {
         // Fail-fast: a torn-down IPsec SA gives no SYN-ACK and no RST, so an
         // un-bounded connect would block the calling worker forever (and trip
         // the script-executor watchdog → process abort).  Bound it.
-        let stream = match tokio::time::timeout(self.connect_timeout, socket.connect(destination))
-            .await
-        {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => {
-                warn!(
-                    bind_addr = %bind_addr,
-                    destination = %destination,
-                    "pool: TCP connect failed: {e}"
-                );
-                return Err(e);
-            }
-            Err(_) => {
-                warn!(
-                    bind_addr = %bind_addr,
-                    destination = %destination,
-                    timeout = ?self.connect_timeout,
-                    "pool: TCP connect timed out — no SYN-ACK and no RST \
-                     (likely a torn-down IPsec SA); failing fast so the caller \
-                     is not stranded"
-                );
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "TCP connect timed out",
-                ));
-            }
-        };
+        let stream =
+            match tokio::time::timeout(self.connect_timeout, socket.connect(destination)).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
+                    warn!(
+                        bind_addr = %bind_addr,
+                        destination = %destination,
+                        "pool: TCP connect failed: {e}"
+                    );
+                    return Err(e);
+                }
+                Err(_) => {
+                    warn!(
+                        bind_addr = %bind_addr,
+                        destination = %destination,
+                        timeout = ?self.connect_timeout,
+                        "pool: TCP connect timed out — no SYN-ACK and no RST \
+                         (likely a torn-down IPsec SA); failing fast so the caller \
+                         is not stranded"
+                    );
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "TCP connect timed out",
+                    ));
+                }
+            };
         configure_tcp_socket(&stream, self.tos);
 
         let connection_id = next_connection_id();
@@ -548,10 +551,12 @@ impl ConnectionPool {
             let mut accumulator = BytesMut::with_capacity(65536);
             let mut read_buf = [0u8; 8192];
             loop {
-                match tokio::time::timeout(POOL_IDLE_TIMEOUT, reader.read(&mut read_buf)).await
-                {
+                match tokio::time::timeout(POOL_IDLE_TIMEOUT, reader.read(&mut read_buf)).await {
                     Ok(Ok(0)) => {
-                        info!("pool: TCP connection {:?} to {} closed by peer", connection_id, destination);
+                        info!(
+                            "pool: TCP connection {:?} to {} closed by peer",
+                            connection_id, destination
+                        );
                         break;
                     }
                     Ok(Ok(size)) => {
@@ -595,8 +600,7 @@ impl ConnectionPool {
                                 FrameVerdict::Garbage => {
                                     warn!(
                                         "pool: non-SIP bytes from {} peer {}; dropping connection",
-                                        "TCP",
-                                        destination
+                                        "TCP", destination
                                     );
                                     break;
                                 }
@@ -679,7 +683,8 @@ impl ConnectionPool {
         server_name: Option<&str>,
         data: Bytes,
     ) -> Result<ConnectionId, std::io::Error> {
-        self.send_tls_inner(None, destination, server_name, data).await
+        self.send_tls_inner(None, destination, server_name, data)
+            .await
     }
 
     /// Send over TLS, binding the outbound socket's source to `bind_addr`
@@ -715,9 +720,7 @@ impl ConnectionPool {
 
         // Try existing connection first
         if let Some(entry) = self.connections.get(&key) {
-            if !entry.sender.is_closed()
-                && entry.sender.send(data.clone()).await.is_ok()
-            {
+            if !entry.sender.is_closed() && entry.sender.send(data.clone()).await.is_ok() {
                 return Ok(entry.connection_id);
             }
             // Connection dead — remove and create new
@@ -794,7 +797,11 @@ impl ConnectionPool {
         };
 
         let connection_id = next_connection_id();
-        let local_addr = tls_stream.get_ref().0.local_addr().unwrap_or(self.local_addr);
+        let local_addr = tls_stream
+            .get_ref()
+            .0
+            .local_addr()
+            .unwrap_or(self.local_addr);
         let (mut reader, mut writer) = tokio::io::split(tls_stream);
 
         // Per-connection write channel
@@ -836,7 +843,10 @@ impl ConnectionPool {
             loop {
                 match reader.read(&mut read_buf).await {
                     Ok(0) => {
-                        info!("pool: TLS connection {:?} to {} closed by peer", connection_id, destination);
+                        info!(
+                            "pool: TLS connection {:?} to {} closed by peer",
+                            connection_id, destination
+                        );
                         break;
                     }
                     Ok(size) => {
@@ -878,8 +888,7 @@ impl ConnectionPool {
                                 FrameVerdict::Garbage => {
                                     warn!(
                                         "pool: non-SIP bytes from {} peer {}; dropping connection",
-                                        "TLS",
-                                        destination
+                                        "TLS", destination
                                     );
                                     break;
                                 }
@@ -961,10 +970,7 @@ impl ConnectionPool {
     /// `stream_connections` and finish any in-flight exchange naturally — they
     /// are simply no longer offered for reuse. Pooled TCP connections are
     /// retained (their identity is transport-level, unaffected by the cert).
-    pub fn reload_tls_client_config(
-        &self,
-        new_config: Arc<tokio_rustls::rustls::ClientConfig>,
-    ) {
+    pub fn reload_tls_client_config(&self, new_config: Arc<tokio_rustls::rustls::ClientConfig>) {
         self.tls_connector
             .store(Arc::new(TlsConnector::from(new_config)));
         self.connections
@@ -1053,7 +1059,11 @@ impl ConnectionPool {
                     None => break,
                 };
                 match event {
-                    Ok(Event { kind: EventKind::Modify(_) | EventKind::Create(_), paths, .. }) => {
+                    Ok(Event {
+                        kind: EventKind::Modify(_) | EventKind::Create(_),
+                        paths,
+                        ..
+                    }) => {
                         let touched = paths.iter().any(|p| {
                             let name = p.file_name().map(|n| n.to_owned());
                             name == cert_name || name == key_name
@@ -1129,13 +1139,11 @@ mod tests {
         assert!(received.contains("INVITE"));
 
         // Verify response comes back via inbound channel
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            inbound_rx.recv_async(),
-        )
-        .await
-        .expect("timeout waiting for response")
-        .expect("channel closed");
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .expect("timeout waiting for response")
+                .expect("channel closed");
 
         assert_eq!(response.connection_id, connection_id);
         assert_eq!(response.transport, Transport::Tcp);
@@ -1340,7 +1348,10 @@ mod tests {
 
         // The outer 2 s guard must NOT fire — the inner connect failed fast.
         let inner = outcome.expect("send_tcp_from hung past 2s — connect was not bounded");
-        assert!(inner.is_err(), "connect to a black-hole must return Err, not succeed");
+        assert!(
+            inner.is_err(),
+            "connect to a black-hole must return Err, not succeed"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "connect must fail fast, not strand the caller"
@@ -1419,7 +1430,11 @@ mod tests {
             ids.iter().all(|id| *id == first),
             "all concurrent sends must share one connection_id"
         );
-        assert_eq!(pool.active_connections(), 1, "exactly one pooled connection");
+        assert_eq!(
+            pool.active_connections(),
+            1,
+            "exactly one pooled connection"
+        );
         assert_eq!(
             accepted.load(Ordering::SeqCst),
             1,
@@ -1499,7 +1514,9 @@ mod tests {
         use tokio_rustls::rustls::{version, RootCertStore, ServerConfig};
 
         let mut roots = RootCertStore::empty();
-        roots.add(certs.ca_cert_der.clone()).expect("add ca to roots");
+        roots
+            .add(certs.ca_cert_der.clone())
+            .expect("add ca to roots");
         let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
             .build()
             .expect("build client verifier");
@@ -1526,11 +1543,9 @@ mod tests {
         let key_path = directory.path().join("client.key");
         std::fs::write(&cert_path, &certs.client_cert_pem).unwrap();
         std::fs::write(&key_path, &certs.client_key_pem).unwrap();
-        let identity = load_outbound_client_identity(
-            cert_path.to_str().unwrap(),
-            key_path.to_str().unwrap(),
-        )
-        .expect("client identity must load");
+        let identity =
+            load_outbound_client_identity(cert_path.to_str().unwrap(), key_path.to_str().unwrap())
+                .expect("client identity must load");
         assert!(build_outbound_tls_config(Some(identity), TlsMethod::default()).is_ok());
     }
 
@@ -1652,13 +1667,11 @@ mod tests {
         let key_path = directory.path().join("client.key");
         std::fs::write(&cert_path, &certs.client_cert_pem).unwrap();
         std::fs::write(&key_path, &certs.client_key_pem).unwrap();
-        let identity = load_outbound_client_identity(
-            cert_path.to_str().unwrap(),
-            key_path.to_str().unwrap(),
-        )
-        .expect("client identity must load");
-        let client_config = build_outbound_tls_config(Some(identity), TlsMethod::default())
-            .expect("client config");
+        let identity =
+            load_outbound_client_identity(cert_path.to_str().unwrap(), key_path.to_str().unwrap())
+                .expect("client identity must load");
+        let client_config =
+            build_outbound_tls_config(Some(identity), TlsMethod::default()).expect("client config");
 
         let connection_map = Arc::new(DashMap::new());
         let (inbound_tx, _inbound_rx) = flume::unbounded();
@@ -1699,8 +1712,8 @@ mod tests {
             acceptor2.accept(tcp).await.is_err()
         });
 
-        let no_auth_config = build_outbound_tls_config(None, TlsMethod::default())
-            .expect("no-auth client config");
+        let no_auth_config =
+            build_outbound_tls_config(None, TlsMethod::default()).expect("no-auth client config");
         let connection_map2 = Arc::new(DashMap::new());
         let (inbound_tx2, _inbound_rx2) = flume::unbounded();
         let pool2 = ConnectionPool::new(
@@ -1756,11 +1769,8 @@ mod tests {
         let key_path = directory.path().join("client.key");
         std::fs::write(&cert_path, cert_pem).unwrap();
         std::fs::write(&key_path, key_pem).unwrap();
-        load_outbound_client_identity(
-            cert_path.to_str().unwrap(),
-            key_path.to_str().unwrap(),
-        )
-        .expect("client identity must load")
+        load_outbound_client_identity(cert_path.to_str().unwrap(), key_path.to_str().unwrap())
+            .expect("client identity must load")
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1778,7 +1788,8 @@ mod tests {
 
         // Pool starts with the CA-A client identity (wrong CA for these servers).
         let identity_a = identity_from_pem(&certs_a.client_cert_pem, &certs_a.client_key_pem);
-        let config_a = build_outbound_tls_config(Some(identity_a), TlsMethod::default()).expect("config a");
+        let config_a =
+            build_outbound_tls_config(Some(identity_a), TlsMethod::default()).expect("config a");
         let connection_map = Arc::new(DashMap::new());
         let (inbound_tx, _inbound_rx) = flume::unbounded();
         let pool = ConnectionPool::new(
@@ -1817,7 +1828,8 @@ mod tests {
 
         // Swap in the renewed identity signed by CA-B.
         let identity_b = identity_from_pem(&certs_b.client_cert_pem, &certs_b.client_key_pem);
-        let config_b = build_outbound_tls_config(Some(identity_b), TlsMethod::default()).expect("config b");
+        let config_b =
+            build_outbound_tls_config(Some(identity_b), TlsMethod::default()).expect("config b");
         pool.reload_tls_client_config(config_b);
 
         // (b) A fresh outbound handshake now SUCCEEDS with the new identity.

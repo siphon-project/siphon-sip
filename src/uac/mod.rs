@@ -174,8 +174,17 @@ impl UacSender {
     /// Return the effective address for a given transport, resolving
     /// unspecified (0.0.0.0) addresses via advertised address config.
     pub fn addr_for(&self, transport: &Transport) -> SocketAddr {
-        let addr = self.listen_addrs.get(transport).copied().unwrap_or(self.local_addr);
-        resolve_via_addr(addr, transport, &self.advertised_addrs, self.advertised_address.as_deref())
+        let addr = self
+            .listen_addrs
+            .get(transport)
+            .copied()
+            .unwrap_or(self.local_addr);
+        resolve_via_addr(
+            addr,
+            transport,
+            &self.advertised_addrs,
+            self.advertised_address.as_deref(),
+        )
     }
 
     /// Return the host string (IP literal or FQDN) to advertise in the
@@ -218,7 +227,16 @@ impl UacSender {
         request_uri: SipUri,
         connection_id: ConnectionId,
     ) -> oneshot::Receiver<UacResult> {
-        self.send_options_on_connection_inner(destination, transport, request_uri, connection_id, None, None, None, None)
+        self.send_options_on_connection_inner(
+            destination,
+            transport,
+            request_uri,
+            connection_id,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     /// Send an OPTIONS over a captured inbound flow: egress from
@@ -268,8 +286,14 @@ impl UacSender {
         server_name: Option<&str>,
     ) -> oneshot::Receiver<UacResult> {
         self.send_options_on_connection_inner(
-            destination, transport, request_uri,
-            ConnectionId::default(), from_user, from_domain, None, server_name,
+            destination,
+            transport,
+            request_uri,
+            ConnectionId::default(),
+            from_user,
+            from_domain,
+            None,
+            server_name,
         )
     }
 
@@ -310,7 +334,10 @@ impl UacSender {
         };
         let via = format!(
             "SIP/2.0/{} {}:{};branch={}",
-            transport, via_host, addr.port(), branch
+            transport,
+            via_host,
+            addr.port(),
+            branch
         );
 
         let from_name = from_user.unwrap_or("siphon");
@@ -352,8 +379,7 @@ impl UacSender {
             builder = builder.header("User-Agent", user_agent.clone());
         }
 
-        let message = match builder.build()
-        {
+        let message = match builder.build() {
             Ok(message) => message,
             Err(error) => {
                 warn!("UAC failed to build OPTIONS message: {error}");
@@ -371,8 +397,12 @@ impl UacSender {
         // capture doesn't report an unspecified source (the `addr_for` fallback is
         // already resolved, so this is a no-op there).
         if let Some(ref hep) = self.hep_sender {
-            let hep_local =
-                resolve_via_addr(addr, &transport, &self.advertised_addrs, self.advertised_address.as_deref());
+            let hep_local = resolve_via_addr(
+                addr,
+                &transport,
+                &self.advertised_addrs,
+                self.advertised_address.as_deref(),
+            );
             hep.capture_outbound(hep_local, destination, transport, &data);
         }
 
@@ -389,7 +419,10 @@ impl UacSender {
         let (sender, receiver) = oneshot::channel();
         self.pending.insert(
             branch.clone(),
-            PendingRequest { sender, inserted_at: Instant::now() },
+            PendingRequest {
+                sender,
+                inserted_at: Instant::now(),
+            },
         );
 
         debug!(
@@ -414,13 +447,15 @@ impl UacSender {
     /// Returns `true` if the response was consumed (matched a UAC branch).
     pub fn match_response(&self, message: &SipMessage) -> bool {
         // Extract branch from topmost Via
-        let branch = match message.headers.get("Via").or_else(|| message.headers.get("v")) {
-            Some(via_raw) => {
-                match crate::sip::headers::via::Via::parse_multi(via_raw) {
-                    Ok(vias) => vias.first().and_then(|v| v.branch.clone()),
-                    Err(_) => None,
-                }
-            }
+        let branch = match message
+            .headers
+            .get("Via")
+            .or_else(|| message.headers.get("v"))
+        {
+            Some(via_raw) => match crate::sip::headers::via::Via::parse_multi(via_raw) {
+                Ok(vias) => vias.first().and_then(|v| v.branch.clone()),
+                Err(_) => None,
+            },
             None => None,
         };
 
@@ -431,7 +466,9 @@ impl UacSender {
 
         if let Some((_, pending)) = self.pending.remove(&branch) {
             debug!(branch = %branch, "UAC matched response");
-            let _ = pending.sender.send(UacResult::Response(Box::new(message.clone())));
+            let _ = pending
+                .sender
+                .send(UacResult::Response(Box::new(message.clone())));
             true
         } else {
             false
@@ -492,7 +529,10 @@ impl UacSender {
 
         self.pending.insert(
             branch.clone(),
-            PendingRequest { sender, inserted_at: Instant::now() },
+            PendingRequest {
+                sender,
+                inserted_at: Instant::now(),
+            },
         );
 
         debug!(
@@ -516,12 +556,7 @@ impl UacSender {
     ///
     /// Used for NOTIFY, MESSAGE, and other outbound requests where the caller
     /// does not need to correlate a response.
-    pub fn send_request(
-        &self,
-        message: SipMessage,
-        destination: SocketAddr,
-        transport: Transport,
-    ) {
+    pub fn send_request(&self, message: SipMessage, destination: SocketAddr, transport: Transport) {
         let data = Bytes::from(message.to_bytes());
 
         // HEP capture — outbound fire-and-forget
@@ -651,7 +686,15 @@ mod tests {
             sctp: sctp_tx,
         });
 
-        let sender = UacSender::new(router, "127.0.0.1:5060".parse().unwrap(), HashMap::new(), HashMap::new(), None, None, None);
+        let sender = UacSender::new(
+            router,
+            "127.0.0.1:5060".parse().unwrap(),
+            HashMap::new(),
+            HashMap::new(),
+            None,
+            None,
+            None,
+        );
         let receivers = vec![udp_rx, tcp_rx, tls_rx, ws_rx, wss_rx, sctp_rx];
         (sender, receivers)
     }
@@ -876,11 +919,7 @@ mod tests {
             .build()
             .unwrap();
 
-        sender.send_request(
-            message,
-            "10.0.0.5:5060".parse().unwrap(),
-            Transport::Udp,
-        );
+        sender.send_request(message, "10.0.0.5:5060".parse().unwrap(), Transport::Udp);
 
         // No pending entry (fire-and-forget).
         assert_eq!(sender.pending_count(), 0);
@@ -977,8 +1016,12 @@ mod tests {
         });
 
         let sender = UacSender::new(
-            router, "127.0.0.1:5060".parse().unwrap(),
-            HashMap::new(), HashMap::new(), None, None,
+            router,
+            "127.0.0.1:5060".parse().unwrap(),
+            HashMap::new(),
+            HashMap::new(),
+            None,
+            None,
             Some("SIPhon/0.1".to_string()),
         );
 
@@ -990,7 +1033,10 @@ mod tests {
 
         let outbound = udp_rx.try_recv().unwrap();
         let raw = String::from_utf8_lossy(&outbound.data);
-        assert!(raw.contains("User-Agent: SIPhon/0.1"), "missing User-Agent header: {raw}");
+        assert!(
+            raw.contains("User-Agent: SIPhon/0.1"),
+            "missing User-Agent header: {raw}"
+        );
     }
 
     #[test]
@@ -1013,8 +1059,13 @@ mod tests {
         });
 
         let sender = UacSender::new(
-            router, "127.0.0.1:5060".parse().unwrap(),
-            HashMap::new(), HashMap::new(), None, None, None,
+            router,
+            "127.0.0.1:5060".parse().unwrap(),
+            HashMap::new(),
+            HashMap::new(),
+            None,
+            None,
+            None,
         );
 
         let _receiver = sender.send_options_with_identity(
@@ -1028,7 +1079,10 @@ mod tests {
 
         let outbound = udp_rx.try_recv().unwrap();
         let raw = String::from_utf8_lossy(&outbound.data);
-        assert!(raw.contains("sip:bgcf@sip.connect.example.com"), "From should use configured user and domain: {raw}");
+        assert!(
+            raw.contains("sip:bgcf@sip.connect.example.com"),
+            "From should use configured user and domain: {raw}"
+        );
     }
 
     #[test]
@@ -1043,7 +1097,10 @@ mod tests {
 
         let outbound = rxs[0].try_recv().unwrap();
         let raw = String::from_utf8_lossy(&outbound.data);
-        assert!(!raw.contains("User-Agent:"), "should not have User-Agent: {raw}");
+        assert!(
+            !raw.contains("User-Agent:"),
+            "should not have User-Agent: {raw}"
+        );
     }
 
     #[test]
@@ -1058,7 +1115,10 @@ mod tests {
 
         let outbound = rxs[0].try_recv().unwrap();
         let raw = String::from_utf8_lossy(&outbound.data);
-        assert!(raw.contains("sip:siphon@127.0.0.1"), "From should use IP fallback: {raw}");
+        assert!(
+            raw.contains("sip:siphon@127.0.0.1"),
+            "From should use IP fallback: {raw}"
+        );
     }
 
     // --- resolve_via_addr tests ---
@@ -1096,7 +1156,10 @@ mod tests {
         assert_eq!(result.port(), 5060);
         assert!(!result.ip().is_unspecified());
         if crate::transport::detect_routable_local_ip(false).is_some() {
-            assert!(!result.ip().is_loopback(), "expected a routable IP, got {result}");
+            assert!(
+                !result.ip().is_loopback(),
+                "expected a routable IP, got {result}"
+            );
         }
     }
 
@@ -1109,7 +1172,10 @@ mod tests {
         assert_eq!(result.port(), 5060);
         assert!(!result.ip().is_unspecified());
         if crate::transport::detect_routable_local_ip(true).is_some() {
-            assert!(!result.ip().is_loopback(), "expected a routable v6, got {result}");
+            assert!(
+                !result.ip().is_loopback(),
+                "expected a routable v6, got {result}"
+            );
         }
     }
 
@@ -1122,7 +1188,10 @@ mod tests {
         let result = resolve_via_addr(addr, &Transport::Udp, &HashMap::new(), Some("not-an-ip"));
         assert_eq!(result.port(), 5060);
         if crate::transport::detect_routable_local_ip(false).is_some() {
-            assert!(!result.ip().is_loopback(), "FQDN should auto-detect source, got {result}");
+            assert!(
+                !result.ip().is_loopback(),
+                "FQDN should auto-detect source, got {result}"
+            );
         }
     }
 
@@ -1159,31 +1228,42 @@ mod tests {
     fn resolve_via_host_preserves_global_fqdn() {
         // The whole point: an FQDN advertised_address is kept verbatim, not
         // collapsed to an IP the way resolve_via_addr must.
-        let result = resolve_via_host(&Transport::Udp, &HashMap::new(), Some("sbc.example.org"), || {
-            panic!("fallback must not run when a global advertised address is present")
-        });
+        let result = resolve_via_host(
+            &Transport::Udp,
+            &HashMap::new(),
+            Some("sbc.example.org"),
+            || panic!("fallback must not run when a global advertised address is present"),
+        );
         assert_eq!(result, "sbc.example.org");
     }
 
     #[test]
     fn resolve_via_host_global_ip_literal() {
-        let result = resolve_via_host(&Transport::Udp, &HashMap::new(), Some("198.51.100.5"), || {
-            "127.0.0.1".to_string()
-        });
+        let result = resolve_via_host(
+            &Transport::Udp,
+            &HashMap::new(),
+            Some("198.51.100.5"),
+            || "127.0.0.1".to_string(),
+        );
         assert_eq!(result, "198.51.100.5");
     }
 
     #[test]
     fn resolve_via_host_brackets_ipv6() {
-        let result = resolve_via_host(&Transport::Udp, &HashMap::new(), Some("2001:db8::1"), || {
-            "::1".to_string()
-        });
+        let result = resolve_via_host(
+            &Transport::Udp,
+            &HashMap::new(),
+            Some("2001:db8::1"),
+            || "::1".to_string(),
+        );
         assert_eq!(result, "[2001:db8::1]");
     }
 
     #[test]
     fn resolve_via_host_lazy_fallback_used_only_without_config() {
-        let result = resolve_via_host(&Transport::Udp, &HashMap::new(), None, || "192.0.2.7".to_string());
+        let result = resolve_via_host(&Transport::Udp, &HashMap::new(), None, || {
+            "192.0.2.7".to_string()
+        });
         assert_eq!(result, "192.0.2.7");
     }
 

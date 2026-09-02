@@ -25,22 +25,22 @@ use dashmap::DashMap;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
-use crate::auth::{
-    self, DigestChallenge, DigestCredentials, NonceCounter,
-};
+use crate::auth::{self, DigestChallenge, DigestCredentials, NonceCounter};
 use std::net::IpAddr;
 
+use crate::hep::HepSender;
+use crate::ipsec::ue::{build_security_client, UeSecurityOffer};
 use crate::ipsec::{
     EncryptionAlgorithm, IntegrityAlgorithm, IpsecManager, SaProtocol, SaRole,
     SecurityAssociationPair, SecurityClient,
 };
-use crate::ipsec::ue::{build_security_client, UeSecurityOffer};
-use crate::hep::HepSender;
-use crate::uac::resolve_via_addr;
 use crate::sip::builder::SipMessageBuilder;
 use crate::sip::message::{Method, SipMessage};
 use crate::sip::uri::SipUri;
-use crate::transport::{ConnectionId, OutboundMessage, OutboundRouter, StreamConnections, Transport};
+use crate::transport::{
+    ConnectionId, OutboundMessage, OutboundRouter, StreamConnections, Transport,
+};
+use crate::uac::resolve_via_addr;
 
 // ---------------------------------------------------------------------------
 // Events
@@ -535,7 +535,9 @@ impl RegistrantManager {
     pub fn remove(&self, aor: &str) -> Option<RegistrantEntry> {
         let removed = self.entries.remove(aor).map(|(_, entry)| entry);
         if removed.is_some() {
-            self.emit_event(RegistrantEvent::Deregistered { aor: aor.to_string() });
+            self.emit_event(RegistrantEvent::Deregistered {
+                aor: aor.to_string(),
+            });
         }
         removed
     }
@@ -559,13 +561,7 @@ impl RegistrantManager {
     pub fn list(&self) -> Vec<(String, RegistrantState, u64)> {
         self.entries
             .iter()
-            .map(|entry| {
-                (
-                    entry.aor.clone(),
-                    entry.state,
-                    entry.expires_in(),
-                )
-            })
+            .map(|entry| (entry.aor.clone(), entry.state, entry.expires_in()))
             .collect()
     }
 
@@ -574,7 +570,11 @@ impl RegistrantManager {
     /// Returns `(expires_in, failure_count, registrar_uri)`.
     pub fn entry_info(&self, aor: &str) -> Option<(u64, u32, String)> {
         self.entries.get(aor).map(|entry| {
-            (entry.expires_in(), entry.failure_count, entry.registrar_uri.clone())
+            (
+                entry.expires_in(),
+                entry.failure_count,
+                entry.registrar_uri.clone(),
+            )
         })
     }
 
@@ -612,10 +612,9 @@ impl RegistrantManager {
 
         let request_uri = registrar_request_uri(&entry.registrar_uri);
 
-        let contact = entry
-            .contact_uri
-            .clone()
-            .unwrap_or_else(|| default_contact_uri(&entry.credentials.username, effective_addr, entry.transport));
+        let contact = entry.contact_uri.clone().unwrap_or_else(|| {
+            default_contact_uri(&entry.credentials.username, effective_addr, entry.transport)
+        });
 
         let via = format!(
             "SIP/2.0/{} {};branch={};rport",
@@ -626,13 +625,13 @@ impl RegistrantManager {
             .request(Method::Register, request_uri)
             .via(via)
             .to(format!("<{}>", entry.aor))
-            .from(format!(
-                "<{}>;tag=reg-{}",
-                entry.aor, cseq
-            ))
+            .from(format!("<{}>;tag=reg-{}", entry.aor, cseq))
             .call_id(entry.call_id.clone())
             .cseq(format!("{cseq} REGISTER"))
-            .header("Contact", build_contact_header(&contact, entry.ims_contact.as_ref()))
+            .header(
+                "Contact",
+                build_contact_header(&contact, entry.ims_contact.as_ref()),
+            )
             .header("Expires", expires.to_string())
             .max_forwards(70)
             .content_length(0);
@@ -727,10 +726,9 @@ impl RegistrantManager {
             .to_string();
         let request_uri = registrar_request_uri(&entry.registrar_uri);
 
-        let contact = entry
-            .contact_uri
-            .clone()
-            .unwrap_or_else(|| default_contact_uri(&entry.credentials.username, effective_addr, entry.transport));
+        let contact = entry.contact_uri.clone().unwrap_or_else(|| {
+            default_contact_uri(&entry.credentials.username, effective_addr, entry.transport)
+        });
 
         let via = format!(
             "SIP/2.0/{} {};branch={};rport",
@@ -768,13 +766,13 @@ impl RegistrantManager {
             .request(Method::Register, request_uri)
             .via(via)
             .to(format!("<{}>", entry.aor))
-            .from(format!(
-                "<{}>;tag=reg-{}",
-                entry.aor, cseq
-            ))
+            .from(format!("<{}>;tag=reg-{}", entry.aor, cseq))
             .call_id(entry.call_id.clone())
             .cseq(format!("{cseq} REGISTER"))
-            .header("Contact", build_contact_header(&contact, entry.ims_contact.as_ref()))
+            .header(
+                "Contact",
+                build_contact_header(&contact, entry.ims_contact.as_ref()),
+            )
             .header("Expires", expires.to_string())
             .header(auth_header_name, auth_header_value)
             .max_forwards(70)
@@ -829,30 +827,34 @@ impl RegistrantManager {
             }
         };
 
-        let (res, auts): (Vec<u8>, Option<String>) =
-            match aka::aka_challenge(&credentials, &rand, &autn, &entry.sqn_ms) {
-                aka::AkaOutcome::Success { res, ck, ik, sqn } => {
-                    entry.sqn_ms = sqn;
-                    // Stash CK/IK so the dispatcher can derive the IPsec SA
-                    // keys before sending the protected REGISTER (Phase 2).
-                    if let Some(ipsec) = entry.ue_ipsec.as_mut() {
-                        ipsec.ck = Some(ck);
-                        ipsec.ik = Some(ik);
-                    }
-                    (res, None)
+        let (res, auts): (Vec<u8>, Option<String>) = match aka::aka_challenge(
+            &credentials,
+            &rand,
+            &autn,
+            &entry.sqn_ms,
+        ) {
+            aka::AkaOutcome::Success { res, ck, ik, sqn } => {
+                entry.sqn_ms = sqn;
+                // Stash CK/IK so the dispatcher can derive the IPsec SA
+                // keys before sending the protected REGISTER (Phase 2).
+                if let Some(ipsec) = entry.ue_ipsec.as_mut() {
+                    ipsec.ck = Some(ck);
+                    ipsec.ik = Some(ik);
                 }
-                aka::AkaOutcome::SyncFailure { auts } => {
-                    warn!(aor = %entry.aor, "AKA SQN out of range — sending AUTS re-synchronisation");
-                    // RFC 3310 §3.4: the resync REGISTER carries the auts token;
-                    // the response is computed over an empty RES and the server
-                    // re-bases SQN and re-challenges.
-                    (Vec::new(), Some(aka::encode_auts(&auts)))
-                }
-                aka::AkaOutcome::MacFailure => {
-                    warn!(aor = %entry.aor, "AKA AUTN MAC failed — untrusted network challenge, aborting");
-                    return None;
-                }
-            };
+                (res, None)
+            }
+            aka::AkaOutcome::SyncFailure { auts } => {
+                warn!(aor = %entry.aor, "AKA SQN out of range — sending AUTS re-synchronisation");
+                // RFC 3310 §3.4: the resync REGISTER carries the auts token;
+                // the response is computed over an empty RES and the server
+                // re-bases SQN and re-challenges.
+                (Vec::new(), Some(aka::encode_auts(&auts)))
+            }
+            aka::AkaOutcome::MacFailure => {
+                warn!(aor = %entry.aor, "AKA AUTN MAC failed — untrusted network challenge, aborting");
+                return None;
+            }
+        };
 
         let effective_addr = listen_addrs
             .get(&entry.transport)
@@ -868,10 +870,9 @@ impl RegistrantManager {
             .to_string();
         let request_uri = registrar_request_uri(&entry.registrar_uri);
 
-        let contact = entry
-            .contact_uri
-            .clone()
-            .unwrap_or_else(|| default_contact_uri(&entry.credentials.username, effective_addr, entry.transport));
+        let contact = entry.contact_uri.clone().unwrap_or_else(|| {
+            default_contact_uri(&entry.credentials.username, effective_addr, entry.transport)
+        });
         let via = format!(
             "SIP/2.0/{} {};branch={};rport",
             entry.transport, effective_addr, branch
@@ -901,7 +902,10 @@ impl RegistrantManager {
             .from(format!("<{}>;tag=reg-{}", entry.aor, cseq))
             .call_id(entry.call_id.clone())
             .cseq(format!("{cseq} REGISTER"))
-            .header("Contact", build_contact_header(&contact, entry.ims_contact.as_ref()))
+            .header(
+                "Contact",
+                build_contact_header(&contact, entry.ims_contact.as_ref()),
+            )
             .header("Expires", expires.to_string())
             .header("Authorization", auth_header_value)
             .max_forwards(70)
@@ -1015,9 +1019,12 @@ impl RegistrantManager {
 
     /// The raw Security-Server value to echo in Security-Verify, if recorded.
     pub fn security_server_value(&self, aor: &str) -> Option<String> {
-        self.entries
-            .get(aor)
-            .and_then(|entry| entry.ue_ipsec.as_ref().and_then(|i| i.security_server.clone()))
+        self.entries.get(aor).and_then(|entry| {
+            entry
+                .ue_ipsec
+                .as_ref()
+                .and_then(|i| i.security_server.clone())
+        })
     }
 
     /// Components for the UE→P-CSCF SA flow, used to build a `Flow` the B2BUA
@@ -1099,10 +1106,7 @@ impl RegistrantManager {
             entry.expires_at = None;
 
             // Exponential backoff capped at max_retry_interval.
-            let backoff = std::cmp::min(
-                entry.backoff * 2,
-                self.max_retry_interval,
-            );
+            let backoff = std::cmp::min(entry.backoff * 2, self.max_retry_interval);
             entry.backoff = backoff;
 
             // A server-supplied Retry-After wins over local backoff — honor the
@@ -1124,7 +1128,8 @@ impl RegistrantManager {
                 use std::net::ToSocketAddrs;
                 if let Ok(mut addrs) = address_str.to_socket_addrs() {
                     let old = entry.destination;
-                    let new_addr = addrs.find(|a| *a != old)
+                    let new_addr = addrs
+                        .find(|a| *a != old)
                         .or_else(|| address_str.to_socket_addrs().ok()?.next());
                     if let Some(new_addr) = new_addr {
                         if new_addr != old {
@@ -1142,7 +1147,10 @@ impl RegistrantManager {
 
             let aor_owned = entry.aor.clone();
             drop(entry);
-            self.emit_event(RegistrantEvent::Failed { aor: aor_owned, status_code });
+            self.emit_event(RegistrantEvent::Failed {
+                aor: aor_owned,
+                status_code,
+            });
         }
     }
 
@@ -1152,12 +1160,14 @@ impl RegistrantManager {
         self.entries
             .iter()
             .filter(|entry| entry.next_attempt <= now)
-            .filter(|entry| matches!(
-                entry.state,
-                RegistrantState::Unregistered
-                    | RegistrantState::Registered
-                    | RegistrantState::Failed
-            ))
+            .filter(|entry| {
+                matches!(
+                    entry.state,
+                    RegistrantState::Unregistered
+                        | RegistrantState::Registered
+                        | RegistrantState::Failed
+                )
+            })
             .map(|entry| entry.aor.clone())
             .collect()
     }
@@ -1478,10 +1488,12 @@ fn rand_u32() -> u32 {
     use std::hash::{BuildHasher, Hasher};
     let state = RandomState::new();
     let mut hasher = state.build_hasher();
-    hasher.write_u64(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64);
+    hasher.write_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64,
+    );
     hasher.finish() as u32
 }
 
@@ -1686,11 +1698,7 @@ mod tests {
         // A registrar Retry-After of 120s must win, pushing next_attempt out far
         // beyond the backoff.
         let before = Instant::now();
-        manager.handle_failure(
-            "sip:alice@carrier.com",
-            503,
-            Some(Duration::from_secs(120)),
-        );
+        manager.handle_failure("sip:alice@carrier.com", 503, Some(Duration::from_secs(120)));
 
         let next_attempt = manager
             .entries
@@ -1773,12 +1781,8 @@ mod tests {
 
     #[test]
     fn backoff_capped_at_max() {
-        let manager = RegistrantManager::new(
-            3600,
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            None,
-        );
+        let manager =
+            RegistrantManager::new(3600, Duration::from_secs(10), Duration::from_secs(30), None);
         manager.add(make_entry("sip:alice@carrier.com"));
 
         // Fail many times
@@ -1919,7 +1923,8 @@ mod tests {
         // Register only alice
         manager.handle_success("sip:alice@carrier.com", 3600);
 
-        let dereg = manager.build_deregistrations("127.0.0.1:5060".parse().unwrap(), &HashMap::new());
+        let dereg =
+            manager.build_deregistrations("127.0.0.1:5060".parse().unwrap(), &HashMap::new());
         assert_eq!(dereg.len(), 1);
 
         let bytes = dereg[0].0.to_bytes();
@@ -1974,7 +1979,9 @@ mod tests {
         manager.handle_success("sip:alice@carrier.com", 3600);
 
         let event = receiver.try_recv().unwrap();
-        assert!(matches!(event, RegistrantEvent::Registered { ref aor } if aor == "sip:alice@carrier.com"));
+        assert!(
+            matches!(event, RegistrantEvent::Registered { ref aor } if aor == "sip:alice@carrier.com")
+        );
     }
 
     #[test]
@@ -1988,7 +1995,9 @@ mod tests {
         manager.handle_success("sip:alice@carrier.com", 3600);
 
         let event = receiver.try_recv().unwrap();
-        assert!(matches!(event, RegistrantEvent::Refreshed { ref aor } if aor == "sip:alice@carrier.com"));
+        assert!(
+            matches!(event, RegistrantEvent::Refreshed { ref aor } if aor == "sip:alice@carrier.com")
+        );
     }
 
     #[test]
@@ -2000,7 +2009,9 @@ mod tests {
         manager.handle_failure("sip:alice@carrier.com", 503, None);
 
         let event = receiver.try_recv().unwrap();
-        assert!(matches!(event, RegistrantEvent::Failed { ref aor, status_code: 503 } if aor == "sip:alice@carrier.com"));
+        assert!(
+            matches!(event, RegistrantEvent::Failed { ref aor, status_code: 503 } if aor == "sip:alice@carrier.com")
+        );
     }
 
     #[test]
@@ -2012,7 +2023,9 @@ mod tests {
         manager.remove("sip:alice@carrier.com");
 
         let event = receiver.try_recv().unwrap();
-        assert!(matches!(event, RegistrantEvent::Deregistered { ref aor } if aor == "sip:alice@carrier.com"));
+        assert!(
+            matches!(event, RegistrantEvent::Deregistered { ref aor } if aor == "sip:alice@carrier.com")
+        );
     }
 
     #[test]
@@ -2031,7 +2044,8 @@ mod tests {
         manager.add(make_entry("sip:alice@carrier.com"));
         manager.handle_success("sip:alice@carrier.com", 3600);
 
-        let (expires_in, failure_count, registrar) = manager.entry_info("sip:alice@carrier.com").unwrap();
+        let (expires_in, failure_count, registrar) =
+            manager.entry_info("sip:alice@carrier.com").unwrap();
         assert!(expires_in > 0);
         assert_eq!(failure_count, 0);
         assert_eq!(registrar, "sip:registrar.carrier.com:5060");
@@ -2049,7 +2063,12 @@ mod tests {
         manager.add(make_entry("sip:alice@carrier.com"));
 
         // Before building: no last_sent_at
-        assert!(manager.entries.get("sip:alice@carrier.com").unwrap().last_sent_at.is_none());
+        assert!(manager
+            .entries
+            .get("sip:alice@carrier.com")
+            .unwrap()
+            .last_sent_at
+            .is_none());
 
         manager.build_register(
             "sip:alice@carrier.com",
@@ -2059,7 +2078,12 @@ mod tests {
         );
 
         // After building: last_sent_at should be set
-        assert!(manager.entries.get("sip:alice@carrier.com").unwrap().last_sent_at.is_some());
+        assert!(manager
+            .entries
+            .get("sip:alice@carrier.com")
+            .unwrap()
+            .last_sent_at
+            .is_some());
     }
 
     #[test]
@@ -2073,10 +2097,20 @@ mod tests {
             &HashMap::new(),
             3600,
         );
-        assert!(manager.entries.get("sip:alice@carrier.com").unwrap().last_sent_at.is_some());
+        assert!(manager
+            .entries
+            .get("sip:alice@carrier.com")
+            .unwrap()
+            .last_sent_at
+            .is_some());
 
         manager.handle_success("sip:alice@carrier.com", 3600);
-        assert!(manager.entries.get("sip:alice@carrier.com").unwrap().last_sent_at.is_none());
+        assert!(manager
+            .entries
+            .get("sip:alice@carrier.com")
+            .unwrap()
+            .last_sent_at
+            .is_none());
     }
 
     #[test]
@@ -2109,8 +2143,11 @@ mod tests {
         );
 
         // Simulate passage of time by backdating last_sent_at
-        manager.entries.get_mut("sip:alice@carrier.com").unwrap().last_sent_at =
-            Some(Instant::now() - Duration::from_secs(33));
+        manager
+            .entries
+            .get_mut("sip:alice@carrier.com")
+            .unwrap()
+            .last_sent_at = Some(Instant::now() - Duration::from_secs(33));
 
         let timed_out = manager.entries_timed_out();
         assert_eq!(timed_out.len(), 1);
@@ -2200,8 +2237,11 @@ mod tests {
 
         // Registered entries should never time out (even with stale last_sent_at)
         manager.handle_success("sip:alice@carrier.com", 3600);
-        manager.entries.get_mut("sip:alice@carrier.com").unwrap().last_sent_at =
-            Some(Instant::now() - Duration::from_secs(60));
+        manager
+            .entries
+            .get_mut("sip:alice@carrier.com")
+            .unwrap()
+            .last_sent_at = Some(Instant::now() - Duration::from_secs(60));
 
         assert!(manager.entries_timed_out().is_empty());
     }
@@ -2278,7 +2318,12 @@ mod tests {
         manager.add(make_aka_entry(AKA_AOR));
 
         let (message, _, _, _) = manager
-            .build_register(AKA_AOR, "127.0.0.1:5060".parse().unwrap(), &HashMap::new(), 600000)
+            .build_register(
+                AKA_AOR,
+                "127.0.0.1:5060".parse().unwrap(),
+                &HashMap::new(),
+                600000,
+            )
             .unwrap();
         let bytes = message.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
@@ -2286,9 +2331,7 @@ mod tests {
         assert!(raw.contains("algorithm=AKAv1-MD5"));
         assert!(raw.contains("nonce=\"\""));
         assert!(raw.contains("response=\"\""));
-        assert!(raw.contains(
-            "username=\"001010000000001@ims.mnc01.mcc001.3gppnetwork.org\""
-        ));
+        assert!(raw.contains("username=\"001010000000001@ims.mnc01.mcc001.3gppnetwork.org\""));
         assert!(raw.contains(&format!("realm=\"{AKA_REALM}\"")));
     }
 
@@ -2314,7 +2357,10 @@ mod tests {
         let raw = String::from_utf8_lossy(&bytes);
         assert!(raw.contains("Authorization: Digest"));
         assert!(raw.contains("algorithm=AKAv1-MD5"));
-        assert!(!raw.contains("auts="), "fresh challenge must not resync: {raw}");
+        assert!(
+            !raw.contains("auts="),
+            "fresh challenge must not resync: {raw}"
+        );
 
         let entry = manager.entries.get(AKA_AOR).unwrap();
         assert_eq!(entry.sqn_ms, [0xff, 0x9b, 0xb4, 0xd0, 0xb6, 0x07]);
@@ -2378,7 +2424,10 @@ mod tests {
         let manager = make_manager();
         manager.add(make_entry("sip:alice@carrier.com"));
         manager.add(make_aka_entry(AKA_AOR));
-        assert_eq!(manager.auth_mode("sip:alice@carrier.com"), Some(AuthMode::Digest));
+        assert_eq!(
+            manager.auth_mode("sip:alice@carrier.com"),
+            Some(AuthMode::Digest)
+        );
         assert_eq!(manager.auth_mode(AKA_AOR), Some(AuthMode::Aka));
         assert_eq!(manager.auth_mode("sip:nobody@x.com"), None);
     }
@@ -2391,10 +2440,7 @@ mod tests {
         manager.store_registration_routes(
             AKA_AOR,
             vec![format!("<sip:scscf.{AKA_REALM}:6060;lr>")],
-            vec![
-                AKA_AOR.to_string(),
-                "tel:+15551234567".to_string(),
-            ],
+            vec![AKA_AOR.to_string(), "tel:+15551234567".to_string()],
             vec![format!("<sip:pcscf.{AKA_REALM}:5060;lr>")],
         );
 
@@ -2406,7 +2452,10 @@ mod tests {
     #[test]
     fn home_domain_extraction() {
         assert_eq!(home_domain_from_aor(AKA_AOR), AKA_REALM);
-        assert_eq!(home_domain_from_aor("sip:ims.example.com:5060"), "ims.example.com");
+        assert_eq!(
+            home_domain_from_aor("sip:ims.example.com:5060"),
+            "ims.example.com"
+        );
         assert_eq!(
             home_domain_from_aor("sip:user@host.com;transport=tcp"),
             "host.com"
@@ -2432,8 +2481,7 @@ mod tests {
         assert!(header.starts_with("<sip:208909990000002@100.65.0.4:5060>"));
         assert!(header.contains(";+sip.instance=\"<urn:gsma:imei:35436012-861541-0>\""));
         assert!(header.contains(";q=1.0"));
-        assert!(header
-            .contains(";+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\""));
+        assert!(header.contains(";+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\""));
         assert!(header.contains(";video"));
         assert!(header.contains(";+g.3gpp.smsip"));
 
@@ -2478,7 +2526,12 @@ mod tests {
         manager.add(entry);
 
         let (message, _, _, _) = manager
-            .build_register(aor, "100.65.0.3:5060".parse().unwrap(), &HashMap::new(), 3600)
+            .build_register(
+                aor,
+                "100.65.0.3:5060".parse().unwrap(),
+                &HashMap::new(),
+                3600,
+            )
             .unwrap();
         let bytes = message.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
@@ -2531,14 +2584,22 @@ mod tests {
         manager.add(make_aka_ipsec_entry(AKA_AOR));
 
         let (message, _, _, _) = manager
-            .build_register(AKA_AOR, "127.0.0.1:5060".parse().unwrap(), &HashMap::new(), 600000)
+            .build_register(
+                AKA_AOR,
+                "127.0.0.1:5060".parse().unwrap(),
+                &HashMap::new(),
+                600000,
+            )
             .unwrap();
         let bytes = message.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
 
         // Handset-shaped Security-Client: mandatory prot=esp;mod=trans, and one
         // mechanism per offered algorithm (SHA-1 + MD5).
-        assert!(raw.contains("Security-Client: ipsec-3gpp;prot=esp;mod=trans;"), "{raw}");
+        assert!(
+            raw.contains("Security-Client: ipsec-3gpp;prot=esp;mod=trans;"),
+            "{raw}"
+        );
         assert!(raw.contains("alg=hmac-sha-1-96"));
         assert!(raw.contains("alg=hmac-md5-96"));
         assert!(raw.contains("ealg=null"));
@@ -2567,20 +2628,45 @@ mod tests {
         let local = "127.0.0.1:5060".parse().unwrap();
 
         // Initial REGISTER allocates the SPIs.
-        manager.build_register(AKA_AOR, local, &HashMap::new(), 600000).unwrap();
+        manager
+            .build_register(AKA_AOR, local, &HashMap::new(), 600000)
+            .unwrap();
         // Record server answer + run the challenge so the SA descriptor exists.
         let server = crate::ipsec::parse_security_client(SECURITY_SERVER).unwrap();
         manager.store_security_server(AKA_AOR, &server, SECURITY_SERVER);
         let challenge = build_aka_challenge("ff9bb4d0b607");
         manager
-            .build_register_aka(AKA_AOR, local, &HashMap::new(), &challenge, 600000, Some(SECURITY_SERVER))
+            .build_register_aka(
+                AKA_AOR,
+                local,
+                &HashMap::new(),
+                &challenge,
+                600000,
+                Some(SECURITY_SERVER),
+            )
             .unwrap();
 
-        let advertised = manager.entries.get(AKA_AOR).unwrap().ue_ipsec.as_ref().unwrap().spi_uc;
+        let advertised = manager
+            .entries
+            .get(AKA_AOR)
+            .unwrap()
+            .ue_ipsec
+            .as_ref()
+            .unwrap()
+            .spi_uc;
         let sa = manager
-            .ue_sa_pair(AKA_AOR, "127.0.0.1".parse().unwrap(), "10.0.0.1".parse().unwrap(), Some(600000), SaProtocol::Any)
+            .ue_sa_pair(
+                AKA_AOR,
+                "127.0.0.1".parse().unwrap(),
+                "10.0.0.1".parse().unwrap(),
+                Some(600000),
+                SaProtocol::Any,
+            )
             .expect("SA descriptor");
-        assert_eq!(advertised, sa.spi_uc, "advertised spi-c must equal installed UE inbound SA SPI");
+        assert_eq!(
+            advertised, sa.spi_uc,
+            "advertised spi-c must equal installed UE inbound SA SPI"
+        );
         assert!(sa.spi_uc >= 256, "RFC 4303 §2.1: SPI must be >= 256");
     }
 
@@ -2590,7 +2676,12 @@ mod tests {
         manager.add(make_aka_entry(AKA_AOR)); // AKA but no IPsec
 
         let (message, _, _, _) = manager
-            .build_register(AKA_AOR, "127.0.0.1:5060".parse().unwrap(), &HashMap::new(), 600000)
+            .build_register(
+                AKA_AOR,
+                "127.0.0.1:5060".parse().unwrap(),
+                &HashMap::new(),
+                600000,
+            )
             .unwrap();
         let bytes = message.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
@@ -2605,7 +2696,12 @@ mod tests {
 
         // expires == 0 → de-REGISTER must not carry a fresh Security-Client.
         let (message, _, _, _) = manager
-            .build_register(AKA_AOR, "127.0.0.1:5060".parse().unwrap(), &HashMap::new(), 0)
+            .build_register(
+                AKA_AOR,
+                "127.0.0.1:5060".parse().unwrap(),
+                &HashMap::new(),
+                0,
+            )
             .unwrap();
         let bytes = message.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
@@ -2624,7 +2720,9 @@ mod tests {
         let local = "127.0.0.1:5060".parse().unwrap();
 
         // Initial REGISTER allocates the UE SPIs (stored on the entry).
-        manager.build_register(AKA_AOR, local, &HashMap::new(), 600000).unwrap();
+        manager
+            .build_register(AKA_AOR, local, &HashMap::new(), 600000)
+            .unwrap();
 
         // Record the P-CSCF's Security-Server answer.
         let server = crate::ipsec::parse_security_client(SECURITY_SERVER).unwrap();
@@ -2633,12 +2731,22 @@ mod tests {
         // Protected re-REGISTER.
         let challenge = build_aka_challenge("ff9bb4d0b607");
         let (message, _, destination, _) = manager
-            .build_register_aka(AKA_AOR, local, &HashMap::new(), &challenge, 600000, Some(SECURITY_SERVER))
+            .build_register_aka(
+                AKA_AOR,
+                local,
+                &HashMap::new(),
+                &challenge,
+                600000,
+                Some(SECURITY_SERVER),
+            )
             .unwrap();
         let bytes = message.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
 
-        assert!(raw.contains(&format!("Security-Verify: {SECURITY_SERVER}")), "{raw}");
+        assert!(
+            raw.contains(&format!("Security-Verify: {SECURITY_SERVER}")),
+            "{raw}"
+        );
         // RFC 3329: Security-Client repeated on the protected request.
         assert!(raw.contains("Security-Client: ipsec-3gpp"), "{raw}");
         assert!(raw.contains("Authorization: Digest"));
@@ -2661,7 +2769,9 @@ mod tests {
         let manager = make_manager();
         manager.add(make_aka_ipsec_entry(AKA_AOR));
         let local = "127.0.0.1:5060".parse().unwrap();
-        manager.build_register(AKA_AOR, local, &HashMap::new(), 600000).unwrap();
+        manager
+            .build_register(AKA_AOR, local, &HashMap::new(), 600000)
+            .unwrap();
 
         let ue_addr: IpAddr = "127.0.0.1".parse().unwrap();
         let pcscf_addr: IpAddr = "10.0.0.1".parse().unwrap();
@@ -2681,7 +2791,14 @@ mod tests {
         // Run the challenge (stashes CK/IK).
         let challenge = build_aka_challenge("ff9bb4d0b607");
         manager
-            .build_register_aka(AKA_AOR, local, &HashMap::new(), &challenge, 600000, Some(SECURITY_SERVER))
+            .build_register_aka(
+                AKA_AOR,
+                local,
+                &HashMap::new(),
+                &challenge,
+                600000,
+                Some(SECURITY_SERVER),
+            )
             .unwrap();
 
         let sa = manager
@@ -2722,10 +2839,18 @@ mod tests {
         let manager = make_manager();
         manager.add(make_entry("sip:alice@carrier.com"));
         let (message, _, _, _) = manager
-            .build_register("sip:alice@carrier.com", "127.0.0.1:5060".parse().unwrap(), &HashMap::new(), 3600)
+            .build_register(
+                "sip:alice@carrier.com",
+                "127.0.0.1:5060".parse().unwrap(),
+                &HashMap::new(),
+                3600,
+            )
             .unwrap();
         let bytes = message.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
-        assert!(!raw.contains("Authorization"), "digest initial REGISTER has no auth: {raw}");
+        assert!(
+            !raw.contains("Authorization"),
+            "digest initial REGISTER has no auth: {raw}"
+        );
     }
 }

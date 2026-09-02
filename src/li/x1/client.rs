@@ -28,13 +28,11 @@ use crate::config::{LiX1AdmfConfig, LiX1Config};
 
 use super::codec;
 use super::error::{ErrorCode, X1Error};
-use super::message::{
-    Envelope, RequestBody, RequestContainer, RequestMessage, ResponseBody,
-};
+use super::message::{Envelope, RequestBody, RequestContainer, RequestMessage, ResponseBody};
 use super::schema::X1Schema;
 use super::store::{DestinationStore, TaskStore};
 use super::types::{
-    DId, TaskReportType, Timestamp, Token, TypeOfNeIssueMessage, Version, XId, X1TransactionId,
+    DId, TaskReportType, Timestamp, Token, TypeOfNeIssueMessage, Version, X1TransactionId, XId,
 };
 
 /// An X1 client pointed at the ADMF.
@@ -217,9 +215,10 @@ impl X1Client {
         })?;
         let decoded = codec::decode_response_container(&document)?;
 
-        let message = decoded.messages.into_iter().next().ok_or_else(|| {
-            X1Error::syntax("the ADMF's response container holds no messages")
-        })?;
+        let message =
+            decoded.messages.into_iter().next().ok_or_else(|| {
+                X1Error::syntax("the ADMF's response container holds no messages")
+            })?;
         if message.kind != kind {
             return Err(X1Error::syntax(format!(
                 "the ADMF answered {} to a {} request",
@@ -306,10 +305,7 @@ impl X1Client {
                 destinations,
                 ..
             } => Ok(ReconciledState {
-                tasks: tasks
-                    .into_iter()
-                    .map(|entry| entry.task_details)
-                    .collect(),
+                tasks: tasks.into_iter().map(|entry| entry.task_details).collect(),
                 destinations: destinations
                     .into_iter()
                     .map(|entry| entry.destination_details)
@@ -522,7 +518,10 @@ mod tests {
         };
 
         let rejected = apply_reconciled_state(&state, &tasks, &destinations);
-        assert!(rejected.is_empty(), "nothing should be rejected: {rejected:?}");
+        assert!(
+            rejected.is_empty(),
+            "nothing should be rejected: {rejected:?}"
+        );
         assert_eq!(destinations.len(), 1);
         assert_eq!(tasks.len(), 1);
         assert!(tasks.get(x_id).is_some());
@@ -586,8 +585,7 @@ mod tests {
     #[test]
     fn reconciliation_of_an_empty_state_is_a_no_op() {
         let (tasks, destinations) = stores(ContentCapability::Available);
-        let rejected =
-            apply_reconciled_state(&ReconciledState::default(), &tasks, &destinations);
+        let rejected = apply_reconciled_state(&ReconciledState::default(), &tasks, &destinations);
         assert!(rejected.is_empty());
         assert!(tasks.is_empty());
         assert!(destinations.is_empty());
@@ -604,7 +602,9 @@ mod tests {
         destinations
             .create(destination(d_id, DeliveryType::X2AndX3))
             .unwrap();
-        tasks.activate(task(x_id, d_id, DeliveryType::X2Only)).unwrap();
+        tasks
+            .activate(task(x_id, d_id, DeliveryType::X2Only))
+            .unwrap();
 
         apply_reconciled_state(&ReconciledState::default(), &tasks, &destinations);
         assert!(tasks.get(x_id).is_some());

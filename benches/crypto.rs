@@ -18,12 +18,12 @@
 //! test realm — never real subscriber secrets.
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use std::hint::black_box;
 use siphon::auth::{
     compute_aka_response, compute_digest_response, DigestAlgorithm, DigestChallenge,
     DigestCredentials,
 };
 use siphon::ipsec::milenage::{compute_opc, generate_vector_with_rand};
+use std::hint::black_box;
 
 // 3GPP TS 35.208 Test Set 1.
 const KEY: [u8; 16] = [

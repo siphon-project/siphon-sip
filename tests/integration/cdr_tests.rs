@@ -3,7 +3,6 @@
 //! Tests cover Cdr struct construction, builder pattern, JSON serialization,
 //! timestamp formatting, extra field flattening, and file backend writing.
 
-
 use siphon::cdr::{Cdr, CdrBackendType, CdrConfig};
 
 // ---------------------------------------------------------------------------
@@ -92,9 +91,7 @@ fn json_serialization_contains_all_fields() {
 
 #[test]
 fn json_roundtrip_via_serde_value() {
-    let cdr = sample_cdr()
-        .with_response_code(180)
-        .with_duration(42.5);
+    let cdr = sample_cdr().with_response_code(180).with_duration(42.5);
 
     let json_string = serde_json::to_string(&cdr).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json_string).unwrap();
@@ -117,7 +114,11 @@ fn timestamp_is_iso_8601_utc() {
     // Timestamp should be in the form: YYYY-MM-DDTHH:MM:SS.mmmZ
     assert!(cdr.timestamp.contains('T'), "missing 'T' separator");
     assert!(cdr.timestamp.ends_with('Z'), "missing trailing 'Z'");
-    assert!(cdr.timestamp.len() >= 23, "timestamp too short: {}", cdr.timestamp);
+    assert!(
+        cdr.timestamp.len() >= 23,
+        "timestamp too short: {}",
+        cdr.timestamp
+    );
 
     // Verify the date portion parses as digits.
     let date_part = &cdr.timestamp[..10];
@@ -154,7 +155,10 @@ fn extra_fields_are_flattened_in_json() {
     assert_eq!(parsed["billing_id"], "B-12345");
     assert_eq!(parsed["account_code"], "ACC-789");
     assert_eq!(parsed["custom_field"], "custom_value");
-    assert!(parsed.get("extra").is_none(), "extra should be flattened, not nested");
+    assert!(
+        parsed.get("extra").is_none(),
+        "extra should be flattened, not nested"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -208,7 +212,10 @@ fn cdr_config_defaults() {
     assert_eq!(config.channel_size, 10_000);
 
     match &config.backend {
-        CdrBackendType::File { path, rotate_size_mb } => {
+        CdrBackendType::File {
+            path,
+            rotate_size_mb,
+        } => {
             assert_eq!(path, "/var/log/siphon/cdr.jsonl");
             assert_eq!(*rotate_size_mb, 100);
         }

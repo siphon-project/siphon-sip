@@ -9,9 +9,9 @@ use pyo3::prelude::*;
 use tracing::{debug, error, info, warn};
 
 use crate::config::{self, Config};
-use crate::hep::HepSender;
 use crate::gateway::DispatcherManager;
-use crate::script::engine::{ScriptEngine, spawn_file_watcher};
+use crate::hep::HepSender;
+use crate::script::engine::{spawn_file_watcher, ScriptEngine};
 use crate::script::ScriptHandle;
 use crate::transport;
 use crate::uac::UacSender;
@@ -415,7 +415,7 @@ impl SiphonServer {
         // (`PYTHONMALLOC=malloc`) under load to name a true raw-domain leak.
         #[cfg(unix)]
         tokio::spawn(async move {
-            use tokio::signal::unix::{SignalKind, signal};
+            use tokio::signal::unix::{signal, SignalKind};
             let mut stream = match signal(SignalKind::user_defined2()) {
                 Ok(stream) => stream,
                 Err(error) => {
@@ -439,8 +439,7 @@ impl SiphonServer {
 
         info!(
             "{product_name} v{product_version} starting — script: {}, domain: {:?}",
-            script_desc,
-            config.domain.local
+            script_desc, config.domain.local
         );
 
         // --- Inject Rust singletons before script loads ---
@@ -561,7 +560,8 @@ impl SiphonServer {
         // stale presence documents/subscriptions (L1 has no TTL reaper of its own).
         crate::presence::set_global_store(Arc::clone(&presence_store));
         pyo3::Python::attach(|python| {
-            let py_presence = crate::script::api::presence::PyPresence::new(Arc::clone(&presence_store));
+            let py_presence =
+                crate::script::api::presence::PyPresence::new(Arc::clone(&presence_store));
             if let Err(error) = crate::script::api::set_presence_singleton(python, py_presence) {
                 error!("failed to store presence singleton: {error}");
             } else {
@@ -601,23 +601,17 @@ impl SiphonServer {
                 .as_ref()
                 .map(|m| m.health_check_interval_secs)
                 .unwrap_or(0);
-            dispatcher::spawn_rtpengine_health_check(
-                Arc::clone(rtpengine_set),
-                interval_secs,
-            );
+            dispatcher::spawn_rtpengine_health_check(Arc::clone(rtpengine_set), interval_secs);
         }
 
         // --- Initialize custom metrics namespace for Python scripts ---
         // Must happen before script engine so `from siphon import metrics` works.
         if let Some(custom) = crate::metrics::custom_metrics() {
             pyo3::Python::attach(|python| {
-                let py_metrics =
-                    crate::script::api::metrics::PyMetricsNamespace::new(
-                        std::sync::Arc::clone(custom),
-                    );
-                if let Err(error) =
-                    crate::script::api::set_metrics_singleton(python, py_metrics)
-                {
+                let py_metrics = crate::script::api::metrics::PyMetricsNamespace::new(
+                    std::sync::Arc::clone(custom),
+                );
+                if let Err(error) = crate::script::api::set_metrics_singleton(python, py_metrics) {
                     error!("failed to store metrics singleton: {error}");
                 } else {
                     info!("metrics namespace registered for Python scripts");
@@ -734,7 +728,9 @@ impl SiphonServer {
             let ifc_store = Arc::new(crate::ifc::IfcStore::new(global_ifcs));
             pyo3::Python::attach(|python| {
                 let py_isc = crate::script::api::isc::PyIsc::new(Arc::clone(&ifc_store));
-                if let Err(error) = crate::script::api::set_isc_singleton(python, py_isc, Arc::clone(&ifc_store)) {
+                if let Err(error) =
+                    crate::script::api::set_isc_singleton(python, py_isc, Arc::clone(&ifc_store))
+                {
                     error!("failed to store ISC singleton: {error}");
                 } else {
                     info!("ISC namespace registered for injection");
@@ -764,15 +760,11 @@ impl SiphonServer {
                     let py_obj = match factory(python) {
                         Ok(obj) => obj,
                         Err(error) => {
-                            eprintln!(
-                                "Failed to construct user namespace '{name}': {error}"
-                            );
+                            eprintln!("Failed to construct user namespace '{name}': {error}");
                             std::process::exit(1);
                         }
                     };
-                    if let Err(error) =
-                        crate::script::api::set_user_namespace(&name, py_obj)
-                    {
+                    if let Err(error) = crate::script::api::set_user_namespace(&name, py_obj) {
                         eprintln!("Failed to register user namespace '{name}': {error}");
                         std::process::exit(1);
                     }
@@ -804,80 +796,83 @@ impl SiphonServer {
         // 0.0.0.0 if no UDP listener is configured — XFRM will not
         // match traffic against the wildcard, but the singleton is
         // still wired so the script can import it.
-        let ipsec_manager: Option<Arc<crate::ipsec::IpsecManager>> = if let Some(ref ipsec_config) = config.ipsec {
-            let backend = match ipsec_config.backend {
-                crate::config::IpsecBackend::Netlink => crate::ipsec::XfrmBackend::Netlink,
-                crate::config::IpsecBackend::Ip => crate::ipsec::XfrmBackend::IpCommand,
-            };
-            let spi_start = ipsec_config.spi_range_start.unwrap_or(10000);
-            let spi_count = ipsec_config.spi_range_count;
-            let manager = Arc::new(crate::ipsec::IpsecManager::with_partition(
-                backend, spi_start, spi_count,
-            ));
-            // Register the process-wide handle so the dispatcher's 30 s
-            // cleanup tick can sweep abandoned SA pairs (states + policies +
-            // map entry) once they pass their own hard-lifetime + grace.
-            crate::ipsec::set_global_manager(Arc::clone(&manager));
-            info!(
-                backend = ?backend,
-                spi_start,
-                spi_count,
-                active = manager.active_count(),
-                "IPsec SA manager initialized (script-driven via siphon.ipsec)"
-            );
+        let ipsec_manager: Option<Arc<crate::ipsec::IpsecManager>> =
+            if let Some(ref ipsec_config) = config.ipsec {
+                let backend = match ipsec_config.backend {
+                    crate::config::IpsecBackend::Netlink => crate::ipsec::XfrmBackend::Netlink,
+                    crate::config::IpsecBackend::Ip => crate::ipsec::XfrmBackend::IpCommand,
+                };
+                let spi_start = ipsec_config.spi_range_start.unwrap_or(10000);
+                let spi_count = ipsec_config.spi_range_count;
+                let manager = Arc::new(crate::ipsec::IpsecManager::with_partition(
+                    backend, spi_start, spi_count,
+                ));
+                // Register the process-wide handle so the dispatcher's 30 s
+                // cleanup tick can sweep abandoned SA pairs (states + policies +
+                // map entry) once they pass their own hard-lifetime + grace.
+                crate::ipsec::set_global_manager(Arc::clone(&manager));
+                info!(
+                    backend = ?backend,
+                    spi_start,
+                    spi_count,
+                    active = manager.active_count(),
+                    "IPsec SA manager initialized (script-driven via siphon.ipsec)"
+                );
 
-            // Derive the P-CSCF local address per family from the first UDP
-            // listen entry of each family, without binding the listener.  Used
-            // at SA creation time as the P-CSCF side of the kernel's xfrm
-            // selectors — which must match the UE's family (3GPP TS 33.203
-            // §7.2), so a dual-stack P-CSCF needs both.
-            let mut pcscf_addr_v4: Option<std::net::IpAddr> = None;
-            let mut pcscf_addr_v6: Option<std::net::IpAddr> = None;
-            // Prefer a concrete bind address over a wildcard (0.0.0.0 / [::]):
-            // an unspecified address yields a dead XFRM selector, so take the
-            // first concrete listener of each family when one exists, only
-            // falling back to a wildcard entry if that's all that's configured
-            // (preserves the historical single-wildcard-listener behaviour).
-            for entry in &config.listen.udp {
-                if let Ok(addr) = entry.address().parse::<std::net::SocketAddr>() {
-                    let ip = addr.ip();
-                    let slot = if ip.is_ipv6() { &mut pcscf_addr_v6 } else { &mut pcscf_addr_v4 };
-                    match slot {
-                        None => *slot = Some(ip),
-                        Some(existing) if existing.is_unspecified() && !ip.is_unspecified() => {
-                            *slot = Some(ip);
+                // Derive the P-CSCF local address per family from the first UDP
+                // listen entry of each family, without binding the listener.  Used
+                // at SA creation time as the P-CSCF side of the kernel's xfrm
+                // selectors — which must match the UE's family (3GPP TS 33.203
+                // §7.2), so a dual-stack P-CSCF needs both.
+                let mut pcscf_addr_v4: Option<std::net::IpAddr> = None;
+                let mut pcscf_addr_v6: Option<std::net::IpAddr> = None;
+                // Prefer a concrete bind address over a wildcard (0.0.0.0 / [::]):
+                // an unspecified address yields a dead XFRM selector, so take the
+                // first concrete listener of each family when one exists, only
+                // falling back to a wildcard entry if that's all that's configured
+                // (preserves the historical single-wildcard-listener behaviour).
+                for entry in &config.listen.udp {
+                    if let Ok(addr) = entry.address().parse::<std::net::SocketAddr>() {
+                        let ip = addr.ip();
+                        let slot = if ip.is_ipv6() {
+                            &mut pcscf_addr_v6
+                        } else {
+                            &mut pcscf_addr_v4
+                        };
+                        match slot {
+                            None => *slot = Some(ip),
+                            Some(existing) if existing.is_unspecified() && !ip.is_unspecified() => {
+                                *slot = Some(ip);
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
-            }
 
-            let ipsec_manager_for_singleton = Arc::clone(&manager);
-            let ipsec_config_arc = Arc::new(ipsec_config.clone());
-            pyo3::Python::attach(|python| {
-                let py_ipsec = crate::script::api::ipsec::PyIpsec::new(
-                    ipsec_manager_for_singleton,
-                    ipsec_config_arc,
-                    pcscf_addr_v4,
-                    pcscf_addr_v6,
-                );
-                if let Err(error) =
-                    crate::script::api::set_ipsec_singleton(python, py_ipsec)
-                {
-                    error!("failed to store IPsec singleton: {error}");
-                } else {
-                    info!(
-                        pcscf_addr_v4 = ?pcscf_addr_v4,
-                        pcscf_addr_v6 = ?pcscf_addr_v6,
-                        "ipsec namespace registered for injection"
+                let ipsec_manager_for_singleton = Arc::clone(&manager);
+                let ipsec_config_arc = Arc::new(ipsec_config.clone());
+                pyo3::Python::attach(|python| {
+                    let py_ipsec = crate::script::api::ipsec::PyIpsec::new(
+                        ipsec_manager_for_singleton,
+                        ipsec_config_arc,
+                        pcscf_addr_v4,
+                        pcscf_addr_v6,
                     );
-                }
-            });
+                    if let Err(error) = crate::script::api::set_ipsec_singleton(python, py_ipsec) {
+                        error!("failed to store IPsec singleton: {error}");
+                    } else {
+                        info!(
+                            pcscf_addr_v4 = ?pcscf_addr_v4,
+                            pcscf_addr_v6 = ?pcscf_addr_v6,
+                            "ipsec namespace registered for injection"
+                        );
+                    }
+                });
 
-            Some(manager)
-        } else {
-            None
-        };
+                Some(manager)
+            } else {
+                None
+            };
 
         // --- STIR/SHAKEN namespace (siphon.stir) ---
         //
@@ -930,17 +925,14 @@ impl SiphonServer {
         // Source-script apps masked the bug because file-watcher reloads
         // re-run install_siphon_module after the singleton is set.
         {
-            let cache_manager = std::sync::Arc::new(
-                crate::cache::CacheManager::new(config.cache.as_deref().unwrap_or(&[])),
-            );
+            let cache_manager = std::sync::Arc::new(crate::cache::CacheManager::new(
+                config.cache.as_deref().unwrap_or(&[]),
+            ));
             let mut store = crate::subscribe_state::SubscribeStore::new();
             if let Some(ref cfg) = config.subscribe_state {
                 if let Some(ref cache_name) = cfg.cache {
                     if cache_manager.has_cache(cache_name) {
-                        store = store.with_cache(
-                            Arc::clone(&cache_manager),
-                            cache_name.clone(),
-                        );
+                        store = store.with_cache(Arc::clone(&cache_manager), cache_name.clone());
                         info!(cache = %cache_name, "subscribe_state: L2 persistence enabled");
                     } else {
                         error!(
@@ -956,10 +948,9 @@ impl SiphonServer {
             // L2, has no TTL reaper of its own).
             crate::subscribe_state::set_global_store(Arc::clone(&store_arc));
             pyo3::Python::attach(|python| {
-                let namespace =
-                    crate::script::api::subscribe_state::PySubscribeState::new(
-                        Arc::clone(&store_arc),
-                    );
+                let namespace = crate::script::api::subscribe_state::PySubscribeState::new(
+                    Arc::clone(&store_arc),
+                );
                 if let Err(error) =
                     crate::script::api::set_subscribe_state_singleton(python, namespace)
                 {
@@ -1069,10 +1060,12 @@ impl SiphonServer {
 
         // --- Script engine ---
         let engine = if let Some(bytecode) = self.embedded_bytecode {
-            Arc::new(ScriptEngine::new_from_bytecode(bytecode).unwrap_or_else(|error| {
-                eprintln!("Failed to load embedded bytecode: {error}");
-                std::process::exit(1);
-            }))
+            Arc::new(
+                ScriptEngine::new_from_bytecode(bytecode).unwrap_or_else(|error| {
+                    eprintln!("Failed to load embedded bytecode: {error}");
+                    std::process::exit(1);
+                }),
+            )
         } else if let Some(source) = self.embedded_script {
             Arc::new(ScriptEngine::new_embedded(source).unwrap_or_else(|error| {
                 eprintln!("Failed to load embedded script: {error}");
@@ -1104,9 +1097,7 @@ impl SiphonServer {
                 let script_handle = ScriptHandle::new(engine.state_arc(), runtime_handle.clone());
                 task(script_handle);
             }
-            info!(
-                "extension tasks started"
-            );
+            info!("extension tasks started");
         }
 
         // --- Kernel firewall (nf_tables) — opt-in, needs CAP_NET_ADMIN ---
@@ -1114,7 +1105,11 @@ impl SiphonServer {
         // dropped before it reaches siphon's socket. On failure (missing
         // capability, non-Linux) we warn and fall back to the userspace ACL —
         // never fatal.
-        let kernel_firewall = match config.security.as_ref().and_then(|sec| sec.firewall.as_ref()) {
+        let kernel_firewall = match config
+            .security
+            .as_ref()
+            .and_then(|sec| sec.firewall.as_ref())
+        {
             Some(firewall_config) => match crate::firewall::start(firewall_config).await {
                 Ok(handle) => Some(handle),
                 Err(error) => {
@@ -1222,7 +1217,8 @@ impl SiphonServer {
         #[cfg(feature = "sctp")]
         let (sctp_outbound_tx, sctp_outbound_rx) = flume::unbounded::<transport::OutboundMessage>();
         #[cfg(not(feature = "sctp"))]
-        let (sctp_outbound_tx, _sctp_outbound_rx) = flume::unbounded::<transport::OutboundMessage>();
+        let (sctp_outbound_tx, _sctp_outbound_rx) =
+            flume::unbounded::<transport::OutboundMessage>();
 
         // UDP listeners get a dedicated outbound channel each — required
         // for IPsec sec-agree on the P-CSCF role (3GPP TS 33.203 §7.4)
@@ -1232,7 +1228,10 @@ impl SiphonServer {
         // (see `default_udp_egress_addr`).
         let mut udp_listener_channels: std::collections::HashMap<
             std::net::SocketAddr,
-            (flume::Sender<transport::OutboundMessage>, flume::Receiver<transport::OutboundMessage>),
+            (
+                flume::Sender<transport::OutboundMessage>,
+                flume::Receiver<transport::OutboundMessage>,
+            ),
         > = std::collections::HashMap::new();
         for entry in &config.listen.udp {
             let addr: std::net::SocketAddr = match entry.address().parse() {
@@ -1294,12 +1293,16 @@ impl SiphonServer {
         // --- Start transport listeners ---
         let mut first_listen_addr: Option<std::net::SocketAddr> = None;
         let mut listen_addrs = std::collections::HashMap::new();
-        let mut advertised_addrs: std::collections::HashMap<transport::Transport, String> = std::collections::HashMap::new();
+        let mut advertised_addrs: std::collections::HashMap<transport::Transport, String> =
+            std::collections::HashMap::new();
         // Every configured listener (transport + bound addr + advertised host),
         // for `send_socket=` egress resolution.  Unlike `listen_addrs` (first
         // per transport), this keeps the FULL multi-homed set across transports.
-        let mut listener_registry_entries: Vec<(transport::Transport, std::net::SocketAddr, Option<String>)> =
-            Vec::new();
+        let mut listener_registry_entries: Vec<(
+            transport::Transport,
+            std::net::SocketAddr,
+            Option<String>,
+        )> = Vec::new();
 
         // DSCP → TOS byte resolution helper.
         // Per-entry overrides the global listen.dscp (default CS3 = 24 → TOS 96).
@@ -1307,13 +1310,17 @@ impl SiphonServer {
         let udp_recv_buffer_bytes = config.listen.udp_recv_buffer_bytes;
         let resolve_tos = |entry: &config::ListenEntry| -> Option<u32> {
             let dscp = entry.dscp().or(global_dscp)?;
-            if dscp == 0 { None } else { Some(config::dscp_to_tos(dscp)) }
+            if dscp == 0 {
+                None
+            } else {
+                Some(config::dscp_to_tos(dscp))
+            }
         };
 
         // Reject listen addresses that cannot share one socket, and work out
         // which ones are shared legitimately, before any listener is bound.
-        let (tcp_ws_mux, tls_wss_mux) = resolve_mux_addresses(&config.listen)
-            .unwrap_or_else(|error| {
+        let (tcp_ws_mux, tls_wss_mux) =
+            resolve_mux_addresses(&config.listen).unwrap_or_else(|error| {
                 eprintln!("{error}");
                 std::process::exit(1);
             });
@@ -1327,11 +1334,19 @@ impl SiphonServer {
             if first_listen_addr.is_none() {
                 first_listen_addr = Some(addr);
             }
-            listen_addrs.entry(transport::Transport::Udp).or_insert(addr);
+            listen_addrs
+                .entry(transport::Transport::Udp)
+                .or_insert(addr);
             if let Some(adv) = entry.advertise() {
-                advertised_addrs.entry(transport::Transport::Udp).or_insert_with(|| adv.to_string());
+                advertised_addrs
+                    .entry(transport::Transport::Udp)
+                    .or_insert_with(|| adv.to_string());
             }
-            listener_registry_entries.push((transport::Transport::Udp, addr, entry.advertise().map(str::to_string)));
+            listener_registry_entries.push((
+                transport::Transport::Udp,
+                addr,
+                entry.advertise().map(str::to_string),
+            ));
             let tos = resolve_tos(entry);
             info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting UDP transport");
             // Use this listener's dedicated outbound channel (TS 33.203
@@ -1342,7 +1357,15 @@ impl SiphonServer {
                 .get(&addr)
                 .map(|(_, rx)| rx.clone())
                 .unwrap_or_else(|| flume::unbounded().1);
-            transport::udp::listen(addr, inbound_tx.clone(), listener_rx, Arc::clone(&transport_acl), tos, udp_recv_buffer_bytes).await;
+            transport::udp::listen(
+                addr,
+                inbound_tx.clone(),
+                listener_rx,
+                Arc::clone(&transport_acl),
+                tos,
+                udp_recv_buffer_bytes,
+            )
+            .await;
         }
 
         // RFC 5626 §4.4.1 pong tracker — created up front so it can be
@@ -1366,34 +1389,31 @@ impl SiphonServer {
         // task drains the channel and calls `Registrar::unregister_flow`.
         // Left `None` when liveness is disabled so transports never enqueue
         // (an unbounded channel with no receiver would otherwise grow).
-        let connection_close_tx: Option<flume::Sender<u64>> =
-            if config.registrar.liveness.enabled {
-                let liveness = &config.registrar.liveness;
-                tracing::info!(
-                    keepalive_interval_secs = liveness.keepalive_interval_secs,
-                    idle_multiplier = liveness.idle_multiplier,
-                    probe_timeout_ms = liveness.probe_timeout_ms,
-                    dereg_mode = ?liveness.dereg_mode,
-                    "registrar liveness ENABLED — flow-failure dereg (non-IPsec stream) + IPsec SA-idle sweep active"
-                );
-                let dereg_mode = liveness.dereg_mode;
-                let (close_tx, close_rx) = flume::unbounded::<u64>();
-                tokio::spawn(async move {
-                    // A closed stream flow defers to the SA-idle sweep for IPsec
-                    // bindings (RFC 5626 §4.2.2 flow recovery) and only
-                    // deregisters non-IPsec bindings immediately — see
-                    // `dispatcher::liveness_on_flow_close`.
-                    while let Ok(connection_id) = close_rx.recv_async().await {
-                        crate::dispatcher::liveness_on_flow_close(connection_id, dereg_mode).await;
-                    }
-                });
-                Some(close_tx)
-            } else {
-                tracing::debug!(
-                    "registrar liveness disabled — Expires-only deregistration"
-                );
-                None
-            };
+        let connection_close_tx: Option<flume::Sender<u64>> = if config.registrar.liveness.enabled {
+            let liveness = &config.registrar.liveness;
+            tracing::info!(
+                keepalive_interval_secs = liveness.keepalive_interval_secs,
+                idle_multiplier = liveness.idle_multiplier,
+                probe_timeout_ms = liveness.probe_timeout_ms,
+                dereg_mode = ?liveness.dereg_mode,
+                "registrar liveness ENABLED — flow-failure dereg (non-IPsec stream) + IPsec SA-idle sweep active"
+            );
+            let dereg_mode = liveness.dereg_mode;
+            let (close_tx, close_rx) = flume::unbounded::<u64>();
+            tokio::spawn(async move {
+                // A closed stream flow defers to the SA-idle sweep for IPsec
+                // bindings (RFC 5626 §4.2.2 flow recovery) and only
+                // deregisters non-IPsec bindings immediately — see
+                // `dispatcher::liveness_on_flow_close`.
+                while let Ok(connection_id) = close_rx.recv_async().await {
+                    crate::dispatcher::liveness_on_flow_close(connection_id, dereg_mode).await;
+                }
+            });
+            Some(close_tx)
+        } else {
+            tracing::debug!("registrar liveness disabled — Expires-only deregistration");
+            None
+        };
 
         // --- Protocol mux (raw SIP + SIP-over-WebSocket on one socket) ---
         // An address that appears under both `listen.tcp` and `listen.ws` (or
@@ -1409,10 +1429,12 @@ impl SiphonServer {
         // Declared here (rather than beside their listeners) because a muxed
         // listener registers into the same per-transport map as the dedicated
         // one, so a WS connection is reachable identically either way.
-        let ws_connection_map: Arc<dashmap::DashMap<transport::ConnectionId, tokio::sync::mpsc::Sender<bytes::Bytes>>> =
-            Arc::new(dashmap::DashMap::new());
-        let wss_connection_map: Arc<dashmap::DashMap<transport::ConnectionId, tokio::sync::mpsc::Sender<bytes::Bytes>>> =
-            Arc::new(dashmap::DashMap::new());
+        let ws_connection_map: Arc<
+            dashmap::DashMap<transport::ConnectionId, tokio::sync::mpsc::Sender<bytes::Bytes>>,
+        > = Arc::new(dashmap::DashMap::new());
+        let wss_connection_map: Arc<
+            dashmap::DashMap<transport::ConnectionId, tokio::sync::mpsc::Sender<bytes::Bytes>>,
+        > = Arc::new(dashmap::DashMap::new());
 
         // TCP
         let tcp_connection_map = Arc::new(dashmap::DashMap::new());
@@ -1432,11 +1454,19 @@ impl SiphonServer {
             if first_listen_addr.is_none() {
                 first_listen_addr = Some(addr);
             }
-            listen_addrs.entry(transport::Transport::Tcp).or_insert(addr);
+            listen_addrs
+                .entry(transport::Transport::Tcp)
+                .or_insert(addr);
             if let Some(adv) = entry.advertise() {
-                advertised_addrs.entry(transport::Transport::Tcp).or_insert_with(|| adv.to_string());
+                advertised_addrs
+                    .entry(transport::Transport::Tcp)
+                    .or_insert_with(|| adv.to_string());
             }
-            listener_registry_entries.push((transport::Transport::Tcp, addr, entry.advertise().map(str::to_string)));
+            listener_registry_entries.push((
+                transport::Transport::Tcp,
+                addr,
+                entry.advertise().map(str::to_string),
+            ));
             let tos = resolve_tos(entry);
             tcp_entries.push((addr, tos, entry.dscp().or(global_dscp)));
         }
@@ -1450,19 +1480,16 @@ impl SiphonServer {
         // Publish it process-globally so the Python `Flow.is_alive` getter can
         // do a real liveness lookup against the live connection set.
         crate::script::api::set_stream_connections(stream_connections.clone());
-        let tls_connection_map: Arc<dashmap::DashMap<transport::ConnectionId, tokio::sync::mpsc::Sender<bytes::Bytes>>> =
-            Arc::new(dashmap::DashMap::new());
+        let tls_connection_map: Arc<
+            dashmap::DashMap<transport::ConnectionId, tokio::sync::mpsc::Sender<bytes::Bytes>>,
+        > = Arc::new(dashmap::DashMap::new());
 
         // --- Connection pool ---
         // Created before TCP/TLS listeners so outbound messages on those
         // transports can fall back to the pool when no inbound connection
         // matches the requested `ConnectionId`.
-        let pool_tos = global_dscp
-            .filter(|&d| d > 0)
-            .map(config::dscp_to_tos);
-        let pool_local_addr = first_listen_addr.unwrap_or_else(||
-            "0.0.0.0:5060".parse().unwrap()
-        );
+        let pool_tos = global_dscp.filter(|&d| d > 0).map(config::dscp_to_tos);
+        let pool_local_addr = first_listen_addr.unwrap_or_else(|| "0.0.0.0:5060".parse().unwrap());
         // Outbound client-certificate (mutual TLS): when `tls.client_certificate`
         // + `tls.client_private_key` are configured, siphon presents that client
         // identity on outbound TLS connections whose peer requests one (upstream
@@ -1470,54 +1497,53 @@ impl SiphonServer {
         // neither; a one-sided setting or an unreadable/unparseable file is a
         // hard startup error (fail closed) — mirrors `verify_client` without
         // `client_ca` in the TLS acceptor.
-        let outbound_client_identity =
-            match config.tls.as_ref().map(|t| (&t.client_certificate, &t.client_private_key)) {
-                Some((Some(certificate_path), Some(private_key_path))) => {
-                    match transport::pool::load_outbound_client_identity(
-                        certificate_path,
-                        private_key_path,
-                    ) {
-                        Ok(identity) => {
-                            info!(
-                                certificate = %certificate_path,
-                                "outbound mutual TLS enabled — presenting client certificate on outbound TLS"
-                            );
-                            Some(identity)
-                        }
-                        Err(error) => {
-                            eprintln!(
-                                "Failed to load outbound TLS client certificate/key: {error}"
-                            );
-                            std::process::exit(1);
-                        }
+        let outbound_client_identity = match config
+            .tls
+            .as_ref()
+            .map(|t| (&t.client_certificate, &t.client_private_key))
+        {
+            Some((Some(certificate_path), Some(private_key_path))) => {
+                match transport::pool::load_outbound_client_identity(
+                    certificate_path,
+                    private_key_path,
+                ) {
+                    Ok(identity) => {
+                        info!(
+                            certificate = %certificate_path,
+                            "outbound mutual TLS enabled — presenting client certificate on outbound TLS"
+                        );
+                        Some(identity)
+                    }
+                    Err(error) => {
+                        eprintln!("Failed to load outbound TLS client certificate/key: {error}");
+                        std::process::exit(1);
                     }
                 }
-                Some((Some(_), None)) | Some((None, Some(_))) => {
-                    eprintln!(
-                        "tls.client_certificate and tls.client_private_key must both be set \
+            }
+            Some((Some(_), None)) | Some((None, Some(_))) => {
+                eprintln!(
+                    "tls.client_certificate and tls.client_private_key must both be set \
                          (outbound mutual TLS) — one was provided without the other"
-                    );
-                    std::process::exit(1);
-                }
-                _ => None,
-            };
+                );
+                std::process::exit(1);
+            }
+            _ => None,
+        };
         // One floor for both directions: `tls.method` governs the versions siphon
         // accepts on its listeners and the versions it offers when it dials out.
         // No `tls:` block at all means the default floor (TLS 1.2), i.e. exactly
         // what outbound TLS negotiated before the setting was honored.
-        let outbound_tls_method =
-            config.tls.as_ref().map(|t| t.method).unwrap_or_default();
-        let tls_client_config =
-            match transport::pool::build_outbound_tls_config(
-                outbound_client_identity,
-                outbound_tls_method,
-            ) {
-                Ok(config) => config,
-                Err(error) => {
-                    eprintln!("Failed to build outbound TLS client config: {error}");
-                    std::process::exit(1);
-                }
-            };
+        let outbound_tls_method = config.tls.as_ref().map(|t| t.method).unwrap_or_default();
+        let tls_client_config = match transport::pool::build_outbound_tls_config(
+            outbound_client_identity,
+            outbound_tls_method,
+        ) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("Failed to build outbound TLS client config: {error}");
+                std::process::exit(1);
+            }
+        };
         let connection_pool = Arc::new(transport::pool::ConnectionPool::new(
             Arc::clone(&tcp_connection_map),
             inbound_tx.clone(),
@@ -1533,8 +1559,10 @@ impl SiphonServer {
         // configured (outbound mutual TLS — Teams Direct Routing, carrier
         // interconnects), watch them on disk and swap the renewed identity into
         // the pool so outbound handshakes present the new cert without a restart.
-        if let Some((Some(certificate_path), Some(private_key_path))) =
-            config.tls.as_ref().map(|t| (&t.client_certificate, &t.client_private_key))
+        if let Some((Some(certificate_path), Some(private_key_path))) = config
+            .tls
+            .as_ref()
+            .map(|t| (&t.client_certificate, &t.client_private_key))
         {
             transport::pool::ConnectionPool::spawn_client_cert_hot_reload(
                 &connection_pool,
@@ -1550,7 +1578,18 @@ impl SiphonServer {
                 continue; // served by the TCP+WS mux listener below
             }
             info!(addr = %addr, dscp = ?dscp, "starting TCP transport");
-            transport::tcp::listen(addr, inbound_tx.clone(), tcp_outbound_rx.clone(), Arc::clone(&tcp_connection_map), Arc::clone(&transport_acl), tos, Some(Arc::clone(&connection_pool)), crlf_pong_tracker.clone(), connection_close_tx.clone()).await;
+            transport::tcp::listen(
+                addr,
+                inbound_tx.clone(),
+                tcp_outbound_rx.clone(),
+                Arc::clone(&tcp_connection_map),
+                Arc::clone(&transport_acl),
+                tos,
+                Some(Arc::clone(&connection_pool)),
+                crlf_pong_tracker.clone(),
+                connection_close_tx.clone(),
+            )
+            .await;
         }
 
         if let Some(ref tls_config) = config.tls {
@@ -1562,17 +1601,38 @@ impl SiphonServer {
                 if first_listen_addr.is_none() {
                     first_listen_addr = Some(addr);
                 }
-                listen_addrs.entry(transport::Transport::Tls).or_insert(addr);
+                listen_addrs
+                    .entry(transport::Transport::Tls)
+                    .or_insert(addr);
                 if let Some(adv) = entry.advertise() {
-                    advertised_addrs.entry(transport::Transport::Tls).or_insert_with(|| adv.to_string());
+                    advertised_addrs
+                        .entry(transport::Transport::Tls)
+                        .or_insert_with(|| adv.to_string());
                 }
-                listener_registry_entries.push((transport::Transport::Tls, addr, entry.advertise().map(str::to_string)));
+                listener_registry_entries.push((
+                    transport::Transport::Tls,
+                    addr,
+                    entry.advertise().map(str::to_string),
+                ));
                 if tls_wss_mux.contains(&addr) {
                     continue; // served by the TLS+WSS mux listener below
                 }
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting TLS transport");
-                transport::tls::listen(addr, tls_config, inbound_tx.clone(), tls_outbound_rx.clone(), Arc::clone(&tls_connection_map), Arc::clone(&transport_acl), stream_connections.clone(), tos, Some(Arc::clone(&connection_pool)), crlf_pong_tracker.clone(), connection_close_tx.clone()).await;
+                transport::tls::listen(
+                    addr,
+                    tls_config,
+                    inbound_tx.clone(),
+                    tls_outbound_rx.clone(),
+                    Arc::clone(&tls_connection_map),
+                    Arc::clone(&transport_acl),
+                    stream_connections.clone(),
+                    tos,
+                    Some(Arc::clone(&connection_pool)),
+                    crlf_pong_tracker.clone(),
+                    connection_close_tx.clone(),
+                )
+                .await;
             }
         }
 
@@ -1585,17 +1645,35 @@ impl SiphonServer {
             if first_listen_addr.is_none() {
                 first_listen_addr = Some(addr);
             }
-            listen_addrs.entry(transport::Transport::WebSocket).or_insert(addr);
+            listen_addrs
+                .entry(transport::Transport::WebSocket)
+                .or_insert(addr);
             if let Some(adv) = entry.advertise() {
-                advertised_addrs.entry(transport::Transport::WebSocket).or_insert_with(|| adv.to_string());
+                advertised_addrs
+                    .entry(transport::Transport::WebSocket)
+                    .or_insert_with(|| adv.to_string());
             }
-            listener_registry_entries.push((transport::Transport::WebSocket, addr, entry.advertise().map(str::to_string)));
+            listener_registry_entries.push((
+                transport::Transport::WebSocket,
+                addr,
+                entry.advertise().map(str::to_string),
+            ));
             if tcp_ws_mux.contains(&addr) {
                 continue; // served by the TCP+WS mux listener below
             }
             let tos = resolve_tos(entry);
             info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting WS transport");
-            transport::ws::listen(addr, inbound_tx.clone(), ws_outbound_rx.clone(), Arc::clone(&ws_connection_map), Arc::clone(&transport_acl), stream_connections.clone(), tos, connection_close_tx.clone()).await;
+            transport::ws::listen(
+                addr,
+                inbound_tx.clone(),
+                ws_outbound_rx.clone(),
+                Arc::clone(&ws_connection_map),
+                Arc::clone(&transport_acl),
+                stream_connections.clone(),
+                tos,
+                connection_close_tx.clone(),
+            )
+            .await;
         }
 
         // WSS
@@ -1608,17 +1686,36 @@ impl SiphonServer {
                 if first_listen_addr.is_none() {
                     first_listen_addr = Some(addr);
                 }
-                listen_addrs.entry(transport::Transport::WebSocketSecure).or_insert(addr);
+                listen_addrs
+                    .entry(transport::Transport::WebSocketSecure)
+                    .or_insert(addr);
                 if let Some(adv) = entry.advertise() {
-                    advertised_addrs.entry(transport::Transport::WebSocketSecure).or_insert_with(|| adv.to_string());
+                    advertised_addrs
+                        .entry(transport::Transport::WebSocketSecure)
+                        .or_insert_with(|| adv.to_string());
                 }
-                listener_registry_entries.push((transport::Transport::WebSocketSecure, addr, entry.advertise().map(str::to_string)));
+                listener_registry_entries.push((
+                    transport::Transport::WebSocketSecure,
+                    addr,
+                    entry.advertise().map(str::to_string),
+                ));
                 if tls_wss_mux.contains(&addr) {
                     continue; // served by the TLS+WSS mux listener below
                 }
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting WSS transport");
-                transport::ws::listen_secure(addr, tls_config, inbound_tx.clone(), wss_outbound_rx.clone(), Arc::clone(&wss_connection_map), Arc::clone(&transport_acl), stream_connections.clone(), tos, connection_close_tx.clone()).await;
+                transport::ws::listen_secure(
+                    addr,
+                    tls_config,
+                    inbound_tx.clone(),
+                    wss_outbound_rx.clone(),
+                    Arc::clone(&wss_connection_map),
+                    Arc::clone(&transport_acl),
+                    stream_connections.clone(),
+                    tos,
+                    connection_close_tx.clone(),
+                )
+                .await;
             }
         }
 
@@ -1698,14 +1795,30 @@ impl SiphonServer {
                 if first_listen_addr.is_none() {
                     first_listen_addr = Some(addr);
                 }
-                listen_addrs.entry(transport::Transport::Sctp).or_insert(addr);
+                listen_addrs
+                    .entry(transport::Transport::Sctp)
+                    .or_insert(addr);
                 if let Some(adv) = entry.advertise() {
-                    advertised_addrs.entry(transport::Transport::Sctp).or_insert_with(|| adv.to_string());
+                    advertised_addrs
+                        .entry(transport::Transport::Sctp)
+                        .or_insert_with(|| adv.to_string());
                 }
-                listener_registry_entries.push((transport::Transport::Sctp, addr, entry.advertise().map(str::to_string)));
+                listener_registry_entries.push((
+                    transport::Transport::Sctp,
+                    addr,
+                    entry.advertise().map(str::to_string),
+                ));
                 let tos = resolve_tos(entry);
                 info!(addr = %addr, dscp = ?entry.dscp().or(global_dscp), "starting SCTP transport");
-                transport::sctp::listen(addr, inbound_tx.clone(), sctp_outbound_rx.clone(), Arc::clone(&sctp_connection_map), Arc::clone(&transport_acl), tos).await;
+                transport::sctp::listen(
+                    addr,
+                    inbound_tx.clone(),
+                    sctp_outbound_rx.clone(),
+                    Arc::clone(&sctp_connection_map),
+                    Arc::clone(&transport_acl),
+                    tos,
+                )
+                .await;
             }
         }
         // Built without the `sctp` feature: any configured SCTP listener cannot
@@ -1747,17 +1860,20 @@ impl SiphonServer {
         // --- Prometheus metrics endpoint ---
         if let Some(ref metrics_config) = config.metrics {
             if let Some(ref prom_config) = metrics_config.prometheus {
-                let listen_addr: std::net::SocketAddr = prom_config.listen.parse().unwrap_or_else(|error| {
-                    eprintln!("Invalid metrics listen address '{}': {error}", prom_config.listen);
-                    std::process::exit(1);
-                });
+                let listen_addr: std::net::SocketAddr =
+                    prom_config.listen.parse().unwrap_or_else(|error| {
+                        eprintln!(
+                            "Invalid metrics listen address '{}': {error}",
+                            prom_config.listen
+                        );
+                        std::process::exit(1);
+                    });
                 let path = prom_config.path.clone();
                 let cors = prom_config.cors.clone();
                 tokio::spawn(async move {
                     use axum::{routing::get, Router};
-                    let mut app = Router::new().route(&path, get(|| async {
-                        crate::metrics::encode_metrics()
-                    }));
+                    let mut app = Router::new()
+                        .route(&path, get(|| async { crate::metrics::encode_metrics() }));
                     if let Some(layer) = cors.as_ref().and_then(crate::cors::build_cors_layer) {
                         app = app.layer(layer);
                     }
@@ -1777,7 +1893,9 @@ impl SiphonServer {
         }
 
         // --- UAC sender ---
-        let uac_user_agent = config.server.as_ref()
+        let uac_user_agent = config
+            .server
+            .as_ref()
             .and_then(|server| server.user_agent_header.clone())
             .or_else(|| Some(format!("{product_name}/{product_version}")));
         let uac_sender = Arc::new(UacSender::new(
@@ -1809,10 +1927,7 @@ impl SiphonServer {
 
         // --- Gateway health probers ---
         if let Some(ref manager) = gateway_manager {
-            crate::gateway::spawn_health_probers(
-                Arc::clone(manager),
-                Arc::clone(&uac_sender),
-            );
+            crate::gateway::spawn_health_probers(Arc::clone(manager), Arc::clone(&uac_sender));
         }
 
         // --- CDR writer ---
@@ -1857,15 +1972,15 @@ impl SiphonServer {
 
         // --- Diameter peers ---
         // Shared channel for incoming Diameter requests from all peers (RTR, etc.).
-        let (diameter_incoming_tx, diameter_incoming_rx) =
-            tokio::sync::mpsc::channel::<(
-                crate::diameter::peer::IncomingRequest,
-                std::sync::Arc<crate::diameter::peer::DiameterPeer>,
-            )>(256);
+        let (diameter_incoming_tx, diameter_incoming_rx) = tokio::sync::mpsc::channel::<(
+            crate::diameter::peer::IncomingRequest,
+            std::sync::Arc<crate::diameter::peer::DiameterPeer>,
+        )>(256);
         if let Some(ref diameter_config) = config.diameter {
             if let Some(ref manager) = diameter_manager {
                 for peer_entry in &diameter_config.peers {
-                    let peer_config = diameter_config.to_peer_config(peer_entry, product_name, product_version);
+                    let peer_config =
+                        diameter_config.to_peer_config(peer_entry, product_name, product_version);
                     let peer_name = peer_entry.name.clone();
                     let manager_for_task = Arc::clone(manager);
                     let tx = diameter_incoming_tx.clone();
@@ -1878,9 +1993,9 @@ impl SiphonServer {
                         loop {
                             match crate::diameter::peer::connect(peer_config.clone()).await {
                                 Ok((peer, mut incoming_rx)) => {
-                                    let client = Arc::new(
-                                        crate::diameter::DiameterClient::new(Arc::clone(&peer)),
-                                    );
+                                    let client = Arc::new(crate::diameter::DiameterClient::new(
+                                        Arc::clone(&peer),
+                                    ));
                                     manager_for_task.register(peer_name.clone(), client);
                                     info!(peer = %peer_name, "Diameter peer connected");
 
@@ -1907,7 +2022,8 @@ impl SiphonServer {
                                     );
                                 }
                             }
-                            tokio::time::sleep(std::time::Duration::from_secs(reconnect_delay)).await;
+                            tokio::time::sleep(std::time::Duration::from_secs(reconnect_delay))
+                                .await;
                         }
                     });
                 }
@@ -1936,7 +2052,16 @@ impl SiphonServer {
         // `registrant_manager` was created (and its Python namespace installed)
         // before ScriptEngine::new; here we wire its config entries + loop.
         if let Some(ref manager) = registrant_manager {
-            init_registrant(manager, &config, &outbound_senders, local_addr, &listen_addrs, &advertised_addrs, &hep_sender, stream_connections.clone());
+            init_registrant(
+                manager,
+                &config,
+                &outbound_senders,
+                local_addr,
+                &listen_addrs,
+                &advertised_addrs,
+                &hep_sender,
+                stream_connections.clone(),
+            );
         }
 
         // --- LI tasks ---
@@ -1963,8 +2088,7 @@ impl SiphonServer {
                 let communication = crate::sbi::Communication::from_config_str(
                     sbi_config.communication.as_deref().unwrap_or("direct"),
                 );
-                let requester_nf_type =
-                    sbi_config.requester_nf_type.as_deref().unwrap_or("AF");
+                let requester_nf_type = sbi_config.requester_nf_type.as_deref().unwrap_or("AF");
 
                 let http_client = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(sbi_config.timeout_secs))
@@ -1999,11 +2123,8 @@ impl SiphonServer {
                 );
 
                 pyo3::Python::attach(|python| {
-                    let py_sbi = crate::script::api::sbi::PySbi::new(
-                        npcf_client,
-                        bsf_client,
-                        pcf_scheme,
-                    );
+                    let py_sbi =
+                        crate::script::api::sbi::PySbi::new(npcf_client, bsf_client, pcf_scheme);
                     if let Err(error) = crate::script::api::set_sbi_singleton(python, py_sbi) {
                         error!("failed to store SBI singleton: {error}");
                     }
@@ -2021,13 +2142,17 @@ impl SiphonServer {
 
             // Start SBI notification listener for PCF events (N5 callback)
             if let Some(ref notif_listen) = sbi_config.notif_listen {
-                let notif_addr: std::net::SocketAddr = notif_listen.parse().unwrap_or_else(|error| {
-                    eprintln!("Invalid sbi.notif_listen address '{}': {error}", notif_listen);
-                    std::process::exit(1);
-                });
+                let notif_addr: std::net::SocketAddr =
+                    notif_listen.parse().unwrap_or_else(|error| {
+                        eprintln!(
+                            "Invalid sbi.notif_listen address '{}': {error}",
+                            notif_listen
+                        );
+                        std::process::exit(1);
+                    });
                 let engine_for_sbi = Arc::clone(&engine);
                 tokio::spawn(async move {
-                    use axum::{routing::post, extract::State, Router};
+                    use axum::{extract::State, routing::post, Router};
 
                     #[derive(Clone)]
                     struct SbiNotifState {
@@ -2044,9 +2169,7 @@ impl SiphonServer {
                         let json_str = match pcf_notification_body_to_json(&body) {
                             Some(json_str) => json_str,
                             None => {
-                                tracing::error!(
-                                    "PCF event notification body was not valid JSON"
-                                );
+                                tracing::error!("PCF event notification body was not valid JSON");
                                 return axum::http::StatusCode::BAD_REQUEST;
                             }
                         };
@@ -2103,7 +2226,9 @@ impl SiphonServer {
 
                     let app = Router::new()
                         .route("/sbi/events", post(handle_pcf_notification))
-                        .with_state(SbiNotifState { engine: engine_for_sbi });
+                        .with_state(SbiNotifState {
+                            engine: engine_for_sbi,
+                        });
 
                     info!(addr = %notif_addr, "SBI notification listener started on /sbi/events");
                     match tokio::net::TcpListener::bind(notif_addr).await {
@@ -2156,14 +2281,12 @@ impl SiphonServer {
         }
 
         // Subscribe to registrar events
-        let registrar_event_rx = crate::script::api::registrar_arc()
-            .map(|r| r.subscribe_events());
+        let registrar_event_rx = crate::script::api::registrar_arc().map(|r| r.subscribe_events());
 
         // --- Rf ACR-EVENT auto-emit on registration changes ---
-        if let (Some(rf_service), Some(registrar)) = (
-            rf_charger.as_ref(),
-            crate::script::api::registrar_arc(),
-        ) {
+        if let (Some(rf_service), Some(registrar)) =
+            (rf_charger.as_ref(), crate::script::api::registrar_arc())
+        {
             if rf_service.auto_emit_register() {
                 spawn_rf_register_emitter(Arc::clone(rf_service), registrar.subscribe_events());
             }
@@ -2181,8 +2304,11 @@ impl SiphonServer {
                 Ok(listen_addr) => {
                     if let Some(registrar) = crate::script::api::registrar_arc() {
                         let auth = admin_config.auth.clone().unwrap_or_default();
-                        let ui_enabled =
-                            admin_config.ui.as_ref().map(|ui| ui.enabled).unwrap_or(false);
+                        let ui_enabled = admin_config
+                            .ui
+                            .as_ref()
+                            .map(|ui| ui.enabled)
+                            .unwrap_or(false);
                         let instance_id = config
                             .server
                             .as_ref()
@@ -2264,7 +2390,10 @@ impl SiphonServer {
         if let Some(registrar) = crate::script::api::registrar_arc() {
             let evicted = registrar.evict_connection_oriented();
             if evicted > 0 {
-                info!(evicted, "evicted connection-oriented contacts after restart");
+                info!(
+                    evicted,
+                    "evicted connection-oriented contacts after restart"
+                );
             }
         }
 
@@ -2273,14 +2402,14 @@ impl SiphonServer {
         // Wait for shutdown signal (SIGINT or SIGTERM)
         shutdown::wait_for_signal().await;
 
-        let drain_secs = config.server.as_ref()
-            .map(|s| s.drain_secs)
-            .unwrap_or(30);
+        let drain_secs = config.server.as_ref().map(|s| s.drain_secs).unwrap_or(30);
 
         if drain_secs > 0 {
             // Stop accepting new INVITEs; let in-flight transactions and B2BUA
             // calls finish for up to drain_secs.
-            drain.is_draining.store(true, std::sync::atomic::Ordering::SeqCst);
+            drain
+                .is_draining
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             let (initial_tx, initial_calls) = drain.active_counts();
             info!(
                 drain_secs,
@@ -2328,26 +2457,22 @@ fn init_logging(
     use crate::config::{LogFormat, LogLevel};
     use tracing_subscriber::prelude::*;
 
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| {
-            let level = match log_config.level {
-                LogLevel::Debug => "debug",
-                LogLevel::Info => "info",
-                LogLevel::Warn => "warn",
-                LogLevel::Error => "error",
-            };
-            tracing_subscriber::EnvFilter::new(level)
-        });
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        let level = match log_config.level {
+            LogLevel::Debug => "debug",
+            LogLevel::Info => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Error => "error",
+        };
+        tracing_subscriber::EnvFilter::new(level)
+    });
 
     let is_json = log_config.format == LogFormat::Json;
 
     let console_layer = if is_json {
-        tracing_subscriber::fmt::layer()
-            .json()
-            .boxed()
+        tracing_subscriber::fmt::layer().json().boxed()
     } else {
-        tracing_subscriber::fmt::layer()
-            .boxed()
+        tracing_subscriber::fmt::layer().boxed()
     };
 
     let (file_layer, guard) = if let Some(ref path) = log_config.file {
@@ -2566,15 +2691,14 @@ fn init_gateway(config: &Config) -> Option<Arc<DispatcherManager>> {
     let manager = Arc::new(DispatcherManager::new());
 
     for group_config in &gateway_config.groups {
-        let algorithm = Algorithm::from_str(&group_config.algorithm)
-            .unwrap_or_else(|| {
-                warn!(
-                    algorithm = %group_config.algorithm,
-                    group = %group_config.name,
-                    "unknown algorithm, defaulting to weighted"
-                );
-                Algorithm::Weighted
-            });
+        let algorithm = Algorithm::from_str(&group_config.algorithm).unwrap_or_else(|| {
+            warn!(
+                algorithm = %group_config.algorithm,
+                group = %group_config.name,
+                "unknown algorithm, defaulting to weighted"
+            );
+            Algorithm::Weighted
+        });
 
         let mut destinations = Vec::new();
         for dest_config in &group_config.destinations {
@@ -2694,7 +2818,9 @@ fn init_li(config: &Config) -> Option<LiState> {
         return None;
     }
 
-    let channel_size = li_config.x2.as_ref()
+    let channel_size = li_config
+        .x2
+        .as_ref()
         .map(|x2| x2.channel_size)
         .unwrap_or(10_000);
     // Whether a content warrant can be provisioned at all depends on the media
@@ -2704,7 +2830,11 @@ fn init_li(config: &Config) -> Option<LiState> {
     // this carries the same fact to `ActivateTask`, which can arrive long after
     // boot.
     let content_capability = crate::li::LiManager::content_capability_for(
-        config.media.as_ref().map(|media| media.backend).unwrap_or_default(),
+        config
+            .media
+            .as_ref()
+            .map(|media| media.backend)
+            .unwrap_or_default(),
     );
     let (li_manager, iri_rx, audit_rx) =
         crate::li::LiManager::new(li_config.clone(), channel_size, content_capability);
@@ -2806,8 +2936,9 @@ fn spawn_rf_register_emitter(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
             let (aor, cause_code) = match &event {
-                RegistrationEvent::Registered { aor }
-                | RegistrationEvent::Refreshed { aor } => (aor.clone(), 0i32),
+                RegistrationEvent::Registered { aor } | RegistrationEvent::Refreshed { aor } => {
+                    (aor.clone(), 0i32)
+                }
                 RegistrationEvent::Deregistered { aor } => (aor.clone(), -200),
                 RegistrationEvent::Expired { aor } => (aor.clone(), -487),
             };
@@ -2910,7 +3041,8 @@ fn init_registrant(
     };
 
     for entry_config in &registrant_config.entries {
-        let registrar_host = entry_config.registrar
+        let registrar_host = entry_config
+            .registrar
             .strip_prefix("sip:")
             .or_else(|| entry_config.registrar.strip_prefix("sips:"))
             .unwrap_or(&entry_config.registrar);
@@ -2921,7 +3053,11 @@ fn init_registrant(
             _ => transport::Transport::Udp,
         };
 
-        let default_port: u16 = if transport_type == transport::Transport::Tls { 5061 } else { 5060 };
+        let default_port: u16 = if transport_type == transport::Transport::Tls {
+            5061
+        } else {
+            5060
+        };
         let address_str = if registrar_host.contains(':') {
             registrar_host.to_string()
         } else {
@@ -2950,7 +3086,9 @@ fn init_registrant(
                 password: entry_config.password.clone(),
                 realm: entry_config.realm.clone(),
             },
-            entry_config.interval.unwrap_or(registrant_config.default_interval),
+            entry_config
+                .interval
+                .unwrap_or(registrant_config.default_interval),
             entry_config.contact.clone(),
         );
         if is_hostname {
@@ -3006,14 +3144,18 @@ fn init_registrant(
                 error!(aor = %entry_config.aor, "registrant ipsec requires auth: aka, skipping entry");
                 continue;
             }
-            let aalg = match crate::ipsec::IntegrityAlgorithm::from_sec_agree_name(&ipsec_config.alg) {
+            let aalg = match crate::ipsec::IntegrityAlgorithm::from_sec_agree_name(
+                &ipsec_config.alg,
+            ) {
                 Some(alg) => alg,
                 None => {
                     error!(aor = %entry_config.aor, alg = %ipsec_config.alg, "unknown ipsec alg, skipping entry");
                     continue;
                 }
             };
-            let ealg = match crate::ipsec::EncryptionAlgorithm::from_sec_agree_name(&ipsec_config.ealg) {
+            let ealg = match crate::ipsec::EncryptionAlgorithm::from_sec_agree_name(
+                &ipsec_config.ealg,
+            ) {
                 Some(ealg) => ealg,
                 None => {
                     error!(aor = %entry_config.aor, ealg = %ipsec_config.ealg, "unknown ipsec ealg, skipping entry");
@@ -3032,7 +3174,12 @@ fn init_registrant(
 
         // IMS Contact feature tags (instance ID + MMTel/video/SMS).
         let entry = if let Some(ims_config) = &entry_config.ims {
-            let has = |tag: &str| ims_config.features.iter().any(|f| f.eq_ignore_ascii_case(tag));
+            let has = |tag: &str| {
+                ims_config
+                    .features
+                    .iter()
+                    .any(|f| f.eq_ignore_ascii_case(tag))
+            };
             entry.with_ims_contact(crate::registrant::ImsContactParams {
                 instance_id: ims_config.imei.clone(),
                 mmtel: has("mmtel"),
@@ -3071,7 +3218,8 @@ fn init_registrant(
             loop_hep_sender,
             loop_stream_connections,
             shutdown_rx,
-        ).await;
+        )
+        .await;
     });
 
     // Keep shutdown_tx alive — dropping it would cause the registration
@@ -3083,10 +3231,7 @@ fn init_registrant(
     // `serve()` (before ScriptEngine::new) using this same manager.
 }
 
-async fn spawn_li_tasks(
-    li_state: Option<LiState>,
-    config: &Config,
-) {
+async fn spawn_li_tasks(li_state: Option<LiState>, config: &Config) {
     let (li_manager, iri_rx, audit_rx) = match li_state {
         Some(state) => state,
         None => return,
@@ -3337,9 +3482,15 @@ fn resolve_mux_addresses(
         entries
             .iter()
             .map(|entry| {
-                entry.address().parse::<std::net::SocketAddr>().map_err(|error| {
-                    format!("Invalid {label} listen address '{}': {error}", entry.address())
-                })
+                entry
+                    .address()
+                    .parse::<std::net::SocketAddr>()
+                    .map_err(|error| {
+                        format!(
+                            "Invalid {label} listen address '{}': {error}",
+                            entry.address()
+                        )
+                    })
             })
             .collect()
     }
@@ -3349,8 +3500,13 @@ fn resolve_mux_addresses(
     let ws = addresses(&listen.ws, "WS")?;
     let wss = addresses(&listen.wss, "WSS")?;
 
-    let shared = |left: &[std::net::SocketAddr], right: &[std::net::SocketAddr]| -> Vec<std::net::SocketAddr> {
-        left.iter().filter(|addr| right.contains(addr)).copied().collect()
+    let shared = |left: &[std::net::SocketAddr],
+                  right: &[std::net::SocketAddr]|
+     -> Vec<std::net::SocketAddr> {
+        left.iter()
+            .filter(|addr| right.contains(addr))
+            .copied()
+            .collect()
     };
 
     for (left, left_label, right, right_label) in [
@@ -3599,7 +3755,10 @@ mod tests {
     use crate::config::{ListenConfig, ListenEntry};
 
     fn listen_on(addresses: &[&str]) -> Vec<ListenEntry> {
-        addresses.iter().map(|a| ListenEntry::Plain((*a).to_string())).collect()
+        addresses
+            .iter()
+            .map(|a| ListenEntry::Plain((*a).to_string()))
+            .collect()
     }
 
     #[test]
@@ -3794,8 +3953,8 @@ mod tests {
             ],
             "succResourcAllocReports": [ { "medComponents": {} } ]
         }"#;
-        let out = pcf_notification_body_to_json(body.as_bytes())
-            .expect("well-formed JSON must decode");
+        let out =
+            pcf_notification_body_to_json(body.as_bytes()).expect("well-formed JSON must decode");
         let value: serde_json::Value = serde_json::from_str(&out).unwrap();
 
         // evSubsUri — the correlation key — survives.

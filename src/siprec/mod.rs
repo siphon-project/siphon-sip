@@ -230,24 +230,35 @@ impl RecordingManager {
             request_uri = request_uri.with_port(port);
         }
         if transport != Transport::Udp {
-            request_uri = request_uri.with_param(
-                "transport".to_string(),
-                Some(transport_name.to_string()),
-            );
+            request_uri =
+                request_uri.with_param("transport".to_string(), Some(transport_name.to_string()));
         }
-        let via = format!("SIP/2.0/{} {};branch={}", transport_name, local_addr, branch);
+        let via = format!(
+            "SIP/2.0/{} {};branch={}",
+            transport_name, local_addr, branch
+        );
 
         let message = SipMessageBuilder::new()
             .request(Method::Invite, request_uri)
             .via(via)
-            .from(format!("<sip:recorder@{}>;tag={}", local_addr.ip(), from_tag))
+            .from(format!(
+                "<sip:recorder@{}>;tag={}",
+                local_addr.ip(),
+                from_tag
+            ))
             .to(format!("<{srs_uri}>"))
             .call_id(sip_call_id.clone())
             .cseq(format!("{cseq} INVITE"))
             .header("Contact", format!("<sip:recorder@{local_addr}>"))
-            .header("Content-Type", format!("multipart/mixed;boundary={boundary}"))
+            .header(
+                "Content-Type",
+                format!("multipart/mixed;boundary={boundary}"),
+            )
             .header("Require", "siprec".to_string())
-            .header("User-Agent", user_agent.unwrap_or(&self.default_user_agent).to_string())
+            .header(
+                "User-Agent",
+                user_agent.unwrap_or(&self.default_user_agent).to_string(),
+            )
             .max_forwards(70)
             .body(multipart_body)
             .build();
@@ -313,7 +324,8 @@ impl RecordingManager {
         );
 
         // Build ACK for the 200 OK (same SRS URI parsing as BYE).
-        let srs_host_part = session.srs_uri
+        let srs_host_part = session
+            .srs_uri
             .strip_prefix("sip:")
             .or_else(|| session.srs_uri.strip_prefix("sips:"))
             .unwrap_or(&session.srs_uri);
@@ -363,15 +375,16 @@ impl RecordingManager {
             request_uri = request_uri.with_port(port);
         }
         if ack_transport != Transport::Udp {
-            request_uri = request_uri.with_param(
-                "transport".to_string(),
-                Some(transport_name.to_string()),
-            );
+            request_uri =
+                request_uri.with_param("transport".to_string(), Some(transport_name.to_string()));
         }
 
         // ACK for 2xx is a new transaction — new branch (RFC 3261 §13.2.2.4).
         let branch = format!("z9hG4bK-rec-ack-{}", uuid::Uuid::new_v4());
-        let via = format!("SIP/2.0/{} {};branch={}", transport_name, local_addr, branch);
+        let via = format!(
+            "SIP/2.0/{} {};branch={}",
+            transport_name, local_addr, branch
+        );
 
         let mut to_value = format!("<{}>", session.srs_uri);
         if let Some(ref to_tag) = session.to_tag {
@@ -384,7 +397,11 @@ impl RecordingManager {
         match SipMessageBuilder::new()
             .request(Method::Ack, request_uri)
             .via(via)
-            .from(format!("<sip:recorder@{}>;tag={}", local_addr.ip(), session.from_tag))
+            .from(format!(
+                "<sip:recorder@{}>;tag={}",
+                local_addr.ip(),
+                session.from_tag
+            ))
             .to(to_value)
             .call_id(session.sip_call_id.clone())
             .cseq(format!("{invite_cseq} ACK"))
@@ -432,7 +449,11 @@ impl RecordingManager {
     /// Get the original call's SIP Call-ID and tags (for RTPEngine subscribe/unsubscribe).
     pub fn original_call_info(&self, session_id: &str) -> Option<(String, String, String)> {
         self.sessions.get(session_id).and_then(|session| {
-            match (&session.original_sip_call_id, &session.original_from_tag, &session.original_to_tag) {
+            match (
+                &session.original_sip_call_id,
+                &session.original_from_tag,
+                &session.original_to_tag,
+            ) {
                 (Some(call_id), Some(from_tag), Some(to_tag)) => {
                     Some((call_id.clone(), from_tag.clone(), to_tag.clone()))
                 }
@@ -447,7 +468,8 @@ impl RecordingManager {
             Some(ids) => ids.clone(),
             None => return Vec::new(),
         };
-        session_ids.iter()
+        session_ids
+            .iter()
             .filter_map(|session_id| self.original_call_info(session_id))
             .collect()
     }
@@ -477,7 +499,8 @@ impl RecordingManager {
                 let cseq = session.cseq.fetch_add(1, Ordering::Relaxed);
 
                 // Parse SRS URI — extract host, port, transport (same logic as start_recording).
-                let srs_host_part = session.srs_uri
+                let srs_host_part = session
+                    .srs_uri
                     .strip_prefix("sip:")
                     .or_else(|| session.srs_uri.strip_prefix("sips:"))
                     .unwrap_or(&session.srs_uri);
@@ -527,13 +550,14 @@ impl RecordingManager {
                     request_uri = request_uri.with_port(port);
                 }
                 if bye_transport != Transport::Udp {
-                    request_uri = request_uri.with_param(
-                        "transport".to_string(),
-                        Some(transport_name.to_string()),
-                    );
+                    request_uri = request_uri
+                        .with_param("transport".to_string(), Some(transport_name.to_string()));
                 }
                 let branch = format!("z9hG4bK-rec-bye-{}", uuid::Uuid::new_v4());
-                let via = format!("SIP/2.0/{} {};branch={}", transport_name, local_addr, branch);
+                let via = format!(
+                    "SIP/2.0/{} {};branch={}",
+                    transport_name, local_addr, branch
+                );
 
                 let mut to_value = format!("<{}>", session.srs_uri);
                 if let Some(ref to_tag) = session.to_tag {
@@ -543,7 +567,11 @@ impl RecordingManager {
                 if let Ok(bye) = SipMessageBuilder::new()
                     .request(Method::Bye, request_uri)
                     .via(via)
-                    .from(format!("<sip:recorder@{}>;tag={}", local_addr.ip(), session.from_tag))
+                    .from(format!(
+                        "<sip:recorder@{}>;tag={}",
+                        local_addr.ip(),
+                        session.from_tag
+                    ))
                     .to(to_value)
                     .call_id(session.sip_call_id.clone())
                     .cseq(format!("{cseq} BYE"))
@@ -563,7 +591,8 @@ impl RecordingManager {
         // Clean up
         self.call_sessions.remove(call_id);
         for session_id in &session_ids {
-            self.branch_to_session.retain(|_, value| value != session_id);
+            self.branch_to_session
+                .retain(|_, value| value != session_id);
             self.sessions.remove(session_id);
         }
 
@@ -572,16 +601,23 @@ impl RecordingManager {
 
     /// Look up a recording session by branch (for routing SRS responses).
     pub fn session_for_branch(&self, branch: &str) -> Option<String> {
-        self.branch_to_session.get(branch).map(|value| value.clone())
+        self.branch_to_session
+            .get(branch)
+            .map(|value| value.clone())
     }
 
     /// Check if a call has any active recording sessions.
     pub fn is_recording(&self, call_id: &str) -> bool {
-        self.call_sessions.get(call_id)
+        self.call_sessions
+            .get(call_id)
             .map(|ids| {
                 ids.iter().any(|id| {
-                    self.sessions.get(id)
-                        .map(|session| session.state == RecordingState::Active || session.state == RecordingState::Pending)
+                    self.sessions
+                        .get(id)
+                        .map(|session| {
+                            session.state == RecordingState::Active
+                                || session.state == RecordingState::Pending
+                        })
                         .unwrap_or(false)
                 })
             })
@@ -590,7 +626,8 @@ impl RecordingManager {
 
     /// Number of active recording sessions.
     pub fn active_count(&self) -> usize {
-        self.sessions.iter()
+        self.sessions
+            .iter()
             .filter(|session| session.state == RecordingState::Active)
             .count()
     }
@@ -616,7 +653,8 @@ impl RecordingManager {
             // Drop the primary record.
             self.sessions.remove(session_id);
             // Drop the branch alias(es) pointing at this session.
-            self.branch_to_session.retain(|_, value| value != session_id);
+            self.branch_to_session
+                .retain(|_, value| value != session_id);
             // Drop the session id from its call's list; remove now-empty lists.
             self.call_sessions.retain(|_, ids| {
                 ids.retain(|id| id != session_id);
@@ -626,7 +664,10 @@ impl RecordingManager {
 
         let reaped = stale_ids.len();
         if reaped > 0 {
-            info!(reaped, "SIPREC: orphan backstop swept stale recording sessions");
+            info!(
+                reaped,
+                "SIPREC: orphan backstop swept stale recording sessions"
+            );
         }
         reaped
     }
@@ -907,7 +948,10 @@ fn build_recording_sdp(original_sdp: &[u8], local_addr: SocketAddr) -> Vec<u8> {
             if parts.len() >= 6 {
                 result.push_str(&format!(
                     "{} {} {} IN IP4 {}\r\n",
-                    parts[0], parts[1], parts[2], local_addr.ip()
+                    parts[0],
+                    parts[1],
+                    parts[2],
+                    local_addr.ip()
                 ));
             } else {
                 result.push_str(line);
@@ -1036,21 +1080,27 @@ mod tests {
             "a=sendrecv\r\n",
         );
 
-        let (session_id, _, _, _) = manager.start_recording(
-            "call-1",
-            "sip:srs@10.0.0.5:5060",
-            "sip:alice@example.com",
-            "sip:bob@example.com",
-            sdp.as_bytes(),
-            "10.0.0.1:5060".parse().unwrap(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+        let (session_id, _, _, _) = manager
+            .start_recording(
+                "call-1",
+                "sip:srs@10.0.0.5:5060",
+                "sip:alice@example.com",
+                "sip:bob@example.com",
+                sdp.as_bytes(),
+                "10.0.0.1:5060".parse().unwrap(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
-        let ack_result = manager.handle_success(&session_id, Some("srs-tag-1".to_string()), "10.0.0.1:5060".parse().unwrap());
+        let ack_result = manager.handle_success(
+            &session_id,
+            Some("srs-tag-1".to_string()),
+            "10.0.0.1:5060".parse().unwrap(),
+        );
 
         let session = manager.sessions.get(&session_id).unwrap();
         assert_eq!(session.state, RecordingState::Active);
@@ -1065,7 +1115,10 @@ mod tests {
         let bytes = ack.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
         assert!(raw.starts_with("ACK sip:10.0.0.5:5060 SIP/2.0\r\n"));
-        assert!(raw.contains(";tag=srs-tag-1"), "ACK must include SRS To-tag");
+        assert!(
+            raw.contains(";tag=srs-tag-1"),
+            "ACK must include SRS To-tag"
+        );
         assert!(raw.contains("CSeq: "), "ACK must have CSeq header");
         assert!(raw.contains(" ACK"), "CSeq method must be ACK");
         // ACK CSeq number must match the original INVITE CSeq.
@@ -1086,23 +1139,29 @@ mod tests {
             "a=sendrecv\r\n",
         );
 
-        let (session_id, _, _, _) = manager.start_recording(
-            "call-1",
-            "sip:srs@10.0.0.5:5080;transport=TCP",
-            "sip:alice@example.com",
-            "sip:bob@example.com",
-            sdp.as_bytes(),
-            "10.0.0.1:5060".parse().unwrap(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+        let (session_id, _, _, _) = manager
+            .start_recording(
+                "call-1",
+                "sip:srs@10.0.0.5:5080;transport=TCP",
+                "sip:alice@example.com",
+                "sip:bob@example.com",
+                sdp.as_bytes(),
+                "10.0.0.1:5060".parse().unwrap(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
-        let (ack, destination, transport) = manager.handle_success(
-            &session_id, Some("srs-tag-tcp".to_string()), "10.0.0.1:5060".parse().unwrap(),
-        ).unwrap();
+        let (ack, destination, transport) = manager
+            .handle_success(
+                &session_id,
+                Some("srs-tag-tcp".to_string()),
+                "10.0.0.1:5060".parse().unwrap(),
+            )
+            .unwrap();
 
         assert_eq!(transport, Transport::Tcp);
         assert_eq!(destination, "10.0.0.5:5080".parse::<SocketAddr>().unwrap());
@@ -1126,19 +1185,21 @@ mod tests {
             "a=sendrecv\r\n",
         );
 
-        let (session_id, _, _, _) = manager.start_recording(
-            "call-1",
-            "sip:srs@10.0.0.5:5060",
-            "sip:alice@example.com",
-            "sip:bob@example.com",
-            sdp.as_bytes(),
-            "10.0.0.1:5060".parse().unwrap(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+        let (session_id, _, _, _) = manager
+            .start_recording(
+                "call-1",
+                "sip:srs@10.0.0.5:5060",
+                "sip:alice@example.com",
+                "sip:bob@example.com",
+                sdp.as_bytes(),
+                "10.0.0.1:5060".parse().unwrap(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
         manager.handle_failure(&session_id, 503);
 
@@ -1159,21 +1220,27 @@ mod tests {
             "a=sendrecv\r\n",
         );
 
-        let (session_id, _, _, _) = manager.start_recording(
-            "call-1",
-            "sip:srs@10.0.0.5:5060",
-            "sip:alice@example.com",
-            "sip:bob@example.com",
-            sdp.as_bytes(),
-            "10.0.0.1:5060".parse().unwrap(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+        let (session_id, _, _, _) = manager
+            .start_recording(
+                "call-1",
+                "sip:srs@10.0.0.5:5060",
+                "sip:alice@example.com",
+                "sip:bob@example.com",
+                sdp.as_bytes(),
+                "10.0.0.1:5060".parse().unwrap(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
-        manager.handle_success(&session_id, Some("srs-tag-1".to_string()), "10.0.0.1:5060".parse().unwrap());
+        manager.handle_success(
+            &session_id,
+            Some("srs-tag-1".to_string()),
+            "10.0.0.1:5060".parse().unwrap(),
+        );
         assert_eq!(manager.active_count(), 1);
 
         let bye_messages = manager.stop_recording("call-1", "10.0.0.1:5060".parse().unwrap());
@@ -1210,27 +1277,36 @@ mod tests {
             "a=sendrecv\r\n",
         );
 
-        let (session_id, message, _, _) = manager.start_recording(
-            "call-1",
-            "sip:srs@10.0.0.5:5060",
-            "sip:alice@example.com",
-            "sip:bob@example.com",
-            sdp.as_bytes(),
-            "10.0.0.1:5060".parse().unwrap(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+        let (session_id, message, _, _) = manager
+            .start_recording(
+                "call-1",
+                "sip:srs@10.0.0.5:5060",
+                "sip:alice@example.com",
+                "sip:bob@example.com",
+                sdp.as_bytes(),
+                "10.0.0.1:5060".parse().unwrap(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
         // Extract branch from the message
         let bytes = message.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
-        let branch = raw.lines()
+        let branch = raw
+            .lines()
             .find(|line| line.starts_with("Via:"))
             .and_then(|line| line.split("branch=").nth(1))
-            .map(|branch_value| branch_value.split(';').next().unwrap_or(branch_value).trim())
+            .map(|branch_value| {
+                branch_value
+                    .split(';')
+                    .next()
+                    .unwrap_or(branch_value)
+                    .trim()
+            })
             .unwrap();
 
         assert_eq!(manager.session_for_branch(branch), Some(session_id));
@@ -1284,17 +1360,16 @@ mod tests {
         );
         let result = fix_recording_sdp_direction(sdp.as_bytes());
         let result_str = String::from_utf8_lossy(&result);
-        assert!(result_str.contains("a=sendonly"), "recvonly must be rewritten to sendonly");
+        assert!(
+            result_str.contains("a=sendonly"),
+            "recvonly must be rewritten to sendonly"
+        );
         assert!(!result_str.contains("a=recvonly"));
     }
 
     #[test]
     fn fix_recording_sdp_direction_preserves_sendonly() {
-        let sdp = concat!(
-            "v=0\r\n",
-            "m=audio 10000 RTP/AVP 0\r\n",
-            "a=sendonly\r\n",
-        );
+        let sdp = concat!("v=0\r\n", "m=audio 10000 RTP/AVP 0\r\n", "a=sendonly\r\n",);
         let result = fix_recording_sdp_direction(sdp.as_bytes());
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("a=sendonly"));
@@ -1477,40 +1552,52 @@ mod tests {
             "a=sendrecv\r\n",
         );
 
-        let (session_id_1, _, _, _) = manager.start_recording(
-            "call-1",
-            "sip:srs1@10.0.0.5:5060",
-            "sip:alice@example.com",
-            "sip:bob@example.com",
-            sdp.as_bytes(),
-            "10.0.0.1:5060".parse().unwrap(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+        let (session_id_1, _, _, _) = manager
+            .start_recording(
+                "call-1",
+                "sip:srs1@10.0.0.5:5060",
+                "sip:alice@example.com",
+                "sip:bob@example.com",
+                sdp.as_bytes(),
+                "10.0.0.1:5060".parse().unwrap(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
-        let (session_id_2, _, _, _) = manager.start_recording(
-            "call-1",
-            "sip:srs2@10.0.0.6:5060",
-            "sip:alice@example.com",
-            "sip:bob@example.com",
-            sdp.as_bytes(),
-            "10.0.0.1:5060".parse().unwrap(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+        let (session_id_2, _, _, _) = manager
+            .start_recording(
+                "call-1",
+                "sip:srs2@10.0.0.6:5060",
+                "sip:alice@example.com",
+                "sip:bob@example.com",
+                sdp.as_bytes(),
+                "10.0.0.1:5060".parse().unwrap(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
         assert_ne!(session_id_1, session_id_2);
         assert!(manager.is_recording("call-1"));
 
         // Activate both
-        manager.handle_success(&session_id_1, Some("tag-1".to_string()), "10.0.0.1:5060".parse().unwrap());
-        manager.handle_success(&session_id_2, Some("tag-2".to_string()), "10.0.0.1:5060".parse().unwrap());
+        manager.handle_success(
+            &session_id_1,
+            Some("tag-1".to_string()),
+            "10.0.0.1:5060".parse().unwrap(),
+        );
+        manager.handle_success(
+            &session_id_2,
+            Some("tag-2".to_string()),
+            "10.0.0.1:5060".parse().unwrap(),
+        );
         assert_eq!(manager.active_count(), 2);
 
         // Stop all recordings for the call
@@ -1532,19 +1619,21 @@ mod tests {
             "a=sendrecv\r\n",
         );
 
-        let (_, message, destination, transport) = manager.start_recording(
-            "call-1",
-            "sip:10.0.0.5:5080;transport=TCP",
-            "sip:alice@example.com",
-            "sip:bob@example.com",
-            sdp.as_bytes(),
-            "10.0.0.1:5060".parse().unwrap(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+        let (_, message, destination, transport) = manager
+            .start_recording(
+                "call-1",
+                "sip:10.0.0.5:5080;transport=TCP",
+                "sip:alice@example.com",
+                "sip:bob@example.com",
+                sdp.as_bytes(),
+                "10.0.0.1:5060".parse().unwrap(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
         // Transport should be TCP, not UDP.
         assert_eq!(transport, Transport::Tcp);
@@ -1573,19 +1662,21 @@ mod tests {
             "a=sendrecv\r\n",
         );
 
-        let (_, message, destination, transport) = manager.start_recording(
-            "call-1",
-            "sip:srs@10.0.0.5:5060",
-            "sip:alice@example.com",
-            "sip:bob@example.com",
-            sdp.as_bytes(),
-            "10.0.0.1:5060".parse().unwrap(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+        let (_, message, destination, transport) = manager
+            .start_recording(
+                "call-1",
+                "sip:srs@10.0.0.5:5060",
+                "sip:alice@example.com",
+                "sip:bob@example.com",
+                sdp.as_bytes(),
+                "10.0.0.1:5060".parse().unwrap(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
         // Default transport should be UDP.
         assert_eq!(transport, Transport::Udp);
@@ -1611,19 +1702,21 @@ mod tests {
             "a=sendrecv\r\n",
         );
 
-        let (_, _, destination, _) = manager.start_recording(
-            "call-1",
-            "sip:10.0.0.5",
-            "sip:alice@example.com",
-            "sip:bob@example.com",
-            sdp.as_bytes(),
-            "10.0.0.1:5060".parse().unwrap(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+        let (_, _, destination, _) = manager
+            .start_recording(
+                "call-1",
+                "sip:10.0.0.5",
+                "sip:alice@example.com",
+                "sip:bob@example.com",
+                sdp.as_bytes(),
+                "10.0.0.1:5060".parse().unwrap(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
         // Should default to port 5060.
         assert_eq!(destination, "10.0.0.5:5060".parse::<SocketAddr>().unwrap());
@@ -1642,21 +1735,27 @@ mod tests {
             "a=sendrecv\r\n",
         );
 
-        let (session_id, _, _, _) = manager.start_recording(
-            "call-1",
-            "sip:10.0.0.5:5080;transport=TCP",
-            "sip:alice@example.com",
-            "sip:bob@example.com",
-            sdp.as_bytes(),
-            "10.0.0.1:5060".parse().unwrap(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+        let (session_id, _, _, _) = manager
+            .start_recording(
+                "call-1",
+                "sip:10.0.0.5:5080;transport=TCP",
+                "sip:alice@example.com",
+                "sip:bob@example.com",
+                sdp.as_bytes(),
+                "10.0.0.1:5060".parse().unwrap(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
-        manager.handle_success(&session_id, Some("srs-tag-1".to_string()), "10.0.0.1:5060".parse().unwrap());
+        manager.handle_success(
+            &session_id,
+            Some("srs-tag-1".to_string()),
+            "10.0.0.1:5060".parse().unwrap(),
+        );
 
         let bye_messages = manager.stop_recording("call-1", "10.0.0.1:5060".parse().unwrap());
         assert_eq!(bye_messages.len(), 1);
@@ -1683,19 +1782,21 @@ mod tests {
             "a=sendrecv\r\n",
         );
 
-        let (_, message, _, _) = manager.start_recording(
-            "call-1",
-            "sip:srs@10.0.0.5:5060",
-            "sip:alice@example.com",
-            "sip:bob@example.com",
-            sdp.as_bytes(),
-            "10.0.0.1:5060".parse().unwrap(),
-            None,
-            None,
-            None,
-            None,
-            Some("SIPhon/0.1.3"),
-        ).unwrap();
+        let (_, message, _, _) = manager
+            .start_recording(
+                "call-1",
+                "sip:srs@10.0.0.5:5060",
+                "sip:alice@example.com",
+                "sip:bob@example.com",
+                sdp.as_bytes(),
+                "10.0.0.1:5060".parse().unwrap(),
+                None,
+                None,
+                None,
+                None,
+                Some("SIPhon/0.1.3"),
+            )
+            .unwrap();
 
         let bytes = message.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
@@ -1858,26 +1959,29 @@ mod tests {
             "a=label:1\r\n",
         );
 
-        let (_session_id, message, _destination, _transport) = manager.start_recording(
-            "call-dual",
-            "sip:srs@10.0.0.5:5060",
-            "sip:alice@example.com",
-            "sip:bob@example.com",
-            fallback_sdp.as_bytes(),
-            "10.0.0.1:5060".parse().unwrap(),
-            Some(caller_sdp.as_bytes()),
-            Some(callee_sdp.as_bytes()),
-            Some("original-call-id"),
-            Some(("", "subscriber-to-tag")),
-            None,
-        ).unwrap();
+        let (_session_id, message, _destination, _transport) = manager
+            .start_recording(
+                "call-dual",
+                "sip:srs@10.0.0.5:5060",
+                "sip:alice@example.com",
+                "sip:bob@example.com",
+                fallback_sdp.as_bytes(),
+                "10.0.0.1:5060".parse().unwrap(),
+                Some(caller_sdp.as_bytes()),
+                Some(callee_sdp.as_bytes()),
+                Some("original-call-id"),
+                Some(("", "subscriber-to-tag")),
+                None,
+            )
+            .unwrap();
 
         let bytes = message.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
 
         // The INVITE body must contain 2 m= lines (both monologues).
         assert_eq!(
-            raw.matches("m=audio").count(), 2,
+            raw.matches("m=audio").count(),
+            2,
             "SIPREC INVITE must have 2 m=audio lines for both monologues"
         );
         // Both should be sendonly (SRC → SRS direction).
@@ -1918,26 +2022,29 @@ mod tests {
             "a=recvonly\r\n",
         );
 
-        let (_session_id, message, _destination, _transport) = manager.start_recording(
-            "call-single",
-            "sip:srs@10.0.0.5:5060",
-            "sip:alice@example.com",
-            "sip:bob@example.com",
-            fallback_sdp.as_bytes(),
-            "10.0.0.1:5060".parse().unwrap(),
-            Some(caller_sdp.as_bytes()),
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+        let (_session_id, message, _destination, _transport) = manager
+            .start_recording(
+                "call-single",
+                "sip:srs@10.0.0.5:5060",
+                "sip:alice@example.com",
+                "sip:bob@example.com",
+                fallback_sdp.as_bytes(),
+                "10.0.0.1:5060".parse().unwrap(),
+                Some(caller_sdp.as_bytes()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
         let bytes = message.to_bytes();
         let raw = String::from_utf8_lossy(&bytes);
 
         // Single m= line fallback.
         assert_eq!(
-            raw.matches("m=audio").count(), 1,
+            raw.matches("m=audio").count(),
+            1,
             "single-direction fallback should have 1 m=audio line"
         );
         // Direction flipped to sendonly.
@@ -1959,34 +2066,38 @@ mod tests {
         );
 
         // One session that we'll age into staleness.
-        let (old_id, old_message, _, _) = manager.start_recording(
-            "old-call",
-            "sip:srs@10.0.0.5:5060",
-            "sip:alice@example.com",
-            "sip:bob@example.com",
-            sdp.as_bytes(),
-            "10.0.0.1:5060".parse().unwrap(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+        let (old_id, old_message, _, _) = manager
+            .start_recording(
+                "old-call",
+                "sip:srs@10.0.0.5:5060",
+                "sip:alice@example.com",
+                "sip:bob@example.com",
+                sdp.as_bytes(),
+                "10.0.0.1:5060".parse().unwrap(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
         // One fresh session that must survive the sweep.
-        let (fresh_id, _, _, _) = manager.start_recording(
-            "fresh-call",
-            "sip:srs@10.0.0.5:5060",
-            "sip:alice@example.com",
-            "sip:bob@example.com",
-            sdp.as_bytes(),
-            "10.0.0.1:5060".parse().unwrap(),
-            None,
-            None,
-            None,
-            None,
-            None,
-        ).unwrap();
+        let (fresh_id, _, _, _) = manager
+            .start_recording(
+                "fresh-call",
+                "sip:srs@10.0.0.5:5060",
+                "sip:alice@example.com",
+                "sip:bob@example.com",
+                sdp.as_bytes(),
+                "10.0.0.1:5060".parse().unwrap(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
         // Capture the old session's branch so we can assert its alias is cleared.
         let old_raw = String::from_utf8_lossy(&old_message.to_bytes()).into_owned();
@@ -1998,11 +2109,8 @@ mod tests {
             .unwrap();
 
         // Force the old session to look 48 h old.
-        manager
-            .sessions
-            .get_mut(&old_id)
-            .unwrap()
-            .created_at -= std::time::Duration::from_secs(48 * 3600);
+        manager.sessions.get_mut(&old_id).unwrap().created_at -=
+            std::time::Duration::from_secs(48 * 3600);
 
         let reaped = manager.sweep_stale(std::time::Duration::from_secs(24 * 3600));
         assert_eq!(reaped, 1, "exactly the aged session should be reaped");

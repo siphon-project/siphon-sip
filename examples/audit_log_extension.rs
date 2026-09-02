@@ -16,8 +16,8 @@
 //! Run with:
 //!   cargo run --example audit_log_extension
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::PyDict;

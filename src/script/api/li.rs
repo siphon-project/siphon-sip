@@ -152,7 +152,10 @@ impl PyLiNamespace {
             return Ok(true);
         }
 
-        if let Ok(request) = target.cast::<super::request::PyRequest>().map(|r| r.borrow()) {
+        if let Ok(request) = target
+            .cast::<super::request::PyRequest>()
+            .map(|r| r.borrow())
+        {
             let call_id = request.li_call_id();
             self.manager.audit(
                 AuditOperation::MediaCaptureStarted,
@@ -181,7 +184,10 @@ impl PyLiNamespace {
 
         let call_id = if let Ok(call) = target.cast::<super::call::PyCall>().map(|c| c.borrow()) {
             call.li_call_id()
-        } else if let Ok(request) = target.cast::<super::request::PyRequest>().map(|r| r.borrow()) {
+        } else if let Ok(request) = target
+            .cast::<super::request::PyRequest>()
+            .map(|r| r.borrow())
+        {
             request.li_call_id()
         } else {
             return Err(pyo3::exceptions::PyTypeError::new_err(

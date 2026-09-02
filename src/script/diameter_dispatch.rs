@@ -34,7 +34,9 @@ use crate::diameter::server::{CerDecision, ServerHandshake, ServerIdentity};
 use crate::diameter::transport::DiameterListener;
 use crate::diameter::{forward, DiameterClient, DiameterManager};
 use crate::script::api::diameter_server::{PyDiameterAnswer, PyDiameterRequest, PyInboundPeer};
-use crate::script::engine::{run_coroutine_value, HandlerEntry, HandlerKind, ScriptEngine, ScriptState};
+use crate::script::engine::{
+    run_coroutine_value, HandlerEntry, HandlerKind, ScriptEngine, ScriptState,
+};
 
 /// Global cap on concurrently in-flight inbound requests being relayed.
 const MAX_INFLIGHT: usize = 512;
@@ -182,12 +184,21 @@ fn warn_if_sctp_without_feature(config: &DiameterConfig) {
     let is_sctp = |transport: &str| transport.eq_ignore_ascii_case("sctp");
     let mut surfaces: Vec<String> = Vec::new();
 
-    if config.listen.as_ref().and_then(|listen| listen.sctp.as_ref()).is_some() {
+    if config
+        .listen
+        .as_ref()
+        .and_then(|listen| listen.sctp.as_ref())
+        .is_some()
+    {
         surfaces.push("diameter.listen.sctp".to_string());
     }
     let default_is_sctp = is_sctp(&config.transport);
     for peer in &config.peers {
-        let uses_sctp = peer.transport.as_deref().map(is_sctp).unwrap_or(default_is_sctp);
+        let uses_sctp = peer
+            .transport
+            .as_deref()
+            .map(is_sctp)
+            .unwrap_or(default_is_sctp);
         if uses_sctp {
             surfaces.push(format!("diameter.peers[{}]", peer.name));
         }
@@ -205,7 +216,10 @@ fn warn_if_sctp_without_feature(config: &DiameterConfig) {
     for (tenant_name, tenant) in &config.tenants {
         for server in &tenant.servers {
             if is_sctp(&server.transport) {
-                surfaces.push(format!("diameter.tenants.{tenant_name}.servers[{}]", server.name));
+                surfaces.push(format!(
+                    "diameter.tenants.{tenant_name}.servers[{}]",
+                    server.name
+                ));
             }
         }
         for entry in &tenant.connect_to {
@@ -438,19 +452,23 @@ async fn serve_connection(
     let resolver_engine = Arc::clone(&engine);
     let resolver_identities = Arc::clone(&identities);
     let resolve = move |acl_match: &AclMatch, asserted: &str| -> CerDecision {
-        resolve_cer_identity(&resolver_engine, &resolver_identities, acl_match, asserted, peer_addr)
+        resolve_cer_identity(
+            &resolver_engine,
+            &resolver_identities,
+            acl_match,
+            asserted,
+            peer_addr,
+        )
     };
 
-    let (admitted_peer, acl_match) = match handshake
-        .run(stream, peer_addr, incoming_tx, resolve)
-        .await
-    {
-        Ok(result) => result,
-        Err(error) => {
-            warn!(%peer_addr, %transport, %error, "Diameter server: handshake rejected");
-            return;
-        }
-    };
+    let (admitted_peer, acl_match) =
+        match handshake.run(stream, peer_addr, incoming_tx, resolve).await {
+            Ok(result) => result,
+            Err(error) => {
+                warn!(%peer_addr, %transport, %error, "Diameter server: handshake rejected");
+                return;
+            }
+        };
 
     let local_origin_host = admitted_peer.config().origin_host.clone();
     let local_origin_realm = admitted_peer.config().origin_realm.clone();
@@ -686,7 +704,8 @@ fn build_answer_via_handler(
     // Route to the most specific @diameter.on_request handler for this
     // request's (application_id, command_code) — matched by code so the
     // vocabulary stays consistent with decoration-time validation.
-    let selected = select_request_handler(&state, request_msg.application_id, request_msg.command_code);
+    let selected =
+        select_request_handler(&state, request_msg.application_id, request_msg.command_code);
     let no_route_answer = || {
         forward::build_answer(
             &request_msg,
@@ -726,7 +745,10 @@ fn build_answer_via_handler(
         }
     };
 
-    let result = handler.callable.bind(python).call1((request_py.bind(python),));
+    let result = handler
+        .callable
+        .bind(python)
+        .call1((request_py.bind(python),));
     let resolved = match result {
         Ok(value) => {
             if handler.is_async {
@@ -919,10 +941,16 @@ mod filter_tests {
         assert_eq!(request_filter_score(Some("ULR"), s6a, air), None);
         // App-qualified → 2, and only for the right app.
         assert_eq!(request_filter_score(Some("S6a:ULR"), s6a, ulr), Some(2));
-        assert_eq!(request_filter_score(Some("S6a:ULR"), dictionary::CX_APP_ID, ulr), None);
+        assert_eq!(
+            request_filter_score(Some("S6a:ULR"), dictionary::CX_APP_ID, ulr),
+            None
+        );
         // Pipe sets + case/whitespace tolerance.
         assert_eq!(request_filter_score(Some("ULR|AIR"), s6a, air), Some(1));
-        assert_eq!(request_filter_score(Some(" s6a : ulr | air "), s6a, air), Some(2));
+        assert_eq!(
+            request_filter_score(Some(" s6a : ulr | air "), s6a, air),
+            Some(2)
+        );
     }
 
     #[test]
@@ -932,10 +960,18 @@ mod filter_tests {
         let s6a = dictionary::S6A_APP_ID;
         let ulr = dictionary::CMD_UPDATE_LOCATION;
         for filter in ["S6A:ULR", "S6a:ulr", "s6a:ULR", "s6a:ulr", "S6A:UlR"] {
-            assert_eq!(request_filter_score(Some(filter), s6a, ulr), Some(2), "{filter}");
+            assert_eq!(
+                request_filter_score(Some(filter), s6a, ulr),
+                Some(2),
+                "{filter}"
+            );
         }
         for filter in ["ULR", "ulr", "Ulr"] {
-            assert_eq!(request_filter_score(Some(filter), s6a, ulr), Some(1), "{filter}");
+            assert_eq!(
+                request_filter_score(Some(filter), s6a, ulr),
+                Some(1),
+                "{filter}"
+            );
         }
     }
 
@@ -948,7 +984,10 @@ mod filter_tests {
         let s6a_pur = dictionary::CMD_PURGE_UE;
         assert_eq!(request_filter_score(Some("Sh:PUR"), sh, sh_pur), Some(2));
         assert_eq!(request_filter_score(Some("Sh:PUR"), s6a, s6a_pur), None);
-        assert_eq!(request_filter_score(Some("S6a:purge-ue"), s6a, s6a_pur), Some(2));
+        assert_eq!(
+            request_filter_score(Some("S6a:purge-ue"), s6a, s6a_pur),
+            Some(2)
+        );
         assert_eq!(request_filter_score(Some("S6a:purge-ue"), sh, sh_pur), None);
     }
 }

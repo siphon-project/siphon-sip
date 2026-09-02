@@ -87,7 +87,9 @@ impl MinSe {
 
 /// Extract `Session-Expires` from SIP headers.
 pub fn parse_session_expires(headers: &super::SipHeaders) -> Option<SessionExpires> {
-    headers.get("Session-Expires").and_then(|v| SessionExpires::parse(v))
+    headers
+        .get("Session-Expires")
+        .and_then(|v| SessionExpires::parse(v))
 }
 
 /// Extract `Min-SE` from SIP headers.

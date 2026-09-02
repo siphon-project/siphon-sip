@@ -191,10 +191,10 @@ fn encode_xfrm_selector(
     out.extend_from_slice(&u16::MAX.to_be_bytes()); // sport_mask = 0xFFFF
     out.extend_from_slice(&family_for(source).to_ne_bytes());
     out.push(host_prefix_len(destination)); // prefixlen_d
-    out.push(host_prefix_len(source));      // prefixlen_s
-    out.push(proto);                         // selector proto (UDP/TCP)
-    // C struct pads 3 bytes here so `ifindex` (i32) lands on a 4-byte
-    // boundary — total selector size 56 bytes.
+    out.push(host_prefix_len(source)); // prefixlen_s
+    out.push(proto); // selector proto (UDP/TCP)
+                     // C struct pads 3 bytes here so `ifindex` (i32) lands on a 4-byte
+                     // boundary — total selector size 56 bytes.
     out.push(0);
     out.push(0);
     out.push(0);
@@ -209,7 +209,7 @@ fn encode_xfrm_lifetime_cfg(hard_lifetime_secs: Option<u64>, out: &mut Vec<u8>) 
     let inf = u64::MAX;
     let zero = 0u64;
     let hard_add = hard_lifetime_secs.unwrap_or(0); // 0 = no expiry
-    // soft_byte_limit, hard_byte_limit
+                                                    // soft_byte_limit, hard_byte_limit
     out.extend_from_slice(&inf.to_ne_bytes());
     out.extend_from_slice(&inf.to_ne_bytes());
     // soft_packet_limit, hard_packet_limit
@@ -260,7 +260,14 @@ fn encode_xfrm_usersa_info(
     hard_lifetime_secs: Option<u64>,
     out: &mut Vec<u8>,
 ) {
-    encode_xfrm_selector(source, source_port, destination, destination_port, selector_proto, out);
+    encode_xfrm_selector(
+        source,
+        source_port,
+        destination,
+        destination_port,
+        selector_proto,
+        out,
+    );
     encode_xfrm_id(destination, spi, IPPROTO_ESP, out);
     let mut saddr = [0u8; 16];
     encode_xfrm_address(source, &mut saddr);
@@ -275,15 +282,15 @@ fn encode_xfrm_usersa_info(
     out.push(XFRM_MODE_TRANSPORT);
     out.push(0); // replay_window
     out.push(0); // flags
-    // The C struct embeds `xfrm_lifetime_cfg` whose `__u64` fields force
-    // 8-byte struct alignment.  sizeof(struct xfrm_usersa_info) on
-    // x86_64 is therefore 224, not 220 — content spans 217 bytes
-    // (selector 56 + id 24 + saddr 16 + lft 64 + curlft 32 + stats 12 +
-    // seq 4 + reqid 4 + family 2 + mode 1 + replay 1 + flags 1) and the
-    // struct pads 7 bytes to round to 224.  The kernel rejects with
-    // EINVAL when the netlink body is shorter than its expected
-    // `min_len = sizeof(...)`, so emitting 220 (4-byte-aligned) is not
-    // enough.
+                 // The C struct embeds `xfrm_lifetime_cfg` whose `__u64` fields force
+                 // 8-byte struct alignment.  sizeof(struct xfrm_usersa_info) on
+                 // x86_64 is therefore 224, not 220 — content spans 217 bytes
+                 // (selector 56 + id 24 + saddr 16 + lft 64 + curlft 32 + stats 12 +
+                 // seq 4 + reqid 4 + family 2 + mode 1 + replay 1 + flags 1) and the
+                 // struct pads 7 bytes to round to 224.  The kernel rejects with
+                 // EINVAL when the netlink body is shorter than its expected
+                 // `min_len = sizeof(...)`, so emitting 220 (4-byte-aligned) is not
+                 // enough.
     for _ in 0..7 {
         out.push(0);
     }
@@ -303,7 +310,14 @@ fn encode_xfrm_userpolicy_info(
     hard_lifetime_secs: Option<u64>,
     out: &mut Vec<u8>,
 ) {
-    encode_xfrm_selector(source, source_port, destination, destination_port, selector_proto, out);
+    encode_xfrm_selector(
+        source,
+        source_port,
+        destination,
+        destination_port,
+        selector_proto,
+        out,
+    );
     encode_xfrm_lifetime_cfg(hard_lifetime_secs, out);
     encode_xfrm_lifetime_cur(out);
     out.extend_from_slice(&0u32.to_ne_bytes()); // priority
@@ -322,12 +336,7 @@ fn encode_xfrm_userpolicy_info(
 }
 
 /// Encode `struct xfrm_user_tmpl`.
-fn encode_xfrm_user_tmpl(
-    source: &IpAddr,
-    destination: &IpAddr,
-    spi: u32,
-    out: &mut Vec<u8>,
-) {
+fn encode_xfrm_user_tmpl(source: &IpAddr, destination: &IpAddr, spi: u32, out: &mut Vec<u8>) {
     encode_xfrm_id(destination, spi, IPPROTO_ESP, out);
     out.extend_from_slice(&family_for(source).to_ne_bytes());
     // C struct pads 2 bytes after `family` (u16 at offset 24) to keep
@@ -343,7 +352,7 @@ fn encode_xfrm_user_tmpl(
     out.push(XFRM_SHARE_ANY); // share
     out.push(0); // optional
     out.push(0); // pad to 4-byte align aalgos
-    // aalgos, ealgos, calgos — ~0 means accept any.
+                 // aalgos, ealgos, calgos — ~0 means accept any.
     out.extend_from_slice(&u32::MAX.to_ne_bytes());
     out.extend_from_slice(&u32::MAX.to_ne_bytes());
     out.extend_from_slice(&u32::MAX.to_ne_bytes());
@@ -371,7 +380,14 @@ fn encode_xfrm_userpolicy_id(
     selector_proto: u8,
     out: &mut Vec<u8>,
 ) {
-    encode_xfrm_selector(source, source_port, destination, destination_port, selector_proto, out);
+    encode_xfrm_selector(
+        source,
+        source_port,
+        destination,
+        destination_port,
+        selector_proto,
+        out,
+    );
     out.extend_from_slice(&0u32.to_ne_bytes()); // index
     out.push(direction);
     // pad to 4
@@ -937,7 +953,10 @@ mod tests {
         assert_eq!(out.len(), 56);
         // Check ports are big-endian.
         // sel.daddr (16) + sel.saddr (16) → port fields start at offset 32.
-        assert_eq!(&out[32..34], &[5066u16.to_be_bytes()[0], 5066u16.to_be_bytes()[1]]);
+        assert_eq!(
+            &out[32..34],
+            &[5066u16.to_be_bytes()[0], 5066u16.to_be_bytes()[1]]
+        );
     }
 
     #[test]
@@ -1034,8 +1053,7 @@ mod tests {
             Some(3600),
             &mut with_lifetime,
         );
-        let hard_add =
-            u64::from_ne_bytes(with_lifetime[96..104].try_into().unwrap());
+        let hard_add = u64::from_ne_bytes(with_lifetime[96..104].try_into().unwrap());
         assert_eq!(hard_add, 3600);
 
         // None must keep the legacy "no expiry" (0) encoding so
@@ -1051,8 +1069,7 @@ mod tests {
             None,
             &mut no_lifetime,
         );
-        let hard_add_none =
-            u64::from_ne_bytes(no_lifetime[96..104].try_into().unwrap());
+        let hard_add_none = u64::from_ne_bytes(no_lifetime[96..104].try_into().unwrap());
         assert_eq!(hard_add_none, 0);
     }
 
@@ -1333,7 +1350,10 @@ mod tests {
 
         let (parsed_spi, last_active) = parse_sa_use_time(&info).expect("should parse");
         assert_eq!(parsed_spi, spi);
-        assert_eq!(last_active, use_time, "use_time > add_time → last_active = use_time");
+        assert_eq!(
+            last_active, use_time,
+            "use_time > add_time → last_active = use_time"
+        );
     }
 
     #[test]
@@ -1347,7 +1367,10 @@ mod tests {
         // use_time stays 0 — SA installed but no packet seen yet.
         let (parsed_spi, last_active) = parse_sa_use_time(&info).expect("should parse");
         assert_eq!(parsed_spi, spi);
-        assert_eq!(last_active, add_time, "use_time == 0 → fall back to add_time");
+        assert_eq!(
+            last_active, add_time,
+            "use_time == 0 → fall back to add_time"
+        );
     }
 
     #[test]

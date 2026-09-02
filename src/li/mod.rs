@@ -652,7 +652,6 @@ impl LiManager {
     pub fn x3_attachment_count(&self) -> usize {
         self.x3_attachments.len()
     }
-
 }
 
 impl std::fmt::Debug for LiManager {
@@ -669,11 +668,11 @@ impl std::fmt::Debug for LiManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
     use x1::message::{DestinationDetails, MediationDetails, TaskDetails};
     use x1::types::{
         DId, DeliveryAddress, IpAddressPort, Liid, MediationDeliveryType, Port, TargetIdentifier,
     };
-    use std::net::Ipv4Addr;
 
     fn test_config() -> LawfulInterceptConfig {
         LawfulInterceptConfig {

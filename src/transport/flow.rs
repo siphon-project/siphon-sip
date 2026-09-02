@@ -73,7 +73,9 @@ impl FlowToken {
     /// the user part.
     pub fn from_route_uri(uri: &str) -> Option<Self> {
         // Strip sip: prefix
-        let rest = uri.strip_prefix("sip:").or_else(|| uri.strip_prefix("sips:"))?;
+        let rest = uri
+            .strip_prefix("sip:")
+            .or_else(|| uri.strip_prefix("sips:"))?;
         // Get user part (before @)
         let user = rest.split('@').next()?;
         Self::decode(user)

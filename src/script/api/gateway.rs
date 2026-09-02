@@ -539,5 +539,4 @@ mod tests {
         let py = PyDestination::from_destination(&dest);
         assert_eq!(py.uri, "sip:gw.example.com;transport=tcp");
     }
-
 }

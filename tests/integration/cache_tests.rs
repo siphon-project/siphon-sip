@@ -27,10 +27,7 @@ async fn fetch_miss_then_store_then_hit() {
     assert!(manager.store("cnam", "msisdn:1234", "Alice", None).await);
 
     // Hit
-    assert_eq!(
-        manager.fetch("cnam", "msisdn:1234").await.unwrap(),
-        "Alice"
-    );
+    assert_eq!(manager.fetch("cnam", "msisdn:1234").await.unwrap(), "Alice");
 }
 
 #[tokio::test]
@@ -91,10 +88,16 @@ async fn overwrite_existing_key() {
     let manager = CacheManager::new(&[make_config("overwrite", 60, 100)]);
 
     manager.store("overwrite", "key", "old_value", None).await;
-    assert_eq!(manager.fetch("overwrite", "key").await.unwrap(), "old_value");
+    assert_eq!(
+        manager.fetch("overwrite", "key").await.unwrap(),
+        "old_value"
+    );
 
     manager.store("overwrite", "key", "new_value", None).await;
-    assert_eq!(manager.fetch("overwrite", "key").await.unwrap(), "new_value");
+    assert_eq!(
+        manager.fetch("overwrite", "key").await.unwrap(),
+        "new_value"
+    );
 }
 
 #[tokio::test]

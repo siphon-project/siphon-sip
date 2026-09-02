@@ -1,5 +1,5 @@
-use crate::sip::uri::SipUri;
 use crate::sip::headers::SipHeaders;
+use crate::sip::uri::SipUri;
 
 /// SIP Method as defined in RFC 3261
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -19,7 +19,7 @@ pub enum Method {
     Notify,
     Refer,
     Message,
-    Publish,   // RFC 3903
+    Publish, // RFC 3903
     // Custom/unknown
     Extension(String),
 }
@@ -161,6 +161,3 @@ impl SipMessage {
         }
     }
 }
-
-
-

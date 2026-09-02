@@ -186,7 +186,9 @@ impl WatcherInfoStore {
 
     /// Get a snapshot of the watcher info for `resource`.
     pub fn get_info(&self, resource: &str) -> Option<WatcherInfo> {
-        self.entries.get(resource).map(|reference| reference.clone())
+        self.entries
+            .get(resource)
+            .map(|reference| reference.clone())
     }
 
     /// Return the number of watchers for `resource` (0 if not found).

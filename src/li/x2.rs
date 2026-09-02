@@ -203,13 +203,15 @@ pub async fn delivery_task(mut receiver: mpsc::Receiver<IriEvent>, config: Arc<L
 
         for address in addresses {
             let server_name = tls_server_name(config.tls.as_ref(), &address);
-            let delivery = deliveries.entry(address.clone()).or_insert_with(|| Delivery {
-                address: address.clone(),
-                connector: connector.clone(),
-                server_name,
-                connection: None,
-                sequence: 0,
-            });
+            let delivery = deliveries
+                .entry(address.clone())
+                .or_insert_with(|| Delivery {
+                    address: address.clone(),
+                    connector: connector.clone(),
+                    server_name,
+                    connection: None,
+                    sequence: 0,
+                });
 
             if delivery.connection.is_none()
                 && !delivery.connect_with_retries(reconnect_interval).await
@@ -390,8 +392,8 @@ fn build_tls_connector(tls: Option<&LiTlsConfig>) -> Result<TlsConnector, String
     // at the peer with far less to go on than this.
     let config = match (tls.certificate.as_ref(), tls.private_key.as_ref()) {
         (Some(certificate_path), Some(key_path)) => {
-            let certificate_pem =
-                std::fs::read(certificate_path).map_err(|error| format!("{certificate_path}: {error}"))?;
+            let certificate_pem = std::fs::read(certificate_path)
+                .map_err(|error| format!("{certificate_path}: {error}"))?;
             let mut cursor = std::io::Cursor::new(certificate_pem);
             let chain: Vec<_> = rustls_pki_types::CertificateDer::pem_reader_iter(&mut cursor)
                 .collect::<Result<Vec<_>, _>>()
@@ -623,14 +625,10 @@ mod tests {
             u32::from_be_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]) as usize;
         let attributes = &encoded[40..header_length];
 
-        assert!(
-            find_attribute(attributes, attribute_type::SOURCE_IPV4)
-                .is_some_and(|value| value == vec![192, 0, 2, 1])
-        );
-        assert!(
-            find_attribute(attributes, attribute_type::DESTINATION_IPV4)
-                .is_some_and(|value| value == vec![198, 51, 100, 9])
-        );
+        assert!(find_attribute(attributes, attribute_type::SOURCE_IPV4)
+            .is_some_and(|value| value == vec![192, 0, 2, 1]));
+        assert!(find_attribute(attributes, attribute_type::DESTINATION_IPV4)
+            .is_some_and(|value| value == vec![198, 51, 100, 9]));
         assert!(
             find_attribute(attributes, attribute_type::MATCHED_TARGET_IDENTIFIER)
                 .is_some_and(|value| value == b"LI-001".to_vec())
@@ -710,7 +708,10 @@ mod tests {
             tls_server_name(Some(&tls), "192.0.2.1:42069"),
             "mdf.example.test"
         );
-        assert_eq!(tls_server_name(None, "mdf.example.test:42069"), "mdf.example.test");
+        assert_eq!(
+            tls_server_name(None, "mdf.example.test:42069"),
+            "mdf.example.test"
+        );
         assert_eq!(tls_server_name(None, "[2001:db8::1]:42069"), "2001:db8::1");
     }
 
@@ -722,7 +723,10 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("TLS with no tls block must be refused"),
         };
-        assert!(error.contains("no lawful_intercept.x2.tls block"), "{error}");
+        assert!(
+            error.contains("no lawful_intercept.x2.tls block"),
+            "{error}"
+        );
 
         let tls = LiTlsConfig {
             certificate: None,

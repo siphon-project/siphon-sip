@@ -155,7 +155,9 @@ impl StirService {
 
     /// The configured default attestation level, if signing is enabled.
     pub fn default_attestation(&self) -> Option<Attestation> {
-        self.signing.as_ref().map(|context| context.default_attestation)
+        self.signing
+            .as_ref()
+            .map(|context| context.default_attestation)
     }
 
     /// Whether the Authentication Service (signing) is configured.
@@ -251,7 +253,9 @@ impl StirService {
             .ok_or(StirError::VerificationNotConfigured)?;
 
         if identity_values.is_empty() {
-            return Ok(StirVerification::no_validation("no Identity header present"));
+            return Ok(StirVerification::no_validation(
+                "no Identity header present",
+            ));
         }
 
         let mut decoded: Vec<serde_json::Value> = Vec::new();
@@ -392,15 +396,11 @@ impl VerificationContext {
                 return ProcessedPassport::unable(ppt, claims, reason);
             }
         };
-        let leaf_key = match cert::validate_chain(
-            &chain,
-            &self.anchors,
-            now_unix,
-            self.require_tnauthlist,
-        ) {
-            Ok(key) => key,
-            Err(reason) => return ProcessedPassport::hard_fail(ppt, claims, reason),
-        };
+        let leaf_key =
+            match cert::validate_chain(&chain, &self.anchors, now_unix, self.require_tnauthlist) {
+                Ok(key) => key,
+                Err(reason) => return ProcessedPassport::hard_fail(ppt, claims, reason),
+            };
 
         if !parsed.verify_signature(&leaf_key) {
             return ProcessedPassport::hard_fail(
@@ -511,11 +511,7 @@ impl VerificationContext {
 }
 
 impl ProcessedPassport {
-    fn hard_fail(
-        ppt: Option<String>,
-        claims: Option<serde_json::Value>,
-        reason: String,
-    ) -> Self {
+    fn hard_fail(ppt: Option<String>, claims: Option<serde_json::Value>, reason: String) -> Self {
         Self {
             ppt,
             claims,
@@ -564,8 +560,7 @@ fn tn_matches(left: &str, right: &str) -> bool {
     if left.is_empty() || right.is_empty() {
         return false;
     }
-    left == right
-        || left.trim_start_matches('1') == right.trim_start_matches('1')
+    left == right || left.trim_start_matches('1') == right.trim_start_matches('1')
 }
 
 /// Load the P-256 signing key from a PEM file (PKCS#8 or SEC1).
@@ -839,7 +834,11 @@ mod tests {
             .enumerate()
             .map(|(index, character)| {
                 if index == 0 {
-                    if character == 'A' { 'B' } else { 'A' }
+                    if character == 'A' {
+                        'B'
+                    } else {
+                        'A'
+                    }
                 } else {
                     character
                 }

@@ -14,7 +14,7 @@ use super::error::{ErrorCode, X1Error};
 use super::types::{
     DId, DeliveryAddress, DeliveryType, DestinationDeliveryStatus, Liid, MediationDeliveryType,
     NeStatus, OkValue, ProvisioningStatus, ServiceType, TargetIdentifier, TaskReportType,
-    Timestamp, Token, TypeOfNeIssueMessage, Version, XId, X1TransactionId,
+    Timestamp, Token, TypeOfNeIssueMessage, Version, X1TransactionId, XId,
 };
 
 /// The five fields every X1 message carries (clause 6.1).
@@ -645,7 +645,10 @@ mod tests {
     fn unknown_and_malformed_type_names_do_not_resolve() {
         assert_eq!(MessageKind::from_request_type_name("NotARealMessage"), None);
         assert_eq!(MessageKind::from_request_type_name("ActivateTask"), None); // no suffix
-        assert_eq!(MessageKind::from_request_type_name("ActivateTaskResponse"), None);
+        assert_eq!(
+            MessageKind::from_request_type_name("ActivateTaskResponse"),
+            None
+        );
         assert_eq!(MessageKind::from_request_type_name(""), None);
     }
 
@@ -729,7 +732,10 @@ mod tests {
             product_id: None,
             list_of_service_types: Vec::new(),
         };
-        assert_eq!(task.primary_liid().map(|l| l.as_str()), Some("LI-2026-0001"));
+        assert_eq!(
+            task.primary_liid().map(|l| l.as_str()),
+            Some("LI-2026-0001")
+        );
     }
 
     #[test]

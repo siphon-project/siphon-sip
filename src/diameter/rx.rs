@@ -183,8 +183,14 @@ pub struct MediaComponent {
 impl MediaComponent {
     pub fn encode(&self) -> Vec<u8> {
         let mut inner = Vec::new();
-        inner.extend_from_slice(&encode_avp_u32_3gpp(avp::MEDIA_COMPONENT_NUMBER, self.number));
-        inner.extend_from_slice(&encode_avp_u32_3gpp(avp::MEDIA_TYPE, self.media_type.as_u32()));
+        inner.extend_from_slice(&encode_avp_u32_3gpp(
+            avp::MEDIA_COMPONENT_NUMBER,
+            self.number,
+        ));
+        inner.extend_from_slice(&encode_avp_u32_3gpp(
+            avp::MEDIA_TYPE,
+            self.media_type.as_u32(),
+        ));
         for flow in &self.flows {
             inner.extend_from_slice(&flow.encode());
         }
@@ -271,10 +277,16 @@ pub async fn send_aar(
 
     let mut payload = Vec::with_capacity(512);
     payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, &session_id));
-    payload.extend_from_slice(&encode_avp_u32(avp::AUTH_APPLICATION_ID, dictionary::RX_APP_ID));
+    payload.extend_from_slice(&encode_avp_u32(
+        avp::AUTH_APPLICATION_ID,
+        dictionary::RX_APP_ID,
+    ));
     payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, &config.origin_host));
     payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, &config.origin_realm));
-    payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_REALM, &config.destination_realm));
+    payload.extend_from_slice(&encode_avp_utf8(
+        avp::DESTINATION_REALM,
+        &config.destination_realm,
+    ));
     if let Some(ref host) = config.destination_host {
         payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, host));
     }
@@ -350,10 +362,16 @@ pub async fn send_str(
 
     let mut payload = Vec::new();
     payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, session_id));
-    payload.extend_from_slice(&encode_avp_u32(avp::AUTH_APPLICATION_ID, dictionary::RX_APP_ID));
+    payload.extend_from_slice(&encode_avp_u32(
+        avp::AUTH_APPLICATION_ID,
+        dictionary::RX_APP_ID,
+    ));
     payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, &config.origin_host));
     payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, &config.origin_realm));
-    payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_REALM, &config.destination_realm));
+    payload.extend_from_slice(&encode_avp_utf8(
+        avp::DESTINATION_REALM,
+        &config.destination_realm,
+    ));
     if let Some(ref host) = config.destination_host {
         payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, host));
     }
@@ -394,8 +412,14 @@ pub fn parse_policy_change(incoming: &IncomingRequest) -> PolicyChangeNotificati
     };
 
     PolicyChangeNotification {
-        session_id: avps.get("Session-Id").and_then(|v| v.as_str()).map(String::from),
-        abort_cause: avps.get("Abort-Cause").and_then(|v| v.as_u64()).map(|n| n as u32),
+        session_id: avps
+            .get("Session-Id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        abort_cause: avps
+            .get("Abort-Cause")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32),
         specific_actions,
     }
 }
@@ -430,9 +454,18 @@ pub fn build_policy_change_answer(
 pub fn parse_session_abort(incoming: &IncomingRequest) -> SessionAbortRequest {
     let avps = &incoming.avps;
     SessionAbortRequest {
-        session_id: avps.get("Session-Id").and_then(|v| v.as_str()).map(String::from),
-        abort_cause: avps.get("Abort-Cause").and_then(|v| v.as_u64()).map(|n| n as u32),
-        origin_host: avps.get("Origin-Host").and_then(|v| v.as_str()).map(String::from),
+        session_id: avps
+            .get("Session-Id")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        abort_cause: avps
+            .get("Abort-Cause")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32),
+        origin_host: avps
+            .get("Origin-Host")
+            .and_then(|v| v.as_str())
+            .map(String::from),
     }
 }
 
@@ -540,9 +573,7 @@ mod tests {
     fn single_flow_encoding() {
         let flow = MediaFlow {
             flow_number: 1,
-            descriptions: vec![
-                "permit in ip from 10.45.1.100 49152 to 10.45.1.200 50000".into(),
-            ],
+            descriptions: vec!["permit in ip from 10.45.1.100 49152 to 10.45.1.200 50000".into()],
             status: Some(FlowStatus::Enabled),
             usage: None,
         };
@@ -603,7 +634,10 @@ mod tests {
                 break;
             }
         }
-        assert!(found, "Flow-Usage AVP (512) must be present in RTCP sub-component");
+        assert!(
+            found,
+            "Flow-Usage AVP (512) must be present in RTCP sub-component"
+        );
     }
 
     // ── Media component encoding ────────────────────────────────────────
@@ -687,8 +721,14 @@ mod tests {
     fn parse_rar_with_specific_actions() {
         let mut raw = Vec::new();
         raw.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "pcscf;rx;sess;42"));
-        raw.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "pcrf.ims.mnc001.mcc001.3gppnetwork.org"));
-        raw.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "ims.mnc001.mcc001.3gppnetwork.org"));
+        raw.extend_from_slice(&encode_avp_utf8(
+            avp::ORIGIN_HOST,
+            "pcrf.ims.mnc001.mcc001.3gppnetwork.org",
+        ));
+        raw.extend_from_slice(&encode_avp_utf8(
+            avp::ORIGIN_REALM,
+            "ims.mnc001.mcc001.3gppnetwork.org",
+        ));
         raw.extend_from_slice(&encode_avp_u32_3gpp(
             avp::SPECIFIC_ACTION,
             SpecificAction::IndicationOfLossOfBearer.as_u32(),
@@ -700,15 +740,24 @@ mod tests {
         assert_eq!(rar.session_id.as_deref(), Some("pcscf;rx;sess;42"));
         assert!(rar.abort_cause.is_none());
         assert_eq!(rar.specific_actions.len(), 1);
-        assert_eq!(rar.specific_actions[0], SpecificAction::IndicationOfLossOfBearer.as_u32());
+        assert_eq!(
+            rar.specific_actions[0],
+            SpecificAction::IndicationOfLossOfBearer.as_u32()
+        );
     }
 
     #[test]
     fn parse_rar_with_abort_cause() {
         let mut raw = Vec::new();
         raw.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "pcscf;rx;sess;99"));
-        raw.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "pcrf.ims.mnc001.mcc001.3gppnetwork.org"));
-        raw.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "ims.mnc001.mcc001.3gppnetwork.org"));
+        raw.extend_from_slice(&encode_avp_utf8(
+            avp::ORIGIN_HOST,
+            "pcrf.ims.mnc001.mcc001.3gppnetwork.org",
+        ));
+        raw.extend_from_slice(&encode_avp_utf8(
+            avp::ORIGIN_REALM,
+            "ims.mnc001.mcc001.3gppnetwork.org",
+        ));
         raw.extend_from_slice(&encode_avp_u32_3gpp(
             avp::ABORT_CAUSE,
             AbortCause::InsufficientBearerResources.as_u32(),
@@ -717,7 +766,10 @@ mod tests {
         let incoming = synthesize_rx_request(dictionary::CMD_RE_AUTH, dictionary::RX_APP_ID, &raw);
         let rar = parse_policy_change(&incoming);
 
-        assert_eq!(rar.abort_cause, Some(AbortCause::InsufficientBearerResources.as_u32()));
+        assert_eq!(
+            rar.abort_cause,
+            Some(AbortCause::InsufficientBearerResources.as_u32())
+        );
     }
 
     // ── ASR parsing (PCRF → P-CSCF) ────────────────────────────────────
@@ -726,19 +778,29 @@ mod tests {
     fn parse_asr_from_pcrf() {
         let mut raw = Vec::new();
         raw.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "pcscf;rx;abort;7"));
-        raw.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "pcrf.ims.mnc001.mcc001.3gppnetwork.org"));
-        raw.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "ims.mnc001.mcc001.3gppnetwork.org"));
+        raw.extend_from_slice(&encode_avp_utf8(
+            avp::ORIGIN_HOST,
+            "pcrf.ims.mnc001.mcc001.3gppnetwork.org",
+        ));
+        raw.extend_from_slice(&encode_avp_utf8(
+            avp::ORIGIN_REALM,
+            "ims.mnc001.mcc001.3gppnetwork.org",
+        ));
         raw.extend_from_slice(&encode_avp_u32_3gpp(
             avp::ABORT_CAUSE,
             AbortCause::BearerReleased.as_u32(),
         ));
 
-        let incoming = synthesize_rx_request(dictionary::CMD_ABORT_SESSION, dictionary::RX_APP_ID, &raw);
+        let incoming =
+            synthesize_rx_request(dictionary::CMD_ABORT_SESSION, dictionary::RX_APP_ID, &raw);
         let asr = parse_session_abort(&incoming);
 
         assert_eq!(asr.session_id.as_deref(), Some("pcscf;rx;abort;7"));
         assert_eq!(asr.abort_cause, Some(AbortCause::BearerReleased.as_u32()));
-        assert_eq!(asr.origin_host.as_deref(), Some("pcrf.ims.mnc001.mcc001.3gppnetwork.org"));
+        assert_eq!(
+            asr.origin_host.as_deref(),
+            Some("pcrf.ims.mnc001.mcc001.3gppnetwork.org")
+        );
     }
 
     // ── RAA/ASA answer roundtrips ───────────────────────────────────────
@@ -791,7 +853,8 @@ mod tests {
             "pcscf.ims.example.net",
             "ims.example.net",
             dictionary::DIAMETER_UNABLE_TO_COMPLY,
-            1, 2,
+            1,
+            2,
         );
         let decoded = decode_diameter(&wire).unwrap();
         assert_eq!(

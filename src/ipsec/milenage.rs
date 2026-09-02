@@ -269,12 +269,7 @@ pub fn f5star(key: &[u8; 16], opc: &[u8; 16], rand: &[u8; 16]) -> [u8; 6] {
 /// The UE emits this in the `auts` Authorization parameter when it detects an
 /// out-of-range SQN in a network challenge, forcing the HSS to re-base its
 /// sequence counter.
-pub fn compute_auts(
-    key: &[u8; 16],
-    opc: &[u8; 16],
-    rand: &[u8; 16],
-    sqn_ms: &[u8; 6],
-) -> [u8; 14] {
+pub fn compute_auts(key: &[u8; 16], opc: &[u8; 16], rand: &[u8; 16], sqn_ms: &[u8; 6]) -> [u8; 14] {
     const RESYNC_AMF: [u8; 2] = [0, 0];
 
     let ak_star = f5star(key, opc, rand);
@@ -299,12 +294,7 @@ pub fn compute_auts(
 /// * `op` — Operator variant configuration OP (128 bits)
 /// * `sqn` — Sequence number (48 bits)
 /// * `amf` — Authentication management field (16 bits)
-pub fn generate_vector(
-    key: &[u8; 16],
-    op: &[u8; 16],
-    sqn: &[u8; 6],
-    amf: &[u8; 2],
-) -> AkaVector {
+pub fn generate_vector(key: &[u8; 16], op: &[u8; 16], sqn: &[u8; 6], amf: &[u8; 2]) -> AkaVector {
     let mut rand = [0u8; 16];
     // RAND is the challenge value the UE will sign with K. It MUST be
     // unpredictable — a guessable RAND lets an attacker pre-compute valid
@@ -463,18 +453,12 @@ mod tests {
 
     #[test]
     fn hex_to_bytes_valid() {
-        assert_eq!(
-            hex_to_bytes("deadbeef"),
-            Some(vec![0xde, 0xad, 0xbe, 0xef])
-        );
+        assert_eq!(hex_to_bytes("deadbeef"), Some(vec![0xde, 0xad, 0xbe, 0xef]));
     }
 
     #[test]
     fn hex_to_bytes_uppercase() {
-        assert_eq!(
-            hex_to_bytes("DEADBEEF"),
-            Some(vec![0xde, 0xad, 0xbe, 0xef])
-        );
+        assert_eq!(hex_to_bytes("DEADBEEF"), Some(vec![0xde, 0xad, 0xbe, 0xef]));
     }
 
     #[test]
@@ -500,10 +484,7 @@ mod tests {
 
     #[test]
     fn hex_to_bytes_all_zeros() {
-        assert_eq!(
-            hex_to_bytes("00000000"),
-            Some(vec![0x00, 0x00, 0x00, 0x00])
-        );
+        assert_eq!(hex_to_bytes("00000000"), Some(vec![0x00, 0x00, 0x00, 0x00]));
     }
 
     // -- compute_opc tests --

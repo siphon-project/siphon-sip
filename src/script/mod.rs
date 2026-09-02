@@ -9,5 +9,5 @@ pub mod engine;
 pub mod handle;
 pub mod py_executor;
 
-pub use handle::{HandlerHandle, ScriptHandle};
 pub(crate) use blocking::detach_block_on;
+pub use handle::{HandlerHandle, ScriptHandle};

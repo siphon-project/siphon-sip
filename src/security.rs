@@ -85,7 +85,10 @@ pub fn set_max_message_bytes(limit: usize) {
 /// The configured stream message-size ceiling, or [`DEFAULT_MAX_MESSAGE_BYTES`]
 /// when none was installed. Read on every stream framing attempt.
 pub fn max_message_bytes() -> usize {
-    MAX_MESSAGE_BYTES.get().copied().unwrap_or(DEFAULT_MAX_MESSAGE_BYTES)
+    MAX_MESSAGE_BYTES
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_MAX_MESSAGE_BYTES)
 }
 
 /// Record one failed/timed-out transport handshake (TLS / WSS TLS / WS upgrade)
@@ -240,10 +243,10 @@ impl AutoBanStore {
         }
 
         let newly_banned = {
-            let mut entry = self
-                .failures
-                .entry(source)
-                .or_insert(FailureWindow { count: 0, window_start: now });
+            let mut entry = self.failures.entry(source).or_insert(FailureWindow {
+                count: 0,
+                window_start: now,
+            });
             // Roll the window if it has elapsed.
             if now.duration_since(entry.window_start) > self.window {
                 entry.count = 0;
@@ -403,10 +406,10 @@ impl RateLimitState {
         }
 
         let over_limit = {
-            let mut entry = self
-                .windows
-                .entry(source)
-                .or_insert(FailureWindow { count: 0, window_start: now });
+            let mut entry = self.windows.entry(source).or_insert(FailureWindow {
+                count: 0,
+                window_start: now,
+            });
             if now.duration_since(entry.window_start) > self.window {
                 entry.count = 0;
                 entry.window_start = now;
@@ -553,7 +556,9 @@ impl SecurityFilter {
 
     /// Number of currently-tracked rate-limit bans (0 when rate limiting is off).
     pub fn rate_limit_bans(&self) -> usize {
-        self.rate_limit.as_ref().map_or(0, RateLimitState::active_bans)
+        self.rate_limit
+            .as_ref()
+            .map_or(0, RateLimitState::active_bans)
     }
 }
 
@@ -676,7 +681,9 @@ mod tests {
         listed.sort_by_key(|(address, _)| address.to_string());
         assert_eq!(listed.len(), 2);
         // Both carry a positive remaining TTL (≤ the 3600 s ban duration).
-        assert!(listed.iter().all(|(_, remaining)| *remaining > 0 && *remaining <= 3600));
+        assert!(listed
+            .iter()
+            .all(|(_, remaining)| *remaining > 0 && *remaining <= 3600));
         assert!(listed.iter().any(|(address, _)| *address == one));
         assert!(listed.iter().any(|(address, _)| *address == two));
     }

@@ -193,8 +193,8 @@ impl PyStir {
             (orig, dest, div)
         };
 
-        let orig = orig
-            .ok_or_else(|| PyValueError::new_err("could not determine originating TN"))?;
+        let orig =
+            orig.ok_or_else(|| PyValueError::new_err("could not determine originating TN"))?;
         let dest =
             dest.ok_or_else(|| PyValueError::new_err("could not determine destination TN"))?;
         let div = div.ok_or_else(|| {
@@ -226,8 +226,7 @@ impl PyStir {
                 .cloned()
                 .unwrap_or_default();
             let orig = header_uri_user(message.headers.from());
-            let dest =
-                header_uri_user(message.headers.to()).or_else(|| ruri_user(&message));
+            let dest = header_uri_user(message.headers.to()).or_else(|| ruri_user(&message));
             (values, orig, dest)
         };
 
@@ -293,7 +292,9 @@ fn lock_message(
 /// Extract the user part of a From/To-style header URI.
 fn header_uri_user(raw: Option<&String>) -> Option<String> {
     let raw = raw?;
-    NameAddr::parse(raw).ok().and_then(|name_addr| name_addr.uri.user)
+    NameAddr::parse(raw)
+        .ok()
+        .and_then(|name_addr| name_addr.uri.user)
 }
 
 /// Extract the user part of the Request-URI.
@@ -387,9 +388,10 @@ mod tests {
             "<sip:12025550100@b.com>",
             "12025550100",
         );
-        message
-            .headers
-            .set("Diversion", "<sip:12155550199@a.com>;reason=unconditional".to_string());
+        message.headers.set(
+            "Diversion",
+            "<sip:12155550199@a.com>;reason=unconditional".to_string(),
+        );
         assert_eq!(diverting_tn(&message).as_deref(), Some("12155550199"));
     }
 

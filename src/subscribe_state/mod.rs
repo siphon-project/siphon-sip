@@ -407,7 +407,10 @@ mod tests {
             })
             .expect("dialog present");
         assert_eq!(after_first.event_version, 1);
-        assert_eq!(after_first.cseq, 0, "event_version must not piggyback on CSeq");
+        assert_eq!(
+            after_first.cseq, 0,
+            "event_version must not piggyback on CSeq"
+        );
 
         let after_second = store
             .update("abc", |dialog| {

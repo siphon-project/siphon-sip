@@ -150,10 +150,7 @@ impl RlmiDocument {
             ));
 
             if let Some(ref resource_name) = resource.name {
-                xml.push_str(&format!(
-                    "    <name>{}</name>\n",
-                    xml_escape(resource_name),
-                ));
+                xml.push_str(&format!("    <name>{}</name>\n", xml_escape(resource_name),));
             }
 
             let instance_id = index + 1;
@@ -204,10 +201,7 @@ impl RlmiDocument {
 /// ```text
 /// multipart/related;type="application/rlmi+xml";boundary=<boundary>
 /// ```
-pub fn build_multipart(
-    rlmi_xml: &str,
-    parts: &[(String, String, String)],
-) -> (String, String) {
+pub fn build_multipart(rlmi_xml: &str, parts: &[(String, String, String)]) -> (String, String) {
     let boundary = format!("siphon-rls-{:016x}", random_boundary_seed());
 
     let mut body = String::with_capacity(rlmi_xml.len() + parts.len() * 256);
@@ -455,10 +449,7 @@ mod tests {
 
     #[test]
     fn rlmi_document_empty() {
-        let document = RlmiDocument::new(
-            "sip:friends@lists.example.com".to_string(),
-            true,
-        );
+        let document = RlmiDocument::new("sip:friends@lists.example.com".to_string(), true);
 
         let xml = document.to_xml();
         assert!(xml.contains("fullState=\"true\""));
@@ -468,10 +459,7 @@ mod tests {
 
     #[test]
     fn rlmi_document_with_name() {
-        let mut document = RlmiDocument::new(
-            "sip:friends@lists.example.com".to_string(),
-            true,
-        );
+        let mut document = RlmiDocument::new("sip:friends@lists.example.com".to_string(), true);
         document.name = Some("Friends".to_string());
 
         let xml = document.to_xml();
@@ -480,10 +468,7 @@ mod tests {
 
     #[test]
     fn rlmi_document_partial_state() {
-        let document = RlmiDocument::new(
-            "sip:friends@lists.example.com".to_string(),
-            false,
-        );
+        let document = RlmiDocument::new("sip:friends@lists.example.com".to_string(), false);
 
         let xml = document.to_xml();
         assert!(xml.contains("fullState=\"false\""));
@@ -491,10 +476,7 @@ mod tests {
 
     #[test]
     fn rlmi_document_with_resources() {
-        let mut document = RlmiDocument::new(
-            "sip:friends@lists.example.com".to_string(),
-            true,
-        );
+        let mut document = RlmiDocument::new("sip:friends@lists.example.com".to_string(), true);
 
         document.add_resource(RlmiResource {
             uri: "sip:alice@example.com".to_string(),
@@ -538,10 +520,7 @@ mod tests {
 
     #[test]
     fn rlmi_document_xml_escaping() {
-        let mut document = RlmiDocument::new(
-            "sip:list@example.com".to_string(),
-            true,
-        );
+        let mut document = RlmiDocument::new("sip:list@example.com".to_string(), true);
 
         document.add_resource(RlmiResource {
             uri: "sip:user@example.com".to_string(),
@@ -556,10 +535,7 @@ mod tests {
 
     #[test]
     fn rlmi_document_terminated_resource() {
-        let mut document = RlmiDocument::new(
-            "sip:friends@lists.example.com".to_string(),
-            true,
-        );
+        let mut document = RlmiDocument::new("sip:friends@lists.example.com".to_string(), true);
 
         document.add_resource(RlmiResource {
             uri: "sip:gone@example.com".to_string(),
@@ -621,7 +597,11 @@ mod tests {
         let count = body.matches(&boundary_marker).count();
         // 3 opening boundaries (rlmi + 2 parts) + 1 closing = 4 occurrences of --boundary
         // but the closing --boundary-- also contains --boundary, so we count at least 4
-        assert!(count >= 4, "expected at least 4 boundary markers, got {}", count);
+        assert!(
+            count >= 4,
+            "expected at least 4 boundary markers, got {}",
+            count
+        );
     }
 
     #[test]
@@ -693,10 +673,7 @@ mod tests {
         assert_eq!(members.len(), 2);
 
         // 3. Build RLMI document
-        let mut document = RlmiDocument::new(
-            "sip:friends@lists.example.com".to_string(),
-            true,
-        );
+        let mut document = RlmiDocument::new("sip:friends@lists.example.com".to_string(), true);
         document.name = Some("Friends".to_string());
 
         for member_uri in &members {

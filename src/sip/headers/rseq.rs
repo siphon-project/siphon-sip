@@ -4,8 +4,8 @@
 //!   RSeq: <response-number>
 //!   RAck: <response-number> <cseq-number> <method>
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 
 /// Allocate the next RSeq value for a reliable provisional response.
 ///
@@ -24,7 +24,11 @@ pub fn next_rseq() -> u32 {
         AtomicU32::new(init.max(1))
     });
     let value = counter.fetch_add(1, Ordering::Relaxed) & 0x7FFF_FFFF;
-    if value == 0 { counter.fetch_add(1, Ordering::Relaxed) & 0x7FFF_FFFF } else { value }
+    if value == 0 {
+        counter.fetch_add(1, Ordering::Relaxed) & 0x7FFF_FFFF
+    } else {
+        value
+    }
 }
 
 /// Parsed `RSeq` header — sequence number for a reliable provisional response.
@@ -89,7 +93,10 @@ impl RAck {
 
     /// Format as a SIP header value.
     pub fn to_header_value(&self) -> String {
-        format!("{} {} {}", self.response_number, self.cseq_number, self.method)
+        format!(
+            "{} {} {}",
+            self.response_number, self.cseq_number, self.method
+        )
     }
 }
 
@@ -233,7 +240,9 @@ mod tests {
 
     #[test]
     fn rseq_to_header_value() {
-        let rseq = RSeq { response_number: 42 };
+        let rseq = RSeq {
+            response_number: 42,
+        };
         assert_eq!(rseq.to_header_value(), "42");
     }
 

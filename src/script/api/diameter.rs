@@ -66,9 +66,7 @@ use crate::diameter::codec::{
 };
 use crate::diameter::cx::{octet_string_as_utf8, required_str};
 use crate::diameter::dictionary::{self, avp, AvpDef, AvpType};
-use crate::diameter::rf::{
-    self, AccountingAnswer, AccountingParams, AccountingRecordType,
-};
+use crate::diameter::rf::{self, AccountingAnswer, AccountingParams, AccountingRecordType};
 use crate::diameter::ro::{
     self, CcRequestType, CreditControlAnswer, CreditControlParams, ImsChargingData,
     NodeFunctionality, NodeRole, ServiceUnit, SmsChargingData, SubscriberId,
@@ -280,9 +278,9 @@ fn extract_ipv6_prefix(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     if let Ok(raw) = obj.extract::<Vec<u8>>() {
         return Ok(raw);
     }
-    let text: String = obj.extract().map_err(|_| {
-        pyo3::exceptions::PyTypeError::new_err("framed_ipv6 must be str or bytes")
-    })?;
+    let text: String = obj
+        .extract()
+        .map_err(|_| pyo3::exceptions::PyTypeError::new_err("framed_ipv6 must be str or bytes"))?;
     let addr: std::net::Ipv6Addr = text.parse().map_err(|_| {
         pyo3::exceptions::PyValueError::new_err(format!(
             "framed_ipv6 is not a valid IPv6 address: {text}"
@@ -301,18 +299,14 @@ fn extract_ipv6_prefix(obj: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
 /// a string alias.
 fn extract_subscription_id(obj: &Bound<'_, PyAny>) -> PyResult<(String, u32)> {
     let tuple: (String, Bound<'_, PyAny>) = obj.extract().map_err(|_| {
-        pyo3::exceptions::PyTypeError::new_err(
-            "subscription_id must be (data: str, type: int|str)",
-        )
+        pyo3::exceptions::PyTypeError::new_err("subscription_id must be (data: str, type: int|str)")
     })?;
     let (data, type_obj) = tuple;
     let type_num: u32 = if let Ok(int_value) = type_obj.extract::<u32>() {
         int_value
     } else {
         let alias: String = type_obj.extract().map_err(|_| {
-            pyo3::exceptions::PyTypeError::new_err(
-                "subscription_id[1] must be int or str alias",
-            )
+            pyo3::exceptions::PyTypeError::new_err("subscription_id[1] must be int or str alias")
         })?;
         match alias.to_ascii_lowercase().as_str() {
             "e164" | "e.164" => 0,
@@ -374,7 +368,10 @@ fn register_on_request(
         Some(value) => value.into_pyobject(python)?.into_any(),
         None => python.None().into_bound(python),
     };
-    registry.call_method1("register", ("diameter.on_request", filter_obj, func, is_async))?;
+    registry.call_method1(
+        "register",
+        ("diameter.on_request", filter_obj, func, is_async),
+    )?;
     Ok(())
 }
 
@@ -604,14 +601,11 @@ fn build_ims_data(
 fn parse_optional_ip(label: &str, value: Option<&str>) -> PyResult<Option<std::net::IpAddr>> {
     match value {
         None => Ok(None),
-        Some(text) => text
-            .parse::<std::net::IpAddr>()
-            .map(Some)
-            .map_err(|_| {
-                pyo3::exceptions::PyValueError::new_err(format!(
-                    "{label} expects an IPv4/IPv6 literal, got {text:?}"
-                ))
-            }),
+        Some(text) => text.parse::<std::net::IpAddr>().map(Some).map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "{label} expects an IPv4/IPv6 literal, got {text:?}"
+            ))
+        }),
     }
 }
 
@@ -678,9 +672,8 @@ fn build_sms_data(
         return Ok(None);
     }
 
-    let discharge_time = sm_discharge_time.map(|secs| {
-        std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(secs.max(0.0))
-    });
+    let discharge_time = sm_discharge_time
+        .map(|secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(secs.max(0.0)));
 
     Ok(Some(SmsChargingData {
         originator_address: originator_address.map(str::to_owned),
@@ -800,7 +793,8 @@ fn build_subscriber(id: &str, id_type: Option<&str>) -> PyResult<SubscriberId> {
         Some("sip") | Some("sipuri") | Some("sip_uri") => Ok(SubscriberId::sip_uri(id)),
         None => {
             let lower = id.to_ascii_lowercase();
-            if lower.starts_with("sip:") || lower.starts_with("sips:") || lower.starts_with("tel:") {
+            if lower.starts_with("sip:") || lower.starts_with("sips:") || lower.starts_with("tel:")
+            {
                 Ok(SubscriberId::sip_uri(id))
             } else {
                 Ok(SubscriberId::msisdn(id))
@@ -950,9 +944,11 @@ impl PyDiameter {
         };
 
         let visited = visited_network_id.unwrap_or("");
-        let answer = crate::script::detach_block_on(
-            client.send_uar(public_identity, visited, user_auth_type),
-        );
+        let answer = crate::script::detach_block_on(client.send_uar(
+            public_identity,
+            visited,
+            user_auth_type,
+        ));
 
         match answer {
             Ok(message) => {
@@ -1001,9 +997,8 @@ impl PyDiameter {
         };
 
         let name = server_name.unwrap_or("");
-        let answer = crate::script::detach_block_on(
-            client.send_sar(public_identity, name, assignment_type),
-        );
+        let answer =
+            crate::script::detach_block_on(client.send_sar(public_identity, name, assignment_type));
 
         match answer {
             Ok(message) => {
@@ -1048,9 +1043,7 @@ impl PyDiameter {
             }
         };
 
-        let answer = crate::script::detach_block_on(
-            client.send_lir(public_identity),
-        );
+        let answer = crate::script::detach_block_on(client.send_lir(public_identity));
 
         match answer {
             Ok(message) => {
@@ -1332,10 +1325,8 @@ impl PyDiameter {
 
         if let Some(ip) = framed_ip {
             match ip.parse::<std::net::Ipv4Addr>() {
-                Ok(addr) => payload.extend_from_slice(&encode_avp_octet(
-                    avp::FRAMED_IP_ADDRESS,
-                    &addr.octets(),
-                )),
+                Ok(addr) => payload
+                    .extend_from_slice(&encode_avp_octet(avp::FRAMED_IP_ADDRESS, &addr.octets())),
                 Err(_) => {
                     return Err(pyo3::exceptions::PyValueError::new_err(format!(
                         "framed_ip is not a valid IPv4 address: {ip}"
@@ -1381,7 +1372,6 @@ impl PyDiameter {
             }
         }
     }
-
 
     /// Register the server mode CER identity callback.
     ///
@@ -1826,9 +1816,7 @@ impl PyDiameter {
                 return Ok(None);
             }
         };
-        let answer = crate::script::detach_block_on(
-            client.send_srr(msisdn, sc_address, sm_rp_mti),
-        );
+        let answer = crate::script::detach_block_on(client.send_srr(msisdn, sc_address, sm_rp_mti));
         match answer {
             Ok(message) => match crate::diameter::s6c::parse_sra(&message) {
                 Some(sra) => {
@@ -1881,9 +1869,11 @@ impl PyDiameter {
                 return Ok(None);
             }
         };
-        let answer = crate::script::detach_block_on(
-            client.send_rsr(user_name, sc_address, delivery_outcome),
-        );
+        let answer = crate::script::detach_block_on(client.send_rsr(
+            user_name,
+            sc_address,
+            delivery_outcome,
+        ));
         match answer {
             Ok(message) => match crate::diameter::s6c::parse_rsa(&message) {
                 Some(rsa) => {
@@ -1964,7 +1954,6 @@ impl PyDiameter {
             }
         }
     }
-
 
     /// Originate a Diameter request by spec name + application name +
     /// AVP kwargs. Generic counterpart of the typed helpers (`cx_uar`,
@@ -2076,14 +2065,14 @@ impl PyDiameter {
                 })?;
                 // Reserved kwargs siphon consumes itself — never travel
                 // on the wire.
-                if matches!(key_str.as_str(), "peer" | "timeout_ms" | "command" | "application")
-                {
+                if matches!(
+                    key_str.as_str(),
+                    "peer" | "timeout_ms" | "command" | "application"
+                ) {
                     continue;
                 }
                 let avp_def = dictionary::lookup_avp_by_python_name(&key_str).ok_or_else(|| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "unknown AVP kwarg: {key_str}"
-                    ))
+                    pyo3::exceptions::PyValueError::new_err(format!("unknown AVP kwarg: {key_str}"))
                 })?;
                 let encoded = encode_kwarg_avp(avp_def, &value)?;
                 avp_bytes.extend_from_slice(&encoded);
@@ -2204,25 +2193,46 @@ impl PyDiameter {
             }
         };
         let ims_data = build_ims_data(
-            calling_party, called_party, sip_method,
-            role_of_node, node_functionality, ims_charging_identifier,
-            user_session_id, originating_ioi, terminating_ioi,
-            application_server, application_provided_called_party_address,
-            incoming_trunk_group_id, outgoing_trunk_group_id,
-            visited_network_id, cause_code,
+            calling_party,
+            called_party,
+            sip_method,
+            role_of_node,
+            node_functionality,
+            ims_charging_identifier,
+            user_session_id,
+            originating_ioi,
+            terminating_ioi,
+            application_server,
+            application_provided_called_party_address,
+            incoming_trunk_group_id,
+            outgoing_trunk_group_id,
+            visited_network_id,
+            cause_code,
         )?;
         let sms_data = build_sms_data(
-            originator_address, recipient_address,
-            originator_sccp_address, recipient_sccp_address,
-            sm_message_type, reply_path_requested,
-            sm_user_data_header, sm_service_type,
-            sms_node, sm_discharge_time,
-            number_of_messages_sent, client_address,
-            data_coding_scheme, sms_result,
-            sm_protocol_id, sm_status,
-            application_port_identifier, external_identifier,
-            sm_device_trigger_indicator, mtc_iwf_address,
-            originating_ioi, terminating_ioi, user_session_id,
+            originator_address,
+            recipient_address,
+            originator_sccp_address,
+            recipient_sccp_address,
+            sm_message_type,
+            reply_path_requested,
+            sm_user_data_header,
+            sm_service_type,
+            sms_node,
+            sm_discharge_time,
+            number_of_messages_sent,
+            client_address,
+            data_coding_scheme,
+            sms_result,
+            sm_protocol_id,
+            sm_status,
+            application_port_identifier,
+            external_identifier,
+            sm_device_trigger_indicator,
+            mtc_iwf_address,
+            originating_ioi,
+            terminating_ioi,
+            user_session_id,
         )?;
 
         let mut params = AccountingParams::new(AccountingRecordType::StartRecord);
@@ -2326,25 +2336,46 @@ impl PyDiameter {
             }
         };
         let ims_data = build_ims_data(
-            calling_party, called_party, sip_method,
-            role_of_node, node_functionality, ims_charging_identifier,
-            user_session_id, originating_ioi, terminating_ioi,
-            application_server, application_provided_called_party_address,
-            incoming_trunk_group_id, outgoing_trunk_group_id,
-            visited_network_id, cause_code,
+            calling_party,
+            called_party,
+            sip_method,
+            role_of_node,
+            node_functionality,
+            ims_charging_identifier,
+            user_session_id,
+            originating_ioi,
+            terminating_ioi,
+            application_server,
+            application_provided_called_party_address,
+            incoming_trunk_group_id,
+            outgoing_trunk_group_id,
+            visited_network_id,
+            cause_code,
         )?;
         let sms_data = build_sms_data(
-            originator_address, recipient_address,
-            originator_sccp_address, recipient_sccp_address,
-            sm_message_type, reply_path_requested,
-            sm_user_data_header, sm_service_type,
-            sms_node, sm_discharge_time,
-            number_of_messages_sent, client_address,
-            data_coding_scheme, sms_result,
-            sm_protocol_id, sm_status,
-            application_port_identifier, external_identifier,
-            sm_device_trigger_indicator, mtc_iwf_address,
-            originating_ioi, terminating_ioi, user_session_id,
+            originator_address,
+            recipient_address,
+            originator_sccp_address,
+            recipient_sccp_address,
+            sm_message_type,
+            reply_path_requested,
+            sm_user_data_header,
+            sm_service_type,
+            sms_node,
+            sm_discharge_time,
+            number_of_messages_sent,
+            client_address,
+            data_coding_scheme,
+            sms_result,
+            sm_protocol_id,
+            sm_status,
+            application_port_identifier,
+            external_identifier,
+            sm_device_trigger_indicator,
+            mtc_iwf_address,
+            originating_ioi,
+            terminating_ioi,
+            user_session_id,
         )?;
 
         let mut params = AccountingParams::new(AccountingRecordType::InterimRecord);
@@ -2459,25 +2490,46 @@ impl PyDiameter {
             }
         };
         let ims_data = build_ims_data(
-            calling_party, called_party, sip_method,
-            role_of_node, node_functionality, ims_charging_identifier,
-            user_session_id, originating_ioi, terminating_ioi,
-            application_server, application_provided_called_party_address,
-            incoming_trunk_group_id, outgoing_trunk_group_id,
-            visited_network_id, cause_code,
+            calling_party,
+            called_party,
+            sip_method,
+            role_of_node,
+            node_functionality,
+            ims_charging_identifier,
+            user_session_id,
+            originating_ioi,
+            terminating_ioi,
+            application_server,
+            application_provided_called_party_address,
+            incoming_trunk_group_id,
+            outgoing_trunk_group_id,
+            visited_network_id,
+            cause_code,
         )?;
         let sms_data = build_sms_data(
-            originator_address, recipient_address,
-            originator_sccp_address, recipient_sccp_address,
-            sm_message_type, reply_path_requested,
-            sm_user_data_header, sm_service_type,
-            sms_node, sm_discharge_time,
-            number_of_messages_sent, client_address,
-            data_coding_scheme, sms_result,
-            sm_protocol_id, sm_status,
-            application_port_identifier, external_identifier,
-            sm_device_trigger_indicator, mtc_iwf_address,
-            originating_ioi, terminating_ioi, user_session_id,
+            originator_address,
+            recipient_address,
+            originator_sccp_address,
+            recipient_sccp_address,
+            sm_message_type,
+            reply_path_requested,
+            sm_user_data_header,
+            sm_service_type,
+            sms_node,
+            sm_discharge_time,
+            number_of_messages_sent,
+            client_address,
+            data_coding_scheme,
+            sms_result,
+            sm_protocol_id,
+            sm_status,
+            application_port_identifier,
+            external_identifier,
+            sm_device_trigger_indicator,
+            mtc_iwf_address,
+            originating_ioi,
+            terminating_ioi,
+            user_session_id,
         )?;
 
         let mut params = AccountingParams::new(AccountingRecordType::StopRecord);
@@ -2585,25 +2637,46 @@ impl PyDiameter {
             }
         };
         let ims_data = build_ims_data(
-            calling_party, called_party, sip_method,
-            role_of_node, node_functionality, ims_charging_identifier,
-            user_session_id, originating_ioi, terminating_ioi,
-            application_server, application_provided_called_party_address,
-            incoming_trunk_group_id, outgoing_trunk_group_id,
-            visited_network_id, cause_code,
+            calling_party,
+            called_party,
+            sip_method,
+            role_of_node,
+            node_functionality,
+            ims_charging_identifier,
+            user_session_id,
+            originating_ioi,
+            terminating_ioi,
+            application_server,
+            application_provided_called_party_address,
+            incoming_trunk_group_id,
+            outgoing_trunk_group_id,
+            visited_network_id,
+            cause_code,
         )?;
         let sms_data = build_sms_data(
-            originator_address, recipient_address,
-            originator_sccp_address, recipient_sccp_address,
-            sm_message_type, reply_path_requested,
-            sm_user_data_header, sm_service_type,
-            sms_node, sm_discharge_time,
-            number_of_messages_sent, client_address,
-            data_coding_scheme, sms_result,
-            sm_protocol_id, sm_status,
-            application_port_identifier, external_identifier,
-            sm_device_trigger_indicator, mtc_iwf_address,
-            originating_ioi, terminating_ioi, user_session_id,
+            originator_address,
+            recipient_address,
+            originator_sccp_address,
+            recipient_sccp_address,
+            sm_message_type,
+            reply_path_requested,
+            sm_user_data_header,
+            sm_service_type,
+            sms_node,
+            sm_discharge_time,
+            number_of_messages_sent,
+            client_address,
+            data_coding_scheme,
+            sms_result,
+            sm_protocol_id,
+            sm_status,
+            application_port_identifier,
+            external_identifier,
+            sm_device_trigger_indicator,
+            mtc_iwf_address,
+            originating_ioi,
+            terminating_ioi,
+            user_session_id,
         )?;
 
         let mut params = AccountingParams::new(AccountingRecordType::EventRecord);
@@ -2674,13 +2747,26 @@ impl PyDiameter {
         // does `await diameter.ro_ccr_initial(...)`.
         let subscriber = build_subscriber(subscription_id, subscription_id_type)?;
         let ims_data = build_ims_data(
-            calling_party, called_party, sip_method, role_of_node, node_functionality,
-            ims_charging_identifier, user_session_id, originating_ioi, terminating_ioi,
-            application_server, application_provided_called_party_address,
-            incoming_trunk_group_id, outgoing_trunk_group_id, visited_network_id, cause_code,
+            calling_party,
+            called_party,
+            sip_method,
+            role_of_node,
+            node_functionality,
+            ims_charging_identifier,
+            user_session_id,
+            originating_ioi,
+            terminating_ioi,
+            application_server,
+            application_provided_called_party_address,
+            incoming_trunk_group_id,
+            outgoing_trunk_group_id,
+            visited_network_id,
+            cause_code,
         )?;
         let requested = time_service_unit(requested_seconds);
-        let service_context_id = service_context_id.unwrap_or(SERVICE_CONTEXT_ID_IMS).to_string();
+        let service_context_id = service_context_id
+            .unwrap_or(SERVICE_CONTEXT_ID_IMS)
+            .to_string();
         let peer_handle = self.pick_rf_peer(peer).map(|c| c.peer().clone());
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
             let Some(peer_handle) = peer_handle else {
@@ -2704,7 +2790,9 @@ impl PyDiameter {
             };
             match ro::send_ccr(&peer_handle, &params).await {
                 Ok(answer) => Python::attach(|py| {
-                    Ok(credit_control_answer_to_dict(py, answer)?.into_any().unbind())
+                    Ok(credit_control_answer_to_dict(py, answer)?
+                        .into_any()
+                        .unbind())
                 }),
                 Err(error) => {
                     warn!(error = %error, "ro_ccr_initial failed");
@@ -2824,18 +2912,50 @@ impl PyDiameter {
         // (`await diameter.ro_ccr_event(...)`).
         let subscriber = build_subscriber(subscription_id, subscription_id_type)?;
         let ims_data = build_ims_data(
-            calling_party, called_party, None, None, node_functionality,
-            None, user_session_id, None, None, None, None, None, None, None, None,
+            calling_party,
+            called_party,
+            None,
+            None,
+            node_functionality,
+            None,
+            user_session_id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )?;
         let sms_data = build_sms_data(
-            originator_address, recipient_address, None, None,
-            sm_message_type, None, None, sm_service_type,
-            sms_node, None, None, None,
-            data_coding_scheme, None, None, None,
-            None, None, None, None,
-            None, None, user_session_id,
+            originator_address,
+            recipient_address,
+            None,
+            None,
+            sm_message_type,
+            None,
+            None,
+            sm_service_type,
+            sms_node,
+            None,
+            None,
+            None,
+            data_coding_scheme,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            user_session_id,
         )?;
-        let service_context_id = service_context_id.unwrap_or(SERVICE_CONTEXT_ID_IMS).to_string();
+        let service_context_id = service_context_id
+            .unwrap_or(SERVICE_CONTEXT_ID_IMS)
+            .to_string();
         let requested_action = requested_action.unwrap_or(REQUESTED_ACTION_DIRECT_DEBITING);
         let peer_handle = self.pick_rf_peer(peer).map(|c| c.peer().clone());
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
@@ -2860,7 +2980,9 @@ impl PyDiameter {
             };
             match ro::send_ccr(&peer_handle, &params).await {
                 Ok(answer) => Python::attach(|py| {
-                    Ok(credit_control_answer_to_dict(py, answer)?.into_any().unbind())
+                    Ok(credit_control_answer_to_dict(py, answer)?
+                        .into_any()
+                        .unbind())
                 }),
                 Err(error) => {
                     warn!(error = %error, "ro_ccr_event failed");
@@ -2894,7 +3016,9 @@ impl PyDiameter {
         // Python worker thread (`await diameter.ro_ccr_update(...)`).
         let subscriber = build_subscriber(subscription_id, subscription_id_type)?;
         let session_id = session_id.to_string();
-        let service_context_id = service_context_id.unwrap_or(SERVICE_CONTEXT_ID_IMS).to_string();
+        let service_context_id = service_context_id
+            .unwrap_or(SERVICE_CONTEXT_ID_IMS)
+            .to_string();
         let used = time_service_unit(used_seconds);
         let requested = time_service_unit(requested_seconds);
         let peer_handle = self.pick_rf_peer(peer).map(|c| c.peer().clone());
@@ -2920,7 +3044,9 @@ impl PyDiameter {
             };
             match ro::send_ccr(&peer_handle, &params).await {
                 Ok(answer) => Python::attach(|py| {
-                    Ok(credit_control_answer_to_dict(py, answer)?.into_any().unbind())
+                    Ok(credit_control_answer_to_dict(py, answer)?
+                        .into_any()
+                        .unbind())
                 }),
                 Err(error) => {
                     warn!(error = %error, "ro_ccr continuation failed");
@@ -3074,7 +3200,6 @@ fn encode_kwarg_avp(def: &AvpDef, value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>>
     }
 }
 
-
 fn decode_avps_to_pydict<'py>(
     python: Python<'py>,
     value: &serde_json::Value,
@@ -3100,10 +3225,7 @@ fn avp_name_to_snake(name: &str) -> String {
         .collect()
 }
 
-fn json_to_py<'py>(
-    python: Python<'py>,
-    value: &serde_json::Value,
-) -> PyResult<Py<PyAny>> {
+fn json_to_py<'py>(python: Python<'py>, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
     Ok(match value {
         serde_json::Value::Null => python.None(),
         serde_json::Value::Bool(b) => b
@@ -3139,12 +3261,9 @@ fn json_to_py<'py>(
             }
             list.into_any().unbind()
         }
-        serde_json::Value::Object(_) => {
-            decode_avps_to_pydict(python, value)?.into_any().unbind()
-        }
+        serde_json::Value::Object(_) => decode_avps_to_pydict(python, value)?.into_any().unbind(),
     })
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -3189,7 +3308,9 @@ mod tests {
             };
 
             let (write_tx, _write_rx) = tokio::sync::mpsc::channel(1);
-            let peer = Arc::new(crate::diameter::peer::DiameterPeer::new_for_test(config, write_tx));
+            let peer = Arc::new(crate::diameter::peer::DiameterPeer::new_for_test(
+                config, write_tx,
+            ));
             let client = Arc::new(crate::diameter::DiameterClient::new(peer));
             manager.register("hss1".to_string(), client);
         });
@@ -3245,9 +3366,7 @@ mod tests {
         let manager = Arc::new(DiameterManager::new());
         let py_diameter = PyDiameter::new(manager);
         pyo3::Python::attach(|python| {
-            let result = py_diameter
-                .cx_lir(python, "sip:alice@example.com")
-                .unwrap();
+            let result = py_diameter.cx_lir(python, "sip:alice@example.com").unwrap();
             assert!(result.is_none());
         });
     }
@@ -3265,7 +3384,10 @@ mod tests {
             component.set_item("max_bandwidth_dl", 64000u32).unwrap();
             component.set_item("flow_status", "enabled").unwrap();
             component
-                .set_item("codec_data", b"uplink\noffer\nm=audio 50000 RTP/AVP 0".to_vec())
+                .set_item(
+                    "codec_data",
+                    b"uplink\noffer\nm=audio 50000 RTP/AVP 0".to_vec(),
+                )
                 .unwrap();
 
             let flows = PyList::empty(python);
@@ -3355,7 +3477,10 @@ mod tests {
             let tuple = pyo3::types::PyTuple::new(
                 python,
                 [
-                    "sip:alice@example.com".into_pyobject(python).unwrap().into_any(),
+                    "sip:alice@example.com"
+                        .into_pyobject(python)
+                        .unwrap()
+                        .into_any(),
                     "sip_uri".into_pyobject(python).unwrap().into_any(),
                 ],
             )
@@ -3461,7 +3586,6 @@ mod tests {
     // Generic API surface — send_request / on_command
     // -----------------------------------------------------------------
 
-
     #[test]
     fn send_request_rejects_unknown_command() {
         pyo3::Python::initialize();
@@ -3549,10 +3673,9 @@ mod tests {
     #[test]
     fn encode_kwarg_avp_rejects_grouped_with_value() {
         pyo3::Python::initialize();
-        let avp_def = crate::diameter::dictionary::lookup_avp_by_python_name(
-            "smsmi_correlation_id",
-        )
-        .expect("smsmi_correlation_id must resolve");
+        let avp_def =
+            crate::diameter::dictionary::lookup_avp_by_python_name("smsmi_correlation_id")
+                .expect("smsmi_correlation_id must resolve");
         pyo3::Python::attach(|python| {
             let value = "anything".into_pyobject(python).unwrap();
             let result = encode_kwarg_avp(avp_def, value.as_any());
@@ -3568,7 +3691,10 @@ mod tests {
         assert_eq!(avp_name_to_snake("MSISDN"), "msisdn");
         assert_eq!(avp_name_to_snake("SC-Address"), "sc_address");
         assert_eq!(avp_name_to_snake("SM-RP-UI"), "sm_rp_ui");
-        assert_eq!(avp_name_to_snake("SMSMI-Correlation-ID"), "smsmi_correlation_id");
+        assert_eq!(
+            avp_name_to_snake("SMSMI-Correlation-ID"),
+            "smsmi_correlation_id"
+        );
     }
 
     #[test]
@@ -3603,10 +3729,8 @@ mod tests {
         let py_diameter = PyDiameter::new(Arc::new(DiameterManager::new()));
         pyo3::Python::attach(|python| {
             // Raw ISDN-AddressString bytes (0x91 ToN/NPI + TBCD) → E.164 str.
-            let raw = pyo3::types::PyBytes::new(
-                python,
-                &[0x91, 0x13, 0x16, 0x32, 0x54, 0x76, 0xF8],
-            );
+            let raw =
+                pyo3::types::PyBytes::new(python, &[0x91, 0x13, 0x16, 0x32, 0x54, 0x76, 0xF8]);
             assert_eq!(
                 py_diameter.decode_isdn_address(raw.as_any()).unwrap(),
                 "31612345678",
@@ -3653,5 +3777,4 @@ mod tests {
             assert_eq!(plus.as_bytes(), &[0x91, 0x13, 0x16, 0x32, 0x54, 0x76, 0xF8]);
         });
     }
-
 }

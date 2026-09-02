@@ -354,7 +354,8 @@ impl PresenceStore {
             "adding subscription"
         );
 
-        self.subscriptions.insert(subscription_id.clone(), subscription);
+        self.subscriptions
+            .insert(subscription_id.clone(), subscription);
 
         self.watchers
             .entry(resource)
@@ -505,7 +506,10 @@ impl PresenceStore {
 
         if let Some(existing_etag) = etag {
             // Update: replace the document with the matching etag.
-            if let Some(position) = documents.iter().position(|document| document.etag == existing_etag) {
+            if let Some(position) = documents
+                .iter()
+                .position(|document| document.etag == existing_etag)
+            {
                 debug!(
                     entity = %entity,
                     old_etag = %existing_etag,
@@ -547,7 +551,8 @@ impl PresenceStore {
 
             // Clean up empty entries.
             drop(documents);
-            self.documents.remove_if(entity, |_key, documents| documents.is_empty());
+            self.documents
+                .remove_if(entity, |_key, documents| documents.is_empty());
 
             removed
         } else {
@@ -596,7 +601,11 @@ impl PresenceStore {
 
         // Remove expired documents.
         let mut expired_document_count = 0usize;
-        let entity_keys: Vec<String> = self.documents.iter().map(|entry| entry.key().clone()).collect();
+        let entity_keys: Vec<String> = self
+            .documents
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
 
         for entity in entity_keys {
             if let Some(mut documents) = self.documents.get_mut(&entity) {
@@ -606,7 +615,8 @@ impl PresenceStore {
             }
 
             // Clean up empty entries.
-            self.documents.remove_if(&entity, |_key, documents| documents.is_empty());
+            self.documents
+                .remove_if(&entity, |_key, documents| documents.is_empty());
         }
 
         if expired_subscription_count > 0 || expired_document_count > 0 {
@@ -657,20 +667,23 @@ mod tests {
 
     #[test]
     fn subscription_initial_state_is_init() {
-        let subscription = make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
+        let subscription =
+            make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
         assert_eq!(subscription.state, SubscriptionState::Init);
     }
 
     #[test]
     fn subscription_activate() {
-        let mut subscription = make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
+        let mut subscription =
+            make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
         subscription.activate();
         assert_eq!(subscription.state, SubscriptionState::Active);
     }
 
     #[test]
     fn subscription_terminate() {
-        let mut subscription = make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
+        let mut subscription =
+            make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
         subscription.activate();
         subscription.terminate();
         assert_eq!(subscription.state, SubscriptionState::Terminated);
@@ -678,7 +691,8 @@ mod tests {
 
     #[test]
     fn subscription_activate_after_terminated_is_noop() {
-        let mut subscription = make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
+        let mut subscription =
+            make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
         subscription.terminate();
         subscription.activate();
         assert_eq!(subscription.state, SubscriptionState::Terminated);
@@ -686,7 +700,8 @@ mod tests {
 
     #[test]
     fn subscription_refresh_after_terminated_is_noop() {
-        let mut subscription = make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
+        let mut subscription =
+            make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
         subscription.terminate();
         let original_expires = subscription.expires;
         subscription.refresh(Duration::from_secs(7200));
@@ -695,7 +710,8 @@ mod tests {
 
     #[test]
     fn subscription_refresh_resets_timer() {
-        let mut subscription = make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
+        let mut subscription =
+            make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
         subscription.activate();
         let before_refresh = Instant::now();
         subscription.refresh(Duration::from_secs(1800));
@@ -705,7 +721,8 @@ mod tests {
 
     #[test]
     fn subscription_pending_to_active() {
-        let mut subscription = make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
+        let mut subscription =
+            make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
         subscription.state = SubscriptionState::Pending;
         subscription.activate();
         assert_eq!(subscription.state, SubscriptionState::Active);
@@ -715,14 +732,16 @@ mod tests {
 
     #[test]
     fn subscription_not_expired_when_fresh() {
-        let subscription = make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
+        let subscription =
+            make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
         assert!(!subscription.is_expired());
         assert!(subscription.remaining_seconds() > 0);
     }
 
     #[test]
     fn subscription_expired_with_zero_duration() {
-        let subscription = make_short_lived_subscription("sub-1", "sip:bob@example.com", Duration::ZERO);
+        let subscription =
+            make_short_lived_subscription("sub-1", "sip:bob@example.com", Duration::ZERO);
         assert!(subscription.is_expired());
         assert_eq!(subscription.remaining_seconds(), 0);
     }
@@ -742,7 +761,8 @@ mod tests {
     #[test]
     fn store_add_and_get_subscription() {
         let store = PresenceStore::new();
-        let subscription = make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
+        let subscription =
+            make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com");
 
         store.add_subscription(subscription);
 
@@ -762,7 +782,11 @@ mod tests {
     #[test]
     fn store_remove_subscription() {
         let store = PresenceStore::new();
-        store.add_subscription(make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com"));
+        store.add_subscription(make_subscription(
+            "sub-1",
+            "sip:alice@example.com",
+            "sip:bob@example.com",
+        ));
 
         store.remove_subscription("sub-1");
 
@@ -779,7 +803,11 @@ mod tests {
     #[test]
     fn store_refresh_subscription() {
         let store = PresenceStore::new();
-        store.add_subscription(make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com"));
+        store.add_subscription(make_subscription(
+            "sub-1",
+            "sip:alice@example.com",
+            "sip:bob@example.com",
+        ));
 
         let refreshed = store.refresh_subscription("sub-1", Duration::from_secs(1800));
         assert!(refreshed);
@@ -797,7 +825,11 @@ mod tests {
     #[test]
     fn store_terminate_subscription() {
         let store = PresenceStore::new();
-        store.add_subscription(make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com"));
+        store.add_subscription(make_subscription(
+            "sub-1",
+            "sip:alice@example.com",
+            "sip:bob@example.com",
+        ));
 
         store.terminate_subscription("sub-1");
 
@@ -812,8 +844,16 @@ mod tests {
         let store = PresenceStore::new();
         let resource = "sip:bob@example.com";
 
-        store.add_subscription(make_subscription("sub-1", "sip:alice@example.com", resource));
-        store.add_subscription(make_subscription("sub-2", "sip:carol@example.com", resource));
+        store.add_subscription(make_subscription(
+            "sub-1",
+            "sip:alice@example.com",
+            resource,
+        ));
+        store.add_subscription(make_subscription(
+            "sub-2",
+            "sip:carol@example.com",
+            resource,
+        ));
 
         // Activate both so they show up in subscriptions_for.
         if let Some(mut entry) = store.subscriptions.get_mut("sub-1") {
@@ -836,8 +876,16 @@ mod tests {
         let store = PresenceStore::new();
         let resource = "sip:bob@example.com";
 
-        store.add_subscription(make_subscription("sub-1", "sip:alice@example.com", resource));
-        store.add_subscription(make_subscription("sub-2", "sip:carol@example.com", resource));
+        store.add_subscription(make_subscription(
+            "sub-1",
+            "sip:alice@example.com",
+            resource,
+        ));
+        store.add_subscription(make_subscription(
+            "sub-2",
+            "sip:carol@example.com",
+            resource,
+        ));
 
         if let Some(mut entry) = store.subscriptions.get_mut("sub-1") {
             entry.activate();
@@ -861,7 +909,11 @@ mod tests {
         let store = PresenceStore::new();
         let resource = "sip:bob@example.com";
 
-        store.add_subscription(make_subscription("sub-1", "sip:alice@example.com", resource));
+        store.add_subscription(make_subscription(
+            "sub-1",
+            "sip:alice@example.com",
+            resource,
+        ));
         store.remove_subscription("sub-1");
 
         // Watchers map should be cleaned up.
@@ -986,9 +1038,17 @@ mod tests {
         let resource = "sip:bob@example.com";
 
         // Create an already-expired subscription (zero duration).
-        store.add_subscription(make_short_lived_subscription("sub-expired", resource, Duration::ZERO));
+        store.add_subscription(make_short_lived_subscription(
+            "sub-expired",
+            resource,
+            Duration::ZERO,
+        ));
         // Create a long-lived subscription.
-        store.add_subscription(make_subscription("sub-alive", "sip:alice@example.com", resource));
+        store.add_subscription(make_subscription(
+            "sub-alive",
+            "sip:alice@example.com",
+            resource,
+        ));
 
         assert_eq!(store.subscription_count(), 2);
 
@@ -1003,7 +1063,11 @@ mod tests {
     fn store_expire_stale_removes_terminated_subscriptions() {
         let store = PresenceStore::new();
 
-        store.add_subscription(make_subscription("sub-1", "sip:alice@example.com", "sip:bob@example.com"));
+        store.add_subscription(make_subscription(
+            "sub-1",
+            "sip:alice@example.com",
+            "sip:bob@example.com",
+        ));
         store.terminate_subscription("sub-1");
 
         store.expire_stale();
@@ -1158,11 +1222,15 @@ mod tests {
         store.add_subscription(dialog_sub("sub-b", "callB", "ftagB"));
 
         assert_eq!(
-            store.find_subscription_by_dialog("callA", "ftagA").as_deref(),
+            store
+                .find_subscription_by_dialog("callA", "ftagA")
+                .as_deref(),
             Some("sub-a")
         );
         assert_eq!(
-            store.find_subscription_by_dialog("callB", "ftagB").as_deref(),
+            store
+                .find_subscription_by_dialog("callB", "ftagB")
+                .as_deref(),
             Some("sub-b")
         );
         // A mismatched pair (right Call-ID, wrong From-tag) does not match.

@@ -8,8 +8,8 @@
 //! carrying an SDP body (the realistic large value in these messages).
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use std::hint::black_box;
 use siphon::rtpengine::bencode::{decode_full_dict, encode, BencodeValue};
+use std::hint::black_box;
 
 const OFFER_SDP: &str = concat!(
     "v=0\r\n",
@@ -32,11 +32,11 @@ fn offer_dict() -> BencodeValue {
             b"call-id".to_vec(),
             BencodeValue::String(b"a84b4c76e66710@192.0.2.1".to_vec()),
         ),
-        (b"from-tag".to_vec(), BencodeValue::String(b"1928301774".to_vec())),
         (
-            b"ICE".to_vec(),
-            BencodeValue::String(b"remove".to_vec()),
+            b"from-tag".to_vec(),
+            BencodeValue::String(b"1928301774".to_vec()),
         ),
+        (b"ICE".to_vec(), BencodeValue::String(b"remove".to_vec())),
         (
             b"flags".to_vec(),
             BencodeValue::List(vec![
@@ -44,7 +44,10 @@ fn offer_dict() -> BencodeValue {
                 BencodeValue::String(b"replace-origin".to_vec()),
             ]),
         ),
-        (b"sdp".to_vec(), BencodeValue::String(OFFER_SDP.as_bytes().to_vec())),
+        (
+            b"sdp".to_vec(),
+            BencodeValue::String(OFFER_SDP.as_bytes().to_vec()),
+        ),
     ])
 }
 

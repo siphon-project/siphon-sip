@@ -61,12 +61,20 @@ impl TransactionKey {
             Method::Ack => Method::Invite,
             other => other,
         };
-        Self { branch, method, sent_by }
+        Self {
+            branch,
+            method,
+            sent_by,
+        }
     }
 
     /// Create a key from a raw Via branch, method string, and sent-by.
     pub fn from_parts(branch: &str, method: &str, sent_by: &str) -> Self {
-        Self::new(branch.to_string(), Method::from_str(method), sent_by.to_string())
+        Self::new(
+            branch.to_string(),
+            Method::from_str(method),
+            sent_by.to_string(),
+        )
     }
 
     /// Check if a branch value follows the RFC 3261 magic cookie convention.
@@ -90,7 +98,13 @@ impl TransactionKey {
 
 impl fmt::Display for TransactionKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}:{}", self.branch, self.method.as_str(), self.sent_by)
+        write!(
+            f,
+            "{}:{}:{}",
+            self.branch,
+            self.method.as_str(),
+            self.sent_by
+        )
     }
 }
 
@@ -115,8 +129,16 @@ mod tests {
 
     #[test]
     fn same_branch_same_method_different_sent_by_does_not_match() {
-        let key1 = TransactionKey::new("z9hG4bK-abc".to_string(), Method::Invite, "10.0.0.1:5060".to_string());
-        let key2 = TransactionKey::new("z9hG4bK-abc".to_string(), Method::Invite, "10.0.0.2:5060".to_string());
+        let key1 = TransactionKey::new(
+            "z9hG4bK-abc".to_string(),
+            Method::Invite,
+            "10.0.0.1:5060".to_string(),
+        );
+        let key2 = TransactionKey::new(
+            "z9hG4bK-abc".to_string(),
+            Method::Invite,
+            "10.0.0.2:5060".to_string(),
+        );
         assert_ne!(key1, key2);
     }
 
@@ -176,7 +198,11 @@ mod tests {
 
     #[test]
     fn display_format() {
-        let key = TransactionKey::new("z9hG4bK-abc".to_string(), Method::Invite, "10.0.0.1:5060".to_string());
+        let key = TransactionKey::new(
+            "z9hG4bK-abc".to_string(),
+            Method::Invite,
+            "10.0.0.1:5060".to_string(),
+        );
         assert_eq!(key.to_string(), "z9hG4bK-abc:INVITE:10.0.0.1:5060");
     }
 
@@ -184,16 +210,31 @@ mod tests {
     fn hash_equality() {
         use std::collections::HashSet;
         let mut set = HashSet::new();
-        set.insert(TransactionKey::new("z9hG4bK-abc".to_string(), Method::Invite, sb()));
+        set.insert(TransactionKey::new(
+            "z9hG4bK-abc".to_string(),
+            Method::Invite,
+            sb(),
+        ));
         // ACK with same branch + sent_by should find the INVITE transaction
-        assert!(set.contains(&TransactionKey::new("z9hG4bK-abc".to_string(), Method::Ack, sb())));
+        assert!(set.contains(&TransactionKey::new(
+            "z9hG4bK-abc".to_string(),
+            Method::Ack,
+            sb()
+        )));
         // Different method should not
-        assert!(!set.contains(&TransactionKey::new("z9hG4bK-abc".to_string(), Method::Bye, sb())));
+        assert!(!set.contains(&TransactionKey::new(
+            "z9hG4bK-abc".to_string(),
+            Method::Bye,
+            sb()
+        )));
     }
 
     #[test]
     fn format_sent_by_with_port() {
-        assert_eq!(TransactionKey::format_sent_by("10.0.0.1", Some(5060)), "10.0.0.1:5060");
+        assert_eq!(
+            TransactionKey::format_sent_by("10.0.0.1", Some(5060)),
+            "10.0.0.1:5060"
+        );
     }
 
     #[test]

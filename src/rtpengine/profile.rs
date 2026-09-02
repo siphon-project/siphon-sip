@@ -518,8 +518,7 @@ pub const WS_SAMPLE_RATE_STEP: u32 = 1_000;
 ///
 /// Returns a ready-to-print reason on rejection.
 pub fn validate_ws_sample_rate(rate: u32) -> Result<(), String> {
-    if !(WS_SAMPLE_RATE_MIN..=WS_SAMPLE_RATE_MAX).contains(&rate)
-        || rate % WS_SAMPLE_RATE_STEP != 0
+    if !(WS_SAMPLE_RATE_MIN..=WS_SAMPLE_RATE_MAX).contains(&rate) || rate % WS_SAMPLE_RATE_STEP != 0
     {
         return Err(format!(
             "must be a multiple of {WS_SAMPLE_RATE_STEP} within \
@@ -834,7 +833,11 @@ impl NgFlags {
         // address"`.  Only emitted once the script API has injected the address
         // (`carry_received_from` alone changes nothing on the wire).
         if let Some(received_from) = &self.received_from {
-            let family = if received_from.is_ipv6() { "IP6" } else { "IP4" };
+            let family = if received_from.is_ipv6() {
+                "IP6"
+            } else {
+                "IP4"
+            };
             let address = received_from.to_string();
             pairs.push((
                 "received from",
@@ -928,11 +931,17 @@ mod tests {
         assert!(encoded.contains("SILK"), "SILK missing: {encoded}");
         assert!(encoded.contains("offer"), "offer missing: {encoded}");
         assert!(encoded.contains("PCMA"), "PCMA missing: {encoded}");
-        assert!(encoded.contains("transcode"), "transcode missing: {encoded}");
+        assert!(
+            encoded.contains("transcode"),
+            "transcode missing: {encoded}"
+        );
 
         // Empty lists never reach the wire.
         assert!(!encoded.contains("mask"), "an unset key leaked: {encoded}");
-        assert!(!encoded.contains("ignore"), "an unset key leaked: {encoded}");
+        assert!(
+            !encoded.contains("ignore"),
+            "an unset key leaked: {encoded}"
+        );
 
         // And it is NOT folded into `flags`.
         let flags_pair = pairs.iter().find(|(key, _)| *key == "flags");
@@ -959,7 +968,10 @@ mod tests {
         assert!(flat.contains(&"codec-strip-SILK".to_string()), "{flat:?}");
         assert!(flat.contains(&"codec-offer-PCMA".to_string()), "{flat:?}");
         assert!(flat.contains(&"codec-offer-PCMU".to_string()), "{flat:?}");
-        assert!(flat.contains(&"codec-transcode-PCMA".to_string()), "{flat:?}");
+        assert!(
+            flat.contains(&"codec-transcode-PCMA".to_string()),
+            "{flat:?}"
+        );
         assert!(
             flat.contains(&"codec-except-telephone-event".to_string()),
             "{flat:?}"
@@ -1083,13 +1095,16 @@ mod tests {
     fn ws_sample_rate_validation_matches_the_engines_rule() {
         // Whole kHz within 8000-48000 inclusive.
         for rate in [8_000, 16_000, 24_000, 47_000, 48_000] {
-            assert!(validate_ws_sample_rate(rate).is_ok(), "{rate} must be accepted");
+            assert!(
+                validate_ws_sample_rate(rate).is_ok(),
+                "{rate} must be accepted"
+            );
         }
         // Out of range, or not a whole kHz. The engine fails the offer on these
         // rather than clamping, so they must never reach it.
         for rate in [0, 1_000, 7_999, 44_100, 48_001, 96_000] {
-            let error = validate_ws_sample_rate(rate)
-                .expect_err(&format!("{rate} must be rejected"));
+            let error =
+                validate_ws_sample_rate(rate).expect_err(&format!("{rate} must be rejected"));
             assert!(
                 error.contains(&rate.to_string()),
                 "reason should quote the offending rate: {error}"
@@ -1227,10 +1242,7 @@ mod tests {
     fn wss_to_rtp_offer_flags() {
         let registry = ProfileRegistry::new();
         let entry = registry.get("wss_to_rtp").unwrap();
-        assert_eq!(
-            entry.offer.transport_protocol.as_deref(),
-            Some("RTP/SAVPF")
-        );
+        assert_eq!(entry.offer.transport_protocol.as_deref(), Some("RTP/SAVPF"));
         assert_eq!(entry.offer.ice.as_deref(), Some("force"));
         assert_eq!(entry.offer.dtls.as_deref(), Some("passive"));
     }
@@ -1304,7 +1316,10 @@ mod tests {
         let pairs = flags.to_bencode_pairs();
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
         assert!(keys.contains(&"record call"), "missing 'record call' key");
-        assert!(keys.contains(&"recording-dir"), "missing 'recording-dir' key");
+        assert!(
+            keys.contains(&"recording-dir"),
+            "missing 'recording-dir' key"
+        );
     }
 
     /// `address family` must ride its own NG dict key with the SDP `addrtype`
@@ -1530,8 +1545,13 @@ mod tests {
     #[test]
     fn srs_recording_builtin_emits_record_call() {
         let registry = ProfileRegistry::new();
-        let entry = registry.get("srs_recording").expect("srs_recording profile");
-        assert!(entry.offer.record_call, "srs_recording offer must record_call");
+        let entry = registry
+            .get("srs_recording")
+            .expect("srs_recording profile");
+        assert!(
+            entry.offer.record_call,
+            "srs_recording offer must record_call"
+        );
         let pairs = entry.offer.to_bencode_pairs();
         let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
         assert!(keys.contains(&"record call"));

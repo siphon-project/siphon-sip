@@ -388,6 +388,10 @@ mod tests {
         let mut unique = rendered.clone();
         unique.sort();
         unique.dedup();
-        assert_eq!(unique.len(), codes.len(), "codes collide on the wire: {rendered:?}");
+        assert_eq!(
+            unique.len(),
+            codes.len(),
+            "codes collide on the wire: {rendered:?}"
+        );
     }
 }

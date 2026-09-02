@@ -14,9 +14,9 @@
 //! example.com hosts — never real IPs or subscriber identities.
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
-use std::hint::black_box;
 use siphon::sip::parse_sip_message;
 use siphon::transaction::TransactionManager;
+use std::hint::black_box;
 
 /// A realistic offer SDP — the common INVITE body the parser walks on every call.
 const SDP_BODY: &str = concat!(
@@ -113,8 +113,7 @@ fn bench_parse(criterion: &mut Criterion) {
     group.throughput(Throughput::Bytes(INVITE_NO_SDP.len() as u64));
     group.bench_function("invite_no_sdp", |bencher| {
         bencher.iter(|| {
-            let (_, message) =
-                parse_sip_message(black_box(INVITE_NO_SDP)).expect("parse invite");
+            let (_, message) = parse_sip_message(black_box(INVITE_NO_SDP)).expect("parse invite");
             black_box(message)
         });
     });
@@ -203,9 +202,7 @@ fn bench_headers(criterion: &mut Criterion) {
             |mut owned| {
                 owned.headers.add(
                     "Via",
-                    black_box(
-                        "SIP/2.0/UDP proxy.example.com;branch=z9hG4bK-proxy-1".to_string(),
-                    ),
+                    black_box("SIP/2.0/UDP proxy.example.com;branch=z9hG4bK-proxy-1".to_string()),
                 );
                 black_box(owned)
             },
@@ -226,16 +223,13 @@ fn bench_txn_key(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("txn_key");
     group.bench_function("invite", |bencher| {
         bencher.iter(|| {
-            black_box(
-                TransactionManager::key_from_message(black_box(&invite)).expect("invite key"),
-            )
+            black_box(TransactionManager::key_from_message(black_box(&invite)).expect("invite key"))
         });
     });
     group.bench_function("response", |bencher| {
         bencher.iter(|| {
             black_box(
-                TransactionManager::key_from_message(black_box(&response))
-                    .expect("response key"),
+                TransactionManager::key_from_message(black_box(&response)).expect("response key"),
             )
         });
     });

@@ -84,16 +84,15 @@ impl ShutdownCoordinator {
     /// 3. Waits for `timeout`.
     /// 4. Sends `ForceTerminate` to all subscribers.
     pub async fn shutdown(&self) {
-        if self
-            .inner
-            .shutting_down
-            .swap(true, Ordering::SeqCst)
-        {
+        if self.inner.shutting_down.swap(true, Ordering::SeqCst) {
             debug!("Shutdown already in progress");
             return;
         }
 
-        info!("Graceful shutdown initiated — draining for {:?}", self.inner.timeout);
+        info!(
+            "Graceful shutdown initiated — draining for {:?}",
+            self.inner.timeout
+        );
 
         // Notify via watch (polled by accept loops)
         let _ = self.inner.notify_tx.send(true);

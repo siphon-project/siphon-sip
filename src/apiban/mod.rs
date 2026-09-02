@@ -532,11 +532,11 @@ mod tests {
         let client = client_with(&["203.0.113.0/24"], 604_800);
 
         let added = client.ingest(&feed(&[
-            "198.51.100.7",  // untrusted -> banned
-            "203.0.113.7",   // trusted -> skipped
-            "not-an-ip",     // unparseable -> skipped
-            "198.51.100.8",  // untrusted -> banned
-            "198.51.100.7",  // duplicate -> not counted again
+            "198.51.100.7", // untrusted -> banned
+            "203.0.113.7",  // trusted -> skipped
+            "not-an-ip",    // unparseable -> skipped
+            "198.51.100.8", // untrusted -> banned
+            "198.51.100.7", // duplicate -> not counted again
         ]));
 
         assert_eq!(added, 2);

@@ -9,7 +9,10 @@ use siphon::SiphonServer;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[derive(Parser)]
-#[command(name = "siphon", about = "SIPhon — high-performance SIP proxy, B2BUA and IMS platform")]
+#[command(
+    name = "siphon",
+    about = "SIPhon — high-performance SIP proxy, B2BUA and IMS platform"
+)]
 struct Cli {
     /// Path to the configuration file
     #[arg(short = 'c', long = "config", default_value = "siphon.yaml")]

@@ -1,8 +1,8 @@
 //! SIP-aware DNS resolver implementing RFC 3263 server location.
 
-use std::net::{IpAddr, SocketAddr};
-use hickory_resolver::TokioResolver;
 use hickory_resolver::proto::rr::RData;
+use hickory_resolver::TokioResolver;
+use std::net::{IpAddr, SocketAddr};
 use tracing::{debug, warn};
 
 use crate::sip::uri::strip_ipv6_brackets;
@@ -48,8 +48,8 @@ impl SipResolver {
         let host = strip_ipv6_brackets(host);
 
         // Default port: 5061 for sips: or transport=tls, 5060 otherwise
-        let is_tls = scheme == "sips"
-            || transport_hint.is_some_and(|t| t.eq_ignore_ascii_case("tls"));
+        let is_tls =
+            scheme == "sips" || transport_hint.is_some_and(|t| t.eq_ignore_ascii_case("tls"));
         let default_port = if is_tls { 5061 } else { 5060 };
 
         // 1. Numeric IP — no DNS needed
@@ -73,7 +73,8 @@ impl SipResolver {
 
         // 4. No SRV records — fall back to A/AAAA with default port
         debug!(host = %host, port = default_port, "no SRV records, falling back to A/AAAA");
-        self.resolve_a_aaaa(host, default_port, transport_hint).await
+        self.resolve_a_aaaa(host, default_port, transport_hint)
+            .await
     }
 
     /// Perform SRV lookup for a SIP domain.
@@ -129,11 +130,7 @@ impl SipResolver {
                                 priority: srv.priority,
                                 weight: srv.weight,
                                 port: srv.port,
-                                target: srv
-                                    .target
-                                    .to_string()
-                                    .trim_end_matches('.')
-                                    .to_string(),
+                                target: srv.target.to_string().trim_end_matches('.').to_string(),
                             }),
                             _ => None,
                         })
@@ -360,9 +357,14 @@ mod tests {
     #[tokio::test]
     async fn resolve_numeric_ipv4() {
         let resolver = SipResolver::from_system().unwrap();
-        let results = resolver.resolve("192.168.1.100", Some(5080), "sip", None).await;
+        let results = resolver
+            .resolve("192.168.1.100", Some(5080), "sip", None)
+            .await;
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].address, "192.168.1.100:5080".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            results[0].address,
+            "192.168.1.100:5080".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[tokio::test]
@@ -370,7 +372,10 @@ mod tests {
         let resolver = SipResolver::from_system().unwrap();
         let results = resolver.resolve("10.0.0.1", None, "sip", None).await;
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].address, "10.0.0.1:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            results[0].address,
+            "10.0.0.1:5060".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[tokio::test]
@@ -378,7 +383,10 @@ mod tests {
         let resolver = SipResolver::from_system().unwrap();
         let results = resolver.resolve("10.0.0.1", None, "sips", None).await;
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].address, "10.0.0.1:5061".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            results[0].address,
+            "10.0.0.1:5061".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[tokio::test]
@@ -386,7 +394,10 @@ mod tests {
         let resolver = SipResolver::from_system().unwrap();
         let results = resolver.resolve("::1", Some(5060), "sip", None).await;
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].address, "[::1]:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            results[0].address,
+            "[::1]:5060".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[tokio::test]
@@ -395,13 +406,18 @@ mod tests {
         // SIP URIs store IPv6 with brackets — resolver should strip them
         let results = resolver.resolve("[::1]", Some(5060), "sip", None).await;
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].address, "[::1]:5060".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            results[0].address,
+            "[::1]:5060".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[tokio::test]
     async fn resolve_bracketed_ipv6_full() {
         let resolver = SipResolver::from_system().unwrap();
-        let results = resolver.resolve("[2001:db8::1]", Some(5080), "sip", None).await;
+        let results = resolver
+            .resolve("[2001:db8::1]", Some(5080), "sip", None)
+            .await;
         assert_eq!(results.len(), 1);
         let expected: SocketAddr = "[2001:db8::1]:5080".parse().unwrap();
         assert_eq!(results[0].address, expected);
@@ -433,13 +449,23 @@ mod tests {
     async fn resolve_nonexistent_domain_returns_empty() {
         let resolver = SipResolver::from_system().unwrap();
         let results = resolver
-            .resolve("this-domain-should-not-exist-xyzzy.invalid", None, "sip", None)
+            .resolve(
+                "this-domain-should-not-exist-xyzzy.invalid",
+                None,
+                "sip",
+                None,
+            )
             .await;
         assert!(results.is_empty());
     }
 
     fn entry(priority: u16, weight: u16, target: &str) -> SrvEntry {
-        SrvEntry { priority, weight, port: 5060, target: target.to_string() }
+        SrvEntry {
+            priority,
+            weight,
+            port: 5060,
+            target: target.to_string(),
+        }
     }
 
     fn scripted_random(values: Vec<u32>) -> impl FnMut(u32) -> u32 {

@@ -15,8 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use siphon::ipsec::{IntegrityAlgorithm, IpsecManager};
 use siphon::script::api::ipsec::{
-    parse_security_client_multi, strip_ck_ik, PyAuthVectorHandle, PySecurityOffer,
-    PyTransform,
+    parse_security_client_multi, strip_ck_ik, PyAuthVectorHandle, PySecurityOffer, PyTransform,
 };
 use siphon::script::api::reply::PyReply;
 use siphon::script::api::request::PyRequest;
@@ -31,10 +30,7 @@ use siphon::sip::uri::SipUri;
 /// Build a minimal REGISTER carrying a Security-Client header from a UE.
 fn make_register_with_security_client(value: &str) -> PyRequest {
     let message = SipMessageBuilder::new()
-        .request(
-            Method::Register,
-            SipUri::new("ims.example.com".to_string()),
-        )
+        .request(Method::Register, SipUri::new("ims.example.com".to_string()))
         .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-ipsec".to_string())
         .to("<sip:alice@ims.example.com>".to_string())
         .from("<sip:alice@ims.example.com>;tag=ue1".to_string())
@@ -55,10 +51,7 @@ fn make_register_with_security_client(value: &str) -> PyRequest {
 
 fn make_register_without_security_client() -> PyRequest {
     let message = SipMessageBuilder::new()
-        .request(
-            Method::Register,
-            SipUri::new("ims.example.com".to_string()),
-        )
+        .request(Method::Register, SipUri::new("ims.example.com".to_string()))
         .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-ipsec".to_string())
         .to("<sip:alice@ims.example.com>".to_string())
         .from("<sip:alice@ims.example.com>;tag=ue1".to_string())
@@ -228,10 +221,7 @@ fn auth_vector_handle_take_consumes_exactly_once() {
     assert_eq!(bytes.ck[0], 0xAB);
     assert_eq!(bytes.ik[15], 0xCD);
     drop(bytes);
-    assert!(
-        handle.take().is_none(),
-        "second take must yield None"
-    );
+    assert!(handle.take().is_none(), "second take must yield None");
 }
 
 // ---------------------------------------------------------------------------
@@ -417,16 +407,14 @@ fn transform_compatible_with_sha256_aes_cbc() {
 #[test]
 fn derive_integrity_key_md5_returns_ik_unchanged() {
     let ik = [0xAA; 16];
-    let derived =
-        IpsecManager::derive_integrity_key(IntegrityAlgorithm::HmacMd5, &ik).unwrap();
+    let derived = IpsecManager::derive_integrity_key(IntegrityAlgorithm::HmacMd5, &ik).unwrap();
     assert_eq!(derived.as_slice(), &ik[..]);
 }
 
 #[test]
 fn derive_integrity_key_sha1_zero_pads_to_20() {
     let ik = [0xBB; 16];
-    let derived =
-        IpsecManager::derive_integrity_key(IntegrityAlgorithm::HmacSha1, &ik).unwrap();
+    let derived = IpsecManager::derive_integrity_key(IntegrityAlgorithm::HmacSha1, &ik).unwrap();
     assert_eq!(derived.len(), 20);
     assert_eq!(&derived[..16], &ik[..]);
     assert_eq!(&derived[16..], &[0u8; 4]);
@@ -452,8 +440,9 @@ fn derive_integrity_key_sha256_produces_32_bytes_via_hmac() {
 #[test]
 fn derive_integrity_key_rejects_wrong_ik_length() {
     let too_short = [0xEE; 8];
-    assert!(IpsecManager::derive_integrity_key(IntegrityAlgorithm::HmacSha256, &too_short)
-        .is_none());
+    assert!(
+        IpsecManager::derive_integrity_key(IntegrityAlgorithm::HmacSha256, &too_short).is_none()
+    );
 }
 
 #[test]

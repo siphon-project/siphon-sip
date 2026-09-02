@@ -36,7 +36,12 @@ fn avp_type(code: u32, vendor: u32) -> Option<AvpType> {
 /// Grouped AVPs surface as a list of `(code, value, vendor)` tuples, applied
 /// recursively (so `value` is itself such a list for nested groups). This is
 /// the exact shape `set_avp` accepts, so a group read out can be set back in.
-fn avp_to_py<'py>(py: Python<'py>, code: u32, vendor: u32, avp: &Avp) -> PyResult<Bound<'py, PyAny>> {
+fn avp_to_py<'py>(
+    py: Python<'py>,
+    code: u32,
+    vendor: u32,
+    avp: &Avp,
+) -> PyResult<Bound<'py, PyAny>> {
     match &avp.value {
         AvpData::Grouped(children) => {
             let list = PyList::empty(py);
@@ -48,7 +53,10 @@ fn avp_to_py<'py>(py: Python<'py>, code: u32, vendor: u32, avp: &Avp) -> PyResul
         }
         AvpData::Raw(bytes) => match avp_type(code, vendor) {
             Some(AvpType::UTF8String) | Some(AvpType::DiameterIdentity) => {
-                Ok(String::from_utf8_lossy(bytes).into_owned().into_pyobject(py)?.into_any())
+                Ok(String::from_utf8_lossy(bytes)
+                    .into_owned()
+                    .into_pyobject(py)?
+                    .into_any())
             }
             // ISDN-AddressString (MSISDN / SC-Address / SGSN-Number /
             // MME-Number-for-MT-SMS) → decoded E.164 digit string, not raw
@@ -260,7 +268,11 @@ fn msg_get_avp<'py>(
 fn msg_iter_avps<'py>(py: Python<'py>, msg: &DiameterMsg) -> PyResult<Bound<'py, PyList>> {
     let mut rows: Vec<(u32, u32, Bound<'py, PyAny>)> = Vec::with_capacity(msg.avps.len());
     for avp in &msg.avps {
-        rows.push((avp.code, avp.vendor, avp_to_py(py, avp.code, avp.vendor, avp)?));
+        rows.push((
+            avp.code,
+            avp.vendor,
+            avp_to_py(py, avp.code, avp.vendor, avp)?,
+        ));
     }
     PyList::new(py, rows)
 }
@@ -597,7 +609,11 @@ impl PyDiameterRequest {
     /// Origin-Host/Realm, and the request's hop-by-hop / end-to-end. Add the
     /// application AVPs (including grouped ones) with `set_avp`.
     #[pyo3(signature = (result_code=2001, error_message=None))]
-    fn answer(&self, result_code: u32, error_message: Option<String>) -> PyResult<PyDiameterAnswer> {
+    fn answer(
+        &self,
+        result_code: u32,
+        error_message: Option<String>,
+    ) -> PyResult<PyDiameterAnswer> {
         let request = self.lock()?;
         let answer = forward::build_answer(
             &request,
@@ -612,7 +628,11 @@ impl PyDiameterRequest {
     /// Build an error answer for this request (alias of `answer` kept for
     /// readability when refusing). Sets the E-bit for 3xxx/5xxx codes.
     #[pyo3(signature = (result_code, error_message=None))]
-    fn reject(&self, result_code: u32, error_message: Option<String>) -> PyResult<PyDiameterAnswer> {
+    fn reject(
+        &self,
+        result_code: u32,
+        error_message: Option<String>,
+    ) -> PyResult<PyDiameterAnswer> {
         self.answer(result_code, error_message)
     }
 
@@ -747,7 +767,10 @@ mod tests {
                 request.origin_host().unwrap().as_deref(),
                 Some("mme.epc.example.org")
             );
-            assert_eq!(request.dest_realm().unwrap().as_deref(), Some("epc.example.org"));
+            assert_eq!(
+                request.dest_realm().unwrap().as_deref(),
+                Some("epc.example.org")
+            );
             assert!(request.is_request().unwrap());
             assert!(request.is_proxiable().unwrap());
             assert_eq!(
@@ -772,7 +795,10 @@ mod tests {
             assert_eq!(origin_str, "mme.epc.example.org");
 
             // set_avp by name, then read back
-            let value = "scscf.epc.example.org".into_pyobject(py).unwrap().into_any();
+            let value = "scscf.epc.example.org"
+                .into_pyobject(py)
+                .unwrap()
+                .into_any();
             request
                 .set_avp(
                     &"Destination-Host".into_pyobject(py).unwrap().into_any(),
@@ -879,10 +905,18 @@ mod tests {
             // Build Authentication-Info → E-UTRAN-Vector → {RAND,XRES,AUTN,KASME}
             // entirely from Python value shapes (the script owns S6a semantics).
             let vector = PyList::empty(py);
-            vector.append(("RAND", PyBytes::new(py, &[0x11u8; 16]))).unwrap();
-            vector.append(("XRES", PyBytes::new(py, &[0x22u8; 8]))).unwrap();
-            vector.append(("AUTN", PyBytes::new(py, &[0x33u8; 16]))).unwrap();
-            vector.append(("KASME", PyBytes::new(py, &[0x44u8; 32]))).unwrap();
+            vector
+                .append(("RAND", PyBytes::new(py, &[0x11u8; 16])))
+                .unwrap();
+            vector
+                .append(("XRES", PyBytes::new(py, &[0x22u8; 8])))
+                .unwrap();
+            vector
+                .append(("AUTN", PyBytes::new(py, &[0x33u8; 16])))
+                .unwrap();
+            vector
+                .append(("KASME", PyBytes::new(py, &[0x44u8; 32])))
+                .unwrap();
             let auth_info = PyList::empty(py);
             auth_info.append(("E-UTRAN-Vector", &vector)).unwrap();
 
@@ -893,7 +927,10 @@ mod tests {
             let wire = answer.to_wire().unwrap();
             let msg = DiameterMsg::from_wire(&wire).unwrap();
             let ai = msg
-                .find(dictionary::avp::AUTHENTICATION_INFO, dictionary::VENDOR_3GPP)
+                .find(
+                    dictionary::avp::AUTHENTICATION_INFO,
+                    dictionary::VENDOR_3GPP,
+                )
                 .expect("Authentication-Info present");
             let eutran = match &ai.value {
                 AvpData::Grouped(children) => children
@@ -934,7 +971,10 @@ mod tests {
         Python::attach(|_py| {
             let request = py_request();
             let answer = request
-                .reject(dictionary::DIAMETER_UNABLE_TO_DELIVER, Some("no route".into()))
+                .reject(
+                    dictionary::DIAMETER_UNABLE_TO_DELIVER,
+                    Some("no route".into()),
+                )
                 .unwrap();
             assert_eq!(
                 answer.result_code().unwrap(),

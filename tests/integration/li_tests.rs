@@ -15,8 +15,7 @@ use siphon::li::x1::message::{DestinationDetails, TaskDetails};
 use siphon::li::x1::server::{serve, PeerIdentity, X1Server};
 use siphon::li::x1::store::{ContentCapability, DestinationStore, TaskStore};
 use siphon::li::x1::types::{
-    DId, DeliveryAddress, DeliveryType, IpAddressPort, Port, TargetIdentifier, XId,
-    DEFAULT_VERSION,
+    DId, DeliveryAddress, DeliveryType, IpAddressPort, Port, TargetIdentifier, XId, DEFAULT_VERSION,
 };
 use siphon::li::{IriEventType, LiManager};
 
@@ -54,9 +53,7 @@ struct TestPki {
 }
 
 fn generate_pki(client_common_name: &str) -> TestPki {
-    use rcgen::{
-        BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, SanType,
-    };
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, SanType};
 
     let make_ca = |name: &str| {
         let key = KeyPair::generate().expect("ca keygen");
@@ -229,19 +226,15 @@ fn activate_task_xml(x_id: XId, d_id: DId, delivery: DeliveryType, target: &str)
     )
 }
 
-fn build_server(
-    config: &LiX1Config,
-    manager: &LiManager,
-) -> Arc<X1Server> {
+fn build_server(config: &LiX1Config, manager: &LiManager) -> Arc<X1Server> {
     let audit_manager = manager.clone();
-    let hook: siphon::li::x1::server::AuditHook =
-        Arc::new(move |operation, subject, detail| {
-            audit_manager.audit(
-                siphon::li::AuditOperation::Provisioning(operation.to_string()),
-                subject,
-                detail,
-            );
-        });
+    let hook: siphon::li::x1::server::AuditHook = Arc::new(move |operation, subject, detail| {
+        audit_manager.audit(
+            siphon::li::AuditOperation::Provisioning(operation.to_string()),
+            subject,
+            detail,
+        );
+    });
     Arc::new(
         X1Server::new(
             config,
@@ -259,8 +252,7 @@ fn build_server(
 
 #[tokio::test]
 async fn a_provisioned_warrant_is_matched_and_produces_an_iri_record() {
-    let (manager, mut iri, _audit) =
-        LiManager::new(li_config(), 100, ContentCapability::Available);
+    let (manager, mut iri, _audit) = LiManager::new(li_config(), 100, ContentCapability::Available);
     let directory = tempfile::tempdir().expect("tempdir");
     let pki = generate_pki(ADMF);
     let config = x1_config(&directory, &pki);
@@ -271,7 +263,8 @@ async fn a_provisioned_warrant_is_matched_and_produces_an_iri_record() {
 
     let d_id = DId::generate();
     let x_id = XId::generate();
-    let response = server.handle_container(&create_destination_xml(d_id, DeliveryType::X2AndX3), &peer);
+    let response =
+        server.handle_container(&create_destination_xml(d_id, DeliveryType::X2AndX3), &peer);
     assert!(response.contains("CreateDestinationResponse"), "{response}");
     let response = server.handle_container(
         &activate_task_xml(x_id, d_id, DeliveryType::X2Only, "sip:alice@example.com"),
@@ -301,13 +294,16 @@ async fn a_provisioned_warrant_is_matched_and_produces_an_iri_record() {
     let delivered = iri.recv().await.expect("an IRI record must be delivered");
     assert_eq!(delivered.x_id, x_id);
     assert_ne!(delivered.correlation_id, 0);
-    assert_eq!(delivered.destinations.len(), 1, "only the named destination");
+    assert_eq!(
+        delivered.destinations.len(),
+        1,
+        "only the named destination"
+    );
 }
 
 #[tokio::test]
 async fn deactivating_a_task_over_x1_stops_it_matching() {
-    let (manager, _iri, _audit) =
-        LiManager::new(li_config(), 100, ContentCapability::Available);
+    let (manager, _iri, _audit) = LiManager::new(li_config(), 100, ContentCapability::Available);
     let directory = tempfile::tempdir().expect("tempdir");
     let pki = generate_pki(ADMF);
     let server = build_server(&x1_config(&directory, &pki), &manager);
@@ -342,8 +338,7 @@ async fn deactivating_a_task_over_x1_stops_it_matching() {
 
 #[tokio::test]
 async fn modifying_a_task_over_x1_moves_the_matching_target() {
-    let (manager, _iri, _audit) =
-        LiManager::new(li_config(), 100, ContentCapability::Available);
+    let (manager, _iri, _audit) = LiManager::new(li_config(), 100, ContentCapability::Available);
     let directory = tempfile::tempdir().expect("tempdir");
     let pki = generate_pki(ADMF);
     let server = build_server(&x1_config(&directory, &pki), &manager);
@@ -380,8 +375,7 @@ async fn modifying_a_task_over_x1_moves_the_matching_target() {
 
 #[tokio::test]
 async fn a_task_delivers_only_to_the_destinations_it_names() {
-    let (manager, _iri, _audit) =
-        LiManager::new(li_config(), 100, ContentCapability::Available);
+    let (manager, _iri, _audit) = LiManager::new(li_config(), 100, ContentCapability::Available);
     let directory = tempfile::tempdir().expect("tempdir");
     let pki = generate_pki(ADMF);
     let server = build_server(&x1_config(&directory, &pki), &manager);
@@ -392,7 +386,10 @@ async fn a_task_delivers_only_to_the_destinations_it_names() {
     let named = DId::generate();
     let unnamed = DId::generate();
     server.handle_container(&create_destination_xml(named, DeliveryType::X2AndX3), &peer);
-    server.handle_container(&create_destination_xml(unnamed, DeliveryType::X2AndX3), &peer);
+    server.handle_container(
+        &create_destination_xml(unnamed, DeliveryType::X2AndX3),
+        &peer,
+    );
 
     let x_id = XId::generate();
     server.handle_container(
@@ -407,8 +404,7 @@ async fn a_task_delivers_only_to_the_destinations_it_names() {
 
 #[tokio::test]
 async fn removing_a_destination_a_task_uses_is_refused() {
-    let (manager, _iri, _audit) =
-        LiManager::new(li_config(), 100, ContentCapability::Available);
+    let (manager, _iri, _audit) = LiManager::new(li_config(), 100, ContentCapability::Available);
     let directory = tempfile::tempdir().expect("tempdir");
     let pki = generate_pki(ADMF);
     let server = build_server(&x1_config(&directory, &pki), &manager);
@@ -428,7 +424,10 @@ async fn removing_a_destination_a_task_uses_is_refused() {
         &request("RemoveDestinationRequest", &format!("<dId>{d_id}</dId>")),
         &peer,
     );
-    assert!(response.contains("<errorCode>7010</errorCode>"), "{response}");
+    assert!(
+        response.contains("<errorCode>7010</errorCode>"),
+        "{response}"
+    );
     assert!(manager.destinations().contains(d_id));
 
     // Once the task is gone, the destination can be removed.
@@ -475,7 +474,10 @@ async fn a_content_warrant_is_refused_on_a_backend_that_cannot_deliver_content()
         &peer,
     );
 
-    assert!(response.contains("<errorCode>3040</errorCode>"), "{response}");
+    assert!(
+        response.contains("<errorCode>3040</errorCode>"),
+        "{response}"
+    );
     assert!(
         manager.tasks().is_empty(),
         "a warrant that cannot be honoured must not read as provisioned"
@@ -604,10 +606,7 @@ fn x2_only_needs_no_particular_media_backend() {
 // ---------------------------------------------------------------------------
 
 /// Bind a real X1 listener and return its address.
-async fn start_listener(
-    config: LiX1Config,
-    manager: &LiManager,
-) -> SocketAddr {
+async fn start_listener(config: LiX1Config, manager: &LiManager) -> SocketAddr {
     install_crypto_provider();
     let server = build_server(&config, manager);
     serve(Arc::new(config), server)
@@ -623,17 +622,14 @@ fn client_with(pki: &TestPki, certificate: &str, key: &str) -> reqwest::Client {
     identity_pem.extend_from_slice(key.as_bytes());
     reqwest::Client::builder()
         .identity(reqwest::Identity::from_pem(&identity_pem).expect("client identity"))
-        .add_root_certificate(
-            reqwest::Certificate::from_pem(pki.ca_pem.as_bytes()).expect("root"),
-        )
+        .add_root_certificate(reqwest::Certificate::from_pem(pki.ca_pem.as_bytes()).expect("root"))
         .build()
         .expect("client")
 }
 
 #[tokio::test]
 async fn a_client_with_a_trusted_certificate_is_served() {
-    let (manager, _iri, _audit) =
-        LiManager::new(li_config(), 100, ContentCapability::Available);
+    let (manager, _iri, _audit) = LiManager::new(li_config(), 100, ContentCapability::Available);
     let directory = tempfile::tempdir().expect("tempdir");
     let pki = generate_pki(ADMF);
     let config = x1_config(&directory, &pki);
@@ -656,8 +652,7 @@ async fn a_client_with_a_trusted_certificate_is_served() {
 
 #[tokio::test]
 async fn a_client_with_no_certificate_is_rejected() {
-    let (manager, _iri, _audit) =
-        LiManager::new(li_config(), 100, ContentCapability::Available);
+    let (manager, _iri, _audit) = LiManager::new(li_config(), 100, ContentCapability::Available);
     let directory = tempfile::tempdir().expect("tempdir");
     let pki = generate_pki(ADMF);
     let config = x1_config(&directory, &pki);
@@ -666,9 +661,7 @@ async fn a_client_with_no_certificate_is_rejected() {
 
     install_crypto_provider();
     let client = reqwest::Client::builder()
-        .add_root_certificate(
-            reqwest::Certificate::from_pem(pki.ca_pem.as_bytes()).expect("root"),
-        )
+        .add_root_certificate(reqwest::Certificate::from_pem(pki.ca_pem.as_bytes()).expect("root"))
         .build()
         .expect("client");
 
@@ -685,8 +678,7 @@ async fn a_client_with_no_certificate_is_rejected() {
 
 #[tokio::test]
 async fn a_client_signed_by_an_unknown_ca_is_rejected() {
-    let (manager, _iri, _audit) =
-        LiManager::new(li_config(), 100, ContentCapability::Available);
+    let (manager, _iri, _audit) = LiManager::new(li_config(), 100, ContentCapability::Available);
     let directory = tempfile::tempdir().expect("tempdir");
     let pki = generate_pki(ADMF);
     let config = x1_config(&directory, &pki);
@@ -713,8 +705,7 @@ async fn a_client_signed_by_an_unknown_ca_is_rejected() {
 async fn a_listener_whose_client_ca_is_unreadable_fails_to_start() {
     // Fail closed: X1 provisions warrants, so a listener that would accept
     // anyone must not come up at all.
-    let (manager, _iri, _audit) =
-        LiManager::new(li_config(), 100, ContentCapability::Available);
+    let (manager, _iri, _audit) = LiManager::new(li_config(), 100, ContentCapability::Available);
     let directory = tempfile::tempdir().expect("tempdir");
     let pki = generate_pki(ADMF);
     let mut config = x1_config(&directory, &pki);
@@ -723,13 +714,15 @@ async fn a_listener_whose_client_ca_is_unreadable_fails_to_start() {
     install_crypto_provider();
     let server = build_server(&config, &manager);
     let result = serve(Arc::new(config), server).await;
-    assert!(result.is_err(), "a missing client CA must be a startup error");
+    assert!(
+        result.is_err(),
+        "a missing client CA must be a startup error"
+    );
 }
 
 #[tokio::test]
 async fn a_listener_whose_client_ca_holds_no_certificates_fails_to_start() {
-    let (manager, _iri, _audit) =
-        LiManager::new(li_config(), 100, ContentCapability::Available);
+    let (manager, _iri, _audit) = LiManager::new(li_config(), 100, ContentCapability::Available);
     let directory = tempfile::tempdir().expect("tempdir");
     let pki = generate_pki(ADMF);
     let mut config = x1_config(&directory, &pki);
@@ -748,8 +741,7 @@ async fn a_listener_whose_client_ca_holds_no_certificates_fails_to_start() {
 async fn the_certificate_common_name_is_bound_to_the_admf_identifier() {
     // The reason X1 owns its own listener: the message's claim about who sent
     // it is checked against what TLS proved.
-    let (manager, _iri, _audit) =
-        LiManager::new(li_config(), 100, ContentCapability::Available);
+    let (manager, _iri, _audit) = LiManager::new(li_config(), 100, ContentCapability::Available);
     let directory = tempfile::tempdir().expect("tempdir");
     // A client whose certificate names someone other than the admfIdentifier
     // its messages carry.
@@ -775,8 +767,7 @@ async fn the_certificate_common_name_is_bound_to_the_admf_identifier() {
 
 #[tokio::test]
 async fn a_request_to_the_wrong_path_is_not_served() {
-    let (manager, _iri, _audit) =
-        LiManager::new(li_config(), 100, ContentCapability::Available);
+    let (manager, _iri, _audit) = LiManager::new(li_config(), 100, ContentCapability::Available);
     let directory = tempfile::tempdir().expect("tempdir");
     let pki = generate_pki(ADMF);
     let config = x1_config(&directory, &pki);
@@ -784,7 +775,10 @@ async fn a_request_to_the_wrong_path_is_not_served() {
 
     let client = client_with(&pki, &pki.client_cert_pem, &pki.client_key_pem);
     let response = client
-        .post(format!("https://localhost:{}/not/the/x1/path", address.port()))
+        .post(format!(
+            "https://localhost:{}/not/the/x1/path",
+            address.port()
+        ))
         .body(request("PingRequest", ""))
         .send()
         .await
@@ -794,8 +788,7 @@ async fn a_request_to_the_wrong_path_is_not_served() {
 
 #[tokio::test]
 async fn a_full_provisioning_round_trip_over_mutual_tls() {
-    let (manager, _iri, _audit) =
-        LiManager::new(li_config(), 100, ContentCapability::Available);
+    let (manager, _iri, _audit) = LiManager::new(li_config(), 100, ContentCapability::Available);
     let directory = tempfile::tempdir().expect("tempdir");
     let pki = generate_pki(ADMF);
     let config = x1_config(&directory, &pki);
@@ -864,8 +857,7 @@ async fn interception_does_not_depend_on_the_script_calling_anything() {
     // in the picture at all. If the gate ever moves back into Python, the
     // matching call will need a script context and this stops compiling — or,
     // worse, starts returning nothing, which is what the assertion catches.
-    let (manager, _iri, _audit) =
-        LiManager::new(li_config(), 100, ContentCapability::Available);
+    let (manager, _iri, _audit) = LiManager::new(li_config(), 100, ContentCapability::Available);
     let directory = tempfile::tempdir().expect("tempdir");
     let pki = generate_pki(ADMF);
     let server = build_server(&x1_config(&directory, &pki), &manager);
@@ -902,8 +894,7 @@ async fn interception_does_not_depend_on_the_script_calling_anything() {
 async fn every_leg_of_a_call_is_matched_not_just_the_first() {
     // The failure mode the enforcement change exists to prevent: a script that
     // acted on the A-leg and forgot the B-leg intercepted half the call.
-    let (manager, _iri, _audit) =
-        LiManager::new(li_config(), 100, ContentCapability::Available);
+    let (manager, _iri, _audit) = LiManager::new(li_config(), 100, ContentCapability::Available);
     let directory = tempfile::tempdir().expect("tempdir");
     let pki = generate_pki(ADMF);
     let server = build_server(&x1_config(&directory, &pki), &manager);
@@ -951,7 +942,12 @@ async fn every_leg_of_a_call_is_matched_not_just_the_first() {
     // And the 200 OK coming back.
     assert_eq!(
         manager
-            .check_message(None, Some("sip:alice@example.com"), Some("sip:bob@example.com"), None)
+            .check_message(
+                None,
+                Some("sip:alice@example.com"),
+                Some("sip:bob@example.com"),
+                None
+            )
             .len(),
         1
     );
@@ -969,7 +965,12 @@ fn restarting_restores_provisioned_state_from_the_admf() {
     let d_id = DId::generate();
     let x_id = XId::generate();
     let admf_view = ReconciledState {
-        tasks: vec![task(x_id, d_id, DeliveryType::X2Only, "sip:alice@example.com")],
+        tasks: vec![task(
+            x_id,
+            d_id,
+            DeliveryType::X2Only,
+            "sip:alice@example.com",
+        )],
         destinations: vec![destination(d_id, DeliveryType::X2AndX3, 42069)],
     };
 

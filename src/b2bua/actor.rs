@@ -212,13 +212,21 @@ impl Dialog {
         let old_pattern = format!("tag={}", old_from_tag);
         let new_pattern = format!("tag={}", new_from_tag);
 
-        if let Some(from) = message.headers.get("From").or_else(|| message.headers.get("f")) {
+        if let Some(from) = message
+            .headers
+            .get("From")
+            .or_else(|| message.headers.get("f"))
+        {
             if from.contains(&old_pattern) {
                 let new_from = from.replace(&old_pattern, &new_pattern);
                 message.headers.set("From", new_from);
             }
         }
-        if let Some(to) = message.headers.get("To").or_else(|| message.headers.get("t")) {
+        if let Some(to) = message
+            .headers
+            .get("To")
+            .or_else(|| message.headers.get("t"))
+        {
             if to.contains(&old_pattern) {
                 let new_to = to.replace(&old_pattern, &new_pattern);
                 message.headers.set("To", new_to);
@@ -226,7 +234,11 @@ impl Dialog {
         }
 
         if let Some(new_tag) = new_to_tag {
-            if let Some(to) = message.headers.get("To").or_else(|| message.headers.get("t")) {
+            if let Some(to) = message
+                .headers
+                .get("To")
+                .or_else(|| message.headers.get("t"))
+            {
                 if let Ok(mut name_addr) = crate::sip::headers::nameaddr::NameAddr::parse(to) {
                     if name_addr.tag.is_some() {
                         name_addr.tag = if new_tag.is_empty() {
@@ -289,9 +301,7 @@ pub fn ensure_tag(header_value: &str, tag: Option<&str>) -> String {
 pub fn rewrite_uri_host(header_value: &str, new_host: &str) -> String {
     if let Some(at_pos) = header_value.find('@') {
         let after_at = &header_value[at_pos + 1..];
-        let host_end = after_at
-            .find(['>', ';', ':'])
-            .unwrap_or(after_at.len());
+        let host_end = after_at.find(['>', ';', ':']).unwrap_or(after_at.len());
         let end_pos = at_pos + 1 + host_end;
         format!(
             "{}{}{}",
@@ -668,13 +678,17 @@ impl LegRegistry {
 
     /// Look up (without removing) the originated REFER a branch belongs to.
     pub fn lookup_originated_refer(&self, branch: &str) -> Option<OriginatedRefer> {
-        self.originated_refers.get(branch).map(|entry| entry.clone())
+        self.originated_refers
+            .get(branch)
+            .map(|entry| entry.clone())
     }
 
     /// Remove and return the originated REFER a branch belongs to — the final
     /// response for a non-INVITE transaction ends it, so the entry goes with it.
     pub fn take_originated_refer(&self, branch: &str) -> Option<OriginatedRefer> {
-        self.originated_refers.remove(branch).map(|(_, refer)| refer)
+        self.originated_refers
+            .remove(branch)
+            .map(|(_, refer)| refer)
     }
 
     /// Drop every originated REFER belonging to a call.
@@ -685,12 +699,14 @@ impl LegRegistry {
 
     /// Register a SIP Call-ID → internal call ID mapping.
     pub fn register_call_id(&self, sip_call_id: &str, internal_id: &str) {
-        self.by_call_id.insert(sip_call_id.to_string(), internal_id.to_string());
+        self.by_call_id
+            .insert(sip_call_id.to_string(), internal_id.to_string());
     }
 
     /// Register a Via branch → internal call ID mapping.
     pub fn register_branch(&self, branch: &str, internal_id: &str) {
-        self.by_branch.insert(branch.to_string(), internal_id.to_string());
+        self.by_branch
+            .insert(branch.to_string(), internal_id.to_string());
     }
 
     /// Look up internal call ID by SIP Call-ID.
@@ -989,7 +1005,11 @@ pub struct CallActor {
     pub contact_override: Option<String>,
     /// Pre-built ACK for the winning B-leg, deferred until A-leg ACKs (late ACK pattern).
     /// Contains (ACK message, transport, destination address).
-    pub pending_b_leg_ack: Option<(SipMessage, crate::transport::Transport, std::net::SocketAddr)>,
+    pub pending_b_leg_ack: Option<(
+        SipMessage,
+        crate::transport::Transport,
+        std::net::SocketAddr,
+    )>,
     /// Resolved header policy for this call (preset + per-call deltas) — set
     /// when the script calls `call.dial(header_policy=…)`.  When `None`, the
     /// dispatcher falls back to the configured `b2bua.default_header_policy`.
@@ -1320,12 +1340,18 @@ impl CallActor {
 
     /// Find a B-leg by its Via branch.
     pub fn find_b_leg_by_branch(&self, branch: &str) -> Option<(usize, &Leg)> {
-        self.b_legs.iter().enumerate().find(|(_, leg)| leg.branch == branch)
+        self.b_legs
+            .iter()
+            .enumerate()
+            .find(|(_, leg)| leg.branch == branch)
     }
 
     /// Find a B-leg mutably by its Via branch.
     pub fn find_b_leg_by_branch_mut(&mut self, branch: &str) -> Option<(usize, &mut Leg)> {
-        self.b_legs.iter_mut().enumerate().find(|(_, leg)| leg.branch == branch)
+        self.b_legs
+            .iter_mut()
+            .enumerate()
+            .find(|(_, leg)| leg.branch == branch)
     }
 
     /// Set the winner and update call state.
@@ -1372,13 +1398,18 @@ impl CallActor {
 
     /// Whether we've already forwarded a ringing indication to the A-leg.
     pub fn any_b_leg_ringing(&self) -> bool {
-        self.b_leg_status.iter().any(|s| matches!(s, BLegStatus::Ringing | BLegStatus::Answered))
+        self.b_leg_status
+            .iter()
+            .any(|s| matches!(s, BLegStatus::Ringing | BLegStatus::Answered))
     }
 
     /// Check if all B-legs have reached a terminal state.
     pub fn all_b_legs_settled(&self) -> bool {
         self.b_leg_status.iter().all(|s| {
-            matches!(s, BLegStatus::Answered | BLegStatus::Failed(_) | BLegStatus::Cancelled)
+            matches!(
+                s,
+                BLegStatus::Answered | BLegStatus::Failed(_) | BLegStatus::Cancelled
+            )
         })
     }
 
@@ -1604,7 +1635,9 @@ impl CallActorStore {
                 // evict it. A late in-dialog request for this call falls through
                 // to the script instead of drawing a 481; that is the lesser
                 // failure next to an unbounded map.
-                warn!("terminated-call order mutex poisoned, not remembering {sip_call_id}: {error}");
+                warn!(
+                    "terminated-call order mutex poisoned, not remembering {sip_call_id}: {error}"
+                );
                 return;
             }
         };
@@ -1788,10 +1821,7 @@ impl CallActorStore {
             let leg_matches = |leg: &Leg| {
                 leg.dialog.call_id == call_id
                     && leg.dialog.local_tag == to_tag
-                    && (leg
-                        .dialog
-                        .remote_tag
-                        .as_deref() == Some(from_tag))
+                    && (leg.dialog.remote_tag.as_deref() == Some(from_tag))
             };
             if leg_matches(&call.a_leg) {
                 return Some(ReplacesMatch {
@@ -1896,7 +1926,8 @@ impl CallActorStore {
 
         // The new party's dialog now belongs to this call, so its Call-ID has to
         // resolve here — its ACK, re-INVITEs and BYE all arrive on it.
-        self.registry.register_call_id(&new_sip_call_id, replaced_call_id);
+        self.registry
+            .register_call_id(&new_sip_call_id, replaced_call_id);
         self.registry.register_branch(&new_branch, replaced_call_id);
 
         self.registry.remove_call_id(&replaced.dialog.call_id);
@@ -2043,7 +2074,9 @@ impl CallActorStore {
     /// dispatcher's retry cap before deciding whether to re-auth or surface the
     /// failure.
     pub fn auth_retry_count(&self, call_id: &str) -> u32 {
-        self.calls.get(call_id).map_or(0, |call| call.auth_retry_count)
+        self.calls
+            .get(call_id)
+            .map_or(0, |call| call.auth_retry_count)
     }
 
     /// Increment and return the per-call credentialed-retry counter. Called
@@ -2189,12 +2222,18 @@ impl CallActorStore {
     }
 
     /// Get a call by internal ID.
-    pub fn get_call(&self, call_id: &str) -> Option<dashmap::mapref::one::Ref<'_, String, CallActor>> {
+    pub fn get_call(
+        &self,
+        call_id: &str,
+    ) -> Option<dashmap::mapref::one::Ref<'_, String, CallActor>> {
         self.calls.get(call_id)
     }
 
     /// Get a mutable reference to a call.
-    pub fn get_call_mut(&self, call_id: &str) -> Option<dashmap::mapref::one::RefMut<'_, String, CallActor>> {
+    pub fn get_call_mut(
+        &self,
+        call_id: &str,
+    ) -> Option<dashmap::mapref::one::RefMut<'_, String, CallActor>> {
         self.calls.get_mut(call_id)
     }
 
@@ -2317,7 +2356,9 @@ impl CallActorStore {
 
     /// The best (highest-priority) error across a call's exhausted attempts.
     pub fn best_route_error(&self, call_id: &str) -> Option<u16> {
-        self.calls.get(call_id).and_then(|call| call.best_route_error())
+        self.calls
+            .get(call_id)
+            .and_then(|call| call.best_route_error())
     }
 
     /// When the call was created — i.e. when its A-leg INVITE arrived.  Rf
@@ -2390,9 +2431,9 @@ impl CallActorStore {
         self.calls
             .get(call_id)
             .map(|call| {
-                call.refer_subscriptions
-                    .iter()
-                    .any(|subscription| !subscription.siphon_notifies && subscription.on_a_leg == on_a_leg)
+                call.refer_subscriptions.iter().any(|subscription| {
+                    !subscription.siphon_notifies && subscription.on_a_leg == on_a_leg
+                })
             })
             .unwrap_or(false)
     }
@@ -2538,7 +2579,8 @@ impl CallActorStore {
         if on_a_leg {
             Some(call.a_leg.clone())
         } else {
-            call.winner.and_then(|index| call.b_legs.get(index).cloned())
+            call.winner
+                .and_then(|index| call.b_legs.get(index).cloned())
         }
     }
 
@@ -2689,9 +2731,7 @@ impl CallActorStore {
             // the callee retransmitting a 487 nobody ACKs (RFC 3261 §17.1.1.3),
             // or a 200 for a dialog nobody ACKs or BYEs (§9.1 glare, §13.2.2.4,
             // §15).
-            if call.originated
-                && matches!(call.state, CallState::Calling | CallState::Ringing)
-            {
+            if call.originated && matches!(call.state, CallState::Calling | CallState::Ringing) {
                 if let Some(invite) = call.a_leg_invite.as_ref() {
                     self.zombie_cancelled.insert(
                         call.a_leg.dialog.call_id.clone(),
@@ -2757,10 +2797,7 @@ impl CallActorStore {
     /// retransmission of the response while it sits in `Completed`. Answering
     /// only the first would leave a peer whose ACK was lost retransmitting to
     /// Timer H regardless — the exact stall this entry exists to end.
-    pub fn zombie_cancelled_for_non2xx(
-        &self,
-        sip_call_id: &str,
-    ) -> Option<(Leg, Option<String>)> {
+    pub fn zombie_cancelled_for_non2xx(&self, sip_call_id: &str) -> Option<(Leg, Option<String>)> {
         self.zombie_cancelled
             .get(sip_call_id)
             .map(|entry| (entry.leg.clone(), entry.invite_ruri.clone()))
@@ -2799,7 +2836,9 @@ impl CallActorStore {
     /// Sweep stale calls older than the given duration.
     pub fn sweep_stale(&self, max_age: std::time::Duration) -> usize {
         let now = std::time::Instant::now();
-        let stale_ids: Vec<String> = self.calls.iter()
+        let stale_ids: Vec<String> = self
+            .calls
+            .iter()
             .filter(|entry| now.duration_since(entry.created_at) > max_age)
             .map(|entry| entry.id.clone())
             .collect();
@@ -2830,7 +2869,9 @@ impl CallActorStore {
 
     /// The control app owning a call, if any (cloned).
     pub fn control_app(&self, call_id: &str) -> Option<String> {
-        self.calls.get(call_id).and_then(|call| call.control_app.clone())
+        self.calls
+            .get(call_id)
+            .and_then(|call| call.control_app.clone())
     }
 
     /// Record that the controlling app has acted on a parked call: clear the
@@ -2871,10 +2912,13 @@ impl CallActorStore {
     /// and calls without a deadline are skipped, so a long answered call (whose
     /// `created_at` is old but which is past `Answered`) is never touched.
     pub fn take_timed_out_calls(&self, now: std::time::Instant) -> Vec<String> {
-        self.calls.iter()
+        self.calls
+            .iter()
             .filter(|entry| {
                 matches!(entry.state, CallState::Calling | CallState::Ringing)
-                    && entry.answer_deadline.is_some_and(|deadline| now >= deadline)
+                    && entry
+                        .answer_deadline
+                        .is_some_and(|deadline| now >= deadline)
             })
             .map(|entry| entry.id.clone())
             .collect()
@@ -2939,13 +2983,25 @@ pub enum LegMessage {
 #[derive(Debug)]
 pub enum CallEvent {
     /// Provisional response (1xx).
-    Provisional { leg_id: LegId, status_code: u16, message: SipMessage },
+    Provisional {
+        leg_id: LegId,
+        status_code: u16,
+        message: SipMessage,
+    },
     /// Success response (2xx).
     Answered { leg_id: LegId, message: SipMessage },
     /// Error response (3xx-6xx).
-    Failed { leg_id: LegId, status_code: u16, message: SipMessage },
+    Failed {
+        leg_id: LegId,
+        status_code: u16,
+        message: SipMessage,
+    },
     /// BYE received.
-    Bye { leg_id: LegId, from_side: LegSide, message: SipMessage },
+    Bye {
+        leg_id: LegId,
+        from_side: LegSide,
+        message: SipMessage,
+    },
     /// re-INVITE received.
     ReInvite { leg_id: LegId, message: SipMessage },
     /// REFER received.
@@ -2980,10 +3036,7 @@ pub struct LegHandle {
 
 impl LegActor {
     /// Create a new leg actor. Returns `(actor, handle)`.
-    pub fn new(
-        leg: Leg,
-        call_tx: tokio::sync::mpsc::Sender<CallEvent>,
-    ) -> (Self, LegHandle) {
+    pub fn new(leg: Leg, call_tx: tokio::sync::mpsc::Sender<CallEvent>) -> (Self, LegHandle) {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let handle = LegHandle {
             id: leg.id.clone(),
@@ -3019,9 +3072,12 @@ impl LegActor {
             }
         }
 
-        let _ = self.call_tx.send(CallEvent::Terminated {
-            leg_id: self.leg.id.clone(),
-        }).await;
+        let _ = self
+            .call_tx
+            .send(CallEvent::Terminated {
+                leg_id: self.leg.id.clone(),
+            })
+            .await;
 
         debug!(leg_id = %self.leg.id, "leg actor stopped");
     }
@@ -3035,45 +3091,63 @@ impl LegActor {
         match (method, status) {
             (_, Some(code)) => {
                 if (100..200).contains(&code) {
-                    let _ = self.call_tx.send(CallEvent::Provisional {
-                        leg_id: self.leg.id.clone(),
-                        status_code: code,
-                        message,
-                    }).await;
+                    let _ = self
+                        .call_tx
+                        .send(CallEvent::Provisional {
+                            leg_id: self.leg.id.clone(),
+                            status_code: code,
+                            message,
+                        })
+                        .await;
                 } else if (200..300).contains(&code) {
                     if let Some(to_tag) = extract_to_tag(&message) {
                         self.leg.dialog.remote_tag = Some(to_tag);
                     }
-                    let _ = self.call_tx.send(CallEvent::Answered {
-                        leg_id: self.leg.id.clone(),
-                        message,
-                    }).await;
+                    let _ = self
+                        .call_tx
+                        .send(CallEvent::Answered {
+                            leg_id: self.leg.id.clone(),
+                            message,
+                        })
+                        .await;
                 } else {
-                    let _ = self.call_tx.send(CallEvent::Failed {
-                        leg_id: self.leg.id.clone(),
-                        status_code: code,
-                        message,
-                    }).await;
+                    let _ = self
+                        .call_tx
+                        .send(CallEvent::Failed {
+                            leg_id: self.leg.id.clone(),
+                            status_code: code,
+                            message,
+                        })
+                        .await;
                 }
             }
             (Some(Method::Bye), _) => {
-                let _ = self.call_tx.send(CallEvent::Bye {
-                    leg_id: self.leg.id.clone(),
-                    from_side: self.leg.side,
-                    message,
-                }).await;
+                let _ = self
+                    .call_tx
+                    .send(CallEvent::Bye {
+                        leg_id: self.leg.id.clone(),
+                        from_side: self.leg.side,
+                        message,
+                    })
+                    .await;
             }
             (Some(Method::Invite), _) => {
-                let _ = self.call_tx.send(CallEvent::ReInvite {
-                    leg_id: self.leg.id.clone(),
-                    message,
-                }).await;
+                let _ = self
+                    .call_tx
+                    .send(CallEvent::ReInvite {
+                        leg_id: self.leg.id.clone(),
+                        message,
+                    })
+                    .await;
             }
             (Some(Method::Refer), _) => {
-                let _ = self.call_tx.send(CallEvent::Refer {
-                    leg_id: self.leg.id.clone(),
-                    message,
-                }).await;
+                let _ = self
+                    .call_tx
+                    .send(CallEvent::Refer {
+                        leg_id: self.leg.id.clone(),
+                        message,
+                    })
+                    .await;
             }
             _ => {}
         }
@@ -3082,7 +3156,9 @@ impl LegActor {
 
 /// Extract the To-tag from a SIP message.
 pub fn extract_to_tag(message: &SipMessage) -> Option<String> {
-    message.headers.get("To")
+    message
+        .headers
+        .get("To")
         .or_else(|| message.headers.get("t"))
         .and_then(|to| {
             to.split(';')
@@ -3218,7 +3294,10 @@ mod tests {
 
         assert!(store.control_app(&call_id).is_none());
         let call = store.get_call(&call_id).expect("call still present");
-        assert!(!call.is_handoff_pending(), "handoff must be disarmed after release");
+        assert!(
+            !call.is_handoff_pending(),
+            "handoff must be disarmed after release"
+        );
         assert!(call.on_control_loss.is_none());
         // The call lives on — release does not remove it.
         assert!(matches!(call.state, CallState::Calling));
@@ -3331,13 +3410,17 @@ mod tests {
         assert_ne!(a_sess0, b_sess, "each leg owns a distinct SDP session-id");
 
         // By-index variant advances the same B-leg counter.
-        let (b_sess_idx, bv2) = store.reserve_b_leg_sdp_version_by_index(&call_id, 0).unwrap();
+        let (b_sess_idx, bv2) = store
+            .reserve_b_leg_sdp_version_by_index(&call_id, 0)
+            .unwrap();
         assert_eq!(bv2, 2);
         assert_eq!(b_sess_idx, b_sess);
 
         // Unknown call / index → None.
         assert!(store.reserve_leg_sdp_version("nope", true).is_none());
-        assert!(store.reserve_b_leg_sdp_version_by_index(&call_id, 99).is_none());
+        assert!(store
+            .reserve_b_leg_sdp_version_by_index(&call_id, 99)
+            .is_none());
     }
 
     #[test]
@@ -3482,10 +3565,16 @@ mod tests {
 
         assert_eq!(msg.headers.get("Call-ID").unwrap(), "a-leg-call-id");
         let from = msg.headers.get("From").unwrap();
-        assert!(from.contains("tag=a-leg-remote-tag"), "From should have A-leg remote tag, got: {from}");
+        assert!(
+            from.contains("tag=a-leg-remote-tag"),
+            "From should have A-leg remote tag, got: {from}"
+        );
         assert!(!from.contains("tag=b-leg-from-tag"));
         let to = msg.headers.get("To").unwrap();
-        assert!(to.contains("tag=a-leg-local-tag"), "To should have A-leg local tag, got: {to}");
+        assert!(
+            to.contains("tag=a-leg-local-tag"),
+            "To should have A-leg local tag, got: {to}"
+        );
         assert!(!to.contains("tag=gateway-far-end-tag"));
     }
 
@@ -3514,7 +3603,10 @@ mod tests {
         );
 
         let to = msg.headers.get("To").unwrap();
-        assert!(!to.contains(";tag="), "tagless To must remain tagless, got: {to}");
+        assert!(
+            !to.contains(";tag="),
+            "tagless To must remain tagless, got: {to}"
+        );
     }
 
     #[test]
@@ -3535,7 +3627,10 @@ mod tests {
         Dialog::rewrite_headers(&mut msg, "call-id", "from-tag", "from-tag-new", None);
 
         let to = msg.headers.get("To").unwrap();
-        assert!(to.contains("tag=to-tag-original"), "To should be untouched, got: {to}");
+        assert!(
+            to.contains("tag=to-tag-original"),
+            "To should be untouched, got: {to}"
+        );
     }
 
     // --- CallActor tests ---
@@ -3598,7 +3693,7 @@ mod tests {
         assert_eq!(call.b_legs[0].branch, "z9hG4bK-bleg0-retry"); // live branch
         assert_eq!(call.b_leg_status[0], BLegStatus::Trying); // status reset
         assert!(call.b_leg_handles[0].is_none()); // old actor handle cleared
-        // The unrelated fork branch at index 1 is untouched.
+                                                  // The unrelated fork branch at index 1 is untouched.
         assert_eq!(call.b_legs[1].branch, "z9hG4bK-bleg1");
 
         // Out-of-range supersede is a no-op returning None.
@@ -3673,7 +3768,10 @@ mod tests {
 
         assert_eq!(store.count(), 1);
         assert!(store.get_call(&call_id).is_some());
-        assert_eq!(store.find_by_sip_call_id("call-1@10.0.0.1"), Some(call_id.clone()));
+        assert_eq!(
+            store.find_by_sip_call_id("call-1@10.0.0.1"),
+            Some(call_id.clone())
+        );
     }
 
     #[test]
@@ -3833,7 +3931,10 @@ mod tests {
 
         let detached = store.detach_a_leg_for_adoption(&call_id);
         assert!(detached.is_some());
-        assert!(store.get_call(&call_id).is_none(), "the emptied call is dropped");
+        assert!(
+            store.get_call(&call_id).is_none(),
+            "the emptied call is dropped"
+        );
         assert!(
             !store.is_recently_terminated(&sip_call_id),
             "the moving dialog must NOT be remembered as terminated"
@@ -3937,7 +4038,9 @@ mod tests {
 
         let mut new_leg = make_a_leg();
         new_leg.dialog.call_id = "takeover-early@10.0.0.9".to_string();
-        assert!(store.adopt_replaced_dialog(&call_id, true, new_leg).is_none());
+        assert!(store
+            .adopt_replaced_dialog(&call_id, true, new_leg)
+            .is_none());
     }
 
     /// RFC 3891 §3 dialog lookup: find a call where one of its legs has
@@ -4278,7 +4381,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn store_sweep_stale() {
         let store = CallActorStore::new();
@@ -4384,8 +4486,14 @@ mod tests {
         reg.register_call_id("call-1@host", "internal-1");
         reg.register_branch("z9hG4bK-test", "internal-1");
 
-        assert_eq!(reg.lookup_call_id("call-1@host"), Some("internal-1".to_string()));
-        assert_eq!(reg.lookup_branch("z9hG4bK-test"), Some("internal-1".to_string()));
+        assert_eq!(
+            reg.lookup_call_id("call-1@host"),
+            Some("internal-1".to_string())
+        );
+        assert_eq!(
+            reg.lookup_branch("z9hG4bK-test"),
+            Some("internal-1".to_string())
+        );
         assert!(reg.lookup_call_id("nonexistent").is_none());
 
         reg.remove_call_id("call-1@host");
@@ -4477,10 +4585,14 @@ mod tests {
             .content_length(0)
             .build()
             .unwrap();
-        handle.tx.send(LegMessage::SipInbound {
-            message: response,
-            source: test_transport(),
-        }).await.unwrap();
+        handle
+            .tx
+            .send(LegMessage::SipInbound {
+                message: response,
+                source: test_transport(),
+            })
+            .await
+            .unwrap();
 
         let event = call_rx.recv().await.unwrap();
         match event {
@@ -4512,14 +4624,22 @@ mod tests {
             .content_length(0)
             .build()
             .unwrap();
-        handle.tx.send(LegMessage::SipInbound {
-            message: response,
-            source: test_transport(),
-        }).await.unwrap();
+        handle
+            .tx
+            .send(LegMessage::SipInbound {
+                message: response,
+                source: test_transport(),
+            })
+            .await
+            .unwrap();
 
         let event = call_rx.recv().await.unwrap();
         match event {
-            CallEvent::Failed { leg_id: id, status_code, .. } => {
+            CallEvent::Failed {
+                leg_id: id,
+                status_code,
+                ..
+            } => {
                 assert_eq!(id, leg_id);
                 assert_eq!(status_code, 486);
             }
@@ -4549,14 +4669,22 @@ mod tests {
             .content_length(0)
             .build()
             .unwrap();
-        handle.tx.send(LegMessage::SipInbound {
-            message: response,
-            source: test_transport(),
-        }).await.unwrap();
+        handle
+            .tx
+            .send(LegMessage::SipInbound {
+                message: response,
+                source: test_transport(),
+            })
+            .await
+            .unwrap();
 
         let event = call_rx.recv().await.unwrap();
         match event {
-            CallEvent::Provisional { leg_id: id, status_code, .. } => {
+            CallEvent::Provisional {
+                leg_id: id,
+                status_code,
+                ..
+            } => {
                 assert_eq!(id, leg_id);
                 assert_eq!(status_code, 180);
             }
@@ -4598,7 +4726,10 @@ mod tests {
         let join = tokio::spawn(actor.run());
 
         let bye = crate::sip::builder::SipMessageBuilder::new()
-            .request(Method::Bye, crate::sip::uri::SipUri::new("10.0.0.2".to_string()).with_port(5060))
+            .request(
+                Method::Bye,
+                crate::sip::uri::SipUri::new("10.0.0.2".to_string()).with_port(5060),
+            )
             .via("SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bK-bye".to_string())
             .from("<sip:bob@biloxi.com>;tag=xyz".to_string())
             .to("<sip:alice@atlanta.com>;tag=abc".to_string())
@@ -4607,17 +4738,25 @@ mod tests {
             .content_length(0)
             .build()
             .unwrap();
-        handle.tx.send(LegMessage::SipInbound {
-            message: bye,
-            source: test_transport(),
-        }).await.unwrap();
+        handle
+            .tx
+            .send(LegMessage::SipInbound {
+                message: bye,
+                source: test_transport(),
+            })
+            .await
+            .unwrap();
 
-        let event = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            call_rx.recv(),
-        ).await.unwrap().unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), call_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         match event {
-            CallEvent::Bye { leg_id: id, from_side, .. } => {
+            CallEvent::Bye {
+                leg_id: id,
+                from_side,
+                ..
+            } => {
                 assert_eq!(id, leg_id);
                 assert_eq!(from_side, LegSide::B);
             }
@@ -4640,7 +4779,10 @@ mod tests {
         let join = tokio::spawn(actor.run());
 
         let reinvite = crate::sip::builder::SipMessageBuilder::new()
-            .request(Method::Invite, crate::sip::uri::SipUri::new("10.0.0.2".to_string()).with_port(5060))
+            .request(
+                Method::Invite,
+                crate::sip::uri::SipUri::new("10.0.0.2".to_string()).with_port(5060),
+            )
             .via("SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bK-reinv".to_string())
             .from("<sip:bob@biloxi.com>;tag=xyz".to_string())
             .to("<sip:alice@atlanta.com>;tag=abc".to_string())
@@ -4649,15 +4791,19 @@ mod tests {
             .content_length(0)
             .build()
             .unwrap();
-        handle.tx.send(LegMessage::SipInbound {
-            message: reinvite,
-            source: test_transport(),
-        }).await.unwrap();
+        handle
+            .tx
+            .send(LegMessage::SipInbound {
+                message: reinvite,
+                source: test_transport(),
+            })
+            .await
+            .unwrap();
 
-        let event = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            call_rx.recv(),
-        ).await.unwrap().unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), call_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         match event {
             CallEvent::ReInvite { leg_id: id, .. } => assert_eq!(id, leg_id),
             other => panic!("expected ReInvite, got {:?}", other),
@@ -4723,10 +4869,7 @@ mod tests {
         // which the SBC rejected as 400 Wrong URI.
         let to = "<sip:bob@pcscf.example.com:5061;user=phone>";
         let result = rewrite_uri_authority(to, "trunk.example.com:5060");
-        assert_eq!(
-            result,
-            "<sip:bob@trunk.example.com:5060;user=phone>"
-        );
+        assert_eq!(result, "<sip:bob@trunk.example.com:5060;user=phone>");
         // No double port anywhere in the result.
         assert!(!result.contains(":5060:"));
         assert!(!result.contains("5060:5061"));
@@ -4757,7 +4900,10 @@ mod tests {
     fn rewrite_uri_authority_display_name() {
         let to = "\"Alice\" <sip:alice@old.example.net:5061;user=phone>";
         let result = rewrite_uri_authority(to, "gw.example.net:5060");
-        assert_eq!(result, "\"Alice\" <sip:alice@gw.example.net:5060;user=phone>");
+        assert_eq!(
+            result,
+            "\"Alice\" <sip:alice@gw.example.net:5060;user=phone>"
+        );
     }
 
     #[test]
@@ -4800,10 +4946,7 @@ mod tests {
     #[test]
     fn ensure_tag_trims_trailing_whitespace_before_appending() {
         let to = "<sip:bob@example.com>  ";
-        assert_eq!(
-            ensure_tag(to, Some("abc")),
-            "<sip:bob@example.com>;tag=abc"
-        );
+        assert_eq!(ensure_tag(to, Some("abc")), "<sip:bob@example.com>;tag=abc");
     }
 
     #[test]
@@ -4827,7 +4970,10 @@ mod tests {
         let join = tokio::spawn(actor.run());
 
         let refer = crate::sip::builder::SipMessageBuilder::new()
-            .request(Method::Refer, crate::sip::uri::SipUri::new("10.0.0.2".to_string()).with_port(5060))
+            .request(
+                Method::Refer,
+                crate::sip::uri::SipUri::new("10.0.0.2".to_string()).with_port(5060),
+            )
             .via("SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bK-refer".to_string())
             .from("<sip:bob@biloxi.com>;tag=xyz".to_string())
             .to("<sip:alice@atlanta.com>;tag=abc".to_string())
@@ -4837,15 +4983,19 @@ mod tests {
             .content_length(0)
             .build()
             .unwrap();
-        handle.tx.send(LegMessage::SipInbound {
-            message: refer,
-            source: test_transport(),
-        }).await.unwrap();
+        handle
+            .tx
+            .send(LegMessage::SipInbound {
+                message: refer,
+                source: test_transport(),
+            })
+            .await
+            .unwrap();
 
-        let event = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            call_rx.recv(),
-        ).await.unwrap().unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), call_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         match event {
             CallEvent::Refer { leg_id: id, .. } => assert_eq!(id, leg_id),
             other => panic!("expected Refer, got {:?}", other),
@@ -4867,7 +5017,10 @@ mod tests {
 
         // OPTIONS is not classified by the actor — no event emitted
         let options = crate::sip::builder::SipMessageBuilder::new()
-            .request(Method::Options, crate::sip::uri::SipUri::new("10.0.0.2".to_string()).with_port(5060))
+            .request(
+                Method::Options,
+                crate::sip::uri::SipUri::new("10.0.0.2".to_string()).with_port(5060),
+            )
             .via("SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bK-opts".to_string())
             .from("<sip:bob@biloxi.com>;tag=xyz".to_string())
             .to("<sip:alice@atlanta.com>;tag=abc".to_string())
@@ -4876,16 +5029,18 @@ mod tests {
             .content_length(0)
             .build()
             .unwrap();
-        handle.tx.send(LegMessage::SipInbound {
-            message: options,
-            source: test_transport(),
-        }).await.unwrap();
+        handle
+            .tx
+            .send(LegMessage::SipInbound {
+                message: options,
+                source: test_transport(),
+            })
+            .await
+            .unwrap();
 
         // Should timeout — no event expected
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            call_rx.recv(),
-        ).await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(100), call_rx.recv()).await;
         assert!(result.is_err(), "expected timeout, got event");
 
         handle.tx.send(LegMessage::Shutdown).await.unwrap();
@@ -4918,10 +5073,16 @@ mod tests {
             .call_id("b2b-bleg0".to_string())
             .cseq("1 INVITE".to_string())
             .content_length(0)
-            .build().unwrap();
-        handles[0].tx.send(LegMessage::SipInbound {
-            message: ringing, source: test_transport(),
-        }).await.unwrap();
+            .build()
+            .unwrap();
+        handles[0]
+            .tx
+            .send(LegMessage::SipInbound {
+                message: ringing,
+                source: test_transport(),
+            })
+            .await
+            .unwrap();
 
         // Leg 1: 486 Busy
         let busy = crate::sip::builder::SipMessageBuilder::new()
@@ -4932,10 +5093,16 @@ mod tests {
             .call_id("b2b-bleg1".to_string())
             .cseq("1 INVITE".to_string())
             .content_length(0)
-            .build().unwrap();
-        handles[1].tx.send(LegMessage::SipInbound {
-            message: busy, source: test_transport(),
-        }).await.unwrap();
+            .build()
+            .unwrap();
+        handles[1]
+            .tx
+            .send(LegMessage::SipInbound {
+                message: busy,
+                source: test_transport(),
+            })
+            .await
+            .unwrap();
 
         // Leg 2: 200 OK
         let ok = crate::sip::builder::SipMessageBuilder::new()
@@ -4946,40 +5113,67 @@ mod tests {
             .call_id("b2b-bleg2".to_string())
             .cseq("1 INVITE".to_string())
             .content_length(0)
-            .build().unwrap();
-        handles[2].tx.send(LegMessage::SipInbound {
-            message: ok, source: test_transport(),
-        }).await.unwrap();
+            .build()
+            .unwrap();
+        handles[2]
+            .tx
+            .send(LegMessage::SipInbound {
+                message: ok,
+                source: test_transport(),
+            })
+            .await
+            .unwrap();
 
         // Collect all 3 events — order may vary
         let mut events = Vec::new();
         for _ in 0..3 {
-            let event = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                call_rx.recv(),
-            ).await.unwrap().unwrap();
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), call_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
             events.push(event);
         }
 
         // Verify all 3 leg_ids are present
-        let event_leg_ids: std::collections::HashSet<String> = events.iter().map(|e| match e {
-            CallEvent::Provisional { leg_id, .. } => leg_id.0.clone(),
-            CallEvent::Answered { leg_id, .. } => leg_id.0.clone(),
-            CallEvent::Failed { leg_id, .. } => leg_id.0.clone(),
-            CallEvent::Terminated { leg_id, .. } => leg_id.0.clone(),
-            CallEvent::Bye { leg_id, .. } => leg_id.0.clone(),
-            CallEvent::ReInvite { leg_id, .. } => leg_id.0.clone(),
-            CallEvent::Refer { leg_id, .. } => leg_id.0.clone(),
-        }).collect();
+        let event_leg_ids: std::collections::HashSet<String> = events
+            .iter()
+            .map(|e| match e {
+                CallEvent::Provisional { leg_id, .. } => leg_id.0.clone(),
+                CallEvent::Answered { leg_id, .. } => leg_id.0.clone(),
+                CallEvent::Failed { leg_id, .. } => leg_id.0.clone(),
+                CallEvent::Terminated { leg_id, .. } => leg_id.0.clone(),
+                CallEvent::Bye { leg_id, .. } => leg_id.0.clone(),
+                CallEvent::ReInvite { leg_id, .. } => leg_id.0.clone(),
+                CallEvent::Refer { leg_id, .. } => leg_id.0.clone(),
+            })
+            .collect();
 
         for id in &leg_ids {
-            assert!(event_leg_ids.contains(&id.0), "missing event for leg {}", id);
+            assert!(
+                event_leg_ids.contains(&id.0),
+                "missing event for leg {}",
+                id
+            );
         }
 
         // Verify event types
-        assert!(events.iter().any(|e| matches!(e, CallEvent::Provisional { status_code: 180, .. })));
-        assert!(events.iter().any(|e| matches!(e, CallEvent::Failed { status_code: 486, .. })));
-        assert!(events.iter().any(|e| matches!(e, CallEvent::Answered { .. })));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            CallEvent::Provisional {
+                status_code: 180,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            CallEvent::Failed {
+                status_code: 486,
+                ..
+            }
+        )));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, CallEvent::Answered { .. })));
 
         // Shutdown all
         for handle in &handles {
@@ -5016,10 +5210,10 @@ mod tests {
 
         // All tasks should complete within timeout
         for join in joins {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                join,
-            ).await.expect("actor did not terminate").unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), join)
+                .await
+                .expect("actor did not terminate")
+                .unwrap();
         }
     }
 
@@ -5155,13 +5349,7 @@ mod tests {
             order.push_back((format!("cid-{index}"), stamp));
         }
 
-        CallActorStore::evict_terminated(
-            &terminated,
-            &mut order,
-            base,
-            TERMINATED_CALL_TTL,
-            2,
-        );
+        CallActorStore::evict_terminated(&terminated, &mut order, base, TERMINATED_CALL_TTL, 2);
 
         // Newest two survive, in order.
         assert_eq!(order.len(), 2);
@@ -5272,7 +5460,9 @@ mod originate_tests {
             store.lookup_originated_call("z9hG4bK-orig1").as_deref(),
             Some(call_id.as_str())
         );
-        assert!(store.lookup_originated_call("z9hG4bK-someone-else").is_none());
+        assert!(store
+            .lookup_originated_call("z9hG4bK-someone-else")
+            .is_none());
     }
 
     #[test]

@@ -130,7 +130,8 @@ impl MediaSessionStore {
     /// Remove sessions older than `max_age`.
     pub fn sweep_stale(&self, max_age: std::time::Duration) {
         let cutoff = Instant::now() - max_age;
-        self.sessions.retain(|_, session| session.created_at > cutoff);
+        self.sessions
+            .retain(|_, session| session.created_at > cutoff);
     }
 
     /// Number of active sessions.
@@ -312,7 +313,10 @@ mod tests {
         let session = store.get("call-1").expect("session");
         assert!(session.ws_uri.is_some());
         assert!(session.ws_tee.is_none(), "a takeover is not a tee");
-        assert!(!session.ws_bridge_attached, "a profile takeover is not a mid-call attach");
+        assert!(
+            !session.ws_bridge_attached,
+            "a profile takeover is not a mid-call attach"
+        );
 
         // Attaching a tee leaves the takeover alone, and vice versa.
         store.set_ws_tee("call-1", Some("wss://asr.invalid/tee".to_string()));

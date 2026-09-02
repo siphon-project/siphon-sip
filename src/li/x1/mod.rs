@@ -28,8 +28,8 @@
 //! * [`client`] — the network-element-to-ADMF direction.
 
 pub mod client;
-pub mod compat;
 pub mod codec;
+pub mod compat;
 pub mod error;
 pub mod message;
 pub mod schema;

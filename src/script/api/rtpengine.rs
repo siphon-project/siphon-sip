@@ -19,9 +19,9 @@ use crate::rtpengine::client::PlayMediaSource;
 use crate::rtpengine::profile::{
     validate_ws_sample_rate, NgFlags, ProfileRegistry, WsTeeDirection, WsVadEngine,
 };
+use crate::rtpengine::session::{MediaSession, MediaSessionStore};
 use crate::rtpengine::MediaBackend;
 use crate::rtpengine::RtpEngineError;
-use crate::rtpengine::session::{MediaSession, MediaSessionStore};
 use crate::sip::message::SipMessage;
 
 use super::call::PyCall;
@@ -44,7 +44,11 @@ impl PyRtpEngine {
         sessions: Arc<MediaSessionStore>,
         registry: Arc<ProfileRegistry>,
     ) -> Self {
-        Self { client, sessions, registry }
+        Self {
+            client,
+            sessions,
+            registry,
+        }
     }
 
     /// Shared body for `silence_media`/`unsilence_media`/`block_media`/`unblock_media`.
@@ -101,8 +105,7 @@ fn resolve_play_media_source(
     .count();
     if count != 1 {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "play_media requires exactly one of file=, blob=, db_id=, tone=, or url="
-                .to_string(),
+            "play_media requires exactly one of file=, blob=, db_id=, tone=, or url=".to_string(),
         ));
     }
     if let Some(path) = file {
@@ -1039,7 +1042,9 @@ impl PyRtpEngine {
         // its transient borrow of the object, so borrowing this handle later in
         // the async block cannot alias.
         let reject_call: Option<Py<PyCall>> = if auto_reject {
-            call.cast::<PyCall>().ok().map(|bound| bound.clone().unbind())
+            call.cast::<PyCall>()
+                .ok()
+                .map(|bound| bound.clone().unbind())
         } else {
             None
         };
@@ -1371,11 +1376,14 @@ impl PyRtpEngine {
         let client = Arc::clone(&self.client);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            client.stop_media(&call_id, &from_tag, play_id).await.map_err(|error| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "rtpengine.stop_media failed: {error}"
-                ))
-            })?;
+            client
+                .stop_media(&call_id, &from_tag, play_id)
+                .await
+                .map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "rtpengine.stop_media failed: {error}"
+                    ))
+                })?;
             debug!(call_id = %call_id, play_id = ?play_id, "rtpengine stop_media");
             Ok(true)
         })
@@ -1413,7 +1421,13 @@ impl PyRtpEngine {
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
             client
-                .set_play_gain(&call_id, &from_tag, play_id, gain_decibels, to_tag.as_deref())
+                .set_play_gain(
+                    &call_id,
+                    &from_tag,
+                    play_id,
+                    gain_decibels,
+                    to_tag.as_deref(),
+                )
                 .await
                 .map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -1541,11 +1555,14 @@ impl PyRtpEngine {
         let client = Arc::clone(&self.client);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
-            client.echo(&call_id, &from_tag, enabled).await.map_err(|error| {
-                pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "rtpengine.echo failed: {error}"
-                ))
-            })?;
+            client
+                .echo(&call_id, &from_tag, enabled)
+                .await
+                .map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "rtpengine.echo failed: {error}"
+                    ))
+                })?;
             debug!(call_id = %call_id, enabled, "rtpengine echo");
             Ok(true)
         })
@@ -1790,7 +1807,14 @@ impl PyRtpEngine {
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
             client
-                .attach_ws_tee(&call_id, &from_tag, &ws_uri, direction, channels, sample_rate)
+                .attach_ws_tee(
+                    &call_id,
+                    &from_tag,
+                    &ws_uri,
+                    direction,
+                    channels,
+                    sample_rate,
+                )
                 .await
                 .map_err(|error| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
@@ -2133,9 +2157,15 @@ def make_decorator(call_id, from_tag):
     return decorator
 "#;
         let globals = PyDict::new(python);
-        python.run(&std::ffi::CString::new(code).map_err(|error| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("on_text decorator source: {error}"))
-        })?, Some(&globals), None)?;
+        python.run(
+            &std::ffi::CString::new(code).map_err(|error| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "on_text decorator source: {error}"
+                ))
+            })?,
+            Some(&globals),
+            None,
+        )?;
         let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("failed to build on_text decorator")
         })?;
@@ -2324,7 +2354,9 @@ def make_decorator(call_id, from_tag):
         let globals = PyDict::new(python);
         python.run(&code, Some(&globals), None)?;
         let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("failed to build on_ws_bridge_started decorator")
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "failed to build on_ws_bridge_started decorator",
+            )
         })?;
         let decorator = make_decorator.call1((call_id, from_tag))?;
 
@@ -2391,7 +2423,9 @@ def make_decorator(call_id, from_tag):
         let globals = PyDict::new(python);
         python.run(&code, Some(&globals), None)?;
         let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("failed to build on_ws_bridge_ended decorator")
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "failed to build on_ws_bridge_ended decorator",
+            )
         })?;
         let decorator = make_decorator.call1((call_id, from_tag))?;
 
@@ -2572,22 +2606,27 @@ pub(super) fn extract_sdp_body(message: &SipMessage) -> PyResult<Vec<u8>> {
     }
 
     let empty_string = String::new();
-    let content_type = message.headers.get("Content-Type")
+    let content_type = message
+        .headers
+        .get("Content-Type")
         .or_else(|| message.headers.get("c"))
         .unwrap_or(&empty_string);
 
-    if content_type.to_ascii_lowercase().contains("multipart/mixed") {
+    if content_type
+        .to_ascii_lowercase()
+        .contains("multipart/mixed")
+    {
         // Parse multipart body and extract the SDP part.
-        let parts = crate::siprec::multipart::parse_multipart(content_type, body)
-            .map_err(|error| {
+        let parts =
+            crate::siprec::multipart::parse_multipart(content_type, body).map_err(|error| {
                 pyo3::exceptions::PyValueError::new_err(format!(
                     "failed to parse multipart body: {error}"
                 ))
             })?;
-        let sdp_part = crate::siprec::multipart::find_part(&parts, "application/sdp")
-            .ok_or_else(|| {
+        let sdp_part =
+            crate::siprec::multipart::find_part(&parts, "application/sdp").ok_or_else(|| {
                 pyo3::exceptions::PyValueError::new_err(
-                    "multipart body has no application/sdp part"
+                    "multipart body has no application/sdp part",
                 )
             })?;
         Ok(sdp_part.body.clone())
@@ -2597,9 +2636,7 @@ pub(super) fn extract_sdp_body(message: &SipMessage) -> PyResult<Vec<u8>> {
 }
 
 /// Extract call-id, from-tag, and SDP body from a SIP message (offer direction).
-fn extract_offer_params(
-    message: &Arc<Mutex<SipMessage>>,
-) -> PyResult<(String, String, Vec<u8>)> {
+fn extract_offer_params(message: &Arc<Mutex<SipMessage>>) -> PyResult<(String, String, Vec<u8>)> {
     let message = lock_message(message)?;
 
     let call_id = message
@@ -2607,17 +2644,13 @@ fn extract_offer_params(
         .get("Call-ID")
         .or_else(|| message.headers.get("i"))
         .map(|v| v.to_string())
-        .ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err("message missing Call-ID header")
-        })?;
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("message missing Call-ID header"))?;
 
     let from_raw = message
         .headers
         .get("From")
         .or_else(|| message.headers.get("f"))
-        .ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err("message missing From header")
-        })?;
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("message missing From header"))?;
 
     let from_tag = extract_tag(from_raw).ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err("From header missing tag parameter")
@@ -2639,17 +2672,13 @@ fn extract_answer_params(
         .get("Call-ID")
         .or_else(|| message.headers.get("i"))
         .map(|v| v.to_string())
-        .ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err("message missing Call-ID header")
-        })?;
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("message missing Call-ID header"))?;
 
     let from_raw = message
         .headers
         .get("From")
         .or_else(|| message.headers.get("f"))
-        .ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err("message missing From header")
-        })?;
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("message missing From header"))?;
 
     let from_tag = extract_tag(from_raw).ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err("From header missing tag parameter")
@@ -2659,9 +2688,7 @@ fn extract_answer_params(
         .headers
         .get("To")
         .or_else(|| message.headers.get("t"))
-        .ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err("message missing To header")
-        })?;
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("message missing To header"))?;
 
     let to_tag = extract_tag(to_raw).ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err("To header missing tag parameter")
@@ -2673,9 +2700,7 @@ fn extract_answer_params(
 }
 
 /// Extract call-id and from-tag from a SIP message (delete direction — no SDP required).
-fn extract_delete_params(
-    message: &Arc<Mutex<SipMessage>>,
-) -> PyResult<(String, String)> {
+fn extract_delete_params(message: &Arc<Mutex<SipMessage>>) -> PyResult<(String, String)> {
     let message = lock_message(message)?;
 
     let call_id = message
@@ -2683,17 +2708,13 @@ fn extract_delete_params(
         .get("Call-ID")
         .or_else(|| message.headers.get("i"))
         .map(|v| v.to_string())
-        .ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err("message missing Call-ID header")
-        })?;
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("message missing Call-ID header"))?;
 
     let from_raw = message
         .headers
         .get("From")
         .or_else(|| message.headers.get("f"))
-        .ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err("message missing From header")
-        })?;
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("message missing From header"))?;
 
     let from_tag = extract_tag(from_raw).ok_or_else(|| {
         pyo3::exceptions::PyValueError::new_err("From header missing tag parameter")
@@ -2710,17 +2731,12 @@ fn extract_tag(header_value: &str) -> Option<String> {
     let value_start = tag_start + 5; // skip ";tag="
     let rest = &header_value[value_start..];
     // Tag ends at next ';', '>', or end of string.
-    let end = rest
-        .find([';', '>'])
-        .unwrap_or(rest.len());
+    let end = rest.find([';', '>']).unwrap_or(rest.len());
     Some(rest[..end].to_string())
 }
 
 /// Replace the SIP message body with new SDP and update Content-Length.
-pub(super) fn replace_body(
-    message: &Arc<Mutex<SipMessage>>,
-    new_body: &[u8],
-) -> PyResult<()> {
+pub(super) fn replace_body(message: &Arc<Mutex<SipMessage>>, new_body: &[u8]) -> PyResult<()> {
     let mut message = message.lock().map_err(|error| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
     })?;
@@ -2767,10 +2783,7 @@ mod tests {
             extract_tag("\"Alice\" <sip:alice@atlanta.com>;tag=xyz;other=val"),
             Some("xyz".to_string())
         );
-        assert_eq!(
-            extract_tag("<sip:alice@atlanta.com>"),
-            None,
-        );
+        assert_eq!(extract_tag("<sip:alice@atlanta.com>"), None,);
     }
 
     #[test]
@@ -2783,9 +2796,9 @@ mod tests {
 
     /// Helper to build a minimal SIP message for testing.
     fn test_message(content_type: Option<&str>, body: &[u8]) -> SipMessage {
-        use crate::sip::message::{RequestLine, StartLine, Version, Method};
-        use crate::sip::uri::SipUri;
         use crate::sip::headers::SipHeaders;
+        use crate::sip::message::{Method, RequestLine, StartLine, Version};
+        use crate::sip::uri::SipUri;
 
         let mut headers = SipHeaders::new();
         if let Some(content_type) = content_type {
@@ -2858,28 +2871,17 @@ mod tests {
     #[test]
     fn resolve_play_media_source_file() {
         pyo3::Python::initialize();
-        let source = resolve_play_media_source(
-            Some("/tmp/a.wav".to_string()),
-            None,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let source =
+            resolve_play_media_source(Some("/tmp/a.wav".to_string()), None, None, None, None)
+                .unwrap();
         assert!(matches!(source, PlayMediaSource::File(ref path) if path == "/tmp/a.wav"));
     }
 
     #[test]
     fn resolve_play_media_source_blob() {
         pyo3::Python::initialize();
-        let source = resolve_play_media_source(
-            None,
-            Some(vec![0x00, 0xff]),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let source =
+            resolve_play_media_source(None, Some(vec![0x00, 0xff]), None, None, None).unwrap();
         assert!(matches!(source, PlayMediaSource::Blob(ref bytes) if bytes == &[0x00, 0xff]));
     }
 
@@ -2942,9 +2944,8 @@ mod tests {
     fn resolve_play_media_source_non_http_url_rejected() {
         pyo3::Python::initialize();
         for url in ["file:///etc/passwd", "ftp://host/a.wav", "prompts/a.wav"] {
-            let error =
-                resolve_play_media_source(None, None, None, None, Some(url.to_string()))
-                    .unwrap_err();
+            let error = resolve_play_media_source(None, None, None, None, Some(url.to_string()))
+                .unwrap_err();
             Python::attach(|py| {
                 assert!(
                     error.value(py).to_string().contains("http://"),
@@ -3044,7 +3045,10 @@ mod tests {
 
         Python::attach(|py| {
             assert!(bad_rate.value(py).to_string().contains("ws_sample_rate"));
-            assert!(bad_tee_rate.value(py).to_string().contains("ws_tee_sample_rate"));
+            assert!(bad_tee_rate
+                .value(py)
+                .to_string()
+                .contains("ws_tee_sample_rate"));
             assert!(bad_engine.value(py).to_string().contains("ws_vad_engine"));
         });
     }
@@ -3069,17 +3073,18 @@ mod tests {
             None,
         )
         .unwrap_err();
-        let error_file_and_db = resolve_play_media_source(
-            Some("/tmp/a.wav".to_string()),
-            None,
-            Some(1),
-            None,
-            None,
-        )
-        .unwrap_err();
+        let error_file_and_db =
+            resolve_play_media_source(Some("/tmp/a.wav".to_string()), None, Some(1), None, None)
+                .unwrap_err();
         Python::attach(|py| {
-            assert!(error_file_and_blob.value(py).to_string().contains("exactly one"));
-            assert!(error_file_and_db.value(py).to_string().contains("exactly one"));
+            assert!(error_file_and_blob
+                .value(py)
+                .to_string()
+                .contains("exactly one"));
+            assert!(error_file_and_db
+                .value(py)
+                .to_string()
+                .contains("exactly one"));
         });
     }
 
@@ -3303,7 +3308,8 @@ mod tests {
 
     #[test]
     fn classify_answer_local_ok_answers() {
-        let outcome = classify_answer_local(Ok("v=0\r\nm=audio 40000 RTP/AVP 8\r\n".to_string()), true);
+        let outcome =
+            classify_answer_local(Ok("v=0\r\nm=audio 40000 RTP/AVP 8\r\n".to_string()), true);
         assert_eq!(
             outcome,
             AnswerLocalOutcome::Answered("v=0\r\nm=audio 40000 RTP/AVP 8\r\n".to_string())
@@ -3313,7 +3319,9 @@ mod tests {
     #[test]
     fn classify_answer_local_no_codec_with_call_rejects() {
         let outcome = classify_answer_local(
-            Err(RtpEngineError::EngineError("no-encodable-codec".to_string())),
+            Err(RtpEngineError::EngineError(
+                "no-encodable-codec".to_string(),
+            )),
             true,
         );
         assert_eq!(outcome, AnswerLocalOutcome::Reject488);
@@ -3322,7 +3330,9 @@ mod tests {
     #[test]
     fn classify_answer_local_no_codec_without_call_value_error() {
         let outcome = classify_answer_local(
-            Err(RtpEngineError::EngineError("no-encodable-codec".to_string())),
+            Err(RtpEngineError::EngineError(
+                "no-encodable-codec".to_string(),
+            )),
             false,
         );
         assert_eq!(outcome, AnswerLocalOutcome::ValueError);

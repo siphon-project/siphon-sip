@@ -7,9 +7,9 @@
 //! Uses `reqwest` for HTTP transport. Full NRF discovery and OAuth2
 //! token management are planned for future implementation.
 
-pub mod npcf;
-pub mod nchf;
 pub mod nbsf;
+pub mod nchf;
+pub mod npcf;
 
 /// SBI communication model (TS 29.500 §6.10).
 ///
@@ -81,7 +81,10 @@ impl SbiManager {
             .timeout(std::time::Duration::from_secs(config.timeout_secs))
             .build()
             .unwrap_or_default();
-        Self { config, http_client }
+        Self {
+            config,
+            http_client,
+        }
     }
 
     /// Get the HTTP client for making SBI requests.
@@ -101,10 +104,22 @@ mod tests {
 
     #[test]
     fn communication_from_config_str() {
-        assert_eq!(Communication::from_config_str("indirect"), Communication::Indirect);
-        assert_eq!(Communication::from_config_str("INDIRECT"), Communication::Indirect);
-        assert_eq!(Communication::from_config_str("direct"), Communication::Direct);
-        assert_eq!(Communication::from_config_str("whatever"), Communication::Direct);
+        assert_eq!(
+            Communication::from_config_str("indirect"),
+            Communication::Indirect
+        );
+        assert_eq!(
+            Communication::from_config_str("INDIRECT"),
+            Communication::Indirect
+        );
+        assert_eq!(
+            Communication::from_config_str("direct"),
+            Communication::Direct
+        );
+        assert_eq!(
+            Communication::from_config_str("whatever"),
+            Communication::Direct
+        );
         // Default is Direct (today's behaviour, backward-compatible).
         assert_eq!(Communication::default(), Communication::Direct);
         assert!(Communication::Indirect.is_indirect());
@@ -128,7 +143,10 @@ mod tests {
             oauth2_client_id: Some("siphon-pcscf".to_string()),
             oauth2_client_secret: Some("secret123".to_string()),
         };
-        assert_eq!(config.nrf_url.as_deref(), Some("https://nrf.5gc.example.com"));
+        assert_eq!(
+            config.nrf_url.as_deref(),
+            Some("https://nrf.5gc.example.com")
+        );
         assert_eq!(config.timeout_secs, 10);
     }
 

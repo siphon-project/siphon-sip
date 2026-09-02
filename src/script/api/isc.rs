@@ -116,7 +116,9 @@ impl PyIsc {
             ))
         })?;
 
-        let matches = self.store.evaluate(aor, method, ruri, &headers, case, start_after_priority);
+        let matches = self
+            .store
+            .evaluate(aor, method, ruri, &headers, case, start_after_priority);
 
         let mut results = Vec::with_capacity(matches.len());
         for matched in &matches {

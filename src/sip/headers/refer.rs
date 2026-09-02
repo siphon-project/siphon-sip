@@ -144,10 +144,8 @@ fn parse_replaces_value(input: &str) -> Result<Replaces, String> {
 
     Ok(Replaces {
         call_id,
-        from_tag: from_tag
-            .ok_or_else(|| "Replaces: missing from-tag".to_string())?,
-        to_tag: to_tag
-            .ok_or_else(|| "Replaces: missing to-tag".to_string())?,
+        from_tag: from_tag.ok_or_else(|| "Replaces: missing from-tag".to_string())?,
+        to_tag: to_tag.ok_or_else(|| "Replaces: missing to-tag".to_string())?,
         early_only,
     })
 }
@@ -242,7 +240,8 @@ mod tests {
 
     #[test]
     fn parse_refer_to_with_replaces_early_only() {
-        let input = "<sip:bob@example.com?Replaces=call-1%3Bfrom-tag%3Da%3Bto-tag%3Db%3Bearly-only>";
+        let input =
+            "<sip:bob@example.com?Replaces=call-1%3Bfrom-tag%3Da%3Bto-tag%3Db%3Bearly-only>";
         let result = parse_refer_to(input).unwrap();
         let replaces = result.replaces.unwrap();
         assert!(replaces.early_only);
@@ -288,8 +287,7 @@ mod tests {
 
     #[test]
     fn parse_replaces_with_at_sign() {
-        let result =
-            parse_replaces("12345@192.168.1.1;from-tag=tag-a;to-tag=tag-b").unwrap();
+        let result = parse_replaces("12345@192.168.1.1;from-tag=tag-a;to-tag=tag-b").unwrap();
         assert_eq!(result.call_id, "12345@192.168.1.1");
         assert_eq!(result.from_tag, "tag-a");
         assert_eq!(result.to_tag, "tag-b");
@@ -297,15 +295,13 @@ mod tests {
 
     #[test]
     fn parse_replaces_with_early_only() {
-        let result =
-            parse_replaces("callid;from-tag=f;to-tag=t;early-only").unwrap();
+        let result = parse_replaces("callid;from-tag=f;to-tag=t;early-only").unwrap();
         assert!(result.early_only);
     }
 
     #[test]
     fn parse_replaces_extra_whitespace() {
-        let result =
-            parse_replaces("  callid ; from-tag=f ; to-tag=t  ").unwrap();
+        let result = parse_replaces("  callid ; from-tag=f ; to-tag=t  ").unwrap();
         assert_eq!(result.call_id, "callid");
         assert_eq!(result.from_tag, "f");
         assert_eq!(result.to_tag, "t");
@@ -341,10 +337,7 @@ mod tests {
             to_tag: "ttag".to_string(),
             early_only: false,
         };
-        assert_eq!(
-            replaces.to_string(),
-            "abc@host;from-tag=ftag;to-tag=ttag"
-        );
+        assert_eq!(replaces.to_string(), "abc@host;from-tag=ftag;to-tag=ttag");
     }
 
     #[test]
@@ -355,10 +348,7 @@ mod tests {
             to_tag: "t".to_string(),
             early_only: true,
         };
-        assert_eq!(
-            replaces.to_string(),
-            "abc;from-tag=f;to-tag=t;early-only"
-        );
+        assert_eq!(replaces.to_string(), "abc;from-tag=f;to-tag=t;early-only");
     }
 
     #[test]

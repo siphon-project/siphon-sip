@@ -21,7 +21,9 @@ pub async fn store_recording(config: &SrsConfig, record: &RecordingRecord) {
 
 /// File backend — write JSON metadata to disk.
 async fn store_file(config: &SrsConfig, record: &RecordingRecord) {
-    let base_dir = config.file.as_ref()
+    let base_dir = config
+        .file
+        .as_ref()
         .map(|file_config| file_config.base_dir.clone())
         .unwrap_or_else(|| config.recording_dir.clone());
 
@@ -101,18 +103,19 @@ async fn store_http(config: &SrsConfig, record: &RecordingRecord) {
 
     let client = reqwest::Client::new();
 
-    let should_upload_audio = http_config.upload_audio
-        && record.recording_dir.is_some();
+    let should_upload_audio = http_config.upload_audio && record.recording_dir.is_some();
 
     let request_builder = if should_upload_audio {
         // Multipart upload: metadata JSON + audio files.
         let recording_dir = record.recording_dir.as_ref().unwrap();
         let audio_files = collect_audio_files(recording_dir).await;
 
-        let mut form = reqwest::multipart::Form::new()
-            .part("metadata", reqwest::multipart::Part::text(json)
+        let mut form = reqwest::multipart::Form::new().part(
+            "metadata",
+            reqwest::multipart::Part::text(json)
                 .mime_str("application/json")
-                .unwrap_or_else(|_| reqwest::multipart::Part::text("{}")));
+                .unwrap_or_else(|_| reqwest::multipart::Part::text("{}")),
+        );
 
         for (index, (filename, data)) in audio_files.into_iter().enumerate() {
             let mime_type = mime_for_extension(&filename);
@@ -242,7 +245,11 @@ async fn collect_audio_files(recording_dir: &str) -> Vec<(String, Vec<u8>)> {
 
 /// Map file extension to MIME type for the upload part.
 fn mime_for_extension(filename: &str) -> String {
-    let extension = filename.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let extension = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     match extension.as_str() {
         "wav" => "audio/wav",
         "mp3" => "audio/mpeg",
@@ -254,7 +261,8 @@ fn mime_for_extension(filename: &str) -> String {
         "mkv" => "video/x-matroska",
         "webm" => "video/webm",
         _ => "application/octet-stream",
-    }.to_string()
+    }
+    .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -271,19 +279,15 @@ mod tests {
             session_id: "test-session-001".to_string(),
             recording_call_id: "call-1".to_string(),
             original_call_id: None,
-            participants: vec![
-                ParticipantRecord {
-                    participant_id: "p1".to_string(),
-                    aor: "sip:alice@example.com".to_string(),
-                    name: None,
-                },
-            ],
-            streams: vec![
-                StreamRecord {
-                    stream_id: "s1".to_string(),
-                    label: "caller-audio".to_string(),
-                },
-            ],
+            participants: vec![ParticipantRecord {
+                participant_id: "p1".to_string(),
+                aor: "sip:alice@example.com".to_string(),
+                name: None,
+            }],
+            streams: vec![StreamRecord {
+                stream_id: "s1".to_string(),
+                label: "caller-audio".to_string(),
+            }],
             state: "completed".to_string(),
             duration_secs: 120,
             recording_dir: Some("/tmp/test/test-session-001".to_string()),
@@ -332,12 +336,22 @@ mod tests {
         tokio::fs::create_dir_all(&temp_dir).await.unwrap();
 
         // Create fake audio files and a metadata.json.
-        tokio::fs::write(temp_dir.join("metadata.json"), b"{}").await.unwrap();
-        tokio::fs::write(temp_dir.join("call-123_a_b.wav"), b"RIFF....").await.unwrap();
-        tokio::fs::write(temp_dir.join("call-123_c_d.wav"), b"RIFF....").await.unwrap();
+        tokio::fs::write(temp_dir.join("metadata.json"), b"{}")
+            .await
+            .unwrap();
+        tokio::fs::write(temp_dir.join("call-123_a_b.wav"), b"RIFF....")
+            .await
+            .unwrap();
+        tokio::fs::write(temp_dir.join("call-123_c_d.wav"), b"RIFF....")
+            .await
+            .unwrap();
 
         let files = collect_audio_files(&temp_dir.display().to_string()).await;
-        assert_eq!(files.len(), 2, "should collect 2 audio files, not metadata.json");
+        assert_eq!(
+            files.len(),
+            2,
+            "should collect 2 audio files, not metadata.json"
+        );
         let names: Vec<&str> = files.iter().map(|(name, _)| name.as_str()).collect();
         assert!(!names.contains(&"metadata.json"));
 
@@ -367,7 +381,10 @@ mod tests {
         assert_eq!(mime_for_extension("call.wav"), "audio/wav");
         assert_eq!(mime_for_extension("call.mp3"), "audio/mpeg");
         assert_eq!(mime_for_extension("call.opus"), "audio/opus");
-        assert_eq!(mime_for_extension("call.pcap"), "application/vnd.tcpdump.pcap");
+        assert_eq!(
+            mime_for_extension("call.pcap"),
+            "application/vnd.tcpdump.pcap"
+        );
         assert_eq!(mime_for_extension("call.raw"), "audio/L16");
         assert_eq!(mime_for_extension("call.xyz"), "application/octet-stream");
     }

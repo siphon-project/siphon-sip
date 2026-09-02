@@ -1,12 +1,12 @@
-pub mod via;
-pub mod nameaddr;
-pub mod cseq;
-pub mod refer;
-pub mod route;
-pub mod session_timer;
-pub mod rseq;
 pub mod charging;
+pub mod cseq;
+pub mod nameaddr;
+pub mod refer;
 pub mod retry_after;
+pub mod route;
+pub mod rseq;
+pub mod session_timer;
+pub mod via;
 
 use indexmap::IndexMap;
 use std::sync::Arc;
@@ -68,25 +68,25 @@ fn canonical_key(name: &str) -> String {
     // Everything else is just lowercased.
     if name.len() == 1 {
         let full = match name.as_bytes()[0].to_ascii_lowercase() {
-            b'a' => Some("accept-contact"),   // RFC 3841
-            b'b' => Some("referred-by"),       // RFC 3892
-            b'c' => Some("content-type"),      // RFC 3261
+            b'a' => Some("accept-contact"),      // RFC 3841
+            b'b' => Some("referred-by"),         // RFC 3892
+            b'c' => Some("content-type"),        // RFC 3261
             b'd' => Some("request-disposition"), // RFC 3841
-            b'e' => Some("content-encoding"),  // RFC 3261
-            b'f' => Some("from"),              // RFC 3261
-            b'i' => Some("call-id"),           // RFC 3261
-            b'j' => Some("reject-contact"),    // RFC 3841
-            b'k' => Some("supported"),         // RFC 3261
-            b'l' => Some("content-length"),    // RFC 3261
-            b'm' => Some("contact"),           // RFC 3261
-            b'o' => Some("event"),             // RFC 6665 (orig RFC 3265)
-            b'r' => Some("refer-to"),          // RFC 3515
-            b's' => Some("subject"),           // RFC 3261
-            b't' => Some("to"),                // RFC 3261
-            b'u' => Some("allow-events"),      // RFC 6665
-            b'v' => Some("via"),               // RFC 3261
-            b'x' => Some("session-expires"),   // RFC 4028
-            b'y' => Some("identity"),          // RFC 8224
+            b'e' => Some("content-encoding"),    // RFC 3261
+            b'f' => Some("from"),                // RFC 3261
+            b'i' => Some("call-id"),             // RFC 3261
+            b'j' => Some("reject-contact"),      // RFC 3841
+            b'k' => Some("supported"),           // RFC 3261
+            b'l' => Some("content-length"),      // RFC 3261
+            b'm' => Some("contact"),             // RFC 3261
+            b'o' => Some("event"),               // RFC 6665 (orig RFC 3265)
+            b'r' => Some("refer-to"),            // RFC 3515
+            b's' => Some("subject"),             // RFC 3261
+            b't' => Some("to"),                  // RFC 3261
+            b'u' => Some("allow-events"),        // RFC 6665
+            b'v' => Some("via"),                 // RFC 3261
+            b'x' => Some("session-expires"),     // RFC 4028
+            b'y' => Some("identity"),            // RFC 8224
             _ => None,
         };
         if let Some(full) = full {
@@ -98,7 +98,9 @@ fn canonical_key(name: &str) -> String {
 
 impl SipHeaders {
     pub fn new() -> Self {
-        Self { inner: Arc::new(HeadersInner::new()) }
+        Self {
+            inner: Arc::new(HeadersInner::new()),
+        }
     }
 
     fn make_mut(&mut self) -> &mut HeadersInner {
@@ -169,11 +171,7 @@ impl SipHeaders {
 
     /// Get all header names (in original case)
     pub fn names(&self) -> Vec<&String> {
-        self.inner
-            .headers
-            .values()
-            .map(|(name, _)| name)
-            .collect()
+        self.inner.headers.values().map(|(name, _)| name).collect()
     }
 
     /// Iterate over headers — yields `(lowercase name, values)`.
@@ -188,7 +186,10 @@ impl SipHeaders {
     /// insertion order — for serialization, which needs the on-the-wire name
     /// without re-lowercasing and re-looking-up each header.
     pub fn iter_original(&self) -> impl Iterator<Item = (&String, &Vec<String>)> {
-        self.inner.headers.values().map(|(name, values)| (name, values))
+        self.inner
+            .headers
+            .values()
+            .map(|(name, values)| (name, values))
     }
 
     /// Convenience methods for common headers
@@ -226,8 +227,7 @@ impl SipHeaders {
     }
 
     pub fn max_forwards(&self) -> Option<u8> {
-        self.get("Max-Forwards")
-            .and_then(|s| s.trim().parse().ok())
+        self.get("Max-Forwards").and_then(|s| s.trim().parse().ok())
     }
 }
 
@@ -248,7 +248,10 @@ mod tests {
     #[test]
     fn compact_via_found_by_long_name() {
         let mut headers = SipHeaders::new();
-        headers.add("v", "SIP/2.0/UDP siphon.example:5060;branch=z9hG4bK-abc".to_string());
+        headers.add(
+            "v",
+            "SIP/2.0/UDP siphon.example:5060;branch=z9hG4bK-abc".to_string(),
+        );
         assert_eq!(
             headers.via().map(String::as_str),
             Some("SIP/2.0/UDP siphon.example:5060;branch=z9hG4bK-abc"),
@@ -311,7 +314,10 @@ mod tests {
         assert_eq!(headers.names(), vec![&"v".to_string()]);
         let (name, values) = headers.iter_original().next().unwrap();
         assert_eq!(name, "v");
-        assert_eq!(values, &vec!["SIP/2.0/UDP h:5060;branch=z9hG4bK1".to_string()]);
+        assert_eq!(
+            values,
+            &vec!["SIP/2.0/UDP h:5060;branch=z9hG4bK1".to_string()]
+        );
     }
 
     /// Compact and long form of the same header merge into one entry
@@ -351,6 +357,3 @@ mod tests {
         assert!(!headers.has("Via"));
     }
 }
-
-
-

@@ -15,8 +15,10 @@ use tokio::sync::mpsc;
 use tokio_sctp::{SctpListener, SendOptions};
 use tracing::{debug, error, info, warn};
 
-use crate::transport::{ConnectionId, InboundMessage, OutboundMessage, Transport, next_connection_id};
 use crate::transport::acl::TransportAcl;
+use crate::transport::{
+    next_connection_id, ConnectionId, InboundMessage, OutboundMessage, Transport,
+};
 
 /// Spawn an SCTP listener.
 pub async fn listen(
@@ -49,13 +51,19 @@ pub async fn listen(
                             break;
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
-                            warn!("SCTP outbound dropped: connection {:?} closed", connection_id);
+                            warn!(
+                                "SCTP outbound dropped: connection {:?} closed",
+                                connection_id
+                            );
                             break;
                         }
                     }
                 }
             } else {
-                debug!("SCTP outbound: connection {:?} not found (may have closed)", outbound.connection_id);
+                debug!(
+                    "SCTP outbound: connection {:?} not found (may have closed)",
+                    outbound.connection_id
+                );
             }
         }
     });
@@ -110,7 +118,9 @@ pub async fn listen(
                                             remote_addr,
                                             data,
                                         };
-                                        if let Err(error) = inbound_tx_clone.send_async(message).await {
+                                        if let Err(error) =
+                                            inbound_tx_clone.send_async(message).await
+                                        {
                                             error!("SCTP inbound enqueue failed: {}", error);
                                             break;
                                         }
@@ -172,11 +182,21 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None).await;
+        listen(
+            addr,
+            inbound_tx,
+            outbound_rx,
+            Arc::clone(&connection_map),
+            test_acl(),
+            None,
+        )
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         // Connect as an SCTP client
-        let client = SctpStream::connect(addr).await.expect("SCTP connect failed");
+        let client = SctpStream::connect(addr)
+            .await
+            .expect("SCTP connect failed");
 
         // Send a SIP message
         let sip_message = concat!(
@@ -190,20 +210,25 @@ mod tests {
             "\r\n",
         );
         let options = SendOptions::default();
-        client.sendmsg(sip_message.as_bytes(), None, &options).await.unwrap();
+        client
+            .sendmsg(sip_message.as_bytes(), None, &options)
+            .await
+            .unwrap();
 
         // Receive the inbound message
-        let message = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            inbound_rx.recv_async(),
-        )
-        .await
-        .expect("timed out waiting for inbound message")
-        .expect("inbound channel closed");
+        let message =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .expect("timed out waiting for inbound message")
+                .expect("inbound channel closed");
 
         assert_eq!(message.transport, Transport::Sctp);
         let data_str = String::from_utf8_lossy(&message.data);
-        assert!(data_str.contains("REGISTER"), "expected REGISTER in data: {}", data_str);
+        assert!(
+            data_str.contains("REGISTER"),
+            "expected REGISTER in data: {}",
+            data_str
+        );
         assert!(connection_map.contains_key(&message.connection_id));
     }
 
@@ -215,20 +240,31 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None).await;
+        listen(
+            addr,
+            inbound_tx,
+            outbound_rx,
+            Arc::clone(&connection_map),
+            test_acl(),
+            None,
+        )
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let client = SctpStream::connect(addr).await.expect("SCTP connect failed");
+        let client = SctpStream::connect(addr)
+            .await
+            .expect("SCTP connect failed");
         let options = SendOptions::default();
-        client.sendmsg(b"OPTIONS sip:test SIP/2.0\r\n\r\n", None, &options).await.unwrap();
+        client
+            .sendmsg(b"OPTIONS sip:test SIP/2.0\r\n\r\n", None, &options)
+            .await
+            .unwrap();
 
-        let message = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            inbound_rx.recv_async(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let message =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .unwrap()
+                .unwrap();
 
         let connection_id = message.connection_id;
         assert!(connection_map.contains_key(&connection_id));
@@ -253,34 +289,46 @@ mod tests {
         let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
             Arc::new(DashMap::new());
 
-        listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None).await;
+        listen(
+            addr,
+            inbound_tx,
+            outbound_rx,
+            Arc::clone(&connection_map),
+            test_acl(),
+            None,
+        )
+        .await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let client = SctpStream::connect(addr).await.expect("SCTP connect failed");
+        let client = SctpStream::connect(addr)
+            .await
+            .expect("SCTP connect failed");
         let options = SendOptions::default();
 
         // Send two messages back-to-back
         let message1 = "REGISTER sip:a SIP/2.0\r\n\r\n";
         let message2 = "OPTIONS sip:b SIP/2.0\r\n\r\n";
-        client.sendmsg(message1.as_bytes(), None, &options).await.unwrap();
-        client.sendmsg(message2.as_bytes(), None, &options).await.unwrap();
+        client
+            .sendmsg(message1.as_bytes(), None, &options)
+            .await
+            .unwrap();
+        client
+            .sendmsg(message2.as_bytes(), None, &options)
+            .await
+            .unwrap();
 
         // Both should arrive as separate InboundMessages (not coalesced)
-        let received1 = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            inbound_rx.recv_async(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let received1 =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .unwrap()
+                .unwrap();
 
-        let received2 = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            inbound_rx.recv_async(),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let received2 =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound_rx.recv_async())
+                .await
+                .unwrap()
+                .unwrap();
 
         let data1 = String::from_utf8_lossy(&received1.data);
         let data2 = String::from_utf8_lossy(&received2.data);

@@ -19,7 +19,14 @@ fn md5_hex(input: &str) -> String {
 }
 
 /// Build a Digest Authorization header with a valid RFC 2617 response.
-fn digest_header(username: &str, password: &str, realm: &str, nonce: &str, uri: &str, method: &str) -> String {
+fn digest_header(
+    username: &str,
+    password: &str,
+    realm: &str,
+    nonce: &str,
+    uri: &str,
+    method: &str,
+) -> String {
     let ha1 = md5_hex(&format!("{username}:{realm}:{password}"));
     let ha2 = md5_hex(&format!("{method}:{uri}"));
     let response = md5_hex(&format!("{ha1}:{nonce}:{ha2}"));
@@ -41,10 +48,7 @@ fn fresh_nonce() -> String {
 
 fn make_register(auth_header: Option<&str>) -> PyRequest {
     let mut builder = SipMessageBuilder::new()
-        .request(
-            Method::Register,
-            SipUri::new("atlanta.com".to_string()),
-        )
+        .request(Method::Register, SipUri::new("atlanta.com".to_string()))
         .via("SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK-auth-test".to_string())
         .to("Alice <sip:alice@atlanta.com>".to_string())
         .from("Alice <sip:alice@atlanta.com>;tag=auth123".to_string())
@@ -81,7 +85,9 @@ fn www_digest_challenge_sets_401_reply() {
     let auth = make_auth("atlanta.com", &[("alice", "secret123")]);
     let mut request = make_register(None);
 
-    let result = auth.challenge_www(&mut request, Some("atlanta.com")).unwrap();
+    let result = auth
+        .challenge_www(&mut request, Some("atlanta.com"))
+        .unwrap();
     assert!(!result, "should return false when no credentials present");
 
     match request.action() {
@@ -129,7 +135,9 @@ fn proxy_digest_challenge_sets_407_reply() {
         5060,
     );
 
-    let result = auth.challenge_proxy(&mut request, Some("atlanta.com")).unwrap();
+    let result = auth
+        .challenge_proxy(&mut request, Some("atlanta.com"))
+        .unwrap();
     assert!(!result);
 
     match request.action() {
@@ -144,10 +152,19 @@ fn proxy_digest_challenge_sets_407_reply() {
 #[test]
 fn valid_credentials_return_true() {
     let auth = make_auth("atlanta.com", &[("alice", "secret123")]);
-    let header = digest_header("alice", "secret123", "atlanta.com", &fresh_nonce(), "sip:atlanta.com", "REGISTER");
+    let header = digest_header(
+        "alice",
+        "secret123",
+        "atlanta.com",
+        &fresh_nonce(),
+        "sip:atlanta.com",
+        "REGISTER",
+    );
     let mut request = make_register(Some(&header));
 
-    let result = auth.challenge_www(&mut request, Some("atlanta.com")).unwrap();
+    let result = auth
+        .challenge_www(&mut request, Some("atlanta.com"))
+        .unwrap();
     assert!(result, "valid user should be authenticated");
 
     // Action should remain None (no reply needed)
@@ -162,17 +179,28 @@ fn check_credentials_without_header_returns_false() {
     let auth = make_auth("atlanta.com", &[("alice", "secret123")]);
     let request = make_register(None);
 
-    let result = auth.check_credentials(&request, Some("atlanta.com")).unwrap();
+    let result = auth
+        .check_credentials(&request, Some("atlanta.com"))
+        .unwrap();
     assert!(!result);
 }
 
 #[test]
 fn check_credentials_with_valid_user_returns_true() {
     let auth = make_auth("atlanta.com", &[("alice", "secret123")]);
-    let header = digest_header("alice", "secret123", "atlanta.com", &fresh_nonce(), "sip:atlanta.com", "REGISTER");
+    let header = digest_header(
+        "alice",
+        "secret123",
+        "atlanta.com",
+        &fresh_nonce(),
+        "sip:atlanta.com",
+        "REGISTER",
+    );
     let request = make_register(Some(&header));
 
-    let result = auth.check_credentials(&request, Some("atlanta.com")).unwrap();
+    let result = auth
+        .check_credentials(&request, Some("atlanta.com"))
+        .unwrap();
     assert!(result, "should return true for known user");
 }
 
@@ -183,7 +211,9 @@ fn check_credentials_with_unknown_user_returns_false() {
         "Digest username=\"eve\", realm=\"atlanta.com\", nonce=\"abc\", uri=\"sip:atlanta.com\", response=\"xyz\""
     ));
 
-    let result = auth.check_credentials(&request, Some("atlanta.com")).unwrap();
+    let result = auth
+        .check_credentials(&request, Some("atlanta.com"))
+        .unwrap();
     assert!(!result, "should return false for unknown user");
 }
 
@@ -201,20 +231,40 @@ fn multi_realm_users() {
     let auth = PyAuth::new(realm_users, "realm1.com".to_string());
 
     // Bob is in realm1
-    let header = digest_header("bob", "pass1", "realm1.com", &fresh_nonce(), "sip:realm1.com", "REGISTER");
+    let header = digest_header(
+        "bob",
+        "pass1",
+        "realm1.com",
+        &fresh_nonce(),
+        "sip:realm1.com",
+        "REGISTER",
+    );
     let request = make_register(Some(&header));
-    assert!(auth.check_credentials(&request, Some("realm1.com")).unwrap());
+    assert!(auth
+        .check_credentials(&request, Some("realm1.com"))
+        .unwrap());
 
     // Carol is in realm2 — static backend checks all realms regardless
-    let header = digest_header("carol", "pass2", "realm2.com", &fresh_nonce(), "sip:realm2.com", "REGISTER");
+    let header = digest_header(
+        "carol",
+        "pass2",
+        "realm2.com",
+        &fresh_nonce(),
+        "sip:realm2.com",
+        "REGISTER",
+    );
     let request = make_register(Some(&header));
-    assert!(auth.check_credentials(&request, Some("realm2.com")).unwrap());
+    assert!(auth
+        .check_credentials(&request, Some("realm2.com"))
+        .unwrap());
 
     // Unknown user fails
     let request = make_register(Some(
         "Digest username=\"dave\", realm=\"realm1.com\", nonce=\"abc\", uri=\"sip:realm1.com\", response=\"xyz\""
     ));
-    assert!(!auth.check_credentials(&request, Some("realm1.com")).unwrap());
+    assert!(!auth
+        .check_credentials(&request, Some("realm1.com"))
+        .unwrap());
 }
 
 // ---------------------------------------------------------------------------

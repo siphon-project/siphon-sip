@@ -236,7 +236,10 @@ mod tests {
         let from = header(&message, "From").expect("From present");
         assert!(from.contains("+12025550111"), "{from}");
         assert!(!from.contains("+12025550100"), "{from}");
-        assert!(from.contains("tag=a-tag"), "the dialog tag must survive: {from}");
+        assert!(
+            from.contains("tag=a-tag"),
+            "the dialog tag must survive: {from}"
+        );
         assert!(from.contains("Alice"), "the display name survives: {from}");
     }
 
@@ -254,7 +257,9 @@ mod tests {
     fn set_calling_number_ignores_an_empty_number() {
         let mut message = invite_with("");
         assert!(!set_calling_number(&mut message, ""));
-        assert!(header(&message, "From").expect("From").contains("+12025550100"));
+        assert!(header(&message, "From")
+            .expect("From")
+            .contains("+12025550100"));
     }
 
     #[test]
@@ -269,7 +274,10 @@ mod tests {
             !from.contains("+12025550100"),
             "the real number must not survive in From: {from}",
         );
-        assert!(from.contains("tag=a-tag"), "the dialog tag must survive: {from}");
+        assert!(
+            from.contains("tag=a-tag"),
+            "the dialog tag must survive: {from}"
+        );
         assert_eq!(header(&message, "Privacy").as_deref(), Some("id"));
     }
 
@@ -284,7 +292,9 @@ mod tests {
 
         let pai = header(&message, "P-Asserted-Identity").expect("PAI present");
         assert!(pai.contains("+12025550100"), "{pai}");
-        assert!(header(&message, "From").expect("From").contains(ANONYMOUS_URI));
+        assert!(header(&message, "From")
+            .expect("From")
+            .contains(ANONYMOUS_URI));
     }
 
     #[test]
@@ -305,7 +315,10 @@ mod tests {
         restrict_calling_identity(&mut message);
 
         let privacy = header(&message, "Privacy").expect("Privacy present");
-        assert!(privacy.contains("header"), "existing tokens survive: {privacy}");
+        assert!(
+            privacy.contains("header"),
+            "existing tokens survive: {privacy}"
+        );
         assert!(privacy.contains("id"), "{privacy}");
     }
 

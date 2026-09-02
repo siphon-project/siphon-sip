@@ -18,10 +18,7 @@ use tokio::net::UdpSocket;
 /// Spawn a fake rtpproxy that allocates `reply_port`/`reply_address` for every
 /// `U`/`L`, answers `V` with a version, and `D`/anything else with `0`.
 /// Returns the bound control address.
-async fn spawn_fake_rtpproxy(
-    reply_address: &'static str,
-    reply_port: u16,
-) -> std::net::SocketAddr {
+async fn spawn_fake_rtpproxy(reply_address: &'static str, reply_port: u16) -> std::net::SocketAddr {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let address = socket.local_addr().unwrap();
     tokio::spawn(async move {
@@ -69,7 +66,9 @@ const INVITE_WITH_SDP: &str = concat!(
 #[tokio::test]
 async fn media_backend_rtpproxy_offer_rewrites_sdp() {
     let address = spawn_fake_rtpproxy("203.0.113.1", 30000).await;
-    let set = RtpProxyClientSet::new(vec![(address, 1000, 1)], 2).await.unwrap();
+    let set = RtpProxyClientSet::new(vec![(address, 1000, 1)], 2)
+        .await
+        .unwrap();
     let backend = MediaBackend::RtpProxy(set);
 
     // Confirm the abstraction reports the rtpproxy backend's shape.
@@ -93,7 +92,10 @@ async fn media_backend_rtpproxy_offer_rewrites_sdp() {
         rewritten.contains("c=IN IP4 203.0.113.1"),
         "SDP not rewritten: {rewritten}"
     );
-    assert!(rewritten.contains("m=audio 30000 RTP/AVP 0"), "SDP: {rewritten}");
+    assert!(
+        rewritten.contains("m=audio 30000 RTP/AVP 0"),
+        "SDP: {rewritten}"
+    );
     // The original endpoint must be gone from the connection line.
     assert!(!rewritten.contains("c=IN IP4 10.0.0.1"), "SDP: {rewritten}");
     assert_eq!(backend.active_sessions(), 1);
@@ -105,13 +107,21 @@ async fn media_backend_rtpproxy_offer_rewrites_sdp() {
 #[tokio::test]
 async fn media_backend_rtpproxy_unsupported_op_errors_cleanly() {
     let address = spawn_fake_rtpproxy("203.0.113.1", 30000).await;
-    let set = RtpProxyClientSet::new(vec![(address, 1000, 1)], 2).await.unwrap();
+    let set = RtpProxyClientSet::new(vec![(address, 1000, 1)], 2)
+        .await
+        .unwrap();
     let backend = MediaBackend::RtpProxy(set);
 
     // rtpengine-only verbs must surface a clear typed error, not panic or hang.
     let error = backend.silence_media("c1", "ft").await.unwrap_err();
     assert!(
-        matches!(error, RtpEngineError::Unsupported { backend: "rtpproxy", .. }),
+        matches!(
+            error,
+            RtpEngineError::Unsupported {
+                backend: "rtpproxy",
+                ..
+            }
+        ),
         "{error}"
     );
 }

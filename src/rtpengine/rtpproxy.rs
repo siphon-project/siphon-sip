@@ -218,14 +218,15 @@ impl RtpProxyClient {
                 continue;
             }
 
-            let media_connection = parsed.media_sections[index].connection().map(str::to_string);
+            let media_connection = parsed.media_sections[index]
+                .connection()
+                .map(str::to_string);
             let connection = media_connection
                 .as_deref()
                 .or(session_connection.as_deref())
                 .ok_or_else(|| {
                     RtpEngineError::Protocol(
-                        "SDP has no connection address (c=) for an active media stream"
-                            .to_string(),
+                        "SDP has no connection address (c=) for an active media stream".to_string(),
                     )
                 })?;
             let (is_ipv6, advertised_address) = parse_connection(connection)?;
@@ -250,8 +251,7 @@ impl RtpProxyClient {
             );
 
             let response = self.request(&command).await?;
-            let (relay_address, relay_port) =
-                parse_session_response(&response, self.address.ip())?;
+            let (relay_address, relay_port) = parse_session_response(&response, self.address.ip())?;
 
             parsed.media_sections[index].port = relay_port;
             if media_connection.is_some() {
@@ -279,7 +279,8 @@ impl RtpProxyClient {
         self.pending.insert(cookie.clone(), sender);
 
         let attempts = self.retries + 1;
-        let per_attempt = Duration::from_millis((self.timeout_ms / attempts as u64).max(MIN_PER_ATTEMPT_MS));
+        let per_attempt =
+            Duration::from_millis((self.timeout_ms / attempts as u64).max(MIN_PER_ATTEMPT_MS));
 
         for attempt in 0..attempts {
             if let Err(error) = self.socket.send_to(datagram.as_bytes(), self.address).await {
@@ -408,7 +409,10 @@ impl RtpProxyClientSet {
         sdp: &[u8],
         flags: &NgFlags,
     ) -> Result<Vec<u8>, RtpEngineError> {
-        let result = self.select(call_id).offer(call_id, from_tag, sdp, flags).await?;
+        let result = self
+            .select(call_id)
+            .offer(call_id, from_tag, sdp, flags)
+            .await?;
         self.bind_affinity(call_id);
         Ok(result)
     }
@@ -470,7 +474,11 @@ impl RtpProxyClientSet {
     }
 
     /// Replace egress audio with silence — unsupported by rtpproxy.
-    pub async fn silence_media(&self, _call_id: &str, _from_tag: &str) -> Result<(), RtpEngineError> {
+    pub async fn silence_media(
+        &self,
+        _call_id: &str,
+        _from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
         Err(unsupported("silence_media"))
     }
 
@@ -489,7 +497,11 @@ impl RtpProxyClientSet {
     }
 
     /// Resume egress packets — unsupported by rtpproxy.
-    pub async fn unblock_media(&self, _call_id: &str, _from_tag: &str) -> Result<(), RtpEngineError> {
+    pub async fn unblock_media(
+        &self,
+        _call_id: &str,
+        _from_tag: &str,
+    ) -> Result<(), RtpEngineError> {
         Err(unsupported("unblock_media"))
     }
 
@@ -541,7 +553,9 @@ impl RtpProxyClientSet {
     pub async fn ping(&self) -> Result<(), RtpEngineError> {
         match self.clients.first() {
             Some(client) => client.ping().await,
-            None => Err(RtpEngineError::Protocol("no rtpproxy instances".to_string())),
+            None => Err(RtpEngineError::Protocol(
+                "no rtpproxy instances".to_string(),
+            )),
         }
     }
 
@@ -556,7 +570,10 @@ impl RtpProxyClientSet {
 
     /// Total active call-ids across all instances.
     pub fn active_sessions(&self) -> usize {
-        self.clients.iter().map(|client| client.active_sessions()).sum()
+        self.clients
+            .iter()
+            .map(|client| client.active_sessions())
+            .sum()
     }
 
     /// Number of configured instances.
@@ -664,16 +681,18 @@ fn parse_session_response(
 ) -> Result<(String, u16), RtpEngineError> {
     let trimmed = response.trim();
     if let Some(code) = trimmed.strip_prefix('E') {
-        return Err(RtpEngineError::EngineError(format!("rtpproxy error {code}")));
+        return Err(RtpEngineError::EngineError(format!(
+            "rtpproxy error {code}"
+        )));
     }
 
     let mut tokens = trimmed.split_whitespace();
     let port_token = tokens
         .next()
         .ok_or_else(|| RtpEngineError::Protocol("empty rtpproxy response".to_string()))?;
-    let port: u16 = port_token.parse().map_err(|_| {
-        RtpEngineError::Protocol(format!("invalid rtpproxy port {port_token:?}"))
-    })?;
+    let port: u16 = port_token
+        .parse()
+        .map_err(|_| RtpEngineError::Protocol(format!("invalid rtpproxy port {port_token:?}")))?;
     if port == 0 {
         return Err(RtpEngineError::EngineError(
             "rtpproxy returned port 0 (allocation declined)".to_string(),
@@ -710,7 +729,11 @@ fn connection_line(address: &str) -> String {
 /// Replace (or insert) the session-level `c=` line with the relay address.
 fn set_session_connection(sdp: &mut SdpBody, address: &str) {
     let new_line = connection_line(address);
-    if let Some(position) = sdp.session_lines.iter().position(|line| line.starts_with("c=")) {
+    if let Some(position) = sdp
+        .session_lines
+        .iter()
+        .position(|line| line.starts_with("c="))
+    {
         sdp.session_lines[position] = new_line;
         return;
     }
@@ -733,7 +756,11 @@ fn set_session_connection(sdp: &mut SdpBody, address: &str) {
 /// Replace (or insert) a media-level `c=` line with the relay address.
 fn set_media_connection(media: &mut MediaLine, address: &str) {
     let new_line = connection_line(address);
-    if let Some(position) = media.other_attrs.iter().position(|line| line.starts_with("c=")) {
+    if let Some(position) = media
+        .other_attrs
+        .iter()
+        .position(|line| line.starts_with("c="))
+    {
         media.other_attrs[position] = new_line;
     } else {
         // A media-level c= must precede the a= lines.
@@ -909,12 +936,17 @@ mod tests {
 
     #[test]
     fn set_session_connection_replaces_existing() {
-        let mut sdp = SdpBody::parse("v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\n");
+        let mut sdp = SdpBody::parse(
+            "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\n",
+        );
         set_session_connection(&mut sdp, "203.0.113.1");
         assert_eq!(sdp.connection(), Some("IN IP4 203.0.113.1"));
         // Exactly one c= line.
         assert_eq!(
-            sdp.session_lines.iter().filter(|l| l.starts_with("c=")).count(),
+            sdp.session_lines
+                .iter()
+                .filter(|l| l.starts_with("c="))
+                .count(),
             1
         );
     }
@@ -925,8 +957,16 @@ mod tests {
         set_session_connection(&mut sdp, "203.0.113.1");
         assert_eq!(sdp.connection(), Some("IN IP4 203.0.113.1"));
         // c= lands after s=.
-        let s_pos = sdp.session_lines.iter().position(|l| l.starts_with("s=")).unwrap();
-        let c_pos = sdp.session_lines.iter().position(|l| l.starts_with("c=")).unwrap();
+        let s_pos = sdp
+            .session_lines
+            .iter()
+            .position(|l| l.starts_with("s="))
+            .unwrap();
+        let c_pos = sdp
+            .session_lines
+            .iter()
+            .position(|l| l.starts_with("c="))
+            .unwrap();
         assert_eq!(c_pos, s_pos + 1);
     }
 
@@ -994,7 +1034,10 @@ mod tests {
 
         // c= now points at the relay; m= carries the relay port; codecs intact.
         assert!(text.contains("c=IN IP4 203.0.113.1"), "sdp was: {text}");
-        assert!(text.contains("m=audio 30000 RTP/AVP 0 8"), "sdp was: {text}");
+        assert!(
+            text.contains("m=audio 30000 RTP/AVP 0 8"),
+            "sdp was: {text}"
+        );
         assert!(text.contains("a=rtpmap:0 PCMU/8000"));
         // The original endpoint must be gone from the connection line.
         assert!(!text.contains("c=IN IP4 10.0.0.1"));
@@ -1129,7 +1172,10 @@ mod tests {
         let address = spawn_mock_rtpproxy("203.0.113.1", 30000).await;
         let client = RtpProxyClient::new(address, 1000, 1).await.unwrap();
         let flags = NgFlags::default();
-        client.offer("call-1", "ft", sample_offer_sdp(), &flags).await.unwrap();
+        client
+            .offer("call-1", "ft", sample_offer_sdp(), &flags)
+            .await
+            .unwrap();
         assert_eq!(client.active_sessions(), 1);
         client.delete("call-1", "ft").await.unwrap();
         assert_eq!(client.active_sessions(), 0);
@@ -1156,8 +1202,14 @@ mod tests {
         let flags = NgFlags::default();
         for index in 0..300 {
             let call_id = format!("leak-{index}");
-            client.offer(&call_id, "ft", sample_offer_sdp(), &flags).await.unwrap();
-            client.answer(&call_id, "ft", "tt", sample_offer_sdp(), &flags).await.unwrap();
+            client
+                .offer(&call_id, "ft", sample_offer_sdp(), &flags)
+                .await
+                .unwrap();
+            client
+                .answer(&call_id, "ft", "tt", sample_offer_sdp(), &flags)
+                .await
+                .unwrap();
             client.delete(&call_id, "ft").await.unwrap();
         }
         assert_eq!(
@@ -1215,12 +1267,18 @@ mod tests {
     #[tokio::test]
     async fn set_single_instance_offer_answer_delete() {
         let address = spawn_mock_rtpproxy("203.0.113.1", 30000).await;
-        let set = RtpProxyClientSet::new(vec![(address, 1000, 1)], 1).await.unwrap();
+        let set = RtpProxyClientSet::new(vec![(address, 1000, 1)], 1)
+            .await
+            .unwrap();
         assert_eq!(set.instance_count(), 1);
         let flags = NgFlags::default();
-        set.offer("c1", "ft", sample_offer_sdp(), &flags).await.unwrap();
+        set.offer("c1", "ft", sample_offer_sdp(), &flags)
+            .await
+            .unwrap();
         assert_eq!(set.active_sessions(), 1);
-        set.answer("c1", "ft", "tt", sample_offer_sdp(), &flags).await.unwrap();
+        set.answer("c1", "ft", "tt", sample_offer_sdp(), &flags)
+            .await
+            .unwrap();
         set.delete("c1", "ft").await.unwrap();
         assert_eq!(set.active_sessions(), 0);
     }
@@ -1233,7 +1291,9 @@ mod tests {
             .await
             .unwrap();
         let flags = NgFlags::default();
-        set.offer("call-affinity", "ft", sample_offer_sdp(), &flags).await.unwrap();
+        set.offer("call-affinity", "ft", sample_offer_sdp(), &flags)
+            .await
+            .unwrap();
         // One affinity entry recorded; total active sessions == 1.
         assert_eq!(set.active_sessions(), 1);
         set.delete("call-affinity", "ft").await.unwrap();
@@ -1249,11 +1309,16 @@ mod tests {
     #[tokio::test]
     async fn set_unsupported_ops_error_clearly() {
         let address = spawn_mock_rtpproxy("203.0.113.1", 30000).await;
-        let set = RtpProxyClientSet::new(vec![(address, 1000, 1)], 1).await.unwrap();
+        let set = RtpProxyClientSet::new(vec![(address, 1000, 1)], 1)
+            .await
+            .unwrap();
         let error = set.silence_media("c1", "ft").await.unwrap_err();
         assert!(matches!(
             error,
-            RtpEngineError::Unsupported { operation: "silence_media", backend: "rtpproxy" }
+            RtpEngineError::Unsupported {
+                operation: "silence_media",
+                backend: "rtpproxy"
+            }
         ));
         assert!(error.to_string().contains("not supported"));
     }

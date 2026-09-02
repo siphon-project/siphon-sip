@@ -185,10 +185,7 @@ impl ReginfoBody {
                     output.push_str(&format!(" q=\"{q:.1}\""));
                 }
                 output.push_str(">\n");
-                output.push_str(&format!(
-                    "      <uri>{}</uri>\n",
-                    xml_escape(&contact.uri),
-                ));
+                output.push_str(&format!("      <uri>{}</uri>\n", xml_escape(&contact.uri),));
                 // RFC 3680 §5.3.2 — surface RFC 3840 feature tags and
                 // other Contact-header parameters as <unknown-param>
                 // children.  Flag params (`+g.3gpp.smsip`) become
@@ -607,10 +604,9 @@ fn attr_required_u32(
     name: &'static str,
 ) -> Result<u32, ReginfoParseError> {
     let value = attr_required_str(element, name)?;
-    value.parse::<u32>().map_err(|_| ReginfoParseError::InvalidAttr {
-        attr: name,
-        value,
-    })
+    value
+        .parse::<u32>()
+        .map_err(|_| ReginfoParseError::InvalidAttr { attr: name, value })
 }
 
 fn attr_optional_u64(
@@ -668,8 +664,8 @@ fn xml_escape(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use crate::sip::uri::SipUri;
+    use std::time::Duration;
 
     fn make_contact(uri_str: &str, expires_secs: u64) -> Contact {
         let mut uri = SipUri::new("10.0.0.1".to_string());
@@ -783,8 +779,14 @@ mod tests {
         assert_eq!(body.registrations.len(), 1);
         assert_eq!(body.registrations[0].state, RegistrationState::Active);
         assert_eq!(body.registrations[0].contacts.len(), 1);
-        assert_eq!(body.registrations[0].contacts[0].state, ContactState::Active);
-        assert_eq!(body.registrations[0].contacts[0].event, ContactEvent::Registered);
+        assert_eq!(
+            body.registrations[0].contacts[0].state,
+            ContactState::Active
+        );
+        assert_eq!(
+            body.registrations[0].contacts[0].event,
+            ContactEvent::Registered
+        );
 
         let xml = body.to_xml();
         assert!(!xml.contains("application/reginfo+xml")); // content type is separate
@@ -922,8 +924,14 @@ mod tests {
         assert_eq!(body.registrations.len(), 1);
         assert_eq!(body.registrations[0].state, RegistrationState::Terminated);
         assert_eq!(body.registrations[0].contacts.len(), 1);
-        assert_eq!(body.registrations[0].contacts[0].state, ContactState::Terminated);
-        assert_eq!(body.registrations[0].contacts[0].event, ContactEvent::Expired);
+        assert_eq!(
+            body.registrations[0].contacts[0].state,
+            ContactState::Terminated
+        );
+        assert_eq!(
+            body.registrations[0].contacts[0].event,
+            ContactEvent::Expired
+        );
         assert!(body.registrations[0].contacts[0].expires.is_none());
         assert!(body.registrations[0].contacts[0].q.is_none());
     }
@@ -956,10 +964,7 @@ mod tests {
         assert_eq!(parsed.version, 5);
         assert_eq!(parsed.state, ReginfoState::Full);
         assert_eq!(parsed.registrations.len(), 1);
-        assert_eq!(
-            parsed.registrations[0].state,
-            RegistrationState::Terminated
-        );
+        assert_eq!(parsed.registrations[0].state, RegistrationState::Terminated);
     }
 
     #[test]
@@ -983,7 +988,10 @@ mod tests {
         // Missing version on <reginfo>.
         let xml = r#"<reginfo state="full"></reginfo>"#;
         let result = parse_reginfo(xml);
-        assert!(matches!(result, Err(ReginfoParseError::MissingAttr("version"))));
+        assert!(matches!(
+            result,
+            Err(ReginfoParseError::MissingAttr("version"))
+        ));
     }
 
     #[test]
@@ -1009,7 +1017,10 @@ mod tests {
   </registration>
 </reginfo>"#;
         let body = parse_reginfo(xml).unwrap();
-        assert_eq!(body.registrations[0].contacts[0].event, ContactEvent::Registered);
+        assert_eq!(
+            body.registrations[0].contacts[0].event,
+            ContactEvent::Registered
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1035,10 +1046,7 @@ mod tests {
                         ("+g.3gpp.smsip".to_string(), None),
                         (
                             "+g.3gpp.icsi-ref".to_string(),
-                            Some(
-                                "\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\""
-                                    .to_string(),
-                            ),
+                            Some("\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"".to_string()),
                         ),
                     ],
                 }],
@@ -1140,9 +1148,7 @@ mod tests {
                 ("+g.3gpp.smsip".to_string(), None),
                 (
                     "+g.3gpp.icsi-ref".to_string(),
-                    Some(
-                        "urn:urn-7:3gpp-service.ims.icsi.mmtel".to_string(),
-                    ),
+                    Some("urn:urn-7:3gpp-service.ims.icsi.mmtel".to_string()),
                 ),
                 ("vendor.x".to_string(), Some("y".to_string())),
             ],

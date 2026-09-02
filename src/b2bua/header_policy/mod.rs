@@ -260,11 +260,7 @@ pub(crate) fn is_framework_auto(name: &str) -> bool {
 ///
 /// Called from `b2bua_send_b_leg_invite` after Record-Route/Route/etc. have
 /// been stripped, and before Via/Call-ID/From/To/Contact framework rewrites.
-pub fn apply_to_request(
-    outbound: &mut SipMessage,
-    policy: &ResolvedPolicy,
-    ctx: &PolicyContext,
-) {
+pub fn apply_to_request(outbound: &mut SipMessage, policy: &ResolvedPolicy, ctx: &PolicyContext) {
     apply(outbound, policy, ctx, /*is_request=*/ true);
 }
 
@@ -273,11 +269,7 @@ pub fn apply_to_request(
 ///
 /// Called from `sanitize_b2bua_response` in place of the previous hardcoded
 /// `Allow` / `Supported` / `Require` / etc. strips.
-pub fn apply_to_response(
-    response: &mut SipMessage,
-    policy: &ResolvedPolicy,
-    ctx: &PolicyContext,
-) {
+pub fn apply_to_response(response: &mut SipMessage, policy: &ResolvedPolicy, ctx: &PolicyContext) {
     apply(response, policy, ctx, /*is_request=*/ false);
 }
 
@@ -357,8 +349,13 @@ fn apply_translate(value: &str, op: &TranslateOp) -> Option<(String, String)> {
 /// hierarchical index `1.1`, `1.1.1`) is out of scope for v1 — the BGCF use
 /// case that motivates this verb only sees one divert at the trust boundary.
 fn translate_diversion_to_history_info(diversion: &str) -> String {
-    let uri_end = diversion.find('>').map(|i| i + 1).unwrap_or(diversion.len());
-    let uri_part = diversion[..uri_end].trim_end_matches('>').trim_start_matches('<');
+    let uri_end = diversion
+        .find('>')
+        .map(|i| i + 1)
+        .unwrap_or(diversion.len());
+    let uri_part = diversion[..uri_end]
+        .trim_end_matches('>')
+        .trim_start_matches('<');
     let params_part = if uri_end < diversion.len() {
         &diversion[uri_end..]
     } else {
@@ -366,7 +363,8 @@ fn translate_diversion_to_history_info(diversion: &str) -> String {
     };
     let reason = params_part.split(';').find_map(|p| {
         let p = p.trim();
-        p.strip_prefix("reason=").map(|v| v.trim_matches('"').to_string())
+        p.strip_prefix("reason=")
+            .map(|v| v.trim_matches('"').to_string())
     });
     let cause = reason.as_deref().map(reason_to_sip_cause).unwrap_or(302);
     format!("<{}?Reason=SIP%3Bcause%3D{}>;index=1", uri_part, cause)
@@ -462,12 +460,18 @@ fn transparent_b2bua_2026() -> Preset {
         request: DirectionPolicy {
             default: Verb::Copy,
             overrides: vec![
-                (HeaderPattern::Exact("Authorization".to_string()), Verb::Strip),
+                (
+                    HeaderPattern::Exact("Authorization".to_string()),
+                    Verb::Strip,
+                ),
                 // RFC 3261 §22.3: Proxy-Authorization is hop-by-hop —
                 // forwarding it across a B2BUA hop would target the wrong
                 // realm.  Scripts can opt in via dial(copy=[…]) for the
                 // rare transparent-proxy case.
-                (HeaderPattern::Exact("Proxy-Authorization".to_string()), Verb::Strip),
+                (
+                    HeaderPattern::Exact("Proxy-Authorization".to_string()),
+                    Verb::Strip,
+                ),
                 (
                     HeaderPattern::Exact("User-Agent".to_string()),
                     Verb::Rewrite(RewriteOp::ReplaceWithUserAgentHeader),
@@ -482,9 +486,15 @@ fn transparent_b2bua_2026() -> Preset {
             default: Verb::Copy,
             overrides: vec![
                 (HeaderPattern::Exact("Allow".to_string()), Verb::Strip),
-                (HeaderPattern::Exact("Allow-Events".to_string()), Verb::Strip),
+                (
+                    HeaderPattern::Exact("Allow-Events".to_string()),
+                    Verb::Strip,
+                ),
                 (HeaderPattern::Exact("Supported".to_string()), Verb::Strip),
-                (HeaderPattern::Exact("Content-Disposition".to_string()), Verb::Strip),
+                (
+                    HeaderPattern::Exact("Content-Disposition".to_string()),
+                    Verb::Strip,
+                ),
                 (HeaderPattern::Exact("Require".to_string()), Verb::Strip),
                 (HeaderPattern::Exact("RSeq".to_string()), Verb::Strip),
                 (HeaderPattern::Exact("User-Agent".to_string()), Verb::Strip),
@@ -497,7 +507,10 @@ fn transparent_b2bua_2026() -> Preset {
                 // compute Proxy-Authorization against the wrong realm.
                 // **Intentional behaviour change vs pre-policy siphon**,
                 // which passed this header through (latent bug).
-                (HeaderPattern::Exact("Proxy-Authenticate".to_string()), Verb::Strip),
+                (
+                    HeaderPattern::Exact("Proxy-Authenticate".to_string()),
+                    Verb::Strip,
+                ),
             ],
         },
     }
@@ -514,8 +527,14 @@ fn ims_intra_trust_domain_2026() -> Preset {
         request: DirectionPolicy {
             default: Verb::Copy,
             overrides: vec![
-                (HeaderPattern::Exact("Authorization".to_string()), Verb::Strip),
-                (HeaderPattern::Exact("Proxy-Authorization".to_string()), Verb::Strip),
+                (
+                    HeaderPattern::Exact("Authorization".to_string()),
+                    Verb::Strip,
+                ),
+                (
+                    HeaderPattern::Exact("Proxy-Authorization".to_string()),
+                    Verb::Strip,
+                ),
                 (
                     HeaderPattern::Exact("User-Agent".to_string()),
                     Verb::Rewrite(RewriteOp::ReplaceWithUserAgentHeader),
@@ -531,7 +550,10 @@ fn ims_intra_trust_domain_2026() -> Preset {
                     Verb::Rewrite(RewriteOp::ReplaceWithServerHeader),
                 ),
                 (HeaderPattern::Exact("User-Agent".to_string()), Verb::Strip),
-                (HeaderPattern::Exact("Proxy-Authenticate".to_string()), Verb::Strip),
+                (
+                    HeaderPattern::Exact("Proxy-Authenticate".to_string()),
+                    Verb::Strip,
+                ),
                 (HeaderPattern::Prefix("X-".to_string()), Verb::Strip),
             ],
         },
@@ -551,13 +573,22 @@ fn ims_trust_domain_boundary_2026() -> Preset {
             default: Verb::Strip,
             overrides: vec![
                 (HeaderPattern::Exact("Accept".to_string()), Verb::Copy),
-                (HeaderPattern::Exact("Accept-Encoding".to_string()), Verb::Copy),
-                (HeaderPattern::Exact("Accept-Language".to_string()), Verb::Copy),
+                (
+                    HeaderPattern::Exact("Accept-Encoding".to_string()),
+                    Verb::Copy,
+                ),
+                (
+                    HeaderPattern::Exact("Accept-Language".to_string()),
+                    Verb::Copy,
+                ),
                 (HeaderPattern::Exact("Allow".to_string()), Verb::Copy),
                 (HeaderPattern::Exact("Supported".to_string()), Verb::Copy),
                 (HeaderPattern::Exact("Require".to_string()), Verb::Copy),
                 (HeaderPattern::Exact("Min-SE".to_string()), Verb::Copy),
-                (HeaderPattern::Exact("Session-Expires".to_string()), Verb::Copy),
+                (
+                    HeaderPattern::Exact("Session-Expires".to_string()),
+                    Verb::Copy,
+                ),
                 (HeaderPattern::Exact("Reason".to_string()), Verb::Copy),
                 (HeaderPattern::Exact("Refer-To".to_string()), Verb::Copy),
                 (HeaderPattern::Exact("Referred-By".to_string()), Verb::Copy),
@@ -568,8 +599,14 @@ fn ims_trust_domain_boundary_2026() -> Preset {
                 (HeaderPattern::Exact("Timestamp".to_string()), Verb::Copy),
                 (HeaderPattern::Exact("Expires".to_string()), Verb::Copy),
                 (HeaderPattern::Exact("Content-Type".to_string()), Verb::Copy),
-                (HeaderPattern::Exact("Content-Encoding".to_string()), Verb::Copy),
-                (HeaderPattern::Exact("Content-Language".to_string()), Verb::Copy),
+                (
+                    HeaderPattern::Exact("Content-Encoding".to_string()),
+                    Verb::Copy,
+                ),
+                (
+                    HeaderPattern::Exact("Content-Language".to_string()),
+                    Verb::Copy,
+                ),
                 (HeaderPattern::Exact("MIME-Version".to_string()), Verb::Copy),
                 (HeaderPattern::Exact("Organization".to_string()), Verb::Copy),
                 (
@@ -593,13 +630,22 @@ fn ims_trust_domain_boundary_2026() -> Preset {
                 (HeaderPattern::Exact("Supported".to_string()), Verb::Copy),
                 (HeaderPattern::Exact("Require".to_string()), Verb::Copy),
                 (HeaderPattern::Exact("Min-SE".to_string()), Verb::Copy),
-                (HeaderPattern::Exact("Session-Expires".to_string()), Verb::Copy),
+                (
+                    HeaderPattern::Exact("Session-Expires".to_string()),
+                    Verb::Copy,
+                ),
                 (HeaderPattern::Exact("Reason".to_string()), Verb::Copy),
                 (HeaderPattern::Exact("Date".to_string()), Verb::Copy),
                 (HeaderPattern::Exact("Expires".to_string()), Verb::Copy),
                 (HeaderPattern::Exact("Content-Type".to_string()), Verb::Copy),
-                (HeaderPattern::Exact("Content-Encoding".to_string()), Verb::Copy),
-                (HeaderPattern::Exact("Content-Language".to_string()), Verb::Copy),
+                (
+                    HeaderPattern::Exact("Content-Encoding".to_string()),
+                    Verb::Copy,
+                ),
+                (
+                    HeaderPattern::Exact("Content-Language".to_string()),
+                    Verb::Copy,
+                ),
                 (HeaderPattern::Exact("Retry-After".to_string()), Verb::Copy),
                 (
                     HeaderPattern::Exact("Server".to_string()),
@@ -619,13 +665,25 @@ fn sip_trunk_edge_2026() -> Preset {
         request: DirectionPolicy {
             default: Verb::Copy,
             overrides: vec![
-                (HeaderPattern::Exact("Authorization".to_string()), Verb::Strip),
-                (HeaderPattern::Exact("Proxy-Authorization".to_string()), Verb::Strip),
+                (
+                    HeaderPattern::Exact("Authorization".to_string()),
+                    Verb::Strip,
+                ),
+                (
+                    HeaderPattern::Exact("Proxy-Authorization".to_string()),
+                    Verb::Strip,
+                ),
                 (HeaderPattern::Prefix("P-".to_string()), Verb::Strip),
                 (HeaderPattern::Prefix("X-".to_string()), Verb::Strip),
-                (HeaderPattern::Exact("History-Info".to_string()), Verb::Strip),
+                (
+                    HeaderPattern::Exact("History-Info".to_string()),
+                    Verb::Strip,
+                ),
                 (HeaderPattern::Exact("Diversion".to_string()), Verb::Strip),
-                (HeaderPattern::Exact("Allow-Events".to_string()), Verb::Strip),
+                (
+                    HeaderPattern::Exact("Allow-Events".to_string()),
+                    Verb::Strip,
+                ),
                 (
                     HeaderPattern::Exact("User-Agent".to_string()),
                     Verb::Rewrite(RewriteOp::ReplaceWithUserAgentHeader),
@@ -638,8 +696,14 @@ fn sip_trunk_edge_2026() -> Preset {
                 (HeaderPattern::Prefix("P-".to_string()), Verb::Strip),
                 (HeaderPattern::Prefix("X-".to_string()), Verb::Strip),
                 (HeaderPattern::Exact("User-Agent".to_string()), Verb::Strip),
-                (HeaderPattern::Exact("Allow-Events".to_string()), Verb::Strip),
-                (HeaderPattern::Exact("Proxy-Authenticate".to_string()), Verb::Strip),
+                (
+                    HeaderPattern::Exact("Allow-Events".to_string()),
+                    Verb::Strip,
+                ),
+                (
+                    HeaderPattern::Exact("Proxy-Authenticate".to_string()),
+                    Verb::Strip,
+                ),
                 (
                     HeaderPattern::Exact("Server".to_string()),
                     Verb::Rewrite(RewriteOp::ReplaceWithServerHeader),
@@ -668,7 +732,10 @@ mod tests {
     }
 
     fn transparent() -> Arc<Preset> {
-        builtin_presets().get("transparent-b2bua@2026").unwrap().clone()
+        builtin_presets()
+            .get("transparent-b2bua@2026")
+            .unwrap()
+            .clone()
     }
 
     fn intra_trust() -> Arc<Preset> {
@@ -686,13 +753,14 @@ mod tests {
     }
 
     fn trunk_edge() -> Arc<Preset> {
-        builtin_presets().get("sip-trunk-edge@2026").unwrap().clone()
+        builtin_presets()
+            .get("sip-trunk-edge@2026")
+            .unwrap()
+            .clone()
     }
 
     fn parse(raw: &str) -> SipMessage {
-        parse_sip_message(raw)
-            .expect("test fixture must parse")
-            .1
+        parse_sip_message(raw).expect("test fixture must parse").1
     }
 
     fn invite_with(extras: &[(&str, &str)]) -> SipMessage {
@@ -740,7 +808,10 @@ mod tests {
         let p = HeaderPattern::Prefix("P-".to_string());
         assert!(p.matches("P-Asserted-Identity"));
         assert!(p.matches("p-charging-vector"));
-        assert!(!p.matches("Privacy"), "single P with no dash must not match P-");
+        assert!(
+            !p.matches("Privacy"),
+            "single P with no dash must not match P-"
+        );
         assert!(!p.matches("Allow"));
     }
 
@@ -761,10 +832,7 @@ mod tests {
             "Record-Route",
             "Route",
         ] {
-            assert!(
-                is_framework_auto(name),
-                "{name} should be framework-auto"
-            );
+            assert!(is_framework_auto(name), "{name} should be framework-auto");
         }
     }
 
@@ -839,7 +907,10 @@ mod tests {
         policy.deltas_copy.push("Proxy-Authenticate".to_string());
         let mut msg = ok_with(&[("Proxy-Authenticate", "Digest realm=\"c\"")]);
         apply_to_response(&mut msg, &policy, &ctx());
-        assert!(msg.headers.has("Proxy-Authenticate"), "delta copy should override preset strip");
+        assert!(
+            msg.headers.has("Proxy-Authenticate"),
+            "delta copy should override preset strip"
+        );
     }
 
     #[test]
@@ -863,14 +934,22 @@ mod tests {
     #[test]
     fn transparent_strips_authorization_on_request() {
         let mut msg = invite_with(&[("Authorization", "Digest username=\"alice\"")]);
-        apply_to_request(&mut msg, &ResolvedPolicy::from_preset(transparent()), &ctx());
+        apply_to_request(
+            &mut msg,
+            &ResolvedPolicy::from_preset(transparent()),
+            &ctx(),
+        );
         assert!(!msg.headers.has("Authorization"));
     }
 
     #[test]
     fn transparent_strips_allow_on_response() {
         let mut msg = ok_with(&[("Allow", "INVITE, ACK, BYE")]);
-        apply_to_response(&mut msg, &ResolvedPolicy::from_preset(transparent()), &ctx());
+        apply_to_response(
+            &mut msg,
+            &ResolvedPolicy::from_preset(transparent()),
+            &ctx(),
+        );
         assert!(!msg.headers.has("Allow"));
     }
 
@@ -883,7 +962,11 @@ mod tests {
             ("RSeq", "1"),
             ("Content-Disposition", "session"),
         ]);
-        apply_to_response(&mut msg, &ResolvedPolicy::from_preset(transparent()), &ctx());
+        apply_to_response(
+            &mut msg,
+            &ResolvedPolicy::from_preset(transparent()),
+            &ctx(),
+        );
         assert!(!msg.headers.has("Allow-Events"));
         assert!(!msg.headers.has("Supported"));
         assert!(!msg.headers.has("Require"));
@@ -894,31 +977,56 @@ mod tests {
     #[test]
     fn transparent_strips_user_agent_on_response() {
         let mut msg = ok_with(&[("User-Agent", "SomeVendor/9.9")]);
-        apply_to_response(&mut msg, &ResolvedPolicy::from_preset(transparent()), &ctx());
+        apply_to_response(
+            &mut msg,
+            &ResolvedPolicy::from_preset(transparent()),
+            &ctx(),
+        );
         assert!(!msg.headers.has("User-Agent"));
     }
 
     #[test]
     fn transparent_rewrites_server_on_response() {
         let mut msg = ok_with(&[("Server", "BadActor/1.0")]);
-        apply_to_response(&mut msg, &ResolvedPolicy::from_preset(transparent()), &ctx());
-        assert_eq!(msg.headers.get("Server").map(|s| s.as_str()), Some("siphon-test/1.0"));
+        apply_to_response(
+            &mut msg,
+            &ResolvedPolicy::from_preset(transparent()),
+            &ctx(),
+        );
+        assert_eq!(
+            msg.headers.get("Server").map(|s| s.as_str()),
+            Some("siphon-test/1.0")
+        );
     }
 
     #[test]
     fn transparent_rewrites_user_agent_on_request() {
         let mut msg = invite_with(&[("User-Agent", "SomeVendor/9.9")]);
-        apply_to_request(&mut msg, &ResolvedPolicy::from_preset(transparent()), &ctx());
-        assert_eq!(msg.headers.get("User-Agent").map(|s| s.as_str()), Some("siphon-test/1.0"));
+        apply_to_request(
+            &mut msg,
+            &ResolvedPolicy::from_preset(transparent()),
+            &ctx(),
+        );
+        assert_eq!(
+            msg.headers.get("User-Agent").map(|s| s.as_str()),
+            Some("siphon-test/1.0")
+        );
     }
 
     #[test]
     fn transparent_rewrites_pai_host_on_request() {
         let mut msg = invite_with(&[("P-Asserted-Identity", "<sip:alice@private.internal>")]);
-        apply_to_request(&mut msg, &ResolvedPolicy::from_preset(transparent()), &ctx());
+        apply_to_request(
+            &mut msg,
+            &ResolvedPolicy::from_preset(transparent()),
+            &ctx(),
+        );
         // host rewritten to b2bua_host
         let pai = msg.headers.get("P-Asserted-Identity").unwrap();
-        assert!(pai.contains("192.0.2.1"), "PAI host should be rewritten: {pai}");
+        assert!(
+            pai.contains("192.0.2.1"),
+            "PAI host should be rewritten: {pai}"
+        );
         assert!(pai.contains("alice"), "PAI user must be preserved: {pai}");
     }
 
@@ -929,7 +1037,11 @@ mod tests {
             ("Subject", "Hi"),
             ("X-Custom", "value"),
         ]);
-        apply_to_request(&mut msg, &ResolvedPolicy::from_preset(transparent()), &ctx());
+        apply_to_request(
+            &mut msg,
+            &ResolvedPolicy::from_preset(transparent()),
+            &ctx(),
+        );
         // transparent preset default=Copy, so unfamiliar headers pass through
         assert!(msg.headers.has("Alert-Info"));
         assert!(msg.headers.has("Subject"));
@@ -939,7 +1051,11 @@ mod tests {
     #[test]
     fn transparent_passes_www_authenticate_on_response() {
         let mut msg = ok_with(&[("WWW-Authenticate", "Digest realm=\"c.example.com\"")]);
-        apply_to_response(&mut msg, &ResolvedPolicy::from_preset(transparent()), &ctx());
+        apply_to_response(
+            &mut msg,
+            &ResolvedPolicy::from_preset(transparent()),
+            &ctx(),
+        );
         // matches today's pass-through behaviour
         assert!(msg.headers.has("WWW-Authenticate"));
     }
@@ -947,7 +1063,11 @@ mod tests {
     #[test]
     fn transparent_passes_authentication_info_on_response() {
         let mut msg = ok_with(&[("Authentication-Info", "nextnonce=\"xyz\"")]);
-        apply_to_response(&mut msg, &ResolvedPolicy::from_preset(transparent()), &ctx());
+        apply_to_response(
+            &mut msg,
+            &ResolvedPolicy::from_preset(transparent()),
+            &ctx(),
+        );
         assert!(msg.headers.has("Authentication-Info"));
     }
 
@@ -959,7 +1079,11 @@ mod tests {
         // everything not in the safe-set.  Framework-auto headers must
         // survive regardless.
         let mut msg = invite_with(&[("X-Should-Be-Stripped", "yes")]);
-        apply_to_request(&mut msg, &ResolvedPolicy::from_preset(trust_boundary()), &ctx());
+        apply_to_request(
+            &mut msg,
+            &ResolvedPolicy::from_preset(trust_boundary()),
+            &ctx(),
+        );
         assert!(msg.headers.has("Via"));
         assert!(msg.headers.has("From"));
         assert!(msg.headers.has("To"));
@@ -979,7 +1103,11 @@ mod tests {
             ("X-FS-Support", "update_display"),
             ("P-Visited-Network-ID", "foo.example.com"),
         ]);
-        apply_to_request(&mut msg, &ResolvedPolicy::from_preset(trust_boundary()), &ctx());
+        apply_to_request(
+            &mut msg,
+            &ResolvedPolicy::from_preset(trust_boundary()),
+            &ctx(),
+        );
         // these are the four headers from the BGCF MTC trace that leaked
         // through to the IMS side and confused the Samsung S21
         assert!(!msg.headers.has("Alert-Info"));
@@ -997,7 +1125,11 @@ mod tests {
             ("Refer-To", "<sip:target@example.com>"),
             ("Subject", "Important"),
         ]);
-        apply_to_request(&mut msg, &ResolvedPolicy::from_preset(trust_boundary()), &ctx());
+        apply_to_request(
+            &mut msg,
+            &ResolvedPolicy::from_preset(trust_boundary()),
+            &ctx(),
+        );
         assert!(msg.headers.has("Allow"));
         assert!(msg.headers.has("Supported"));
         assert!(msg.headers.has("Min-SE"));
@@ -1011,13 +1143,20 @@ mod tests {
             "Diversion",
             "<sip:+3197010267609@sip.didww.com>;reason=unconditional",
         )]);
-        apply_to_request(&mut msg, &ResolvedPolicy::from_preset(trust_boundary()), &ctx());
+        apply_to_request(
+            &mut msg,
+            &ResolvedPolicy::from_preset(trust_boundary()),
+            &ctx(),
+        );
         assert!(!msg.headers.has("Diversion"));
         let hi = msg
             .headers
             .get("History-Info")
             .expect("History-Info should be present");
-        assert!(hi.contains("+3197010267609@sip.didww.com"), "URI preserved: {hi}");
+        assert!(
+            hi.contains("+3197010267609@sip.didww.com"),
+            "URI preserved: {hi}"
+        );
         assert!(hi.contains("cause%3D302"), "unconditional → 302: {hi}");
         assert!(hi.contains("index=1"), "single-divert index: {hi}");
     }
@@ -1025,10 +1164,17 @@ mod tests {
     #[test]
     fn trust_boundary_rewrites_pai_host_on_request() {
         let mut msg = invite_with(&[("P-Asserted-Identity", "<sip:alice@private.internal>")]);
-        apply_to_request(&mut msg, &ResolvedPolicy::from_preset(trust_boundary()), &ctx());
+        apply_to_request(
+            &mut msg,
+            &ResolvedPolicy::from_preset(trust_boundary()),
+            &ctx(),
+        );
         let pai = msg.headers.get("P-Asserted-Identity").unwrap();
         assert!(pai.contains("192.0.2.1"), "PAI host masked: {pai}");
-        assert!(!pai.contains("private.internal"), "internal host gone: {pai}");
+        assert!(
+            !pai.contains("private.internal"),
+            "internal host gone: {pai}"
+        );
     }
 
     // ----- ims-intra-trust-domain@2026: PRACK/preconditions flow through -----
@@ -1040,7 +1186,11 @@ mod tests {
             ("RSeq", "1"),
             ("Supported", "100rel, precondition"),
         ]);
-        apply_to_response(&mut msg, &ResolvedPolicy::from_preset(intra_trust()), &ctx());
+        apply_to_response(
+            &mut msg,
+            &ResolvedPolicy::from_preset(intra_trust()),
+            &ctx(),
+        );
         // intra-trust must pass these — RFC 3262 §6 + RFC 3312 / 4032
         assert!(msg.headers.has("Require"));
         assert!(msg.headers.has("RSeq"));
@@ -1050,7 +1200,11 @@ mod tests {
     #[test]
     fn intra_trust_flows_pai_on_request() {
         let mut msg = invite_with(&[("P-Asserted-Identity", "<sip:alice@trusted.internal>")]);
-        apply_to_request(&mut msg, &ResolvedPolicy::from_preset(intra_trust()), &ctx());
+        apply_to_request(
+            &mut msg,
+            &ResolvedPolicy::from_preset(intra_trust()),
+            &ctx(),
+        );
         // intra-trust passes PAI verbatim — no host rewrite within trust domain
         let pai = msg.headers.get("P-Asserted-Identity").unwrap();
         assert_eq!(pai, "<sip:alice@trusted.internal>");
@@ -1058,11 +1212,12 @@ mod tests {
 
     #[test]
     fn intra_trust_strips_x_headers() {
-        let mut msg = invite_with(&[
-            ("X-Internal-Tag", "secret"),
-            ("X-Customer-Tier", "gold"),
-        ]);
-        apply_to_request(&mut msg, &ResolvedPolicy::from_preset(intra_trust()), &ctx());
+        let mut msg = invite_with(&[("X-Internal-Tag", "secret"), ("X-Customer-Tier", "gold")]);
+        apply_to_request(
+            &mut msg,
+            &ResolvedPolicy::from_preset(intra_trust()),
+            &ctx(),
+        );
         assert!(!msg.headers.has("X-Internal-Tag"));
         assert!(!msg.headers.has("X-Customer-Tier"));
     }
@@ -1099,7 +1254,10 @@ mod tests {
         let mut policy = ResolvedPolicy::from_preset(trust_boundary()); // strips Alert-Info
         policy.deltas_copy.push("Alert-Info".to_string());
         apply_to_request(&mut msg, &policy, &ctx());
-        assert!(msg.headers.has("Alert-Info"), "delta copy must override preset strip");
+        assert!(
+            msg.headers.has("Alert-Info"),
+            "delta copy must override preset strip"
+        );
     }
 
     #[test]
@@ -1149,7 +1307,10 @@ mod tests {
             request: DirectionPolicy {
                 default: Verb::Copy,
                 overrides: vec![
-                    (HeaderPattern::Exact("Authorization".to_string()), Verb::Copy),
+                    (
+                        HeaderPattern::Exact("Authorization".to_string()),
+                        Verb::Copy,
+                    ),
                     (
                         HeaderPattern::Exact("P-Asserted-Identity".to_string()),
                         Verb::Rewrite(RewriteOp::HostToAdvertised),
@@ -1175,7 +1336,10 @@ mod tests {
         let mut preset = (*intra_trust()).clone();
         preset.request.overrides.insert(
             0,
-            (HeaderPattern::Exact("Authorization".to_string()), Verb::Copy),
+            (
+                HeaderPattern::Exact("Authorization".to_string()),
+                Verb::Copy,
+            ),
         );
         validate_preset(&preset).expect("intra-trust + Authorization Copy must validate");
     }
@@ -1194,17 +1358,15 @@ mod tests {
 
     #[test]
     fn diversion_user_busy_becomes_history_info_486() {
-        let h = translate_diversion_to_history_info(
-            "<sip:+12025551212@example.com>;reason=user-busy",
-        );
+        let h =
+            translate_diversion_to_history_info("<sip:+12025551212@example.com>;reason=user-busy");
         assert!(h.contains("cause%3D486"));
     }
 
     #[test]
     fn diversion_no_answer_becomes_history_info_480() {
-        let h = translate_diversion_to_history_info(
-            "<sip:+12025551212@example.com>;reason=no-answer",
-        );
+        let h =
+            translate_diversion_to_history_info("<sip:+12025551212@example.com>;reason=no-answer");
         assert!(h.contains("cause%3D480"));
     }
 

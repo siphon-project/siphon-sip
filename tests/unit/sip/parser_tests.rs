@@ -72,13 +72,21 @@ fn test_header_folding() {
     match &result {
         Ok((_remaining, msg)) => {
             if let Some(via) = msg.headers.via() {
-                assert!(via.contains("received=192.0.2.1"), "Folded header should be parsed correctly. Via: {:?}", via);
+                assert!(
+                    via.contains("received=192.0.2.1"),
+                    "Folded header should be parsed correctly. Via: {:?}",
+                    via
+                );
             } else {
                 panic!("Via header not found. Headers: {:?}", msg.headers.names());
             }
         }
         Err(e) => {
-            panic!("Failed to parse folded header: {:?}. Message length: {}", e, message.len());
+            panic!(
+                "Failed to parse folded header: {:?}. Message length: {}",
+                e,
+                message.len()
+            );
         }
     }
 }
@@ -112,8 +120,14 @@ fn test_all_sip_methods() {
 #[test]
 fn test_extension_sip_methods() {
     let methods = vec![
-        "SUBSCRIBE", "NOTIFY", "MESSAGE", "PUBLISH",
-        "INFO", "UPDATE", "REFER", "PRACK",
+        "SUBSCRIBE",
+        "NOTIFY",
+        "MESSAGE",
+        "PUBLISH",
+        "INFO",
+        "UPDATE",
+        "REFER",
+        "PRACK",
     ];
 
     for method in methods {
@@ -275,10 +289,7 @@ fn test_parse_message_with_text_body() {
     let (remaining, msg) = parse_sip_message(&message).unwrap();
     assert_eq!(remaining, "");
     assert_eq!(msg.method().unwrap().as_str(), "MESSAGE");
-    assert_eq!(
-        msg.headers.get("Content-Type").unwrap(),
-        "text/plain",
-    );
+    assert_eq!(msg.headers.get("Content-Type").unwrap(), "text/plain",);
     assert_eq!(String::from_utf8_lossy(&msg.body), text_body);
 }
 
@@ -316,7 +327,8 @@ fn test_content_length() {
             "\r\n",
             "{}",
         ),
-        body.len(), body,
+        body.len(),
+        body,
     );
 
     let result = parse_sip_message(&message);

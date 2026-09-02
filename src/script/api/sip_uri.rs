@@ -85,9 +85,9 @@ impl PySipUri {
     #[getter]
     fn is_local(&self) -> bool {
         match &self.local_domains {
-            Some(domains) => domains.iter().any(|domain| {
-                domain.eq_ignore_ascii_case(&self.inner.host)
-            }),
+            Some(domains) => domains
+                .iter()
+                .any(|domain| domain.eq_ignore_ascii_case(&self.inner.host)),
             None => false,
         }
     }
@@ -138,8 +138,7 @@ mod tests {
 
     #[test]
     fn str_and_repr() {
-        let uri = SipUri::new("example.com".to_string())
-            .with_user("bob".to_string());
+        let uri = SipUri::new("example.com".to_string()).with_user("bob".to_string());
         let py_uri = PySipUri::new(uri);
 
         assert_eq!(py_uri.__str__(), "sip:bob@example.com");

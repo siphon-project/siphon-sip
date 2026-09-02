@@ -74,19 +74,23 @@ impl PyRecordingMetadata {
         Self {
             session_id: metadata.session_id.clone(),
             sip_session_ids: metadata.sip_session_ids.clone(),
-            participants: metadata.participants.iter().map(|participant| {
-                PyParticipant {
+            participants: metadata
+                .participants
+                .iter()
+                .map(|participant| PyParticipant {
                     participant_id: participant.participant_id.clone(),
                     aor: participant.aor.clone(),
                     name: participant.name.clone(),
-                }
-            }).collect(),
-            streams: metadata.streams.iter().map(|stream| {
-                PyStreamInfo {
+                })
+                .collect(),
+            streams: metadata
+                .streams
+                .iter()
+                .map(|stream| PyStreamInfo {
                     stream_id: stream.stream_id.clone(),
                     label: stream.label.clone(),
-                }
-            }).collect(),
+                })
+                .collect(),
         }
     }
 }
@@ -206,13 +210,15 @@ impl PySrsSession {
             session_id: record.session_id.clone(),
             recording_call_id: record.recording_call_id.clone(),
             original_call_id: record.original_call_id.clone(),
-            participants: record.participants.iter().map(|participant| {
-                PyParticipant {
+            participants: record
+                .participants
+                .iter()
+                .map(|participant| PyParticipant {
                     participant_id: participant.participant_id.clone(),
                     aor: participant.aor.clone(),
                     name: participant.name.clone(),
-                }
-            }).collect(),
+                })
+                .collect(),
             duration_secs: record.duration_secs,
             recording_dir: record.recording_dir.clone(),
         }

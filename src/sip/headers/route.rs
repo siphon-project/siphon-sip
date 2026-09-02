@@ -7,8 +7,8 @@
 
 use std::fmt;
 
-use crate::sip::uri::SipUri;
 use crate::sip::parser::parse_uri_standalone;
+use crate::sip::uri::SipUri;
 
 /// A single entry in a Route or Record-Route header.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,10 +188,8 @@ mod tests {
 
     #[test]
     fn format_route_header_multi() {
-        let entries = RouteEntry::parse_multi(
-            "<sip:p1.example.com;lr>, <sip:p2.example.com;lr>",
-        )
-        .unwrap();
+        let entries =
+            RouteEntry::parse_multi("<sip:p1.example.com;lr>, <sip:p2.example.com;lr>").unwrap();
         let formatted = format_route_header(&entries);
         assert!(formatted.contains("p1.example.com"));
         assert!(formatted.contains("p2.example.com"));

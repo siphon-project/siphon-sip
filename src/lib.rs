@@ -1,49 +1,49 @@
 //! SIPhon — high-performance SIP proxy, B2BUA and IMS platform.
 
+pub mod admin;
 pub mod apiban;
 pub mod auth;
 pub mod b2bua;
 pub mod cache;
+pub mod cdr;
 pub mod config;
 pub mod control;
 pub mod cors;
-pub mod diameter;
 pub mod dialog;
+pub mod diameter;
 pub mod dispatcher;
 pub mod dns;
-pub mod hep;
 pub mod error;
-pub mod firewall;
-pub mod nat;
-pub mod numbers;
-pub mod presence;
-pub mod proxy;
-pub mod gateway;
-pub mod registrant;
-pub mod registrar;
-pub mod rtpengine;
-pub mod script;
-pub mod sip;
-pub mod transaction;
-pub mod transport;
-pub mod uac;
-pub mod metrics;
-pub mod admin;
-pub mod cdr;
 pub mod file_sink;
-pub mod shutdown;
-pub mod media;
+pub mod firewall;
+pub mod gateway;
+pub mod hep;
 pub mod ifc;
 pub mod ipsec;
 pub mod lcr;
 pub mod li;
+pub mod media;
+pub mod metrics;
+pub mod nat;
+pub mod numbers;
+pub mod presence;
+pub mod proxy;
+pub mod registrant;
+pub mod registrar;
+pub mod rtpengine;
 pub mod sbi;
+pub mod script;
 pub mod security;
 pub mod server;
+pub mod shutdown;
+pub mod sip;
 pub mod siprec;
-pub mod stir;
 pub mod srs;
+pub mod stir;
 pub mod subscribe_state;
+pub mod transaction;
+pub mod transport;
+pub mod uac;
 
 pub use server::SiphonServer;
 
@@ -89,9 +89,7 @@ pub use tikv_jemallocator;
 #[macro_export]
 macro_rules! install_allocator {
     () => {
-        $crate::install_allocator!(
-            "background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0"
-        );
+        $crate::install_allocator!("background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0");
     };
     ($conf:literal) => {
         #[cfg(not(target_env = "msvc"))]

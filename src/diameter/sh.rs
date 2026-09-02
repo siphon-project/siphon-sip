@@ -37,7 +37,9 @@ pub mod subscription_type {
 // ── AVP extraction helpers ─────────────────────────────────────────────────
 
 fn mandatory_string(avps: &serde_json::Value, key: &str) -> Option<String> {
-    avps.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    avps.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 fn extract_public_identity(avps: &serde_json::Value) -> Option<String> {
@@ -54,7 +56,11 @@ fn collect_data_references(avps: &serde_json::Value) -> Option<Vec<u32>> {
                 .iter()
                 .filter_map(|v| v.as_u64().map(|n| n as u32))
                 .collect();
-            if refs.is_empty() { None } else { Some(refs) }
+            if refs.is_empty() {
+                None
+            } else {
+                Some(refs)
+            }
         }
         Some(single) => single.as_u64().map(|n| vec![n as u32]),
         None => None,
@@ -96,24 +102,30 @@ impl ShAnswerBuilder {
     }
 
     fn session(mut self, session_id: &str) -> Self {
-        self.avp_payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, session_id));
+        self.avp_payload
+            .extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, session_id));
         self
     }
 
     fn origin(mut self, host: &str, realm: &str) -> Self {
-        self.avp_payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, host));
-        self.avp_payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, realm));
+        self.avp_payload
+            .extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, host));
+        self.avp_payload
+            .extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, realm));
         self
     }
 
     fn destination(mut self, host: &str, realm: &str) -> Self {
-        self.avp_payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, host));
-        self.avp_payload.extend_from_slice(&encode_avp_utf8(avp::DESTINATION_REALM, realm));
+        self.avp_payload
+            .extend_from_slice(&encode_avp_utf8(avp::DESTINATION_HOST, host));
+        self.avp_payload
+            .extend_from_slice(&encode_avp_utf8(avp::DESTINATION_REALM, realm));
         self
     }
 
     fn result_code(mut self, code: u32) -> Self {
-        self.avp_payload.extend_from_slice(&encode_avp_u32(avp::RESULT_CODE, code));
+        self.avp_payload
+            .extend_from_slice(&encode_avp_u32(avp::RESULT_CODE, code));
         self
     }
 
@@ -130,29 +142,30 @@ impl ShAnswerBuilder {
     }
 
     fn no_state(mut self) -> Self {
-        self.avp_payload.extend_from_slice(&encode_avp_u32(avp::AUTH_SESSION_STATE, 1));
+        self.avp_payload
+            .extend_from_slice(&encode_avp_u32(avp::AUTH_SESSION_STATE, 1));
         self
     }
 
     fn sh_app(mut self) -> Self {
-        self.avp_payload.extend_from_slice(&encode_vendor_specific_app_id(
-            dictionary::VENDOR_3GPP,
-            dictionary::SH_APP_ID,
-        ));
+        self.avp_payload
+            .extend_from_slice(&encode_vendor_specific_app_id(
+                dictionary::VENDOR_3GPP,
+                dictionary::SH_APP_ID,
+            ));
         self
     }
 
     fn user_data_xml(mut self, xml: &str) -> Self {
-        self.avp_payload.extend_from_slice(&encode_avp_octet_3gpp(
-            avp::USER_DATA_SH,
-            xml.as_bytes(),
-        ));
+        self.avp_payload
+            .extend_from_slice(&encode_avp_octet_3gpp(avp::USER_DATA_SH, xml.as_bytes()));
         self
     }
 
     fn user_identity(mut self, public_id: &str) -> Self {
         let inner = encode_avp_utf8_3gpp(avp::PUBLIC_IDENTITY, public_id);
-        self.avp_payload.extend_from_slice(&encode_avp_grouped_3gpp(avp::USER_IDENTITY, &inner));
+        self.avp_payload
+            .extend_from_slice(&encode_avp_grouped_3gpp(avp::USER_IDENTITY, &inner));
         self
     }
 
@@ -162,7 +175,14 @@ impl ShAnswerBuilder {
         } else {
             FLAG_PROXIABLE
         };
-        encode_diameter_message(flags, self.command, dictionary::SH_APP_ID, self.hbh, self.e2e, &self.avp_payload)
+        encode_diameter_message(
+            flags,
+            self.command,
+            dictionary::SH_APP_ID,
+            self.hbh,
+            self.e2e,
+            &self.avp_payload,
+        )
     }
 }
 
@@ -247,9 +267,7 @@ pub struct ProfileUpdateData {
 pub fn parse_profile_update(incoming: &IncomingRequest) -> Option<ProfileUpdateData> {
     let avps = &incoming.avps;
 
-    let reference = avps
-        .get("Data-Reference")
-        .and_then(|v| v.as_u64())? as u32;
+    let reference = avps.get("Data-Reference").and_then(|v| v.as_u64())? as u32;
 
     Some(ProfileUpdateData {
         session_id: mandatory_string(avps, "Session-Id")?,
@@ -293,12 +311,12 @@ pub struct NotificationSubscription {
 }
 
 /// Parse an incoming Subscribe-Notifications-Request.
-pub fn parse_notification_subscribe(incoming: &IncomingRequest) -> Option<NotificationSubscription> {
+pub fn parse_notification_subscribe(
+    incoming: &IncomingRequest,
+) -> Option<NotificationSubscription> {
     let avps = &incoming.avps;
 
-    let action = avps
-        .get("Subs-Req-Type")
-        .and_then(|v| v.as_u64())? as u32;
+    let action = avps.get("Subs-Req-Type").and_then(|v| v.as_u64())? as u32;
 
     Some(NotificationSubscription {
         session_id: mandatory_string(avps, "Session-Id")?,
@@ -396,11 +414,7 @@ pub fn build_push_notification_answer(
 
 // ── AS-side outbound request builders (AS → HSS) ───────────────────────────
 
-fn append_common_request_headers(
-    avp_bytes: &mut Vec<u8>,
-    config: &PeerConfig,
-    session_id: &str,
-) {
+fn append_common_request_headers(avp_bytes: &mut Vec<u8>, config: &PeerConfig, session_id: &str) {
     avp_bytes.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, session_id));
     avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, &config.origin_host));
     avp_bytes.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, &config.origin_realm));
@@ -532,23 +546,39 @@ mod tests {
     use super::*;
 
     fn create_udr_message() -> Vec<u8> {
-        let identity_inner = encode_avp_utf8_3gpp(avp::PUBLIC_IDENTITY, "sip:subscriber@ims.mnc001.mcc001.3gppnetwork.org");
+        let identity_inner = encode_avp_utf8_3gpp(
+            avp::PUBLIC_IDENTITY,
+            "sip:subscriber@ims.mnc001.mcc001.3gppnetwork.org",
+        );
         let user_identity = encode_avp_grouped_3gpp(avp::USER_IDENTITY, &identity_inner);
 
         let mut payload = Vec::new();
         payload.extend_from_slice(&encode_avp_utf8(avp::SESSION_ID, "sh;001011234567890;42"));
-        payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_HOST, "telephony-as.ims.mnc001.mcc001.3gppnetwork.org"));
-        payload.extend_from_slice(&encode_avp_utf8(avp::ORIGIN_REALM, "ims.mnc001.mcc001.3gppnetwork.org"));
+        payload.extend_from_slice(&encode_avp_utf8(
+            avp::ORIGIN_HOST,
+            "telephony-as.ims.mnc001.mcc001.3gppnetwork.org",
+        ));
+        payload.extend_from_slice(&encode_avp_utf8(
+            avp::ORIGIN_REALM,
+            "ims.mnc001.mcc001.3gppnetwork.org",
+        ));
         payload.extend_from_slice(&encode_avp_u32(avp::AUTH_SESSION_STATE, 1));
         payload.extend_from_slice(&user_identity);
-        payload.extend_from_slice(&encode_avp_u32_3gpp(avp::DATA_REFERENCE, data_reference::IMS_USER_STATE));
-        payload.extend_from_slice(&encode_avp_u32_3gpp(avp::DATA_REFERENCE, data_reference::S_CSCF_NAME));
+        payload.extend_from_slice(&encode_avp_u32_3gpp(
+            avp::DATA_REFERENCE,
+            data_reference::IMS_USER_STATE,
+        ));
+        payload.extend_from_slice(&encode_avp_u32_3gpp(
+            avp::DATA_REFERENCE,
+            data_reference::S_CSCF_NAME,
+        ));
 
         encode_diameter_message(
             FLAG_REQUEST | FLAG_PROXIABLE,
             dictionary::CMD_SH_USER_DATA,
             dictionary::SH_APP_ID,
-            10, 20,
+            10,
+            20,
             &payload,
         )
     }
@@ -569,8 +599,14 @@ mod tests {
 
         let query = parse_user_data_request(&incoming).expect("valid UDR");
         assert_eq!(query.session_id, "sh;001011234567890;42");
-        assert_eq!(query.requesting_host, "telephony-as.ims.mnc001.mcc001.3gppnetwork.org");
-        assert_eq!(query.identity, "sip:subscriber@ims.mnc001.mcc001.3gppnetwork.org");
+        assert_eq!(
+            query.requesting_host,
+            "telephony-as.ims.mnc001.mcc001.3gppnetwork.org"
+        );
+        assert_eq!(
+            query.identity,
+            "sip:subscriber@ims.mnc001.mcc001.3gppnetwork.org"
+        );
         assert_eq!(query.references.len(), 2);
         assert!(query.references.contains(&data_reference::IMS_USER_STATE));
         assert!(query.references.contains(&data_reference::S_CSCF_NAME));
@@ -579,23 +615,36 @@ mod tests {
 
     #[test]
     fn user_data_answer_roundtrip() {
-        let xml = "<Sh-Data><IMSPublicIdentity>sip:test@ims.example.net</IMSPublicIdentity></Sh-Data>";
+        let xml =
+            "<Sh-Data><IMSPublicIdentity>sip:test@ims.example.net</IMSPublicIdentity></Sh-Data>";
         let wire = build_user_data_answer(
             "hss.ims.mnc001.mcc001.3gppnetwork.org",
             "ims.mnc001.mcc001.3gppnetwork.org",
             "sh;001011234567890;42",
-            xml, 10, 20,
+            xml,
+            10,
+            20,
         );
 
         let decoded = decode_diameter(&wire).unwrap();
         assert!(!decoded.is_request);
         assert_eq!(decoded.command_code, dictionary::CMD_SH_USER_DATA);
         assert_eq!(decoded.application_id, dictionary::SH_APP_ID);
-        assert_eq!(decoded.avps.get("Result-Code").and_then(|v| v.as_u64()), Some(2001));
-        assert_eq!(decoded.avps.get("Session-Id").and_then(|v| v.as_str()), Some("sh;001011234567890;42"));
+        assert_eq!(
+            decoded.avps.get("Result-Code").and_then(|v| v.as_u64()),
+            Some(2001)
+        );
+        assert_eq!(
+            decoded.avps.get("Session-Id").and_then(|v| v.as_str()),
+            Some("sh;001011234567890;42")
+        );
 
         // Verify XML payload survives encode/decode
-        let xml_hex = decoded.avps.get("User-Data-Sh").and_then(|v| v.as_str()).unwrap();
+        let xml_hex = decoded
+            .avps
+            .get("User-Data-Sh")
+            .and_then(|v| v.as_str())
+            .unwrap();
         let xml_bytes = crate::diameter::codec::hex::decode(xml_hex).unwrap();
         assert_eq!(String::from_utf8(xml_bytes).unwrap(), xml);
     }
@@ -606,14 +655,22 @@ mod tests {
             "hss.ims.mnc001.mcc001.3gppnetwork.org",
             "ims.mnc001.mcc001.3gppnetwork.org",
             "sh;err;1",
-            5001, 5, 6,
+            5001,
+            5,
+            6,
         );
 
         let decoded = decode_diameter(&wire).unwrap();
         assert!(!decoded.is_request);
         assert!(decoded.avps.get("Result-Code").is_none());
-        let exp = decoded.avps.get("Experimental-Result").expect("must have Experimental-Result");
-        assert_eq!(exp.get("Experimental-Result-Code").and_then(|v| v.as_u64()), Some(5001));
+        let exp = decoded
+            .avps
+            .get("Experimental-Result")
+            .expect("must have Experimental-Result");
+        assert_eq!(
+            exp.get("Experimental-Result-Code").and_then(|v| v.as_u64()),
+            Some(5001)
+        );
     }
 
     #[test]
@@ -626,14 +683,17 @@ mod tests {
             "ims.example.net",
             "sh;pnr;99",
             "sip:user@ims.example.net",
-            xml, 30, 40,
+            xml,
+            30,
+            40,
         );
 
         let decoded = decode_diameter(&wire).unwrap();
         assert!(decoded.is_request);
         assert_eq!(decoded.command_code, dictionary::CMD_SH_PUSH_NOTIFICATION);
 
-        let identity = decoded.avps
+        let identity = decoded
+            .avps
             .get("User-Identity")
             .and_then(|ui| ui.get("Public-Identity"))
             .and_then(|v| v.as_str());
@@ -642,17 +702,16 @@ mod tests {
 
     #[test]
     fn profile_update_answer_is_valid() {
-        let wire = build_profile_update_answer(
-            "hss.ims.example.net",
-            "ims.example.net",
-            "sh;pur;5",
-            7, 8,
-        );
+        let wire =
+            build_profile_update_answer("hss.ims.example.net", "ims.example.net", "sh;pur;5", 7, 8);
 
         let decoded = decode_diameter(&wire).unwrap();
         assert!(!decoded.is_request);
         assert_eq!(decoded.command_code, dictionary::CMD_SH_PROFILE_UPDATE);
-        assert_eq!(decoded.avps.get("Result-Code").and_then(|v| v.as_u64()), Some(2001));
+        assert_eq!(
+            decoded.avps.get("Result-Code").and_then(|v| v.as_u64()),
+            Some(2001)
+        );
     }
 
     #[test]
@@ -661,13 +720,20 @@ mod tests {
             "hss.ims.example.net",
             "ims.example.net",
             "sh;snr;12",
-            11, 22,
+            11,
+            22,
         );
 
         let decoded = decode_diameter(&wire).unwrap();
         assert!(!decoded.is_request);
-        assert_eq!(decoded.command_code, dictionary::CMD_SH_SUBSCRIBE_NOTIFICATIONS);
-        assert_eq!(decoded.avps.get("Result-Code").and_then(|v| v.as_u64()), Some(2001));
+        assert_eq!(
+            decoded.command_code,
+            dictionary::CMD_SH_SUBSCRIBE_NOTIFICATIONS
+        );
+        assert_eq!(
+            decoded.avps.get("Result-Code").and_then(|v| v.as_u64()),
+            Some(2001)
+        );
     }
 
     fn as_peer_config() -> PeerConfig {
@@ -779,7 +845,10 @@ mod tests {
 
         let decoded = decode_diameter(&wire).unwrap();
         assert!(decoded.is_request);
-        assert_eq!(decoded.command_code, dictionary::CMD_SH_SUBSCRIBE_NOTIFICATIONS);
+        assert_eq!(
+            decoded.command_code,
+            dictionary::CMD_SH_SUBSCRIBE_NOTIFICATIONS
+        );
 
         let subs = decoded.avps.get("Subs-Req-Type").and_then(|v| v.as_u64());
         assert_eq!(subs, Some(u64::from(subscription_type::SUBSCRIBE)));
@@ -801,7 +870,10 @@ mod tests {
 
         let decoded = decode_diameter(&wire).unwrap();
         assert!(decoded.is_request);
-        assert_eq!(decoded.command_code, dictionary::CMD_SH_SUBSCRIBE_NOTIFICATIONS);
+        assert_eq!(
+            decoded.command_code,
+            dictionary::CMD_SH_SUBSCRIBE_NOTIFICATIONS
+        );
 
         let service_indication_hex = decoded
             .avps

@@ -126,10 +126,7 @@ mod tests {
 
     #[test]
     fn allow_only_permits_matching() {
-        let acl = TransportAcl::new(
-            vec![],
-            vec!["172.16.0.0/12".to_string()],
-        );
+        let acl = TransportAcl::new(vec![], vec!["172.16.0.0/12".to_string()]);
 
         assert!(acl.is_allowed("172.16.0.1".parse().unwrap()));
         assert!(acl.is_allowed("172.31.255.255".parse().unwrap()));
@@ -154,10 +151,7 @@ mod tests {
 
     #[test]
     fn ipv6_support() {
-        let acl = TransportAcl::new(
-            vec!["fd00::/8".to_string()],
-            vec![],
-        );
+        let acl = TransportAcl::new(vec!["fd00::/8".to_string()], vec![]);
 
         assert!(!acl.is_allowed("fd00::1".parse().unwrap()));
         assert!(acl.is_allowed("2001:db8::1".parse().unwrap()));

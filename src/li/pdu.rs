@@ -449,14 +449,22 @@ mod tests {
 
         assert_eq!(&encoded[0..2], &[0x00, 0x05], "major/minor version");
         assert_eq!(&encoded[2..4], &[0x00, 0x01], "PDU type X2");
-        assert_eq!(&encoded[4..8], &[0x00, 0x00, 0x00, 0x28], "header length 40");
+        assert_eq!(
+            &encoded[4..8],
+            &[0x00, 0x00, 0x00, 0x28],
+            "header length 40"
+        );
         assert_eq!(
             &encoded[8..12],
             &[0x00, 0x00, 0x00, 0x26],
             "payload length 38"
         );
         assert_eq!(&encoded[12..14], &[0x00, 0x09], "payload format SIP");
-        assert_eq!(&encoded[14..16], &[0x00, 0x03], "direction sent-from-target");
+        assert_eq!(
+            &encoded[14..16],
+            &[0x00, 0x03],
+            "direction sent-from-target"
+        );
         assert_eq!(
             &encoded[16..32],
             &[

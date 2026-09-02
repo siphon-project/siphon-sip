@@ -32,9 +32,8 @@ fn method_strategy() -> impl Strategy<Value = Method> {
 fn host_strategy() -> impl Strategy<Value = String> {
     prop_oneof![
         // IPv4 addresses
-        (1u8..=254, 0u8..=254, 0u8..=254, 1u8..=254).prop_map(|(a, b, c, d)| {
-            format!("{a}.{b}.{c}.{d}")
-        }),
+        (1u8..=254, 0u8..=254, 0u8..=254, 1u8..=254)
+            .prop_map(|(a, b, c, d)| { format!("{a}.{b}.{c}.{d}") }),
         // Simple domain names
         "[a-z][a-z0-9]{1,8}\\.[a-z]{2,4}".prop_map(|s| s),
     ]
@@ -76,7 +75,10 @@ fn via_strategy() -> impl Strategy<Value = String> {
     )
         .prop_map(|(transport, host, port)| {
             let port_str = port.map(|p| format!(":{p}")).unwrap_or_default();
-            format!("SIP/2.0/{transport} {host}{port_str};branch=z9hG4bK{:08x}", rand_branch())
+            format!(
+                "SIP/2.0/{transport} {host}{port_str};branch=z9hG4bK{:08x}",
+                rand_branch()
+            )
         })
 }
 
@@ -131,7 +133,9 @@ fn sip_request_strategy() -> impl Strategy<Value = siphon::sip::message::SipMess
                     builder = builder.content_length(0);
                 }
 
-                builder.build().expect("builder should produce valid message")
+                builder
+                    .build()
+                    .expect("builder should produce valid message")
             },
         )
 }
@@ -190,9 +194,9 @@ fn sdp_body_strategy() -> impl Strategy<Value = String> {
         1024u16..65000,
         // Codec set
         prop_oneof![
-            Just("0"),          // PCMU only
-            Just("0 8"),        // PCMU + PCMA
-            Just("0 8 101"),    // PCMU + PCMA + telephone-event
+            Just("0"),       // PCMU only
+            Just("0 8"),     // PCMU + PCMA
+            Just("0 8 101"), // PCMU + PCMA + telephone-event
         ],
     )
         .prop_map(|(session_id, version, (a, b, c, d), port, codecs)| {

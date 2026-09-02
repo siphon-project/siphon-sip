@@ -15,12 +15,12 @@ use std::sync::Arc;
 use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::sync::mpsc;
 
-use siphon::transport::{ConnectionId, OutboundMessage, StreamConnections, Transport};
-use siphon::transport::{udp, tcp, tls, ws};
 use siphon::transport::acl::TransportAcl;
+use siphon::transport::{tcp, tls, udp, ws};
+use siphon::transport::{ConnectionId, OutboundMessage, StreamConnections, Transport};
 
 /// Helper: build a permissive ACL for tests.
 fn test_acl() -> Arc<TransportAcl> {
@@ -145,7 +145,10 @@ async fn udp_roundtrip() {
 
     // Client: send OPTIONS
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    client.send_to(sip_options_request().as_bytes(), addr).await.unwrap();
+    client
+        .send_to(sip_options_request().as_bytes(), addr)
+        .await
+        .unwrap();
 
     // Verify inbound arrives
     let inbound = tokio::time::timeout(TIMEOUT, inbound_rx.recv_async())
@@ -155,7 +158,11 @@ async fn udp_roundtrip() {
 
     assert_eq!(inbound.transport, Transport::Udp);
     let data_str = String::from_utf8_lossy(&inbound.data);
-    assert!(data_str.contains("OPTIONS"), "expected OPTIONS: {}", data_str);
+    assert!(
+        data_str.contains("OPTIONS"),
+        "expected OPTIONS: {}",
+        data_str
+    );
 
     // Send response back through outbound channel
     outbound_tx
@@ -191,15 +198,28 @@ async fn tcp_roundtrip() {
     let addr = free_port();
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-        Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
 
-    tcp::listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), None, None, None, None).await;
+    tcp::listen(
+        addr,
+        inbound_tx,
+        outbound_rx,
+        Arc::clone(&connection_map),
+        test_acl(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
     tokio::time::sleep(SETTLE).await;
 
     // Client: connect and send OPTIONS
     let mut client = connect_with_retry("tcp listener", || TcpStream::connect(addr)).await;
-    client.write_all(sip_options_request().as_bytes()).await.unwrap();
+    client
+        .write_all(sip_options_request().as_bytes())
+        .await
+        .unwrap();
 
     // Verify inbound arrives
     let inbound = tokio::time::timeout(TIMEOUT, inbound_rx.recv_async())
@@ -209,7 +229,11 @@ async fn tcp_roundtrip() {
 
     assert_eq!(inbound.transport, Transport::Tcp);
     let data_str = String::from_utf8_lossy(&inbound.data);
-    assert!(data_str.contains("OPTIONS"), "expected OPTIONS: {}", data_str);
+    assert!(
+        data_str.contains("OPTIONS"),
+        "expected OPTIONS: {}",
+        data_str
+    );
 
     // Connection should be tracked
     assert!(connection_map.contains_key(&inbound.connection_id));
@@ -249,8 +273,7 @@ async fn tcp_close_notifies_flow_failure() {
     let addr = free_port();
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-        Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
     let (close_tx, close_rx) = flume::unbounded::<u64>();
 
     tcp::listen(
@@ -269,7 +292,10 @@ async fn tcp_close_notifies_flow_failure() {
 
     // Connect and send a request so we learn the assigned ConnectionId.
     let mut client = connect_with_retry("tcp listener", || TcpStream::connect(addr)).await;
-    client.write_all(sip_options_request().as_bytes()).await.unwrap();
+    client
+        .write_all(sip_options_request().as_bytes())
+        .await
+        .unwrap();
     let inbound = tokio::time::timeout(TIMEOUT, inbound_rx.recv_async())
         .await
         .expect("timed out waiting for TCP inbound")
@@ -284,7 +310,10 @@ async fn tcp_close_notifies_flow_failure() {
         .await
         .expect("no flow-failure close notification")
         .expect("close channel closed");
-    assert_eq!(closed, connection_id, "close notification must carry the dead connection id");
+    assert_eq!(
+        closed, connection_id,
+        "close notification must carry the dead connection id"
+    );
 }
 
 /// Regression: fire-and-forget outbound TCP with `ConnectionId::default()`
@@ -316,7 +345,10 @@ async fn tcp_outbound_fallback_to_pool_when_no_connection() {
         let (mut socket, _) = target_listener.accept().await.unwrap();
         let mut buffer = vec![0u8; 4096];
         let size = socket.read(&mut buffer).await.unwrap();
-        received_clone.lock().await.extend_from_slice(&buffer[..size]);
+        received_clone
+            .lock()
+            .await
+            .extend_from_slice(&buffer[..size]);
     });
 
     // 2) Build a real ConnectionPool sharing the listener's connection_map
@@ -324,8 +356,7 @@ async fn tcp_outbound_fallback_to_pool_when_no_connection() {
     let listen_addr = free_port();
     let (inbound_tx, _inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-        Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
     let pool = Arc::new(ConnectionPool::new(
         Arc::clone(&connection_map),
         inbound_tx.clone(),
@@ -337,7 +368,7 @@ async fn tcp_outbound_fallback_to_pool_when_no_connection() {
             None,
             siphon::config::TlsMethod::default(),
         )
-            .expect("outbound tls config"),
+        .expect("outbound tls config"),
     ));
 
     // 3) Start the TCP listener with the pool wired in — this is the
@@ -359,7 +390,8 @@ async fn tcp_outbound_fallback_to_pool_when_no_connection() {
 
     // 4) Fire-and-forget: send the OutboundMessage UacSender::send_request()
     //    builds — sentinel id 0, no source_local_addr.
-    let notify_bytes = Bytes::from_static(b"NOTIFY sip:bob@example.com SIP/2.0\r\n\
+    let notify_bytes = Bytes::from_static(
+        b"NOTIFY sip:bob@example.com SIP/2.0\r\n\
         Via: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bK-pool-fallback\r\n\
         From: <sip:scscf@example.com>;tag=notifier\r\n\
         To: <sip:bob@example.com>;tag=subscriber\r\n\
@@ -368,7 +400,8 @@ async fn tcp_outbound_fallback_to_pool_when_no_connection() {
         Event: reg\r\n\
         Subscription-State: active;expires=3600\r\n\
         Content-Length: 0\r\n\
-        \r\n");
+        \r\n",
+    );
     outbound_tx
         .send_async(OutboundMessage {
             followups: None,
@@ -397,8 +430,14 @@ async fn tcp_outbound_fallback_to_pool_when_no_connection() {
     }
     let buf = received.lock().await.clone();
     let on_wire = String::from_utf8_lossy(&buf);
-    assert!(on_wire.contains("NOTIFY"), "expected NOTIFY on wire, got: {on_wire}");
-    assert!(on_wire.contains("Event: reg"), "expected Event: reg on wire");
+    assert!(
+        on_wire.contains("NOTIFY"),
+        "expected NOTIFY on wire, got: {on_wire}"
+    );
+    assert!(
+        on_wire.contains("Event: reg"),
+        "expected Event: reg on wire"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -416,8 +455,7 @@ async fn tcp_responds_to_peer_crlf_ping_with_pong() {
     let addr = free_port();
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (_outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-        Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
     let tracker = Arc::new(CrlfPongTracker::new());
 
     tcp::listen(
@@ -490,10 +528,22 @@ async fn tls_roundtrip() {
     let addr = free_port();
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-        Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
 
-    tls::listen(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None, None, None).await;
+    tls::listen(
+        addr,
+        &tls_config,
+        inbound_tx,
+        outbound_rx,
+        Arc::clone(&connection_map),
+        test_acl(),
+        StreamConnections::new(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
     tokio::time::sleep(SETTLE).await;
 
     // Build a TLS client that trusts our self-signed cert
@@ -501,10 +551,16 @@ async fn tls_roundtrip() {
 
     let tcp_stream = connect_with_retry("tcp listener", || TcpStream::connect(addr)).await;
     let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-    let mut tls_stream = tls_connector.connect(server_name, tcp_stream).await.unwrap();
+    let mut tls_stream = tls_connector
+        .connect(server_name, tcp_stream)
+        .await
+        .unwrap();
 
     // Send OPTIONS
-    tls_stream.write_all(sip_options_request().as_bytes()).await.unwrap();
+    tls_stream
+        .write_all(sip_options_request().as_bytes())
+        .await
+        .unwrap();
 
     // Verify inbound arrives
     let inbound = tokio::time::timeout(TIMEOUT, inbound_rx.recv_async())
@@ -514,7 +570,11 @@ async fn tls_roundtrip() {
 
     assert_eq!(inbound.transport, Transport::Tls);
     let data_str = String::from_utf8_lossy(&inbound.data);
-    assert!(data_str.contains("OPTIONS"), "expected OPTIONS: {}", data_str);
+    assert!(
+        data_str.contains("OPTIONS"),
+        "expected OPTIONS: {}",
+        data_str
+    );
     assert!(connection_map.contains_key(&inbound.connection_id));
 
     // Send response back
@@ -554,10 +614,19 @@ async fn ws_roundtrip() {
     let addr = free_port();
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-        Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
 
-    ws::listen(addr, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None).await;
+    ws::listen(
+        addr,
+        inbound_tx,
+        outbound_rx,
+        Arc::clone(&connection_map),
+        test_acl(),
+        StreamConnections::new(),
+        None,
+        None,
+    )
+    .await;
     tokio::time::sleep(SETTLE).await;
 
     // Client: connect via WebSocket
@@ -566,7 +635,10 @@ async fn ws_roundtrip() {
         connect_with_retry("ws listener", || tokio_tungstenite::connect_async(&url)).await;
 
     // Send OPTIONS as text frame
-    ws_stream.send(Message::text(sip_options_request())).await.unwrap();
+    ws_stream
+        .send(Message::text(sip_options_request()))
+        .await
+        .unwrap();
 
     // Verify inbound arrives
     let inbound = tokio::time::timeout(TIMEOUT, inbound_rx.recv_async())
@@ -576,7 +648,11 @@ async fn ws_roundtrip() {
 
     assert_eq!(inbound.transport, Transport::WebSocket);
     let data_str = String::from_utf8_lossy(&inbound.data);
-    assert!(data_str.contains("OPTIONS"), "expected OPTIONS: {}", data_str);
+    assert!(
+        data_str.contains("OPTIONS"),
+        "expected OPTIONS: {}",
+        data_str
+    );
     assert!(connection_map.contains_key(&inbound.connection_id));
 
     // Send response back through outbound channel
@@ -601,7 +677,11 @@ async fn ws_roundtrip() {
         .expect("WS read error");
 
     let response_text = response_msg.into_text().expect("expected text frame");
-    assert!(response_text.contains("200 OK"), "expected 200 OK: {}", response_text);
+    assert!(
+        response_text.contains("200 OK"),
+        "expected 200 OK: {}",
+        response_text
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -621,17 +701,30 @@ async fn wss_roundtrip() {
     let addr = free_port();
     let (inbound_tx, inbound_rx) = flume::unbounded();
     let (outbound_tx, outbound_rx) = flume::unbounded::<OutboundMessage>();
-    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> =
-        Arc::new(DashMap::new());
+    let connection_map: Arc<DashMap<ConnectionId, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
 
-    ws::listen_secure(addr, &tls_config, inbound_tx, outbound_rx, Arc::clone(&connection_map), test_acl(), StreamConnections::new(), None, None).await;
+    ws::listen_secure(
+        addr,
+        &tls_config,
+        inbound_tx,
+        outbound_rx,
+        Arc::clone(&connection_map),
+        test_acl(),
+        StreamConnections::new(),
+        None,
+        None,
+    )
+    .await;
     tokio::time::sleep(SETTLE).await;
 
     // Manual TLS connect then WebSocket upgrade
     let tls_connector = build_test_tls_connector(&tls_config);
     let tcp_stream = connect_with_retry("tcp listener", || TcpStream::connect(addr)).await;
     let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-    let tls_stream = tls_connector.connect(server_name, tcp_stream).await.unwrap();
+    let tls_stream = tls_connector
+        .connect(server_name, tcp_stream)
+        .await
+        .unwrap();
 
     let url = format!("wss://localhost:{}", addr.port());
     let request = url.parse::<http::Uri>().unwrap();
@@ -640,7 +733,10 @@ async fn wss_roundtrip() {
         .expect("WSS WebSocket upgrade failed");
 
     // Send OPTIONS
-    ws_stream.send(Message::text(sip_options_request())).await.unwrap();
+    ws_stream
+        .send(Message::text(sip_options_request()))
+        .await
+        .unwrap();
 
     // Verify inbound arrives
     let inbound = tokio::time::timeout(TIMEOUT, inbound_rx.recv_async())
@@ -650,7 +746,11 @@ async fn wss_roundtrip() {
 
     assert_eq!(inbound.transport, Transport::WebSocketSecure);
     let data_str = String::from_utf8_lossy(&inbound.data);
-    assert!(data_str.contains("OPTIONS"), "expected OPTIONS: {}", data_str);
+    assert!(
+        data_str.contains("OPTIONS"),
+        "expected OPTIONS: {}",
+        data_str
+    );
     assert!(connection_map.contains_key(&inbound.connection_id));
 
     // Send response back
@@ -675,7 +775,11 @@ async fn wss_roundtrip() {
         .expect("WSS read error");
 
     let response_text = response_msg.into_text().expect("expected text frame");
-    assert!(response_text.contains("200 OK"), "expected 200 OK: {}", response_text);
+    assert!(
+        response_text.contains("200 OK"),
+        "expected 200 OK: {}",
+        response_text
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -704,25 +808,63 @@ async fn multi_transport_shared_inbound_channel() {
         Arc::new(DashMap::new());
 
     // Start all three transports with the same inbound_tx
-    udp::listen(udp_addr, inbound_tx.clone(), udp_outbound_rx, test_acl(), None, 0).await;
-    tcp::listen(tcp_addr, inbound_tx.clone(), tcp_outbound_rx, Arc::clone(&tcp_connection_map), test_acl(), None, None, None, None).await;
-    ws::listen(ws_addr, inbound_tx.clone(), ws_outbound_rx, Arc::clone(&ws_connection_map), test_acl(), StreamConnections::new(), None, None).await;
+    udp::listen(
+        udp_addr,
+        inbound_tx.clone(),
+        udp_outbound_rx,
+        test_acl(),
+        None,
+        0,
+    )
+    .await;
+    tcp::listen(
+        tcp_addr,
+        inbound_tx.clone(),
+        tcp_outbound_rx,
+        Arc::clone(&tcp_connection_map),
+        test_acl(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    ws::listen(
+        ws_addr,
+        inbound_tx.clone(),
+        ws_outbound_rx,
+        Arc::clone(&ws_connection_map),
+        test_acl(),
+        StreamConnections::new(),
+        None,
+        None,
+    )
+    .await;
     drop(inbound_tx); // Only transport workers hold clones now
     tokio::time::sleep(SETTLE).await;
 
     // Send via UDP
     let udp_client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    udp_client.send_to(b"OPTIONS sip:udp SIP/2.0\r\n\r\n", udp_addr).await.unwrap();
+    udp_client
+        .send_to(b"OPTIONS sip:udp SIP/2.0\r\n\r\n", udp_addr)
+        .await
+        .unwrap();
 
     // Send via TCP
     let mut tcp_client = connect_with_retry("tcp listener", || TcpStream::connect(tcp_addr)).await;
-    tcp_client.write_all(b"OPTIONS sip:tcp SIP/2.0\r\n\r\n").await.unwrap();
+    tcp_client
+        .write_all(b"OPTIONS sip:tcp SIP/2.0\r\n\r\n")
+        .await
+        .unwrap();
 
     // Send via WS
     let url = format!("ws://127.0.0.1:{}", ws_addr.port());
     let (mut ws_client, _) =
         connect_with_retry("ws listener", || tokio_tungstenite::connect_async(&url)).await;
-    ws_client.send(Message::text("OPTIONS sip:ws SIP/2.0\r\n\r\n")).await.unwrap();
+    ws_client
+        .send(Message::text("OPTIONS sip:ws SIP/2.0\r\n\r\n"))
+        .await
+        .unwrap();
 
     // Collect three messages from the shared channel
     let mut transports_seen = Vec::new();
@@ -735,9 +877,21 @@ async fn multi_transport_shared_inbound_channel() {
     }
 
     // All three transport types should be represented
-    assert!(transports_seen.contains(&Transport::Udp), "missing UDP: {:?}", transports_seen);
-    assert!(transports_seen.contains(&Transport::Tcp), "missing TCP: {:?}", transports_seen);
-    assert!(transports_seen.contains(&Transport::WebSocket), "missing WS: {:?}", transports_seen);
+    assert!(
+        transports_seen.contains(&Transport::Udp),
+        "missing UDP: {:?}",
+        transports_seen
+    );
+    assert!(
+        transports_seen.contains(&Transport::Tcp),
+        "missing TCP: {:?}",
+        transports_seen
+    );
+    assert!(
+        transports_seen.contains(&Transport::WebSocket),
+        "missing WS: {:?}",
+        transports_seen
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -746,9 +900,11 @@ async fn multi_transport_shared_inbound_channel() {
 
 fn generate_test_tls_config(directory: &tempfile::TempDir) -> siphon::config::TlsServerConfig {
     let key_pair = rcgen::KeyPair::generate().expect("keygen");
-    let certificate_params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
-        .expect("cert params");
-    let certificate = certificate_params.self_signed(&key_pair).expect("self-sign");
+    let certificate_params =
+        rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
+    let certificate = certificate_params
+        .self_signed(&key_pair)
+        .expect("self-sign");
 
     let cert_path = directory.path().join("cert.pem");
     let key_path = directory.path().join("key.pem");
@@ -767,7 +923,9 @@ fn generate_test_tls_config(directory: &tempfile::TempDir) -> siphon::config::Tl
     }
 }
 
-fn build_test_tls_connector(tls_config: &siphon::config::TlsServerConfig) -> tokio_rustls::TlsConnector {
+fn build_test_tls_connector(
+    tls_config: &siphon::config::TlsServerConfig,
+) -> tokio_rustls::TlsConnector {
     use tokio_rustls::rustls;
 
     let cert_pem = std::fs::read(&tls_config.certificate).unwrap();

@@ -77,9 +77,7 @@ impl PySdpNamespace {
         })?;
         let sdp_bytes = extract_sdp_from_message(&message_arc)?;
         let text = String::from_utf8(sdp_bytes).map_err(|error| {
-            pyo3::exceptions::PyValueError::new_err(format!(
-                "SDP body is not valid UTF-8: {error}"
-            ))
+            pyo3::exceptions::PyValueError::new_err(format!("SDP body is not valid UTF-8: {error}"))
         })?;
         let sdp = SdpBody::parse(&text);
         Ok(PySdp {
@@ -149,7 +147,9 @@ impl PySdp {
 
     /// Get all session-level attribute values matching ``name``.
     fn get_attrs_by_name(&self, name: &str) -> PyResult<Vec<String>> {
-        Ok(self.lock()?.session_get_attrs_by_name(name)
+        Ok(self
+            .lock()?
+            .session_get_attrs_by_name(name)
             .into_iter()
             .map(|s| s.to_string())
             .collect())
@@ -478,9 +478,7 @@ impl PyMediaSection {
 // ---------------------------------------------------------------------------
 
 /// Extract SDP bytes from a SIP message, handling multipart/mixed bodies.
-fn extract_sdp_from_message(
-    message: &Arc<Mutex<SipMessage>>,
-) -> PyResult<Vec<u8>> {
+fn extract_sdp_from_message(message: &Arc<Mutex<SipMessage>>) -> PyResult<Vec<u8>> {
     let message = message.lock().map_err(|error| {
         pyo3::exceptions::PyRuntimeError::new_err(format!("lock poisoned: {error}"))
     })?;

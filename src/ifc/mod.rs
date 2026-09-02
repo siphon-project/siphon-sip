@@ -236,14 +236,16 @@ pub fn parse_service_profile(xml: &str) -> Result<Vec<InitialFilterCriteria>, If
                     // --- TriggerPoint fields ---
                     "ConditionTypeCNF" => {
                         if let Some(ref mut trigger) = current_trigger {
-                            trigger.condition_type_cnf = Some(text == "1" || text.eq_ignore_ascii_case("true"));
+                            trigger.condition_type_cnf =
+                                Some(text == "1" || text.eq_ignore_ascii_case("true"));
                         }
                     }
 
                     // --- SPT fields ---
                     "ConditionNegated" => {
                         if let Some(ref mut spt) = current_spt {
-                            spt.condition_negated = text == "1" || text.eq_ignore_ascii_case("true");
+                            spt.condition_negated =
+                                text == "1" || text.eq_ignore_ascii_case("true");
                         }
                     }
                     "Group" => {
@@ -388,7 +390,7 @@ pub fn parse_service_profile(xml: &str) -> Result<Vec<InitialFilterCriteria>, If
                 current_text.push_str(
                     &element
                         .unescape()
-                        .map_err(|error| IfcError::XmlParse(error.to_string()))?
+                        .map_err(|error| IfcError::XmlParse(error.to_string()))?,
                 );
             }
             Ok(Event::Eof) => break,
@@ -457,7 +459,10 @@ impl TriggerPointBuilder {
 /// `Some(method)` only when the trigger UNAMBIGUOUSLY requires that method —
 /// so any iFC with negated conditions, multiple SPTs in a CNF group, or no
 /// method criterion at all, falls through to the full evaluator.
-fn compute_method_fast_path(condition_type_cnf: bool, spts: &[ServicePointTrigger]) -> Option<String> {
+fn compute_method_fast_path(
+    condition_type_cnf: bool,
+    spts: &[ServicePointTrigger],
+) -> Option<String> {
     // Single-SPT triggers are by far the most common shape: "trigger on INVITE".
     if spts.len() == 1 {
         let spt = &spts[0];
@@ -482,11 +487,17 @@ fn compute_method_fast_path(condition_type_cnf: bool, spts: &[ServicePointTrigge
                 spts.iter().filter(|other| other.group.is_empty()).count() == 1
             } else {
                 spt.group.iter().all(|index| {
-                    spts.iter().filter(|other| other.group.contains(index)).count() == 1
+                    spts.iter()
+                        .filter(|other| other.group.contains(index))
+                        .count()
+                        == 1
                 })
             };
             if group_alone {
-                return spt.method.as_ref().map(|method| method.to_ascii_lowercase());
+                return spt
+                    .method
+                    .as_ref()
+                    .map(|method| method.to_ascii_lowercase());
             }
         }
     }
@@ -575,7 +586,9 @@ fn matches_ifc(
 ) -> bool {
     match &ifc.trigger_point {
         None => true, // No trigger point → always matches.
-        Some(trigger) => evaluate_trigger_point(trigger, method, request_uri, headers, session_case),
+        Some(trigger) => {
+            evaluate_trigger_point(trigger, method, request_uri, headers, session_case)
+        }
     }
 }
 
@@ -606,7 +619,10 @@ fn evaluate_trigger_point(
     if trigger.service_point_triggers.len() == 1 {
         return evaluate_spt(
             &trigger.service_point_triggers[0],
-            method, request_uri, headers, session_case,
+            method,
+            request_uri,
+            headers,
+            session_case,
         );
     }
 
@@ -856,9 +872,10 @@ pub async fn restore_ifc_profiles(
     let mut ifc_count = 0usize;
 
     for key in &keys {
-        let xml: Option<String> = connection.get(key).await.map_err(|error| {
-            format!("GET {key} failed: {error}")
-        })?;
+        let xml: Option<String> = connection
+            .get(key)
+            .await
+            .map_err(|error| format!("GET {key} failed: {error}"))?;
 
         if let Some(xml) = xml {
             let aor = key.strip_prefix(key_prefix).unwrap_or(key);
@@ -982,9 +999,23 @@ impl IfcStore {
         start_after_priority: Option<i32>,
     ) -> Vec<MatchedApplicationServer> {
         if let Some(user_ifcs) = self.profiles.get(aor) {
-            Self::evaluate_ifcs(&user_ifcs, method, request_uri, headers, session_case, start_after_priority)
+            Self::evaluate_ifcs(
+                &user_ifcs,
+                method,
+                request_uri,
+                headers,
+                session_case,
+                start_after_priority,
+            )
         } else {
-            Self::evaluate_ifcs(&self.global, method, request_uri, headers, session_case, start_after_priority)
+            Self::evaluate_ifcs(
+                &self.global,
+                method,
+                request_uri,
+                headers,
+                session_case,
+                start_after_priority,
+            )
         }
     }
 
@@ -1084,14 +1115,20 @@ mod tests {
         let ifcs = parse_service_profile(simple_ifc_xml()).unwrap();
         // INVITE-only iFC: any non-INVITE request must early-return false.
         let matched = evaluate(
-            "REGISTER", "sip:user@example.com", &[],
-            SessionCase::Originating, &ifcs,
+            "REGISTER",
+            "sip:user@example.com",
+            &[],
+            SessionCase::Originating,
+            &ifcs,
         );
         assert!(matched.is_empty());
 
         let matched = evaluate(
-            "INVITE", "sip:user@example.com", &[],
-            SessionCase::Originating, &ifcs,
+            "INVITE",
+            "sip:user@example.com",
+            &[],
+            SessionCase::Originating,
+            &ifcs,
         );
         assert_eq!(matched.len(), 1);
     }
@@ -1522,7 +1559,11 @@ mod tests {
             SessionCase::Originating,
             &ifcs,
         );
-        assert_eq!(results.len(), 1, "should match: INVITE without X-TAS-Handled");
+        assert_eq!(
+            results.len(),
+            1,
+            "should match: INVITE without X-TAS-Handled"
+        );
 
         // Second evaluation: INVITE with X-TAS-Handled → must NOT match (loop prevention)
         let results = evaluate(
@@ -1535,7 +1576,10 @@ mod tests {
             SessionCase::Originating,
             &ifcs,
         );
-        assert!(results.is_empty(), "must not match: X-TAS-Handled present, negated condition should block");
+        assert!(
+            results.is_empty(),
+            "must not match: X-TAS-Handled present, negated condition should block"
+        );
     }
 
     #[test]
@@ -1871,7 +1915,9 @@ mod tests {
         let store = IfcStore::new(vec![]);
 
         let xml = simple_ifc_xml();
-        let count = store.store_profile_xml("sip:alice@example.com", xml).unwrap();
+        let count = store
+            .store_profile_xml("sip:alice@example.com", xml)
+            .unwrap();
         assert_eq!(count, 1);
         assert!(store.has_profile("sip:alice@example.com"));
         assert_eq!(store.profile_count(), 1);
@@ -1933,7 +1979,9 @@ mod tests {
             "  </InitialFilterCriteria>\n",
             "</ServiceProfile>\n",
         );
-        store.store_profile_xml("sip:alice@example.com", custom_xml).unwrap();
+        store
+            .store_profile_xml("sip:alice@example.com", custom_xml)
+            .unwrap();
 
         let results = store.evaluate(
             "sip:alice@example.com",
@@ -1953,7 +2001,9 @@ mod tests {
     fn store_remove_profile() {
         let store = IfcStore::new(vec![]);
 
-        store.store_profile_xml("sip:alice@example.com", simple_ifc_xml()).unwrap();
+        store
+            .store_profile_xml("sip:alice@example.com", simple_ifc_xml())
+            .unwrap();
         assert!(store.has_profile("sip:alice@example.com"));
 
         assert!(store.remove_profile("sip:alice@example.com"));
@@ -1976,10 +2026,8 @@ mod tests {
     fn store_empty_service_profile() {
         let store = IfcStore::new(vec![]);
         // Valid XML but no iFCs — should succeed with count 0.
-        let result = store.store_profile_xml(
-            "sip:alice@example.com",
-            "<ServiceProfile></ServiceProfile>",
-        );
+        let result =
+            store.store_profile_xml("sip:alice@example.com", "<ServiceProfile></ServiceProfile>");
         assert_eq!(result.unwrap(), 0);
         assert!(store.has_profile("sip:alice@example.com"));
     }
@@ -1987,7 +2035,9 @@ mod tests {
     #[test]
     fn store_evaluate_no_match() {
         let store = IfcStore::new(vec![]);
-        store.store_profile_xml("sip:alice@example.com", simple_ifc_xml()).unwrap();
+        store
+            .store_profile_xml("sip:alice@example.com", simple_ifc_xml())
+            .unwrap();
 
         // REGISTER doesn't match the INVITE-only trigger.
         let results = store.evaluate(
@@ -2089,20 +2139,30 @@ mod tests {
         );
 
         let store = IfcStore::new(vec![]);
-        store.store_profile_xml("sip:alice@example.com", xml).unwrap();
+        store
+            .store_profile_xml("sip:alice@example.com", xml)
+            .unwrap();
 
         // Full evaluation: all three match
         let all = store.evaluate(
-            "sip:alice@example.com", "INVITE", "sip:bob@example.com",
-            &[], SessionCase::Originating, None,
+            "sip:alice@example.com",
+            "INVITE",
+            "sip:bob@example.com",
+            &[],
+            SessionCase::Originating,
+            None,
         );
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].server_name, "sip:as1@example.com");
 
         // After AS1 (priority 10) returns: skip priority <= 10
         let remaining = store.evaluate(
-            "sip:alice@example.com", "INVITE", "sip:bob@example.com",
-            &[], SessionCase::Originating, Some(10),
+            "sip:alice@example.com",
+            "INVITE",
+            "sip:bob@example.com",
+            &[],
+            SessionCase::Originating,
+            Some(10),
         );
         assert_eq!(remaining.len(), 2);
         assert_eq!(remaining[0].server_name, "sip:as2@example.com");
@@ -2110,16 +2170,24 @@ mod tests {
 
         // After AS2 (priority 20) returns: skip priority <= 20
         let remaining = store.evaluate(
-            "sip:alice@example.com", "INVITE", "sip:bob@example.com",
-            &[], SessionCase::Originating, Some(20),
+            "sip:alice@example.com",
+            "INVITE",
+            "sip:bob@example.com",
+            &[],
+            SessionCase::Originating,
+            Some(20),
         );
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].server_name, "sip:as3@example.com");
 
         // After AS3 (priority 30) returns: nothing left
         let remaining = store.evaluate(
-            "sip:alice@example.com", "INVITE", "sip:bob@example.com",
-            &[], SessionCase::Originating, Some(30),
+            "sip:alice@example.com",
+            "INVITE",
+            "sip:bob@example.com",
+            &[],
+            SessionCase::Originating,
+            Some(30),
         );
         assert!(remaining.is_empty());
     }

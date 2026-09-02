@@ -109,8 +109,14 @@ fn router(state: AdminState, cors: Option<&CorsConfig>, ui_enabled: bool) -> Rou
         .route("/admin/ready", get(ready_handler))
         .route("/admin/stats", get(stats_handler))
         .route("/admin/registrations", get(registrations_handler))
-        .route("/admin/registrations/{aor}", get(registration_detail_handler))
-        .route("/admin/registrations/{aor}", delete(registration_delete_handler))
+        .route(
+            "/admin/registrations/{aor}",
+            get(registration_detail_handler),
+        )
+        .route(
+            "/admin/registrations/{aor}",
+            delete(registration_delete_handler),
+        )
         .route("/admin/bans", get(bans_handler))
         .route("/admin/bans/{ip}", delete(ban_delete_handler))
         .route("/admin/gateways", get(gateways_handler))
@@ -150,7 +156,11 @@ fn router(state: AdminState, cors: Option<&CorsConfig>, ui_enabled: bool) -> Rou
 /// `Authorization: Bearer <token>` on every mutating method (`POST`, `PUT`,
 /// `PATCH`, `DELETE`) — and, when `protect_reads`, on the read methods too —
 /// comparing in constant time.
-async fn require_admin_auth(State(state): State<AdminState>, request: Request, next: Next) -> Response {
+async fn require_admin_auth(
+    State(state): State<AdminState>,
+    request: Request,
+    next: Next,
+) -> Response {
     let method = request.method();
     let is_read = method == Method::GET || method == Method::HEAD || method == Method::OPTIONS;
     let needs_auth = state.auth_token.is_some()
@@ -288,7 +298,8 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
     // Gateway-health rollup for the overview's "Connections & health" block. Only
     // present when a gateway block is configured (proxy-only nodes omit it, and the
     // dashboard hides the line accordingly).
-    let gateways = crate::script::api::gateway_manager().map(|manager| gateways_summary_json(manager));
+    let gateways =
+        crate::script::api::gateway_manager().map(|manager| gateways_summary_json(manager));
 
     Json(serde_json::json!({
         "version": version,
@@ -346,9 +357,7 @@ async fn metrics_json_handler(State(state): State<AdminState>) -> impl IntoRespo
 }
 
 /// `GET /admin/registrations` — list all active AoRs with their contacts.
-async fn registrations_handler(
-    State(state): State<AdminState>,
-) -> impl IntoResponse {
+async fn registrations_handler(State(state): State<AdminState>) -> impl IntoResponse {
     let all = state.registrar.all_contacts();
     let entries: Vec<serde_json::Value> = all
         .iter()
@@ -371,10 +380,14 @@ async fn registration_detail_handler(
 ) -> impl IntoResponse {
     let contacts = state.registrar.lookup(&aor);
     if contacts.is_empty() {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "error": "not found",
-            "aor": aor,
-        }))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "not found",
+                "aor": aor,
+            })),
+        )
+            .into_response();
     }
 
     let contact_list: Vec<serde_json::Value> = contacts
@@ -388,10 +401,14 @@ async fn registration_detail_handler(
         })
         .collect();
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "aor": aor,
-        "contacts": contact_list,
-    }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "aor": aor,
+            "contacts": contact_list,
+        })),
+    )
+        .into_response()
 }
 
 /// `DELETE /admin/registrations/:aor` — force-unregister all contacts for an AoR.
@@ -400,10 +417,13 @@ async fn registration_delete_handler(
     Path(aor): Path<String>,
 ) -> impl IntoResponse {
     if !state.registrar.is_registered(&aor) {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "error": "not found",
-            "aor": aor,
-        })));
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "not found",
+                "aor": aor,
+            })),
+        );
     }
 
     state.registrar.remove_all(&aor);
@@ -412,10 +432,13 @@ async fn registration_delete_handler(
         metrics.registrations_active.dec();
     }
 
-    (StatusCode::OK, Json(serde_json::json!({
-        "status": "removed",
-        "aor": aor,
-    })))
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "removed",
+            "aor": aor,
+        })),
+    )
 }
 
 /// `GET /admin/bans` — list the sources currently auto-banned by
@@ -509,7 +532,12 @@ fn gateways_json(manager: &crate::gateway::DispatcherManager) -> serde_json::Val
             .collect();
         let up = destinations
             .iter()
-            .filter(|value| value.get("healthy").and_then(|h| h.as_bool()).unwrap_or(false))
+            .filter(|value| {
+                value
+                    .get("healthy")
+                    .and_then(|h| h.as_bool())
+                    .unwrap_or(false)
+            })
             .count();
         groups.push(serde_json::json!({
             "name": group.name,
@@ -583,19 +611,25 @@ async fn gateway_action_handler(
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "action must be 'up' or 'down'", "action": action })),
+                Json(
+                    serde_json::json!({ "error": "action must be 'up' or 'down'", "action": action }),
+                ),
             );
         }
     };
     if changed {
         (
             StatusCode::OK,
-            Json(serde_json::json!({ "status": action, "group": group, "destination": destination })),
+            Json(
+                serde_json::json!({ "status": action, "group": group, "destination": destination }),
+            ),
         )
     } else {
         (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "unknown destination", "group": group, "destination": destination })),
+            Json(
+                serde_json::json!({ "error": "unknown destination", "group": group, "destination": destination }),
+            ),
         )
     }
 }
@@ -639,13 +673,21 @@ fn calls_json(store: &crate::b2bua::actor::CallActorStore) -> serde_json::Value 
         // A-leg's `local_from_uri` is the INVITE *To* (the dialed identity), NOT
         // the caller — surfacing that as "from" was why a bridged call looked
         // like it only showed one leg.
-        let a_party = call.a_leg.dialog.remote_to_uri.as_deref().map(display_party);
+        let a_party = call
+            .a_leg
+            .dialog
+            .remote_to_uri
+            .as_deref()
+            .map(display_party);
         // B-party = the real dialed/forked callee. Exclude the re-INVITE/UPDATE
         // response-tracking pseudo-legs (their `target_uri` is a direction
         // marker) from both the displayed callee and the leg count, so a plain
         // call that did one re-INVITE no longer reports two B-legs.
-        let real_b_legs: Vec<&Leg> =
-            call.b_legs.iter().filter(|leg| !leg.is_tracking_leg()).collect();
+        let real_b_legs: Vec<&Leg> = call
+            .b_legs
+            .iter()
+            .filter(|leg| !leg.is_tracking_leg())
+            .collect();
         let b_party = real_b_legs
             .first()
             .and_then(|leg| leg.dialog.target_uri.as_deref())
@@ -768,7 +810,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");
         assert!(json["uptime_seconds"].as_u64().is_some());
@@ -785,7 +829,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ready");
     }
@@ -812,7 +858,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "draining");
     }
@@ -828,7 +876,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(text.contains("siphon_"));
     }
@@ -844,7 +894,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["uptime_seconds"].as_u64().is_some());
         assert_eq!(json["registrations_active"], 0);
@@ -865,7 +917,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.as_array().unwrap().is_empty());
     }
@@ -919,7 +973,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json.is_array());
     }
@@ -938,7 +994,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "invalid IP address");
     }
@@ -1116,11 +1174,7 @@ mod tests {
         let app = router(authed_state("s3cret", false), None, false);
 
         let response = app
-            .oneshot(
-                Request::get("/admin/stats")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/admin/stats").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -1318,8 +1372,7 @@ mod tests {
             transport(),
         );
         // The caller (INVITE From) is stored on the A-leg as remote_to_uri.
-        a_leg.dialog.remote_to_uri =
-            Some("\"Alice\" <sip:alice@example.com>;tag=abc".to_string());
+        a_leg.dialog.remote_to_uri = Some("\"Alice\" <sip:alice@example.com>;tag=abc".to_string());
         let id = store.create_call(a_leg);
 
         // A freshly created call: caller surfaced, no B-party yet, zero B-legs.

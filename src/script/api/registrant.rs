@@ -118,26 +118,24 @@ impl PyRegistration {
             format!("{registrar_host}:5060")
         };
 
-        let destination: std::net::SocketAddr = host_with_port
-            .parse()
-            .or_else(|_| {
-                // Not a raw IP:port — try DNS resolution
-                use std::net::ToSocketAddrs;
-                host_with_port
-                    .to_socket_addrs()
-                    .map_err(|e| {
+        let destination: std::net::SocketAddr = host_with_port.parse().or_else(|_| {
+            // Not a raw IP:port — try DNS resolution
+            use std::net::ToSocketAddrs;
+            host_with_port
+                .to_socket_addrs()
+                .map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "cannot resolve registrar address '{registrar}': {e}"
+                    ))
+                })
+                .and_then(|mut addrs| {
+                    addrs.next().ok_or_else(|| {
                         pyo3::exceptions::PyValueError::new_err(format!(
-                            "cannot resolve registrar address '{registrar}': {e}"
+                            "DNS returned no addresses for '{registrar}'"
                         ))
                     })
-                    .and_then(|mut addrs| {
-                        addrs.next().ok_or_else(|| {
-                            pyo3::exceptions::PyValueError::new_err(format!(
-                                "DNS returned no addresses for '{registrar}'"
-                            ))
-                        })
-                    })
-            })?;
+                })
+        })?;
 
         let entry = RegistrantEntry::new(
             aor.to_string(),
@@ -157,7 +155,9 @@ impl PyRegistration {
         // through Milenage instead of password digest (RFC 3310 / TS 33.203).
         let entry = if auth.is_some_and(|mode| mode.eq_ignore_ascii_case("aka")) {
             let k = k.ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("auth='aka' requires the subscriber key `k`")
+                pyo3::exceptions::PyValueError::new_err(
+                    "auth='aka' requires the subscriber key `k`",
+                )
             })?;
             let credentials =
                 crate::registrant::aka::AkaCredentials::from_hex(k, op, opc, amf.unwrap_or("8000"))
@@ -193,7 +193,9 @@ impl PyRegistration {
             })?;
             let ealg_token = ipsec_ealg.unwrap_or("null");
             let ealg = EncryptionAlgorithm::from_sec_agree_name(ealg_token).ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(format!("unknown ipsec_ealg '{ealg_token}'"))
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown ipsec_ealg '{ealg_token}'"
+                ))
             })?;
             entry.with_ipsec(UeIpsec::new(port_c, port_s, aalg, ealg))
         } else {
@@ -276,7 +278,11 @@ impl PyRegistration {
     /// port, so it rides the SA. `ue_ip` is siphon's own address on the SA
     /// (the IP its protected ports are bound to). Returns ``None`` until the
     /// sec-agree handshake has completed (no Security-Server recorded yet).
-    fn flow(&self, aor: &str, ue_ip: &str) -> PyResult<Option<crate::script::api::registrar::PyFlow>> {
+    fn flow(
+        &self,
+        aor: &str,
+        ue_ip: &str,
+    ) -> PyResult<Option<crate::script::api::registrar::PyFlow>> {
         let ue_ip: std::net::IpAddr = ue_ip.parse().map_err(|_| {
             pyo3::exceptions::PyValueError::new_err(format!("ue_ip '{ue_ip}' is not an IP address"))
         })?;
@@ -474,7 +480,13 @@ mod tests {
         let manager = make_manager();
         let py_reg = PyRegistration::new(Arc::clone(&manager), "127.0.0.1:5060".parse().unwrap());
 
-        add_aka(&py_reg, Some(AKA_K), Some("cdc202d5123e20f62b6d676ac72cb318"), None).unwrap();
+        add_aka(
+            &py_reg,
+            Some(AKA_K),
+            Some("cdc202d5123e20f62b6d676ac72cb318"),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             manager.auth_mode(AKA_AOR),
             Some(crate::registrant::AuthMode::Aka)
