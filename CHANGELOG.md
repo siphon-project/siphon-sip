@@ -66,6 +66,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   a peer that meant the second.
 
 ### Added
+- **The WebSocket stream lifecycle now reaches the control plane, for the tee as
+  well as the bridge.** `stream_start` shipped before any lifecycle events did,
+  so an app could start a tee over the control rail and had no way to learn it
+  had stopped — the audio just went quiet, which is the exact silent failure
+  these events exist to surface. `WsTeeStarted` / `WsTeeEnded` now publish
+  alongside `WsBridgeStarted` / `WsBridgeEnded`, carrying the negotiated wire
+  shape, the end reason, an `unexpected` flag (`detached` is the only orderly
+  end of either) and, for the tee, the frames sent and dropped so an app can see
+  its own consumer was the bottleneck.
+
+  All four are typed in the SDKs rather than arriving as the forward-compatible
+  `Other` catch-all: new `SipEvent` variants and payload structs on
+  `siphon-control-proto`, `ws_tee_started()` / `ws_tee_ended()` /
+  `ws_bridge_started()` / `ws_bridge_ended()` accessors plus an
+  `is_unexpected_stream_end()` helper on `siphon-control-client`, and the
+  matching payload interfaces on the TypeScript client.
 - **Attach, re-point and detach a WebSocket *takeover* bridge on a live call.**
   The tee (`attach_ws_tee`) streams a copy while the call keeps relaying; a
   takeover makes the WebSocket server the leg's far side and unwires A↔B. Until

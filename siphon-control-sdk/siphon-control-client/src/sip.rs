@@ -18,6 +18,7 @@ use tracing::{debug, warn};
 
 use siphon_control_proto::sip::{
     BridgeFailedPayload, ChannelBridgedPayload, ChannelDtmfPayload, ChannelUnbridgedPayload, PlayStartedPayload, SipEvent, SipVerb, TransferOutcomePayload, TransferRequestedPayload,
+    WsBridgeEndedPayload, WsBridgeStartedPayload, WsTeeEndedPayload, WsTeeStartedPayload,
 };
 // The `bridge` verb's teardown policy is an argument of this facade, so it is
 // re-exported here rather than reached for through the proto crate.
@@ -350,6 +351,64 @@ impl CallEvent {
             self.kind,
             SipEvent::ChannelBridged | SipEvent::BridgeFailed
         )
+    }
+
+    /// The typed [`WsTeeStartedPayload`] when this is a
+    /// [`SipEvent::WsTeeStarted`] event, else `None`. Carries the negotiated
+    /// wire shape, so a consumer decodes the socket's binary frames without
+    /// guessing.
+    pub fn ws_tee_started(&self) -> Option<WsTeeStartedPayload> {
+        if self.kind != SipEvent::WsTeeStarted {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+
+    /// The typed [`WsTeeEndedPayload`] when this is a [`SipEvent::WsTeeEnded`]
+    /// event, else `None`. Exactly one arrives per `WsTeeStarted`, including
+    /// when the *server* ends it.
+    pub fn ws_tee_ended(&self) -> Option<WsTeeEndedPayload> {
+        if self.kind != SipEvent::WsTeeEnded {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+
+    /// The typed [`WsBridgeStartedPayload`] when this is a
+    /// [`SipEvent::WsBridgeStarted`] event, else `None`. Unlike a tee, this
+    /// means the WebSocket server *is* the leg's far side.
+    pub fn ws_bridge_started(&self) -> Option<WsBridgeStartedPayload> {
+        if self.kind != SipEvent::WsBridgeStarted {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+
+    /// The typed [`WsBridgeEndedPayload`] when this is a
+    /// [`SipEvent::WsBridgeEnded`] event, else `None`. A re-point arrives as an
+    /// ended (reason `detached`) followed by a fresh started.
+    pub fn ws_bridge_ended(&self) -> Option<WsBridgeEndedPayload> {
+        if self.kind != SipEvent::WsBridgeEnded {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
+    }
+
+    /// Whether a WebSocket stream this app started ended for a reason it did
+    /// not ask for.
+    ///
+    /// True for a tee whose audio stopped reaching the consumer mid-call, and
+    /// for a bridge — where it is graver, because a bridge is the call's media
+    /// path, so both parties are now up and hearing nothing. `detached` is the
+    /// only orderly end of either.
+    pub fn is_unexpected_stream_end(&self) -> bool {
+        match self.kind {
+            SipEvent::WsTeeEnded => self.ws_tee_ended().is_some_and(|end| end.unexpected),
+            SipEvent::WsBridgeEnded => {
+                self.ws_bridge_ended().is_some_and(|end| end.unexpected)
+            }
+            _ => false,
+        }
     }
 }
 

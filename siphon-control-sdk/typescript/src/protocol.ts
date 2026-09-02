@@ -217,6 +217,10 @@ export type SipEventKind =
   | "ChannelBridged"
   | "BridgeFailed"
   | "ChannelUnbridged"
+  | "WsTeeStarted"
+  | "WsTeeEnded"
+  | "WsBridgeStarted"
+  | "WsBridgeEnded"
   | (string & {});
 
 /** Parse a wire event name; unknown names pass through verbatim (forward-compatible). */
@@ -430,6 +434,75 @@ export interface ChannelUnbridgedPayload {
   peer_sip_call_id: string;
   /** The reason the `unbridge` carried (default `"unbridged"`). */
   reason: string;
+}
+
+/**
+ * The `payload` of a `WsTeeStarted` event — a WebSocket audio **tee** began
+ * streaming a copy of the channel's audio. Additive: the call relays on
+ * regardless, so a tee never affects the parties.
+ *
+ * `streamId` correlates this event with the `start` frame on the socket, and
+ * the wire shape is stated so a consumer decodes the binary frames without
+ * guessing.
+ */
+export interface WsTeeStartedPayload {
+  from_tag: string;
+  stream_id: string;
+  ws_uri: string;
+  /** `both`, `caller` or `callee`. */
+  direction: string;
+  /** 1 = mono/mixed, 2 = caller/callee interleaved. */
+  channels: number;
+  /** Wire sample rate in Hz (L16, little-endian). */
+  sample_rate: number;
+}
+
+/**
+ * The `payload` of a `WsTeeEnded` event. Exactly one arrives per
+ * `WsTeeStarted`, including when the *server* ends it, so a consumer learns
+ * the stream died rather than silently losing the audio.
+ *
+ * `frames_dropped > 0` means the consumer could not keep up; the call itself
+ * was never affected.
+ */
+export interface WsTeeEndedPayload {
+  from_tag: string;
+  stream_id: string;
+  /** `detached`, `server_closed`, `server_stopped`, `call_ended` or `transport_error`. */
+  reason: string;
+  /** `detached` is the only orderly end; anything else stopped the audio mid-call. */
+  unexpected: boolean;
+  frames_sent?: number | null;
+  frames_dropped?: number | null;
+}
+
+/**
+ * The `payload` of a `WsBridgeStarted` event — a WebSocket **takeover** bridge
+ * began. Unlike a tee this *replaced* the call's audio path: the WebSocket
+ * server is now the leg's far side and A-to-B is unwired.
+ */
+export interface WsBridgeStartedPayload {
+  from_tag: string;
+  stream_id: string;
+  ws_uri: string;
+  /** Wire sample rate in Hz (L16, little-endian). */
+  sample_rate: number;
+}
+
+/**
+ * The `payload` of a `WsBridgeEnded` event. Exactly one per
+ * `WsBridgeStarted`; a re-point arrives as an ended (reason `detached`)
+ * followed by a fresh started.
+ *
+ * `unexpected` matters more here than on a tee: a bridge *is* the call's media
+ * path, so anything but `detached` leaves both parties up and hearing nothing.
+ */
+export interface WsBridgeEndedPayload {
+  from_tag: string;
+  stream_id: string;
+  /** `detached`, `server_closed`, `server_stopped`, `call_ended` or `transport_error`. */
+  reason: string;
+  unexpected: boolean;
 }
 
 /**

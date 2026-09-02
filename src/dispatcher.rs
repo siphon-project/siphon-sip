@@ -1327,6 +1327,21 @@ pub async fn run(
                             sample_rate = tee.sample_rate,
                             "media engine started a websocket tee"
                         );
+                        // Same rail as the bridge's lifecycle: a controller
+                        // that started this stream over the control plane has
+                        // no other way to learn its shape or that it died.
+                        crate::control::notify_channel_event(
+                            &tee.call_id,
+                            "WsTeeStarted",
+                            serde_json::json!({
+                                "from_tag": tee.from_tag,
+                                "stream_id": tee.stream_id,
+                                "ws_uri": tee.ws_uri,
+                                "direction": tee.direction.as_str(),
+                                "channels": tee.channels,
+                                "sample_rate": tee.sample_rate,
+                            }),
+                        );
                         let engine_state = state_for_events.engine.state();
                         let handlers =
                             engine_state.ws_tee_started_handlers(&tee.call_id, &tee.from_tag);
@@ -1553,6 +1568,25 @@ pub async fn run(
                                 "websocket tee ended"
                             );
                         }
+                        crate::control::notify_channel_event(
+                            &tee.call_id,
+                            "WsTeeEnded",
+                            serde_json::json!({
+                                "from_tag": tee.from_tag,
+                                "stream_id": tee.stream_id,
+                                "reason": tee.reason.as_str(),
+                                // `detached` is the only orderly end; anything
+                                // else means audio stopped reaching the
+                                // consumer while the call carried on.
+                                "unexpected": tee.reason.is_unexpected(),
+                                // Non-zero means the consumer could not keep
+                                // up. The call was never affected — this is the
+                                // one number that tells a controller its own
+                                // side is the bottleneck.
+                                "frames_sent": tee.frames_sent,
+                                "frames_dropped": tee.frames_dropped,
+                            }),
+                        );
                         let engine_state = state_for_events.engine.state();
                         let handlers =
                             engine_state.ws_tee_ended_handlers(&tee.call_id, &tee.from_tag);

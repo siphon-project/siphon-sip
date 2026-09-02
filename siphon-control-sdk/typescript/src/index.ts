@@ -90,6 +90,10 @@ export type {
   ChannelBridgedPayload,
   BridgeFailedPayload,
   ChannelUnbridgedPayload,
+  WsTeeStartedPayload,
+  WsTeeEndedPayload,
+  WsBridgeStartedPayload,
+  WsBridgeEndedPayload,
 } from "./protocol";
 
 export { ControlClient, EventStream } from "./client";
