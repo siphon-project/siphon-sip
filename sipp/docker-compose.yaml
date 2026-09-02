@@ -4799,6 +4799,144 @@ services:
       - reoffer
 
 
+  # ── WebSocket takeover-bridge lifecycle ───────────────────────────────────
+  # Attach, re-point, detach on a live call. The re-point is the reason the
+  # mode exists: moving a party between media servers must be one attach, not a
+  # detach and an attach, because the detach is a gap the other party hears.
+  # SIPp sees an ordinary answered call either way — the proof is the verb
+  # sequence the mock engine echoes.
+  mock-siphon-rtp-ws-bridge:
+    image: python:3.12-slim
+    container_name: mock-siphon-rtp-ws-bridge
+    volumes:
+      - ./siphon-rtp:/app:ro
+    working_dir: /app
+    command: ["python3", "mock_siphon_rtp.py"]
+    environment:
+      SIPHON_RTP_PORT: "8080"
+      MOCK_MEDIA_IP: "203.0.113.1"
+      MOCK_MEDIA_PORT: "30000"
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.116
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket,struct,json; s=socket.create_connection(('127.0.0.1',8080),2); b=json.dumps({'id':1,'command':'ping'}).encode(); s.sendall(struct.pack('!I',len(b))+b); h=s.recv(4); n=struct.unpack('!I',h)[0]; d=s.recv(n); s.close(); exit(0 if b'pong' in d else 1)\""]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    profiles:
+      - ws-bridge
+
+  siphon-ws-bridge:
+    image: sipp-siphon   # reuse the siphon image (built by the `siphon` service)
+    build:
+      context: ..
+    container_name: siphon-ws-bridge-test
+    depends_on:
+      mock-siphon-rtp-ws-bridge:
+        condition: service_healthy
+    volumes:
+      - ./siphon-rtp/siphon-ws-bridge.yaml:/etc/siphon/siphon.yaml:ro
+      - ./siphon-rtp:/etc/siphon/sipp-scripts:ro
+      - ../scripts:/etc/siphon/scripts:ro
+      - ../examples:/etc/siphon/examples:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.117
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(b'OPTIONS sip:siphon.test SIP/2.0\\r\\nVia: SIP/2.0/UDP 127.0.0.1:15060;branch=z9hG4bK-hc\\r\\nFrom: <sip:hc@siphon.test>;tag=hc\\r\\nTo: <sip:siphon.test>\\r\\nCall-ID: hc@check\\r\\nCSeq: 1 OPTIONS\\r\\nMax-Forwards: 1\\r\\nContent-Length: 0\\r\\n\\r\\n', ('127.0.0.1',5060)); s.recv(1024); s.close()\""]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    profiles:
+      - ws-bridge
+
+  sipp-ws-bridge-register:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-ws-bridge:
+        condition: service_healthy
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        # Same address as the UAS below, deliberately: the registrar binds bob
+        # to the source address the REGISTER arrived from, so the contact only
+        # points at the UAS if they share an IP. They never run at the same
+        # time — the UAS waits for this to complete.
+        ipv4_address: 172.20.0.118
+    entrypoint:
+      - sipp
+      - "172.20.0.117:5060"
+      - -sf
+      - /sipp/scenarios/register.xml
+      - -s
+      - bob
+      - -ap
+      - secret
+      - -m
+      - "1"
+      - -timeout
+      - "20"
+      - -trace_err
+    profiles:
+      - ws-bridge
+
+  sipp-ws-bridge-uas:
+    image: ctaloi/sipp:latest
+    depends_on:
+      sipp-ws-bridge-register:
+        condition: service_completed_successfully
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.118
+    entrypoint:
+      - sipp
+      - -sf
+      - /sipp/scenarios/rtpengine_uas.xml
+      - -p
+      - "5060"
+      - -m
+      - "1"
+      - -timeout
+      - "30"
+      - -trace_err
+    profiles:
+      - ws-bridge
+
+  sipp-ws-bridge-uac:
+    image: ctaloi/sipp:latest
+    depends_on:
+      siphon-ws-bridge:
+        condition: service_healthy
+      sipp-ws-bridge-uas:
+        condition: service_started
+    volumes:
+      - .:/sipp/scenarios:ro
+    networks:
+      sipnet:
+        ipv4_address: 172.20.0.119
+    entrypoint:
+      - sipp
+      - "172.20.0.117:5060"
+      - -sf
+      - /sipp/scenarios/rtpengine_uac.xml
+      - -m
+      - "1"
+      - -l
+      - "1"
+      - -timeout
+      - "30"
+      - -timeout_error
+      - -trace_err
+    profiles:
+      - ws-bridge
+
+
   # ── REAL siphon-rtp engine ────────────────────────────────────────────────
   # The published engine image, standing in for the Python control-plane mocks
   # (sipp/siphon-rtp/mock_siphon_rtp.py) the way rtpengine-real stands in for

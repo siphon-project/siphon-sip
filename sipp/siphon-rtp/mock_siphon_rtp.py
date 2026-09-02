@@ -177,6 +177,38 @@ def handle_command(command: dict) -> dict:
         return {"result": "ok", "play_id": next_play_id(), "duration_ms": 1500}
     if verb in ("attach_ws_tee", "detach_ws_tee", "stop_media"):
         return {"result": "ok"}
+    if verb == "attach_ws_bridge":
+        # A takeover, not a copy: the WS server becomes the leg's far side.
+        # Attaching to a call that already has one is a *re-point*, and it is
+        # explicitly not an error — that is the whole reason the verb exists,
+        # since the alternative (detach, then attach) is a gap the other party
+        # hears.
+        with CALLS_LOCK:
+            call = CALLS.get(call_id)
+            if call is None:
+                return {"result": "error", "reason": f"unknown call-id {call_id!r}"}
+            call["ws_bridge"] = command.get("ws_uri", "")
+        return {"result": "ok"}
+    if verb == "detach_ws_bridge":
+        # Deliberately NOT idempotent, unlike detach_ws_tee. The real engine
+        # refuses a detach where there is no relay to hand the call back to, so
+        # a mock that answered ok here would hide siphon detaching a bridge it
+        # never attached — which on a real engine leaves a live call with no
+        # audio path at all.
+        with CALLS_LOCK:
+            call = CALLS.get(call_id)
+            if call is None:
+                return {"result": "error", "reason": f"unknown call-id {call_id!r}"}
+            if not call.get("ws_bridge"):
+                return {
+                    "result": "error",
+                    "reason": (
+                        "no takeover bridge on this call - nothing to hand the "
+                        "media path back to"
+                    ),
+                }
+            call["ws_bridge"] = None
+        return {"result": "ok"}
     # Unknown verbs are an explicit error, never a silent ok — a mock that
     # answers ok to everything hides exactly the bugs this exists to catch.
     return {"result": "error", "reason": f"mock: unsupported verb {verb!r}"}
@@ -205,6 +237,13 @@ class Handler(socketserver.BaseRequestHandler):
                     continue
                 print(json.dumps(command), flush=True)
                 response = handle_command(command)
+                # Refusals are echoed too. Without this a scenario can only
+                # assert on what siphon *sent*, never on whether the engine
+                # accepted it — and a command the real engine would reject
+                # looks identical to a working one from SIPp's side.
+                if response.get("result") == "error":
+                    print(json.dumps({"refused": command.get("command"), **response}),
+                          flush=True)
                 response["id"] = command.get("id", 0)
                 payload = json.dumps(response).encode()
                 try:

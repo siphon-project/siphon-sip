@@ -737,6 +737,8 @@ impl PyRtpEngine {
                     to_tag: None,
                     profile: profile_str,
                     ws_uri: resolved_ws_uri,
+                    ws_tee: flags.ws_tee.clone(),
+                    ws_bridge_attached: false,
                     created_at: std::time::Instant::now(),
                 });
             }
@@ -1067,6 +1069,8 @@ impl PyRtpEngine {
                         to_tag: None,
                         profile: profile_str,
                         ws_uri: resolved_ws_uri,
+                        ws_tee: flags.ws_tee.clone(),
+                        ws_bridge_attached: false,
                         created_at: std::time::Instant::now(),
                     });
                     Ok(Some(answer_sdp))
@@ -1782,6 +1786,7 @@ impl PyRtpEngine {
         }
 
         let client = Arc::clone(&self.client);
+        let sessions = Arc::clone(&self.sessions);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
             client
@@ -1792,6 +1797,9 @@ impl PyRtpEngine {
                         "rtpengine.attach_ws_tee failed: {error}"
                     ))
                 })?;
+            // Recorded only after the engine accepted, so a failed attach never
+            // leaves a bridge plan detaching a tee that was never there.
+            sessions.set_ws_tee(&call_id, Some(ws_uri.clone()));
             debug!(
                 call_id = %call_id,
                 from_tag = %from_tag,
@@ -1827,6 +1835,7 @@ impl PyRtpEngine {
     ) -> PyResult<Bound<'py, PyAny>> {
         let (call_id, from_tag) = resolve_call_from_tag(target)?;
         let client = Arc::clone(&self.client);
+        let sessions = Arc::clone(&self.sessions);
 
         pyo3_async_runtimes::tokio::future_into_py(python, async move {
             client
@@ -1837,10 +1846,116 @@ impl PyRtpEngine {
                         "rtpengine.detach_ws_tee failed: {error}"
                     ))
                 })?;
+            sessions.set_ws_tee(&call_id, None);
             debug!(
                 call_id = %call_id,
                 from_tag = %from_tag,
                 "rtpengine detach_ws_tee"
+            );
+            Ok(true)
+        })
+    }
+
+    /// Attach a **WebSocket takeover bridge** to a live call, or re-point an
+    /// existing one at a different server.
+    ///
+    /// The opposite of :meth:`attach_ws_tee` in what it does to the call.  A
+    /// tee is *additive* — the call keeps relaying and a copy is streamed out.
+    /// A bridge is a *takeover*: the WebSocket server becomes this leg's far
+    /// side and A↔B is unwired for as long as the bridge lives.
+    ///
+    /// Calling it on a call that already has a bridge **re-points** it rather
+    /// than failing, and the media path never drops in between — which is what
+    /// lets one party be moved from one media server to another without the
+    /// other party hearing a gap.
+    ///
+    /// Requires ``media.backend: siphon-rtp``.
+    ///
+    /// ```python,ignore
+    /// await rtpengine.attach_ws_bridge(call, "wss://ai.internal/session-1")
+    /// # ... later, hand the same caller to a different model session:
+    /// await rtpengine.attach_ws_bridge(call, "wss://ai.internal/session-2")
+    /// ```
+    ///
+    /// Args:
+    ///     target: Request, Reply or Call identifying the media session.
+    ///     ws_uri: ``ws://`` or ``wss://`` URI the engine dials as a client.
+    #[pyo3(signature = (target, ws_uri))]
+    fn attach_ws_bridge<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+        ws_uri: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let client = Arc::clone(&self.client);
+        let sessions = Arc::clone(&self.sessions);
+
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            client
+                .attach_ws_bridge(&call_id, &from_tag, &ws_uri)
+                .await
+                .map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "rtpengine.attach_ws_bridge failed: {error}"
+                    ))
+                })?;
+            // A re-point stays attached — the flag tracks "a detachable bridge
+            // is on this leg", not how many times it has been pointed.
+            sessions.set_ws_bridge_attached(&call_id, true);
+            debug!(
+                call_id = %call_id,
+                from_tag = %from_tag,
+                ws_uri = %ws_uri,
+                "rtpengine attach_ws_bridge"
+            );
+            Ok(true)
+        })
+    }
+
+    /// Detach a call's **WebSocket takeover bridge**, putting its media path
+    /// back the way it was.
+    ///
+    /// Not idempotent, unlike :meth:`detach_ws_tee`.  The engine refuses a
+    /// detach when there is no relay to return the call to — a bridge
+    /// negotiated through ``ws_uri`` on the media profile *is* the call's media
+    /// path, and a single-leg (``answer_local``) takeover has no second party
+    /// that could ever be relayed to.  Both raise rather than answering
+    /// success, because the alternative is a live call with no audio path at
+    /// all.  Re-point those with :meth:`attach_ws_bridge`, or end the call.
+    ///
+    /// Requires ``media.backend: siphon-rtp``.
+    ///
+    /// ```python,ignore
+    /// await rtpengine.detach_ws_bridge(call)   # back to relaying A<->B
+    /// ```
+    ///
+    /// Args:
+    ///     target: Request, Reply or Call identifying the media session.
+    #[pyo3(signature = (target))]
+    fn detach_ws_bridge<'py>(
+        &self,
+        python: Python<'py>,
+        target: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let (call_id, from_tag) = resolve_call_from_tag(target)?;
+        let client = Arc::clone(&self.client);
+        let sessions = Arc::clone(&self.sessions);
+
+        pyo3_async_runtimes::tokio::future_into_py(python, async move {
+            client
+                .detach_ws_bridge(&call_id, &from_tag)
+                .await
+                .map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "rtpengine.detach_ws_bridge failed: {error}"
+                    ))
+                })?;
+            sessions.set_ws_bridge_attached(&call_id, false);
+            debug!(
+                call_id = %call_id,
+                from_tag = %from_tag,
+                "rtpengine detach_ws_bridge"
             );
             Ok(true)
         })
@@ -2083,6 +2198,138 @@ def make_decorator(call_id, from_tag):
 
         // Support both `@on_ws_tee_started` (bare) and
         // `@on_ws_tee_started(call_id=...)` forms.
+        match func_or_none {
+            Some(func) => decorator.call1((func.bind(python),)),
+            None => Ok(decorator),
+        }
+    }
+
+    /// Register a handler for **WebSocket takeover bridge started** events.
+    ///
+    /// Fires once the engine has dialled the bridge's WebSocket server and the
+    /// leg's far side *is* that server — A↔B is unwired for the bridge's
+    /// lifetime.  ``stream_id`` is the correlator between this control event
+    /// and the media stream on the socket.
+    ///
+    /// A re-point (``attach_ws_bridge`` on a call that already had one) ends
+    /// the old bridge and starts a new one, so it delivers an ``ended`` with
+    /// reason ``detached`` followed by a fresh ``started`` carrying the new
+    /// ``stream_id``.
+    ///
+    /// Delivered by the native **siphon-rtp** backend only.
+    ///
+    /// ```python,ignore
+    /// @rtpengine.on_ws_bridge_started
+    /// def bridge_up(call_id, from_tag, stream_id, ws_uri, sample_rate):
+    ///     log.info(f"bridge {stream_id} @ {sample_rate}Hz -> {ws_uri}")
+    /// ```
+    ///
+    /// Args:
+    ///     func_or_none: When applied directly (``@rtpengine.on_ws_bridge_started``) this is
+    ///         the function.  When called with keyword filters the return value
+    ///         is a decorator.
+    ///     call_id: Optional engine call-id filter.
+    ///     from_tag: Optional from-tag filter.
+    #[pyo3(signature = (func_or_none=None, *, call_id=None, from_tag=None))]
+    fn on_ws_bridge_started<'py>(
+        &self,
+        python: Python<'py>,
+        func_or_none: Option<Py<PyAny>>,
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let code = r#"
+def make_decorator(call_id, from_tag):
+    import asyncio
+    import _siphon_registry
+    def decorator(fn):
+        is_async = asyncio.iscoroutinefunction(fn)
+        metadata = {"call_id": call_id, "from_tag": from_tag}
+        _siphon_registry.register("rtpengine.on_ws_bridge_started", None, fn, is_async, metadata)
+        return fn
+    return decorator
+"#;
+        let code = std::ffi::CString::new(code).map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to build on_ws_bridge_started decorator source: {error}"
+            ))
+        })?;
+        let globals = PyDict::new(python);
+        python.run(&code, Some(&globals), None)?;
+        let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("failed to build on_ws_bridge_started decorator")
+        })?;
+        let decorator = make_decorator.call1((call_id, from_tag))?;
+
+        // Support both `@on_ws_bridge_started` (bare) and
+        // `@on_ws_bridge_started(call_id=...)` forms.
+        match func_or_none {
+            Some(func) => decorator.call1((func.bind(python),)),
+            None => Ok(decorator),
+        }
+    }
+
+    /// Register a handler for **WebSocket takeover bridge ended** events.
+    ///
+    /// Fires exactly once per started bridge, including when the *server* ends
+    /// it.  ``reason`` is one of ``detached``, ``server_closed``,
+    /// ``server_stopped``, ``call_ended`` or ``transport_error``.
+    ///
+    /// Only ``detached`` is orderly.  Every other reason leaves a **live call
+    /// with no media far side** — both parties are up and hearing nothing — so
+    /// unlike the tee's equivalent this handler usually has to act: re-point
+    /// with ``attach_ws_bridge``, fall back with ``detach_ws_bridge``, or tear
+    /// the call down.  siphon logs an unexpected end at WARN even when no
+    /// handler is registered.
+    ///
+    /// Delivered by the native **siphon-rtp** backend only.
+    ///
+    /// ```python,ignore
+    /// @rtpengine.on_ws_bridge_ended
+    /// async def bridge_down(call_id, from_tag, stream_id, reason):
+    ///     if reason != "detached":
+    ///         log.warn(f"{call_id}: bridge died ({reason}), falling back to relay")
+    /// ```
+    ///
+    /// Args:
+    ///     func_or_none: When applied directly (``@rtpengine.on_ws_bridge_ended``) this is
+    ///         the function.  When called with keyword filters the return value
+    ///         is a decorator.
+    ///     call_id: Optional engine call-id filter.
+    ///     from_tag: Optional from-tag filter.
+    #[pyo3(signature = (func_or_none=None, *, call_id=None, from_tag=None))]
+    fn on_ws_bridge_ended<'py>(
+        &self,
+        python: Python<'py>,
+        func_or_none: Option<Py<PyAny>>,
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let code = r#"
+def make_decorator(call_id, from_tag):
+    import asyncio
+    import _siphon_registry
+    def decorator(fn):
+        is_async = asyncio.iscoroutinefunction(fn)
+        metadata = {"call_id": call_id, "from_tag": from_tag}
+        _siphon_registry.register("rtpengine.on_ws_bridge_ended", None, fn, is_async, metadata)
+        return fn
+    return decorator
+"#;
+        let code = std::ffi::CString::new(code).map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to build on_ws_bridge_ended decorator source: {error}"
+            ))
+        })?;
+        let globals = PyDict::new(python);
+        python.run(&code, Some(&globals), None)?;
+        let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("failed to build on_ws_bridge_ended decorator")
+        })?;
+        let decorator = make_decorator.call1((call_id, from_tag))?;
+
+        // Support both `@on_ws_bridge_ended` (bare) and
+        // `@on_ws_bridge_ended(call_id=...)` forms.
         match func_or_none {
             Some(func) => decorator.call1((func.bind(python),)),
             None => Ok(decorator),
@@ -2797,6 +3044,8 @@ mod tests {
             to_tag: None,
             profile: profile.to_string(),
             ws_uri: None,
+            ws_tee: None,
+            ws_bridge_attached: false,
             created_at: std::time::Instant::now(),
         }
     }

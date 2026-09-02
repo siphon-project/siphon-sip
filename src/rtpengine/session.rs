@@ -30,6 +30,25 @@ pub struct MediaSession {
     /// same bridge without the script re-passing `ws_uri=` — the same reason
     /// [`MediaSession::profile`] is recorded.
     pub ws_uri: Option<String>,
+    /// The WebSocket **tee** URI streaming a copy of this session's audio, when
+    /// one is attached.
+    ///
+    /// Deliberately separate from [`MediaSession::ws_uri`]: a tee is additive
+    /// (the call relays on and a copy goes out) while `ws_uri` is a takeover
+    /// (the server *is* the far side). Conflating them makes a leg with a
+    /// takeover look like a leg with a tee, which sends the wrong detach at
+    /// bridge time — the wrong verb succeeds harmlessly and the media path the
+    /// bridge was about to renegotiate is still owned by the WebSocket server.
+    pub ws_tee: Option<String>,
+    /// Whether a WebSocket **takeover bridge** was attached to this session
+    /// *mid-call* (`attach_ws_bridge`) rather than negotiated through the
+    /// profile's `ws_uri`.
+    ///
+    /// Only a mid-call attach can be detached — it took over a live relay, so
+    /// there is a relay to give back. A `ws_uri`-negotiated bridge is the
+    /// call's whole media path and the engine refuses to detach it, which is
+    /// why the two are tracked apart rather than as one "has a bridge" flag.
+    pub ws_bridge_attached: bool,
     /// When this session was created.
     pub created_at: Instant,
 }
@@ -82,6 +101,32 @@ impl MediaSessionStore {
         }
     }
 
+    /// Record the WebSocket **tee** attached to a session, or clear it on
+    /// detach.
+    ///
+    /// Kept apart from the takeover bridge below: a bridge plan has to send
+    /// `detach_ws_tee` for one and `detach_ws_bridge` for the other, and the
+    /// wrong verb succeeds harmlessly rather than failing loudly — so a
+    /// conflated flag leaves the media path still owned by the WebSocket
+    /// server while the plan believes it was handed back.
+    pub fn set_ws_tee(&self, call_id: &str, ws_tee: Option<String>) {
+        if let Some(mut entry) = self.sessions.get_mut(call_id) {
+            entry.ws_tee = ws_tee;
+        }
+    }
+
+    /// Record that a WebSocket **takeover bridge** was attached to a session
+    /// mid-call, or that it was detached.
+    ///
+    /// Only mid-call attaches are tracked here. A bridge negotiated through the
+    /// profile's `ws_uri` is not detachable, so flagging it would make a bridge
+    /// plan emit a detach the engine refuses.
+    pub fn set_ws_bridge_attached(&self, call_id: &str, attached: bool) {
+        if let Some(mut entry) = self.sessions.get_mut(call_id) {
+            entry.ws_bridge_attached = attached;
+        }
+    }
+
     /// Remove sessions older than `max_age`.
     pub fn sweep_stale(&self, max_age: std::time::Duration) {
         let cutoff = Instant::now() - max_age;
@@ -123,6 +168,8 @@ mod tests {
             to_tag: None,
             profile: "srtp_to_rtp".to_string(),
             ws_uri: None,
+            ws_tee: None,
+            ws_bridge_attached: false,
             created_at: Instant::now(),
         }
     }
@@ -247,5 +294,56 @@ mod tests {
         // Back-compat: an empty rtpengine_call_id falls back to the SIP Call-ID.
         session.rtpengine_call_id = String::new();
         assert_eq!(session.rtpengine_id(), "sip-cid");
+    }
+
+    /// The takeover URI and the tee URI are independent state. Conflating them
+    /// is what made a leg holding a `ws_uri` takeover look like a leg holding a
+    /// tee, so the bridge plan sent the tee detach — which succeeds, being
+    /// idempotent — and then renegotiated a path the WebSocket server owned.
+    #[test]
+    fn a_takeover_uri_and_a_tee_uri_are_tracked_apart() {
+        let store = MediaSessionStore::new();
+        store.insert(MediaSession {
+            ws_uri: Some("wss://ai.invalid/takeover".to_string()),
+            ..make_session("call-1")
+        });
+
+        // A leg with only a takeover has no tee.
+        let session = store.get("call-1").expect("session");
+        assert!(session.ws_uri.is_some());
+        assert!(session.ws_tee.is_none(), "a takeover is not a tee");
+        assert!(!session.ws_bridge_attached, "a profile takeover is not a mid-call attach");
+
+        // Attaching a tee leaves the takeover alone, and vice versa.
+        store.set_ws_tee("call-1", Some("wss://asr.invalid/tee".to_string()));
+        let session = store.get("call-1").expect("session");
+        assert_eq!(session.ws_tee.as_deref(), Some("wss://asr.invalid/tee"));
+        assert_eq!(session.ws_uri.as_deref(), Some("wss://ai.invalid/takeover"));
+
+        store.set_ws_tee("call-1", None);
+        assert!(store.get("call-1").expect("session").ws_tee.is_none());
+        assert!(
+            store.get("call-1").expect("session").ws_uri.is_some(),
+            "detaching a tee must not disturb the takeover"
+        );
+    }
+
+    /// Only a mid-call attach is detachable, so it is tracked separately from
+    /// the profile-negotiated `ws_uri`.
+    #[test]
+    fn a_mid_call_takeover_is_flagged_detachable_and_clears_on_detach() {
+        let store = MediaSessionStore::new();
+        store.insert(make_session("call-1"));
+        assert!(!store.get("call-1").expect("session").ws_bridge_attached);
+
+        store.set_ws_bridge_attached("call-1", true);
+        assert!(store.get("call-1").expect("session").ws_bridge_attached);
+
+        // A re-point stays attached; only a detach clears it.
+        store.set_ws_bridge_attached("call-1", true);
+        assert!(store.get("call-1").expect("session").ws_bridge_attached);
+
+        store.set_ws_bridge_attached("call-1", false);
+        assert!(!store.get("call-1").expect("session").ws_bridge_attached);
     }
 }

@@ -1157,6 +1157,61 @@ jobs:
             mock-siphon-rtp.log
 
   # ── Re-INVITE renegotiation on the siphon-rtp backend ──────────────────
+  sipp-ws-bridge:
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      - name: Start mock siphon-rtp + siphon
+        run: docker compose -f sipp/docker-compose.yaml --profile ws-bridge up -d --wait mock-siphon-rtp-ws-bridge siphon-ws-bridge
+
+      - name: Register bob
+        run: docker compose -f sipp/docker-compose.yaml --profile ws-bridge run --rm sipp-ws-bridge-register
+
+      - name: Call, attach, re-point, detach, hang up
+        run: docker compose -f sipp/docker-compose.yaml --profile ws-bridge up --abort-on-container-exit --exit-code-from sipp-ws-bridge-uac sipp-ws-bridge-uac sipp-ws-bridge-uas
+
+      - name: Assert the re-point never dropped the media path
+        # SIPp cannot tell the two apart — the call answers and hangs up the
+        # same either way. The difference is on the control channel: moving a
+        # party between media servers must be a second `attach_ws_bridge`, and
+        # a `detach_ws_bridge` appearing *between* the two attaches means the
+        # media path went back to the relay for as long as the next attach took
+        # to land, which the other party hears as a gap.
+        run: |
+          verbs="$(docker compose -f sipp/docker-compose.yaml --profile ws-bridge logs --no-log-prefix mock-siphon-rtp-ws-bridge \
+            | grep -oE '"command": ?"[a-z_]+"' | sed -E 's/"command": ?"//; s/"//' | grep -E '^(attach_ws_bridge|detach_ws_bridge)$' || true)"
+          echo "bridge verbs seen:"
+          printf '%s\n' "$verbs"
+          expected="$(printf 'attach_ws_bridge\nattach_ws_bridge\ndetach_ws_bridge')"
+          test "$verbs" = "$expected" || {
+            echo "::error::expected attach,attach,detach — got: $(printf '%s' "$verbs" | tr '\n' ',')"
+            exit 1
+          }
+
+      - name: Assert the engine never refused a bridge verb
+        # The mock refuses a detach on a call with no bridge, and refuses any
+        # verb it does not model. Either would mean siphon sent something the
+        # real engine would have rejected, on a call that looked fine to SIPp.
+        run: |
+          if docker compose -f sipp/docker-compose.yaml --profile ws-bridge logs --no-log-prefix mock-siphon-rtp-ws-bridge | grep -q '"refused"'; then
+            echo "::error::the mock engine refused a command siphon sent"
+            docker compose -f sipp/docker-compose.yaml --profile ws-bridge logs --no-log-prefix mock-siphon-rtp-ws-bridge | grep '"refused"'
+            exit 1
+          fi
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose -f sipp/docker-compose.yaml --profile ws-bridge logs --no-color
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile ws-bridge down -v
+
   sipp-reoffer:
     runs-on: ubuntu-latest
     needs: build-image

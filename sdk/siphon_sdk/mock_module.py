@@ -2515,6 +2515,8 @@ class MockRtpEngine:
         self._media_timeout_handlers: list[dict[str, Any]] = []
         self._ws_tee_started_handlers: list[dict[str, Any]] = []
         self._ws_tee_ended_handlers: list[dict[str, Any]] = []
+        self._ws_bridge_started_handlers: list[dict[str, Any]] = []
+        self._ws_bridge_ended_handlers: list[dict[str, Any]] = []
         self._text_handlers: list[dict[str, Any]] = []
         self._beep_handlers: list[dict[str, Any]] = []
         self._play_overlay_id: Optional[int] = 1
@@ -3328,6 +3330,78 @@ class MockRtpEngine:
         })
         return True
 
+    async def attach_ws_bridge(self, target: Any, ws_uri: str) -> bool:
+        """Attach a **WebSocket takeover bridge** to a live call, or re-point an
+        existing one at a different server.
+
+        The opposite of :meth:`attach_ws_tee` in what it does to the call. A tee
+        is *additive* — the call keeps relaying and a copy is streamed out. A
+        bridge is a *takeover*: the WebSocket server becomes this leg's far side
+        and A<->B is unwired for as long as the bridge lives.
+
+        Calling it on a call that already has a bridge **re-points** it rather
+        than failing, and the media path never drops in between — which is what
+        lets one party be moved from one media server to another without the
+        other party hearing a gap.
+
+        Requires ``media.backend: siphon-rtp``.
+
+        Args:
+            target: Request, Reply, or Call object.
+            ws_uri: ``ws://`` or ``wss://`` URI the engine dials as a client.
+
+        Returns:
+            ``True`` on success.
+
+        Example::
+
+            await rtpengine.attach_ws_bridge(call, "wss://ai.internal/session-1")
+            # ... later, hand the same caller to a different model session:
+            await rtpengine.attach_ws_bridge(call, "wss://ai.internal/session-2")
+        """
+        call_id, from_tag = _resolve_media_target(target)
+        self.operations.append(("attach_ws_bridge", ws_uri))
+        self.media_calls.append({
+            "op": "attach_ws_bridge",
+            "call_id": call_id,
+            "from_tag": from_tag,
+            "ws_uri": ws_uri,
+        })
+        return True
+
+    async def detach_ws_bridge(self, target: Any) -> bool:
+        """Detach a call's **WebSocket takeover bridge**, putting its media path
+        back the way it was.
+
+        Not idempotent, unlike :meth:`detach_ws_tee`. The engine refuses a
+        detach when there is no relay to return the call to — a bridge
+        negotiated through ``ws_uri`` on the media profile *is* the call's media
+        path, and a single-leg (``answer_local``) takeover has no second party
+        that could ever be relayed to. Both raise rather than answering success,
+        because the alternative is a live call with no audio path at all.
+        Re-point those with :meth:`attach_ws_bridge`, or end the call.
+
+        Requires ``media.backend: siphon-rtp``.
+
+        Args:
+            target: Request, Reply, or Call object.
+
+        Returns:
+            ``True`` on success.
+
+        Example::
+
+            await rtpengine.detach_ws_bridge(call)   # back to relaying A<->B
+        """
+        call_id, from_tag = _resolve_media_target(target)
+        self.operations.append(("detach_ws_bridge", None))
+        self.media_calls.append({
+            "op": "detach_ws_bridge",
+            "call_id": call_id,
+            "from_tag": from_tag,
+        })
+        return True
+
     def on_dtmf(self, func_or_none: Any = None, *,
                 call_id: Optional[str] = None,
                 from_tag: Optional[str] = None) -> Any:
@@ -3637,6 +3711,105 @@ class MockRtpEngine:
             fired += 1
         return fired
 
+    def on_ws_bridge_started(self, func_or_none: Any = None, *,
+                             call_id: Optional[str] = None,
+                             from_tag: Optional[str] = None) -> Any:
+        """Register a handler for **WebSocket takeover bridge started** events.
+
+        Fires once the engine has dialled the bridge's WebSocket server and the
+        leg's far side *is* that server — A<->B is unwired for the bridge's
+        lifetime. ``stream_id`` is the correlator between this control event and
+        the media stream on the socket.
+
+        A re-point (``attach_ws_bridge`` on a call that already had one) ends
+        the old bridge and starts a new one, so it delivers an ``ended`` with
+        reason ``detached`` followed by a fresh ``started`` carrying the new
+        ``stream_id``.
+
+        Delivered by the native **siphon-rtp** backend only.
+
+        Usage::
+
+            @rtpengine.on_ws_bridge_started
+            def bridge_up(call_id, from_tag, stream_id, ws_uri, sample_rate):
+                log.info(f"bridge {stream_id} @ {sample_rate}Hz -> {ws_uri}")
+        """
+        def decorator(fn: Any) -> Any:
+            self._ws_bridge_started_handlers.append({
+                "fn": fn,
+                "call_id": call_id,
+                "from_tag": from_tag,
+            })
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def fire_ws_bridge_started(self, call_id: str, from_tag: str,
+                               stream_id: str, ws_uri: str,
+                               sample_rate: int = 8000) -> int:
+        """Test helper: fire a ws-bridge-started event.  Returns the number of
+        handlers that matched (and were invoked)."""
+        fired = 0
+        for entry in self._ws_bridge_started_handlers:
+            if entry["call_id"] is not None and entry["call_id"] != call_id:
+                continue
+            if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
+                continue
+            entry["fn"](call_id, from_tag, stream_id, ws_uri, sample_rate)
+            fired += 1
+        return fired
+
+    def on_ws_bridge_ended(self, func_or_none: Any = None, *,
+                           call_id: Optional[str] = None,
+                           from_tag: Optional[str] = None) -> Any:
+        """Register a handler for **WebSocket takeover bridge ended** events.
+
+        Fires exactly once per started bridge, including when the *server* ends
+        it. ``reason`` is one of ``detached``, ``server_closed``,
+        ``server_stopped``, ``call_ended`` or ``transport_error``.
+
+        Only ``detached`` is orderly. Every other reason leaves a **live call
+        with no media far side** — both parties are up and hearing nothing — so
+        unlike the tee's equivalent this handler usually has to act: re-point
+        with ``attach_ws_bridge``, fall back with ``detach_ws_bridge``, or tear
+        the call down. siphon logs an unexpected end at WARN even when no
+        handler is registered.
+
+        Delivered by the native **siphon-rtp** backend only.
+
+        Usage::
+
+            @rtpengine.on_ws_bridge_ended
+            async def bridge_down(call_id, from_tag, stream_id, reason):
+                if reason != "detached":
+                    log.warn(f"{call_id}: bridge died ({reason})")
+        """
+        def decorator(fn: Any) -> Any:
+            self._ws_bridge_ended_handlers.append({
+                "fn": fn,
+                "call_id": call_id,
+                "from_tag": from_tag,
+            })
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def fire_ws_bridge_ended(self, call_id: str, from_tag: str, stream_id: str,
+                             reason: str = "detached") -> int:
+        """Test helper: fire a ws-bridge-ended event.  Returns the number of
+        handlers that matched (and were invoked)."""
+        fired = 0
+        for entry in self._ws_bridge_ended_handlers:
+            if entry["call_id"] is not None and entry["call_id"] != call_id:
+                continue
+            if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
+                continue
+            entry["fn"](call_id, from_tag, stream_id, reason)
+            fired += 1
+        return fired
+
     def set_subscribe_request_sdp(self, sdp: bytes) -> None:
         """Configure the SDP returned by :meth:`subscribe_request` (test helper)."""
         self._subscribe_request_sdp = sdp
@@ -3678,6 +3851,8 @@ class MockRtpEngine:
         self._media_timeout_handlers.clear()
         self._ws_tee_started_handlers.clear()
         self._ws_tee_ended_handlers.clear()
+        self._ws_bridge_started_handlers.clear()
+        self._ws_bridge_ended_handlers.clear()
         self._text_handlers.clear()
         self._beep_handlers.clear()
         self._answer_local_no_codec = False
