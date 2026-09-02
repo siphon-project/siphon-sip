@@ -116,6 +116,14 @@ impl ControlAdapter for SipControlAdapter {
                 // WsBridgeStarted, and a re-point is an ended+started pair.
                 "WsBridgeStarted".to_string(),
                 "WsBridgeEnded".to_string(),
+                // The tee's lifecycle, on the same rail and for the same
+                // reason. A dead tee is less severe than a dead bridge — the
+                // call keeps relaying and only the consumer loses its copy —
+                // but a controller that started the stream over this rail still
+                // cannot otherwise tell that it stopped, and silently losing
+                // the audio is exactly what these exist to prevent.
+                "WsTeeStarted".to_string(),
+                "WsTeeEnded".to_string(),
             ],
         }
     }
@@ -2494,6 +2502,24 @@ mod tests {
         let schema = SipControlAdapter::new().describe();
         let events: Vec<&str> = schema.events.iter().map(String::as_str).collect();
         for expected in ["ChannelBridged", "BridgeFailed", "ChannelUnbridged"] {
+            assert!(events.contains(&expected), "missing event {expected}");
+        }
+    }
+
+    /// Every WebSocket stream a controller can start over this rail must have
+    /// its lifecycle on the same rail. `stream_start` shipped before the events
+    /// did, which left a controller able to start a tee and unable to learn it
+    /// had stopped — the stream just went quiet.
+    #[test]
+    fn describe_lists_a_lifecycle_for_every_stream_mode() {
+        let schema = SipControlAdapter::new().describe();
+        let events: Vec<&str> = schema.events.iter().map(String::as_str).collect();
+        for expected in [
+            "WsTeeStarted",
+            "WsTeeEnded",
+            "WsBridgeStarted",
+            "WsBridgeEnded",
+        ] {
             assert!(events.contains(&expected), "missing event {expected}");
         }
     }

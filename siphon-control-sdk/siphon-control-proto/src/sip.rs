@@ -169,6 +169,23 @@ pub enum SipEvent {
     /// A bridge was broken ([`ChannelUnbridgedPayload`]). Both legs stay
     /// answered, owned and held — neither was hung up. Pushed on both channels.
     ChannelUnbridged,
+    /// A WebSocket audio **tee** started streaming a copy of this channel's
+    /// audio ([`WsTeeStartedPayload`]). The call relays on regardless — a tee
+    /// is additive.
+    WsTeeStarted,
+    /// A WebSocket audio tee stopped ([`WsTeeEndedPayload`]). Exactly one per
+    /// `WsTeeStarted`, including when the *server* ends it, so a consumer
+    /// learns the stream died rather than silently losing the audio.
+    WsTeeEnded,
+    /// A WebSocket **takeover bridge** started on this channel
+    /// ([`WsBridgeStartedPayload`]). Unlike a tee this *replaced* the call's
+    /// audio path: the WebSocket server is now the leg's far side.
+    WsBridgeStarted,
+    /// A WebSocket takeover bridge ended ([`WsBridgeEndedPayload`]). Exactly
+    /// one per `WsBridgeStarted`; a re-point arrives as an ended (reason
+    /// `detached`) followed by a fresh started. Any reason other than
+    /// `detached` leaves a live call with no media far side.
+    WsBridgeEnded,
     /// Any other event name (forward-compatible catch-all).
     Other(String),
 }
@@ -190,6 +207,10 @@ impl SipEvent {
             SipEvent::ChannelBridged => "ChannelBridged",
             SipEvent::BridgeFailed => "BridgeFailed",
             SipEvent::ChannelUnbridged => "ChannelUnbridged",
+            SipEvent::WsTeeStarted => "WsTeeStarted",
+            SipEvent::WsTeeEnded => "WsTeeEnded",
+            SipEvent::WsBridgeStarted => "WsBridgeStarted",
+            SipEvent::WsBridgeEnded => "WsBridgeEnded",
             SipEvent::Other(name) => name.as_str(),
         }
     }
@@ -211,6 +232,10 @@ impl From<&str> for SipEvent {
             "ChannelBridged" => SipEvent::ChannelBridged,
             "BridgeFailed" => SipEvent::BridgeFailed,
             "ChannelUnbridged" => SipEvent::ChannelUnbridged,
+            "WsTeeStarted" => SipEvent::WsTeeStarted,
+            "WsTeeEnded" => SipEvent::WsTeeEnded,
+            "WsBridgeStarted" => SipEvent::WsBridgeStarted,
+            "WsBridgeEnded" => SipEvent::WsBridgeEnded,
             other => SipEvent::Other(other.to_string()),
         }
     }
@@ -651,6 +676,95 @@ pub struct ChannelUnbridgedPayload {
     pub reason: String,
 }
 
+/// Payload of [`SipEvent::WsTeeStarted`] — the negotiated wire shape, so a
+/// consumer can decode the binary frames without guessing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WsTeeStartedPayload {
+    /// The teed leg's from-tag.
+    #[serde(default)]
+    pub from_tag: String,
+    /// Correlator between this event and the `start` frame on the socket.
+    #[serde(default)]
+    pub stream_id: String,
+    /// The URI the engine dialled.
+    #[serde(default)]
+    pub ws_uri: String,
+    /// `both`, `caller` or `callee`.
+    #[serde(default)]
+    pub direction: String,
+    /// 1 = mono/mixed, 2 = caller/callee interleaved.
+    #[serde(default)]
+    pub channels: u8,
+    /// Wire sample rate in Hz (L16, little-endian).
+    #[serde(default)]
+    pub sample_rate: u32,
+}
+
+/// Payload of [`SipEvent::WsTeeEnded`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WsTeeEndedPayload {
+    #[serde(default)]
+    pub from_tag: String,
+    /// The stream id from the matching `WsTeeStarted`.
+    #[serde(default)]
+    pub stream_id: String,
+    /// `detached`, `server_closed`, `server_stopped`, `call_ended` or
+    /// `transport_error`.
+    #[serde(default)]
+    pub reason: String,
+    /// Whether the tee ended for a reason the app did not ask for. `detached`
+    /// is the only orderly end; anything else means audio stopped reaching the
+    /// consumer while the call was still up.
+    #[serde(default)]
+    pub unexpected: bool,
+    /// Wire frames handed to the transport over the tee's lifetime.
+    #[serde(default)]
+    pub frames_sent: Option<u64>,
+    /// Frames dropped because the consumer stalled. Non-zero means the
+    /// consumer could not keep up; the call itself was never affected.
+    #[serde(default)]
+    pub frames_dropped: Option<u64>,
+}
+
+/// Payload of [`SipEvent::WsBridgeStarted`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WsBridgeStartedPayload {
+    /// The bridged leg's from-tag.
+    #[serde(default)]
+    pub from_tag: String,
+    /// Correlator between this event and the `start` frame on the socket.
+    #[serde(default)]
+    pub stream_id: String,
+    /// The URI the engine dialled.
+    #[serde(default)]
+    pub ws_uri: String,
+    /// Wire sample rate in Hz (L16, little-endian).
+    #[serde(default)]
+    pub sample_rate: u32,
+}
+
+/// Payload of [`SipEvent::WsBridgeEnded`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WsBridgeEndedPayload {
+    #[serde(default)]
+    pub from_tag: String,
+    /// The stream id from the matching `WsBridgeStarted`.
+    #[serde(default)]
+    pub stream_id: String,
+    /// `detached`, `server_closed`, `server_stopped`, `call_ended` or
+    /// `transport_error`.
+    #[serde(default)]
+    pub reason: String,
+    /// Whether the bridge ended for a reason the app did not ask for.
+    ///
+    /// Weightier than the tee's flag of the same name: a bridge *is* the call's
+    /// media path, so anything but `detached` leaves both parties up and
+    /// hearing nothing. An app that branches on nothing else should branch on
+    /// this.
+    #[serde(default)]
+    pub unexpected: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -951,5 +1065,55 @@ mod tests {
         .unwrap();
         assert_eq!(unbridged.peer_call_id, "call-b");
         assert_eq!(unbridged.reason, "supervisor took over");
+    }
+
+    /// Every stream event name must survive the wire round trip as a typed
+    /// variant rather than falling into `Other`. The bridge pair shipped with
+    /// the verbs but was never added here, so an app matching on
+    /// `SipEvent::WsBridgeEnded` silently never fired.
+    #[test]
+    fn stream_lifecycle_events_round_trip_as_typed_variants() {
+        for (wire, expected) in [
+            ("WsTeeStarted", SipEvent::WsTeeStarted),
+            ("WsTeeEnded", SipEvent::WsTeeEnded),
+            ("WsBridgeStarted", SipEvent::WsBridgeStarted),
+            ("WsBridgeEnded", SipEvent::WsBridgeEnded),
+        ] {
+            let parsed = SipEvent::from(wire);
+            assert_eq!(parsed, expected, "{wire} must parse to its own variant");
+            assert_eq!(parsed.as_str(), wire, "{wire} must serialise back unchanged");
+            assert!(
+                !matches!(parsed, SipEvent::Other(_)),
+                "{wire} fell through to Other"
+            );
+        }
+    }
+
+    /// The end payloads carry `unexpected` because `detached` is the only
+    /// orderly end of either stream — an app that branches on nothing else
+    /// still has to be able to see that one.
+    #[test]
+    fn stream_end_payloads_carry_the_unexpected_flag() {
+        let tee: WsTeeEndedPayload = serde_json::from_value(serde_json::json!({
+            "from_tag": "tag-a",
+            "stream_id": "s-1",
+            "reason": "server_closed",
+            "unexpected": true,
+            "frames_sent": 1200,
+            "frames_dropped": 3
+        }))
+        .expect("tee end payload");
+        assert!(tee.unexpected);
+        assert_eq!(tee.frames_dropped, Some(3));
+
+        let bridge: WsBridgeEndedPayload = serde_json::from_value(serde_json::json!({
+            "from_tag": "tag-a",
+            "stream_id": "s-2",
+            "reason": "detached",
+            "unexpected": false
+        }))
+        .expect("bridge end payload");
+        assert!(!bridge.unexpected);
+        assert_eq!(bridge.reason, "detached");
     }
 }
