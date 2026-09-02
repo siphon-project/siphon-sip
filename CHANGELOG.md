@@ -6,6 +6,10 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+## [1.8.0] — 2026-09-02
+
+_Codename: kees._
+
 ### Security
 - **Refused bare CR/LF in a SIP header block, and closed five framer/parser
   disagreements it was hiding.** siphon's header-value scan runs to the next
