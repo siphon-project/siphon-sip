@@ -85,6 +85,25 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   a peer that meant the second.
 
 ### Added
+- **A playback now reports that it ended.** `PlayStarted` said a prompt began
+  and nothing said it finished: the engine's `PlayFinished` was consumed inside
+  siphon to resolve a blocking `play_media(wait=True)` and dropped otherwise, so
+  a fire-and-forget play — which is every `play` issued over the control plane —
+  had no completion signal at all. An app whose next step is "when the prompt
+  ends" had to guess from the accept's estimated duration, which a stop, a
+  supersede or a decode error all make wrong.
+
+  `PlayFinished` now publishes on the control rail and as
+  `@rtpengine.on_play_finished`, carrying the `play_id` that correlates with the
+  accept and with `PlayStarted`, the end reason (`completed`, `stopped`,
+  `superseded`, `error`), a `completed` flag — only that one reason means the
+  prompt was actually heard in full — and the played duration. A blocking
+  `play_media` still returns its outcome *and* the event still reaches the
+  stream: the two are different consumers, and a signal that appeared only when
+  nobody happened to be awaiting is one an app cannot rely on. Typed in the
+  SDKs (`SipEvent::PlayFinished`, `PlayFinishedPayload`, a `play_finished()`
+  accessor, and the TypeScript interface) rather than arriving as the
+  forward-compatible `Other` catch-all.
 - **The WebSocket stream lifecycle now reaches the control plane, for the tee as
   well as the bridge.** `stream_start` shipped before any lifecycle events did,
   so an app could start a tee over the control rail and had no way to learn it

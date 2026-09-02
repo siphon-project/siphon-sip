@@ -90,6 +90,7 @@ export type {
   ChannelBridgedPayload,
   BridgeFailedPayload,
   ChannelUnbridgedPayload,
+  PlayFinishedPayload,
   WsTeeStartedPayload,
   WsTeeEndedPayload,
   WsBridgeStartedPayload,
