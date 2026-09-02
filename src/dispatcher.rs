@@ -1408,6 +1408,80 @@ pub async fn run(
                         })
                         .await;
                     }
+                    crate::rtpengine::events::RtpEngineEvent::PlayFinished(play) => {
+                        tracing::debug!(
+                            call_id = %play.call_id,
+                            from_tag = %play.from_tag,
+                            play_id = play.play_id,
+                            reason = %play.reason.as_str(),
+                            played_ms = ?play.played_ms,
+                            "media engine finished a playback"
+                        );
+                        crate::control::notify_channel_event(
+                            &play.call_id,
+                            "PlayFinished",
+                            serde_json::json!({
+                                "from_tag": play.from_tag,
+                                "to_tag": play.to_tag,
+                                // Correlates with the play_id the accept and the
+                                // PlayStarted event both carry.
+                                "play_id": play.play_id,
+                                "reason": play.reason.as_str(),
+                                // Only `completed` means the prompt was heard in
+                                // full — a stop, a supersede and an error all end
+                                // a playback without that being true, and an app
+                                // queueing its next step needs the difference.
+                                "completed": play.reason.is_completed(),
+                                "played_ms": play.played_ms,
+                            }),
+                        );
+                        let engine_state = state_for_events.engine.state();
+                        let handlers =
+                            engine_state.play_finished_handlers(&play.call_id, &play.from_tag);
+                        if handlers.is_empty() {
+                            continue;
+                        }
+                        let state_ref = Arc::clone(&state_for_events);
+                        let play_clone = play.clone();
+                        let _ = crate::script::py_executor::try_run(move || {
+                            let engine_state = state_ref.engine.state();
+                            let handlers = engine_state.play_finished_handlers(
+                                &play_clone.call_id,
+                                &play_clone.from_tag,
+                            );
+                            pyo3::Python::attach(|python| {
+                                for handler in handlers {
+                                    let callable = handler.callable.bind(python);
+                                    let result = callable.call1((
+                                        play_clone.call_id.as_str(),
+                                        play_clone.from_tag.as_str(),
+                                        play_clone.play_id,
+                                        play_clone.reason.as_str(),
+                                        play_clone.played_ms,
+                                    ));
+                                    match result {
+                                        Ok(ret) => {
+                                            if handler.is_async {
+                                                if let Err(error) = run_coroutine(python, &ret) {
+                                                    tracing::error!(
+                                                        %error,
+                                                        "async rtpengine.on_play_finished handler error"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            tracing::error!(
+                                                %error,
+                                                "rtpengine.on_play_finished handler failed"
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        })
+                        .await;
+                    }
                     crate::rtpengine::events::RtpEngineEvent::WsBridgeStarted(bridge) => {
                         tracing::debug!(
                             call_id = %bridge.call_id,

@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tracing::{debug, warn};
 
 use siphon_control_proto::sip::{
-    BridgeFailedPayload, ChannelBridgedPayload, ChannelDtmfPayload, ChannelUnbridgedPayload, PlayStartedPayload, SipEvent, SipVerb, TransferOutcomePayload, TransferRequestedPayload,
+    BridgeFailedPayload, ChannelBridgedPayload, ChannelDtmfPayload, ChannelUnbridgedPayload, PlayFinishedPayload, PlayStartedPayload, SipEvent, SipVerb, TransferOutcomePayload, TransferRequestedPayload,
     WsBridgeEndedPayload, WsBridgeStartedPayload, WsTeeEndedPayload, WsTeeStartedPayload,
 };
 // The `bridge` verb's teardown policy is an argument of this facade, so it is
@@ -351,6 +351,19 @@ impl CallEvent {
             self.kind,
             SipEvent::ChannelBridged | SipEvent::BridgeFailed
         )
+    }
+
+    /// The typed [`PlayFinishedPayload`] when this is a
+    /// [`SipEvent::PlayFinished`] event, else `None`.
+    ///
+    /// This — not the accept's estimated duration — is when the prompt is over.
+    /// Check `completed`: a stop, a supersede or an error ends the playback
+    /// without it having been heard in full.
+    pub fn play_finished(&self) -> Option<PlayFinishedPayload> {
+        if self.kind != SipEvent::PlayFinished {
+            return None;
+        }
+        serde_json::from_value(self.payload.clone()).ok()
     }
 
     /// The typed [`WsTeeStartedPayload`] when this is a

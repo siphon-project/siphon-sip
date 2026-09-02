@@ -2204,6 +2204,73 @@ def make_decorator(call_id, from_tag):
         }
     }
 
+    /// Register a handler for **playback finished** events.
+    ///
+    /// Fires when a playback the engine accepted ends — for **every** play,
+    /// including a fire-and-forget one. A blocking ``play_media(wait=True)``
+    /// already learns the outcome as its return value; this is for everything
+    /// else, and it is what an announcement-then-act flow hangs on instead of a
+    /// timer that a stop or a decode error would make wrong.
+    ///
+    /// ``reason`` is one of ``completed``, ``stopped``, ``superseded`` or
+    /// ``error``. Only ``completed`` means the prompt was heard in full.
+    /// ``play_id`` correlates with the accept and with the ``PlayStarted``
+    /// event.
+    ///
+    /// Delivered by the native **siphon-rtp** backend only.
+    ///
+    /// ```python,ignore
+    /// @rtpengine.on_play_finished
+    /// async def prompt_done(call_id, from_tag, play_id, reason, played_ms):
+    ///     if reason == "completed":
+    ///         await rtpengine.play_dtmf(call_id, "1")
+    /// ```
+    ///
+    /// Args:
+    ///     func_or_none: When applied directly (``@rtpengine.on_play_finished``)
+    ///         this is the function.  When called with keyword filters the
+    ///         return value is a decorator.
+    ///     call_id: Optional engine call-id filter.
+    ///     from_tag: Optional from-tag filter.
+    #[pyo3(signature = (func_or_none=None, *, call_id=None, from_tag=None))]
+    fn on_play_finished<'py>(
+        &self,
+        python: Python<'py>,
+        func_or_none: Option<Py<PyAny>>,
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let code = r#"
+def make_decorator(call_id, from_tag):
+    import asyncio
+    import _siphon_registry
+    def decorator(fn):
+        is_async = asyncio.iscoroutinefunction(fn)
+        metadata = {"call_id": call_id, "from_tag": from_tag}
+        _siphon_registry.register("rtpengine.on_play_finished", None, fn, is_async, metadata)
+        return fn
+    return decorator
+"#;
+        let code = std::ffi::CString::new(code).map_err(|error| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "failed to build on_play_finished decorator source: {error}"
+            ))
+        })?;
+        let globals = PyDict::new(python);
+        python.run(&code, Some(&globals), None)?;
+        let make_decorator = globals.get_item("make_decorator")?.ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("failed to build on_play_finished decorator")
+        })?;
+        let decorator = make_decorator.call1((call_id, from_tag))?;
+
+        // Support both `@on_play_finished` (bare) and
+        // `@on_play_finished(call_id=...)` forms.
+        match func_or_none {
+            Some(func) => decorator.call1((func.bind(python),)),
+            None => Ok(decorator),
+        }
+    }
+
     /// Register a handler for **WebSocket takeover bridge started** events.
     ///
     /// Fires once the engine has dialled the bridge's WebSocket server and the

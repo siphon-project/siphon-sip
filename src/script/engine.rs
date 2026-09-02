@@ -154,6 +154,16 @@ pub enum HandlerKind {
         call_id: Option<String>,
         from_tag: Option<String>,
     },
+    /// `@rtpengine.on_play_finished` — a playback ended. Fires for every play
+    /// the engine accepted, including a fire-and-forget one, so a script that
+    /// acts when a prompt ends has something to hang that on rather than a
+    /// timer.
+    ///
+    /// ``call_id`` and ``from_tag`` are optional filters.
+    RtpEngineOnPlayFinished {
+        call_id: Option<String>,
+        from_tag: Option<String>,
+    },
     /// `@rtpengine.on_ws_bridge_started` — a WebSocket **takeover** bridge began
     /// on a live call. Unlike a tee this replaced the call's audio path rather
     /// than copying it, so the far side is now the WebSocket server.
@@ -344,6 +354,22 @@ impl ScriptState {
             .iter()
             .filter(|h| match &h.kind {
                 HandlerKind::RtpEngineOnWsTeeEnded { call_id: filter_cid, from_tag: filter_ftag } => {
+                    filter_cid.as_deref().map_or(true, |v| v == call_id)
+                        && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// Return all `RtpEngineOnPlayFinished` handlers whose optional
+    /// call-id/from-tag filters match the event.  `None` filters match
+    /// everything.
+    pub fn play_finished_handlers(&self, call_id: &str, from_tag: &str) -> Vec<&HandlerEntry> {
+        self.handlers
+            .iter()
+            .filter(|h| match &h.kind {
+                HandlerKind::RtpEngineOnPlayFinished { call_id: filter_cid, from_tag: filter_ftag } => {
                     filter_cid.as_deref().map_or(true, |v| v == call_id)
                         && filter_ftag.as_deref().map_or(true, |v| v == from_tag)
                 }
@@ -1300,6 +1326,17 @@ fn extract_handlers(
                     .and_then(|meta| meta.get_item("from_tag").ok())
                     .and_then(|v| v.extract().ok());
                 HandlerKind::RtpEngineOnWsTeeEnded { call_id, from_tag }
+            }
+            "rtpengine.on_play_finished" => {
+                let call_id: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("call_id").ok())
+                    .and_then(|v| v.extract().ok());
+                let from_tag: Option<String> = metadata
+                    .as_ref()
+                    .and_then(|meta| meta.get_item("from_tag").ok())
+                    .and_then(|v| v.extract().ok());
+                HandlerKind::RtpEngineOnPlayFinished { call_id, from_tag }
             }
             "rtpengine.on_ws_bridge_started" => {
                 let call_id: Option<String> = metadata

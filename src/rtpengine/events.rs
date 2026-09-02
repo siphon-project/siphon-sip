@@ -58,6 +58,10 @@ pub enum RtpEngineEvent {
     /// Emitted exactly once per started tee, so a script learns the stream died
     /// rather than silently losing audio.  `siphon-rtp` native backend only.
     WsTeeEnded(WsTeeEnded),
+    /// A playback the engine accepted has ended, for any reason. Emitted for
+    /// every play including a fire-and-forget one, so an app that acts when a
+    /// prompt ends has something to wait on. `siphon-rtp` native backend only.
+    PlayFinished(PlayFinishedEvent),
     /// A WebSocket **takeover** bridge started on a live call — the engine
     /// dialled the server and the leg's far side is now the WebSocket rather
     /// than the other party.  Unlike [`Self::WsTeeStarted`] this *replaces* the
@@ -325,6 +329,69 @@ impl WsTeeEndReason {
     /// silent-failure case a handler exists to catch.
     pub fn is_unexpected(self) -> bool {
         !matches!(self, Self::Detached)
+    }
+}
+
+/// A playback finished, carried by [`RtpEngineEvent::PlayFinished`].
+///
+/// Emitted for **every** play the engine accepted, including a fire-and-forget
+/// one. That is the point of it: a blocking `play_media` learns the outcome as
+/// its return value, but a `play` issued over the control rail — or with
+/// `wait=False` — otherwise has no completion signal at all, and an app whose
+/// next step is "when the prompt ends" has nothing to wait on.
+#[derive(Debug, Clone)]
+pub struct PlayFinishedEvent {
+    /// SIP Call-ID the media session is keyed on.
+    pub call_id: String,
+    /// The leg the prompt was playing toward.
+    pub from_tag: String,
+    /// Optional peer tag, for a playback scoped to one peer of a bridge.
+    pub to_tag: Option<String>,
+    /// The `play_id` from the matching accept — the correlator, and what a
+    /// targeted stop or gain change addresses.
+    pub play_id: u64,
+    /// Why it ended.
+    pub reason: PlayEndReason,
+    /// Actual played duration in milliseconds, when the engine tracked it.
+    pub played_ms: Option<u64>,
+}
+
+/// Why a playback ended.  A siphon-side mirror of the native backend's
+/// `siphon_rtp_proto::PlayEndReason`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayEndReason {
+    /// The prompt drained naturally — all repeats done, or the `duration_ms`
+    /// cap was hit.
+    Completed,
+    /// Ended by an explicit stop.
+    Stopped,
+    /// A newer play replaced this one on the same leg.
+    Superseded,
+    /// Aborted — a decode or source error, or the leg was torn down mid-play.
+    Error,
+    /// A reason this build of siphon does not know — a newer engine.
+    Other(&'static str),
+}
+
+impl PlayEndReason {
+    /// The wire spelling, as handed to Python handlers.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Stopped => "stopped",
+            Self::Superseded => "superseded",
+            Self::Error => "error",
+            Self::Other(reason) => reason,
+        }
+    }
+
+    /// Whether the prompt actually played to its end.
+    ///
+    /// Only `completed` did. An app that queues the next step on a prompt
+    /// finishing has to tell that from a stop, a supersede or an error — all
+    /// three of which end the playback without it having been heard in full.
+    pub fn is_completed(self) -> bool {
+        matches!(self, Self::Completed)
     }
 }
 

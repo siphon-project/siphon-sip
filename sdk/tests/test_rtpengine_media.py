@@ -724,3 +724,55 @@ class TestWebSocketTakeoverBridge:
              "wss://ai.example.com/s1", 16000),
             ("ended", "bridge-4@example.invalid", "s-1", "server_closed"),
         ]
+
+
+class TestPlayFinished:
+    """``@rtpengine.on_play_finished`` — the other half of a play's lifecycle.
+
+    ``PlayStarted`` says a prompt began. Nothing said it ended: a blocking
+    ``play_media`` returned the duration, but a fire-and-forget play — which is
+    what the control rail issues — had no completion signal at all.
+    """
+
+    def test_handler_fires_with_the_correlating_play_id(self, harness):
+        seen = []
+
+        @harness.rtpengine.on_play_finished
+        def done(call_id, from_tag, play_id, reason, played_ms):
+            seen.append((call_id, play_id, reason, played_ms))
+
+        assert harness.rtpengine.fire_play_finished(
+            "play-1@example.invalid", "tag-a", 7, "completed", 1500,
+        ) == 1
+        assert seen == [("play-1@example.invalid", 7, "completed", 1500)]
+
+    def test_filters_scope_the_handler(self, harness):
+        seen = []
+
+        @harness.rtpengine.on_play_finished(call_id="play-2@example.invalid")
+        def done(call_id, from_tag, play_id, reason, played_ms):
+            seen.append(call_id)
+
+        assert harness.rtpengine.fire_play_finished(
+            "other@example.invalid", "tag-a", 1,
+        ) == 0
+        assert harness.rtpengine.fire_play_finished(
+            "play-2@example.invalid", "tag-a", 1,
+        ) == 1
+        assert seen == ["play-2@example.invalid"]
+
+    def test_every_end_reason_reaches_the_handler(self, harness):
+        """A stop, a supersede and an error all end a playback without the
+        prompt having been heard — an app that treats any ending as success
+        acts on a prompt the caller never got."""
+        seen = []
+
+        @harness.rtpengine.on_play_finished
+        def done(call_id, from_tag, play_id, reason, played_ms):
+            seen.append(reason)
+
+        for reason in ["completed", "stopped", "superseded", "error"]:
+            harness.rtpengine.fire_play_finished(
+                "play-3@example.invalid", "tag-a", 1, reason,
+            )
+        assert seen == ["completed", "stopped", "superseded", "error"]

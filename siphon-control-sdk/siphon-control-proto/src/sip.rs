@@ -169,6 +169,11 @@ pub enum SipEvent {
     /// A bridge was broken ([`ChannelUnbridgedPayload`]). Both legs stay
     /// answered, owned and held — neither was hung up. Pushed on both channels.
     ChannelUnbridged,
+    /// A playback on this channel ended ([`PlayFinishedPayload`]). Emitted for
+    /// every accepted `play`, which over this rail is always fire-and-forget —
+    /// so this, not the accept's estimated duration, is when the prompt is
+    /// actually over.
+    PlayFinished,
     /// A WebSocket audio **tee** started streaming a copy of this channel's
     /// audio ([`WsTeeStartedPayload`]). The call relays on regardless — a tee
     /// is additive.
@@ -207,6 +212,7 @@ impl SipEvent {
             SipEvent::ChannelBridged => "ChannelBridged",
             SipEvent::BridgeFailed => "BridgeFailed",
             SipEvent::ChannelUnbridged => "ChannelUnbridged",
+            SipEvent::PlayFinished => "PlayFinished",
             SipEvent::WsTeeStarted => "WsTeeStarted",
             SipEvent::WsTeeEnded => "WsTeeEnded",
             SipEvent::WsBridgeStarted => "WsBridgeStarted",
@@ -232,6 +238,7 @@ impl From<&str> for SipEvent {
             "ChannelBridged" => SipEvent::ChannelBridged,
             "BridgeFailed" => SipEvent::BridgeFailed,
             "ChannelUnbridged" => SipEvent::ChannelUnbridged,
+            "PlayFinished" => SipEvent::PlayFinished,
             "WsTeeStarted" => SipEvent::WsTeeStarted,
             "WsTeeEnded" => SipEvent::WsTeeEnded,
             "WsBridgeStarted" => SipEvent::WsBridgeStarted,
@@ -676,6 +683,34 @@ pub struct ChannelUnbridgedPayload {
     pub reason: String,
 }
 
+/// Payload of [`SipEvent::PlayFinished`] — a playback ended.
+///
+/// `completed` is the field to branch on: a stop, a supersede and an error all
+/// end a playback without the prompt having been heard in full, and the accept's
+/// estimated duration says nothing about which happened.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PlayFinishedPayload {
+    /// The leg the prompt was playing toward.
+    #[serde(default)]
+    pub from_tag: String,
+    /// Peer tag, for a playback scoped to one peer of a bridge.
+    #[serde(default)]
+    pub to_tag: Option<String>,
+    /// Correlates with the `play` accept and the `PlayStarted` event.
+    #[serde(default)]
+    pub play_id: u64,
+    /// `completed`, `stopped`, `superseded` or `error`.
+    #[serde(default)]
+    pub reason: String,
+    /// Whether the prompt drained naturally — the only reason it was heard in
+    /// full.
+    #[serde(default)]
+    pub completed: bool,
+    /// Actual played duration in milliseconds, when the engine tracked it.
+    #[serde(default)]
+    pub played_ms: Option<u64>,
+}
+
 /// Payload of [`SipEvent::WsTeeStarted`] — the negotiated wire shape, so a
 /// consumer can decode the binary frames without guessing.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1074,6 +1109,7 @@ mod tests {
     #[test]
     fn stream_lifecycle_events_round_trip_as_typed_variants() {
         for (wire, expected) in [
+            ("PlayFinished", SipEvent::PlayFinished),
             ("WsTeeStarted", SipEvent::WsTeeStarted),
             ("WsTeeEnded", SipEvent::WsTeeEnded),
             ("WsBridgeStarted", SipEvent::WsBridgeStarted),

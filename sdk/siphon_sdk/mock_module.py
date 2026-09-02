@@ -2515,6 +2515,7 @@ class MockRtpEngine:
         self._media_timeout_handlers: list[dict[str, Any]] = []
         self._ws_tee_started_handlers: list[dict[str, Any]] = []
         self._ws_tee_ended_handlers: list[dict[str, Any]] = []
+        self._play_finished_handlers: list[dict[str, Any]] = []
         self._ws_bridge_started_handlers: list[dict[str, Any]] = []
         self._ws_bridge_ended_handlers: list[dict[str, Any]] = []
         self._text_handlers: list[dict[str, Any]] = []
@@ -3711,6 +3712,56 @@ class MockRtpEngine:
             fired += 1
         return fired
 
+    def on_play_finished(self, func_or_none: Any = None, *,
+                         call_id: Optional[str] = None,
+                         from_tag: Optional[str] = None) -> Any:
+        """Register a handler for **playback finished** events.
+
+        Fires when a playback the engine accepted ends — for *every* play,
+        including a fire-and-forget one. A blocking ``play_media(wait=True)``
+        already learns the outcome as its return value; this is for everything
+        else, and it is what an announcement-then-act flow hangs on instead of a
+        timer that a stop or a decode error would make wrong.
+
+        ``reason`` is one of ``completed``, ``stopped``, ``superseded`` or
+        ``error``. Only ``completed`` means the prompt was heard in full.
+        ``play_id`` correlates with the accept and with ``PlayStarted``.
+
+        Delivered by the native **siphon-rtp** backend only.
+
+        Usage::
+
+            @rtpengine.on_play_finished
+            async def prompt_done(call_id, from_tag, play_id, reason, played_ms):
+                if reason == "completed":
+                    await rtpengine.play_dtmf(call_id, "1")
+        """
+        def decorator(fn: Any) -> Any:
+            self._play_finished_handlers.append({
+                "fn": fn,
+                "call_id": call_id,
+                "from_tag": from_tag,
+            })
+            return fn
+        if func_or_none is not None:
+            return decorator(func_or_none)
+        return decorator
+
+    def fire_play_finished(self, call_id: str, from_tag: str, play_id: int,
+                           reason: str = "completed",
+                           played_ms: Optional[int] = None) -> int:
+        """Test helper: fire a play-finished event.  Returns the number of
+        handlers that matched (and were invoked)."""
+        fired = 0
+        for entry in self._play_finished_handlers:
+            if entry["call_id"] is not None and entry["call_id"] != call_id:
+                continue
+            if entry["from_tag"] is not None and entry["from_tag"] != from_tag:
+                continue
+            entry["fn"](call_id, from_tag, play_id, reason, played_ms)
+            fired += 1
+        return fired
+
     def on_ws_bridge_started(self, func_or_none: Any = None, *,
                              call_id: Optional[str] = None,
                              from_tag: Optional[str] = None) -> Any:
@@ -3851,6 +3902,7 @@ class MockRtpEngine:
         self._media_timeout_handlers.clear()
         self._ws_tee_started_handlers.clear()
         self._ws_tee_ended_handlers.clear()
+        self._play_finished_handlers.clear()
         self._ws_bridge_started_handlers.clear()
         self._ws_bridge_ended_handlers.clear()
         self._text_handlers.clear()

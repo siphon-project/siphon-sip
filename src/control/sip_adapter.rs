@@ -90,6 +90,12 @@ impl ControlAdapter for SipControlAdapter {
                 // accept-on-start, not a claim that audio is already on the
                 // wire — a fetched source accepts before its body arrives.
                 "PlayStarted".to_string(),
+                // The other half of a play's lifecycle. `play` over this rail is
+                // always fire-and-forget — the blocking form is in-process only —
+                // so without this an app that acts when a prompt ends has to
+                // guess from the accept's duration, which a stop, a supersede or
+                // a decode error all make wrong.
+                "PlayFinished".to_string(),
                 "TransferRequested".to_string(),
                 // The verdict on an *outbound* REFER (the `refer` verb). Three
                 // names, because RFC 3515 §2.4.4 splits "accepted for

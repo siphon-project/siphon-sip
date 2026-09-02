@@ -217,6 +217,7 @@ export type SipEventKind =
   | "ChannelBridged"
   | "BridgeFailed"
   | "ChannelUnbridged"
+  | "PlayFinished"
   | "WsTeeStarted"
   | "WsTeeEnded"
   | "WsBridgeStarted"
@@ -434,6 +435,25 @@ export interface ChannelUnbridgedPayload {
   peer_sip_call_id: string;
   /** The reason the `unbridge` carried (default `"unbridged"`). */
   reason: string;
+}
+
+/**
+ * The `payload` of a `PlayFinished` event — a playback ended.
+ *
+ * `completed` is the field to branch on: a stop, a supersede and an error all
+ * end a playback without the prompt having been heard in full, and the accept's
+ * estimated duration says nothing about which happened.
+ */
+export interface PlayFinishedPayload {
+  from_tag: string;
+  to_tag?: string | null;
+  /** Correlates with the `play` accept and the `PlayStarted` event. */
+  play_id: number;
+  /** `completed`, `stopped`, `superseded` or `error`. */
+  reason: string;
+  /** Whether the prompt drained naturally — the only reason it was heard in full. */
+  completed: boolean;
+  played_ms?: number | null;
 }
 
 /**

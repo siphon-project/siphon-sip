@@ -44,7 +44,8 @@ use super::client::PlayMediaSource;
 use super::error::RtpEngineError;
 use super::events::{
     BeepDetectedEvent, CallLegSummary, CallSummary, DtmfEvent, RtpEngineEvent, TextEvent,
-    TextStreamStats, WsBridgeEndReason, WsBridgeEnded, WsBridgeStarted, WsTeeEndReason,
+    PlayEndReason as SiphonPlayEndReason, PlayFinishedEvent, TextStreamStats,
+    WsBridgeEndReason, WsBridgeEnded, WsBridgeStarted, WsTeeEndReason,
     WsTeeStarted, WsTeeEnded, X3EndedEvent, X3LossEvent, X3StartedEvent,
 };
 use super::profile::{NgFlags, WsTeeDirection, WsVadEngine};
@@ -1582,16 +1583,21 @@ fn convert_event(event: Event) -> RtpEngineEvent {
             call_id: call_id.or(conference_id),
             from_tag: Some(from_tag),
         },
-        // Intercepted by route_frame before it reaches here (resolves a blocking
-        // play_media). Mapped defensively so the match stays exhaustive and
-        // non-panicking if that ordering ever changes.
         Event::PlayFinished {
-            call_id, from_tag, ..
-        } => RtpEngineEvent::Unknown {
-            event: "play_finished".to_string(),
-            call_id: Some(call_id),
-            from_tag: Some(from_tag),
-        },
+            call_id,
+            from_tag,
+            to_tag,
+            play_id,
+            reason,
+            played_ms,
+        } => RtpEngineEvent::PlayFinished(PlayFinishedEvent {
+            call_id,
+            from_tag,
+            to_tag,
+            play_id,
+            reason: play_end_reason_from_proto(reason),
+            played_ms,
+        }),
         Event::WsTeeStarted {
             call_id,
             from_tag,
@@ -1752,6 +1758,24 @@ fn ws_tee_end_reason_from_proto(reason: ProtoWsTeeEndReason) -> WsTeeEndReason {
         ProtoWsTeeEndReason::CallEnded => WsTeeEndReason::CallEnded,
         ProtoWsTeeEndReason::TransportError => WsTeeEndReason::TransportError,
         _ => WsTeeEndReason::TransportError,
+    }
+}
+
+/// Map the proto play end-reason onto siphon's own enum.
+///
+/// `PlayEndReason` is `#[non_exhaustive]` upstream. The wildcard maps to
+/// [`SiphonPlayEndReason::Error`] rather than [`SiphonPlayEndReason::Completed`], for the
+/// same reason the two stream mappings never guess "orderly": `Completed` is
+/// the only reason that means the prompt was actually heard in full, and an app
+/// that queues its next step on that would take an unknown ending as a
+/// successful one.
+fn play_end_reason_from_proto(reason: PlayEndReason) -> SiphonPlayEndReason {
+    match reason {
+        PlayEndReason::Completed => SiphonPlayEndReason::Completed,
+        PlayEndReason::Stopped => SiphonPlayEndReason::Stopped,
+        PlayEndReason::Superseded => SiphonPlayEndReason::Superseded,
+        PlayEndReason::Error => SiphonPlayEndReason::Error,
+        _ => SiphonPlayEndReason::Error,
     }
 }
 
@@ -1960,16 +1984,23 @@ async fn route_frame(
 ) {
     if value.get("event").is_some() {
         match serde_json::from_value::<Event>(value) {
-            Ok(Event::PlayFinished { play_id, reason, played_ms, .. }) => {
-                // Internal correlation for a blocking play_media(wait=True): hand
-                // the reason + played duration to the waiting call. No waiter
-                // means a wait=False play (or a lost accept/register race, covered
-                // by the play fallback timeout) — drop it, don't surface it as an
-                // event.
-                debug!(play_id, ?reason, played_ms, "siphon-rtp play finished");
-                if let Some((_, sender)) = play_pending.remove(&play_id) {
-                    let _ = sender.send((reason, played_ms));
+            Ok(event @ Event::PlayFinished { .. }) => {
+                // Two consumers, and they are not alternatives. The waiter is a
+                // blocking play_media(wait=True) in this process, which takes
+                // the reason + played duration as its return value. The event
+                // stream is everything else — script handlers and the control
+                // rail — and a `play` issued over the rail is always
+                // fire-and-forget, so dropping the event whenever a waiter
+                // happened to exist would make an app's completion signal
+                // depend on an unrelated caller's choice.
+                if let Event::PlayFinished { play_id, reason, played_ms, .. } = &event {
+                    debug!(play_id, ?reason, played_ms, "siphon-rtp play finished");
+                    if let Some((_, sender)) = play_pending.remove(play_id) {
+                        let _ = sender.send((*reason, *played_ms));
+                    }
                 }
+                let converted = convert_event(event);
+                let _ = event_tx.send(converted).await;
             }
             Ok(event) => {
                 let converted = convert_event(event);
@@ -2965,6 +2996,46 @@ mod tests {
         assert_eq!(json["sample_rate"], 16_000);
     }
 
+    /// The bug: `PlayFinished` was consumed by `route_frame` to resolve a
+    /// blocking play and dropped otherwise, so a fire-and-forget play — every
+    /// play issued over the control rail — had no completion signal at all.
+    #[test]
+    fn play_finished_converts_rather_than_vanishing_into_unknown() {
+        let mapped = convert_event(Event::PlayFinished {
+            call_id: "c".into(),
+            from_tag: "t".into(),
+            to_tag: Some("peer".into()),
+            play_id: 7,
+            reason: PlayEndReason::Completed,
+            played_ms: Some(1500),
+        });
+        match mapped {
+            RtpEngineEvent::PlayFinished(play) => {
+                assert_eq!(play.play_id, 7);
+                assert_eq!(play.played_ms, Some(1500));
+                assert_eq!(play.to_tag.as_deref(), Some("peer"));
+                assert!(play.reason.is_completed());
+            }
+            other => panic!("expected a play-finished event, got {other:?}"),
+        }
+    }
+
+    /// Only `completed` means the prompt was heard in full. An unknown reason
+    /// from a newer engine must not read as completed — an app queueing its
+    /// next step on that would act on a prompt the caller never got.
+    #[test]
+    fn only_a_completed_play_reads_as_completed() {
+        assert!(play_end_reason_from_proto(PlayEndReason::Completed).is_completed());
+        for reason in [
+            PlayEndReason::Stopped,
+            PlayEndReason::Superseded,
+            PlayEndReason::Error,
+        ] {
+            let mapped = play_end_reason_from_proto(reason);
+            assert!(!mapped.is_completed(), "{} must not read as completed", mapped.as_str());
+        }
+    }
+
     #[test]
     fn attach_ws_bridge_carries_the_ws_uri() {
         let json = serde_json::to_value(Command::AttachWsBridge {
@@ -3473,6 +3544,37 @@ mod tests {
         // The handle must survive alongside the duration so a caller can still
         // stop or retune the playback it just started.
         assert_eq!(played.play_id, Some(7));
+    }
+
+    /// The two consumers are not alternatives. A blocking `play_media` takes the
+    /// outcome as its return value, *and* the event still has to reach the
+    /// stream — script handlers and the control rail read it there, and a
+    /// completion signal that appears only when no one happened to be awaiting
+    /// is one an app cannot rely on.
+    #[tokio::test]
+    async fn a_blocking_play_still_publishes_the_finished_event() {
+        let address = spawn_play_server(9, Some((PlayEndReason::Completed, Some(1234)))).await;
+        let (event_tx, mut event_rx) = channel();
+        let client = SiphonRtpClient::new(address, None, 2000, 5_000, event_tx);
+
+        let played = client
+            .play_media("call-play", "tag-a", &play_source(), None, None, None, None, false, None, true)
+            .await
+            .unwrap();
+        assert_eq!(played.duration_ms, Some(1234), "the waiter must still resolve");
+
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("the finished event must reach the stream, not only the waiter")
+            .expect("event channel closed");
+        match event {
+            RtpEngineEvent::PlayFinished(play) => {
+                assert_eq!(play.play_id, 9);
+                assert!(play.reason.is_completed());
+                assert_eq!(play.played_ms, Some(1234));
+            }
+            other => panic!("expected a play-finished event, got {other:?}"),
+        }
     }
 
     #[tokio::test]
