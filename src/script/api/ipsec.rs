@@ -1169,9 +1169,8 @@ impl PyIpsec {
                 transform, offer.alg, offer.ealg
             )));
         }
-        let sa_protocol = parse_allocate_protocol(protocol).map_err(|message| {
-            pyo3::exceptions::PyValueError::new_err(message)
-        })?;
+        let sa_protocol = parse_allocate_protocol(protocol)
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
         let keys = av.borrow().take().ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err("AuthVectorHandle already consumed")
         })?;
