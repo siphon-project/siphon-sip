@@ -4,11 +4,43 @@
 
 This document tracks the maturity of every SIPhon feature across three readiness levels. SIPhon runs in production today in a residential SIP registrar/proxy role and a 3GPP IMS deployment exercising Diameter Cx/Sh/Rx, iFC, IPsec, and 5G SBI policy control. Features validated on live traffic are marked Production.
 
-| Readiness | Meaning |
-|-----------|---------|
-| **Production** | Running on live traffic today |
-| **Implemented** | Code-complete, unit/integration tested, not yet production-deployed |
-| **Planned** | Partially wired or design-only |
+| Readiness | Meaning | Evidence behind it |
+|-----------|---------|--------------------|
+| **Production** | Running on live traffic today | Everything below, plus a deployment carrying real calls |
+| **Implemented** | Code-complete and tested, not yet production-deployed | At least unit/integration tests; often a SIPp scenario too — but see below, the level does not say which |
+| **Planned** | Partially wired or design-only | None yet |
+| **Not implemented** | Named here because its absence is worth knowing | n/a |
+
+### What these levels do not tell you
+
+**"Implemented" spans a wide range of evidence.** A row backed by unit tests
+only and a row backed by a SIPp scenario that runs on every pull request both
+read `Implemented`. When a row's evidence matters to you, the Notes column
+names it — most rows say which tests exist — but the level alone will not.
+
+The gates, weakest to strongest:
+
+| Gate | What it proves | When it runs |
+|------|----------------|--------------|
+| Unit / integration tests | The code does what its author intended | Every PR |
+| RFC 4475 corpus + parser proptests | Adversarial messages parse or are refused per the RFC | Every PR |
+| Fuzz targets | The parser and stream framer survive hostile input, and agree with each other | Every PR (60 s each) |
+| SIPp scenarios | The feature works end to end against a message generator | **Most on every PR; some only via `scripts/run-tests.sh`** |
+| Throughput + memory-leak baseline | 16 rows of proxy/B2BUA × UDP/TCP hold with zero failures and flat allocation | Release cut |
+| Live traffic | It survives real endpoints | Production rows only |
+
+**No level asserts interoperability with an independent implementation.** SIPp
+is a message generator, not a SIP element: it builds no route set, matches no
+CANCEL to a transaction, and has no opinion about a Record-Route it did not
+write. A feature can pass every gate above and still be wrong in a way only
+another stack would notice. Closing that is what `interop/` is for; until it
+covers a feature, read `Implemented` as "correct by siphon's own account".
+
+**Some SIPp scenarios do not run per-PR.** They exist and pass when invoked, but
+a regression in them is caught at a release cut or by hand, not on the PR that
+causes it. Four have no runner at all — `b2bua-refer-outbound`,
+`b2bua-reinvite-bleg`, `b2bua-reinvite-breject`, `b2bua-reinvite-reject` — so
+the behaviour they describe is currently asserted by nothing.
 
 ---
 
@@ -29,8 +61,8 @@ This document tracks the maturity of every SIPhon feature across three readiness
 | Call transfer (REFER, RFC 3515) | Implemented | B2BUA `@b2bua.on_refer` | |
 | Cancel teardown hook | Implemented | `@proxy.on_cancel` / `@b2bua.on_cancel` | Fires once when a relayed (proxy) or B2BUA INVITE is CANCELled before a final response (RFC 3261 §9) — the only script teardown signal for a cancelled-before-answer call, which neither `on_reply`/`on_failure` (proxy: the 487 is generated at the transaction layer, never reaching a reply handler) nor `on_bye` (b2bua: no dialog was ever established) deliver. Receives the original INVITE (proxy `fn(request)`) / the Call (b2bua `fn(call)`); fire-and-forget, does not gate the 487. Exists to release per-call resources no BYE will ever clear (Diameter Rx/N5 QoS sessions, rtpengine media anchors). The B2BUA hook fires only in Calling/Ringing, so a 2xx that wins the cancel/answer glare (independently ACK+BYE'd by `handle_zombie_cancelled_2xx`) never triggers it — no answered call is torn down. Engine-registration unit tests (`script::engine::tests::{proxy,b2bua}_on_cancel_decorator_registers_handler`) + SDK dispatch tests (`sdk/tests/test_on_cancel.py`). |
 | Reply-time proxy reject | Implemented | `reply.reject(code, reason)` (in `@proxy.on_reply`) | Fail an in-progress proxied INVITE from the reply context — the proxy-side equivalent of B2BUA `call.reject()`, needed because IMS P-CSCF media authorization (N5 `sbi.create_session` / Rx `diameter.rx_aar`) runs at answer time, when the negotiated SDP is available, and a failure must reject the leg (e.g. `503`) rather than proceed medialess. On a **provisional (1xx)** — typically a reliable `183` in the VoLTE preconditions / early-media flow where the SDP answer rides the provisional — records the reject and returns `True`; the dispatcher then sends `code reason` upstream to the UAC via the server transaction (retransmission + UAC-ACK absorption) and CANCELs every pending downstream branch (reusing `cancel_fork_branches`, RFC 3261 §9). The straggler `487` the CANCEL draws back is absorbed via a new `ProxySession.final_response_sent` guard (the single-target relay path has no fork-aggregator `final_forwarded` to dedup it), so no second final reaches the UAC. On a **final (≥200)** — UAS already answered — it is a no-op returning `False` (a proxy cannot retract a 2xx); the script branches on the bool (log + `reply.relay()`, best-effort). Takes precedence over `relay()`. Unit-tested (`script::api::reply::tests` decision logic + `proxy::session::tests` flag) + SDK-mirrored/tested (`reply.reject`, `sdk/tests/test_reply_reject.py`). End-to-end SIPp-validated (`sipp/reject_{uac,uas}.xml` + `reject_proxy.py`): caller gets `100`→`503 Media Authorization Failed` (To-tag added, 183 suppressed), UAS gets the CANCEL on the INVITE's Via branch (RFC 3261 §9.1) and its `487` is ACKed and absorbed — both endpoints 1 Successful / 0 Failed / 0 Retrans / 0 Unexpected, siphon 0 WARN/ERROR. SIPp validation also surfaced + fixed a pre-existing loop: a non-compliant ACK (fresh branch instead of the INVITE's, §17.1.1.3) carrying the 503's To-tag + an R-URI pointing at the proxy was matched by `by_dialog_key` and relayed to the proxy's own address in `handle_ack_via_session`, stacking a Via per hop until the datagram exceeded the 8192-byte UDP buffer (truncated → parse-error drop). Two guards: (1) reject now drops the dead `by_dialog_key` entry (`ProxySessionStore::remove_dialog_key` — a rejected INVITE forms no dialog), and (2) `handle_ack_via_session` reuses the existing `is_own_address` loop check to silently drop an ACK whose resolved next-hop is one of our own listeners (RFC 3261 §16.3). |
-| Session timers (RFC 4028) | Implemented | `session_timer:` | UAC/UAS/B2BUA refresher modes |
-| PRACK (RFC 3262) | Implemented | Core | Reliable provisional responses; B2BUA terminates 100rel per-leg — auto-PRACKs a reliable-provisional B-leg and strips `Require:100rel`/`RSeq` toward a non-100rel A-leg (framework-auto, preset-independent) |
+| Session timers (RFC 4028) | Implemented | `session_timer:` | UAC/UAS/B2BUA refresher modes. End-to-end SIPp scenario (`b2bua-session-timer`) runs on every PR. |
+| PRACK (RFC 3262) | Implemented | Core | Reliable provisional responses; B2BUA terminates 100rel per-leg — auto-PRACKs a reliable-provisional B-leg and strips `Require:100rel`/`RSeq` toward a non-100rel A-leg (framework-auto, preset-independent). **Evidence caveat:** the end-to-end SIPp scenario (`b2bua-reliable-prov`, run against a dedicated `sip-trunk-edge@2026` instance) is driven by `scripts/run-tests.sh`, **not** by CI — so a regression in the 100rel interworking is not caught on the PR that causes it. |
 | E.164 number normalization (identity headers) | Implemented | `numbering:` / `number_policies:` / `request.rewrite_identities()` / `call.dial(number_policy=…)` | One call reformats every dialable identity userpart (`From`, `To`, `P-Asserted-Identity`, `P-Preferred-Identity`, Request-URI, opt-in `Referred-By`/`Remote-Party-ID`) into `e164`/`plain`/`international`/`national` under a home numbering plan + named versioned presets. Display names, tags, hosts, non-numbers and `preserve_users` service/emergency codes untouched; a national form of a foreign number falls back to the international access form. `numbers.parse(raw, home=)` exposes `.e164`/`.plain`/`.international`/`.national`/`.cc`/`.nsn`/`.format()`. B2BUA `number_policy=` (or `b2bua.default_number_policy`) normalizes the A-leg identities that flow to the B-leg plus the dial/fork target. Opt-in `diversion:` extends to `Diversion` (RFC 5806) / `History-Info` (RFC 7044) with structured per-entry rewrites preserving `index`/`reason`/embedded escaped `cause`/ordering and privacy-restricted entries (`respect_privacy`). Rust unit + KAV-vector + script-engine end-to-end tests; SDK-mirrored + tested (`sdk/tests/test_numbers.py`). |
 
 ## Transports
