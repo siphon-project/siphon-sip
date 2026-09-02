@@ -1,0 +1,11 @@
+# Commits that changed formatting only, and would otherwise bury the real
+# author of every line they touched.
+#
+# Enable locally (once per clone):
+#
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# GitHub honours this file automatically in its blame view.
+
+# style: cargo fmt --all, no manual edits (208 files)
+9ab0d71ab472f3bfc9547e84d1634f23baf66e2b

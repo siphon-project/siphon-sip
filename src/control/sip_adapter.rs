@@ -960,15 +960,13 @@ async fn bridge_with_bus(
                     "bridge args.on_peer_hangup must be a string",
                 );
             };
-            match crate::b2bua::bridge::PeerHangupPolicy::parse(text) {
-                Some(policy) => policy,
-                None => return ControlResult::error(
-                    ControlErrorCode::BadRequest,
-                    format!(
-                        "bridge args.on_peer_hangup must be \"hangup\" or \"hold\", got '{text}'"
-                    ),
-                ),
-            }
+            let Some(policy) = crate::b2bua::bridge::PeerHangupPolicy::parse(text) else {
+                let detail = format!(
+                    "bridge args.on_peer_hangup must be \"hangup\" or \"hold\", got '{text}'"
+                );
+                return ControlResult::error(ControlErrorCode::BadRequest, detail);
+            };
+            policy
         }
     };
 
