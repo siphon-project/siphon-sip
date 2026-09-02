@@ -376,6 +376,44 @@ class Request:
             reliable=reliable,
         ))
 
+    def stop_propagation(self) -> None:
+        """Stop siphon running any further handlers for this request.
+
+        Every ``@proxy.on_request`` handler whose filter matches runs, and they
+        share one request object with a **single action slot**. ``reply()`` /
+        ``relay()`` / ``fork()`` assign that slot rather than sending anything,
+        and only its final value is executed — so a later handler silently
+        replaces an earlier one's routing decision, with registration order
+        deciding::
+
+            @proxy.on_request("OPTIONS")
+            def probe(request):
+                request.reply(200, "OK")      # discarded below
+
+            @proxy.on_request
+            def route(request):
+                request.relay(NEXT_HOP)       # probe is forwarded, not answered
+
+        Calling ``request.stop_propagation()`` after the reply keeps it.
+
+        Opt-in on purpose: answering is not on its own a request to stop — a
+        metrics or logging handler running afterwards is legitimate. Idempotent,
+        and it leaves the chosen action alone.
+
+        Example::
+
+            @proxy.on_request("OPTIONS")
+            def probe(request):
+                request.reply(200, "OK")
+                request.stop_propagation()
+        """
+        self._propagation_stopped = True
+
+    @property
+    def propagation_stopped(self) -> bool:
+        """Whether a handler called :meth:`stop_propagation` on this request."""
+        return getattr(self, "_propagation_stopped", False)
+
     def relay(
         self,
         next_hop: Optional[str] = None,
