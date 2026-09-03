@@ -71,6 +71,7 @@ class Call:
         refer_side: Optional[str] = None,
         transport: str = "udp",
         active_route: Optional[Route] = None,
+        route_attempts: Optional[list[dict]] = None,
         flow: Optional[Flow] = None,
     ) -> None:
         self._id = call_id or str(uuid.uuid4())
@@ -102,6 +103,10 @@ class Call:
         # dispatcher sets this on the on_answer/on_bye Call; in tests pass
         # ``active_route=`` (or set ``call._active_route``) to simulate the winner.
         self._active_route = active_route
+        # LCR: the carriers that FAILED before the sequence settled. The
+        # dispatcher fills this from the call actor's recorded attempts; pass
+        # ``route_attempts=`` to simulate a call that failed over.
+        self._route_attempts: list[dict] = list(route_attempts) if route_attempts else []
         # Ro reserve-before-connect gate: the result ``ro_authorize`` returns
         # (default a grant), and a record of each call for test assertions.
         self._ro_authorize_result: Optional[dict] = None
@@ -118,6 +123,28 @@ class Call:
         (``call.route(...)``), or ``None`` for a non-LCR call. Read in
         ``@b2bua.on_answer`` / ``on_bye`` to stamp the carrier onto a CDR."""
         return self._active_route
+
+    @property
+    def route_attempts(self) -> list[dict]:
+        """Every carrier attempt that FAILED before this call settled, oldest
+        first — the counterpart to :attr:`active_route`, which names only the
+        winner.
+
+        Each entry is a dict with ``carrier_id``, ``status`` and
+        ``elapsed_ms``. Empty for a non-LCR call, and for an LCR call whose
+        first carrier answered. Available wherever the ``Call`` is, so a call
+        that answered *after* burning a carrier can still record which one it
+        burned — siphon stamps the same list onto the CDR as ``lcr_attempts``.
+
+        Example::
+
+            @b2bua.on_answer
+            def answered(call, reply):
+                for attempt in call.route_attempts:
+                    log.warn(f"carrier {attempt['carrier_id']} failed "
+                             f"{attempt['status']} after {attempt['elapsed_ms']}ms")
+        """
+        return self._route_attempts
 
     @property
     def id(self) -> str:

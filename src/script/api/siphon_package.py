@@ -468,6 +468,35 @@ class _B2buaNamespace:
         _registry.register("b2bua.on_cancel", None, fn, is_async)
         return fn
 
+    @staticmethod
+    def on_route_failure(fn):
+        """Register handler for one failed carrier of an LCR sequence.
+
+        Fires once per failed attempt of a ``call.route(...)`` sequential
+        failover — including the last one, and for every non-2xx a carrier
+        returns (a definitive ``486`` as much as a ``503``) plus a ring
+        timeout, reported as ``408``. That is the same set ``call.route_attempts``
+        records, so the two can never disagree; filter on ``code`` for
+        whatever you count as the carrier's fault.
+
+        Purely a notification: the failover decision is already made by the
+        time this runs, and unlike ``@b2bua.on_answer`` raising here does not
+        change the call's outcome. Use it to count a carrier out, alert, or
+        feed your own health view.
+
+        Usage:
+            @b2bua.on_route_failure
+            def carrier_failed(call, route, code):
+                if code in (408, 503):
+                    metrics.counter("carrier_failures_total",
+                                    "carrier failures",
+                                    labels=["carrier"]).labels(
+                                        carrier=route.carrier_id).inc()
+        """
+        is_async = _asyncio.iscoroutinefunction(fn)
+        _registry.register("b2bua.on_route_failure", None, fn, is_async)
+        return fn
+
 
 # ---------------------------------------------------------------------------
 # Registrar namespace (stubs — wired to Rust in Phase 4)

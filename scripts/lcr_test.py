@@ -25,11 +25,23 @@ async def route(call):
     call.route(decision.routes)
 
 
+@b2bua.on_route_failure
+def carrier_failed(call, route, code):
+    log.info(f"[{call.id}] carrier {route.carrier_id} failed {code}")
+
+
 @b2bua.on_answer
 def answered(call, reply):
     route = call.active_route
     if route:
         log.info(f"[{call.id}] answered via {route.carrier_id}")
+    # The carriers burned on the way to that answer — nothing recorded these
+    # before, so a completed call that failed over left no trace of it.
+    for attempt in call.route_attempts:
+        log.info(
+            f"[{call.id}] burned {attempt['carrier_id']} "
+            f"{attempt['status']} after {attempt['elapsed_ms']}ms"
+        )
 
 
 @b2bua.on_failure
