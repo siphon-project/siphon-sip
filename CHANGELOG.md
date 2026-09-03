@@ -172,6 +172,23 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   that genuinely has no effect once the B-leg has answered is now logged by name
   rather than discarded silently.
 
+- **One event now carries one timestamp.** With `log.file` configured, siphon
+  installed a console `fmt` layer and a file `fmt` layer, and each timed the
+  event as it formatted it — so a single log line was stamped twice, at two
+  different instants. Measured on a running process, the file's stamp was
+  between 57 µs and 1.4 ms behind the console's for the same event.
+
+  Invisible while reading a log, and not invisible the moment a log line is
+  correlated against a CDR, a HEP capture or an intercept record: which stamp is
+  authoritative then depends on which log happens to be in hand, and nothing in
+  either says they disagree. On a platform where CDRs, credit ticks and
+  intercept records are all stamped from one clock, a log disagreeing with
+  itself is not something anyone thinks to check.
+
+  The event is now timed once, before either layer formats it, and both render
+  that one value. It goes through the same timer as before, so the rendered
+  format is byte-identical and nothing parsing these logs is affected.
+
 - **Registrar lookups now canonicalise the AoR they are given.** `bindings` and
   `aliases` are both keyed on the normalised form, but `Registrar`'s own lookup
   methods took the caller's string as-is, so an AoR that was not already
@@ -277,6 +294,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   interworking) existed but was driven only by `scripts/run-tests.sh`, so a
   regression in it was not caught on the PR that caused it; it now has its own
   CI job.
+
 - **Fixed a race in the `b2bua-reinvite-breject` scenario.** A `<pause>` sat
   where the BYE arrives, so an on-time BYE landed before SIPp had armed the
   `recv` and aborted the run as unexpected. Test-side only — siphon sends
@@ -387,6 +405,7 @@ _Codename: kees._
     stripped it, so `content-length\x0b` became `Content-Length` to the parser,
     while the framer's ASCII trim left it alone. Header names are ASCII tokens
     (§25.1), so the parser now trims ASCII too.
+
 - **Refused ambiguous and abusive message shapes.** `validate_message` now
   checks a message's shape before any check that reads a particular field:
   - **A duplicated single-instance header field is `400 Bad Request`** (To,
@@ -438,6 +457,7 @@ _Codename: kees._
   SDKs (`SipEvent::PlayFinished`, `PlayFinishedPayload`, a `play_finished()`
   accessor, and the TypeScript interface) rather than arriving as the
   forward-compatible `Other` catch-all.
+
 - **The WebSocket stream lifecycle now reaches the control plane, for the tee as
   well as the bridge.** `stream_start` shipped before any lifecycle events did,
   so an app could start a tee over the control rail and had no way to learn it
@@ -454,6 +474,7 @@ _Codename: kees._
   `ws_bridge_started()` / `ws_bridge_ended()` accessors plus an
   `is_unexpected_stream_end()` helper on `siphon-control-client`, and the
   matching payload interfaces on the TypeScript client.
+
 - **Attach, re-point and detach a WebSocket *takeover* bridge on a live call.**
   The tee (`attach_ws_tee`) streams a copy while the call keeps relaying; a
   takeover makes the WebSocket server the leg's far side and unwires A↔B. Until
@@ -481,6 +502,7 @@ _Codename: kees._
   registered. Requires `media.backend: siphon-rtp` (rtpengine and rtpproxy
   refuse the verbs rather than answering a hollow success) and
   `siphon-rtp-proto` 0.4.0.
+
 - **`siphon_requests_without_branch_total`.** Counts inbound requests whose
   topmost Via carries no `branch` parameter (mandatory since RFC 3261 §8.1.1.7).
   siphon has no RFC 2543 legacy transaction matching, so these are processed
@@ -488,6 +510,7 @@ _Codename: kees._
   script again. Previously this degradation was invisible outside a debug log.
   The gap is now stated in the feature-readiness matrix; the `transaction::key`
   module documentation had claimed a fallback that was never implemented.
+
 - **Control plane: `ring` is its own verb, split from `progress`.** RFC 3261
   §13.2.1 makes the `180 Ringing` the "callee is being alerted" signal and
   §21.1.2 gives it no session semantics; RFC 3960 §3.1 puts early media on the
@@ -498,6 +521,7 @@ _Codename: kees._
   path. That is what lets an application ring for an interval of its own
   choosing and separately decide whether to open early media. Mirrored in all
   three control SDKs (`Call::ring` / `call.ring()` / `Call.ring()`).
+
 - **Control plane: a `PlayStarted` event.** `play` was fire-and-forget with no
   event at all, and its reply dropped the media engine's `play_id`, so an
   application had nothing to hang a playback watchdog or a gain ramp on and no
@@ -508,6 +532,7 @@ _Codename: kees._
   that audio has reached the wire — a `url` source accepts before its body has
   arrived. A play the backend refuses pushes **no** event, so "no `PlayStarted`
   yet" always reads as "not started".
+
 - **`siphon_udp_datagrams_at_buffer_limit_total`.** `recv_from` reports the
   bytes it copied, not the datagram's length, so a datagram that exactly fills
   the receive buffer is indistinguishable from one the kernel truncated.
@@ -520,6 +545,7 @@ _Codename: kees._
   invariants — a framed length never exceeds the buffer or the ceiling, and a
   refused message's header block stays inside the buffer — alongside the
   existing parser target in CI.
+
 - **`bridge` — joining two legs siphon already owns.** `originate` shipped the
   ability to place a call; nothing could connect one to another, which is what a
   transfer, a callback-and-connect and an attended hand-off all need. The verb
@@ -580,6 +606,7 @@ _Codename: kees._
   all (`b2bua-refer-outbound`, `b2bua-reinvite-bleg`, `b2bua-reinvite-breject`,
   `b2bua-reinvite-reject`), so the behaviour they describe is currently asserted
   by nothing.
+
 - **Corrected the PRACK and Session Timers rows in the README**, which said
   "Parser tests" while the matrix described full B2BUA 100rel interworking — the
   two documents disagreed. Session timers have an end-to-end SIPp scenario that
@@ -617,6 +644,7 @@ _Codename: kees._
   `@proxy.on_request("INVITE")`. Both of those have exactly one automatic route
   block, so `is_method()` is an *exclusive branch*; the decorator is additive.
   The guide now shows both correct forms.
+
 - **Control plane: `StasisEnd` now carries the SIP status on every teardown that
   had one.** `code` / `response` were only populated on the two originate paths;
   four more now report theirs — `487 Request Terminated` on a CANCEL in either
@@ -626,11 +654,13 @@ _Codename: kees._
   response (an ordinary BYE, a script-driven terminate) still omits both keys
   rather than inventing one, so `code` present always means a real status was on
   the wire.
+
 - **Control plane: a provisional's reply names what it sent.** `progress`
   reported `state: "ringing"` for every 1xx, including a 183 carrying early
   media. It now replies `{state: "ringing"|"progress", code, early_media}`,
   using the same rule as the callee-side `ChannelStateChange` on an originated
   leg, so there is one vocabulary to learn rather than two.
+
 - **`SipVerb` in `siphon-control-proto` is now `#[non_exhaustive]`** (as
   `SipEvent` already was), so every future verb is additive for consumers rather
   than breaking an exhaustive `match`.
@@ -652,6 +682,7 @@ _Codename: kees._
   Acceptance is now recorded for 64×T1 (Timer J), the window that transaction
   would have held its cached response. The B2BUA path already answered 200 to a
   CANCEL for a call no longer Calling/Ringing and is unchanged.
+
 - **A bridge no longer sends the wrong media detach, leaving the WebSocket
   server owning a leg it was about to renegotiate.** `bridge` tears every
   attachment off both legs before it re-points the media, but it decided what
@@ -663,6 +694,7 @@ _Codename: kees._
   the script or control API, was recorded nowhere, so its tee was never detached
   and kept streaming across the bridge. The two are now tracked apart and each
   gets its own verb.
+
 - **A request racing an in-flight copy of itself no longer forks the call
   twice.** The dispatcher checks `handle_server_retransmit` and then creates the
   server transaction, which is a check-then-act: when a request and its
@@ -673,19 +705,23 @@ _Codename: kees._
   time. Creation is now atomic: the first caller owns the transaction and a
   concurrent duplicate is absorbed. Reachable under packet loss on UDP, where a
   UAC's Timer A fires while the original is still being processed.
+
 - **A colliding client transaction is refused instead of silently replacing the
   live one.** siphon picks its own branch, so a collision is not a peer
   retransmission — a blind `insert` destroyed a running transaction's timers and
   left its request unanswered.
+
 - **A header with an empty value no longer swallows the next header line.**
   RFC 3261 §25.1 has `SWS = [LWS]` and `LWS = [*WSP CRLF] 1*WSP` — a CRLF after
   the header colon is only whitespace when a space or tab follows it. siphon
   accepted a bare one, so `X:\r\nContent-Length: 5\r\n\r\n` parsed as a single
   header `X` with the value `Content-Length: 5` and no `Content-Length` at all.
+
 - **A UDP datagram prefixed with a stray CRLF is no longer dropped as a parse
   error** (RFC 3261 §7.5). The stream transports drain keepalives in their own
   read tasks, but the parser searched for the header/body boundary before
   skipping the prefix and so found the prefix itself.
+
 - **Bounded stream message size (`security.max_message_bytes`).** A peer on a
   stream transport (TCP/TLS/WS/WSS) could declare an arbitrarily large
   `Content-Length`, send only the header block, and make the reader buffer
@@ -698,6 +734,7 @@ _Codename: kees._
   all. An over-sized request is answered `513 Message Too Large` (RFC 3261
   §21.4.11) and the connection is closed, so a legitimately over-sized body is
   a diagnosable configuration problem rather than an unexplained reset.
+
 - **Fixed a wrapping length calculation in the stream framer.** A
   `Content-Length` near `usize::MAX` overflowed the headers-plus-body sum.
   Release builds do not enable overflow checks, so it wrapped silently to one
@@ -705,6 +742,7 @@ _Codename: kees._
   desynchronised the stream on a value the peer chose. The sum now saturates,
   so an unrepresentable declaration is refused as over-sized. Found by the new
   framing fuzz target.
+
 - **The ACK for a bridged re-INVITE was addressed to siphon itself.** RFC 3261
   §13.2.2.4 puts the responder's own remote target in the ACK's Request-URI, and
   siphon read it from the 200 OK — but only *after* `sanitize_b2bua_response` had
@@ -729,6 +767,7 @@ _Codename: kees._
   (RFC 3261 §7.3.1), so the option tag is merged into the value already there
   instead of arriving as a second `Supported:` line. The refresh-re-INVITE path
   always did this correctly; only the B-leg builder did not.
+
 - **A transfer offered the target the survivor's *original* media, not its
   current media.** siphon tracked the SDP of whichever leg **offered** a
   re-INVITE or UPDATE, never of the leg that merely **answered** one. So a leg
@@ -743,6 +782,7 @@ _Codename: kees._
   on who offered the re-INVITE, which is why this only broke transfers initiated
   from one side of the call. The answerer's own SDP is now tracked too, raw and
   before any rewrite, exactly as the offerer's already was.
+
 - **Two tests that failed at random, both for reasons unrelated to what they
   assert.** `free_port()` bound port 0, read the address and dropped the socket:
   the kernel auto-assigns from the ephemeral range, so between the probe closing
@@ -755,6 +795,7 @@ _Codename: kees._
   copies of the helper are down to two — one shared inside the crate, one for
   `tests/`, which is a separate crate. Measured 4 failures in 20 runs before, 0
   in 25 after.
+
 - **The Python thread-state leak guard now owns the process.** It compares glibc
   in-use bytes across thread-churn batches, but that counter is process-global
   and the parallel test binary allocates on the same order as the signal — it
@@ -801,6 +842,7 @@ _Codename: kees._
   carry was not this shape and never did anything. That form now **fails the
   config load** instead of being silently ignored, and the example carries a real
   codec block.
+
 - **`call.accept_refer(profile=…)` — the media profile for the pairing a
   transfer creates.** A media profile has two halves, and when they differ
   (`srtp_to_rtp` and every other SRTP/DTLS edge) they describe *specific sides*
@@ -820,6 +862,7 @@ _Codename: kees._
   on all three control SDKs (Rust `accept_refer(.., profile)`, Python
   `accept_refer(profile=…)`, TypeScript `acceptRefer({ profile })`). Unset keeps
   the previous inherit behaviour, which is correct for a symmetric profile.
+
 - **`call.refer_side` — which leg sent the REFER** (`"a"` / `"b"`, matching the
   `initiator.side` convention in `@b2bua.on_bye`). Without it a script could not
   work out *which party survives* a transfer, and therefore could not pick the
@@ -877,6 +920,7 @@ _Codename: kees._
   MIT implementation of the same specification, and everything siphon emits is
   validated by `xmllint` in CI as a third-party decoder — a round-trip through
   our own reader would pass a shared encode/decode bug.
+
 - **X3 content delivery is wired to the media engine.** On
   `media.backend: siphon-rtp` (and `siphon-rtp-proto` >= 0.3.1) siphon issues
   `AttachX3` when a content warrant matches a dialog-forming request, and
@@ -927,6 +971,7 @@ _Codename: kees._
   production is, mutual TLS included; the capture is taken one hop later.
   `scripts/validate_x2_pdu.sh` remains the cheap check on a single encoded PDU
   and needs no estate.
+
 - **A load profile with interception actually switched on**, and the metric to
   watch it with. Every other measurement in this repo — the 16-row baseline and
   the memory-leak soak both — runs with `lawful_intercept` absent, so the
@@ -939,6 +984,7 @@ _Codename: kees._
   alerting on in production for the same reason: it is keyed on a value the
   peer chooses, so it must track live dialogs and fall back, and sitting at the
   cap is the signature of a Call-ID flood.
+
 - **Per-target-type detection coverage.** A warrant can be accepted and then
   match nothing, which no provisioning test can catch — provisioning succeeded.
   So `sipp/li/li_target_types_test.py` provisions a warrant on each identifier
@@ -973,6 +1019,7 @@ _Codename: kees._
   recording is not lawful-intercept product and does not belong on a mediation
   function's warrant feed. Two new read-only properties, `li.task_count` and
   `li.destination_count`, report what the ADMF has provisioned.
+
 - **X2 records carry the task's XID and a non-zero per-session Correlation ID.**
   TS 103 221-2 clause 6 requires that a session's X2 and X3 records share a
   correlation, and since X3 is emitted by the media engine and X2 by this
@@ -980,12 +1027,14 @@ _Codename: kees._
   ADMF provisioned is honoured; otherwise one is derived deterministically from
   the Call-ID (FNV-1a, forced non-zero) so both sides reach the same value
   without exchanging it.
+
 - **`lawful_intercept.x1` configuration.** `auth_token` is **removed** — a
   bearer token is not part of TS 103 221-1 and mutual TLS is the authentication.
   `tls.client_ca` is now **required**: a listener without one would accept
   anyone, so a missing or empty CA bundle is a startup error rather than a
   silent downgrade. New: `ne_identifier` (required), `admf_identifier`, `path`,
   `version`, `bind_admf_identifier_to_certificate`.
+
 - **The X1 listener is bound at startup.** A configured `lawful_intercept.x1`
   that cannot be bound now fails startup instead of coming up with an interface
   that is not listening.
@@ -1019,6 +1068,7 @@ _Codename: kees._
   with dead audio and no clue why. Same warning on an inbound `INVITE` with
   `Replaces`, which re-pairs the call the same way. siphon does not guess a
   replacement — only the script knows what the surviving pair looks like.
+
 - **`examples/teams_sbc.yaml` no longer shows a config key that does nothing.**
   Both profiles carried `codec: ["offer", "PCMA,PCMU"]`; there is no `codec`
   field on a media profile and nothing encodes it, so the line was silently
@@ -1031,6 +1081,7 @@ _Codename: kees._
   direction-bound profiles are now labelled as such, and the example gains a
   `@b2bua.on_refer` handler showing the `profile=` a Teams SBC needs — the exact
   topology where getting this wrong costs you the audio.
+
 - **A per-dialog map leaked one entry for every call the node completed.** The
   per-session matching decision was released on the `BYE`, which is one message
   too early: the `200` to that BYE then found nothing remembered, re-derived a
@@ -1048,6 +1099,7 @@ _Codename: kees._
   point of adding it: the predicate was self-consistent, so only watching the
   gauge across thousands of generated calls showed it. The tell was counter-
   intuitive — a number that sat perfectly still rather than one that climbed.
+
 - **A retransmission produced a second copy of a record the mediation function
   already had.** Interception is placed before transaction matching, so that a
   script cannot drop a message before it is intercepted, and the cost of that
@@ -1065,6 +1117,7 @@ _Codename: kees._
   with the session, and past a per-session bound de-duplication stops rather
   than starts dropping: a duplicated record is recoverable at the mediation
   function and a missing one is not.
+
 - **Matching ran per message, which could intercept a call's opening and miss
   its end.** Deciding each message on its own identities assumes every message
   of a dialog carries the target in matchable form, and they do not — a
@@ -1084,6 +1137,7 @@ _Codename: kees._
   rather than the tasks themselves, so a `ModifyTask` is honoured on the next
   message instead of being shadowed by a cached copy. `li.is_target()` asks the
   same question, so the script API can no longer contradict enforcement.
+
 - **X2 delivered the wrong interface's PDUs.** The records siphon sent to the
   Mediation Function were ETSI TS 102 232 PS-PDUs behind a four-octet length
   prefix. TS 102 232 is the *handover* format — what the MDF emits onwards to
@@ -1109,6 +1163,7 @@ _Codename: kees._
   Validated against a third-party dissector via `scripts/validate_x2_pdu.sh`,
   and end-to-end against sipgate's mediation function, which decodes and
   validates every PDU it accepts.
+
 - **One failed connection attempt lost a warrant's first record.** The X2
   delivery task dropped a record outright if the connection could not be opened
   on the first try, and that record is the least affordable one to lose: the
@@ -1118,6 +1173,7 @@ _Codename: kees._
   accepting a moment after the call that triggered it, and anything in front of
   it forks per connection. It now retries, bounded so a collector that is
   genuinely gone cannot stall delivery to the other destinations behind it.
+
 - **`lawful_intercept.x2.transport: tls` did nothing.** The delivery task
   logged the configured transport and then opened a plain `TcpStream`
   regardless, and the `x2.tls` block was read by nothing at all — so an
@@ -1129,10 +1185,12 @@ _Codename: kees._
   `IPv4Address`). If any of it is missing or unreadable the delivery task
   refuses to start and says so, rather than falling back to plaintext; a silent
   downgrade on this interface is the worst outcome available.
+
 - **X2 delivered only to the configured address, ignoring the warrant's own
   destinations.** A task's records now go to exactly the X2-capable DIDs it
   names, and to all of them; the configured `delivery_address` remains the
   fallback for a deployment that provisions no destinations over X1.
+
 - **X3 content delivery is refused rather than silently accepted where it cannot
   be performed.** ETSI TS 103 221-2 content framing lives in the media engine,
   so `rtpengine` and `rtpproxy` cannot deliver X3 at all. Configuring
@@ -1143,6 +1201,7 @@ _Codename: kees._
   content is the worst available outcome — it reads as provisioned at the ADMF,
   satisfies every acknowledgement, and the absence only surfaces when someone
   goes looking for product that was never sent.
+
 - **A peer's own XML namespace prefixes survived per-message isolation.**
   Schema-validating each message on its own means extracting it into a
   container of its own, and that wrapper carried a *fixed* prefix list while
@@ -1195,6 +1254,7 @@ _Codename: kees._
   deliberately modest; set `0` to leave the kernel default alone. siphon now
   reads the granted size back and warns when `net.core.rmem_max` clamped the
   request, which is otherwise invisible.
+
 - **`originate` — a call siphon places itself.** Both the control-plane verb
   (`module: "sip"`, `verb: "originate"`) and the in-process
   `b2bua.originate(...)`. Until now a call could only ever be a *reaction*:
@@ -1239,10 +1299,12 @@ _Codename: kees._
   - Typed refusals throughout — `bad_request`, `conflict`, `not_found` (no
     route), `unsupported_verb`, `unavailable` — each separately actionable, and
     a refused originate registers no channel and places nothing on the wire.
+
 - **`ui` and `sctp` cargo features on `siphon-bin`**, forwarding to the
   `siphon-sip` features of the same name. Previously an extension build had no
   way to turn either on, so composing extensions meant giving up the operator
   dashboard and SCTP transport. The official artifacts build with `ui`.
+
 - **Release-cut now runs the security-advisory gate over the `siphon-bin`
   composition too**, not just the `siphon-sip` graph. The released binary is
   built from that composition, so the extension crates and their dependency
@@ -1256,6 +1318,7 @@ _Codename: kees._
 - Two new stable control-plane error codes, `conflict` and `invalid_state`,
   mirrored into `siphon-control-proto` and the TypeScript SDK so a client parses
   them as the refusals they are rather than a transport error.
+
 - **Answering-machine detection — `beep_detection` on a media profile and the
   `@rtpengine.on_beep` handler.** The engine could hear the short record tone an
   answering machine plays before it starts recording, but nothing carried it to a
@@ -1269,6 +1332,7 @@ _Codename: kees._
   cadenced ringback or busy tone; it is also the detection latency, so the event
   trails the tone itself by that long, and `offset_ms` is the offset of the
   **tone**, not of the event.
+
 - **Synthesised call-progress tones and engine-fetched HTTP prompts** —
   `rtpengine.play_media(target, tone=...)` and `url=...`. `tone` takes either a
   preset name (`ringback_eu`, `busy_na`, `dial_uk`, …) or an explicit cadence
@@ -1276,6 +1340,7 @@ _Codename: kees._
   no longer needs a provisioned audio file. `url` is fetched by the **engine**
   from its own network position, bounded engine-side and off the media path: a
   URL that never answers ends the playback, never the leg.
+
 - **Overlay playback with per-play gain** — `rtpengine.play_overlay(...)` mixes
   audio *under* a party's live egress instead of replacing it and returns the
   playback's `play_id`; `rtpengine.set_play_gain(target, play_id, decibels)`
@@ -1284,6 +1349,7 @@ _Codename: kees._
   overlays run concurrently per direction. This is what a music bed ducked under
   a prompt needs: `play_media` is a *start*, so reusing it to change a level
   would mean "start another playback".
+
 - **Independent L16 wire rates for the WebSocket bridge and tee** —
   `ws_sample_rate` and `ws_tee_sample_rate` on a media profile,
   `rtpengine.attach_ws_tee(..., sample_rate=...)` per attach. The bridge rate
@@ -1294,17 +1360,20 @@ _Codename: kees._
   media engine *fails* the offer rather than clamping, so siphon rejects a bad
   value at config load and at the call instead of letting the box come up healthy
   and answer every call into silence.
+
 - **Selectable uplink voice-activity detector** — `ws_vad_engine: energy |
   neural` on a media profile. `energy` (the default, and the previous behaviour)
   answers "is something loud here", so breathing, mains hum and uncancelled echo
   all read as speech; `neural` answers "is what is here speech" and does not
   turn-start on non-speech noise. An unknown value is a hard config error rather
   than a quiet fall back to the detector the operator was avoiding.
+
 - **Leading minimum-speech run before barge-in** — `ws_vad_min_speech_ms`, the
   counterpart to the existing trailing `ws_vad_hangover_ms`. Without it the
   speech-start edge fires on the first speech frame, which is what lets a cough,
   a door or one burst of echo interrupt a prompt. 60–120 ms is the useful range;
   it adds directly to turn-start latency.
+
 - **All six new profile fields are accepted per call** on `rtpengine.offer()`,
   `answer()` and `answer_local()`, the same way `ws_uri=` already was — so beep
   detection can be armed on one leg of one call without a second profile.
@@ -1342,6 +1411,7 @@ _Codename: kees._
   report — so a transfer is never left pending. The `refer` command reply is
   unchanged (`{refer: "sent"}`): a far-end outcome is never folded into a
   command reply, which would mean blocking a command on the peer.
+
 - **Control SDKs** (Rust `siphon-control-proto` / `siphon-control-client`,
   TypeScript `@siphon-project/control`): the three events, a typed
   `TransferOutcomePayload` + `TransferStage`, `CallEvent::transfer_outcome()` /
@@ -1352,6 +1422,7 @@ _Codename: kees._
   `match` with an arm per variant. A wildcard arm is now required once, and
   every future event is purely additive. Consumers matching `SipEvent`
   exhaustively need to add `_ => {}`.
+
 - **The official artifacts now ship the `http` extension.** The container image,
   the `.deb`, the `.rpm` and the release tarball are built from the
   extension-composing `siphon-bin` package instead of the plain `siphon-sip`
@@ -1371,6 +1442,7 @@ _Codename: kees._
 
   `cargo install siphon-sip` is unaffected and still installs the SIP core with
   no extensions; the published crate is byte-identical to 1.6.0.
+
 - **`.deb` maintainer address** is now `maintainers@siphon-sip.org` rather than
   a personal one.
 
@@ -1393,6 +1465,7 @@ _Codename: kees._
   and **0 of 180** after, with a new acceptance gate that drives calls in a tight
   loop — the existing SIPp scenarios never produced the concurrency and so never
   caught it.
+
 - **An inbound `INVITE` with `Replaces` now actually takes the call over.** The
   transferee half of attended transfer (RFC 3891 §3 / RFC 5589 §7): a UA calls in
   naming the dialog it is taking over. siphon matched that dialog, logged it, and
@@ -1427,12 +1500,14 @@ _Codename: kees._
     that section names. A `Replaces` naming a dialog that is not answered gets the
     same treatment, and one naming a dialog this node does not host still gets
     `481` as before.
+
 - **A locally-generated 2xx is retransmitted like a relayed one.** `call.answer()`
   sent the 200 once and armed nothing. The B2BUA intercepts the A-leg INVITE
   before a server transaction exists, so nothing underneath recovers a lost 200
   (RFC 3261 §13.3.1.4) and a single dropped packet left the caller ringing until
   it gave up on a call siphon considered answered. Now armed on the same UAS
   schedule as the relayed path and cancelled by the caller's ACK.
+
 - **A blind transfer no longer kills the call when the transferor hangs up
   first.** In a siphon-terminated `REFER` the transferor is free to end its own
   dialog the moment the transfer is accepted (RFC 5589 §7), and real ones do —
@@ -1452,6 +1527,7 @@ _Codename: kees._
   that tears the call down on it can no longer undo the transfer. If the target
   then *fails*, the now-orphaned surviving leg is released instead of being left
   stranded.
+
 - **Attended transfer emits the `Replaces` it was given.** An attended `REFER`
   carries `Refer-To: <target?Replaces=dialog>`, and RFC 3891 §3 requires that
   dialog reference on the INVITE sent to the transfer target. siphon parsed the
@@ -1462,6 +1538,7 @@ _Codename: kees._
   siphon hosts the replaced call: the referrer names it with the identifiers of
   the leg facing itself, which on a B2BUA are meaningless at the far end and
   would draw a `481`. A dialog siphon does not host crosses unchanged.
+
 - **A completed transfer no longer strands the referrer's Call-ID.** The leg the
   transfer promoted away from left the call without its registry entry being
   cleared, and teardown only walks the legs still attached, so the mapping
@@ -1470,6 +1547,7 @@ _Codename: kees._
   got no response at all, not even a `100`. The promoted-away dialog is now
   retired properly, so a late in-dialog request on it answers `481` like any
   other torn-down leg.
+
 - **Runtime threads no longer orphan a CPython thread state when they are
   reaped — a steady, traffic-independent RSS climb on every deployment.** Each
   tokio runtime thread is pinned to the interpreter at thread start with a held
@@ -1490,6 +1568,7 @@ _Codename: kees._
   innocent throughout; only `siphon_glibc_in_use_bytes` moved. The pin is now
   released on thread stop, which bounds the blocking pool while leaving the
   optimization it exists for untouched — the workers it targets never stop.
+
 - **A `siphon-bin` build reports the SIPhon version again.** It announced its
   own package version (`0.1.0`) in the startup banner, the `User-Agent`/`Server`
   headers and `/admin/health`, which broke the lockstep guarantee that the
@@ -1529,6 +1608,7 @@ _Codename: kees._
   engine would recognise coming back, or to reject a replayed one. Validating
   the nonce is what bounds replay of a captured `Authorization`; without it a
   script-side digest check is replayable forever.
+
 - **RFC 3323 caller-ID restriction (CLIR)** — `call.restrict_caller_id()`, and
   `caller_id_presentation: "restricted"` on an LCR route. There was no RFC 3323
   anonymisation anywhere in the tree, so a deployment asserting `Privacy: id`
@@ -1540,6 +1620,7 @@ _Codename: kees._
   dropped (it is the UA's *request*, and forwarding it past a privacy boundary
   re-leaks the number), and `P-Asserted-Identity` keeps the real identity for
   the trusted next hop per RFC 3325 §7.
+
 - **Per-route presented CLI** — `caller_id` on an LCR route, and
   `call.set_caller_id(number)`. The presented CLI is a per-call, per-carrier
   decision the contract could not express: `number_policy` reshapes a number's
@@ -1549,6 +1630,7 @@ _Codename: kees._
   tag-preserving path the identity reshaping already uses, to `From` and to
   `P-Asserted-Identity` / `P-Preferred-Identity` where present. Two carriers in
   one answer can now present different CLIs on the same call.
+
 - **CI covers re-INVITE renegotiation on the `siphon-rtp` backend** (`--reoffer`).
   The existing `--reinvite` mode runs the same hold/resume flow against
   rtpengine, where a repeat `offer` on a live call-id *is* the re-offer — so it
@@ -1562,6 +1644,7 @@ _Codename: kees._
   and a `reoffer` per re-INVITE. Verified against a reverted fix, where the mock
   sees three offers and no re-offers — while SIPp still exits 0, which is why
   the assertion is on the verbs and not on the call outcome.
+
 - **`call.flow`, `Flow.connection_id`, and `Flow` equality/hashing.** A B2BUA
   `Call` exposed no inbound flow at all, so the RFC 5626 authorisation — accept
   an INVITE that arrived on the connection a registration was made on, rather
@@ -1576,6 +1659,7 @@ _Codename: kees._
   and carries no more assurance than the address does. `call.flow` is `None` for
   an internally-originated call, which is distinguishable from a flow that did
   not match.
+
 - **`password=` / `ha1=` on the digest helpers** (`auth.verify_digest`,
   `require_digest`, `require_www_digest`, `require_proxy_digest`, on a `Request`
   or a `Call`). Verifies the digest response against a credential the script
@@ -1590,6 +1674,7 @@ _Codename: kees._
   silently preferring one. Everything else is unchanged: the anti-replay nonce
   check still runs, a rejection still arms the 401/407, still counts toward
   `failed_auth_ban`, and still increments `siphon_credential_failures_total`.
+
 - **A CCR-UPDATE at answer, carrying `Time-Stamps`** (TS 32.299 §7.2.97). There
   was no credit-control request at the 200 OK, so an OCS could not tell when
   charging actually started and a Diameter-to-HTTP bridge had nothing to
@@ -1598,7 +1683,9 @@ _Codename: kees._
   `ImsChargingData.response_timestamp` already existed and was never set,
   because at CCR-INITIAL there is no answer yet. Idempotent — a retransmitted
   200 OK neither restarts the clock nor sends a second record.
+
 - **`ro.charge_from`** (`answer` | `invite`, default `answer`) — see above.
+
 - **`destination` on the LCR answer**, at the answer level and per route (the
   route's own wins). Retargets the call at a different destination number
   (RFC 3261 §16.5) *before* the ordinary dial path runs, so `tech_prefix`,
@@ -1615,6 +1702,7 @@ _Codename: kees._
   being a routing artifact of the R-URI rather than part of the called-party
   identity. The field is absent from the wire when unset, so the contract stays
   additive.
+
 - **`security.apiban.ban_ttl_secs` expires blocklist entries** (default `604800`,
   7 days, matching the interval after which APIBAN itself releases an address).
   Entries used to be inserted permanently and the poll only ever fetched
@@ -1626,6 +1714,7 @@ _Codename: kees._
   `0` restores the previous never-expire behaviour. Note the poll still only
   fetches forward from the last seen id: an address whose TTL expires while it
   is still abusive returns when the feed re-lists it, not immediately.
+
 - **Inbound REFER on a controlled call is surfaced to the control app as a
   `TransferRequested` event.** When a B2BUA call has been handed to an external
   control app, an in-dialog REFER on that call is no longer run through the
@@ -1642,6 +1731,7 @@ _Codename: kees._
   Builds on the single-leg REFER machinery, so a terminate-mode accept on a
   voice-AI / IVR call with no B leg re-dials the target off the A dialog. The SDK
   client facades for the new verbs and event follow separately.
+
 - **RFC 4103 real-time text observability.** A call carrying a plaintext
   `m=text` stream (RTT / T.140, the accessibility and emergency-calling text
   channel, and what an NG112 deployment needs alongside audio) can now be
@@ -1662,6 +1752,7 @@ _Codename: kees._
   reject a `text_events` profile at config load rather than accepting a flag
   they cannot honour and leaving a script waiting on events that can never
   arrive.
+
 - **Per-leg text reception counters in the media CDR** — `text_packets`,
   `text_characters`, `text_missing_markers` and
   `text_recovered_from_redundancy`, prefixed per leg alongside the existing
@@ -1670,6 +1761,7 @@ _Codename: kees._
   including redundancy repair and unrecoverable-loss markers. Absent, not
   zeroed, on a call with no observed text stream — `text_packets=0` would read
   as a text stream that carried nothing, which is a different claim.
+
 - **Media / header / REFER verbs + the two events on the control-plane SDK's
   `sip` facade — all three bindings.** Wraps the SIP-adapter verbs that shipped
   server-side, mirroring the `route()` facade: `play` (one of `file` / `db_id` /
@@ -1690,6 +1782,7 @@ _Codename: kees._
   as the same typed `unsupported_verb` / `bad_request` / `not_found` as the
   sibling verbs. The control SDK version is unchanged (its own `control-sdk-v*`
   train cuts the release).
+
 - **Cold transfer off a call siphon answered itself.** A voice-AI or IVR call has
   no B leg, so the only way to hand the caller on is an in-dialog REFER on the A
   dialog via the imperative `b2bua.refer(call_id, target)` — `call.refer()` is a
@@ -1697,6 +1790,7 @@ _Codename: kees._
   `@b2bua.on_answer` never fires without a B leg. Now covered end to end by a
   functional scenario, wired into `examples/voice_ai_b2bua.py` as "press 0 for an
   agent", and documented in `docs/cookbook/voice-ai.md`.
+
 - **In-band DTMF on a controlled call is forwarded to the control plane as a
   `ChannelDtmfReceived` event.** When the media engine detects a DTMF digit on a
   B2BUA call that was handed over to a control app, siphon pushes a
@@ -1708,6 +1802,7 @@ _Codename: kees._
   handler is registered. The event carries the stable id triple
   `{channel, call_id, sip_call_id}` like every other control event, and the SIP
   adapter's `describe` now lists `ChannelDtmfReceived`.
+
 - **SIGTRAN/SS7 extension module.** `siphon-bin` gains a `sigtran` feature that
   composes [siphon-sigtran](https://github.com/siphon-project/siphon-sigtran)
   v1.0.0 into the drop-in `siphon` binary, alongside the existing `smpp` and
@@ -1742,6 +1837,7 @@ _Codename: kees._
   `siphon-bin` container image). See
   [Extensions](https://siphon-sip.org/extensions/) and
   [sigtran.siphon-sip.org](https://sigtran.siphon-sip.org/).
+
 - **`SiphonServer::register_module_extension(name, hook)`** — embedding API for
   an extension whose surface is more than one attribute. The hook is handed the
   `siphon` package module itself and mounts its own namespaces, shared types,
@@ -1751,6 +1847,7 @@ _Codename: kees._
   "expose one namespace object" case and keep their built-in-name collision
   check — a module extension picks its own attribute names and is not
   collision-checked.
+
 - **Control-plane header-remove + media-control verbs on the SIP adapter.** The
   `siphon-control.v1` `sip` module gains `remove_header` (remove a header from
   the stored A-leg INVITE, the mirror of `set_header`) plus the media verbs
@@ -1772,6 +1869,7 @@ _Codename: kees._
   re-INVITE / SIPREC, so a re-anchored transfer is addressed on its real media
   id. Server-side only — the client SDK facade methods are a follow-up (reach the
   verbs meanwhile through the generic `command(verb, args)` escape hatch).
+
 - **`auth.require_proxy_digest()` / `require_www_digest()` / `require_digest()` /
   `verify_digest()` now take a B2BUA `Call` as well as a proxy `Request`, so a
   B2BUA can challenge its own caller.** Registering any `@b2bua.*` handler makes
@@ -1798,10 +1896,12 @@ _Codename: kees._
   `Call` raises `TypeError` naming both. `require_ims_digest` /
   `require_aka_digest` stay `Request`-only: IMS and AKA digest are REGISTER-time
   procedures and REGISTER never reaches the B2BUA path.
+
 - **`call.auth_user`** — the B2BUA twin of `request.auth_user`, carrying the
   username the A-leg authenticated as (`None` if never challenged). Also stamped
   onto the call's CDR as `auth_user`; a B2BUA call is tracked at INVITE time, so
   a caller authenticated inside `@b2bua.on_invite` previously left the field empty.
+
 - **Raw SIP and SIP-over-WebSocket on one listening socket.** Configure the same
   address under both `listen.tls` and `listen.wss` (or both `listen.tcp` and
   `listen.ws`) and siphon serves both protocols from a single listener,
@@ -1819,6 +1919,7 @@ _Codename: kees._
   Only `tcp`+`ws` and `tls`+`wss` can share a socket: any other pairing on one
   address (notably plaintext with TLS, where a ClientHello is not a SIP message)
   is now a startup error with a message naming both lists and the address.
+
 - **Worked voice-AI example — a carrier call answered by an AI over a WebSocket.**
   `examples/voice_ai_b2bua.py` + `.yaml` compose the shipped pieces into the
   single-leg shape: identify the carrier by source IP, `rtpengine.answer_local()`
@@ -1832,11 +1933,13 @@ _Codename: kees._
   call that merely returns audio. Requires a `siphon-rtp` engine of **0.1.5 or
   later**: earlier builds accept `ws_uri` on `answer_local` and silently never
   dial it.
+
 - **Functional coverage for the voice-AI path** — `scripts/run-tests.sh --voice-ai`
   drives a real INVITE through the example against a mock siphon-rtp control
   server (`sipp/siphon-rtp/mock_siphon_rtp.py`, the JSON-over-TCP twin of the
   existing rtpengine NG mock) and asserts the answer SDP is anchored on the
   engine's media address rather than echoing the caller's own `c=` back.
+
 - **`route()` on the control-plane SDK's `sip` facade — all three bindings.**
   Wraps the server's `route` verb (un-parks a handed-over call and dials the
   B-leg via siphon's LCR sequential-failover engine, returning control to
@@ -1847,6 +1950,7 @@ _Codename: kees._
   raises/rejects the typed `unsupported_verb` / `bad_request` / `not_found`
   errors like the sibling verbs. The control SDK version is unchanged (its own
   `control-sdk-v*` train cuts the release).
+
 - **`Contact.received` on the SDK mock — the field the engine tells you to
   route on.** `PyContact` exposes it and its doc-comment says to prefer it over
   `uri` (a Contact URI can carry a private/NATed address), but the SDK's
@@ -1858,11 +1962,13 @@ _Codename: kees._
   `add_contact()` carries an explicitly-built one through — so the NAT case the
   field exists for (private Contact URI, public source) is finally
   constructible in a test. Additive, defaulting to `None`.
+
 - **`Contact.age_secs`** — seconds since a binding was created or last
   refreshed, for scripts that need their own recency rule (`[c for c in
   registrar.lookup(uri) if c.age_secs < 3600]`). Monotonic, and preserved
   across a restart for bindings restored from a persistence backend; a stored
   record written before age tracking reports `0`.
+
 - **WebSocket tee — stream a copy of a live call's audio without taking the call
   over.** The existing `ws_uri` bridge is a *takeover*: the WebSocket server
   becomes leg A's far side and the A↔B relay is not wired, which is right for
@@ -1879,6 +1985,7 @@ _Codename: kees._
   `DetachWsTee`); rtpengine and rtpproxy reject a tee profile at config load and
   raise on the per-call verbs rather than returning a hollow success that streams
   nothing.
+
 - **`@rtpengine.on_ws_tee_started` / `@rtpengine.on_ws_tee_ended`** — a tee can
   end while the call carries on (the server closes the socket, the transport
   fails), which is otherwise invisible: nothing about the call changes and the
@@ -1890,6 +1997,7 @@ _Codename: kees._
   binary frames rather than guessing, and `stream_id` correlates the control
   event with the `start` envelope on the socket. Both take the same optional
   `call_id` / `from_tag` filters as `@rtpengine.on_dtmf`.
+
 - **External remote-control plane (ARI/ESL-class) — Phase 1.** An out-of-process
   application can now drive B2BUA calls over a WebSocket, in the model Asterisk
   has with ARI and FreeSWITCH with ESL. A Python `@b2bua.on_invite` handler hands
@@ -1929,6 +2037,7 @@ _Codename: kees._
   `siphon_control_commands_total`, `siphon_control_events_dropped_total`,
   `siphon_control_auth_failures_total` and `siphon_control_handoff_timeouts_total`.
   SDK: `call.handover(app, on_lost=, deadline_ms=, vars=)`.
+
 - **Control-plane `route` verb that returns control to siphon with a routing
   decision.** A controller that parked a call (deferred handover) can now hand
   control back so siphon dials the B-leg itself: `route` un-parks the call and
@@ -1947,6 +2056,7 @@ _Codename: kees._
   No routable carrier answers the A-leg `503`; a later B-leg ring-timeout takes
   the normal `408` path. Reuses the same `CallAction::RouteSequence` machinery as
   in-process `call.route(...)` / `call.fork(strategy="sequential")`.
+
 - **Control-plane client SDKs are the official interop path**, now installable:
   `pip install siphon-control` (Python) and `cargo add siphon-control-client`
   (Rust) hide the `siphon-control.v1` wire so a controller is written with
@@ -1956,6 +2066,7 @@ _Codename: kees._
   The raw JSON protocol is now framed as the under-the-hood reference for
   building a client in another language. See the
   [control-plane reference](https://siphon-sip.org/reference/control-plane/).
+
 - **Media profiles can drive the `siphon-rtp` WebSocket audio bridge and its DSP
   chain.** The engine has supported handing a leg's audio to an external
   WebSocket media server (decode → L16 uplink, L16 downlink → encode, the WS
@@ -1968,6 +2079,7 @@ _Codename: kees._
   `ws_barge_in`, `ws_vad_threshold`, `ws_vad_hangover_ms`, `noise_suppression`
   and `echo_cancellation`, and the conversion is exhaustive — a proto field
   siphon does not carry is now a compile error rather than a silent default.
+
 - **`ws_uri=` on `rtpengine.offer()` / `answer()` / `answer_local()`,** for an
   endpoint the script computes per call (session token, tenant lookup). It wins
   over the profile's own value and is recorded on the media session, so a later
@@ -1976,18 +2088,22 @@ _Codename: kees._
   `{from_user}` and `{to_user}`; an unrecognised placeholder raises instead of
   passing through as a literal, so a typo cannot reach the engine as a URI path
   segment.
+
 - **Built-in `voice_ai` media profile** — plain RTP toward the caller with noise
   suppression, echo cancellation, VAD and local barge-in on. `ws_uri` is left
   unset (there is no sensible default endpoint) and comes from YAML or per call.
+
 - **`received_from` media-profile flag (opt-in)** — carries the real post-NAT
   source IP siphon saw the request arrive from, gating that leg's media ingress
   to it. For a NATed UA advertising an unroutable private `c=` address this is a
   tighter RTPBleed source gate than the signalled address allows. Off by default,
   so an existing profile emits a byte-identical command; wrong for deployments
   whose media legitimately arrives from a different address than its signalling.
+
 - **`rtcp_mux` media-profile flag** — the RFC 5761 directive list (`offer`,
   `require`, `demux`, `accept`, `reject`, `remove`) overriding the mux decision
   the engine derives from the offered SDP.
+
 - **`sip::validate` — RFC 3261 validation of messages that parse but are still
   invalid.** A message can be perfectly parseable and yet have to be refused: an
   unsupported version, a CSeq that disagrees with the Request-Line, an
@@ -2015,6 +2131,7 @@ _Codename: kees._
   `--features smpp` gives you http **and** smpp; `--no-default-features`
   restores the empty build. This affects only the `siphon-bin` package —
   `siphon-sip` itself is unchanged and still ships no extensions.
+
 - **Ro no longer bills ring time.** The usage clock was stamped at
   CCR-INITIAL — which `call.ro_authorize()` fires *before* any carrier is
   dialled — and every reported figure was measured from there, so ring time was
@@ -2026,20 +2143,24 @@ _Codename: kees._
   any existing Ro deployment**; set the new `ro.charge_from: invite` to keep the
   previous behaviour. Only the clock moved — the reservation still happens at
   INVITE, since reserve-before-connect is the point of the prepaid gate.
+
 - **`siphon-rtp-proto` pinned to 0.2.0** (from 0.1.5). A 0.x minor bump is a
   semver-breaking range, so it is a deliberate move rather than something
   `cargo update` performs: the pin is what makes the engine's newer control
   surface reachable at all. Deployments on `media.backend: siphon-rtp` must run
   a siphon-rtp built from that contract.
+
 - **`Contact.received` is a SIP URI, not a bare `host:port` — the doc-comment
   now says so.** The value has always been
   `sip:<ip>:<port>;transport=<proto>` (the OpenSIPS `received_avp` shape),
   which is what lets `request.fork([c.received or c.uri for c in contacts])`
   work, but the getter's doc-comment described it as "source IP:port". Only
   the comment changed.
+
 - **`request.fix_nated_register()` writes the observed source port into
   `rport=`** instead of a hardcoded `5060`. SDK mock only; the engine already
   used the real port.
+
 - **`tls.method` is now enforced — it used to be parsed and ignored.** The
   setting was deserialized into the TLS config and never read: the acceptor was
   built from a bare `rustls::ServerConfig::builder()`, so a config asking for
@@ -2056,12 +2177,14 @@ _Codename: kees._
   at config load: `TLSv1_2` / `TLSv1_3` in the OpenSSL/Kamailio spellings
   (`TLSv1.2`, `TLSv1.2+`, `1.2`), while TLS 1.0/1.1, SSL and typos are a startup
   error instead of a silently-ignored string.
+
 - **TLS connection lifecycle logs moved from `info` to `debug`.** The four
   stream transports now share one per-connection reader/writer, and it logs
   "closed by peer", idle timeout and cleanup at `debug` — what the TCP listener
   (the highest-volume of them) already did. A TLS edge with thousands of UEs no
   longer prints a line per connection close at `info`. Warnings and errors are
   unchanged.
+
 - **siphon refuses to start when a `media.profiles` entry sets a field its
   `media.backend` cannot honour,** naming the profile, the direction and the
   field. The WebSocket and DSP flags are `siphon-rtp` only; `received_from` and
@@ -2077,6 +2200,7 @@ _Codename: kees._
 - Invalid `ws_uri` schemes and `rtcp_mux` tokens fail the config load, matching
   the existing `address_family` treatment — the engines ignore an unknown value
   silently, which otherwise lands as a call quietly negotiated the wrong way.
+
 - **Bump the `siphon-bin` SMPP extension to siphon-smpp v1.4.0.** The pin was
   still on v1.3.0: the 1.5.1 entry announcing a move to v1.3.1 never reached
   `siphon-bin/Cargo.toml`, so the manifest and that entry disagreed and the
@@ -2109,15 +2233,18 @@ _Codename: kees._
 
   Only affects builds with `--features smpp`; the plain `siphon` binary is
   unaffected.
+
 - **Content-Length is now validated against the octets actually received.** A
   value that is not a non-negative integer, or that claims more octets than
   arrived, leaves the message unframeable and is rejected instead of being
   papered over with a short read (RFC 3261 §20.14; RFC 4475 §3.1.2.2, §3.1.2.3).
   Stream transports are unaffected — the TCP framer already waits for
   `headers + Content-Length` octets before handing a message to the parser.
+
 - **The Request-Line now requires exactly one SP between elements**, per
   `Request-Line = Method SP Request-URI SP SIP-Version CRLF` (RFC 3261 §25.1). A
   run of spaces made the Request-URI ambiguous (RFC 4475 §3.1.2.9).
+
 - **RFC 4475 tests now run against the byte-exact message corpus.** The 50
   torture messages from RFC 4475 §3 are vendored under `tests/rfc4475/corpus/`
   and driven from a table classified by RFC section, replacing hand-transcribed
@@ -2132,6 +2259,7 @@ _Codename: kees._
   now leaves its seconds unreported, so the next record — or the
   CCR-TERMINATION — still covers them exactly once, instead of the interval
   being lost.
+
 - **Ro CCR-UPDATE and CCR-TERMINATION now carry Service-Information.** Both were
   built with `ims_data: None`, so only the Session-Id, the subscriber and the
   units reached the OCS. Nothing after the initial request named the carrier,
@@ -2143,6 +2271,7 @@ _Codename: kees._
   `Outgoing-Trunk-Group-Id` (TS 32.299 §7.2.71) when the call is answered, and
   sent on every subsequent request in the session. Each record's `Time-Stamps`
   describes its own trigger rather than repeating the INVITE's.
+
 - **Ro CCR-TERMINATION now carries `Cause-Code`** (TS 32.299 §7.2.35), so an OCS
   can tell why a call ended. It is taken from the same disconnect cause Rf's
   ACR-STOP already derives — the RFC 3326 `Reason` header, else the SIP status —
@@ -2150,6 +2279,7 @@ _Codename: kees._
   `-486`, a ring timeout `-408`; a siphon-initiated teardown reports `-402` when
   the OCS refused further credit (the same status a denied setup answers with)
   and `-408` when the max-session-lifetime backstop fired.
+
 - **A proxied in-dialog request whose Request-URI addresses the proxy itself is
   now forwarded to the dialog's established peer instead of failing as a
   routing loop.** RFC 3261 §12.2.1.1 has the UAC build a mid-dialog request
@@ -2170,6 +2300,7 @@ _Codename: kees._
   actually gates on this: the runner propagates the UAC's exit code, the UAC
   fails on the global timeout, and each re-INVITE's 200 is asserted by CSeq so
   a retransmitted initial-INVITE 200 can no longer mask a lost re-INVITE.
+
 - **`security.trusted_cidrs` now covers the APIBAN blocklist.** The transport
   ACL consulted the fetched set directly, before the deny/allow lists and with
   no trusted check, and the kernel-firewall path had none either — so a trusted
@@ -2178,6 +2309,7 @@ _Codename: kees._
   address took ssh down with the trunk. Trusted addresses are now filtered as
   the feed is ingested, ahead of both the userspace store and the kernel set,
   which is what `docs/kernel-firewall.md` already claimed.
+
 - **An LCR route's `headers` can no longer forge a dialog header.** Per-route
   `headers` from the routing answer were injected onto the B-leg INVITE
   verbatim, last (after both the header policy and the number policy) and with
@@ -2190,6 +2322,7 @@ _Codename: kees._
   naming the carrier and the header. `Proxy-Authorization` stays injectable — a
   per-carrier trunk credential is a legitimate use of it. Use `number_policy` to
   reshape identity headers per carrier.
+
 - **`request.auth_user` and `call.auth_user` are writable.** They hold the
   username exactly as it appeared in the `Authorization` / `Proxy-Authorization`
   header, since that is the string the digest response was computed over.
@@ -2202,6 +2335,7 @@ _Codename: kees._
   REGISTER was answered `403` and the only way to deploy was to turn the
   anti-hijack check off entirely. Assign it only on the success path: it asserts
   an identity already proven, it does not prove one.
+
 - **A proxy-mode CDR now carries `auth_user`.** `cdr_session_from_invite` took
   the authenticated username and both of its callers passed `None`, so the
   `auth_user` field on a proxy CDR was always empty even when the script had
@@ -2212,10 +2346,12 @@ _Codename: kees._
   afterwards) is what reaches the record. The B2BUA path was already correct: it
   opens the CDR at INVITE time, before `@b2bua.on_invite` runs, and stamps the
   username on once the handler returns.
+
 - **`auth_user` no longer raises `AttributeError` on a real node.** The SDK mock
   exposed `Request.auth_user` as a writable property while the binding had only
   a getter, so a script assigning it passed pytest and failed at runtime. Mock
   and runtime now agree, on `Call` as well as `Request`.
+
 - **`cdr.file.rotate_size_mb` actually rotates.** The value was documented,
   parsed and carried into the file backend, then dropped at the write site — so
   a CDR file configured with `rotate_size_mb: 100` grew without bound. It now
@@ -2226,6 +2362,7 @@ _Codename: kees._
   billing records to enforce a size cap would be worse than the unbounded file
   this replaces. The packaged logrotate config names `cdr.jsonl` only, so it
   does not re-rotate the size-rotated siblings.
+
 - **A re-INVITE or UPDATE on a `siphon-rtp`-anchored call replaced its media
   session instead of renegotiating it.** siphon has only ever had one verb for
   an SDP offer, and on rtpengine that is correct — a repeat `offer` on a live
@@ -2244,6 +2381,7 @@ _Codename: kees._
   Covers the framework's re-INVITE and UPDATE paths and the script-facing
   `rtpengine.offer()`; rtpengine and rtpproxy still send a plain offer, so their
   wire is byte-identical to before.
+
 - **A re-offer is addressed by the media session's own engine call-id.**
   `rtpengine.offer()` used the SIP Call-ID, but a siphon-terminated transfer
   deliberately re-anchors the surviving pair on a *fresh* engine call-id while
@@ -2251,6 +2389,7 @@ _Codename: kees._
   call-id the engine had never heard of. It now uses `rtpengine_id()`, as every
   other post-offer verb already did, and no longer re-inserts the media session
   on a re-offer (which reset that id and cleared the `to_tag` the answer set).
+
 - **The one case a re-offer cannot serve falls back explicitly.** The engine
   refuses a re-offer that changes the negotiated codec — that needs a pipeline
   rebuild it will not do on a live call — and its error says to replace the call
@@ -2259,6 +2398,7 @@ _Codename: kees._
   logged at WARN naming the consequence (ports re-allocated, bridge/tee/SIPREC
   dropped) rather than performed silently, and the match is deliberately narrow
   so no other engine error can acquire a call-replacing retry.
+
 - **A challenged REFER was never retried, and its response was dropped
   entirely.** A REFER siphon originates on one of its own legs is allocated a
   fresh Via branch that belongs to no leg, and responses are matched to a call by
@@ -2272,6 +2412,7 @@ _Codename: kees._
   (REFER is a non-INVITE transaction; §17.1.2). A REFER that cannot be retried
   now clears its subscription and logs at WARN instead of leaving the transfer
   pending forever.
+
 - **A relative `script.path` now resolves against the config file's directory,
   so siphon starts under a supervisor.** It was resolved against the process
   working directory, which is the config directory when you run siphon by hand
@@ -2285,6 +2426,7 @@ _Codename: kees._
   directory keeps resolving as before; this can only make a previously-failing
   config start. `Config::from_str` is unchanged (no file to anchor on), and the
   startup log line prints the resolved path.
+
 - **The packaged systemd unit can write its state and log directories.**
   `ProtectSystem=strict` was paired with `ReadWritePaths=/var/lib/siphon` only,
   while every default write path (`cdr.file.path` at `/var/log/siphon/cdr.jsonl`,
@@ -2294,6 +2436,7 @@ _Codename: kees._
   owned by the service user, and pins `WorkingDirectory=/etc/siphon`. It also
   documents, as commented lines, the `CAP_NET_ADMIN` + `AF_NETLINK` an IMS
   P-CSCF needs for `ipsec:` sec-agree.
+
 - **A log, CDR, audit or event-sink file whose parent directory is missing now
   creates it.** Opening with `create(true)` creates the file and never the
   directory holding it, so every default path we ship — all of them inside
@@ -2304,6 +2447,7 @@ _Codename: kees._
   file, the LI audit log and the Diameter event sink. The directory is created
   only when the open actually fails with `NotFound`, so the happy path is
   unchanged and a permission error still reads as a permission error.
+
 - **The shipped logrotate config is installed, and rotates the paths siphon
   actually writes.** `etc/logrotate.d/siphon` still named `/var/log/siphon.log`
   — a path that is not writable under `ProtectSystem=strict` — and was in no
@@ -2313,6 +2457,7 @@ _Codename: kees._
   log file) and rotates `cdr.jsonl` separately *without* `copytruncate`, whose
   copy-then-truncate race can drop a billing record. `.deb` and `.rpm` also
   create `/var/log/siphon` at install time for a by-hand first run.
+
 - **The packaged unit stops restart-looping on a broken config.** siphon exits
   non-zero on a config or script error, and `RestartSec=5s` puts only two starts
   inside systemd's default 10 s window, so the default start limit never tripped
@@ -2321,6 +2466,7 @@ _Codename: kees._
   `StartLimitIntervalSec=300` / `StartLimitBurst=10`, so roughly a minute of
   failed restarts puts the unit in `failed` where `systemctl status` shows it —
   generous enough that a slow-to-appear address still recovers on its own.
+
 - **An HTTP probe on a SIP-only TCP/TLS listener was neither dropped nor
   counted.** Stream framing (RFC 3261 §18.3) measures a message by finding
   `\r\n\r\n` and reading `Content-Length` — which a well-formed HTTP request
@@ -2342,6 +2488,7 @@ _Codename: kees._
   no longer decide how much it writes into the log, and a TLS peer that
   disappears without `close_notify` — every scanner, and most browsers — logs at
   `debug` instead of `warn`.
+
 - **Extension-module startup diagnostics were being swallowed.** `siphon-bin`
   composes its extension modules at *builder* time, before `SiphonServer::run()`
   installs the tracing subscriber, so every `tracing::error!` / `warn!` in that
@@ -2351,18 +2498,21 @@ _Codename: kees._
   whose cargo feature was not compiled in never printed either. Those
   diagnostics now go to stderr, where the rest of siphon's pre-subscriber
   startup output goes, and name the offending path.
+
 - **Every digest challenge but the weakest was dropped on the wire.**
   `auth.require_*_digest` builds one challenge per algorithm — MD5 + SHA-256 +
   SHA-512-256, as RFC 7616 §3.7 asks for — so a single 401/407 serves RFC 2617
   and RFC 7616 clients alike. The response builder copied only the first value,
   so the wire carried MD5 alone and no client could negotiate up from it. All
   values are now copied, as separate header lines.
+
 - **A locally-generated B2BUA final response carried no `To` tag.** RFC 3261
   §8.2.6.2 requires a UAS to tag every response but 100, and siphon is the UAS
   on the A-leg. The 408 ring-timeout path stamped the A-leg dialog's tag but
   `call.reject()` did not, so every script-driven rejection answered a
   dialog-forming INVITE with the request's tagless `To`. Both paths now share one
   helper.
+
 - **The same address under two `listen:` protocols silently half-worked.** Every
   stream listener binds with `SO_REUSEPORT`, so configuring one address under
   both `listen.tls` and `listen.wss` (an entirely reasonable-looking way to ask
@@ -2372,6 +2522,7 @@ _Codename: kees._
   WebSocket handshake, with no error logged anywhere. That configuration now
   does what it reads like (see the multiplexed listener above), and the pairings
   that genuinely cannot share a socket are rejected at startup.
+
 - **Rf ACR-START reported no answer instant, so a CDF could not compute billable
   duration.** `Time-Stamps` (TS 32.299 §7.2.183) is what separates alerting from
   talk time, and the auto-emit path filled neither half correctly: it sampled
@@ -2382,10 +2533,12 @@ _Codename: kees._
   reading INVITE-to-BYE over-charged every call by its ring time. Both instants
   are now carried from the session that measured them, derived from its monotonic
   clock so a wall-clock step mid-call cannot invent (or negate) ring time.
+
 - **ACR-STOP timestamped the INVITE while reporting the BYE.** `Time-Stamps`
   describes the record's own trigger request, so a STOP whose `Event-Type` says
   BYE must timestamp the BYE — it carried the INVITE instant forward from the
   START instead, leaving the two AVPs describing different events minutes apart.
+
 - **A failed call produced no Rf record whatsoever.** No accounting session is
   opened for an INVITE that never gets a 2xx, and nothing else was emitted
   either, so an unanswered or rejected call was simply absent from the stream —
@@ -2396,6 +2549,7 @@ _Codename: kees._
   excluded — the UA re-sends against a challenge and the retry is the same call
   attempt — while 487 is included, a caller who hung up during alerting being a
   real unsuccessful setup.
+
 - **No IMS ACR carried a `Subscription-Id`**, so every CDR landed with no billable
   subscriber on it and the collector had to resolve the IMPU out-of-band, which
   only works for subscribers it has provisioned. Records now carry one typed
@@ -2403,6 +2557,7 @@ _Codename: kees._
   `+E.164` → END_USER_E164, IMPUs → END_USER_SIP_URI), and `rf_acr_*` gained
   `subscription_id` / `subscription_id_type` kwargs — each accepting one value or
   a list — for scripts that hold an IMSI the SIP layer cannot derive.
+
 - **A multi-valued `P-Asserted-Identity` was concatenated into one
   `Calling-Party-Address`.** The whole header value was reduced by taking its
   first `<` and last `>`, so a subscriber asserting an IMPU, a `tel:` alias and an
@@ -2413,10 +2568,12 @@ _Codename: kees._
   on commas outside angle brackets and quoted display names. The same parse fixes
   a bracketed URI carrying its own parameters, which used to be truncated at the
   first `;`.
+
 - **The served party on a terminating record was the caller.** `User-Name` was
   taken from the calling party regardless of role, so the callee's own record
   identified whoever placed the call. It now follows `Role-Of-Node` per
   TS 32.260 §5.1 — caller on originating, callee on terminating.
+
 - **An intra-node call opened two terminating accounting records and only ever
   stopped one.** `rf_sessions` gains its entry after the CDF answers ACR-START,
   but the dedupe gate ran before the spawn, and the two legs of such a call are
@@ -2427,10 +2584,12 @@ _Codename: kees._
   tick until the 24h backstop, ~288 junk records per affected call. The key is
   now reserved synchronously for the duration of the round-trip, and released on
   every exit path so a CDF rejection cannot wedge it.
+
 - **The orphan sweep dropped an Rf session's map entry without releasing the
   session.** Its ACR-INTERIM timer and its `siphon_rf_sessions` slot both
   outlived the entry, so a reaped record kept emitting INTERIMs against a call
   nothing was tracking any more. The sweep now claims the stop as it goes.
+
 - **A UAS-mode B2BUA answer carried no `Contact`, so no in-dialog request could
   be addressed to it.** RFC 3261 §12.1.1 / §13.3.1.4 require a dialog-establishing
   response to carry the Contact the UAC builds its remote target from. The
@@ -2441,10 +2600,12 @@ _Codename: kees._
   arrives unparseable, and the call is only released when a timer fires. Host and
   port now resolve exactly as the relayed path resolves them, so the Contact names
   the listener the INVITE actually arrived on rather than the first-configured one.
+
 - **A SIPp scenario that timed out reported success.** `run_sipp` in
   `scripts/run-tests.sh` exempted exit code 255, which is precisely what SIPp
   returns when a scenario times out — including when an assertion fails and the
   call never completes. Any hanging scenario was green.
+
 - **The extension binary picks up the SMPP bind-handshake fix.** `siphon-bin/`
   moves its `siphon-smpp` pin to v1.5.1, which carries smpp34 1.4.1: both sides
   read the bind handshake with a single `read()` and rejected the buffer when
@@ -2456,6 +2617,7 @@ _Codename: kees._
   server task for the process lifetime), and moves `h2` to 0.4.16 for
   RUSTSEC-2026-0258 (unbounded empty DATA frames), which reaches that graph
   through the HTTP extension.
+
 - **The two excluded workspaces are now covered by the security audit.**
   `siphon-bin/` and `siphon-control-sdk/` are standalone workspaces with their
   own `Cargo.lock`, so the scheduled `cargo-deny` run — which resolves the
@@ -2473,6 +2635,7 @@ _Codename: kees._
   it was introduced. `advisories` stays on the weekly schedule (plus `main`),
   because a fresh RustSec advisory can land against an unchanged dependency and
   must not turn a green pull request red on untouched code.
+
 - **A branch the proxy failed itself no longer outranks a real answer from a
   sibling branch.** Now that a transport error becomes a 503 and a timeout a
   408, straight class ordering (5xx beats 4xx) handed a branch that never left
@@ -2482,6 +2645,7 @@ _Codename: kees._
   proxy's plumbing, not the callee, so any peer-originated response is now
   preferred; ordering among real responses is unchanged, and a fork where every
   branch failed locally still forwards its best synthesized error.
+
 - **`call.fork()` and `call.dial()` now route a binding through its RFC 3327
   Path.** The B2BUA builds a fresh B-leg INVITE, and it was sent to the
   callee's Contact URI — the address the Path exists to route around (NAT,
@@ -2503,6 +2667,7 @@ _Codename: kees._
   as both registrar and B2BUA never honoured a Path at all. A binding with no
   Path still routes over its flow, so connection reuse for a directly-registered
   WebSocket callee (RFC 5626 §5.3 / RFC 7118 §5) is unchanged.
+
 - **A proxied request whose branch never got an answer now gets one.** Two
   independent paths ended at a `warn!` and told nobody, so the upstream UAC sat
   on its `100 Trying` until its own Timer F — 32 s of silence for a failure the
@@ -2526,12 +2691,14 @@ _Codename: kees._
     its live branches, a sequential fork advances to the next target, and
     `@proxy.on_reply` / `@proxy.on_failure`, CDR finalisation and the
     server-transaction handoff all run unchanged.
+
 - **A 503 is no longer forwarded upstream; the proxy sends 500 instead**
   (RFC 3261 §16.7 step 6), and drops the `Retry-After` that described the
   unavailable downstream. A 503 says *this next hop* is unavailable, and a UAC
   that saw it would take the whole proxy out of service. Locally generated
   finals (`request.reply(503)`, `reply.reject(503)`) are unaffected — they are
   not responses the proxy is forwarding on behalf of a branch.
+
 - **The reg-event NOTIFY a UE receives is now a conformant in-dialog request.**
   Two independent defects made it one a strict baseband rejects; measured, a
   handset validating it de-registered itself 21–32 s after each successful
@@ -2567,6 +2734,7 @@ _Codename: kees._
     document. The UE-facing capability surface is RFC 6809 `Feature-Caps` on the
     REGISTER 200 OK, which also reaches UEs that never subscribe to the reg
     event package.
+
 - **A terminating request can now fail over between the bindings of one AoR.**
   An AoR with more than one live binding where only one was reachable was
   undeliverable for the full lifetime of the dead binding — observed as a
@@ -2608,12 +2776,14 @@ _Codename: kees._
     ordered by recency; remaining `expires` is not a substitute, since a UE
     that asked for 600 s and registered a second ago has less time left than
     one that asked for 3600 s an hour ago.
+
 - **The 2xx ACK was relayed once per fork branch,** all resolving to the one UAS
   that answered, because the ACK path iterated the session's client branches
   (a comment there assumed "typically just one"). A 2xx ACK is a new request
   routed by the dialog route set (RFC 3261 §13.2.2.4) and belongs to exactly one
   remote target; a strict UAS treats the duplicate as an out-of-sequence request
   on a dialog it has already confirmed. Now sent once per distinct resolved hop.
+
 - **`registrar.lookup()` did not sort,** despite its own documentation and both
   sibling lookups promising q-value order — it returned backend insertion order
   (oldest first). It now returns highest q first (RFC 3261 §20.10), and within
@@ -2621,6 +2791,7 @@ _Codename: kees._
   sends q, recency is what actually orders a real AoR's bindings, which is the
   right default when a subscriber's SIM has moved to a new handset and the
   previous binding is still inside its granted expiry.
+
 - **A binding's Path now outranks its captured inbound flow when routing a fork
   branch.** A binding registered *through* a proxy is reached via its Path
   vector; the captured flow answers the narrower "the Contact URI is
@@ -2629,6 +2800,7 @@ _Codename: kees._
   token that identifies which binding the request is for. With no Path the flow
   is unchanged — still the only way back to a WebSocket UE (RFC 5626 §5.3 /
   RFC 7118 §5).
+
 - **B2BUA-originated requests are now retransmitted per RFC 3261 §17.1 on
   unreliable transports.** The proxy datapath relays through the transaction
   layer and so has always had Timer A (INVITE, §17.1.1.2) and Timer E
@@ -2660,6 +2832,7 @@ _Codename: kees._
   what makes it work on a flow-dialled leg: the kernel XFRM selector matches only
   the protected client port, so a retry that fell back to the default listener
   would go out unprotected and be dropped (3GPP TS 33.203 §7.4).
+
 - **A `relay(flow=…)` INVITE's Timer A retransmits no longer leave the wrong
   socket.** The proxy relay and fork paths pinned `source_local_addr: None` on
   their client-transaction timer entries, so while the first send went out the
@@ -2668,6 +2841,7 @@ _Codename: kees._
   the IPsec SA on a multi-listener host. Retransmits now resolve the same egress
   socket the original send did (captured flow, then IPsec auto-source, then a
   script `send_socket=` pin).
+
 - **Flow-pinned sends are now visible.** A request sent over a captured flow
   (`call.dial(flow=…)` / `relay(flow=…)`) bypasses the normal egress helper, and
   with it that helper's HEP capture — so a flow-pinned B-leg INVITE was the one
@@ -2675,12 +2849,14 @@ _Codename: kees._
   additionally logs its destination, source socket, transport and size at debug
   level. Nothing on that path logged before, which made an absent send line easy
   to misread as the request never having been handed to the transport.
+
 - **`docs/media-engines.md` claimed SIPREC/MPTY subscriptions were unimplemented
   on `siphon-rtp` and would surface an engine error.** They have been wired on
   all three backends since the native backend shipped; the page was steering
   people away from a working path. The same page's "media profiles are identical
   across backends" statement is now qualified with the per-engine capability
   table.
+
 - **SIP parser: four RFC 3261 grammar defects, found by importing the RFC 4475
   torture corpus.** All four are on the receive path used for every inbound
   datagram, so each one meant dropping a message that the RFC requires an
@@ -2701,6 +2877,7 @@ _Codename: kees._
     (`nobodyKnowsThisScheme:...`, `soap.beep://...`) is syntactically valid and
     §8.2.2 requires a 416 Unsupported URI Scheme — which could not be sent,
     because the message failed to parse first.
+
 - **An in-dialog request for a B2BUA call that was just torn down is answered
   `481 Call/Transaction Does Not Exist` instead of being silently dropped
   (RFC 3261 §12.2.2, §15.1.2).** Hang-up glare — both parties send BYE within a
@@ -2791,6 +2968,7 @@ _Codename: kees._
   session-timer refresh, bridged re-INVITE/UPDATE — both leaves from it and
   advertises it. B-legs without a flow, and every single-listener deployment, are
   byte-for-byte unchanged.
+
 - **An initial NOTIFY could overtake the 2xx that accepted its subscription.**
   A script that replies to a SUBSCRIBE and then calls `subscribe_state.notify()`
   / `presence.notify()` had the reply and the NOTIFY enqueued as two independent
@@ -2802,6 +2980,7 @@ _Codename: kees._
   addressed to the same peer as the reply now leave as ordered followups of it.
   Deferred messages for any other peer are unaffected and still go out at the end
   of the request.
+
 - **A completed transfer could BYE the referrer before telling it the transfer
   succeeded.** At the end of a siphon-terminated REFER the B2BUA sends the
   referrer a terminating `NOTIFY` (sipfrag `200 OK`,
@@ -2812,6 +2991,7 @@ _Codename: kees._
   never learning the outcome of the transfer it requested — RFC 3515 §2.4.4
   makes that NOTIFY the result report, and RFC 5589 §6 shows it ahead of the
   BYE. The pair now travels as one ordered unit when both target the same flow.
+
 - **REFER `202 Accepted` could be overtaken by its own first NOTIFY on UDP.**
   On a siphon-terminated transfer the B2BUA answers `202` and immediately sends
   the `message/sipfrag` `NOTIFY (100 Trying)` that opens the implicit
@@ -2827,6 +3007,7 @@ _Codename: kees._
   unchanged. This was also the cause of the intermittent
   `sipp-b2bua-refer` CI failure (`while expecting '202' … received 'NOTIFY'`).
   Regression-guarded by a multi-worker UDP ordering test.
+
 - **A proxy addressed by IP no longer 404s every in-dialog request.** Route
   recognition (RFC 3261 §16.4 — remove the top Route only when it "indicates
   this proxy") matched the Route host against `domain.local` alone, but
@@ -2843,11 +3024,13 @@ _Codename: kees._
   list, still used for `ruri.is_local` and the Rf/Ro charging role, and still
   honoured as an any-port alias so deployments that worked around this by adding
   their own address to it need no change.
+
 - **Dual-stack and multi-listener deployments are covered.** The dispatcher's
   per-transport listen/advertise maps keep only the *first* listener of each
   transport, so a dual-stack Gm P-CSCF's IPv6 listener — and any second listener
   with its own `advertise` — was absent from the identity. Route recognition now
   reads the full listener registry, the same source loop detection already used.
+
 - **The 2xx ACK no longer strips a Route belonging to a downstream proxy, or
   drops itself.** The ACK path popped the top Route whenever it carried `;lr`
   without checking the Route identified siphon, sending the ACK one hop too far
@@ -2856,11 +3039,13 @@ _Codename: kees._
   dialog's route set. This also closes a way for the ACK to be lost outright: an
   unrecognised self-Route became the computed next hop, which the loop guard
   then correctly identified as siphon and silently discarded.
+
 - **A Route at one of siphon's own addresses on a port it does not serve is no
   longer consumed.** Matching ignored ports, so a proxy co-located on the same
   address (an S-CSCF on `:6060` beside a P-CSCF on `:5060`) had its Route
   stripped too, bypassing it entirely. Matching is now port-aware against the
   ports siphon binds, including the IPsec protected ports.
+
 - **The shipped scripts no longer reject an in-dialog request routed via another
   proxy.** `scripts/proxy_default.py` and ten example scripts answered
   `404 Not Here` whenever `request.loose_route()` returned `False`, but a `False`
@@ -2871,6 +3056,7 @@ _Codename: kees._
   requests it should have forwarded. All twelve sites now loose-route and
   forward unconditionally; the only remaining `404` is `registrar_proxy.py`'s
   genuine "no contacts registered" case.
+
 - **CI now covers Route self-identity on the wire.** A new `sipp-route-selfid`
   job runs `scripts/route_selfid_test.sh` against a config whose `domain.local`
   holds only the served domain — the shape of a proxy addressed by IP. The
@@ -2880,6 +3066,7 @@ _Codename: kees._
   domains alone. The check is deterministic and needs no capability: the UAC
   waits for a 200 to its in-dialog BYE, which only arrives if the self-Route was
   consumed and the request relayed.
+
 - **`request.loose_route()` fails closed.** On the `@proxy.on_reply` /
   `on_failure` / `on_cancel` handler paths the request carried no self-identity
   at all, and `loose_route()` popped any `;lr` Route unconditionally — the same
@@ -2917,6 +3104,7 @@ _Codename: kees._
   carries, it does not select one — so siphon logs a warning at boot naming any
   profile that asks for it there. An unrecognised value fails the config load
   rather than being passed to an engine that would drop it silently.
+
 - **`listen.mtu` — RFC 3261 §18.1.1 UDP→TCP fallback for oversized requests.**
   When `listen.mtu` is set, an outbound SIP *request* built for UDP whose
   serialised length exceeds `mtu − 200` bytes is relayed over TCP instead — but
@@ -2930,6 +3118,7 @@ _Codename: kees._
   side is unchanged. Default is off (no behaviour change on a bump); IMS
   deployments set `1280` (the IPv6 minimum MTU). Family-agnostic — works for v4
   and v6 next hops. Kamailio analog: `udp_mtu` + `udp_mtu_try_proto=TCP`.
+
 - **Dual-stack (IPv4 + IPv6) P-CSCF — per-family Gm identity.** A P-CSCF can bind
   a v4 and a v6 Gm listener set at once and now stamps the family-matching local
   identity on each UE's signalling instead of collapsing to the first configured
@@ -2944,6 +3133,7 @@ _Codename: kees._
   explicit per-family listeners, each with an optional per-listener `advertise`
   (see `examples/ims_pcscf.yaml`). Core-side (Mw / outbound) dual-stack is a
   separate follow-up.
+
 - **WhatsApp Business Calling gateway example.** WhatsApp's Business Calling API
   is SIP-over-TLS to `wa.meta.vc`, so SIPhon bridges WhatsApp voice to an internal
   SIP/IMS network as a B2BUA in both directions with no new protocol code — a TLS
@@ -2958,6 +3148,7 @@ _Codename: kees._
   SDK fix along the way: the `Call` mock's `set_from_user()` / `set_ruri_user()`
   now mutate the parsed URI (they previously did string ops on a `SipUri` and
   raised), matching `set_to_user()`.
+
 - **Docker Compose quickstart + Getting started guide.** A root
   `docker-compose.yaml` runs the published image with your `siphon.yaml` and
   `scripts/` bind-mounted (host networking, hot-reload, a SIP `OPTIONS`
@@ -2965,13 +3156,16 @@ _Codename: kees._
   with nothing to build. A new `Getting started` docs page leads with that path
   and folds in the native/`.deb`/`.rpm` options plus the common Ubuntu build
   gotchas (old `apt` rustc, missing `python3-dev`).
+
 - **SDK: `Request.remove_headers_matching(prefix)`** in the `siphon-sip` mock,
   mirroring the production request method (it was only on the `call` mock), so
   script unit tests can exercise header-prefix stripping on a proxy request.
+
 - **Cookbook recipes: SIP & SDP manipulation (HMR), Number routing (LNP +
   redirect server), and Quick recipes** (common-case snippets), plus a runnable
   `examples/number_routing.py`. The existing Least-Cost Routing recipe is now
   wired into the docs-site navigation.
+
 - **Least-Cost Routing (LCR) — B2BUA-only.** A new `lcr` scripting namespace
   (`await lcr.route(call)`) queries an external HTTP JSON API for an ordered
   carrier decision (the API owns cost/order; siphon is not a rating engine),
@@ -2995,10 +3189,12 @@ _Codename: kees._
   by design (dialog hygiene, per-carrier media, charging). Example:
   `examples/lcr_b2bua.py` + a FastAPI reference API `examples/lcr_api_server.py`;
   SDK contract models in `siphon_sdk.lcr`.
+
 - **`call.fork(strategy="sequential")` now actually fails over.** The strategy
   was previously ignored (every target was rung in parallel); it now tries the
   targets one at a time, advancing on failure, via the same engine as
   `call.route(...)`.
+
 - **Diameter Ro online charging (prepaid), reserve-before-connect.** A B2BUA
   reserves credit with a Credit-Control CCR-INITIAL in `@b2bua.on_invite` via
   `await call.ro_authorize()` BEFORE the B-leg is dialed: a grant dials, a denial
@@ -3014,20 +3210,24 @@ _Codename: kees._
   mid-call teardown needs session ownership, which is why 3GPP triggers Ro at the
   AS/MMTel-AS, not the P-CSCF. Interoperates with CGRateS. New cookbook
   `docs/cookbook/online-charging-ocs.md` + example `scripts/b2bua_ro_charging.py`.
+
 - **The Ro credit-control scripting methods are now async** (`await`-able):
   `diameter.ro_ccr_initial` / `ro_ccr_update` / `ro_ccr_terminate` / `ro_ccr_event`
   and `call.ro_authorize()` return coroutines, so a slow OCS round-trip runs off
   the Python driver thread instead of blocking it. Mirrored in the `siphon-sip`
   SDK mock (`set_ro_result_code` / `set_ro_granted_time` / `captured_ccrs`).
+
 - **`siphon_rf_sessions` / `siphon_ro_sessions` metrics** — gauges of live Rf
   accounting and Ro credit-control sessions (START/INITIAL without a matching
   STOP/TERMINATION); a monotonic climb under a steady, completed-call workload
   flags a charging-session leak.
+
 - **B2BUA call transfer (REFER, RFC 3515 / 3891 / 5589) with three modes.**
   `@b2bua.on_refer(call)` handles an in-dialog REFER on a tracked call (single
   arg, no reply object, REFER is a request). read the target off `call.refer_to`
   and, for attended transfers, `call.refer_replaces` (Replaces dict:
   `call_id` / `from_tag` / `to_tag` / `early_only`).
+
 - **`call.accept_refer(target=None, next_hop=None, mode=None)`** accepts a
   transfer in one of three modes: `"terminate"` (siphon-terminated, the default)
   answers `202` and the sipfrag NOTIFYs itself, re-resolves `Refer-To` through the
@@ -3036,18 +3236,22 @@ _Codename: kees._
   dialog and relays its `202` + `message/sipfrag` NOTIFYs back to the referrer;
   `None` uses `b2bua.default_refer_mode`. `target=` rewrites the destination and
   `next_hop=` steers egress. `call.reject_refer(code, reason)` declines.
+
 - **siphon-originated (outbound) REFER.** `call.refer(target, replaces=None)`
   sends a REFER deferred from a `@b2bua.*` handler that holds a `call`;
   `b2bua.refer(call_id, target, replaces=None)` is the imperative twin for event
   callbacks that only have a `call_id` (e.g. `@rtpengine.on_dtmf`). use for
   IVR / TAS offload: answer, play a prompt, then hand the caller off.
+
 - **`b2bua.default_refer_mode` config knob** (`terminate` | `transparent`,
   default `terminate`) sets the mode used when `accept_refer(mode=None)`.
+
 - **proxy-mode REFER passthrough** is documented and covered by a SIPp test: in
   proxy mode an in-dialog REFER is loose-routed to the far end (record-route
   required) and its `202` + sipfrag NOTIFYs relay straight back, so the transfer
   runs endpoint-to-endpoint with no siphon-side state. no code change (the generic
   in-dialog branch already handled it); the loop fix below is B2BUA-only.
+
 - **terminate-mode transfer now re-anchors media correctly.** the transfer target
   is offered the **surviving** party's media (not the referrer's, who is being
   dropped), and the survivor is re-INVITEd with the target's answer, so RTP is
@@ -3055,21 +3259,25 @@ _Codename: kees._
   siphon-rtp) siphon re-anchors the survivor↔target pair on a fresh media session
   and tears down the old survivor↔referrer anchor, keeping the anchor in the media
   path across the transfer (LI / transcoding / NAT preserved).
+
 - **siphon now owns the SDP `o=` line per leg** (a stable session-id with a
   monotonic version) on every offer/answer it emits into a B2BUA dialog. a
   re-anchor (transfer, hold) presents a strictly greater version under the same
   session identity, so a strict RFC 3264 §8 answerer re-negotiates cleanly rather
   than reading a changed offer as unchanged. previously the peer's `o=` was passed
   through with only the username masked.
+
 - **Dashboard charts now have a scale and hover history** (experimental web UI).
   Each sparkline draws its actual y-axis min/max on-chart, and hovering any point
   shows a tooltip with the exact value and how long ago it was sampled, so a dip
   reads as a real number instead of an unlabelled wiggle. Memory is shown to one
   decimal (MB) so a sub-MB change tracks the line instead of looking frozen.
+
 - **Overview flags gateway trouble at a glance** — a "Gateway groups" line in the
   Connections & health block shows how many groups have an unhealthy destination
   (green when all healthy, amber with a count when not), click-through to the
   Gateways view. Backed by a new `gateways` summary in `GET /admin/metrics.json`.
+
 - **Gateways view shows missed health-checks** — a destination that has failed
   consecutive probes shows an `n/threshold missed` badge (amber while still up as
   an early warning, red once down). `GET /admin/gateways` destinations gain
@@ -3082,11 +3290,13 @@ _Codename: kees._
   for any real deployment** — a wildcard-bound siphon with no `advertised_address`
   auto-detects a routable interface, which on a multi-homed host (LAN + docker +
   VPN) can be the wrong one.
+
 - **B2BUA answer-timeout is now honored within ~0.5s of the deadline** (was up to
   30s late). The `call.fork`/`call.dial`/`call.route` `timeout=` check moved off
   the 30s orphan sweep onto a dedicated 500ms interval, so a short per-carrier LCR
   ring timeout ("try carrier X for N seconds, then re-route") re-routes promptly
   instead of stalling the call.
+
 - **Calls view shows both the caller and the dialed callee.** Previously it showed
   the A-leg From (which is actually the dialed identity, not the caller) and the
   B-leg target, so a bridged call looked like it only had one side. `GET /admin/calls`
@@ -3106,6 +3316,7 @@ _Codename: kees._
   an untagged `From` gains a generated tag (display name and existing params
   kept), and a request with no `From` at all is given one built from the
   advertised identity. The compact `f` form is handled identically.
+
 - **B2BUA auto-PRACK for a reliable provisional now routes to the early-dialog
   remote target (the UE `Contact`), not the To AoR.** When the B-leg answered
   preconditions with a reliable `183` (`Require: 100rel`), the auto-PRACK's
@@ -3118,12 +3329,14 @@ _Codename: kees._
   §12.1.2). Forked early dialogs (several `18x` with distinct To-tags/Contacts on
   one INVITE branch) are each PRACKed to their own Contact, with per-dialog PRACK
   de-duplication keyed on the remote To-tag (their RSeq spaces are independent).
+
 - **B2BUA B-leg answer-timeout no longer panics a worker thread.** The
   answer-timeout sweep runs in the dispatcher's async loop (a tokio worker) and
   fires an async `@b2bua.on_failure`; the synchronous dispatch used a bare
   `block_on`, which panics "Cannot start a runtime from within a runtime" on a
   worker thread. It now yields the worker (`block_in_place`) before blocking, so
   the timeout handler runs instead of the worker panicking.
+
 - **B2BUA answer / provisional handling is now race-free under concurrent
   dispatch.** Two check-then-set decisions read a `call_state` snapshot taken
   early in response handling but committed the new state only ~1600 lines later,
@@ -3137,6 +3350,7 @@ _Codename: kees._
   lock (`try_win` / `try_mark_ringing`). Loopback is too fast to expose these,
   but a real TCP trunk with network latency at high call rates widens exactly
   that window.
+
 - **B2BUA auto-PRACK now carries the early-dialog To-tag** (RFC 3262 §4 / RFC 3261
   §12.1.2). When the B-leg sent a reliable provisional (`18x` with `Require:
   100rel`), siphon built the PRACK's `To` from the dialog's remote tag — but that
@@ -3147,6 +3361,7 @@ _Codename: kees._
   establishes the early dialog, so its To-tag (and route set, already handled) is
   now captured onto the B-leg before the PRACK is built. The SIPp reliable-prov
   scenario now asserts the PRACK's To-tag, which is why this slipped through.
+
 - **B2BUA no longer mis-handles a cancelled B-leg during failover** (surfaced by
   LCR ring-timeout reroute; also affects any CANCEL-then-answer-a-different-leg
   flow). Three fixes: (1) a `2xx` to a B-leg CANCEL shares the INVITE's top Via
@@ -3158,12 +3373,14 @@ _Codename: kees._
   instead of forwarded (and no longer downgrades the confirmed dialog to Ringing).
   (3) A straggler non-2xx from a cancelled/losing carrier after answer is ACKed
   and absorbed rather than torn down toward the caller.
+
 - **Diameter Session-Id uniqueness under concurrency** — `new_session_id` read
   the Hop-by-Hop/End-to-End counters without reserving them, so two requests
   built concurrently could mint the *same* Session-Id, collapsing two accounting
   or credit-control sessions into one at the CDF/OCS (cross-charging; one STOP
   ending both). Session-Ids now come from a dedicated atomic sequence with a
   wall-clock-seeded high part (RFC 6733 §8.8). Affects Rf and Ro.
+
 - **Diameter charging AVP codes corrected to RFC 8506 / IANA** — the
   Credit-Control (Ro/Gy) AVP dictionary used a self-consistent but non-standard
   numbering (e.g. Granted-Service-Unit, CC-Time, CC-Total-Octets, Final-Unit-*,
@@ -3172,28 +3389,33 @@ _Codename: kees._
   values a real OCS expects, so Ro requests interoperate instead of being
   rejected/misparsed. A known-answer test pins every code to the registry.
   **Wire-affecting** for anyone already driving Ro/Gy from scripts.
+
 - **Diameter offline-charging (Rf) SMS AVP codes** — SMS-Result (was 3408 =
   SM-Sequence-Number, now 3409) and MTC-IWF-Address (was 3413, now 3406) are
   emitted on the correct codes, so a CDF parses the SMS record fields instead of
   mislabeling them.
+
 - **CER application advertisement** — the Rf accounting application (id 3) was
   advertised as an `Auth-Application-Id` inside a `Vendor-Specific-Application-Id`
   with `Vendor-Id: 0`, two RFC 6733 violations that make strict peers
   (go-diameter/CGRateS) answer `DIAMETER_NO_COMMON_APPLICATION`. Accounting apps
   are now advertised via `Acct-Application-Id`, and base (vendor-0) apps are no
   longer wrapped in a VSAI.
+
 - **Rf accounting hardening** — IMS-Information and SMS-Information now nest under
   a single `Service-Information` (TS 32.299 §7.2.87 allows only one, was two);
   the non-conformant `User-Session-Id` directly under `Service-Information` is
   dropped; a rejected ACR-START no longer opens a local session or INTERIM timer;
   an explicit `Acct-Interim-Interval: 0` from the CDF is honored; and an
   abandoned session (no ACR-STOP) is released by a max-lifetime backstop.
+
 - **in-dialog REFER on a tracked B2BUA call no longer proxy-relays and can no
   longer loop.** a REFER arriving inside a bridged B2BUA dialog used to fall
   through to the proxy relay path, which could bounce it back through the same
   B2BUA and loop. it is now intercepted at the B2BUA and dispatched to
   `@b2bua.on_refer`. with no `@b2bua.on_refer` handler registered siphon rejects
   it locally with `603 Decline` and relays nothing (loop-safe default).
+
 - **B2BUA rtpengine session cleanup on a B-leg-originated BYE.** the media-session
   safety-net delete keyed on the incoming BYE's Call-ID, which is not the store
   key (the A-leg Call-ID) when the BYE comes from the callee (or from the
@@ -3215,25 +3437,30 @@ _Codename: kees._
   default**; the plain `cargo build` leaves it off, so any library consumer pulls
   none of it. Serving the dashboard logs an EXPERIMENTAL warning; a binary built
   without `--features ui` warns and serves nothing when `admin.ui.enabled` is set.
+
 - **`GET /admin/metrics.json`** — a curated JSON snapshot of the live gauges and
   counters (SIP, memory, Python executor, Diameter, rtpengine, SBI, security),
   intended for the dashboard and any custom tooling that would rather not parse
   the Prometheus text format. Cumulative counters are exposed raw so a client
   diffs them over time to derive rates.
+
 - **`GET /admin/gateways`** — per-group gateway dispatcher status: every
   configured group with its algorithm and each destination's health, weight,
   priority, address, transport, and attributes, read from the shared dispatcher
   (no new state or probing). Surfaced as a Gateways panel on the dashboard's
   Integrations page.
+
 - **`POST /admin/gateways/{group}/{destination}/{up|down}`** — manually mark a
   gateway destination up or down (drain a bad carrier from the dashboard, then
   restore it), with a per-destination button on the Gateways panel. Mutating, so
   it requires the admin bearer token.
+
 - **`GET /admin/calls`** — active B2BUA calls (internal id, SIP Call-ID, state,
   A-leg From, B-leg target, and B-leg count), read from the dispatcher's call
   store. Surfaced as a dedicated Calls view on the dashboard (which now groups
   the nav into Monitor / Routing / System, with Gateways in its own Routing
   section). Empty on a proxy-only node.
+
 - **Bearer-token auth for the admin API** (`admin.auth.token`). When set, every
   mutating route (`POST`/`PUT`/`PATCH`/`DELETE` — force-unregister, lift-ban,
   gateway up/down) requires `Authorization: Bearer <token>`, compared in
@@ -3286,6 +3513,7 @@ _Codename: bjorn._
   emits no CORS headers, so same-origin callers and Prometheus scrapers are
   unaffected. The layer also answers CORS preflight (`OPTIONS`) requests, so a
   dashboard that sends custom headers or hits the admin `DELETE` routes works.
+
 - **Scripts can `import` sibling `.py` helper modules.** A script's own directory
   is now added to the Python `sys.path`, so `import helpers` resolves a
   `helpers.py` sitting next to the main script — no `sys.path.insert` boilerplate.
@@ -3297,6 +3525,7 @@ _Codename: bjorn._
   absolute imports are supported (the script is not a package, so `from . import`
   does not work), and the "no cross-request module state" rule applies to helper
   modules too.
+
 - **`gateway.groups[].source_networks` + `call.source_ip_in(cidr_list)`** — source
   membership for a peer that sends SIP from a whole published subnet, not only the
   IPs its signalling FQDNs resolve to. `from_gateway` matches the source IP against
@@ -3309,6 +3538,7 @@ _Codename: bjorn._
   `call.source_ip_in(["203.0.113.0/24"])` is the B2BUA counterpart of
   `request.source_ip_in` for gating on ranges inline without a gateway group.
   Mirrored in the SDK mock.
+
 - **`presence.refresh(subscription_id, expires)` + `presence.find_by_dialog(call_id, from_tag)`** —
   the two pieces needed to handle an in-dialog SUBSCRIBE (RFC 6665 §4.4.1) as a
   notifier. `find_by_dialog` resolves a subscription id from an in-dialog
@@ -3338,6 +3568,7 @@ _Codename: bjorn._
   Matching on the contact recovers it, so a script can guard
   `if not registrar.lookup_contact(str(call.ruri)): call.reject(404, …)` before
   dialing. AS-side capability records are excluded, matching `lookup`.
+
 - **E.164 number normalization for identity headers — the `numbers` namespace,
   `request.rewrite_identities()` / `call.rewrite_identities()`, and
   `call.dial(number_policy=…)` / `call.fork(number_policy=…)`.** One call
@@ -3359,6 +3590,7 @@ _Codename: bjorn._
   that preserve `index`, `reason`, the embedded escaped `cause`, entry ordering,
   and privacy-restricted entries (`respect_privacy`). Mirrored in the
   `siphon-sip` SDK (`numbers` mock + `rewrite_identities` / `number_policy=`).
+
 - **`reply.from_gateway(group)` / `reply.source_ip` / `reply.source_port`** —
   source-membership predicate on the response path, the reply-side counterpart of
   `request.from_gateway` / `call.from_gateway` (Kamailio `ds_is_from_list()` /
@@ -3372,6 +3604,7 @@ _Codename: bjorn._
   best-effort direction hint on UDP). Returns `False` / `None` where no single
   source applies — e.g. a fork-aggregated `@proxy.on_failure` reply. Mirrored in
   the SDK mock.
+
 - **Media CDR from the engine's end-of-call summary** — on the native
   `siphon-rtp` backend (`siphon-rtp-proto` 0.1.4), the engine now pushes a
   structured `CallSummary` event when it tears a call down. When `cdr.auto_emit`
@@ -3387,6 +3620,7 @@ _Codename: bjorn._
   `media_duration_ms` accompany the standard `duration_secs`. Unmeasured fields
   are omitted, not emitted empty. The rtpengine / rtpproxy backends do not
   surface this event, so no media CDR is written there.
+
 - **`call.dial(..., auth_passthrough=True)` / `call.fork(..., auth_passthrough=True)`** —
   relay B-leg authentication to the caller end-to-end instead of siphon answering
   it (RFC 3261 §22.3), for device-driven proxy auth where the endpoint (not siphon)
@@ -3398,6 +3632,7 @@ _Codename: bjorn._
   tearing down the anchored media, so the caller can authenticate and re-INVITE.
   Mutually exclusive with `set_credentials()`; if both are set the stored
   credentials win (siphon answers the challenge itself). Mirrored in the SDK mock.
+
 - **`rtpengine.answer_local(call, profile=None, auto_reject=True)`** — single-leg
   UAS answer for the caller's own offer, with the media engine as the far side
   (IVR / echo / announcement server). Unlike `answer()` it takes the INVITE offer,
@@ -3412,6 +3647,7 @@ _Codename: bjorn._
   it raises `ValueError` instead, leaving the response to the script. Native
   `siphon-rtp` backend only (`siphon-rtp-proto` 0.1.3 `AnswerLocal`); rtpengine
   and rtpproxy reject it.
+
 - **`rtpengine` media verbs now accept a `(call_id, from_tag)` tuple or a bare
   `call_id` string** as their target, in addition to a `Request`/`Reply`/`Call`
   object — `play_media`, `stop_media`, `play_dtmf`, `silence_media` /
@@ -3419,6 +3655,7 @@ _Codename: bjorn._
   `@rtpengine.on_dtmf` handler (which is handed `call_id` / `from_tag` strings,
   not a SIP message) drive media directly, e.g. `await rtpengine.play_dtmf((call_id, from_tag), "1")`.
   A bare string uses an empty from-tag (best-effort).
+
 - **`b2bua.terminate(call_id, reason="Normal Clearing") -> bool`** — imperative
   hangup of a B2BUA call by SIP Call-ID. Unlike `call.terminate()` (deferred
   until its own handler returns, so a no-op from an out-of-band event), this acts
@@ -3431,6 +3668,7 @@ _Codename: bjorn._
   unknown or already gone, so an IVR racing a caller-initiated BYE is a clean
   no-op. The BYE carries an RFC 3326 `Reason: Q.850;cause=16` header with the
   supplied text.
+
 - **`call.progress(code, reason, body=None, content_type=None)`** — imperative
   UAS provisional (18x) for a B2BUA call: send a `183 Session Progress` with
   early-media SDP, or a `180 Ringing`, immediately from a handler, without
@@ -3480,6 +3718,7 @@ _Codename: bjorn._
   hops are unaffected (a bare `IP:port` already skips DNS; an unknown host still
   resolves normally). Enable probing on the group (the default) so the cache stays
   fresh.
+
 - **HEP/Homer captures no longer report siphon's own side as `0.0.0.0`.** When
   siphon binds to the wildcard address (`listen.udp: 0.0.0.0:5060`, the usual
   production config), every captured leg carried siphon's endpoint as the raw
@@ -3491,6 +3730,7 @@ _Codename: bjorn._
   SIP on the wire was always correct — this was capture metadata only. Set
   `advertised_address` (or a per-transport `advertise`) for the real IP; without
   it the substitute is loopback, exactly as Via behaves today.
+
 - **B2BUA on a multi-homed host now answers on the socket the call arrived on.**
   When siphon listens on more than one UDP port (e.g. `5060` and `5066`), the
   B2BUA sent every A-leg response (100 Trying, 18x, 2xx, 4xx–6xx, 487, 408, PRACK
@@ -3521,6 +3761,7 @@ _Codename: bjorn._
   replaces the whole `host[:port]` authority; the `call.set_to_host()` override
   still rewrites host-only and preserves the original port per its documented
   contract. Only the B2BUA was affected — a proxy does not rewrite To/From.
+
 - **B2BUA no longer emits a spurious `502 Bad Gateway` in response to a caller's
   ACK.** When a B2BUA forwarded a non-2xx final response (e.g. a relayed `407`)
   to the caller and the caller ACKed it, siphon could route that ACK as a fresh
@@ -3529,12 +3770,14 @@ _Codename: bjorn._
   matches no server transaction, dialog session, or B2BUA call is now dropped
   silently, as required. Surfaced with device-driven proxy auth
   (`auth_passthrough`), where the caller ACKs the forwarded challenge.
+
 - **B2BUA now retransmits the A-leg `2xx` until the caller ACKs** (RFC 3261
   §13.3.1.4), so a single lost `200 OK` on the caller leg no longer leaves the
   call ringing until it CANCELs. The B2BUA has no INVITE server transaction for
   the A-leg (it owns the dialog end-to-end), so the 2xx was previously sent once
   with no UAS-core retransmission; it is now resent on the T1→T2 schedule
   (giving up after 64·T1), cancelled the moment the caller's ACK arrives.
+
 - **Outbound TLS client certificate now hot-reloads alongside the inbound
   acceptor.** Previously a cert renewal only swapped the inbound TLS/WSS *server*
   acceptor (the `SharedTlsAcceptor` read by every accept loop), while the
@@ -3547,6 +3790,7 @@ _Codename: bjorn._
   live-swappable connector and a watcher on the client cert/key files rebuilds and
   swaps the identity on change, evicting stale pooled TLS connections so the next
   outbound call re-handshakes with the new cert. No config or scripting-API change.
+
 - **No more spurious `safety-net RTPEngine delete failed: unknown call` WARN on
   every media-timeout teardown.** The media engine owns the call and reaps it on
   media timeout (the reaper removes the call before emitting the timeout event),
@@ -3559,6 +3803,7 @@ _Codename: bjorn._
   logged at `debug` rather than `warn` at all four safety-net delete sites: the
   media was already cleaned, which is exactly what the safety net is for, so this
   also quiets double-BYE / glare and caller-BYE-vs-IVR-terminate races.
+
 - **Compact SIP header forms (RFC 3261 §7.3.3) are now recognized on every
   lookup, not just a few.** Header names are matched by their canonical form, so
   the single-letter compact forms (`v`→Via, `f`→From, `t`→To, `i`→Call-ID,
@@ -3573,12 +3818,14 @@ _Codename: bjorn._
   (seen against an upstream registrar answering REGISTER `401` with compact
   headers). The on-the-wire header name is preserved verbatim on forwarding
   (compact stays compact); canonicalization affects lookup only.
+
 - **Parser no longer panics on a `Content-Length` that points into the middle of
   a multi-byte UTF-8 body character.** The body was sliced by byte index without
   a char-boundary check, so a message whose `Content-Length` fell mid-character
   aborted the parse thread (a DoS on the parse path, found by fuzzing). The
   parser now degrades to taking the whole remaining input as the body instead of
   panicking; char-boundary-aligned lengths split exactly as before.
+
 - **B2BUA UAS-mode answer now tags the 2xx To header (RFC 3261 §12.1.1).** A
   script that answers an INVITE directly (`call.answer(200, ...)` — MRF /
   announcement / echo / IVR) previously sent a 2xx whose To header was copied
@@ -3587,6 +3834,7 @@ _Codename: bjorn._
   siphon-originated in-dialog BYE (from `b2bua.terminate` or session-timer
   expiry) match the caller's dialog instead of being rejected `481`. Bridged
   (`call.dial()`) calls are unchanged.
+
 - **Session-timer expiry (RFC 4028) now completes the call teardown.** Tearing a
   call down on session-timer expiry previously BYE'd both legs but skipped the
   Rf ACR-STOP, the CDR, and the SIPREC stop that an inbound BYE performs, leaking
@@ -3607,6 +3855,7 @@ _Codename: bjorn._
   an OPTIONS probe), which reaps only genuinely gone UEs. Non-IPsec stream
   closes (plain TCP, WSS WebRTC) keep the immediate flow-failure deregistration
   and network-dereg cascade unchanged. No config change.
+
 - **SA-idle liveness sweep no longer network-deregisters a live VoLTE UE that
   races an ECM-IDLE → paging window.** Two compounding defects made the sweep
   probe a healthy UE every 30 s and deregister it whenever a probe landed during
@@ -3638,6 +3887,7 @@ _Codename: bjorn._
   echoing. Native `siphon-rtp` backend only: the rtpengine and rtpproxy backends
   have no echo verb and reject the call with a clear error rather than silently
   no-op'ing. Requires `siphon-rtp-proto` 0.1.1.
+
 - **`send_socket=` egress pin on `request.relay()` / `request.fork()` and
   `call.dial()` / `call.fork()`** — the operator equivalent of Kamailio's
   `force_send_socket()` / OpenSIPS' `$fs`. Selects which of siphon's own
@@ -3655,6 +3905,7 @@ _Codename: bjorn._
   channels are now enabled whenever the host has more than one UDP listener (they
   were previously only enabled under IPsec); a single-listener deployment keeps
   the existing fast path unchanged.
+
 - **Whole-URI setters `set_from_uri` / `set_to_uri` / `set_contact_uri`, plus
   `set_contact_user`, on both `request` (proxy) and `call` (B2BUA).** The
   whole-URI form of the existing `set_*_user` / `set_*_host` setters: replace the
@@ -3671,6 +3922,7 @@ _Codename: bjorn._
   Contact), and `set_contact_uri` replaces the whole Contact for edge/GRUU
   deployments that front siphon. The B-leg Contact stays userless by default
   (RFC 3261 §8.1.1.8 puts no identity in the Contact userpart); these are opt-in.
+
 - **`cache.list_len(name, key)` and `cache.list_len_sum(name, prefix)`.** Two
   async cache-namespace methods for Redis-backed lists. `list_len` returns a
   single list's length (`LLEN`, `0` for a missing key). `list_len_sum` returns
@@ -3682,6 +3934,7 @@ _Codename: bjorn._
   queues (e.g. summing `ims_queue_*`) — where enqueue/drain counters drift
   upward forever because TTL-expired entries leave the keyspace silently, a
   summed `LLEN` is truthful because expired keys are simply gone.
+
 - **Public Python API reference** at
   [siphon-sip.org/reference](https://siphon-sip.org/reference/). Every scripting
   namespace and object (`request`, `reply`, `call`, `sdp`, the SIP value types,
@@ -3701,6 +3954,7 @@ _Codename: bjorn._
   `get_extension()`), and `rasn-derive` 0.22 → 0.28 to match the already-current
   `rasn` 0.28 (the two had drifted out of lockstep). Supersedes the individual
   Dependabot bumps.
+
 - **Bump the `siphon-bin` SMPP extension to siphon-smpp v1.3.0**, which adds
   Prometheus metrics for the SMPP runtime into siphon's shared `/metrics`
   registry: `siphon_smpp_binds` (gauge, `direction`/`state`) plus
@@ -3722,6 +3976,7 @@ _Codename: bjorn._
   to relay) and replaced with siphon's own, so a peer that selects its call-transfer
   method from the SBC's `Allow` (Teams does) sees `REFER`/`NOTIFY`. Both are added
   only when absent, so a script-set `Contact`/`Allow` still wins.
+
 - **Single Record-Route now uses the advertised host, not the bind IP.** When
   siphon record-routes a relayed request whose inbound and outbound transport are
   the same, the Record-Route carried the raw bind IP (and `127.0.0.1` when bound to
@@ -3730,12 +3985,14 @@ _Codename: bjorn._
   now carries the same host:port as the Via for that transport, so an external peer
   that rejects an IP in Record-Route (Microsoft Teams among them) can route
   in-dialog requests back through siphon.
+
 - **siphon's OPTIONS keepalives now advertise an `Allow` header** listing the SIP
   methods siphon supports (`INVITE, ACK, CANCEL, BYE, OPTIONS, INFO, UPDATE, PRACK,
   SUBSCRIBE, NOTIFY, REFER, MESSAGE, PUBLISH`). A peer that probes the trunk with
   OPTIONS can now discover the supported method set — Microsoft Teams Direct Routing
   selects its call-transfer method from the SBC's advertised `Allow`, so without
   `REFER`/`NOTIFY` here it never hands siphon a REFER even though transfer works.
+
 - **Gateway health prober now fails a `503`, and honors `Retry-After`, for
   Teams Direct Routing datacenter failover.** The OPTIONS prober counted *any*
   response as a successful probe, so a destination answering `503 Service
@@ -3753,12 +4010,14 @@ _Codename: bjorn._
   "stop sending me traffic" semantics. Within-call re-selection across gateway
   destinations on a live `503` is unchanged (sequential fork still iterates the
   script-supplied target list); marking down affects subsequent calls.
+
 - **Outbound REGISTER honors a `Retry-After` on the failure response.** A
   carrier or Teams registrar that rejects a REGISTER with `503 + Retry-After`
   now schedules the next registration attempt at the server-supplied cooldown
   instead of the local exponential backoff (the backoff state still advances, so
   a later failure without `Retry-After` resumes where it left off). The existing
   re-resolve-to-a-different-IP-on-failure behavior is unchanged.
+
 - **Outbound OPTIONS keepalives now carry a `Contact` header.** The UAC-side
   OPTIONS builder (NAT keepalive, gateway health probe, registrar liveness probe)
   emitted Via/From/To/Call-ID/CSeq only — no Contact. RFC 3261 §11.1 makes
@@ -3769,6 +4028,7 @@ _Codename: bjorn._
   reachable address (same host:port as the Via, with `transport=` lowercased), so
   the trunk stays healthy. The host follows `advertised_address` when set — point
   it at the SBC FQDN for peers (Teams among them) that reject an IP in Contact.
+
 - **An FQDN `advertised_address` is now honored across every siphon-originated
   (UAC) Via/From/Contact, not just IP literals.** Previously a non-IP
   `advertised_address` (e.g. `sbc.example.org`) was collapsed to `127.0.0.1` on
@@ -3783,6 +4043,7 @@ _Codename: bjorn._
   than siphon's own, so a peer honoring the Via sent-by could route the response
   away from us. A per-transport `listen.<t>.advertise` (or an IP
   `advertised_address`) already worked and is unchanged.
+
 - **Deterministic default outbound UDP socket on multi-homed hosts.** With more
   than one `listen.udp` entry, the default egress socket for outbound UDP
   (relays, forks, UAC-originated requests, and responses without an explicit
@@ -3815,6 +4076,7 @@ _Codename: bjorn._
   media-timeout events (its NG event log carries only DTMF), so the hook is a
   no-op under rtpengine today. Mirrored in the `siphon-sip` SDK mock
   (`on_media_timeout` + a `fire_media_timeout` test helper).
+
 - **Native `siphon-rtp` media backend (JSON-over-TCP) — experimental.** siphon
   can now drive the in-house `siphon-rtp` media engine over its native control
   protocol — a persistent TCP connection carrying length-prefixed JSON frames —
@@ -3847,6 +4109,7 @@ _Codename: bjorn._
     `media.rtpengine` configs are untouched. SIPREC/MPTY subscriptions are not
     yet implemented on `siphon-rtp` and surface a clear engine error there.
   - Depends on the published `siphon-rtp-proto` crate (the shared wire contract).
+
 - **Classic `rtpproxy` media backend (text-over-UDP).** siphon can now drive a
   classic `rtpproxy` relay (the Sippy/Kamailio/OpenSIPS media proxy) as a third
   media-control backend — for migrating an existing deployment to siphon while
@@ -3877,6 +4140,7 @@ _Codename: bjorn._
     rtpengine-only verbs (announcements, DTMF injection, gating, SIPREC/MPTY) are
     not available on rtpproxy and surface a clear engine error there; rtpproxy
     pushes no async events, so the `media.events` listener is unused.
+
 - **B2BUA `call.set_from_host()` / `call.set_to_host()`** — pin the host part of
   the B-leg From / To URI, mirroring `set_from_user` / `set_to_user`. By default
   the B2BUA rewrites the B-leg From host to its own advertised address (topology
@@ -3889,6 +4153,7 @@ _Codename: bjorn._
   params and tags are preserved. Applies to both `call.dial()` and `call.fork()`.
   Mirrored in the `siphon-sip` SDK mock; new SIPp acceptance scenario
   (`sipp/b2bua_set_host_uas.xml`).
+
 - **Kernel firewall (`security.firewall`).** Mirror SIPhon's bans — the
   confidence-weighted `failed_auth_ban` store and the APIBAN blocklist — into a
   kernel nf_tables set, so abusive sources are dropped in the kernel before they
@@ -3907,12 +4172,14 @@ _Codename: bjorn._
   the security cookbook with the ban-scoring model and adds a Kernel firewall page
   covering `CAP_NET_ADMIN` per runtime, container behaviour, and the
   nftables-vs-XDP tradeoff.
+
 - **Admin API ban management** — `GET /admin/bans` lists the sources currently
   auto-banned by `failed_auth_ban` (with remaining TTL), and
   `DELETE /admin/bans/{ip}` lifts a ban early for an operator clearing a false
   positive. The unban clears the userspace ban and, when the kernel firewall is
   enabled, removes the matching nf_tables element in lockstep so the in-kernel
   drop is lifted too.
+
 - **Outbound TLS client certificate (mutual TLS).** New `tls.client_certificate`
   and `tls.client_private_key` (PEM chain + key). When set, siphon presents that
   client certificate on outbound TLS connections whose peer requests one — for
@@ -3922,6 +4189,7 @@ _Codename: bjorn._
   `CertificateUnknown`. Both fields must be set together (or neither); a
   one-sided setting or an unreadable/unparseable file is a hard startup error
   (fail closed). Server-certificate verification is unchanged (still permissive).
+
 - **Hostname-based outbound TLS SNI.** Outbound TLS handshakes now present the
   resolved target hostname as SNI / certificate name instead of the destination
   IP literal. RFC 6066 forbids SNI for an IP literal, so IP-based next hops
@@ -3929,6 +4197,7 @@ _Codename: bjorn._
   hostname now flows from the resolved SIP URI (relay, fork, and gateway TLS
   health probe) through to the connection pool. Bare-IP next hops are unchanged
   (still no SNI).
+
 - **Gateway source-membership predicate — `request.from_gateway(group)` /
   `call.from_gateway(group)`.** Returns `True` when the message's source IP is
   one of the resolved addresses of the named gateway group (configured under
@@ -3945,6 +4214,7 @@ _Codename: bjorn._
   (TCP/TLS/WS/WSS) the source IP is handshake-verified and trustworthy as an
   authorization signal; on UDP it is spoofable, so `from_gateway` there is a
   best-effort direction hint, not an auth gate.
+
 - **Automatic CDR generation (`cdr.auto_emit`).** With `cdr.auto_emit: true`,
   siphon now writes one CDR per call automatically on the call lifecycle — no
   `cdr.write()` in the script — for both the proxy and B2BUA datapaths. The
@@ -3995,6 +4265,7 @@ _Codename: bjorn._
   reporting policy (GitHub private reporting, coordinated disclosure) — previously
   absent. No behavioural change; documents supply-chain artifacts that already
   ship at release.
+
 - **SDK mocks for the extension namespaces (`smpp`, `http`).** The `siphon-sip`
   Python SDK now mocks the namespaces injected by the opt-in extensions, so
   `from siphon import smpp` / `from siphon import http` resolve under pytest and
@@ -4007,6 +4278,7 @@ _Codename: bjorn._
   track the extension runtimes (siphon-smpp, siphon-http), which each ship a CI
   check that fails if their namespace surface drifts from these mocks. The docs
   **Extensions** page and nav now link the per-extension documentation sites.
+
 - **HTTP extension wired into `siphon-bin` (`--features http`).** The second
   opt-in extension module alongside SMPP: when `extensions.http` in `siphon.yaml`
   points at an `http.yaml`, `siphon-bin` registers the scriptable `http`
@@ -4023,6 +4295,7 @@ _Codename: bjorn._
   with the feature off, an `extensions.http` block still parses and is skipped
   with a loud warning (same contract as SMPP and the `sctp` feature). Documented
   under **Extensions** in the docs site.
+
 - **Opt-in extension binary (`siphon-bin`)** — a new standalone package that
   builds a drop-in `siphon` binary composing optional extension modules behind
   cargo features (all off by default). The first module is **SMPP 3.4**
@@ -4038,6 +4311,7 @@ _Codename: bjorn._
   behind their own features. The SMPP module is pinned to **siphon-smpp v1.2.1**,
   which adds a per-ESME-session inbound ingress rate cap (`server.max_msg_per_sec`
   with a `pace` / `reject` over-rate action).
+
 - **`siphon::install_allocator!()` — one-line jemalloc + page-decay setup.** A
   `#[global_allocator]` and jemalloc's `_rjem_malloc_conf` config symbol only
   take effect in the final binary crate (the language honors `#[global_allocator]`
@@ -4056,6 +4330,7 @@ _Codename: bjorn._
   unexpectedly (RSS bloat, `siphon_memory_*` gauges reading jemalloc's idle
   footprint) shows up in logs rather than a memory post-mortem. See
   `examples/embed_with_allocator.rs`. siphon's own binary is unchanged.
+
 - **ISDN-AddressString AVPs decode to E.164 in scripts** — MSISDN (701),
   SC-Address (3300), SGSN-Number (1489) and MME-Number-for-MT-SMS (1645) are
   now dictionary-typed `ISDNAddressString` (3GPP TS 29.002 §17.7.8) instead of
@@ -4068,6 +4343,7 @@ _Codename: bjorn._
   hand-built messages: `diameter.decode_isdn_address(value)` (accepts bytes or
   an already-decoded str — idempotent) and
   `diameter.encode_isdn_address(digits, ton_npi=0x91)`.
+
 - **Generic Diameter server mode** — the Diameter stack was client-only
   (originate toward HSS/PCRF); it now also accepts inbound Diameter from
   authenticated peers, runs the CER/CEA handshake and the DWR/DWA watchdog, and
@@ -4092,6 +4368,7 @@ _Codename: bjorn._
   (TS 29.272: command codes 316–324, AVPs 1400–1450 / 1635, AIR / ULR / PUR
   builders + parsers) and examples (`examples/diameter_server.{py,yaml}`,
   `examples/hss_s6a.py`).
+
 - **glibc allocator instrumentation** — new `siphon_glibc_*` Prometheus gauges
   (`system_bytes`, `in_use_bytes`, `free_bytes`, `mmap_bytes`, `arena_count`)
   sourced from `malloc_info(3)`, aggregated across all arenas. This surfaces the
@@ -4102,15 +4379,18 @@ _Codename: bjorn._
   than `mallinfo2`, which reports the main arena only. Sampled on the dispatcher
   cleanup tick; no-op off glibc. `SIGUSR2` dumps the full `malloc_info` XML to
   the log for call-site attribution.
+
 - **`memory:` config block** for allocator runtime tuning:
   `memory.glibc.arena_max` (`mallopt(M_ARENA_MAX)`, caps the number of arenas)
   and `memory.glibc.trim_interval_secs` (periodic `malloc_trim(0)`). The gauges
   above are always-on; both knobs default off — measure first, bound only if the
   pool proves to be arena retention rather than a leak.
+
 - **`siphon_sbi_npcf_app_sessions_active` gauge** — active N5/Npcf app-sessions
   created by this NF and not yet deleted (a steady climb under flat call rate is
   a stranded-session leak), backed by a new per-replica app-session registry on
   `NpcfClient` that inserts on create and removes on delete.
+
 - **HTTP admin API is now served**, behind a new optional `admin.listen`. It was
   implemented but never started, so only `/metrics` was exposed at runtime.
   Endpoints: `/admin/health` (liveness), `/admin/ready` (readiness — returns 503
@@ -4118,16 +4398,19 @@ _Codename: bjorn._
   deschedules it before it stops accepting new INVITEs), `/admin/stats`,
   `/admin/registrations[/{aor}]` (inspect / force-unregister), and `/metrics`.
   Off by default (no `admin.listen` ⇒ unchanged behaviour).
+
 - **Operator documentation for scaling, redundancy and deployment** (`docs/`):
   `scaling-and-redundancy.md` (what state is node-local vs. Redis-shared, what the
   Redis backend actually provides, and why SIPhon ships no clusterer/DMQ-style
   replication engine), `deployment.md` (single-node / redundant-pair / N-node
   with a front LB + DNS SRV / IMS topologies, an operations runbook, and a light
   Kubernetes shape), and `migrating-from-kamailio-opensips.md`.
+
 - **Reference deployments** (`deploy/`): a front-LB + 2-backend + Redis HA demo
   (docker-compose + a host-binary `validate.sh` that proves restart recovery from
   Redis), and Kubernetes manifests with a `kind` kill-a-pod failover drill
   (`validate-kind.sh`).
+
 - **Release-cut HA failover gate** — `cut-release.sh` now runs the Redis-registrar
   failover validation as a mandatory gate (skip with `FAILOVER_OK=1`), alongside
   the existing perf/mem and criterion regression gates.
@@ -4149,6 +4432,7 @@ _Codename: bjorn._
   256 MB to ~7. The resolved `core`/`max` and which bound won (`cpu`/`memory`/
   `override`) are logged at startup. The `script.sync_pool_size` /
   `script.sync_pool_max` overrides still take precedence when set.
+
 - **SCTP is now an opt-in build feature, off by default.** SIP-over-SCTP
   (RFC 4168) and Diameter-over-SCTP link the `libsctp` system library, which
   only exists on Linux. Moving them behind the `sctp` Cargo feature lets the
