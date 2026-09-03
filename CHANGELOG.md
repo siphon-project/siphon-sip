@@ -57,6 +57,42 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `recv` and aborted the run as unexpected. Test-side only — siphon sends
   exactly one BYE and retransmits it correctly per RFC 3261 §17.1.
 
+- **A registration that ended by expiring or by de-REGISTER left four
+  per-AoR maps holding it forever.** `remove_all` tore down the auxiliary
+  state through `drop_aor_state`, but neither of the two paths a registration
+  normally ends on did: `expire_stale` removed the binding and pruned
+  `tokens` / `connection_index` while leaving `service_routes`,
+  `asserted_identities`, `associated_uris` and the implicit-registration-set
+  `aliases` behind, and `save()` with `Expires: 0` emptied the last binding the
+  same way. On an IMS deployment — where a script populates all four on every
+  REGISTER — that is a permanent entry per completed registration, measured at
+  **384 bytes each**, and it is invisible to `siphon_registrar_aors` /
+  `registrations_active` because those count `bindings` alone. The gauge reads
+  zero while the process keeps growing, which is the hardest shape of leak to
+  find from the outside.
+
+  Both paths now drop the auxiliary state with the binding. Expiry does it in
+  memory only, matching what that sweep already does with the binding itself:
+  a lookup is L1-only, so "this replica stopped seeing refreshes" is an
+  inference rather than the instruction a de-REGISTER carries, and deleting the
+  shared record on that basis would destroy state a peer replica is still
+  serving.
+
+  Measured over 100,000 IMS registrations taken through a full
+  register → de-REGISTER cycle, residency after teardown drops from 751 to 367
+  bytes per registration, and the remainder is now flat across repeated cycles
+  (35,828 KB then 35,826 KB) — hash-table capacity at its high-water mark,
+  reused by the next registration rather than retained.
+
+### Performance
+- **De-registration no longer scans the whole alias index.** Pruning the
+  implicit-registration-set aliases for one AoR was a `retain` over every alias
+  the process held, so tearing down a registration cost O(total aliases) on the
+  write path — quadratic across a population of them. The entries to drop are
+  now derived from that AoR's own `associated_uris` list, which is what they
+  were built from. Taking 100,000 IMS registrations through de-REGISTER goes
+  from **50.7 s to 0.45 s**.
+
 - **The registrar reserved four contact slots for every AoR that only ever
   holds one.** `Vec::push` on an empty vec allocates `MIN_NON_ZERO_CAP` slots
   rather than one, which is 4 for any element of 1 KiB or less. `Contact` is

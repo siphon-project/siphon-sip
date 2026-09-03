@@ -446,7 +446,29 @@ impl Registrar {
     /// (`remove_all`, `drop_aor_state`) and as the first step of
     /// `install_aliases` when the implicit set is being replaced.
     fn prune_aliases_to(&self, primary: &str) {
-        self.aliases.retain(|_, target| target != primary);
+        // Derived from `associated_uris[primary]` — the same list
+        // `install_aliases` built the entries from — rather than scanned out
+        // of the index. A `retain` over every alias is O(total aliases) per
+        // call, which on a box holding a million implicit sets turns one
+        // de-REGISTER into a million-entry scan on the write path.
+        //
+        // Read the list and drop the guard before touching `aliases`, so no
+        // shard lock on one map is held while locking another.
+        let installed: Vec<Aor> = match self.associated_uris.get(primary) {
+            Some(entry) => entry
+                .value()
+                .iter()
+                .map(|uri| normalize_aor(uri))
+                .filter(|alias| alias != primary)
+                .collect(),
+            None => return,
+        };
+        for alias in installed {
+            // Only drop an entry still pointing here: a later implicit set may
+            // legitimately have claimed the same URI for a different primary.
+            self.aliases
+                .remove_if(&alias, |_, target| target == primary);
+        }
     }
 
     /// Replace the alias entries for `primary` with one entry per URI
@@ -517,18 +539,27 @@ impl Registrar {
     /// Drop the in-memory auxiliary state for an AoR and write through to
     /// the backend.  Used on de-registration paths.
     fn drop_aor_state(&self, aor: &str) {
-        let removed = self.service_routes.remove(aor).is_some()
-            | self.asserted_identities.remove(aor).is_some()
-            | self.associated_uris.remove(aor).is_some();
-        // Always prune the alias index for this primary, even if no aux
-        // state was attached — `set_associated_uris` may have populated
-        // aliases without a service_route / asserted_identity.
+        // Order matters: the alias prune reads `associated_uris[aor]`, which
+        // `remove_aor_state_entries` drops.
         self.prune_aliases_to(aor);
+        let removed = self.remove_aor_state_entries(aor);
         if removed {
             if let Some(writer) = self.backend_writer.get() {
                 writer.remove_aor_state(aor);
             }
         }
+    }
+
+    /// Drop the single-key auxiliary state for one AoR, reporting whether any
+    /// was attached.
+    ///
+    /// Alias pruning is the caller's job and must run *first*, because
+    /// `prune_aliases_to` derives the entries to drop from the
+    /// `associated_uris` list this removes.
+    fn remove_aor_state_entries(&self, aor: &str) -> bool {
+        self.service_routes.remove(aor).is_some()
+            | self.asserted_identities.remove(aor).is_some()
+            | self.associated_uris.remove(aor).is_some()
     }
 
     /// Apply a `StoredAorState` (loaded from a backend) into the in-memory
@@ -808,6 +839,13 @@ impl Registrar {
             }
             self.persist_aor(aor, remaining);
             if aor_empty {
+                // The last binding is gone, so the registration is over and
+                // its auxiliary state goes with it — service route, asserted
+                // identity, P-Associated-URI list and the implicit-set
+                // aliases. Same teardown `remove_all` performs; without it a
+                // de-REGISTER left four maps holding a dead AoR, invisible to
+                // `registrations_active` because that counts `bindings` only.
+                self.drop_aor_state(aor);
                 if let Some(metrics) = crate::metrics::try_metrics() {
                     metrics.registrations_active.dec();
                 }
@@ -2003,6 +2041,14 @@ impl Registrar {
         }
         for aor in &empty_aors {
             self.bindings.remove(aor);
+            // The auxiliary state follows the binding. Note this drops it from
+            // memory without telling the backend, which is the same thing this
+            // sweep does with the binding itself: a lookup is L1-only, so "this
+            // replica stopped seeing refreshes" is an inference, not the
+            // instruction a de-REGISTER carries, and deleting the shared record
+            // on that basis would destroy state a peer replica is still serving.
+            self.prune_aliases_to(aor);
+            self.remove_aor_state_entries(aor);
             self.emit_event(RegistrationEvent::Expired { aor: aor.clone() });
         }
         empty_aors.len()
@@ -3296,6 +3342,308 @@ mod tests {
         assert_eq!(registrar.aor_count(), 0); // expired contacts don't count
         registrar.expire_stale();
         assert_eq!(registrar.bindings.len(), 0); // cleaned up
+    }
+
+    /// Expiry must drain **every** per-AoR store, not just `bindings`.
+    ///
+    /// A UE that stops refreshing is the ordinary way a registration ends —
+    /// far more common than an explicit de-REGISTER — and it is the only
+    /// teardown path that runs without the script's involvement. `remove_all`
+    /// dropped the auxiliary state through `drop_aor_state`; `expire_stale`
+    /// removed the binding and pruned `tokens` / `connection_index` but left
+    /// the four IMS maps holding an entry per dead AoR forever.
+    ///
+    /// This is invisible to `registrations_active`, which counts `bindings`
+    /// only, so the gauge reads zero while the process keeps growing.
+    #[test]
+    fn expiry_drains_every_per_aor_store() {
+        let registrar = Registrar::default();
+        let aor = "sip:alice@ims.example.com";
+
+        registrar.set_service_routes(aor, vec!["sip:scscf.ims.example.com;lr".to_string()]);
+        registrar.set_asserted_identity(aor, "sip:+15551234567@ims.example.com".to_string());
+        registrar.set_associated_uris(
+            aor,
+            vec![
+                "sip:+15551234567@ims.example.com".to_string(),
+                "tel:+15551234567".to_string(),
+            ],
+        );
+
+        let contact = Contact {
+            uri: contact_uri("alice", "10.0.0.1"),
+            q: 1.0,
+            registered_at: Instant::now() - Duration::from_secs(7200),
+            expires: Duration::from_secs(3600),
+            call_id: "expired".to_string(),
+            cseq: 1,
+            source_addr: None,
+            source_transport: None,
+            sip_instance: None,
+            reg_id: None,
+            path: vec![],
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: None,
+            inbound_local_addr: None,
+            inbound_connection_id: None,
+            params: Vec::new(),
+            kind: ContactKind::Ue,
+        };
+        registrar
+            .bindings
+            .entry(aor.to_string())
+            .or_default()
+            .push(contact);
+
+        assert_eq!(registrar.expire_stale(), 1, "the AoR is reaped");
+
+        assert_eq!(registrar.bindings.len(), 0, "bindings drained");
+        assert_eq!(
+            registrar.service_routes.len(),
+            0,
+            "service_routes still holds the expired AoR"
+        );
+        assert_eq!(
+            registrar.asserted_identities.len(),
+            0,
+            "asserted_identities still holds the expired AoR"
+        );
+        assert_eq!(
+            registrar.associated_uris.len(),
+            0,
+            "associated_uris still holds the expired AoR"
+        );
+        assert_eq!(
+            registrar.aliases.len(),
+            0,
+            "the implicit-registration-set aliases still resolve to a dead AoR"
+        );
+    }
+
+    /// The explicit de-REGISTER path leaked the same four maps.
+    ///
+    /// `save(expires=0)` that empties the last binding is a real teardown, but
+    /// it removed the AoR from `bindings` without the `drop_aor_state` that
+    /// `remove_all` performs.
+    #[test]
+    fn deregister_drains_every_per_aor_store() {
+        let registrar = Registrar::default();
+        let aor = "sip:alice@ims.example.com";
+
+        registrar
+            .save(
+                aor,
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "call-1".into(),
+                1,
+            )
+            .unwrap();
+        registrar.set_service_routes(aor, vec!["sip:scscf.ims.example.com;lr".to_string()]);
+        registrar.set_asserted_identity(aor, "sip:+15551234567@ims.example.com".to_string());
+        registrar.set_associated_uris(aor, vec!["tel:+15551234567".to_string()]);
+
+        // Expires: 0 on the same contact — the UE de-registering.
+        registrar
+            .save(
+                aor,
+                contact_uri("alice", "10.0.0.1"),
+                0,
+                1.0,
+                "call-1".into(),
+                2,
+            )
+            .unwrap();
+
+        assert_eq!(registrar.bindings.len(), 0, "bindings drained");
+        assert_eq!(registrar.service_routes.len(), 0, "service_routes drained");
+        assert_eq!(
+            registrar.asserted_identities.len(),
+            0,
+            "asserted_identities drained"
+        );
+        assert_eq!(
+            registrar.associated_uris.len(),
+            0,
+            "associated_uris drained"
+        );
+        assert_eq!(registrar.aliases.len(), 0, "aliases drained");
+    }
+
+    /// The batched alias sweep must only touch the AoRs it actually reaped.
+    ///
+    /// Expiry prunes aliases with one `retain` over the whole index instead of
+    /// a scan per AoR, so the filter is the load-bearing part: getting it wrong
+    /// would silently unroute every live implicit registration set on the box,
+    /// which no binding-count assertion would notice.
+    #[test]
+    fn expiry_alias_sweep_spares_live_registrations() {
+        let registrar = Registrar::default();
+        let live = "sip:bob@ims.example.com";
+        let doomed = "sip:alice@ims.example.com";
+
+        registrar
+            .save(
+                live,
+                contact_uri("bob", "10.0.0.2"),
+                3600,
+                1.0,
+                "b".into(),
+                1,
+            )
+            .unwrap();
+        registrar.set_associated_uris(live, vec!["sip:+15559999999@ims.example.com".to_string()]);
+        registrar.set_service_routes(live, vec!["sip:scscf.ims.example.com;lr".to_string()]);
+
+        registrar.set_associated_uris(doomed, vec!["sip:+15551234567@ims.example.com".to_string()]);
+        let expired = Contact {
+            uri: contact_uri("alice", "10.0.0.1"),
+            q: 1.0,
+            registered_at: Instant::now() - Duration::from_secs(7200),
+            expires: Duration::from_secs(3600),
+            call_id: "expired".to_string(),
+            cseq: 1,
+            source_addr: None,
+            source_transport: None,
+            sip_instance: None,
+            reg_id: None,
+            path: vec![],
+            pending: false,
+            instance_id: None,
+            instance_epoch: None,
+            flow_token: None,
+            inbound_local_addr: None,
+            inbound_connection_id: None,
+            params: Vec::new(),
+            kind: ContactKind::Ue,
+        };
+        registrar
+            .bindings
+            .entry(doomed.to_string())
+            .or_default()
+            .push(expired);
+
+        assert_eq!(registrar.expire_stale(), 1, "only the stale AoR is reaped");
+
+        assert!(
+            registrar.is_registered("sip:+15559999999@ims.example.com"),
+            "the live AoR's implicit set must still resolve"
+        );
+        assert_eq!(
+            registrar.service_routes.len(),
+            1,
+            "the live AoR keeps its service route"
+        );
+        assert!(
+            !registrar.is_registered("sip:+15551234567@ims.example.com"),
+            "the expired AoR's alias must be gone"
+        );
+        assert_eq!(registrar.aliases.len(), 1, "exactly one alias survives");
+    }
+
+    /// Steady-state guard for **every** per-AoR store, not just the one the
+    /// metric watches.
+    ///
+    /// The registrar keeps per-registration state across seven concurrent
+    /// maps, so the failure mode to defend against is a new index that gains
+    /// an entry on REGISTER and has no eviction on teardown. That is invisible
+    /// to `registrations_active`, which counts `bindings` alone and reads zero
+    /// while the process keeps growing — which is exactly how the auxiliary
+    /// maps came to survive expiry.
+    ///
+    /// Drives complete cycles over both teardown paths a registration can take
+    /// and asserts every store returns to its starting length. Add a store to
+    /// `Registrar`, and this test should be extended with it.
+    #[test]
+    fn every_per_aor_store_returns_to_baseline_after_complete_cycles() {
+        const BATCH: usize = 200;
+
+        let registrar = Registrar::default();
+        let lengths = |registrar: &Registrar| {
+            [
+                ("bindings", registrar.bindings.len()),
+                ("service_routes", registrar.service_routes.len()),
+                ("asserted_identities", registrar.asserted_identities.len()),
+                ("associated_uris", registrar.associated_uris.len()),
+                ("aliases", registrar.aliases.len()),
+                ("tokens", registrar.tokens.len()),
+                ("connection_index", registrar.connection_index.len()),
+            ]
+        };
+        let baseline = lengths(&registrar);
+
+        // Register a batch carrying every optional index: a flow token, a
+        // stream-transport connection id, and a full IMS implicit set.
+        for index in 0..BATCH {
+            let aor = format!("sip:user{index}@ims.example.com");
+            registrar
+                .save_full(
+                    &aor,
+                    contact_uri(&format!("user{index}"), "10.0.0.1"),
+                    3600,
+                    1.0,
+                    format!("call-{index}"),
+                    1,
+                    None,
+                    Some("tcp".to_string()),
+                    None,
+                    None,
+                    vec![],
+                    FlowCapture {
+                        flow_token: Some(format!("token-{index}")),
+                        inbound_local_addr: None,
+                        inbound_connection_id: Some(index as u64),
+                    },
+                    Vec::new(),
+                )
+                .unwrap();
+            registrar.set_service_routes(&aor, vec!["sip:scscf.ims.example.com;lr".to_string()]);
+            registrar.set_asserted_identity(&aor, format!("sip:+1555{index:07}@ims.example.com"));
+            registrar
+                .set_associated_uris(&aor, vec![format!("sip:+1555{index:07}@ims.example.com")]);
+        }
+
+        for (name, count) in lengths(&registrar) {
+            assert!(count > 0, "{name} should be populated before teardown");
+        }
+
+        // Half go through an explicit de-REGISTER, half through expiry, so
+        // both teardown paths are covered by the same drain assertion.
+        for index in 0..BATCH / 2 {
+            registrar
+                .save(
+                    &format!("sip:user{index}@ims.example.com"),
+                    contact_uri(&format!("user{index}"), "10.0.0.1"),
+                    0,
+                    1.0,
+                    format!("call-{index}"),
+                    2,
+                )
+                .unwrap();
+        }
+        for index in BATCH / 2..BATCH {
+            let aor = format!("sip:user{index}@ims.example.com");
+            if let Some(mut entry) = registrar.bindings.get_mut(&aor) {
+                for contact in entry.value_mut().iter_mut() {
+                    contact.registered_at = Instant::now() - Duration::from_secs(7200);
+                }
+            }
+        }
+        assert_eq!(
+            registrar.expire_stale(),
+            BATCH / 2,
+            "the stale half is reaped"
+        );
+
+        for ((name, after), (_, before)) in lengths(&registrar).iter().zip(baseline.iter()) {
+            assert_eq!(
+                after, before,
+                "{name} did not drain: {after} entries left, started at {before}"
+            );
+        }
     }
 
     #[test]
