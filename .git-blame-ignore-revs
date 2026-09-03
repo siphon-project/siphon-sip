@@ -1,0 +1,15 @@
+# Commits that changed formatting only, and would otherwise bury the real
+# author of every line they touched.
+#
+# Enable locally, once per clone:
+#
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# GitHub honours this file automatically in its blame view.
+
+# style: cargo fmt --all, and gate on it in CI like siphon-rtp (#249)
+# 208 files reformatted on rustfmt defaults. The same commit carries the CI
+# gate and two small code changes the reformat forced, so blame on those few
+# lines still lands here — git can only skip a revision for lines it modified,
+# not for lines it introduced.
+1dba47657ba2f239fc5207a07aecab9abdd4a4dd
