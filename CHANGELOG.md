@@ -6,6 +6,45 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Changed
+- **`cdr.write(request|call, extra=…)` now attaches to the auto-emitted CDR
+  instead of writing a second record.** With `cdr.auto_emit: true`, siphon
+  already tracks a record for the call from the INVITE; a script's `extra`
+  fields are merged into it and emitted once at teardown, on the record that
+  also carries `timestamp_start` / `timestamp_answer` / `timestamp_end`,
+  `duration_secs`, `response_code` and `disconnect_initiator`.
+
+  Before, the script's call queued a separate record built from the identity
+  fields alone — no timings, no duration, `response_code: 0` — so attaching
+  billing metadata to a call produced two rows the collector had to join on
+  Call-ID, one of which was meaningless on its own. Repeat calls now merge on
+  top of each other (last write wins per key).
+
+  A standalone record is still written when there is nothing to merge into:
+  `auto_emit` off, a request the auto-emit hooks do not track (a MESSAGE, an
+  out-of-dialog request), or a call already finalized. **Operators counting CDR
+  rows per call will see one row where they saw two**; the fields are unchanged
+  and now all on the same row.
+
+- **The auto-emitted CDR carries the Rf correlation.** `rf_session_id` /
+  `rf_result_code` (TS 32.299) were stamped only onto a script-written record,
+  so an operator running auto-emit never saw them. The auto-emitted record now
+  resolves them at teardown — including for a B2BUA call, whose accounting
+  record is keyed on the internal call id rather than either leg's dialog, a
+  key the stamp never offered.
+
+- **A proxy call's CDR record is opened before the script handler runs and
+  finalized after it.** It used to be opened after the handler (only for an
+  INVITE the proxy forwarded) and, on the BYE, written before the handler — so
+  a `cdr.write(request, extra=…)` from either handler had nothing to attach to.
+  Both ends now bracket the handler, and the record is still written when the
+  script drops or rejects the BYE.
+
+  An INVITE the proxy does not forward still produces no CDR, as before —
+  unless the script attached fields to it, which is a deliberate ask for a
+  record of the attempt. That record now carries the code the script answered
+  (a 403, a 407) instead of the `response_code: 0` a script-built record had.
+
 ### Performance
 - **The dispatcher's timer wheel no longer retains its peak-concurrency
   footprint either.** Same shape as the transaction map fixed alongside it:

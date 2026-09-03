@@ -31,7 +31,8 @@
 //! }
 //! ```
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 use std::time::{Instant, SystemTime};
 
 use serde::Serialize;
@@ -286,8 +287,13 @@ pub struct CdrSession {
     /// When this session was created — the orphan-sweep backstop keys off it.
     created_at: Instant,
     /// Extra fields auto-stamped onto the finalized CDR (e.g. LCR route
-    /// `cdr_fields` from the winning carrier). Merged into `Cdr.extra`.
+    /// `cdr_fields` from the winning carrier, or a script's
+    /// `cdr.write(…, extra=…)`). Merged into `Cdr.extra`.
     extra: std::collections::HashMap<String, String>,
+    /// Rf-session storage keys to resolve at `finalize` so the record carries
+    /// `rf_session_id` / `rf_result_code`. Filled by the dispatcher when the
+    /// session is created; empty when Rf is not in play.
+    rf_keys: Vec<String>,
 }
 
 impl CdrSession {
@@ -318,15 +324,36 @@ impl CdrSession {
             response_code: 0,
             created_at: Instant::now(),
             extra: std::collections::HashMap::new(),
+            rf_keys: Vec::new(),
         }
+    }
+
+    /// Record the Rf-session storage keys this call's accounting record can be
+    /// found under, so [`finalize`](Self::finalize) can stamp `rf_session_id` /
+    /// `rf_result_code` onto the CDR.
+    pub fn set_rf_keys(&mut self, keys: Vec<String>) {
+        self.rf_keys = keys;
+    }
+
+    /// The Rf-session storage keys recorded by [`set_rf_keys`](Self::set_rf_keys).
+    pub fn rf_keys(&self) -> &[String] {
+        &self.rf_keys
+    }
+
+    /// Whether anything has been merged into this session's extra fields.
+    ///
+    /// On the proxy path that means exactly one thing: a script called
+    /// `cdr.write(request, extra=…)` against this call.
+    pub fn has_extra_fields(&self) -> bool {
+        !self.extra.is_empty()
     }
 
     /// Record the authenticated username after the fact.
     ///
-    /// The proxy path knows `auth_user` before the session is built, but a
-    /// B2BUA call is tracked at INVITE time — *before* `@b2bua.on_invite` runs
+    /// Both paths track the call at INVITE time — *before* the script handler
+    /// runs, so that `cdr.write(…, extra=…)` from it has a record to attach to
     /// — so a caller authenticated inside that handler
-    /// (`auth.require_proxy_digest(call, …)`) can only be stamped on once the
+    /// (`auth.require_proxy_digest(…)`) can only be stamped on once the
     /// handler returns.
     pub fn set_auth_user(&mut self, auth_user: String) {
         self.auth_user = Some(auth_user);
@@ -395,7 +422,65 @@ impl CdrSession {
         cdr.disconnect_initiator = Some(disconnect_initiator.to_string());
         cdr.sip_reason = sip_reason;
         cdr.extra = self.extra;
+        // Rf correlation (TS 32.299): the accounting record for this dialog is
+        // still tracked at teardown — `spawn_rf_*_stop` removes it only after
+        // ACR-STOP completes — so the CDR can name the Diameter session it
+        // belongs to. Stamped here rather than by the script API because the
+        // auto-emitted record is now the only record a script's
+        // `cdr.write(…, extra=…)` contributes to.
+        for key in &self.rf_keys {
+            if let Some((session_id, result_code)) =
+                crate::diameter::rf_service::lookup_rf_for_dialog(key)
+            {
+                cdr.rf_session_id = Some(session_id);
+                cdr.rf_result_code = result_code;
+                break;
+            }
+        }
         cdr
+    }
+}
+
+// ── Script → auto-emit CDR extra-field channel ───────────────────────
+//
+// `cdr.write(request|call, extra=…)` must land on the record the auto-emit
+// hooks already track for that call rather than beside it: a second record
+// carrying only the script's fields has no timings, no duration and no
+// disconnect side, so it is meaningless on its own and forces the collector to
+// join two rows per call.
+//
+// The tracked `CdrSession`s live in `DispatcherState` (which sweeps and gauges
+// them), so the dispatcher installs a merger here at startup and this module
+// calls it without knowing where the sessions are held — the same shape as
+// `rf_service`'s CDR auto-stamp registry, and for the same reason (threading
+// the dispatcher state into this module would create a cycle).
+
+type CdrExtraMerger =
+    Arc<dyn Fn(&[String], &HashMap<String, String>) -> bool + Send + Sync + 'static>;
+
+static CDR_EXTRA_MERGER: OnceLock<CdrExtraMerger> = OnceLock::new();
+
+/// Install the dispatcher's auto-emit session merger. Idempotent (the
+/// dispatcher only runs once per process); later calls are ignored.
+pub fn install_extra_merger(merger: CdrExtraMerger) {
+    let _ = CDR_EXTRA_MERGER.set(merger);
+}
+
+/// Merge `extra` into the tracked auto-emit CDR session that the first
+/// resolving key of `keys` names.
+///
+/// Returns `true` when a session took the fields — the caller must then NOT
+/// write a record of its own, because the fields will be emitted on the
+/// auto-emitted CDR at teardown, alongside the timings and disconnect side.
+/// `false` means no session is tracked (auto-emit off, a non-INVITE, or a call
+/// that already finalized) and the caller owns the record.
+pub fn merge_extra_into_session(keys: &[String], extra: &HashMap<String, String>) -> bool {
+    // No `auto_emit_enabled()` short-circuit needed: every tracking hook
+    // early-returns when auto-emit is off, so the session map is empty and the
+    // merger answers false on its own.
+    match CDR_EXTRA_MERGER.get() {
+        Some(merger) => merger(keys, extra),
+        None => false,
     }
 }
 
@@ -818,6 +903,123 @@ fn is_leap_year(year: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session as the auto-emit hooks track it: answered, then torn down.
+    fn tracked_session() -> CdrSession {
+        CdrSession::new(
+            "a84b4c76e66710@192.0.2.100".to_string(),
+            "sip:alice@example.com".to_string(),
+            "sip:bob@example.com".to_string(),
+            "sip:bob@192.0.2.1:5060".to_string(),
+            "192.0.2.100".to_string(),
+            "udp".to_string(),
+            Some("Test UA/1.0".to_string()),
+            None,
+        )
+    }
+
+    /// `cdr.write(request|call, extra=…)` must land on the record the call is
+    /// already accumulating, so the operator gets ONE row carrying both the
+    /// script's fields and the timings — not a billing row with no duration
+    /// beside a duration row with no billing fields.
+    #[test]
+    fn script_extras_merge_into_the_tracked_session() {
+        use std::sync::Mutex;
+
+        // Stands in for `DispatcherState::cdr_sessions`, which is where the
+        // real merger (installed by the dispatcher) looks.
+        static SESSIONS: OnceLock<Mutex<std::collections::HashMap<String, CdrSession>>> =
+            OnceLock::new();
+        let sessions = SESSIONS.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+        sessions
+            .lock()
+            .expect("sessions lock")
+            .insert("call-1\0tag-A".to_string(), tracked_session());
+
+        install_extra_merger(Arc::new(|keys: &[String], extra: &HashMap<String, String>| {
+            let mut guard = match SESSIONS.get() {
+                Some(store) => store.lock().expect("sessions lock"),
+                None => return false,
+            };
+            for key in keys {
+                if let Some(session) = guard.get_mut(key) {
+                    session.merge_extra(extra);
+                    return true;
+                }
+            }
+            false
+        }));
+
+        let extra = HashMap::from([
+            ("billing_id".to_string(), "B-12345".to_string()),
+            ("carrier_id".to_string(), "carrier-a".to_string()),
+        ]);
+
+        // A key that resolves: the fields are taken, and the caller is told
+        // NOT to write a record of its own.
+        assert!(merge_extra_into_session(
+            &["call-1\0tag-A".to_string()],
+            &extra
+        ));
+
+        // A key that does not (auto-emit off, an untracked request, a call
+        // already finalized): the caller owns the record.
+        assert!(!merge_extra_into_session(
+            &["call-2\0tag-Z".to_string()],
+            &extra
+        ));
+
+        // The one emitted record carries both halves.
+        let mut session = sessions
+            .lock()
+            .expect("sessions lock")
+            .remove("call-1\0tag-A")
+            .expect("session still tracked");
+        session.mark_answered(200);
+        let cdr = session.finalize("caller", None, None);
+
+        assert_eq!(cdr.extra.get("billing_id").map(String::as_str), Some("B-12345"));
+        assert_eq!(
+            cdr.extra.get("carrier_id").map(String::as_str),
+            Some("carrier-a")
+        );
+        assert_eq!(cdr.response_code, 200);
+        assert!(cdr.timestamp_start.is_some());
+        assert!(cdr.timestamp_answer.is_some());
+        assert!(cdr.timestamp_end.is_some());
+        assert_eq!(cdr.disconnect_initiator.as_deref(), Some("caller"));
+    }
+
+    /// The Rf correlation used to be stamped only by the script's own record,
+    /// so an auto-emitted CDR never carried it. Now that the script's fields
+    /// merge into that record, it has to resolve the stamp itself.
+    #[test]
+    fn finalize_stamps_the_rf_session_it_is_keyed_under() {
+        crate::diameter::rf_service::install_rf_lookup(Arc::new(|key: &str| {
+            if key == "b2bua:call-uuid-1" {
+                Some(("cdf.example;1;1;acct".to_string(), Some(2001)))
+            } else {
+                None
+            }
+        }));
+
+        let mut session = tracked_session();
+        session.set_rf_keys(vec![
+            "dialog:no-such\0tag:orig".to_string(),
+            "b2bua:call-uuid-1".to_string(),
+        ]);
+        let cdr = session.finalize("callee", Some(200), None);
+        assert_eq!(cdr.rf_session_id.as_deref(), Some("cdf.example;1;1;acct"));
+        assert_eq!(cdr.rf_result_code, Some(2001));
+
+        // A call with no Rf record tracked is left unstamped rather than
+        // carrying another call's session id.
+        let mut orphan = tracked_session();
+        orphan.set_rf_keys(vec!["b2bua:call-uuid-2".to_string()]);
+        let cdr = orphan.finalize("caller", None, None);
+        assert!(cdr.rf_session_id.is_none());
+        assert!(cdr.rf_result_code.is_none());
+    }
 
     fn sample_cdr() -> Cdr {
         Cdr::new(

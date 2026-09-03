@@ -211,7 +211,7 @@ All four, plus the reliable-provisional scenario that had been driven only by
 
 | Feature | Readiness | Config | Notes |
 |---------|-----------|--------|-------|
-| CDR generation | Implemented | `cdr:` | Auto-emit per call (`cdr.auto_emit`) — proxy + B2BUA, with duration + disconnect_initiator; plus script `cdr.write(request)` (proxy) / `cdr.write(call)` (B2BUA), additive |
+| CDR generation | Implemented | `cdr:` | Auto-emit per call (`cdr.auto_emit`) — proxy + B2BUA, with duration + disconnect_initiator + Rf correlation; script `cdr.write(request)` (proxy) / `cdr.write(call)` (B2BUA) merges its `extra` fields into that record, and writes one of its own only when no auto-emit record is tracked |
 | REGISTER CDRs | Implemented | `cdr.include_register` | With `auto_emit`, one CDR per registrar state change (`reg_event`) |
 | File backend (JSON-lines) | Implemented | `cdr.backend: file` | With rotation |
 | Syslog backend | Implemented | `cdr.backend: syslog` | UDP syslog |

@@ -147,6 +147,22 @@ def answered(call, reply):
     cdr.write(call, extra={"billing_id": "B-12345"})
 ```
 
+With `auto_emit` on, that does **not** write a second record: siphon is already
+tracking one for the call, and `extra` is merged into it, so the fields land on
+the same row as `duration_secs`, `response_code` and `disconnect_initiator` when
+the call ends. Call it as often as you like — later fields merge on top, last
+write wins per key. A record of its own is written only when there is nothing to
+merge into: `auto_emit` off, or a request the auto-emit hooks do not track (a
+MESSAGE, an out-of-dialog request).
+
+So attach fields as soon as you know them (`@proxy.on_request("INVITE")`,
+`@b2bua.on_answer`) rather than trying to assemble a record at teardown — the
+teardown half is siphon's job.
+
+A call the proxy never forwards (the script answered a 403, or dropped it)
+normally produces no CDR at all. Calling `cdr.write()` on it is how you ask for
+one anyway — a blocked-call record, emitted with the code the script answered.
+
 Watch `siphon_cdr_sessions` (the live per-call tracking count): it returns to 0
 between calls, and a steady climb under flat load means a call teardown isn't
 being seen.

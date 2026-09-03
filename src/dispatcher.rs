@@ -356,11 +356,6 @@ impl ProxyRfState {
     }
 }
 
-/// Format the B2BUA Rf-session key from the internal call UUID.
-fn rf_b2bua_key(internal_call_id: &str) -> String {
-    format!("b2bua:{internal_call_id}")
-}
-
 /// State for one outstanding reliable provisional response (RFC 3262 §3).
 pub struct ReliableProvisional {
     /// Notified by the dispatcher when a matching PRACK arrives, or when the
@@ -848,6 +843,25 @@ pub async fn run(
                 (session.session_id().to_string(), session.last_result_code())
             })
         }));
+    }
+
+    // Install the auto-emit CDR session merger so a script's
+    // `cdr.write(request|call, extra=…)` attaches its fields to the record
+    // this call is already accumulating instead of queueing a second,
+    // timing-less record beside it.
+    {
+        let cdr_sessions = Arc::clone(&state.cdr_sessions);
+        crate::cdr::install_extra_merger(Arc::new(
+            move |keys: &[String], extra: &std::collections::HashMap<String, String>| {
+                for key in keys {
+                    if let Some(mut session) = cdr_sessions.get_mut(key.as_str()) {
+                        session.merge_extra(extra);
+                        return true;
+                    }
+                }
+                false
+            },
+        ));
     }
 
     // Install the script → auto-emit charging-param channel so
@@ -4241,9 +4255,22 @@ fn handle_request(
     // is unaffected (spawn is fire-and-forget).
     if method == "BYE" {
         spawn_rf_proxy_stop_if_tracked(state, &message);
-        // CDR: write the call record on in-dialog BYE (cdr.auto_emit).
-        cdr_finalize_proxy_stop(state, &message);
     }
+    // CDR: the call record is written when this scope ends — i.e. *after* the
+    // script's BYE handler ran, so `cdr.write(request, extra=…)` from
+    // `@proxy.on_request("BYE")` still lands on it. A drop guard rather than a
+    // call at the end of the function because the record must be written on
+    // every exit path, including the one a dropped or rejected BYE takes —
+    // same "accounting closes regardless of what the script decides" rule as
+    // the ACR-STOP above.
+    let _cdr_stop_guard = if method == "BYE" && crate::cdr::auto_emit_enabled() {
+        CdrProxyStop::from_bye(&message).map(|parts| CdrProxyStopGuard {
+            sessions: Arc::clone(&state.cdr_sessions),
+            parts: Some(parts),
+        })
+    } else {
+        None
+    };
     if method == "UPDATE" && engine_state.has_b2bua_handlers() {
         // RFC 3311 in-dialog UPDATE belonging to a B2BUA call: bridge it
         // across like a re-INVITE. Calls that don't match a tracked B2BUA
@@ -4453,6 +4480,22 @@ fn handle_request(
         );
         return;
     }
+
+    // CDR: open the record before the script runs (cdr.auto_emit), so
+    // `cdr.write(request, extra=…)` from the handler attaches its fields to the
+    // call's own record instead of queueing a second, timing-less one beside
+    // it. Settled below once the script's decision is known — an INVITE the
+    // proxy never forwards is not a call and its record is dropped again.
+    let cdr_key = if method == "INVITE" {
+        cdr_track_proxy_start(
+            &state.cdr_sessions,
+            &message,
+            &inbound.remote_addr.ip().to_string(),
+            &format!("{}", inbound.transport).to_lowercase(),
+        )
+    } else {
+        None
+    };
 
     // Create PyRequest wrapping the message
     let transport_name = format!("{}", inbound.transport).to_lowercase();
@@ -4931,22 +4974,21 @@ fn handle_request(
         }
     }
 
-    // CDR: start tracking a relayed/forked INVITE so a record is written when
-    // the call ends (cdr.auto_emit). Only a dialog-forming INVITE that the
-    // proxy actually forwarded is tracked.
-    if method == "INVITE"
-        && matches!(
-            action,
-            RequestAction::Relay { .. } | RequestAction::Fork { .. }
-        )
-    {
-        cdr_track_proxy_start(
-            state,
-            &message_guard,
-            &inbound.remote_addr.ip().to_string(),
-            &format!("{}", inbound.transport).to_lowercase(),
-            auth_user.as_deref(),
-        );
+    // CDR: settle the record opened before the handler ran. A forwarded INVITE
+    // keeps it (and takes the identity the script authenticated); anything else
+    // is not a call, so the record is dropped — unless the script attached
+    // fields to it, which is an explicit ask for a record of the attempt.
+    if let Some(cdr_key) = &cdr_key {
+        let outcome = match &action {
+            RequestAction::Relay { .. } | RequestAction::Fork { .. } => {
+                ProxyInviteOutcome::Forwarded {
+                    auth_user: auth_user.as_deref(),
+                }
+            }
+            RequestAction::Reply { code, .. } => ProxyInviteOutcome::Rejected { code: *code },
+            _ => ProxyInviteOutcome::Dropped,
+        };
+        cdr_settle_proxy_start(&state.cdr_sessions, cdr_key, outcome);
     }
 
     // Flush deferred messages (e.g. in-dialog NOTIFY) after the reply/relay
@@ -7558,7 +7600,7 @@ fn handle_response(
                         // so the failed-call record is written exactly once.
                         if let Some(key) = &cdr_fail_key {
                             cdr_finalize(
-                                state,
+                                &state.cdr_sessions,
                                 key,
                                 cdr_disconnect_for_failure(best_code),
                                 Some(best_code),
@@ -11096,7 +11138,7 @@ fn cdr_session_from_invite(
         _ => String::new(),
     };
     let user_agent = invite.headers.get("User-Agent").map(|s| s.to_string());
-    let session = crate::cdr::CdrSession::new(
+    let mut session = crate::cdr::CdrSession::new(
         call_id.clone(),
         from_uri,
         to_uri,
@@ -11106,6 +11148,20 @@ fn cdr_session_from_invite(
         user_agent,
         auth_user,
     );
+    // Rf correlation: remember where this dialog's accounting record can be
+    // found so the finalized CDR can name it (TS 32.299). Resolved at teardown
+    // rather than now — ACR-START is spawned, so the session usually does not
+    // exist yet at INVITE time. Skipped entirely on a deployment with no Rf
+    // configured, where the keys would be eight allocations per call to look
+    // up a map that will never exist.
+    if crate::diameter::rf_service::rf_lookup_installed() {
+        session.set_rf_keys(crate::diameter::rf_service::rf_lookup_candidates(
+            rf_extract_icid(invite).as_deref(),
+            Some(call_id.as_str()),
+            Some(from_tag.as_str()),
+            None,
+        ));
+    }
     Some((cdr_dialog_key(&call_id, &from_tag), session))
 }
 
@@ -11118,14 +11174,18 @@ fn cdr_mark_answer(state: &DispatcherState, key: &str, response_code: u16) {
 
 /// Finalize a tracked CDR session (write the record + drop it). No-op if the
 /// call was never tracked (auto-emit off, or not an INVITE dialog).
+///
+/// Takes the session map rather than the whole dispatcher state so the BYE
+/// drop guard — which outlives the borrow of the message it was built from —
+/// can hold just the map.
 fn cdr_finalize(
-    state: &DispatcherState,
+    sessions: &DashMap<String, crate::cdr::CdrSession>,
     key: &str,
     disconnect_initiator: &str,
     response_code: Option<u16>,
     sip_reason: Option<String>,
 ) {
-    if let Some((_, session)) = state.cdr_sessions.remove(key) {
+    if let Some((_, session)) = sessions.remove(key) {
         let cdr = session.finalize(disconnect_initiator, response_code, sip_reason);
         crate::cdr::write(cdr);
     }
@@ -11238,25 +11298,114 @@ fn media_summary_to_cdr(summary: &crate::rtpengine::events::CallSummary) -> crat
     cdr
 }
 
-/// Proxy CDR START — the proxy is relaying/forking an INVITE. Records the call
-/// so a CDR can be emitted when it ends. Deduped so a retransmitted INVITE
-/// doesn't reset the start time.
+/// Proxy CDR START — open the record for an inbound INVITE, *before* the script
+/// handler runs, so `cdr.write(request, extra=…)` from that handler has a
+/// record to attach its fields to. What the script then decides is settled by
+/// [`cdr_settle_proxy_start`]: an INVITE the proxy does not forward has no call
+/// to account for and its record is dropped again (or emitted, when the script
+/// attached fields to it — it asked for a record for this attempt).
+///
+/// Returns the key of the record this call opened, or `None` when it opened
+/// none: auto-emit off, an INVITE without the Call-ID/From-tag to key on, or a
+/// re-INVITE on a dialog that is already tracked — the established call's
+/// record must survive whatever the script does with the re-INVITE, so it is
+/// neither re-stamped nor settled.
 fn cdr_track_proxy_start(
-    state: &DispatcherState,
+    sessions: &DashMap<String, crate::cdr::CdrSession>,
     invite: &SipMessage,
     source_ip: &str,
     transport: &str,
-    // Username the script authenticated the caller as, read after the handler
-    // ran. `None` when the call was never challenged.
-    auth_user: Option<&str>,
-) {
+) -> Option<String> {
     if !crate::cdr::auto_emit_enabled() {
-        return;
+        return None;
     }
-    if let Some((key, session)) =
-        cdr_session_from_invite(invite, source_ip, transport, auth_user.map(String::from))
-    {
-        state.cdr_sessions.entry(key).or_insert(session);
+    let (key, session) = cdr_session_from_invite(invite, source_ip, transport, None)?;
+    match sessions.entry(key.clone()) {
+        dashmap::mapref::entry::Entry::Occupied(_) => None,
+        dashmap::mapref::entry::Entry::Vacant(slot) => {
+            slot.insert(session);
+            Some(key)
+        }
+    }
+}
+
+/// What the script did with an INVITE whose CDR record was opened by
+/// [`cdr_track_proxy_start`].
+enum ProxyInviteOutcome<'a> {
+    /// Relayed or forked — this is a call, keep the record.
+    Forwarded {
+        // Username the script authenticated the caller as, read after the
+        // handler ran. `None` when the call was never challenged.
+        auth_user: Option<&'a str>,
+    },
+    /// Answered locally (a 403, a 407 challenge the UA will retry, …).
+    Rejected { code: u16 },
+    /// Silently dropped.
+    Dropped,
+}
+
+/// What happens to the record when the script's decision is in.
+#[derive(Debug, PartialEq, Eq)]
+enum CdrSettle {
+    /// This is a call — keep accumulating; the BYE finalizes it.
+    Keep,
+    /// Not a call, but the script asked for a record of the attempt.
+    Emit {
+        disconnect: &'static str,
+        code: Option<u16>,
+    },
+    /// Not a call and nothing was attached — the record never existed as far
+    /// as the operator is concerned.
+    Discard,
+}
+
+/// A forwarded INVITE keeps its record. An INVITE the proxy never forwarded is
+/// not a call, so its record is discarded — *unless* the script attached fields
+/// to it, because `cdr.write(request, extra=…)` on a call the script then
+/// rejects is a deliberate ask for a record of that attempt, and it is emitted
+/// carrying the code the script answered instead of a bare `0`.
+fn cdr_settle_decision(outcome: &ProxyInviteOutcome<'_>, script_attached_fields: bool) -> CdrSettle {
+    match outcome {
+        ProxyInviteOutcome::Forwarded { .. } => CdrSettle::Keep,
+        ProxyInviteOutcome::Rejected { code } if script_attached_fields => CdrSettle::Emit {
+            disconnect: cdr_disconnect_for_failure(*code),
+            code: Some(*code),
+        },
+        ProxyInviteOutcome::Dropped if script_attached_fields => CdrSettle::Emit {
+            disconnect: "error",
+            code: None,
+        },
+        _ => CdrSettle::Discard,
+    }
+}
+
+/// Keep, emit or discard the record [`cdr_track_proxy_start`] opened.
+fn cdr_settle_proxy_start(
+    sessions: &DashMap<String, crate::cdr::CdrSession>,
+    key: &str,
+    outcome: ProxyInviteOutcome<'_>,
+) {
+    let script_attached_fields = sessions
+        .get(key)
+        .is_some_and(|session| session.has_extra_fields());
+
+    match cdr_settle_decision(&outcome, script_attached_fields) {
+        CdrSettle::Keep => {
+            if let ProxyInviteOutcome::Forwarded {
+                auth_user: Some(auth_user),
+            } = outcome
+            {
+                if let Some(mut session) = sessions.get_mut(key) {
+                    session.set_auth_user(auth_user.to_string());
+                }
+            }
+        }
+        CdrSettle::Emit { disconnect, code } => {
+            cdr_finalize(sessions, key, disconnect, code, None);
+        }
+        CdrSettle::Discard => {
+            sessions.remove(key);
+        }
     }
 }
 
@@ -11277,31 +11426,272 @@ fn cdr_mark_proxy_answer(state: &DispatcherState, invite: &SipMessage, response_
 /// Proxy CDR STOP — an in-dialog BYE ended the call. Resolves the disconnecting
 /// side by which tag the BYE arrived under: the BYE's From-tag matches the
 /// INVITE's From-tag when the caller hangs up, else the callee did.
-fn cdr_finalize_proxy_stop(state: &DispatcherState, bye: &SipMessage) {
-    if !crate::cdr::auto_emit_enabled() {
-        return;
-    }
-    let Some(call_id) = bye.headers.get("Call-ID").map(|s| s.to_string()) else {
-        return;
-    };
-    let from_tag = bye.typed_from().ok().flatten().and_then(|na| na.tag);
-    let to_tag = bye.typed_to().ok().flatten().and_then(|na| na.tag);
-    let sip_reason = cdr_extract_reason(bye);
+///
+/// Owned rather than borrowed from the BYE because the record is finalized
+/// after the script handler has run, by which point the relay path has taken
+/// the message.
+struct CdrProxyStop {
+    call_id: String,
+    from_tag: Option<String>,
+    to_tag: Option<String>,
+    sip_reason: Option<String>,
+}
 
-    // Caller hung up: BYE From-tag == INVITE From-tag (the stored key).
-    if let Some(from_tag) = &from_tag {
-        let key = cdr_dialog_key(&call_id, from_tag);
-        if state.cdr_sessions.contains_key(&key) {
-            cdr_finalize(state, &key, "caller", None, sip_reason);
-            return;
+impl CdrProxyStop {
+    fn from_bye(bye: &SipMessage) -> Option<Self> {
+        Some(Self {
+            call_id: bye.headers.get("Call-ID").map(|s| s.to_string())?,
+            from_tag: bye.typed_from().ok().flatten().and_then(|na| na.tag),
+            to_tag: bye.typed_to().ok().flatten().and_then(|na| na.tag),
+            sip_reason: cdr_extract_reason(bye),
+        })
+    }
+
+    fn finalize(self, sessions: &DashMap<String, crate::cdr::CdrSession>) {
+        // Caller hung up: BYE From-tag == INVITE From-tag (the stored key).
+        if let Some(from_tag) = &self.from_tag {
+            let key = cdr_dialog_key(&self.call_id, from_tag);
+            if sessions.contains_key(&key) {
+                cdr_finalize(sessions, &key, "caller", None, self.sip_reason);
+                return;
+            }
+        }
+        // Callee hung up: BYE To-tag == INVITE From-tag.
+        if let Some(to_tag) = &self.to_tag {
+            let key = cdr_dialog_key(&self.call_id, to_tag);
+            if sessions.contains_key(&key) {
+                cdr_finalize(sessions, &key, "callee", None, self.sip_reason);
+            }
         }
     }
-    // Callee hung up: BYE To-tag == INVITE From-tag.
-    if let Some(to_tag) = &to_tag {
-        let key = cdr_dialog_key(&call_id, to_tag);
-        if state.cdr_sessions.contains_key(&key) {
-            cdr_finalize(state, &key, "callee", None, sip_reason);
+}
+
+/// Finalizes the proxy CDR when the BYE's request handling ends, whichever way
+/// it ends.
+///
+/// The record is written *after* the script's `@proxy.on_request("BYE")`
+/// handler has run, so a `cdr.write(request, extra=…)` in that handler still
+/// merges into it — attaching to the auto-emitted record is the whole contract
+/// of `cdr.write` under `auto_emit`, and a record finalized before the handler
+/// would leave that call with nothing to attach to. It is a drop guard rather
+/// than a call at the end of the function because the record must be written
+/// even when the script drops or rejects the BYE, or the handler panics — the
+/// same "accounting closes regardless of what the script decides" rule the Rf
+/// ACR-STOP above follows.
+struct CdrProxyStopGuard {
+    sessions: Arc<DashMap<String, crate::cdr::CdrSession>>,
+    parts: Option<CdrProxyStop>,
+}
+
+impl Drop for CdrProxyStopGuard {
+    fn drop(&mut self) {
+        if let Some(parts) = self.parts.take() {
+            parts.finalize(&self.sessions);
         }
+    }
+}
+
+#[cfg(test)]
+mod cdr_proxy_tests {
+    use super::*;
+    use crate::sip::builder::SipMessageBuilder;
+    use crate::sip::uri::SipUri;
+
+    const CALL_ID: &str = "call-cdr-stop-1";
+    const CALLER_TAG: &str = "tag-caller";
+    const CALLEE_TAG: &str = "tag-callee";
+
+    /// A BYE on the established dialog. `from_caller` picks the direction: the
+    /// hanging-up side is always the one in the From header (RFC 3261 §15.1).
+    fn bye(from_caller: bool) -> SipMessage {
+        let (from_tag, to_tag) = if from_caller {
+            (CALLER_TAG, CALLEE_TAG)
+        } else {
+            (CALLEE_TAG, CALLER_TAG)
+        };
+        SipMessageBuilder::new()
+            .request(
+                Method::Bye,
+                SipUri::new("example.com".to_string()).with_user("bob".to_string()),
+            )
+            .via("SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-bye".to_string())
+            .from(format!("<sip:alice@example.com>;tag={from_tag}"))
+            .to(format!("<sip:bob@example.com>;tag={to_tag}"))
+            .call_id(CALL_ID.to_string())
+            .cseq("2 BYE".to_string())
+            .content_length(0)
+            .build()
+            .expect("BYE builds")
+    }
+
+    /// The dispatcher keys a proxy call on the INVITE's From-tag, i.e. the
+    /// caller's.
+    fn tracked() -> DashMap<String, crate::cdr::CdrSession> {
+        let sessions = DashMap::new();
+        sessions.insert(
+            cdr_dialog_key(CALL_ID, CALLER_TAG),
+            crate::cdr::CdrSession::new(
+                CALL_ID.to_string(),
+                "sip:alice@example.com".to_string(),
+                "sip:bob@example.com".to_string(),
+                "sip:bob@192.0.2.1:5060".to_string(),
+                "192.0.2.100".to_string(),
+                "udp".to_string(),
+                None,
+                None,
+            ),
+        );
+        sessions
+    }
+
+    #[test]
+    fn a_bye_from_the_caller_finalizes_the_session() {
+        let sessions = tracked();
+        CdrProxyStop::from_bye(&bye(true))
+            .expect("BYE carries a Call-ID")
+            .finalize(&sessions);
+        assert!(sessions.is_empty(), "the record should have been written");
+    }
+
+    /// The callee's BYE carries the INVITE's From-tag as its *To*-tag, so the
+    /// session has to be resolved through the second candidate.
+    #[test]
+    fn a_bye_from_the_callee_resolves_through_the_to_tag() {
+        let sessions = tracked();
+        CdrProxyStop::from_bye(&bye(false))
+            .expect("BYE carries a Call-ID")
+            .finalize(&sessions);
+        assert!(sessions.is_empty(), "the record should have been written");
+    }
+
+    /// The record is written when the BYE's handling ends — including when the
+    /// script drops the BYE outright, which is the case the guard exists for:
+    /// finalizing before the handler would have made the record unreachable to
+    /// `cdr.write(request, extra=…)` from `@proxy.on_request("BYE")`, and
+    /// finalizing at the end of the happy path only would have lost the record
+    /// entirely for a dropped BYE.
+    #[test]
+    fn the_record_is_written_even_when_the_script_drops_the_bye() {
+        let sessions = Arc::new(tracked());
+        {
+            let _guard = CdrProxyStopGuard {
+                sessions: Arc::clone(&sessions),
+                parts: CdrProxyStop::from_bye(&bye(true)),
+            };
+            // The script returned without relay()/reply() — the request path
+            // takes an early exit and the guard is all that runs.
+            assert_eq!(sessions.len(), 1, "not finalized before the handler ran");
+        }
+        assert!(sessions.is_empty(), "the record should have been written");
+    }
+
+    /// A forwarded INVITE is a call: its record stays open until the BYE, and
+    /// takes the identity the script authenticated on the way through.
+    #[test]
+    fn a_forwarded_invite_keeps_its_record_and_takes_the_authenticated_identity() {
+        let sessions = tracked();
+        cdr_settle_proxy_start(
+            &sessions,
+            &cdr_dialog_key(CALL_ID, CALLER_TAG),
+            ProxyInviteOutcome::Forwarded {
+                auth_user: Some("alice"),
+            },
+        );
+        let session = sessions
+            .get(&cdr_dialog_key(CALL_ID, CALLER_TAG))
+            .expect("the call's record is still open");
+        assert_eq!(
+            session.clone().finalize("caller", None, None).auth_user,
+            Some("alice".to_string())
+        );
+    }
+
+    /// An INVITE the proxy never forwarded is not a call, so the record opened
+    /// for it before the handler ran is discarded rather than left to the
+    /// orphan sweep — a 407 challenge on every REGISTER-less INVITE would
+    /// otherwise pile up records for calls that never happened.
+    #[test]
+    fn a_rejected_invite_discards_its_record() {
+        let sessions = tracked();
+        cdr_settle_proxy_start(
+            &sessions,
+            &cdr_dialog_key(CALL_ID, CALLER_TAG),
+            ProxyInviteOutcome::Rejected { code: 407 },
+        );
+        assert!(sessions.is_empty());
+    }
+
+    /// …unless the script attached fields to it, which is a deliberate ask for
+    /// a record of the attempt. It carries the code the script answered rather
+    /// than the bare `0` a script-built record used to have.
+    #[test]
+    fn a_rejected_invite_the_script_wrote_a_cdr_for_is_emitted() {
+        assert_eq!(
+            cdr_settle_decision(&ProxyInviteOutcome::Rejected { code: 403 }, true),
+            CdrSettle::Emit {
+                disconnect: "callee",
+                code: Some(403),
+            }
+        );
+        assert_eq!(
+            cdr_settle_decision(&ProxyInviteOutcome::Rejected { code: 403 }, false),
+            CdrSettle::Discard
+        );
+        // A silent drop (the rate-limit / scanner pattern) has no code to
+        // report, but the script's record is still emitted when it asked.
+        assert_eq!(
+            cdr_settle_decision(&ProxyInviteOutcome::Dropped, true),
+            CdrSettle::Emit {
+                disconnect: "error",
+                code: None,
+            }
+        );
+        assert_eq!(
+            cdr_settle_decision(&ProxyInviteOutcome::Dropped, false),
+            CdrSettle::Discard
+        );
+        // A forwarded call is never emitted early, whatever is attached.
+        assert_eq!(
+            cdr_settle_decision(&ProxyInviteOutcome::Forwarded { auth_user: None }, true),
+            CdrSettle::Keep
+        );
+    }
+
+    /// A re-INVITE on an established dialog must not re-open (or re-settle)
+    /// the record the call already has — the script rejecting a re-INVITE
+    /// would otherwise throw away the answered call's CDR.
+    #[test]
+    fn a_reinvite_on_a_tracked_dialog_opens_no_second_record() {
+        let sessions = tracked();
+        let invite = SipMessageBuilder::new()
+            .request(
+                Method::Invite,
+                SipUri::new("example.com".to_string()).with_user("bob".to_string()),
+            )
+            .via("SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-re".to_string())
+            .from(format!("<sip:alice@example.com>;tag={CALLER_TAG}"))
+            .to(format!("<sip:bob@example.com>;tag={CALLEE_TAG}"))
+            .call_id(CALL_ID.to_string())
+            .cseq("2 INVITE".to_string())
+            .content_length(0)
+            .build()
+            .expect("re-INVITE builds");
+
+        // Auto-emit is off in the test binary, so this returns None for that
+        // reason too — what matters is that the tracked record is untouched.
+        assert!(cdr_track_proxy_start(&sessions, &invite, "192.0.2.100", "udp").is_none());
+        assert_eq!(sessions.len(), 1);
+    }
+
+    /// A BYE for a call this proxy never tracked (auto-emit off, or an INVITE
+    /// that predates the process) must not disturb anything.
+    #[test]
+    fn an_untracked_bye_is_a_no_op() {
+        let sessions: DashMap<String, crate::cdr::CdrSession> = DashMap::new();
+        CdrProxyStop::from_bye(&bye(true))
+            .expect("BYE carries a Call-ID")
+            .finalize(&sessions);
+        assert!(sessions.is_empty());
     }
 }
 
@@ -11319,7 +11709,7 @@ fn cdr_finalize_proxy_fail(state: &DispatcherState, invite: &SipMessage, respons
         return;
     };
     cdr_finalize(
-        state,
+        &state.cdr_sessions,
         &cdr_dialog_key(&call_id, &from_tag),
         cdr_disconnect_for_failure(response_code),
         Some(response_code),
@@ -11340,7 +11730,15 @@ fn cdr_track_b2bua_start(
     }
     // Reuse the INVITE field extraction, but key by the internal call UUID so
     // both legs (A/B, different Call-IDs) resolve to one CDR.
-    if let Some((_, session)) = cdr_session_from_invite(invite, source_ip, transport, None) {
+    if let Some((_, mut session)) = cdr_session_from_invite(invite, source_ip, transport, None) {
+        // A B2BUA Rf record is keyed on the internal call UUID, not on either
+        // leg's dialog, so that candidate goes first; the dialog-derived ones
+        // set above stay as the fallback for a record opened on the proxy path.
+        if crate::diameter::rf_service::rf_lookup_installed() {
+            let mut rf_keys = vec![crate::diameter::rf_service::rf_b2bua_key(internal_call_id)];
+            rf_keys.extend(session.rf_keys().iter().cloned());
+            session.set_rf_keys(rf_keys);
+        }
         state
             .cdr_sessions
             .entry(internal_call_id.to_string())
@@ -11384,7 +11782,7 @@ fn cdr_finalize_b2bua_stop(
     }
     let disconnect = if from_a_leg { "caller" } else { "callee" };
     cdr_finalize(
-        state,
+        &state.cdr_sessions,
         internal_call_id,
         disconnect,
         None,
@@ -11400,7 +11798,7 @@ fn cdr_finalize_b2bua_fail(state: &DispatcherState, internal_call_id: &str, resp
         return;
     }
     cdr_finalize(
-        state,
+        &state.cdr_sessions,
         internal_call_id,
         cdr_disconnect_for_failure(response_code),
         Some(response_code),
@@ -12130,7 +12528,7 @@ fn spawn_rf_b2bua_start(
             return;
         }
     };
-    let key = rf_b2bua_key(internal_call_id);
+    let key = crate::diameter::rf_service::rf_b2bua_key(internal_call_id);
     if state.rf_sessions.contains_key(&key) {
         debug!(
             call_id = %internal_call_id,
@@ -12243,7 +12641,7 @@ fn spawn_rf_b2bua_stop(state: &DispatcherState, internal_call_id: &str, cause_co
         Some(c) if c.auto_emit_b2bua() => Arc::clone(c),
         _ => return,
     };
-    let key = rf_b2bua_key(internal_call_id);
+    let key = crate::diameter::rf_service::rf_b2bua_key(internal_call_id);
     if !state.rf_sessions.contains_key(&key) {
         return;
     }
@@ -20593,7 +20991,7 @@ fn b2bua_terminate_call_inner(
     // disconnecting side and the Reason header as sip_reason.
     if crate::cdr::auto_emit_enabled() {
         cdr_finalize(
-            state,
+            &state.cdr_sessions,
             internal_call_id,
             disconnect_initiator,
             None,
@@ -20712,7 +21110,7 @@ fn b2bua_release_transferred_call(internal_call_id: &str, state: &DispatcherStat
     spawn_ro_b2bua_stop(state, internal_call_id, None);
 
     if crate::cdr::auto_emit_enabled() {
-        cdr_finalize(state, internal_call_id, "b2bua", None, None);
+        cdr_finalize(&state.cdr_sessions, internal_call_id, "b2bua", None, None);
     }
 
     // Safety-net RTPEngine cleanup. Keyed on the A-leg Call-ID (the store key);
@@ -28171,24 +28569,62 @@ mod tests {
     /// behaviour test above proves `cdr_session_from_invite` *stores* the
     /// identity, but not that the call site still *passes* it.
     ///
-    /// That is the half that regressed: the parameter existed all along and
-    /// every caller passed `None`. Guard the wiring at the source level, the
-    /// same way the packaging tests guard workflow drift.
+    /// That is the half that regressed once already: the parameter existed all
+    /// along and every caller passed `None`. Guard the wiring at the source
+    /// level, the same way the packaging tests guard workflow drift. The record
+    /// is now opened before the script runs, so the identity is no longer known
+    /// when it is built — it reaches the record through the settle step, and
+    /// that is what has to stay wired.
     #[test]
-    fn the_proxy_cdr_start_is_still_wired_to_the_authenticated_identity() {
+    fn the_proxy_cdr_settle_is_still_wired_to_the_authenticated_identity() {
         let source = include_str!("dispatcher.rs");
 
-        let call = source
-            .split("cdr_track_proxy_start(")
+        // The block in `handle_request` that decides the outcome and settles.
+        let block = source
+            .split("    if let Some(cdr_key) = &cdr_key {")
             .nth(1)
-            .expect("the proxy CDR start is still called");
-        let arguments = call.split(");").next().unwrap_or_default();
+            .expect("the proxy CDR settle is still called");
+        let block = block
+            .split("cdr_settle_proxy_start(")
+            .next()
+            .unwrap_or_default();
 
         assert!(
-            arguments.contains("auth_user"),
-            "cdr_track_proxy_start no longer receives the authenticated \
+            block.contains("auth_user"),
+            "the settled outcome no longer carries the authenticated \
              username — a proxy CDR's auth_user would silently go back to \
-             always being empty. Arguments were:{arguments}"
+             always being empty. The block was:{block}"
+        );
+    }
+
+    /// The record has to exist *while* the script handler runs, or
+    /// `cdr.write(request, extra=…)` from that handler finds nothing to attach
+    /// to and silently falls back to queueing a second, timing-less record —
+    /// the exact behaviour this ordering was changed to fix. Source-level for
+    /// the same reason as the guard above: `handle_request` needs a full
+    /// dispatcher and a live interpreter to drive.
+    #[test]
+    fn the_proxy_cdr_record_is_opened_before_the_script_handler_runs() {
+        let source = include_str!("dispatcher.rs");
+
+        let opened = source
+            .find("    let cdr_key = if method == \"INVITE\" {")
+            .expect("the proxy CDR record is still opened in handle_request");
+        let handlers = source
+            .find("    // Call Python handlers")
+            .expect("the script handlers are still dispatched in handle_request");
+        let settled = source
+            .find("    if let Some(cdr_key) = &cdr_key {")
+            .expect("the proxy CDR record is still settled in handle_request");
+
+        assert!(
+            opened < handlers,
+            "the CDR record is opened after the script handlers run — \
+             cdr.write(request, extra=…) from a handler can no longer reach it"
+        );
+        assert!(
+            handlers < settled,
+            "the CDR record is settled before the script handlers run"
         );
     }
 
