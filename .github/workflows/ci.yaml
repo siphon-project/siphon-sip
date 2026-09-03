@@ -613,6 +613,34 @@ jobs:
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-cancel down sipp-b2bua-cancel-uac sipp-b2bua-cancel-uas 2>/dev/null || true
 
+      # RFC 3261 §14 re-INVITE variants. All three scenarios existed but were
+      # wired to nothing — neither CI nor scripts/run-tests.sh named their
+      # profiles, so the behaviour they describe was asserted by nobody.
+      # `--exit-code-from` names the side that carries the assertion in each.
+      - name: B2BUA re-INVITE from the B-leg (Via branch correctness)
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-reinvite-bleg up --abort-on-container-exit --exit-code-from sipp-b2bua-reinvite-bleg-uac sipp-b2bua-reinvite-bleg-uac sipp-b2bua-reinvite-bleg-uas
+
+      - name: Cleanup reinvite-bleg containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-reinvite-bleg rm -sf sipp-b2bua-reinvite-bleg-uac sipp-b2bua-reinvite-bleg-uas 2>/dev/null || true
+
+      - name: B2BUA re-INVITE rejected by the A-leg (dialog survives, §14.1)
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-reinvite-reject up --abort-on-container-exit --exit-code-from sipp-b2bua-reinvite-reject-uac sipp-b2bua-reinvite-reject-uac sipp-b2bua-reinvite-reject-uas
+
+      - name: Cleanup reinvite-reject containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-reinvite-reject rm -sf sipp-b2bua-reinvite-reject-uac sipp-b2bua-reinvite-reject-uas 2>/dev/null || true
+
+      # The UAS carries the assertion here: it is the side that must still see a
+      # BYE after its own re-INVITE was rejected, so reading the UAC's exit code
+      # would pass vacuously.
+      - name: B2BUA re-INVITE rejected by the B-leg (dialog survives, §14.1)
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua --profile b2bua-reinvite-breject up --abort-on-container-exit --exit-code-from sipp-b2bua-reinvite-breject-uas sipp-b2bua-reinvite-breject-uac sipp-b2bua-reinvite-breject-uas
+
+      - name: Cleanup reinvite-breject containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-reinvite-breject rm -sf sipp-b2bua-reinvite-breject-uac sipp-b2bua-reinvite-breject-uas 2>/dev/null || true
+
       # RFC 3261 §17.1.1.3 — the CANCELled B-leg's 487 MUST be ACKed, or the
       # callee retransmits it on Timer G to Timer H (64*T1 = 32 s, §17.2.1) on
       # every abandoned outbound attempt.  --exit-code-from names the UAS: the
@@ -652,6 +680,53 @@ jobs:
             siphon-b2bua.log
             *.log
 
+  # ── B2BUA reliable-provisional (RFC 3262) interworking ──────────────────
+  # The B-leg answers with a reliable 183 (Require: 100rel, RSeq); the A-leg
+  # never advertised 100rel. siphon must auto-PRACK the B-leg and strip the
+  # 100rel contract from the 183 forwarded to the A-leg, or a real trunk CANCELs.
+  #
+  # Runs against a dedicated instance pinned to `sip-trunk-edge@2026`, whose
+  # response default is Copy — it does not strip Require/RSeq — so the strip is
+  # proven to be framework-auto rather than a side effect of the default preset.
+  #
+  # Its own job because it needs its own siphon instance and its own
+  # registration, and because it was previously driven only by
+  # scripts/run-tests.sh: a regression in the 100rel interworking was not caught
+  # on the PR that caused it. That is the gap this closes.
+  sipp-b2bua-reliable-prov:
+    runs-on: ubuntu-latest
+    needs: build-image
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Load the siphon image
+        uses: ./.github/actions/load-siphon-image
+
+      - name: Start siphon-b2bua-trunk-edge
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-reliable-prov up -d --wait siphon-b2bua-trunk-edge
+
+      - name: Register bob against the trunk-edge instance
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-reliable-prov run --rm sipp-b2bua-trunk-edge-register
+
+      - name: Reliable 183 auto-PRACKed, 100rel stripped toward the A-leg
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-reliable-prov up --abort-on-container-exit --exit-code-from sipp-b2bua-reliable-prov-uac sipp-b2bua-reliable-prov-uac sipp-b2bua-reliable-prov-uas
+
+      - name: Collect siphon logs
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml logs siphon-b2bua-trunk-edge > siphon-reliable-prov.log 2>&1 || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sipp-b2bua-reliable-prov-logs
+          path: siphon-reliable-prov.log
+          if-no-files-found: ignore
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-reliable-prov down --remove-orphans 2>/dev/null || true
+
   # ── B2BUA REFER / call-transfer functional tests ────────────────────────
   # In-dialog REFER on a tracked B2BUA call: transparent forward, loop-safe
   # 603 reject, siphon-terminated transfer (non-anchored), and the terminated
@@ -685,6 +760,18 @@ jobs:
       - name: Cleanup reject containers
         if: always()
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-reject rm -sf sipp-b2bua-refer-reject-uac sipp-b2bua-refer-reject-uas 2>/dev/null || true
+
+      # siphon-originated REFER from @b2bua.on_answer. The scenario existed but
+      # ran nowhere, and the first time it did it caught a real ordering bug:
+      # the deferred call.refer() was emitted where the handler ran, which is
+      # before the A-leg 2xx is forwarded, so the caller received an in-dialog
+      # REFER for a dialog it had not yet confirmed (RFC 3261 §13.2.2.4).
+      - name: B2BUA REFER siphon-originated (REFER follows the 2xx, not before it)
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-outbound up --abort-on-container-exit --exit-code-from sipp-b2bua-refer-outbound-uac sipp-b2bua-refer-outbound-uac sipp-b2bua-refer-outbound-bob-uas
+
+      - name: Cleanup refer-outbound containers
+        if: always()
+        run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-outbound rm -sf sipp-b2bua-refer-outbound-uac sipp-b2bua-refer-outbound-bob-uas 2>/dev/null || true
 
       - name: B2BUA REFER siphon-terminated (dial target + promote + BYE)
         run: docker compose -f sipp/docker-compose.yaml --profile b2bua-refer-terminate up --abort-on-container-exit --exit-code-from sipp-b2bua-refer-terminate-uac sipp-b2bua-refer-terminate-uac sipp-b2bua-refer-terminate-bob-uas sipp-b2bua-refer-terminate-carol-uas

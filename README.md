@@ -98,7 +98,7 @@ This isn't a replacement for Kamailio or OpenSIPS. It's what happens when someon
 | **Outbound / Flow Tokens** | RFC 5626 | Unit tests |
 | **DNS SRV/NAPTR** | RFC 3263 | Unit + integration tests |
 | **ENUM** | RFC 6116 | Unit tests |
-| **PRACK (Reliable Provisionals)** | RFC 3262 | Unit tests + SIPp scenario (not in CI — see matrix) |
+| **PRACK (Reliable Provisionals)** | RFC 3262 | Unit + integration tests + SIPp scenario |
 | **Session Timers** | RFC 4028 | Unit + integration tests + SIPp scenario |
 | **RTPEngine Media Anchoring** | — (RTPEngine NG protocol) | Unit + integration tests |
 | **SDP Codec Filtering** | RFC 4566 | Unit + integration tests |

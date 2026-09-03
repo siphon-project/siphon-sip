@@ -6,6 +6,33 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Fixed
+- **A siphon-originated REFER no longer overtakes the answer it depends on.**
+  A `call.refer()` issued from `@b2bua.on_answer` was emitted at the point the
+  handler ran — which is *before* the A-leg 2xx is forwarded — so the caller
+  received an in-dialog REFER for a dialog it had not yet confirmed (RFC 3261
+  §13.2.2.4: the UAC confirms the dialog on the 2xx). A real UA answers that
+  481. The REFER is now held until the 200 OK is on the wire.
+
+  Found by `b2bua-refer-outbound`, a SIPp scenario that existed but was wired to
+  no runner — the first time it ran, it caught this.
+
+### Changed
+- **Every SIPp scenario now runs on every pull request.** Four had no runner at
+  all (`b2bua-refer-outbound`, `b2bua-reinvite-bleg`, `b2bua-reinvite-breject`,
+  `b2bua-reinvite-reject`), so the behaviour they described — B-leg-initiated
+  re-INVITE Via correctness, and dialog survival when a re-INVITE is rejected
+  from either side (RFC 3261 §14.1) — was asserted by nothing. The
+  reliable-provisional scenario (`b2bua-reliable-prov`, RFC 3262 100rel
+  interworking) existed but was driven only by `scripts/run-tests.sh`, so a
+  regression in it was not caught on the PR that caused it; it now has its own
+  CI job.
+- **Fixed a race in the `b2bua-reinvite-breject` scenario.** A `<pause>` sat
+  where the BYE arrives, so an on-time BYE landed before SIPp had armed the
+  `recv` and aborted the run as unexpected. Test-side only — siphon sends
+  exactly one BYE and retransmits it correctly per RFC 3261 §17.1.
+
+
 ## [1.8.0] — 2026-09-02
 
 _Codename: kees._

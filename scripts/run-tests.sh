@@ -486,6 +486,20 @@ if [[ "$RUN_B2BUA" == true ]]; then
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-reinvite up --abort-on-container-exit --exit-code-from sipp-b2bua-reinvite-uac sipp-b2bua-reinvite-uac sipp-b2bua-reinvite-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-reinvite rm -sf sipp-b2bua-reinvite-uac sipp-b2bua-reinvite-uas 2>/dev/null || true
 
+  echo "=== B2BUA re-INVITE from the B-leg (Via branch correctness) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-reinvite-bleg up --abort-on-container-exit --exit-code-from sipp-b2bua-reinvite-bleg-uac sipp-b2bua-reinvite-bleg-uac sipp-b2bua-reinvite-bleg-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-reinvite-bleg rm -sf sipp-b2bua-reinvite-bleg-uac sipp-b2bua-reinvite-bleg-uas 2>/dev/null || true
+
+  echo "=== B2BUA re-INVITE rejected by the A-leg (dialog survives, RFC 3261 §14.1) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-reinvite-reject up --abort-on-container-exit --exit-code-from sipp-b2bua-reinvite-reject-uac sipp-b2bua-reinvite-reject-uac sipp-b2bua-reinvite-reject-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-reinvite-reject rm -sf sipp-b2bua-reinvite-reject-uac sipp-b2bua-reinvite-reject-uas 2>/dev/null || true
+
+  # The UAS carries the assertion: it is the side that must still see a BYE
+  # after its own re-INVITE was rejected, so --exit-code-from names it.
+  echo "=== B2BUA re-INVITE rejected by the B-leg (dialog survives, RFC 3261 §14.1) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-reinvite-breject up --abort-on-container-exit --exit-code-from sipp-b2bua-reinvite-breject-uas sipp-b2bua-reinvite-breject-uac sipp-b2bua-reinvite-breject-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-reinvite-breject rm -sf sipp-b2bua-reinvite-breject-uac sipp-b2bua-reinvite-breject-uas 2>/dev/null || true
+
   echo "=== B2BUA UPDATE test (RFC 3311 in-dialog UPDATE bridging) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-update up --abort-on-container-exit --exit-code-from sipp-b2bua-update-uac sipp-b2bua-update-uac sipp-b2bua-update-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua --profile b2bua-update rm -sf sipp-b2bua-update-uac sipp-b2bua-update-uas 2>/dev/null || true
@@ -506,6 +520,13 @@ if [[ "$RUN_B2BUA" == true ]]; then
   echo "=== B2BUA REFER siphon-terminated test (dial target + promote + BYE) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-refer-terminate up --abort-on-container-exit --exit-code-from sipp-b2bua-refer-terminate-uac sipp-b2bua-refer-terminate-uac sipp-b2bua-refer-terminate-bob-uas sipp-b2bua-refer-terminate-carol-uas
   docker compose -f "$COMPOSE_FILE" --profile b2bua-refer-terminate down 2>/dev/null || true
+
+  # siphon-originated REFER from @b2bua.on_answer. Caught a real ordering bug
+  # the first time it ran: the deferred call.refer() went out before the A-leg
+  # 2xx, so the caller saw an in-dialog REFER for an unconfirmed dialog.
+  echo "=== B2BUA REFER siphon-originated (REFER follows the 2xx, not before it) ==="
+  run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-refer-outbound up --abort-on-container-exit --exit-code-from sipp-b2bua-refer-outbound-uac sipp-b2bua-refer-outbound-uac sipp-b2bua-refer-outbound-bob-uas
+  docker compose -f "$COMPOSE_FILE" --profile b2bua-refer-outbound rm -sf sipp-b2bua-refer-outbound-uac sipp-b2bua-refer-outbound-bob-uas 2>/dev/null || true
 
   echo "=== B2BUA REFER terminate + REAL rtpengine (media re-anchor: offer/answer/delete) ==="
   run_sipp docker compose -f "$COMPOSE_FILE" --profile b2bua-rtpengine-refer up --abort-on-container-exit --exit-code-from sipp-anchored-refer-uac sipp-anchored-refer-uac sipp-anchored-refer-bob-uas sipp-anchored-refer-carol-uas

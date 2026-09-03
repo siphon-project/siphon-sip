@@ -108,9 +108,10 @@ Content-Length: 0
 ]]>
   </send>
 
-  <pause milliseconds="200" />
-
-  <!-- Receive BYE from B2BUA — call must survive after rejected re-INVITE -->
+  <!-- Receive BYE from B2BUA — call must survive after rejected re-INVITE.
+       No pause before this: the BYE follows the 488's ACK immediately, and a
+       pause here is a window in which SIPp has not yet armed the recv, so an
+       on-time BYE is reported as unexpected and the scenario aborts. -->
   <recv request="BYE" />
 
   <!-- Send 200 OK for BYE -->
