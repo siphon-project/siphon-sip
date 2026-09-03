@@ -9441,6 +9441,47 @@ fn uac_route_set_from_record_routes(record_routes: &[String]) -> Vec<String> {
     routes
 }
 
+/// Store the route set a dialog-establishing 2xx defines on the B-leg it answers
+/// (RFC 3261 §12.1.2 — the UAC's route set is that response's `Record-Route`,
+/// reversed).
+///
+/// Split out of the transfer-completion path so the capture is testable against a
+/// bare [`CallActorStore`], because the leg is where every later in-dialog request
+/// reads its route set from: the ACK for this 2xx, the BYE at hangup, a re-INVITE.
+/// A leg that never captured one sends all of them with no `Route` at all, which
+/// reaches the peer stripped of the state tokens the proxies in between wrote into
+/// their `Record-Route` — a lenient proxy forwards it anyway, one that keys media
+/// on that token never opens the media path, and the call answers silent.
+///
+/// Returns whether a route set was stored. `false` covers the ordinary
+/// direct-peer case where the 2xx carries no `Record-Route`, and leaves whatever
+/// the leg already had alone.
+fn store_b_leg_route_set_from_2xx(
+    call_actors: &CallActorStore,
+    call_id: &str,
+    leg_index: usize,
+    response: &SipMessage,
+) -> bool {
+    let route_set = uac_route_set_from_record_routes(
+        &response
+            .headers
+            .get_all("Record-Route")
+            .cloned()
+            .unwrap_or_default(),
+    );
+    if route_set.is_empty() {
+        return false;
+    }
+    let Some(mut call) = call_actors.get_call_mut(call_id) else {
+        return false;
+    };
+    let Some(leg) = call.b_legs.get_mut(leg_index) else {
+        return false;
+    };
+    leg.dialog.route_set = route_set;
+    true
+}
+
 /// Resolve a script-supplied translate-op name (from `call.dial(translate=[(…, "rfc7044")])`)
 /// to a [`crate::b2bua::header_policy::TranslateOp`].  Returns `None` for
 /// unknown names; the caller is expected to log and skip.
@@ -17086,6 +17127,27 @@ fn handle_b2bua_response(
             }
         }
 
+        // The route set the re-INVITE itself carried, stored on the tracking leg
+        // when it was sent. The ACK is its own request and has to carry the
+        // dialog's route set (RFC 3261 §12.2.1.1) or it reaches the responder
+        // without the state tokens the proxies in between put in their
+        // Record-Route — signalling survives on a lenient proxy, but one that
+        // keys media on that token never opens the path, so the call answers
+        // silent. It cannot be rebuilt from the response: a mid-dialog 2xx does
+        // not re-advertise Record-Route the way an initial INVITE's does
+        // (§12.1.2). Read off the *tracking* leg rather than the winning B-leg
+        // because a transfer promotes legs while its re-anchor re-INVITE is in
+        // flight, so the winner is not reliably the party this ACK addresses.
+        let responder_route_set: Vec<String> = b_leg_index
+            .and_then(|index| {
+                state.call_actors.get_call(call_id).and_then(|call| {
+                    call.b_legs
+                        .get(index)
+                        .map(|leg| leg.dialog.route_set.clone())
+                })
+            })
+            .unwrap_or_default();
+
         // Helper: build and send ACK to the responder of the re-INVITE.
         // For 2xx: ACK uses a NEW branch (end-to-end, RFC 3261 §13.2.2.4).
         // For non-2xx: ACK uses the SAME branch (hop-by-hop, RFC 3261 §17.1.1.3).
@@ -17144,42 +17206,40 @@ fn handle_b2bua_response(
                             SipUri::new(responder_dest.ip().to_string())
                                 .with_port(responder_dest.port())
                         });
-                    let ack = match SipMessageBuilder::new()
-                        .request(Method::Ack, ack_uri)
-                        .via(format!(
-                            "SIP/2.0/{} {}:{};branch={}",
-                            transport_str, outbound_host, outbound_port, ack_branch,
-                        ))
-                        .from(from.to_string())
-                        .to(to.to_string())
-                        .call_id(responder_cid.clone())
-                        .cseq(format!("{} ACK", cseq_num))
-                        .header("Max-Forwards", "70".to_string())
-                        .content_length(0)
-                        .build()
-                    {
-                        Ok(ack) => ack,
-                        Err(error) => {
-                            error!("B2BUA ACK for re-INVITE build failed: {error}");
-                            return;
-                        }
+                    let Some(ack) = build_reinvite_ack(ReinviteAck {
+                        request_uri: ack_uri,
+                        via_transport: &transport_str,
+                        via_host: &outbound_host,
+                        via_port: outbound_port,
+                        branch: &ack_branch,
+                        from: from.as_str(),
+                        to: to.as_str(),
+                        call_id: responder_cid,
+                        cseq_number: &cseq_num,
+                        route_set: &responder_route_set,
+                    }) else {
+                        return;
                     };
+                    // With a route set the ACK goes to its first hop, not the
+                    // cached leg address (RFC 3261 §12.2.1.1) — the same
+                    // resolution the re-INVITE used. A no-op when the route set
+                    // is empty or still resolves to the established peer.
+                    let (ack_dest, ack_transport) = resolve_in_dialog_destination(
+                        &responder_route_set,
+                        state,
+                        responder_dest,
+                        responder_transport,
+                    );
                     if is_a2b {
-                        send_b2bua_to_bleg(
-                            ack,
-                            responder_transport,
-                            responder_dest,
-                            b_leg_local_addr,
-                            state,
-                        );
+                        send_b2bua_to_bleg(ack, ack_transport, ack_dest, b_leg_local_addr, state);
                     } else {
                         // ACK to the A-leg responder — source it from the A-leg's
                         // anchored socket (multi-homed source-port parity; Via above
                         // matches). No-op for single-listener hosts.
                         send_message_from(
                             ack,
-                            responder_transport,
-                            responder_dest,
+                            ack_transport,
+                            ack_dest,
                             a_leg.transport.connection_id,
                             a_leg.transport.local_addr,
                             state,
@@ -19584,7 +19644,18 @@ fn build_b2bua_ack_for_2xx(
         .call_id()
         .map(|s| s.to_string())
         .unwrap_or_default();
-    match SipMessageBuilder::new()
+    // RFC 3261 §12.1.2: this 2xx establishes the dialog, so its Record-Route
+    // reversed IS the UAC's route set — and §12.2.1.1 has every request in the
+    // dialog, the ACK included, carry it. Taken from the response rather than the
+    // leg because both callers reach here with a leg that predates the 2xx.
+    let route_set = uac_route_set_from_record_routes(
+        &response
+            .headers
+            .get_all("Record-Route")
+            .cloned()
+            .unwrap_or_default(),
+    );
+    let mut builder = SipMessageBuilder::new()
         .request(Method::Ack, request_uri)
         .via(format!(
             "SIP/2.0/{} {}:{};branch={}",
@@ -19597,10 +19668,11 @@ fn build_b2bua_ack_for_2xx(
         .to(to.to_string())
         .call_id(call_id)
         .cseq(format!("{} ACK", cseq_num))
-        .header("Max-Forwards", "70".to_string())
-        .content_length(0)
-        .build()
-    {
+        .header("Max-Forwards", "70".to_string());
+    for route in &route_set {
+        builder = builder.header("Route", route.clone());
+    }
+    match builder.content_length(0).build() {
         Ok(ack) => Some(ack),
         Err(error) => {
             warn!("B2BUA: failed to build ACK for raced 2xx: {error}");
@@ -19629,6 +19701,20 @@ fn handle_zombie_cancelled_2xx(
     let local_addr = leg.transport.local_addr;
     let (via_host, via_port) = b_leg_sent_by(local_addr, state, &transport);
 
+    // The raced 2xx established a dialog even though the call is gone, so it also
+    // established a route set (RFC 3261 §12.1.2) — the ACK below carries it, and
+    // the BYE needs it on the leg, which was captured at CANCEL time and predates
+    // this response.
+    let route_set = uac_route_set_from_record_routes(
+        &response
+            .headers
+            .get_all("Record-Route")
+            .cloned()
+            .unwrap_or_default(),
+    );
+    let (destination, transport) =
+        resolve_in_dialog_destination(&route_set, state, destination, transport);
+
     // ACK the 2xx on every match — a lost ACK leaves the callee retransmitting.
     if let Some(ack) = build_b2bua_ack_for_2xx(response, transport, &via_host, via_port) {
         send_b2bua_to_bleg(ack, transport, destination, local_addr, state);
@@ -19645,6 +19731,7 @@ fn handle_zombie_cancelled_2xx(
     if let Some(contact) = response.headers.get("Contact") {
         leg.dialog.remote_contact = Some(crate::b2bua::actor::extract_contact_uri(contact));
     }
+    leg.dialog.route_set = route_set;
     // The BYE CSeq must exceed the INVITE's; derive it from the 2xx's CSeq.
     let invite_cseq = response
         .headers
@@ -20239,6 +20326,10 @@ fn b2bua_send_refresh_reinvite(call_id: &str, state: &DispatcherState) {
         },
     );
     new_b_leg.stored_vias = vec![];
+    // The ACK for this refresh's 200 has to traverse the same proxies the
+    // re-INVITE did (RFC 3261 §12.2.1.1), so carry the B-leg's dialog route set
+    // on the tracking leg — the response arm reads it back off this leg.
+    new_b_leg.dialog.route_set = b_leg.dialog.route_set.clone();
     state.call_actors.add_b_leg(call_id, new_b_leg);
 
     // Reset timer preemptively (will be confirmed on 200 OK)
@@ -20385,6 +20476,10 @@ fn b2bua_send_reinvite_on_leg(
     // No originator leg (siphon-originated) — empty stored Vias tells the
     // re-INVITE response arm to absorb the 200 rather than forward it.
     tracking.stored_vias = vec![];
+    // The route set this re-INVITE carries (`build_b2bua_in_dialog_request`
+    // builds its Route headers from the same dialog), kept on the tracking leg
+    // so the ACK for the 200 follows the same path (RFC 3261 §12.2.1.1).
+    tracking.dialog.route_set = surviving.dialog.route_set.clone();
     state.call_actors.add_b_leg(call_id, tracking);
 
     let (dest, transport) = resolve_in_dialog_destination(
@@ -22482,13 +22577,16 @@ fn originate_ack_2xx(
         ack.headers
             .set("Content-Length", ack.body.len().to_string());
     }
-    send_b2bua_to_bleg(
-        ack,
-        leg.transport.transport,
-        leg.transport.remote_addr,
-        leg.transport.local_addr,
+    // The ACK carries the route set (built into it from the 2xx's Record-Route)
+    // and so goes to its first hop, not the address the INVITE was dialled at
+    // (RFC 3261 §12.2.1.1). A no-op when the callee's side does not record-route.
+    let (destination, transport) = resolve_in_dialog_destination(
+        &leg.dialog.route_set,
         state,
+        leg.transport.remote_addr,
+        leg.transport.transport,
     );
+    send_b2bua_to_bleg(ack, transport, destination, leg.transport.local_addr, state);
 }
 
 /// Answer the callee's 2xx offer locally on the media backend and record the
@@ -23719,6 +23817,64 @@ fn bridge_fail(call_id: &str, stage: &str, status_code: u16, state: &DispatcherS
     );
 }
 
+/// Everything the ACK for a re-INVITE's final response is built from.
+///
+/// A struct rather than ten arguments: the re-INVITE response arm has already
+/// worked out each field (which party is the responder, its Contact, its CSeq,
+/// the sent-by to advertise) by the time the ACK is due.
+struct ReinviteAck<'a> {
+    /// The responder's own `Contact` — the remote target (RFC 3261 §12.2.1.1).
+    request_uri: SipUri,
+    /// Transport token for the `Via` (`UDP` / `TCP` / `TLS` / `WS` / `WSS`).
+    via_transport: &'a str,
+    via_host: &'a str,
+    via_port: u16,
+    /// Fresh for a 2xx (§13.2.2.4), the request's own for a non-2xx (§17.1.1.3).
+    branch: &'a str,
+    from: &'a str,
+    to: &'a str,
+    call_id: &'a str,
+    /// The responder's CSeq number — the one the re-INVITE went out with.
+    cseq_number: &'a str,
+    /// The dialog's route set, as stored on the tracking leg when the re-INVITE
+    /// was sent.
+    route_set: &'a [String],
+}
+
+/// Build the ACK a re-INVITE's final response is owed (RFC 3261 §13.2.2.4 for a
+/// 2xx, §17.1.1.3 for a final non-2xx).
+///
+/// Pure, so the invariant that no two-party test can see is unit-testable: the
+/// ACK carries the dialog's route set. A mid-dialog 2xx does not re-advertise
+/// `Record-Route`, so the route set cannot be recovered from the response the
+/// way an initial INVITE's ACK recovers it (§12.1.2) — it has to come from the
+/// dialog, and an ACK sent without it reaches the responder stripped of the
+/// state tokens the proxies in between wrote into their `Record-Route`.
+fn build_reinvite_ack(ack: ReinviteAck<'_>) -> Option<SipMessage> {
+    let mut builder = SipMessageBuilder::new()
+        .request(Method::Ack, ack.request_uri)
+        .via(format!(
+            "SIP/2.0/{} {}:{};branch={}",
+            ack.via_transport, ack.via_host, ack.via_port, ack.branch,
+        ))
+        .from(ack.from.to_string())
+        .to(ack.to.to_string())
+        .call_id(ack.call_id.to_string())
+        .cseq(format!("{} ACK", ack.cseq_number))
+        .header("Max-Forwards", "70".to_string());
+    for route in ack.route_set {
+        builder = builder.header("Route", route.clone());
+    }
+    builder
+        .content_length(0)
+        .build()
+        .map_err(|error| {
+            error!(%error, "B2BUA ACK for re-INVITE build failed");
+            error
+        })
+        .ok()
+}
+
 /// Build the ACK for a 2xx (or final non-2xx) to a request siphon originated on
 /// a leg it owns.
 ///
@@ -23732,6 +23888,27 @@ fn build_ack_for_owned_leg(
     response: &SipMessage,
     ack_branch: &str,
     state: &DispatcherState,
+) -> Option<SipMessage> {
+    let (via_host, via_port) = leg_sent_by(leg, state);
+    build_owned_leg_ack(leg, response, ack_branch, &via_host, via_port)
+}
+
+/// Pure half of [`build_ack_for_owned_leg`], split out so the invariant that is
+/// invisible in a two-party test is unit-testable: the ACK carries the dialog's
+/// route set, so it reaches the responder through the same proxies the request
+/// traversed (RFC 3261 §12.2.1.1). Without it the ACK arrives stripped of the
+/// state tokens those proxies wrote into their `Record-Route`; a lenient proxy
+/// still forwards it, one that keys media on that token never opens the path and
+/// the call answers with no audio.
+///
+/// The caller supplies the local `via_host` / `via_port` (from [`leg_sent_by`]),
+/// the only thing the ACK needs that is not on the leg or the response.
+fn build_owned_leg_ack(
+    leg: &Leg,
+    response: &SipMessage,
+    ack_branch: &str,
+    via_host: &str,
+    via_port: u16,
 ) -> Option<SipMessage> {
     let request_uri = response
         .headers
@@ -23760,8 +23937,7 @@ fn build_ack_for_owned_leg(
         .cseq()
         .and_then(|cseq| cseq.split_whitespace().next().map(str::to_string))
         .unwrap_or_else(|| "1".to_string());
-    let (via_host, via_port) = leg_sent_by(leg, state);
-    SipMessageBuilder::new()
+    let mut builder = SipMessageBuilder::new()
         .request(Method::Ack, request_uri)
         .via(format!(
             "SIP/2.0/{} {}:{};branch={}",
@@ -23774,7 +23950,16 @@ fn build_ack_for_owned_leg(
         .to(response.headers.to().cloned().unwrap_or_default())
         .call_id(leg.dialog.call_id.clone())
         .cseq(format!("{cseq_num} ACK"))
-        .header("Max-Forwards", "70".to_string())
+        .header("Max-Forwards", "70".to_string());
+    // RFC 3261 §12.2.1.1 — every request within the dialog carries its route set,
+    // the ACK for a 2xx included. The leg's own route set is used rather than the
+    // response's Record-Route because this builder also serves in-dialog requests
+    // whose response does not re-advertise it (§12.1.2 applies to the dialog's
+    // first 2xx only, and the caller stores that on the leg).
+    for route in &leg.dialog.route_set {
+        builder = builder.header("Route", route.clone());
+    }
+    builder
         .content_length(0)
         .build()
         .map_err(|error| {
@@ -24501,6 +24686,9 @@ fn handle_b2bua_reinvite(inbound: InboundMessage, message: SipMessage, state: &D
         );
         reinvite_leg.stored_vias = originator_vias;
         reinvite_leg.stored_cseq = message.headers.cseq().map(|c| c.to_string());
+        // The route set the forwarded re-INVITE carries, so the ACK for its 200
+        // is routed identically (RFC 3261 §12.2.1.1).
+        reinvite_leg.dialog.route_set = target_route_set.clone();
         state.call_actors.add_b_leg(&call_id, reinvite_leg);
 
         // Forward to the target leg. A→B: destination-keyed reuse via
@@ -26275,6 +26463,10 @@ fn b2bua_complete_terminated_transfer(
     response: &SipMessage,
     state: &DispatcherState,
 ) {
+    // Capture the target dialog's route set before anything reads the leg —
+    // everything siphon sends the target from here on takes it from there.
+    store_b_leg_route_set_from_2xx(&state.call_actors, call_id, target_idx, response);
+
     // Snapshot the referrer side + the target (Z) leg before mutating.
     // `referrer_gone` is set when the referrer already BYE'd this call while the
     // target was still ringing (see `mark_transfer_referrer_gone`): the transfer
@@ -29498,6 +29690,194 @@ mod tests {
     #[test]
     fn uac_route_set_from_record_routes_empty() {
         assert!(uac_route_set_from_record_routes(&[]).is_empty());
+    }
+
+    /// The two Record-Route entries a record-routing proxy pair writes, and the
+    /// route set they mean for the UAC: same list, reversed (RFC 3261 §12.1.2).
+    const RECORD_ROUTES: [&str; 2] = [
+        "<sip:198.51.100.10;lr;proxy-state=outer>",
+        "<sip:198.51.100.20;lr;proxy-state=inner>",
+    ];
+
+    fn uac_routes() -> Vec<String> {
+        vec![RECORD_ROUTES[1].to_string(), RECORD_ROUTES[0].to_string()]
+    }
+
+    fn routes_on(message: &SipMessage) -> Vec<String> {
+        message
+            .headers
+            .get_all("Route")
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// A 2xx that establishes a dialog through two record-routing proxies.
+    fn record_routed_2xx() -> SipMessage {
+        parse_sip_message(concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-target-1\r\n",
+            "Record-Route: <sip:198.51.100.10;lr;proxy-state=outer>\r\n",
+            "Record-Route: <sip:198.51.100.20;lr;proxy-state=inner>\r\n",
+            "From: <sip:+15550100@192.0.2.1>;tag=sb-localtag\r\n",
+            "To: <sip:+15550199@example.net>;tag=target-1\r\n",
+            "Call-ID: b2b-transfer-target@192.0.2.1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Contact: <sip:198.51.100.30:5073>\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ))
+        .expect("200 fixture parses")
+        .1
+    }
+
+    fn leg_with_route_set(route_set: Vec<String>) -> Leg {
+        let mut leg = Leg::new_b_leg(
+            "b2b-transfer-target@192.0.2.1".to_string(),
+            "sb-localtag".to_string(),
+            "sip:+15550199@example.net".to_string(),
+            "z9hG4bK-target-1".to_string(),
+            LegTransport {
+                remote_addr: "192.0.2.9:5060".parse().expect("fixture address parses"),
+                connection_id: ConnectionId::default(),
+                transport: Transport::Udp,
+                local_addr: None,
+            },
+        );
+        leg.dialog.route_set = route_set;
+        leg
+    }
+
+    /// The chain a transferred call hangs on: the transfer target's 2xx defines the
+    /// dialog's route set (RFC 3261 §12.1.2), the capture puts it on the leg, and
+    /// every in-dialog request built from that leg then carries it (§12.2.1.1).
+    ///
+    /// Pre-fix the capture did not exist, so the target leg's route set stayed
+    /// empty and its ACK and BYE went out with no `Route` at all — reaching the
+    /// far end without the state the proxies in between had record-routed.
+    #[test]
+    fn transfer_target_leg_captures_its_route_set_and_the_ack_carries_it() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(leg_with_route_set(vec![]));
+        store.add_b_leg(&call_id, leg_with_route_set(vec![]));
+        let response = record_routed_2xx();
+
+        assert!(
+            store_b_leg_route_set_from_2xx(&store, &call_id, 0, &response),
+            "a 2xx carrying Record-Route establishes a route set"
+        );
+        let target = store
+            .get_call(&call_id)
+            .and_then(|call| call.b_legs.first().cloned())
+            .expect("the target leg is in the store");
+        assert_eq!(
+            target.dialog.route_set,
+            uac_routes(),
+            "§12.1.2 — the response's Record-Route, reversed"
+        );
+
+        let ack = build_owned_leg_ack(&target, &response, "z9hG4bK-ack-1", "192.0.2.1", 5060)
+            .expect("the ACK builds");
+        assert_eq!(routes_on(&ack), uac_routes(), "§12.2.1.1 — the ACK routes");
+        // The remote target is still the responder's Contact, not the first Route.
+        match ack.start_line {
+            StartLine::Request(ref line) => {
+                assert_eq!(line.request_uri.to_string(), "sip:198.51.100.30:5073")
+            }
+            _ => panic!("the ACK is a request"),
+        }
+    }
+
+    /// A direct peer that does not record-route leaves the leg's route set alone,
+    /// and its ACK carries no `Route` — the pre-fix wire shape, still correct here.
+    #[test]
+    fn a_2xx_without_record_route_stores_nothing_and_routes_nothing() {
+        let store = CallActorStore::new();
+        let call_id = store.create_call(leg_with_route_set(vec![]));
+        store.add_b_leg(&call_id, leg_with_route_set(vec![]));
+        let response = parse_sip_message(concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/UDP 192.0.2.1:5060;branch=z9hG4bK-target-1\r\n",
+            "From: <sip:+15550100@192.0.2.1>;tag=sb-localtag\r\n",
+            "To: <sip:+15550199@example.net>;tag=target-1\r\n",
+            "Call-ID: b2b-transfer-target@192.0.2.1\r\n",
+            "CSeq: 1 INVITE\r\n",
+            "Contact: <sip:198.51.100.30:5073>\r\n",
+            "Content-Length: 0\r\n",
+            "\r\n",
+        ))
+        .expect("200 fixture parses")
+        .1;
+
+        assert!(!store_b_leg_route_set_from_2xx(
+            &store, &call_id, 0, &response
+        ));
+        let target = store
+            .get_call(&call_id)
+            .and_then(|call| call.b_legs.first().cloned())
+            .expect("the target leg is in the store");
+        assert!(target.dialog.route_set.is_empty());
+        let ack = build_owned_leg_ack(&target, &response, "z9hG4bK-ack-1", "192.0.2.1", 5060)
+            .expect("the ACK builds");
+        assert!(routes_on(&ack).is_empty());
+    }
+
+    /// The ACK for a re-INVITE's 2xx carries the dialog route set the re-INVITE
+    /// itself used. It cannot be recovered from the response — a mid-dialog 2xx
+    /// does not re-advertise `Record-Route` — so it comes off the tracking leg.
+    ///
+    /// Pre-fix this builder emitted no `Route` at all, so every B2BUA re-INVITE
+    /// (hold, resume, session-timer refresh, transfer media re-anchor) answered
+    /// its 200 with an unrouted ACK.
+    #[test]
+    fn reinvite_ack_carries_the_dialog_route_set() {
+        let route_set = uac_routes();
+        let ack = build_reinvite_ack(ReinviteAck {
+            request_uri: SipUri::new("sip:198.51.100.30:5073".to_string()),
+            via_transport: "UDP",
+            via_host: "192.0.2.1",
+            via_port: 5060,
+            branch: "z9hG4bK-ack-1",
+            from: "<sip:+15550100@192.0.2.1>;tag=sb-localtag",
+            to: "<sip:+15550199@example.net>;tag=target-1",
+            call_id: "b2b-survivor@192.0.2.1",
+            cseq_number: "2",
+            route_set: &route_set,
+        })
+        .expect("the ACK builds");
+
+        assert_eq!(routes_on(&ack), route_set);
+        assert_eq!(ack.headers.cseq().map(String::as_str), Some("2 ACK"));
+        assert_eq!(
+            ack.headers.call_id().map(String::as_str),
+            Some("b2b-survivor@192.0.2.1"),
+            "the ACK stays in the responder's dialog"
+        );
+
+        // A leg with no route set (direct peer) still ACKs, with no Route.
+        let direct = build_reinvite_ack(ReinviteAck {
+            request_uri: SipUri::new("sip:198.51.100.30:5073".to_string()),
+            via_transport: "UDP",
+            via_host: "192.0.2.1",
+            via_port: 5060,
+            branch: "z9hG4bK-ack-1",
+            from: "<sip:+15550100@192.0.2.1>;tag=sb-localtag",
+            to: "<sip:+15550199@example.net>;tag=target-1",
+            call_id: "b2b-survivor@192.0.2.1",
+            cseq_number: "2",
+            route_set: &[],
+        })
+        .expect("the ACK builds");
+        assert!(routes_on(&direct).is_empty());
+    }
+
+    /// The ACK for a 2xx on a leg siphon originated takes its route set straight
+    /// from that response (RFC 3261 §12.1.2) — the leg predates the 2xx, so there
+    /// is nothing stored to read.
+    #[test]
+    fn originated_2xx_ack_carries_the_reversed_record_route() {
+        let ack = build_b2bua_ack_for_2xx(&record_routed_2xx(), Transport::Udp, "192.0.2.1", 5060)
+            .expect("the ACK builds");
+        assert_eq!(routes_on(&ack), uac_routes());
     }
 
     #[test]

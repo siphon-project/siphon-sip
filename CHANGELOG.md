@@ -17,6 +17,31 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   Found by `b2bua-refer-outbound`, a SIPp scenario that existed but was wired to
   no runner — the first time it ran, it caught this.
 
+- **B2BUA in-dialog ACKs now carry the dialog's route set (RFC 3261 §12.2.1.1).**
+  Three ACK paths built the request with no `Route` header at all: the ACK for a
+  re-INVITE's 2xx (so every hold, resume, session-timer refresh and transfer
+  media re-anchor), the ACK for a leg siphon originated itself, and the ACK for a
+  2xx that raced an outbound CANCEL. The REFER transfer target's leg went one
+  further and never captured a route set in the first place — the `Record-Route`
+  on its own 200 OK was dropped rather than reversed into the dialog (§12.1.2) —
+  so its BYE at hangup was unrouted too.
+
+  Signalling survives this wherever the next hop is willing to route on the
+  Request-URI alone: the 200 stops retransmitting and the call reads as answered.
+  What does not survive is a proxy that keeps per-dialog state in the parameters
+  of its own `Record-Route`. The ACK reaches it without that state, the media path
+  is never opened, and the call connects with no audio in either direction while
+  every trace of the signalling looks clean. A transferred call is the usual way
+  to meet it, since the transfer target is the leg that carried no route set at
+  all.
+
+  A dialog-establishing 2xx now sets the route set from its `Record-Route`
+  reversed, and a mid-dialog ACK takes it from the leg — a re-INVITE's 200 does
+  not re-advertise `Record-Route`, so there is nothing in the response to rebuild
+  it from. Those ACKs are also sent to the route set's first hop instead of the
+  address the leg was dialled at, which is what §12.2.1.1 asks for and what the
+  re-INVITE itself already did.
+
 ### Changed
 - **Every SIPp scenario now runs on every pull request.** Four had no runner at
   all (`b2bua-refer-outbound`, `b2bua-reinvite-bleg`, `b2bua-reinvite-breject`,
@@ -31,7 +56,6 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   where the BYE arrives, so an on-time BYE landed before SIPp had armed the
   `recv` and aborted the run as unexpected. Test-side only — siphon sends
   exactly one BYE and retransmits it correctly per RFC 3261 §17.1.
-
 
 ## [1.8.0] — 2026-09-02
 
