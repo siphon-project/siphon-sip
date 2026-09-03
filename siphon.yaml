@@ -677,6 +677,30 @@ auth:
 #   ignore     treat as though the offer never contained them
 #   set        options for accepted transcoding codecs (bitrate/rate/channels)
 #
+# Which of these engage the TRANSCODER, and which only reshape what the far side
+# is offered, is the distinction worth knowing before reaching for one:
+#
+#   strip / offer / except / ignore   edit the offer the far side sees. The near
+#                                     leg follows whatever the far side then
+#                                     ANSWERS with (RFC 3264 §6.1 — the
+#                                     answerer's selection is the format for the
+#                                     stream), so no transcoder is engaged and
+#                                     the call relays.
+#   mask / consume / accept           deliberately keep the codec on the near leg
+#                                     while hiding it from the far side, so the
+#                                     two sides differ and the engine bridges
+#                                     them. That IS the transcode request.
+#   transcode                         adds a codec the offerer never listed, so
+#                                     the far side can select something the near
+#                                     side cannot send. Also a transcode request.
+#
+# So to keep a codec off a carrier that cannot take it, `strip` it — the call
+# then settles on whatever the carrier does answer, with no transcoding involved.
+# Reach for `mask` / `consume` only when you actually want the engine to bridge
+# two different codecs, and check the engine has that codec pair (rtpengine needs
+# a --with-transcoding build; the native engine transcodes what its codec set
+# supports and names the codec when it will not).
+#
 # Put it on the OFFER half — both engines apply codec manipulation to the offer
 # and ignore most of it on an answer:
 #
