@@ -94,6 +94,43 @@ Full example: [`examples/lcr_b2bua.py`](https://github.com/siphon-project/siphon
 - The A-leg receives a failure only once **every** carrier is exhausted;
   `@b2bua.on_failure` fires once, with the last carrier's response.
 - On answer, `call.active_route` is the carrier that won.
+- `call.route_attempts` lists the carriers it **burned** to get there — one
+  entry per failed attempt (`carrier_id`, `status`, `elapsed_ms`), oldest
+  first. Empty when the first carrier answered.
+
+## Seeing a failover happen
+
+A failover is an operational event, so it is reported at `info`: siphon logs
+each failed attempt with its carrier, status and elapsed time, and logs the
+advance to the next carrier.
+
+Two ways to keep it rather than just read it:
+
+```python
+@b2bua.on_route_failure
+def carrier_failed(call, route, code):
+    """Fires once per failed attempt, including the last."""
+    if code in (408, 503):                      # what YOU count as the carrier's fault
+        carrier_failures.labels(carrier=route.carrier_id).inc()
+
+@b2bua.on_answer
+def answered(call, reply):
+    for attempt in call.route_attempts:
+        log.warn(f"burned {attempt['carrier_id']} "
+                 f"{attempt['status']} after {attempt['elapsed_ms']}ms")
+```
+
+`@b2bua.on_route_failure` fires for **every** non-2xx a carrier returns — a
+definitive `486 Busy` as much as a `503`, and a ring timeout as `408`. That is
+the same set `call.route_attempts` records, so the two never disagree; filter on
+`code` for what you actually treat as a carrier health signal. It is purely a
+notification: the failover decision is already made, and raising in it does not
+change the call.
+
+When `cdr.auto_emit` is on, the same list is stamped onto the CDR as
+`lcr_attempts` (a compact JSON array), alongside the winning carrier's
+`cdr_fields` — so a completed call that burned a carrier records that in the
+billing pipeline instead of only in the log.
 
 `call.fork(strategy="sequential")` uses the same engine for a bare target list
 (this now actually fails over — previously the strategy was ignored). Captured

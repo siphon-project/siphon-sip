@@ -906,12 +906,11 @@ pub struct PendingReplaces {
 ///
 /// Carriers are tried one at a time in order: [`active`](Self::active) is the
 /// attempt currently in flight (or the winner after a 2xx), [`pending`](Self::pending)
-/// holds the not-yet-tried carriers (front = next), and [`best_error`](Self::best_error)
-/// accumulates the highest-priority failure so a fully-exhausted sequence
-/// surfaces the right code to the A-leg. When `None` on a [`CallActor`], the call
-/// is a plain single dial or a parallel fork (no failover). Each attempt is a
-/// fresh B-leg dialog (`b2bua_send_b_leg_invite` mints a new Call-ID/From-tag/
-/// CSeq per call), so no carrier ever sees a reused Call-ID.
+/// holds the not-yet-tried carriers (front = next), and [`attempts`](Self::attempts)
+/// records every carrier that failed. When `None` on a [`CallActor`], the call is a
+/// plain single dial or a parallel fork (no failover). Each attempt is a fresh
+/// B-leg dialog (`b2bua_send_b_leg_invite` mints a new Call-ID/From-tag/CSeq per
+/// call), so no carrier ever sees a reused Call-ID.
 #[derive(Debug, Default)]
 pub struct RouteSequenceState {
     /// Carriers still to try, front = next attempt.
@@ -919,12 +918,36 @@ pub struct RouteSequenceState {
     /// The carrier currently in flight — becomes the winner on a 2xx answer.
     /// Surfaced to scripts as `call.active_route` for CDR/charging.
     pub active: Option<crate::lcr::Route>,
-    /// Highest-priority error across failed attempts (6xx > 5xx > 4xx).
-    pub best_error: Option<u16>,
+    /// Every failed attempt, in the order they were tried.
+    ///
+    /// This used to be a single `best_error: Option<u16>`, which is all the
+    /// A-leg needs (the code sent once every carrier is exhausted) and nothing
+    /// an operator needs: a call that burned a carrier on its way to answering
+    /// recorded that nowhere, so a failing carrier could not be alerted on,
+    /// trended, or taken to the carrier. The best error is now derived from
+    /// this — see [`CallActor::best_route_error`].
+    pub attempts: Vec<RouteAttempt>,
+    /// When the in-flight attempt was dialled, for its elapsed time.
+    pub active_since: Option<std::time::Instant>,
     /// Call-level send-socket egress pin applied to every attempt.
     pub send_socket: Option<String>,
     /// Ring timeout (seconds) for a route that omits its own `timeout_secs`.
     pub default_timeout: u32,
+}
+
+/// One failed carrier attempt in a sequential failover sequence.
+///
+/// Surfaced to scripts as `call.route_attempts`, to `@b2bua.on_route_failure`,
+/// and onto the CDR as `lcr_attempts`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteAttempt {
+    /// The carrier that was tried (`Route::carrier_id`).
+    pub carrier_id: String,
+    /// Its final status. A ring timeout is recorded as `408`, the code the
+    /// attempt effectively ended on.
+    pub status: u16,
+    /// How long the attempt was in flight, in milliseconds.
+    pub elapsed_ms: u64,
 }
 
 #[derive(Debug)]
@@ -1149,21 +1172,39 @@ impl CallActor {
         let sequence = self.route_sequence.as_mut()?;
         let route = sequence.pending.pop_front()?;
         sequence.active = Some(route.clone());
+        sequence.active_since = Some(std::time::Instant::now());
         Some(route)
     }
 
-    /// Record a failed attempt's status code, keeping the highest-priority one
-    /// (6xx > 5xx > 4xx). No-op for a non-sequential call.
-    pub fn record_route_failure(&mut self, status_code: u16) {
-        if let Some(sequence) = self.route_sequence.as_mut() {
-            let keep = match sequence.best_error {
-                Some(existing) if error_priority(existing) >= error_priority(status_code) => {
-                    existing
-                }
-                _ => status_code,
-            };
-            sequence.best_error = Some(keep);
-        }
+    /// Record a failed attempt against the carrier that was in flight. No-op for
+    /// a non-sequential call.
+    ///
+    /// Returns the attempt, so the caller can log it and hand it to
+    /// `@b2bua.on_route_failure` without re-reading the actor.
+    pub fn record_route_failure(&mut self, status_code: u16) -> Option<RouteAttempt> {
+        let sequence = self.route_sequence.as_mut()?;
+        let attempt = RouteAttempt {
+            carrier_id: sequence
+                .active
+                .as_ref()
+                .map(|route| route.carrier_id.clone())
+                .unwrap_or_default(),
+            status: status_code,
+            elapsed_ms: sequence
+                .active_since
+                .map(|since| since.elapsed().as_millis() as u64)
+                .unwrap_or_default(),
+        };
+        sequence.attempts.push(attempt.clone());
+        Some(attempt)
+    }
+
+    /// Every failed attempt so far, in the order they were tried.
+    pub fn route_attempts(&self) -> &[RouteAttempt] {
+        self.route_sequence
+            .as_ref()
+            .map(|sequence| sequence.attempts.as_slice())
+            .unwrap_or_default()
     }
 
     /// Whether more carriers remain to try in the failover queue.
@@ -1178,9 +1219,22 @@ impl CallActor {
         self.route_sequence.is_some()
     }
 
-    /// The best (highest-priority) error seen across exhausted attempts.
+    /// The best (highest-priority) error seen across exhausted attempts
+    /// (6xx > 5xx > 4xx), which is the code a fully-exhausted sequence surfaces
+    /// to the A-leg. Derived from [`RouteSequenceState::attempts`] rather than
+    /// accumulated, so the per-attempt record and the code the caller gets can
+    /// never disagree.
     pub fn best_route_error(&self) -> Option<u16> {
-        self.route_sequence.as_ref().and_then(|s| s.best_error)
+        self.route_attempts()
+            .iter()
+            .map(|attempt| attempt.status)
+            .reduce(|best, status| {
+                if error_priority(best) >= error_priority(status) {
+                    best
+                } else {
+                    status
+                }
+            })
     }
 
     /// The carrier currently in flight / that won (for `call.active_route`).
@@ -2319,11 +2373,20 @@ impl CallActorStore {
         self.calls.get_mut(call_id)?.take_next_route()
     }
 
-    /// Record a failed attempt's status code for a call's failover sequence.
-    pub fn record_route_failure(&self, call_id: &str, status_code: u16) {
-        if let Some(mut call) = self.calls.get_mut(call_id) {
-            call.record_route_failure(status_code);
-        }
+    /// Record a failed attempt against a call's in-flight carrier, returning it
+    /// so the caller can log it and dispatch `@b2bua.on_route_failure`.
+    pub fn record_route_failure(&self, call_id: &str, status_code: u16) -> Option<RouteAttempt> {
+        self.calls
+            .get_mut(call_id)?
+            .record_route_failure(status_code)
+    }
+
+    /// Every failed attempt of a call's failover sequence, in order tried.
+    pub fn route_attempts(&self, call_id: &str) -> Vec<RouteAttempt> {
+        self.calls
+            .get(call_id)
+            .map(|call| call.route_attempts().to_vec())
+            .unwrap_or_default()
     }
 
     /// Whether a call has more carriers to try in its failover queue.
@@ -3353,6 +3416,61 @@ mod tests {
         // 6xx outranks everything.
         actor.record_route_failure(603);
         assert_eq!(actor.best_route_error(), Some(603));
+    }
+
+    /// Each failure is recorded against the carrier that was actually in
+    /// flight, in the order tried — the record that used to be collapsed into a
+    /// single best-error code, so a call that burned a carrier on its way to
+    /// answering said nothing about which one.
+    #[test]
+    fn every_attempt_is_recorded_against_the_carrier_that_was_tried() {
+        let mut actor = CallActor::new(make_a_leg());
+        actor.route_sequence = Some(RouteSequenceState {
+            pending: [lcr_route("a"), lcr_route("b"), lcr_route("c")]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        });
+
+        actor.take_next_route().expect("carrier a");
+        let first = actor.record_route_failure(503).expect("attempt recorded");
+        assert_eq!(first.carrier_id, "a");
+        assert_eq!(first.status, 503);
+
+        actor.take_next_route().expect("carrier b");
+        // A ring timeout is recorded like any other failure, as 408.
+        let second = actor.record_route_failure(408).expect("attempt recorded");
+        assert_eq!(second.carrier_id, "b");
+        assert_eq!(second.status, 408);
+
+        // Carrier c is dialled and answers, so it is never recorded as an
+        // attempt — it is the winner, and reaches a script as `active_route`.
+        actor.take_next_route().expect("carrier c");
+
+        let carriers: Vec<&str> = actor
+            .route_attempts()
+            .iter()
+            .map(|attempt| attempt.carrier_id.as_str())
+            .collect();
+        assert_eq!(carriers, ["a", "b"]);
+        assert_eq!(
+            actor.active_route().map(|route| route.carrier_id.as_str()),
+            Some("c"),
+            "the answering carrier is the winner, not an attempt"
+        );
+        // Derived from the attempts, so the code the A-leg would get and the
+        // per-attempt record cannot disagree.
+        assert_eq!(actor.best_route_error(), Some(503));
+    }
+
+    /// A call with no failover sequence has nothing to report, and asking must
+    /// not be an error — every `Call` handed to a script reads this property,
+    /// LCR or not.
+    #[test]
+    fn a_non_lcr_call_reports_no_attempts() {
+        let mut actor = CallActor::new(make_a_leg());
+        assert!(actor.route_attempts().is_empty());
+        assert!(actor.record_route_failure(503).is_none());
     }
 
     #[test]

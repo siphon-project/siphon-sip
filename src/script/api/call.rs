@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use super::sip_uri::PySipUri;
 use crate::sip::message::SipMessage;
@@ -344,6 +345,12 @@ pub struct PyCall {
     /// `route_sequence.active`. Read by scripts via `call.active_route` to stamp
     /// the winning carrier onto a CDR / charging record.
     active_route: Option<crate::lcr::Route>,
+    /// Every carrier that FAILED before the sequence settled — injected by the
+    /// dispatcher from the call actor's `route_sequence.attempts`. Read by
+    /// scripts via `call.route_attempts`, the counterpart to `active_route`:
+    /// that one names the carrier that carried the call, this one names the
+    /// carriers it had to burn to get there.
+    route_attempts: Vec<crate::b2bua::actor::RouteAttempt>,
     /// Username verified by `auth.require_proxy_digest(call, …)` /
     /// `require_www_digest` on the A-leg INVITE. `None` until a challenge is
     /// answered correctly. The B2BUA twin of `request.auth_user`; the
@@ -443,6 +450,7 @@ impl PyCall {
             header_policy_input: None,
             auth_passthrough_flag: false,
             active_route: None,
+            route_attempts: Vec::new(),
             auth_user: None,
         }
     }
@@ -485,6 +493,12 @@ impl PyCall {
     /// the handler `Call`.
     pub fn set_active_route(&mut self, route: crate::lcr::Route) {
         self.active_route = Some(route);
+    }
+
+    /// Attach the failed carrier attempts read off the call actor, for
+    /// `call.route_attempts`.
+    pub fn set_route_attempts(&mut self, attempts: Vec<crate::b2bua::actor::RouteAttempt>) {
+        self.route_attempts = attempts;
     }
 
     /// Build an [`LcrRequest`](crate::lcr::LcrRequest) from this call for
@@ -1787,6 +1801,37 @@ impl PyCall {
         self.active_route
             .as_ref()
             .map(|route| super::lcr::PyRoute::from_route(route.clone()))
+    }
+
+    /// Every carrier attempt that FAILED before this call settled, oldest first
+    /// — the counterpart to `active_route`, which names only the winner.
+    ///
+    /// Each entry is a dict with `carrier_id`, `status` and `elapsed_ms`. Empty
+    /// for a non-LCR call, and for an LCR call whose first carrier answered.
+    /// Available wherever the `Call` is (`@b2bua.on_answer`, `on_failure`,
+    /// `on_bye`, `on_route_failure`), so a call that answered *after* burning a
+    /// carrier can still record which one it burned — siphon stamps the same
+    /// list onto the CDR as `lcr_attempts`.
+    ///
+    /// ```python
+    /// @b2bua.on_answer
+    /// def answered(call, reply):
+    ///     for attempt in call.route_attempts:
+    ///         log.warn(f"carrier {attempt['carrier_id']} failed "
+    ///                  f"{attempt['status']} after {attempt['elapsed_ms']}ms")
+    /// ```
+    #[getter]
+    fn route_attempts<'py>(&self, python: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        self.route_attempts
+            .iter()
+            .map(|attempt| {
+                let entry = PyDict::new(python);
+                entry.set_item("carrier_id", &attempt.carrier_id)?;
+                entry.set_item("status", attempt.status)?;
+                entry.set_item("elapsed_ms", attempt.elapsed_ms)?;
+                Ok(entry)
+            })
+            .collect()
     }
 
     /// The Refer-To URI (only set during @b2bua.on_refer handler).

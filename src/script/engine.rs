@@ -71,6 +71,12 @@ pub enum HandlerKind {
     B2buaBye,
     /// `@b2bua.on_refer` — call transfer (RFC 3515).
     B2buaRefer,
+    /// `@b2bua.on_route_failure` — one carrier of a `call.route(...)` sequential
+    /// failover returned a non-2xx (or rang out). Fires once per failed attempt,
+    /// including the last, so a script can count a carrier out or feed its own
+    /// health view. Purely a notification: the failover decision is already made
+    /// and a raise here does not change it.
+    B2buaRouteFailure,
     /// `@b2bua.on_cancel` — an unanswered call (Calling/Ringing) was
     /// CANCELled. Fires once per call with the Call object so a B2BUA
     /// script can release per-call resources (rtpengine media, QoS) that
@@ -455,6 +461,7 @@ impl ScriptState {
                     | HandlerKind::B2buaFailure
                     | HandlerKind::B2buaBye
                     | HandlerKind::B2buaRefer
+                    | HandlerKind::B2buaRouteFailure
             )
         })
     }
@@ -1223,6 +1230,7 @@ fn extract_handlers(_python: Python<'_>, registry: &Bound<'_, PyAny>) -> Result<
             "b2bua.on_failure" => HandlerKind::B2buaFailure,
             "b2bua.on_bye" => HandlerKind::B2buaBye,
             "b2bua.on_refer" => HandlerKind::B2buaRefer,
+            "b2bua.on_route_failure" => HandlerKind::B2buaRouteFailure,
             "b2bua.on_cancel" => HandlerKind::B2buaCancel,
             "registrar.on_change" => HandlerKind::RegistrarOnChange,
             "registration.on_change" => HandlerKind::RegistrantOnChange,

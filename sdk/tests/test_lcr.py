@@ -76,6 +76,56 @@ class TestCallRoute:
         with pytest.raises(ValueError):
             Call().route([Route(carrier_id="a", next_hop="sip:h")], send_socket="bad")
 
+    def test_route_attempts_default_empty(self):
+        # Read on every Call a script sees, LCR or not, so it must never be None.
+        assert Call().route_attempts == []
+
+    def test_route_attempts_records_the_carriers_that_were_burned(self):
+        # The counterpart to active_route: a call that ANSWERED after failing
+        # over still names the carrier it burned, which is the record that did
+        # not exist before.
+        call = Call(
+            active_route=Route(carrier_id="carrier-b"),
+            route_attempts=[
+                {"carrier_id": "carrier-a", "status": 503, "elapsed_ms": 1204},
+            ],
+        )
+        assert call.active_route.carrier_id == "carrier-b"
+        assert [a["carrier_id"] for a in call.route_attempts] == ["carrier-a"]
+        assert call.route_attempts[0]["status"] == 503
+        assert call.route_attempts[0]["elapsed_ms"] == 1204
+
+
+class TestOnRouteFailure:
+    """`@b2bua.on_route_failure` — one carrier of a sequence failed."""
+
+    def setup_method(self):
+        mock_module.install()
+        mock_module.reset()
+
+    def test_decorator_registers_under_the_engine_event_name(self):
+        # The name has to match what the Rust side maps to
+        # HandlerKind::B2buaRouteFailure, or a script that tests green here
+        # registers a handler the engine never calls.
+        from siphon import b2bua
+
+        @b2bua.on_route_failure
+        def carrier_failed(call, route, code):
+            pass
+
+        registered = mock_module._registry.get("b2bua.on_route_failure")
+        assert [fn for fn, _ in registered] == [carrier_failed]
+
+    def test_async_handler_is_recorded_as_async(self):
+        from siphon import b2bua
+
+        @b2bua.on_route_failure
+        async def carrier_failed(call, route, code):
+            pass
+
+        registered = mock_module._registry.get("b2bua.on_route_failure")
+        assert [is_async for _, is_async in registered] == [True]
+
 
 class TestMockLcrNamespace:
     def setup_method(self):

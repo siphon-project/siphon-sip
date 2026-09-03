@@ -11372,6 +11372,42 @@ fn cdr_stamp_route_fields(
     }
 }
 
+/// Stamp the carriers a sequential-failover call BURNED onto its CDR, as
+/// `lcr_attempts`.
+///
+/// The winner already reaches the record through `cdr_stamp_route_fields`; this
+/// is the other half, and the half that was missing — a completed call that
+/// burned a carrier on the way recorded that nowhere, so a failing carrier could
+/// not be trended or taken to the carrier. Serialised as a compact JSON array
+/// because `Cdr.extra` is a flat string map.
+fn cdr_stamp_route_attempts(state: &DispatcherState, internal_call_id: &str) {
+    if !crate::cdr::auto_emit_enabled() {
+        return;
+    }
+    let attempts = state.call_actors.route_attempts(internal_call_id);
+    if attempts.is_empty() {
+        return;
+    }
+    let rendered = attempts
+        .iter()
+        .map(|attempt| {
+            format!(
+                r#"{{"carrier_id":{},"status":{},"elapsed_ms":{}}}"#,
+                serde_json::Value::String(attempt.carrier_id.clone()),
+                attempt.status,
+                attempt.elapsed_ms
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    if let Some(mut session) = state.cdr_sessions.get_mut(internal_call_id) {
+        session.merge_extra(&std::collections::HashMap::from([(
+            "lcr_attempts".to_string(),
+            format!("[{rendered}]"),
+        )]));
+    }
+}
+
 /// B2BUA CDR STOP — a BYE tore the call down. `from_a_leg` gives the side.
 fn cdr_finalize_b2bua_stop(
     state: &DispatcherState,
@@ -13861,7 +13897,21 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
     // ring timeout. If more carriers remain and 408 is a reroute cause for this
     // carrier, CANCEL this attempt and advance instead of failing the call.
     if state.call_actors.has_pending_routes(call_id) && b2bua_status_reroutes(call_id, 408, state) {
-        state.call_actors.record_route_failure(call_id, 408);
+        // A ring timeout is recorded as 408 — the code the attempt effectively
+        // ended on, and the one the A-leg would have seen had the queue been
+        // exhausted here.
+        let timed_out_route = state.call_actors.active_route(call_id);
+        if let Some(attempt) = state.call_actors.record_route_failure(call_id, 408) {
+            info!(
+                call_id = %call_id,
+                carrier = %attempt.carrier_id,
+                elapsed_ms = attempt.elapsed_ms,
+                "LCR: carrier ring-timeout"
+            );
+        }
+        if let Some(route) = &timed_out_route {
+            b2bua_dispatch_route_failure(call_id, route, 408, &a_leg, a_leg_invite.as_ref(), state);
+        }
         // CANCEL the timed-out carrier's pending B-leg(s) (RFC 3261 §9.1) and
         // mark them cancelled so their stray 487s are absorbed.
         for (cancel_msg, transport, dest, local) in &cancel_targets {
@@ -13876,7 +13926,7 @@ fn fail_b2bua_call_on_timeout(call_id: &str, state: &DispatcherState) {
             _ => false,
         };
         if advanced {
-            debug!(call_id = %call_id, "LCR: carrier ring-timeout, advanced to next carrier");
+            info!(call_id = %call_id, "LCR: advanced to next carrier after ring-timeout");
             return;
         }
         // else fall through to the normal 408 teardown (queue exhausted).
@@ -14736,7 +14786,8 @@ fn handle_b2bua_invite(inbound: InboundMessage, message: SipMessage, state: &Dis
                 crate::b2bua::actor::RouteSequenceState {
                     pending: routes.into(),
                     active: None,
-                    best_error: None,
+                    attempts: Vec::new(),
+                    active_since: None,
                     send_socket,
                     default_timeout,
                 },
@@ -17992,6 +18043,7 @@ fn handle_b2bua_response(
                     cdr_stamp_route_fields(state, call_id, &route.cdr_fields);
                     ro_stamp_winning_carrier(state, call_id, &route.carrier_id);
                 }
+                cdr_stamp_route_attempts(state, call_id);
 
                 // Charging is NOT reported here. Both emissions below moved to after
                 // @b2bua.on_answer, because the handler is where the media backend is
@@ -18025,10 +18077,14 @@ fn handle_b2bua_response(
                         )
                         .with_flow(py_flow_from_leg(&a_leg.transport));
                         // LCR: surface the carrier that won as `call.active_route` so the
-                        // script can stamp it onto a CDR / charging record.
+                        // script can stamp it onto a CDR / charging record, and the
+                        // carriers it had to burn to get there as `call.route_attempts`
+                        // — an answered call that failed over used to record that
+                        // nowhere.
                         if let Some(route) = state.call_actors.active_route(call_id) {
                             py_call.set_active_route(route);
                         }
+                        py_call.set_route_attempts(state.call_actors.route_attempts(call_id));
                         let py_reply = PyReply::new(Arc::clone(&response_arc))
                             .with_a_leg(Arc::clone(invite_arc))
                             .with_response_source(
@@ -19403,11 +19459,36 @@ fn handle_b2bua_response(
                             );
                             send_b2bua_to_bleg(ack, b_transport, b_dest, b_leg_local_addr, state);
                         }
-                        debug!(call_id = %call_id, status = status_code,
+                        info!(call_id = %call_id, status = status_code,
                     "LCR: absorbing straggler carrier response (cancelled / post-answer / 487)");
                         return;
                     }
-                    state.call_actors.record_route_failure(call_id, status_code);
+                    // Record the attempt against the carrier that was in flight, then
+                    // report it. A carrier failing is an operational event — it used to
+                    // be visible only at debug, so an answered call that burned a
+                    // carrier on the way left nothing to alert on or trend.
+                    let failed_route = state.call_actors.active_route(call_id);
+                    if let Some(attempt) =
+                        state.call_actors.record_route_failure(call_id, status_code)
+                    {
+                        info!(
+                            call_id = %call_id,
+                            carrier = %attempt.carrier_id,
+                            status = status_code,
+                            elapsed_ms = attempt.elapsed_ms,
+                            "LCR: carrier attempt failed"
+                        );
+                    }
+                    if let Some(route) = &failed_route {
+                        b2bua_dispatch_route_failure(
+                            call_id,
+                            route,
+                            status_code,
+                            &a_leg,
+                            a_leg_invite.as_ref(),
+                            state,
+                        );
+                    }
                     // Fail over only on a configured reroute cause (per-route from the
                     // API > per-gateway override > global set). A definitive response
                     // (486 Busy, 603 Decline, …) is forwarded to the A-leg as-is —
@@ -19438,12 +19519,12 @@ fn handle_b2bua_response(
                             _ => false,
                         };
                         if advanced {
-                            debug!(call_id = %call_id, status = status_code,
-                        "LCR: carrier failed, advanced to next carrier");
+                            info!(call_id = %call_id, status = status_code,
+                        "LCR: advanced to next carrier");
                             return;
                         }
                     }
-                    debug!(call_id = %call_id, status = status_code, reroute,
+                    info!(call_id = %call_id, status = status_code, reroute,
                 "LCR: forwarding carrier response to A-leg (definitive or exhausted)");
                 }
 
@@ -19452,6 +19533,9 @@ fn handle_b2bua_response(
                 // written for the failed call either way. Skipped for a relayed challenge
                 // (the call has not failed).
                 if !relay_challenge {
+                    // Every carrier tried, before the record is closed — an exhausted
+                    // sequence is exactly where the attempt list matters most.
+                    cdr_stamp_route_attempts(state, call_id);
                     cdr_finalize_b2bua_fail(state, call_id, status_code);
                 }
 
@@ -19466,13 +19550,16 @@ fn handle_b2bua_response(
                     };
 
                     if let Some(invite_arc) = &a_leg_invite {
-                        let py_call = PyCall::new(
+                        let mut py_call = PyCall::new(
                             call_id.to_string(),
                             Arc::clone(invite_arc),
                             a_leg.transport.remote_addr.ip().to_string(),
                             format!("{}", a_leg.transport.transport).to_lowercase(),
                         )
                         .with_flow(py_flow_from_leg(&a_leg.transport));
+                        // Every carrier tried, so a handler for an exhausted sequence
+                        // can report which ones failed and how, not just the best code.
+                        py_call.set_route_attempts(state.call_actors.route_attempts(call_id));
 
                         Python::attach(|python| {
                             let call_obj = match Py::new(python, py_call) {
@@ -19624,6 +19711,78 @@ fn handle_b2bua_response(
             }
         } // end ResponseClass::Failed
     } // end match class
+}
+
+/// Invoke `@b2bua.on_route_failure` for one failed carrier of a sequential
+/// failover sequence.
+///
+/// Fires once per failed attempt, including the last one before the A-leg is
+/// given up on, and for every non-2xx a carrier returns — a definitive `486`
+/// as much as a `503`. That is deliberate: the same set is what
+/// `call.route_attempts` records, so the hook and the attempt list can never
+/// disagree, and the script filters on `code` for whatever it counts as a
+/// carrier's fault.
+///
+/// Purely a notification. The failover decision has already been made by the
+/// time this runs, and unlike `@b2bua.on_answer` a raise here does not change
+/// the call's outcome — it is logged and the sequence carries on.
+fn b2bua_dispatch_route_failure(
+    call_id: &str,
+    route: &crate::lcr::Route,
+    status_code: u16,
+    a_leg: &crate::b2bua::actor::Leg,
+    a_leg_invite: Option<&Arc<std::sync::Mutex<SipMessage>>>,
+    state: &DispatcherState,
+) {
+    let engine_state = state.engine.state();
+    let handlers = engine_state.handlers_for(&HandlerKind::B2buaRouteFailure);
+    if handlers.is_empty() {
+        return;
+    }
+    let Some(invite_arc) = a_leg_invite else {
+        warn!(call_id = %call_id, "B2BUA: no stored A-leg INVITE for on_route_failure");
+        return;
+    };
+
+    let mut py_call = PyCall::new(
+        call_id.to_string(),
+        Arc::clone(invite_arc),
+        a_leg.transport.remote_addr.ip().to_string(),
+        format!("{}", a_leg.transport.transport).to_lowercase(),
+    )
+    .with_flow(py_flow_from_leg(&a_leg.transport));
+    py_call.set_route_attempts(state.call_actors.route_attempts(call_id));
+    let py_route = crate::script::api::lcr::PyRoute::from_route(route.clone());
+
+    Python::attach(|python| {
+        let call_obj = match Py::new(python, py_call) {
+            Ok(obj) => obj,
+            Err(error) => {
+                error!("failed to create PyCall for on_route_failure: {error}");
+                return;
+            }
+        };
+        let route_obj = match Py::new(python, py_route) {
+            Ok(obj) => obj,
+            Err(error) => {
+                error!("failed to create PyRoute for on_route_failure: {error}");
+                return;
+            }
+        };
+        for handler in &handlers {
+            let callable = handler.callable.bind(python);
+            match callable.call1((call_obj.bind(python), route_obj.bind(python), status_code)) {
+                Ok(ret) => {
+                    if handler.is_async {
+                        if let Err(error) = run_coroutine(python, &ret) {
+                            error!("async B2BUA on_route_failure handler error: {error}");
+                        }
+                    }
+                }
+                Err(error) => error!("B2BUA on_route_failure handler error: {error}"),
+            }
+        }
+    });
 }
 
 /// Schedule cleanup of zombie re-INVITE entries after Timer H (32 seconds).
@@ -21833,7 +21992,8 @@ pub fn b2bua_route_call(
         crate::b2bua::actor::RouteSequenceState {
             pending: routes.into(),
             active: None,
-            best_error: None,
+            attempts: Vec::new(),
+            active_since: None,
             send_socket: None,
             default_timeout,
         },
