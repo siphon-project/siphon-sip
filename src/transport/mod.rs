@@ -249,6 +249,37 @@ impl std::fmt::Display for Transport {
 }
 
 impl Transport {
+    /// The lowercase SIP transport scheme token — the inverse of
+    /// [`from_scheme`](Self::from_scheme).
+    ///
+    /// Lowercase on purpose: this is what goes into persisted registrar
+    /// bindings, and an older reader must still recognise what a newer writer
+    /// stored. `Display` is the uppercase form used in `Via` and in logs.
+    pub fn as_scheme(self) -> &'static str {
+        match self {
+            Transport::Udp => "udp",
+            Transport::Tcp => "tcp",
+            Transport::Tls => "tls",
+            Transport::WebSocket => "ws",
+            Transport::WebSocketSecure => "wss",
+            Transport::Sctp => "sctp",
+        }
+    }
+
+    /// Whether losing the connection is itself a signal that the flow is gone
+    /// (RFC 5626 §4.2.2) — true for the connection-oriented transports a UE
+    /// registers over.
+    ///
+    /// `Sctp` is excluded deliberately: siphon has no SCTP registrar flow to
+    /// tear down, so claiming its close as a flow failure would invent a
+    /// teardown path that nothing drives.
+    pub fn is_stream(self) -> bool {
+        matches!(
+            self,
+            Transport::Tcp | Transport::Tls | Transport::WebSocket | Transport::WebSocketSecure
+        )
+    }
+
     /// Parse a SIP transport scheme token (`"udp"`, `"tcp"`, `"tls"`, `"ws"`,
     /// `"wss"`, `"sctp"`, case-insensitive) into a [`Transport`].  Returns
     /// `None` for an unrecognized scheme.

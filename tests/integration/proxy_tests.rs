@@ -778,13 +778,12 @@ fn binding_with_path(host: &str, path: Vec<String>) -> siphon::registrar::Contac
         call_id: format!("reg-{host}"),
         cseq: 1,
         source_addr: None,
-        source_transport: Some("udp".to_string()),
+        source_transport: Some(siphon::transport::Transport::Udp),
         sip_instance: None,
         reg_id: None,
         path,
         pending: false,
-        instance_id: None,
-        instance_epoch: None,
+        instance: None,
         flow_token: None,
         inbound_local_addr: None,
         inbound_connection_id: None,
@@ -877,7 +876,7 @@ fn registrar_lookup_orders_bindings_newest_first() {
             "old-handset".to_string(),
             1,
             None,
-            Some("udp".to_string()),
+            Some(siphon::transport::Transport::Udp),
         )
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -892,7 +891,7 @@ fn registrar_lookup_orders_bindings_newest_first() {
             "new-handset".to_string(),
             1,
             None,
-            Some("udp".to_string()),
+            Some(siphon::transport::Transport::Udp),
         )
         .unwrap();
 

@@ -402,7 +402,10 @@ impl PyContact {
         let received_string = contact.source_addr.map(|addr| {
             // Build a SIP URI from source address + transport, matching the
             // format OpenSIPS uses for its received_avp / $param(received).
-            let transport = contact.source_transport.as_deref().unwrap_or("udp");
+            let transport = contact
+                .source_transport
+                .unwrap_or(crate::transport::Transport::Udp)
+                .as_scheme();
             format!("sip:{}:{};transport={}", addr.ip(), addr.port(), transport)
         });
         let is_local_value = registrar
@@ -416,16 +419,14 @@ impl PyContact {
             (Some(source_addr), Some(local_addr)) => {
                 let transport = contact
                     .source_transport
-                    .as_deref()
-                    .unwrap_or("udp")
-                    .to_ascii_lowercase();
+                    .unwrap_or(crate::transport::Transport::Udp);
                 let connection_id = match contact.inbound_connection_id {
                     Some(id) => id,
                     // For UDP, the connection_id is a deterministic hash of
                     // `(local_addr, remote_addr)` — recompute on demand if
                     // the stored binding lacks it (older record).  For
                     // stream transports, no captured id means no flow.
-                    None if transport == "udp" => {
+                    None if transport == crate::transport::Transport::Udp => {
                         use std::collections::hash_map::DefaultHasher;
                         use std::hash::{Hash, Hasher};
                         let mut hasher = DefaultHasher::new();
@@ -441,8 +442,8 @@ impl PyContact {
                             age_seconds: contact.age_seconds(),
                             received_string,
                             path_headers: contact.path.clone(),
-                            instance_id_value: contact.instance_id.clone(),
-                            instance_epoch_value: contact.instance_epoch.clone(),
+                            instance_id_value: contact.instance_id().map(str::to_string),
+                            instance_epoch_value: contact.instance_epoch().map(str::to_string),
                             is_local_value,
                             flow_token_value: contact.flow_token.clone(),
                             flow_value: None,
@@ -452,7 +453,7 @@ impl PyContact {
                     }
                 };
                 Some(PyFlow {
-                    transport,
+                    transport: transport.as_scheme().to_string(),
                     source_addr,
                     local_addr,
                     connection_id,
@@ -467,8 +468,8 @@ impl PyContact {
             age_seconds: contact.age_seconds(),
             received_string,
             path_headers: contact.path.clone(),
-            instance_id_value: contact.instance_id.clone(),
-            instance_epoch_value: contact.instance_epoch.clone(),
+            instance_id_value: contact.instance_id().map(str::to_string),
+            instance_epoch_value: contact.instance_epoch().map(str::to_string),
             is_local_value,
             flow_token_value: contact.flow_token.clone(),
             flow_value,
@@ -612,7 +613,7 @@ impl PyRegistrar {
 
         // Extract source address for NAT traversal (like OpenSIPS received_avp).
         let source_addr = request.source_socket_addr();
-        let source_transport = Some(request.transport_name().to_string());
+        let source_transport = crate::transport::Transport::from_scheme(request.transport_name());
 
         // Capture the inbound flow for every binding this process accepts —
         // `inbound_local_addr` + `inbound_connection_id` together let
@@ -713,7 +714,7 @@ impl PyRegistrar {
                         call_id.clone(),
                         cseq_seq,
                         source_addr,
-                        source_transport.clone(),
+                        source_transport,
                         sip_instance,
                         reg_id,
                         path.clone(),
@@ -865,7 +866,7 @@ impl PyRegistrar {
         repin_protected_sa(request, granted_expires);
 
         let source_addr = request.source_socket_addr();
-        let source_transport = Some(request.transport_name().to_string());
+        let source_transport = crate::transport::Transport::from_scheme(request.transport_name());
 
         // Capture the inbound flow unconditionally (same rationale as `save()`):
         // `inbound_local_addr` + `inbound_connection_id` populate `Contact.flow`
@@ -946,7 +947,7 @@ impl PyRegistrar {
                         call_id.clone(),
                         cseq_seq,
                         source_addr,
-                        source_transport.clone(),
+                        source_transport,
                         sip_instance,
                         reg_id,
                         path.clone(),
@@ -2518,13 +2519,12 @@ mod tests {
             call_id: "c1".into(),
             cseq: 1,
             source_addr: Some("10.0.0.1:50000".parse().unwrap()),
-            source_transport: Some("udp".into()),
+            source_transport: Some(crate::transport::Transport::Udp),
             sip_instance: None,
             reg_id: None,
             path: vec![],
             pending: false,
-            instance_id: None,
-            instance_epoch: None,
+            instance: None,
             flow_token: Some("tok".into()),
             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
             inbound_connection_id: Some(0xc0ffee),
@@ -2577,13 +2577,12 @@ mod tests {
             call_id: "c1".into(),
             cseq: 1,
             source_addr: Some("10.0.0.1:50000".parse().unwrap()),
-            source_transport: Some("wss".into()),
+            source_transport: Some(crate::transport::Transport::WebSocketSecure),
             sip_instance: None,
             reg_id: None,
             path: vec![],
             pending: false,
-            instance_id: None,
-            instance_epoch: None,
+            instance: None,
             flow_token: None,
             inbound_local_addr: Some("127.0.0.1:443".parse().unwrap()),
             inbound_connection_id: Some(0xc0ffee),
@@ -2625,13 +2624,12 @@ mod tests {
             call_id: "c2".into(),
             cseq: 1,
             source_addr: Some("10.0.0.2:50000".parse().unwrap()),
-            source_transport: Some("udp".into()),
+            source_transport: Some(crate::transport::Transport::Udp),
             sip_instance: None,
             reg_id: None,
             path: path.clone(),
             pending: false,
-            instance_id: None,
-            instance_epoch: None,
+            instance: None,
             flow_token: Some("TOKEN-B".into()),
             inbound_local_addr: Some("127.0.0.1:5060".parse().unwrap()),
             inbound_connection_id: Some(7),
@@ -2663,13 +2661,12 @@ mod tests {
             call_id: "c1".into(),
             cseq: 1,
             source_addr: Some("10.0.0.1:50000".parse().unwrap()),
-            source_transport: Some("udp".into()),
+            source_transport: Some(crate::transport::Transport::Udp),
             sip_instance: None,
             reg_id: None,
             path: vec![],
             pending: false,
-            instance_id: None,
-            instance_epoch: None,
+            instance: None,
             flow_token: Some("tok".into()),
             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
             inbound_connection_id: None,
@@ -2697,13 +2694,12 @@ mod tests {
             call_id: "c1".into(),
             cseq: 1,
             source_addr: Some("10.0.0.1:50000".parse().unwrap()),
-            source_transport: Some("tcp".into()),
+            source_transport: Some(crate::transport::Transport::Tcp),
             sip_instance: None,
             reg_id: None,
             path: vec![],
             pending: false,
-            instance_id: None,
-            instance_epoch: None,
+            instance: None,
             flow_token: Some("tok".into()),
             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
             inbound_connection_id: None,
@@ -2727,13 +2723,12 @@ mod tests {
             call_id: "c1".into(),
             cseq: 1,
             source_addr: Some("10.0.0.1:50000".parse().unwrap()),
-            source_transport: Some("udp".into()),
+            source_transport: Some(crate::transport::Transport::Udp),
             sip_instance: None,
             reg_id: None,
             path: vec![],
             pending: false,
-            instance_id: None,
-            instance_epoch: None,
+            instance: None,
             flow_token: Some("tok".into()),
             inbound_local_addr: None,
             inbound_connection_id: Some(42),

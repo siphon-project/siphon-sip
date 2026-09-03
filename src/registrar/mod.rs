@@ -10,13 +10,14 @@ pub mod backend;
 pub mod reginfo;
 
 use std::net::SocketAddr;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::sync::broadcast;
 
 use crate::sip::uri::SipUri;
+use crate::transport::Transport;
 
 /// A registration change event emitted by the registrar.
 #[derive(Debug, Clone)]
@@ -71,11 +72,8 @@ pub fn normalize_aor(uri: &str) -> Aor {
 /// for `unregister_flow`: UDP `ConnectionId`s are deterministic `(local,remote)`
 /// hashes with no closable socket, so a "connection closed" notification never
 /// arrives for them.
-pub(crate) fn is_stream_transport(transport: Option<&str>) -> bool {
-    matches!(
-        transport.map(|t| t.to_ascii_lowercase()).as_deref(),
-        Some("tcp") | Some("tls") | Some("ws") | Some("wss")
-    )
+pub(crate) fn is_stream_transport(transport: Option<Transport>) -> bool {
+    transport.is_some_and(Transport::is_stream)
 }
 
 /// What kind of registration the contact represents.
@@ -127,8 +125,14 @@ pub struct Contact {
     pub cseq: u32,
     /// Source address the REGISTER came from (for NAT traversal routing).
     pub source_addr: Option<SocketAddr>,
-    /// Transport protocol the REGISTER arrived on (for received URI construction).
-    pub source_transport: Option<String>,
+    /// Transport protocol the REGISTER arrived on (for received URI
+    /// construction).
+    ///
+    /// The parsed enum rather than the scheme token: it is one byte instead of
+    /// a `String` plus its heap allocation on every binding in the table, and
+    /// every consumer wanted a `Transport` anyway — the routing path used to
+    /// re-parse this string back into one on each send.
+    pub source_transport: Option<Transport>,
     /// RFC 5627 GRUU: `+sip.instance` (URN, e.g. "urn:uuid:f81d4fae-...").
     pub sip_instance: Option<String>,
     /// RFC 5626 Outbound: `reg-id` parameter.
@@ -137,16 +141,19 @@ pub struct Contact {
     pub path: Vec<String>,
     /// IMS registration state: pending (awaiting SAR) vs active.
     pub pending: bool,
-    /// Stable identity of the siphon instance that originally accepted this
-    /// REGISTER (typically the StatefulSet pod name or hostname).  `None` for
-    /// bindings created before the field was introduced or when no identity
-    /// is configured.
-    pub instance_id: Option<String>,
-    /// Boot-time epoch UUID of the process that accepted this REGISTER.
-    /// Combined with `instance_id`, lets a restarted instance distinguish
-    /// "I (this pod) accepted this binding in a previous life" from
-    /// "another instance accepted it."
-    pub instance_epoch: Option<String>,
+    /// Identity of the siphon process that accepted this REGISTER — the
+    /// stable instance id (typically the StatefulSet pod name or hostname)
+    /// plus the boot epoch, which together let a restarted instance
+    /// distinguish "I accepted this binding in a previous life" from "another
+    /// instance accepted it".  `None` for bindings restored from a peer or
+    /// created before the field existed, and when no identity is configured.
+    ///
+    /// Shared rather than owned: it is a per-process constant, so a `String`
+    /// pair on the struct meant every binding in the table carried its own
+    /// copy of the same two values and paid two allocations for them. Read it
+    /// through [`instance_id`](Self::instance_id) /
+    /// [`instance_epoch`](Self::instance_epoch).
+    pub instance: Option<Arc<InstanceIdentity>>,
     /// Opaque proxy-side token that references this binding.  Set by the
     /// script (typically the P-CSCF) at REGISTER time to enable token-keyed
     /// MT routing — the token is embedded in the userpart of the Path URI
@@ -205,6 +212,20 @@ pub struct Contact {
 fn push_binding(contacts: &mut Vec<Contact>, contact: Contact) {
     contacts.reserve_exact(1);
     contacts.push(contact);
+}
+
+impl Contact {
+    /// Stable id of the siphon instance that accepted this REGISTER.
+    pub fn instance_id(&self) -> Option<&str> {
+        self.instance.as_ref().map(|identity| identity.id.as_str())
+    }
+
+    /// Boot epoch of the process that accepted this REGISTER.
+    pub fn instance_epoch(&self) -> Option<&str> {
+        self.instance
+            .as_ref()
+            .map(|identity| identity.epoch.as_str())
+    }
 }
 
 /// Order routable bindings the way a terminating request should try them:
@@ -353,7 +374,7 @@ pub struct Registrar {
     /// Identity tag stamped onto every locally accepted contact.  Set once
     /// at startup; `None` means scripts can't tell who owns a binding (the
     /// pre-Tier-2 default).
-    instance_identity: OnceLock<InstanceIdentity>,
+    instance_identity: OnceLock<Arc<InstanceIdentity>>,
 }
 
 impl std::fmt::Debug for Registrar {
@@ -394,21 +415,18 @@ impl Registrar {
     /// Should be called once at startup before traffic begins.  Subsequent
     /// calls are ignored.
     pub fn set_instance_identity(&self, identity: InstanceIdentity) {
-        let _ = self.instance_identity.set(identity);
+        let _ = self.instance_identity.set(Arc::new(identity));
     }
 
     /// Returns the configured per-process identity, if any.
     pub fn instance_identity(&self) -> Option<&InstanceIdentity> {
-        self.instance_identity.get()
+        self.instance_identity.get().map(Arc::as_ref)
     }
 
-    /// Snapshot of `(instance_id, instance_epoch)` cloned for stamping onto
-    /// a `Contact`.  Returns `(None, None)` if no identity is configured.
-    fn current_identity_pair(&self) -> (Option<String>, Option<String>) {
-        match self.instance_identity.get() {
-            Some(identity) => (Some(identity.id.clone()), Some(identity.epoch.clone())),
-            None => (None, None),
-        }
+    /// Handle to the per-process identity for stamping onto a `Contact` — a
+    /// refcount bump, not a copy of the two strings.
+    fn current_instance(&self) -> Option<Arc<InstanceIdentity>> {
+        self.instance_identity.get().map(Arc::clone)
     }
 
     /// Returns true when the contact carries this instance's id *and* epoch.
@@ -418,8 +436,8 @@ impl Registrar {
     pub fn is_local_contact(&self, contact: &Contact) -> bool {
         match (
             self.instance_identity.get(),
-            contact.instance_id.as_deref(),
-            contact.instance_epoch.as_deref(),
+            contact.instance_id(),
+            contact.instance_epoch(),
         ) {
             (Some(identity), Some(id), Some(epoch)) => identity.id == id && identity.epoch == epoch,
             _ => false,
@@ -612,7 +630,7 @@ impl Registrar {
         call_id: String,
         cseq: u32,
         source_addr: Option<SocketAddr>,
-        source_transport: Option<String>,
+        source_transport: Option<Transport>,
     ) -> Result<(), RegistrarError> {
         self.save_full(
             aor,
@@ -650,7 +668,7 @@ impl Registrar {
         call_id: String,
         cseq: u32,
         source_addr: Option<SocketAddr>,
-        source_transport: Option<String>,
+        source_transport: Option<Transport>,
         sip_instance: Option<String>,
         reg_id: Option<u32>,
         path: Vec<String>,
@@ -697,7 +715,7 @@ impl Registrar {
         call_id: String,
         cseq: u32,
         source_addr: Option<SocketAddr>,
-        source_transport: Option<String>,
+        source_transport: Option<Transport>,
         sip_instance: Option<String>,
         reg_id: Option<u32>,
         path: Vec<String>,
@@ -723,7 +741,7 @@ impl Registrar {
             });
         }
 
-        let (instance_id, instance_epoch) = self.current_identity_pair();
+        let instance = self.current_instance();
         let FlowCapture {
             flow_token,
             inbound_local_addr,
@@ -733,7 +751,7 @@ impl Registrar {
         // drive the stream-only connection reverse index (`inbound_connection_id`
         // is `Copy`, so it stays usable after the struct takes it).
         let new_connection_id = inbound_connection_id;
-        let new_is_stream = is_stream_transport(source_transport.as_deref());
+        let new_is_stream = is_stream_transport(source_transport);
         let contact = Contact {
             uri: uri.clone(),
             q,
@@ -747,8 +765,7 @@ impl Registrar {
             reg_id,
             path,
             pending: false,
-            instance_id,
-            instance_epoch,
+            instance,
             flow_token: flow_token.clone(),
             inbound_local_addr,
             inbound_connection_id,
@@ -777,7 +794,7 @@ impl Registrar {
                 if let Some(token) = &c.flow_token {
                     tokens_to_remove.push(token.clone());
                 }
-                if is_stream_transport(c.source_transport.as_deref()) {
+                if is_stream_transport(c.source_transport) {
                     if let Some(id) = c.inbound_connection_id {
                         conns_to_deindex.push(id);
                     }
@@ -799,7 +816,7 @@ impl Registrar {
                     if let Some(token) = &c.flow_token {
                         tokens_to_remove.push(token.clone());
                     }
-                    if is_stream_transport(c.source_transport.as_deref()) {
+                    if is_stream_transport(c.source_transport) {
                         if let Some(id) = c.inbound_connection_id {
                             conns_to_deindex.push(id);
                         }
@@ -879,7 +896,7 @@ impl Registrar {
             if let Some(old_token) = &contacts[idx].flow_token {
                 tokens_to_remove.push(old_token.clone());
             }
-            if is_stream_transport(contacts[idx].source_transport.as_deref()) {
+            if is_stream_transport(contacts[idx].source_transport) {
                 if let Some(id) = contacts[idx].inbound_connection_id {
                     conns_to_deindex.push(id);
                 }
@@ -955,7 +972,7 @@ impl Registrar {
                 if let Some(token) = contact.flow_token {
                     self.tokens.remove(&token);
                 }
-                if is_stream_transport(contact.source_transport.as_deref()) {
+                if is_stream_transport(contact.source_transport) {
                     if let Some(id) = contact.inbound_connection_id {
                         self.deindex_connection(id, aor);
                     }
@@ -989,7 +1006,7 @@ impl Registrar {
                 if let Some(token) = contact.flow_token {
                     self.tokens.remove(&token);
                 }
-                if is_stream_transport(contact.source_transport.as_deref()) {
+                if is_stream_transport(contact.source_transport) {
                     if let Some(id) = contact.inbound_connection_id {
                         self.deindex_connection(id, aor);
                     }
@@ -1033,7 +1050,7 @@ impl Registrar {
                         if let Some(token) = &c.flow_token {
                             tokens_to_remove.push(token.clone());
                         }
-                        if is_stream_transport(c.source_transport.as_deref()) {
+                        if is_stream_transport(c.source_transport) {
                             if let Some(id) = c.inbound_connection_id {
                                 conns_to_deindex.push((id, aor.clone()));
                             }
@@ -1279,7 +1296,7 @@ impl Registrar {
                     if let Some(token) = &c.flow_token {
                         tokens_to_remove.push(token.clone());
                     }
-                    if is_stream_transport(c.source_transport.as_deref()) {
+                    if is_stream_transport(c.source_transport) {
                         if let Some(id) = c.inbound_connection_id {
                             conns_to_deindex.push(id);
                         }
@@ -1357,7 +1374,7 @@ impl Registrar {
         let mut conns_to_deindex: Vec<u64> = Vec::new();
         contacts.retain(|c| {
             if c.is_expired() {
-                if is_stream_transport(c.source_transport.as_deref()) {
+                if is_stream_transport(c.source_transport) {
                     if let Some(id) = c.inbound_connection_id {
                         conns_to_deindex.push(id);
                     }
@@ -1420,8 +1437,7 @@ impl Registrar {
             reg_id: None,
             path: vec![],
             pending: false,
-            instance_id: None,
-            instance_epoch: None,
+            instance: None,
             flow_token: None,
             inbound_local_addr: None,
             inbound_connection_id: None,
@@ -1684,7 +1700,7 @@ impl Registrar {
             if let Some(entry) = self.bindings.get(&aor) {
                 for contact in entry.value().iter() {
                     if contact.inbound_connection_id == Some(connection_id)
-                        && is_stream_transport(contact.source_transport.as_deref())
+                        && is_stream_transport(contact.source_transport)
                     {
                         out.push((aor.clone(), contact.clone()));
                     }
@@ -1756,7 +1772,7 @@ impl Registrar {
                 let mut kept = Vec::with_capacity(before);
                 for mut contact in contacts {
                     let on_this_flow = contact.inbound_connection_id == Some(connection_id)
-                        && is_stream_transport(contact.source_transport.as_deref());
+                        && is_stream_transport(contact.source_transport);
                     if on_this_flow && keep.contains(&contact.uri.to_string()) {
                         // Detach: the socket is gone but the registration stands
                         // (RFC 5626 flow recovery).  A future MT send opens a
@@ -1921,7 +1937,7 @@ impl Registrar {
     ) {
         let primary = self.resolve_alias(aor);
         let aor = primary.as_str();
-        let (instance_id, instance_epoch) = self.current_identity_pair();
+        let instance = self.current_instance();
         let contact = Contact {
             uri: uri.clone(),
             q,
@@ -1935,8 +1951,7 @@ impl Registrar {
             reg_id: None,
             path: vec![],
             pending: true,
-            instance_id,
-            instance_epoch,
+            instance,
             flow_token: None,
             inbound_local_addr: None,
             inbound_connection_id: None,
@@ -2007,7 +2022,7 @@ impl Registrar {
                     if let Some(token) = &c.flow_token {
                         tokens_to_remove.push(token.clone());
                     }
-                    if is_stream_transport(c.source_transport.as_deref()) {
+                    if is_stream_transport(c.source_transport) {
                         if let Some(id) = c.inbound_connection_id {
                             conns_to_deindex.push((id, aor_key.clone()));
                         }
@@ -2150,7 +2165,7 @@ mod tests {
                 call_id.into(),
                 1,
                 Some("192.0.2.10:5060".parse().unwrap()),
-                Some(transport.to_string()),
+                Transport::from_scheme(transport),
                 None,
                 None,
                 vec![],
@@ -2251,7 +2266,7 @@ mod tests {
                 "c-a".into(),
                 1,
                 Some("192.0.2.10:5060".parse().unwrap()),
-                Some("tcp".to_string()),
+                Some(Transport::Tcp),
                 None,
                 None,
                 vec![],
@@ -2305,7 +2320,7 @@ mod tests {
                 format!("call-{user}"),
                 1,
                 Some(format!("{ue_ip}:5060").parse().unwrap()),
-                Some("tcp".to_string()),
+                Some(Transport::Tcp),
                 None,
                 None,
                 vec![],
@@ -2462,7 +2477,7 @@ mod tests {
                 "call-udp".into(),
                 1,
                 Some("100.65.0.2:5060".parse().unwrap()),
-                Some("udp".to_string()),
+                Some(Transport::Udp),
                 None,
                 None,
                 vec![],
@@ -2477,7 +2492,7 @@ mod tests {
 
         let peek = registrar.bindings_for_connection(7);
         assert_eq!(peek.len(), 1, "UDP contact colliding on the id is excluded");
-        assert_eq!(peek[0].1.source_transport.as_deref(), Some("tcp"));
+        assert_eq!(peek[0].1.source_transport, Some(Transport::Tcp));
         // Peek does not mutate: both contacts still present.
         assert_eq!(registrar.lookup("sip:alice@example.com").len(), 2);
         // Unknown id → empty.
@@ -3202,8 +3217,8 @@ mod tests {
             .unwrap();
 
         let contacts = registrar.lookup("sip:alice@example.com");
-        assert_eq!(contacts[0].instance_id.as_deref(), Some("siphon-2"));
-        assert_eq!(contacts[0].instance_epoch.as_deref(), Some("boot-1"));
+        assert_eq!(contacts[0].instance_id(), Some("siphon-2"));
+        assert_eq!(contacts[0].instance_epoch(), Some("boot-1"));
         assert!(registrar.is_local_contact(&contacts[0]));
     }
 
@@ -3222,8 +3237,8 @@ mod tests {
             .unwrap();
 
         let contacts = registrar.lookup("sip:alice@example.com");
-        assert!(contacts[0].instance_id.is_none());
-        assert!(contacts[0].instance_epoch.is_none());
+        assert!(contacts[0].instance_id().is_none());
+        assert!(contacts[0].instance_epoch().is_none());
         assert!(!registrar.is_local_contact(&contacts[0]));
     }
 
@@ -3248,8 +3263,10 @@ mod tests {
             reg_id: None,
             path: vec![],
             pending: false,
-            instance_id: Some("siphon-7".to_string()),
-            instance_epoch: Some("boot-2".to_string()),
+            instance: Some(Arc::new(InstanceIdentity {
+                id: "siphon-7".to_string(),
+                epoch: "boot-2".to_string(),
+            })),
             flow_token: None,
             inbound_local_addr: None,
             inbound_connection_id: None,
@@ -3262,8 +3279,10 @@ mod tests {
         );
 
         let stale = Contact {
-            instance_id: Some("siphon-2".to_string()),
-            instance_epoch: Some("boot-1".to_string()),
+            instance: Some(Arc::new(InstanceIdentity {
+                id: "siphon-2".to_string(),
+                epoch: "boot-1".to_string(),
+            })),
             ..foreign.clone()
         };
         assert!(
@@ -3272,8 +3291,10 @@ mod tests {
         );
 
         let exact = Contact {
-            instance_id: Some("siphon-2".to_string()),
-            instance_epoch: Some("boot-2".to_string()),
+            instance: Some(Arc::new(InstanceIdentity {
+                id: "siphon-2".to_string(),
+                epoch: "boot-2".to_string(),
+            })),
             ..foreign
         };
         assert!(registrar.is_local_contact(&exact));
@@ -3294,8 +3315,7 @@ mod tests {
             reg_id: None,
             path: vec![],
             pending: false,
-            instance_id: None,
-            instance_epoch: None,
+            instance: None,
             flow_token: None,
             inbound_local_addr: None,
             inbound_connection_id: None,
@@ -3325,8 +3345,7 @@ mod tests {
                 reg_id: None,
                 path: vec![],
                 pending: false,
-                instance_id: None,
-                instance_epoch: None,
+                instance: None,
                 flow_token: None,
                 inbound_local_addr: None,
                 inbound_connection_id: None,
@@ -3383,8 +3402,7 @@ mod tests {
             reg_id: None,
             path: vec![],
             pending: false,
-            instance_id: None,
-            instance_epoch: None,
+            instance: None,
             flow_token: None,
             inbound_local_addr: None,
             inbound_connection_id: None,
@@ -3512,8 +3530,7 @@ mod tests {
             reg_id: None,
             path: vec![],
             pending: false,
-            instance_id: None,
-            instance_epoch: None,
+            instance: None,
             flow_token: None,
             inbound_local_addr: None,
             inbound_connection_id: None,
@@ -3588,7 +3605,7 @@ mod tests {
                     format!("call-{index}"),
                     1,
                     None,
-                    Some("tcp".to_string()),
+                    Some(Transport::Tcp),
                     None,
                     None,
                     vec![],
@@ -3644,6 +3661,69 @@ mod tests {
                 "{name} did not drain: {after} entries left, started at {before}"
             );
         }
+    }
+
+    /// The per-process identity is *shared* by every binding, not copied into
+    /// each one.
+    ///
+    /// This is the whole point of the `Arc`: with an owned `String` pair, a
+    /// table of a million bindings held a million copies of the same two
+    /// values and paid two allocations per binding for them.
+    #[test]
+    fn every_binding_shares_one_instance_identity() {
+        let registrar = Registrar::default();
+        registrar.set_instance_identity(InstanceIdentity {
+            id: "siphon-pcscf-0".to_string(),
+            epoch: "boot-1".to_string(),
+        });
+
+        for index in 0..3 {
+            registrar
+                .save(
+                    &format!("sip:user{index}@ims.example.com"),
+                    contact_uri(&format!("user{index}"), "10.0.0.1"),
+                    3600,
+                    1.0,
+                    format!("call-{index}"),
+                    1,
+                )
+                .unwrap();
+        }
+
+        let first = registrar.lookup("sip:user0@ims.example.com");
+        let second = registrar.lookup("sip:user1@ims.example.com");
+        let (Some(first), Some(second)) = (first[0].instance.as_ref(), second[0].instance.as_ref())
+        else {
+            panic!("both bindings carry the instance identity");
+        };
+        assert!(
+            Arc::ptr_eq(first, second),
+            "bindings on different AoRs must point at the same identity, not copies"
+        );
+        assert_eq!(first.id, "siphon-pcscf-0");
+        assert_eq!(first.epoch, "boot-1");
+    }
+
+    /// A binding with no configured identity carries none, and the accessors
+    /// report that rather than inventing a value.
+    #[test]
+    fn a_binding_without_a_configured_identity_carries_none() {
+        let registrar = Registrar::default();
+        registrar
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "call-1".into(),
+                1,
+            )
+            .unwrap();
+
+        let contacts = registrar.lookup("sip:alice@example.com");
+        assert!(contacts[0].instance.is_none());
+        assert_eq!(contacts[0].instance_id(), None);
+        assert_eq!(contacts[0].instance_epoch(), None);
     }
 
     #[test]
@@ -4178,13 +4258,13 @@ mod tests {
                 "c1".into(),
                 1,
                 Some(addr),
-                Some("tls".to_string()),
+                Some(Transport::Tls),
             )
             .unwrap();
 
         let contacts = registrar.lookup("sip:alice@example.com");
         assert_eq!(contacts[0].source_addr, Some(addr));
-        assert_eq!(contacts[0].source_transport.as_deref(), Some("tls"));
+        assert_eq!(contacts[0].source_transport, Some(Transport::Tls));
     }
 
     #[test]
@@ -4565,7 +4645,7 @@ mod tests {
                 "c1".into(),
                 1,
                 Some("10.0.0.1:5066".parse().unwrap()),
-                Some("udp".into()),
+                Some(Transport::Udp),
                 None,
                 None,
                 vec![],
@@ -4604,7 +4684,7 @@ mod tests {
                 "c1".into(),
                 1,
                 None,
-                Some("udp".into()),
+                Some(Transport::Udp),
                 Some(instance.clone()),
                 None,
                 vec![],
@@ -4621,7 +4701,7 @@ mod tests {
                 "c2".into(),
                 2,
                 None,
-                Some("udp".into()),
+                Some(Transport::Udp),
                 Some(instance),
                 None,
                 vec![],
@@ -4658,7 +4738,7 @@ mod tests {
                     format!("c{cseq}"),
                     cseq,
                     None,
-                    Some("udp".into()),
+                    Some(Transport::Udp),
                     Some(instance.clone()),
                     None,
                     vec![],
@@ -4685,7 +4765,7 @@ mod tests {
                 "c1".into(),
                 1,
                 None,
-                Some("udp".into()),
+                Some(Transport::Udp),
                 None,
                 None,
                 vec![],
@@ -4704,7 +4784,7 @@ mod tests {
                 "c2".into(),
                 2, // Expires: 0
                 None,
-                Some("udp".into()),
+                Some(Transport::Udp),
                 None,
                 None,
                 vec![],
@@ -4730,7 +4810,7 @@ mod tests {
                 "c1".into(),
                 1,
                 None,
-                Some("udp".into()),
+                Some(Transport::Udp),
                 None,
                 None,
                 vec![],
@@ -4759,13 +4839,12 @@ mod tests {
             call_id: "stale".into(),
             cseq: 1,
             source_addr: None,
-            source_transport: Some("udp".into()),
+            source_transport: Some(Transport::Udp),
             sip_instance: None,
             reg_id: None,
             path: vec![],
             pending: false,
-            instance_id: None,
-            instance_epoch: None,
+            instance: None,
             flow_token: Some("tok-gc".into()),
             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
             inbound_connection_id: Some(42),
@@ -4798,13 +4877,12 @@ mod tests {
             call_id: "c1".into(),
             cseq: 1,
             source_addr: None,
-            source_transport: Some("udp".into()),
+            source_transport: Some(Transport::Udp),
             sip_instance: None,
             reg_id: None,
             path: vec![],
             pending: false,
-            instance_id: None,
-            instance_epoch: None,
+            instance: None,
             flow_token: Some("tok-restored".into()),
             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
             inbound_connection_id: Some(7),
@@ -4839,13 +4917,12 @@ mod tests {
             call_id: "stale".into(),
             cseq: 1,
             source_addr: None,
-            source_transport: Some("udp".into()),
+            source_transport: Some(Transport::Udp),
             sip_instance: None,
             reg_id: None,
             path: vec![],
             pending: false,
-            instance_id: None,
-            instance_epoch: None,
+            instance: None,
             flow_token: Some("tok-expired".into()),
             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
             inbound_connection_id: Some(7),
@@ -4872,7 +4949,7 @@ mod tests {
                 "c1".into(),
                 1,
                 None,
-                Some("udp".into()),
+                Some(Transport::Udp),
                 None,
                 None,
                 vec![],
@@ -4933,13 +5010,12 @@ mod tests {
             call_id: "c1".into(),
             cseq: 1,
             source_addr: None,
-            source_transport: Some("udp".into()),
+            source_transport: Some(Transport::Udp),
             sip_instance: None,
             reg_id: None,
             path: vec![],
             pending: false,
-            instance_id: None,
-            instance_epoch: None,
+            instance: None,
             flow_token: Some("tok".into()),
             inbound_local_addr: Some("127.0.0.1:5066".parse().unwrap()),
             inbound_connection_id: Some(1),
@@ -4983,7 +5059,7 @@ mod tests {
                         format!("c{thread_id}-{i}"),
                         1,
                         None,
-                        Some("udp".into()),
+                        Some(Transport::Udp),
                         None,
                         None,
                         vec![],
@@ -5395,8 +5471,7 @@ mod tests {
             reg_id: None,
             path: vec![],
             pending: false,
-            instance_id: None,
-            instance_epoch: None,
+            instance: None,
             flow_token: None,
             inbound_local_addr: None,
             inbound_connection_id: None,
@@ -5416,8 +5491,7 @@ mod tests {
             reg_id: None,
             path: vec![],
             pending: false,
-            instance_id: None,
-            instance_epoch: None,
+            instance: None,
             flow_token: None,
             inbound_local_addr: None,
             inbound_connection_id: None,
@@ -5454,8 +5528,7 @@ mod tests {
             reg_id: None,
             path: vec![],
             pending: false,
-            instance_id: None,
-            instance_epoch: None,
+            instance: None,
             flow_token: None,
             inbound_local_addr: None,
             inbound_connection_id: None,

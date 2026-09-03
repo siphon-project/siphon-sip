@@ -126,18 +126,7 @@ async fn ping_all_contacts(
         let contact_uri_string = contact.uri.to_string();
         let tracker_key = format!("{aor}|{contact_uri_string}");
 
-        let transport = contact
-            .source_transport
-            .as_deref()
-            .and_then(|t| match t {
-                "udp" => Some(Transport::Udp),
-                "tcp" => Some(Transport::Tcp),
-                "tls" => Some(Transport::Tls),
-                "ws" => Some(Transport::WebSocket),
-                "wss" => Some(Transport::WebSocketSecure),
-                _ => None,
-            })
-            .unwrap_or(Transport::Udp);
+        let transport = contact.source_transport.unwrap_or(Transport::Udp);
 
         // Use the contact URI as the R-URI — the peer registered with this
         // address, so its `is_local` check will match.  Using the NAT'd
