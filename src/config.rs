@@ -372,12 +372,16 @@ pub fn parse_dscp(value: &str) -> std::result::Result<u8, String> {
 }
 
 /// Convert a 6-bit DSCP value to the 8-bit TOS byte (RFC 2474 §3).
-/// Default UDP receive-buffer size: 1 MiB per listener socket.
+/// Default UDP receive-buffer floor: 1 MiB per listener socket.
 ///
 /// Roughly 5x the usual kernel default, which is enough to ride out a
 /// scheduler stall at the throughput siphon targets, while staying small
 /// enough that `worker_count` sockets do not meaningfully dent a
 /// memory-capped container's cgroup budget.
+///
+/// It is a floor rather than a fixed size precisely because it is a default:
+/// a host tuned above it has an operator's decision behind that number, and a
+/// shipped constant must not quietly override one.
 fn default_udp_recv_buffer_bytes() -> usize {
     1024 * 1024
 }
@@ -492,8 +496,15 @@ pub struct ListenConfig {
     /// the inbound side is unaffected.
     #[serde(default)]
     pub mtu: Option<u16>,
-    /// Receive-buffer size in bytes (`SO_RCVBUF`) for every UDP listener
-    /// socket. Default 1 MiB.
+    /// Minimum receive-buffer size in bytes (`SO_RCVBUF`) for every UDP
+    /// listener socket. Default 1 MiB.
+    ///
+    /// A **floor, not a target**: a host whose `net.core.rmem_default` already
+    /// exceeds this keeps its larger buffer. Applying it unconditionally would
+    /// shrink the queue on a tuned host, and silently, because an untouched
+    /// socket reports `rmem_default` raw while an explicit request comes back
+    /// doubled — so 1 MiB against a 4 MiB default lands at 2 MiB with nothing
+    /// clamped and no warning to show for it.
     ///
     /// The kernel default (`net.core.rmem_default`, typically ~212 KB) is a
     /// few hundred milliseconds of headroom at IMS registration rates, so a

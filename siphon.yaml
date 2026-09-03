@@ -36,6 +36,9 @@ listen:
   # SO_REUSEPORT gives one socket per worker, so the real cost is this value
   # times the worker count, and socket buffers are charged to the process's
   # cgroup — raise it deliberately on a memory-capped deployment.
+  # This is a FLOOR, not a target: a host whose net.core.rmem_default is already
+  # larger keeps its bigger buffer, so the setting can only ever raise the queue
+  # on an untuned host, never shrink it on a tuned one.
   # net.core.rmem_max caps what the kernel will actually grant; siphon reads the
   # value back and warns when it was clamped.  Set 0 to leave the kernel default.
   udp_recv_buffer_bytes: 1048576

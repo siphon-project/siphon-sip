@@ -155,6 +155,21 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   process's steady state rather than a transient) and the RFC 5626 flow-teardown
   partition, which sized for "nothing removed" and kept the freed slots.
 
+- **`listen.udp_recv_buffer_bytes` is a floor now, so it stops shrinking the
+  receive queue on a tuned host.** siphon called `setsockopt(SO_RCVBUF)`
+  unconditionally, which made the 1 MiB default a *reduction* on any host whose
+  `net.core.rmem_default` was above 512 KiB. The two sides are not measured the
+  same way — an untouched socket carries `rmem_default` verbatim, while an
+  explicit request is doubled by the kernel — so 1 MiB against a 4 MiB default
+  landed at 2 MiB, halving the headroom the setting exists to provide. It did it
+  silently, too: nothing was clamped, so the read-back warning had nothing to
+  say, and `ss -uanm` was the only place the loss was visible.
+
+  The configured size is now the minimum: siphon reads what the socket already
+  carries and leaves a larger buffer alone. Deliberately conservative about the
+  doubling, so it can decline to raise a buffer already within 2x of the floor,
+  but it can never lower one. `0` still means "don't touch the socket at all".
+
 ## [1.8.0] — 2026-09-02
 
 _Codename: kees._
