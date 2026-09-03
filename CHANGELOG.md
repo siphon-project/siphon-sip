@@ -7,6 +7,28 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 ## [Unreleased]
 
 ### Performance
+- **The dispatcher's timer wheel no longer retains its peak-concurrency
+  footprint either.** Same shape as the transaction map fixed alongside it:
+  `timer_wheel` is a `DashMap<String, TimerEntry>` holding a 176-byte
+  `TimerEntry` inline, so the bucket was 200 bytes. `hashbrown` sizes its bucket
+  array for the peak number of live entries and never shrinks it, and the wheel
+  carries roughly one entry per live transaction timer — so its count tracks
+  `rate x Timer J` the same way, and the array stayed at the busiest moment the
+  process ever saw for the rest of its life. Boxed, the bucket is 32 bytes.
+
+  Measured on the same experiment (100,000 registrations at 4,800 cps, then
+  fully de-registered), against `main` with only this change reverted:
+
+  | | peak RSS | drained RSS | drained live bytes |
+  |---|---|---|---|
+  | before | 289 MB | 153 MB | 80 MB |
+  | after | 267 MB | 121 MB | **47 MB** |
+
+  Post-drain live bytes fall 41 %. Cumulatively with the registrar and
+  transaction work in this release, the same workload goes from 563 MB peak
+  RSS / 158 MB retained to 267 MB / 47 MB.
+
+### Performance
 - **The transaction table no longer holds its peak-concurrency footprint for
   the life of the process.** `TransactionManager` stored the `Transaction`
   enum inline in its `DashMap`. A `Nist` carries two whole `SipMessage`s
