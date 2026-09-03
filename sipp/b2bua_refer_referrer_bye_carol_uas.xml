@@ -74,7 +74,24 @@ a=sendrecv
        §13.2.2.4). Without the fix this never arrives. -->
   <recv request="ACK" timeout="5000" />
 
-  <!-- Carol hangs up; siphon tears down the surviving far leg (bob). -->
+  <!-- Carol hangs up; siphon tears down the surviving far leg (bob).
+
+       The pause is load-bearing, not padding. Hanging up in the same
+       microsecond as the ACK puts carol's BYE inside siphon's re-bridge
+       re-INVITE exchange with bob, so siphon emits an ACK (for bob's 200) and a
+       BYE to bob from two independent inbound events. On UDP those are two
+       separately enqueued datagrams with no ordering guarantee — siphon's UDP
+       workers share the outbound receiver MPMC-style and race to send_to (see
+       `OutboundMessage::followups`). Either order is correct and a stray ACK is
+       a no-op for a real UA (RFC 3261 §17.1.1.3 gives an ACK no response,
+       ever), but SIPp fails the reordered case as a dead call — this was the
+       job's intermittent failure, reproducing about one run in six.
+
+       A real call has talk time. Giving carol some removes the manufactured
+       race without weakening anything: bob must still receive the BYE and
+       answer it, and carol must still get its 200. -->
+  <pause milliseconds="500" />
+
   <send retrans="500">
     <![CDATA[
 BYE [$remote_contact] SIP/2.0
