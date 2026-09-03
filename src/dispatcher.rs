@@ -11364,7 +11364,10 @@ enum CdrSettle {
 /// to it, because `cdr.write(request, extra=…)` on a call the script then
 /// rejects is a deliberate ask for a record of that attempt, and it is emitted
 /// carrying the code the script answered instead of a bare `0`.
-fn cdr_settle_decision(outcome: &ProxyInviteOutcome<'_>, script_attached_fields: bool) -> CdrSettle {
+fn cdr_settle_decision(
+    outcome: &ProxyInviteOutcome<'_>,
+    script_attached_fields: bool,
+) -> CdrSettle {
     match outcome {
         ProxyInviteOutcome::Forwarded { .. } => CdrSettle::Keep,
         ProxyInviteOutcome::Rejected { code } if script_attached_fields => CdrSettle::Emit {

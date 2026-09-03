@@ -936,19 +936,21 @@ mod tests {
             .expect("sessions lock")
             .insert("call-1\0tag-A".to_string(), tracked_session());
 
-        install_extra_merger(Arc::new(|keys: &[String], extra: &HashMap<String, String>| {
-            let mut guard = match SESSIONS.get() {
-                Some(store) => store.lock().expect("sessions lock"),
-                None => return false,
-            };
-            for key in keys {
-                if let Some(session) = guard.get_mut(key) {
-                    session.merge_extra(extra);
-                    return true;
+        install_extra_merger(Arc::new(
+            |keys: &[String], extra: &HashMap<String, String>| {
+                let mut guard = match SESSIONS.get() {
+                    Some(store) => store.lock().expect("sessions lock"),
+                    None => return false,
+                };
+                for key in keys {
+                    if let Some(session) = guard.get_mut(key) {
+                        session.merge_extra(extra);
+                        return true;
+                    }
                 }
-            }
-            false
-        }));
+                false
+            },
+        ));
 
         let extra = HashMap::from([
             ("billing_id".to_string(), "B-12345".to_string()),
@@ -978,7 +980,10 @@ mod tests {
         session.mark_answered(200);
         let cdr = session.finalize("caller", None, None);
 
-        assert_eq!(cdr.extra.get("billing_id").map(String::as_str), Some("B-12345"));
+        assert_eq!(
+            cdr.extra.get("billing_id").map(String::as_str),
+            Some("B-12345")
+        );
         assert_eq!(
             cdr.extra.get("carrier_id").map(String::as_str),
             Some("carrier-a")

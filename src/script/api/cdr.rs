@@ -319,7 +319,10 @@ mod tests {
             dict.set_item(7, "numeric key").unwrap();
 
             let fields = extra_fields(Some(&dict));
-            assert_eq!(fields.get("billing_id").map(String::as_str), Some("B-12345"));
+            assert_eq!(
+                fields.get("billing_id").map(String::as_str),
+                Some("B-12345")
+            );
             assert!(!fields.contains_key("rate"), "non-string value is skipped");
             assert_eq!(fields.len(), 1);
 
