@@ -17953,6 +17953,10 @@ fn handle_b2bua_response(
                 // Wrap the 200 OK in Arc<Mutex<>> so Python handlers can modify SDP in-place
                 let response_arc = Arc::new(std::sync::Mutex::new(message.clone()));
 
+                // A `call.refer()` issued from @b2bua.on_answer, held until the A-leg
+                // 2xx has been sent (see where it is taken, further down).
+                let mut deferred_outbound_refer: Option<crate::sip::headers::refer::ReferTo> = None;
+
                 // Invoke @b2bua.on_answer handlers with (PyCall, PyReply)
                 let engine_state = state.engine.state();
                 let handlers = engine_state.handlers_for(&HandlerKind::B2buaAnswer);
@@ -18016,14 +18020,20 @@ fn handle_b2bua_response(
                             Some(borrowed.action().clone())
                         });
 
-                        // Deferred call.refer() from @b2bua.on_answer: send an outbound
+                        // Deferred call.refer() from @b2bua.on_answer: an outbound
                         // REFER to the A-leg (the connected caller). Other deferred
                         // actions on on_answer are not applicable (the call is already
                         // answered) and are ignored.
+                        //
+                        // NOT sent here. The A-leg 200 OK is only forwarded further
+                        // down this function, so emitting the REFER at this point put
+                        // it on the wire *ahead of the answer*: the caller received an
+                        // in-dialog REFER for a dialog it did not yet consider
+                        // established (RFC 3261 §13.2.2.4 — the UAC confirms the dialog
+                        // on the 2xx), which a real UA answers 481. Carried to after
+                        // the 2xx send instead.
                         if let Some(CallAction::SendRefer { refer_to }) = answer_action {
-                            b2bua_send_outbound_refer(
-                                state, call_id, /*on_a_leg=*/ true, &refer_to,
-                            );
+                            deferred_outbound_refer = Some(refer_to);
                         }
                     } else {
                         warn!(call_id = %call_id, "B2BUA: no stored A-leg INVITE for on_answer");
@@ -18382,6 +18392,15 @@ fn handle_b2bua_response(
                     a_leg_local_addr,
                     state,
                 );
+
+                // A `call.refer()` deferred from @b2bua.on_answer, now that the answer
+                // it depends on is on the wire. Emitting it up where the handler ran
+                // sent it ahead of the 2xx, so the caller saw an in-dialog REFER for a
+                // dialog it had not yet confirmed. Still before the SIPREC block, whose
+                // early returns would otherwise skip it.
+                if let Some(refer_to) = deferred_outbound_refer.take() {
+                    b2bua_send_outbound_refer(state, call_id, /*on_a_leg=*/ true, &refer_to);
+                }
 
                 // SIPREC: start recording if configured for this call
                 if let Some(srs_uri) = li_srs_uri {
