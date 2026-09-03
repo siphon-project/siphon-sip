@@ -74,6 +74,27 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   record of the attempt. That record now carries the code the script answered
   (a 403, a 407) instead of the `response_code: 0` a script-built record had.
 
+- **The B2BUA call store no longer retains its peak-concurrency footprint.**
+  Third and largest instance of the same shape as the transaction map and the
+  timer wheel: `CallActorStore` held `DashMap<String, CallActor>` with the actor
+  **inline**, and `CallActor` is ~2.2 KB (an inline `a_leg: Leg`, the `b_legs`
+  vectors, session-timer and transfer state), making the bucket ~2.3 KB —
+  3.8x the transaction bucket and the biggest retained bucket in siphon.
+  `hashbrown` sizes its bucket array for the peak number of live calls and never
+  shrinks it, so a box that once carried N concurrent calls kept
+  `N/0.875` rounded to a power of two, times 2.3 KB, for the rest of its life,
+  with `call_count()` reading 0 the whole time. Boxed, the bucket is 32 bytes.
+
+  No measurable effect on the SIPp bench, and that is expected: the bench tears
+  every call down immediately, so concurrent `CallActor`s number in the tens and
+  the store never grows a bucket array worth retaining. Four interleaved A/B
+  reps of `MODE=b2bua scripts/scale_test.sh 5000 1000 4` on the reference box
+  came out as noise around zero (deltas -2.4, +3.0, -1.0 MB after discarding a
+  cold first run). The saving is proportional to the **peak concurrent call
+  count**, which this workload does not produce: a node that has once held 50k
+  simultaneous calls retains ~151 MB of bucket array for the rest of its life
+  inline, against ~2 MB boxed.
+
 ### Performance
 - **The dispatcher's timer wheel no longer retains its peak-concurrency
   footprint either.** Same shape as the transaction map fixed alongside it:
