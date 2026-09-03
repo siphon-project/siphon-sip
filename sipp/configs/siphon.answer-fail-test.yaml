@@ -1,0 +1,21 @@
+# siphon config for the answer-time failure SIPp test
+# (scripts/b2bua_answer_fail_test.sh). The B-leg answers and
+# @b2bua.on_answer then fails the call, either by raising or by calling
+# call.terminate(); siphon must fail the caller and BYE the answered B-leg
+# rather than connecting a call with no media path.
+
+listen:
+  udp:
+    - "127.0.0.1:5060"
+
+domain:
+  local:
+    - "127.0.0.1"
+
+advertised_address: "127.0.0.1"
+
+script:
+  path: "scripts/b2bua_answer_fail.py"
+
+log:
+  level: info

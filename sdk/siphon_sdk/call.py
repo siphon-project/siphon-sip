@@ -866,11 +866,24 @@ class Call:
     def terminate(self) -> None:
         """Terminate the call (send BYE to both legs).
 
+        Also honoured from ``@b2bua.on_answer``, where it fails the call rather
+        than connecting it: the B-leg has answered by then but the A-leg has
+        not — its 2xx is only sent once the handler returns — so the caller
+        receives a ``500``, the answered B-leg is ACKed and BYEd, and no
+        answer-time charging is reported. Use it when the handler discovers the
+        call cannot work, typically because the media backend refused the
+        answer. An exception out of the handler has the same effect.
+
         Example::
 
             @b2bua.on_bye
             def call_ended(call, initiator):
                 call.terminate()
+
+            @b2bua.on_answer
+            def answered(call, reply):
+                if not media_ok(reply):
+                    call.terminate()
         """
         self._state = "terminated"
         self._actions.append(Action(kind="terminate"))
