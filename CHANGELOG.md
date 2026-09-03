@@ -6,6 +6,22 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Fixed
+- **Registrar lookups now canonicalise the AoR they are given.** `bindings` and
+  `aliases` are both keyed on the normalised form, but `Registrar`'s own lookup
+  methods took the caller's string as-is, so an AoR that was not already
+  canonical missed a binding that was present — and missed by answering "not
+  registered" rather than erroring, which reads as a UE problem. Scripts were
+  never affected, because the scripting API normalises at its own boundary; the
+  exposed surface was every other entry point, notably the admin HTTP API, which
+  takes the AoR straight off the URL path. `GET /admin/registrations/alice@example.com`
+  (or with a `:5060`, a `;transport=`, or angle brackets) 404'd on a live
+  registration, and `DELETE` on the same path reported nothing to remove.
+
+  This also makes a `tel:` URI in an implicit registration set resolvable:
+  `normalize_aor` maps `tel:+1555…` to `sip:tel:+1555…`, so the alias was
+  stored under a key the raw form never matched.
+
 ### Changed
 - **A binding no longer carries its own copy of two per-process constants.**
   `Contact` stored `instance_id` and `instance_epoch` as an owned `String`
