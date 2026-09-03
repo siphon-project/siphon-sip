@@ -57,6 +57,28 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   `recv` and aborted the run as unexpected. Test-side only — siphon sends
   exactly one BYE and retransmits it correctly per RFC 3261 §17.1.
 
+- **The registrar reserved four contact slots for every AoR that only ever
+  holds one.** `Vec::push` on an empty vec allocates `MIN_NON_ZERO_CAP` slots
+  rather than one, which is 4 for any element of 1 KiB or less. `Contact` is
+  ~480 bytes, so an ordinary single-binding registration asked for 1,920 bytes
+  — rounded up to a 2 KiB allocator size class — to hold 480 bytes of contact,
+  and three quarters of the registrar's largest per-AoR allocation was capacity
+  that the overwhelming majority of AoRs never use. At a million bindings that
+  is over a gigabyte.
+
+  Bindings are now appended through a helper that reserves exactly, so a
+  one-contact AoR occupies one slot. `reserve_exact` is a no-op when there is
+  already room, so a multi-device AoR grows one slot at a time instead of
+  doubling — a fine trade here, since a REGISTER that adds a device is rare
+  next to one that refreshes an existing binding, and a refresh replaces in
+  place without reallocating at all.
+
+  Two paths that build a binding list wholesale were right-sized the same way:
+  restoring from a Redis/Postgres snapshot at boot (previously grown from empty,
+  one push at a time, which on a restart carrying a large binding set is the
+  process's steady state rather than a transient) and the RFC 5626 flow-teardown
+  partition, which sized for "nothing removed" and kept the freed slots.
+
 ## [1.8.0] — 2026-09-02
 
 _Codename: kees._

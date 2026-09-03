@@ -186,6 +186,27 @@ pub struct Contact {
     pub kind: ContactKind,
 }
 
+/// Append a binding without letting `Vec` round the capacity up to four.
+///
+/// `Vec::push` on an empty vec allocates `MIN_NON_ZERO_CAP` slots, which is 4
+/// for any element of 1 KiB or less. `Contact` is ~480 bytes, so the ordinary
+/// one-binding AoR — which is nearly every AoR — reserved ~1.9 KB (rounded up
+/// to a 2 KiB allocator size class) to hold 480 bytes of contact. Three
+/// quarters of the registrar's largest allocation was capacity that the vast
+/// majority of AoRs never use, and at a million bindings that is well over a
+/// gigabyte.
+///
+/// `reserve_exact` is a no-op whenever there is already room, so the cost is
+/// paid only when the vec is actually full: a multi-device AoR grows one slot
+/// at a time instead of doubling. That trade is fine here — a REGISTER that
+/// adds a device is rare next to one that refreshes an existing binding (which
+/// replaces in place and never reallocates at all), and `max_contacts` bounds
+/// the copying.
+fn push_binding(contacts: &mut Vec<Contact>, contact: Contact) {
+    contacts.reserve_exact(1);
+    contacts.push(contact);
+}
+
 /// Order routable bindings the way a terminating request should try them:
 /// highest q first (RFC 3261 §20.10 — the caller's declared preference), and
 /// within one q value the most recently registered binding first.
@@ -833,7 +854,7 @@ impl Registrar {
                     max: self.config.max_contacts,
                 });
             }
-            contacts.push(contact);
+            push_binding(contacts, contact);
         }
 
         // Sort by q-value descending
@@ -1380,7 +1401,7 @@ impl Registrar {
         } else {
             // No max_contacts cap for AS records — iFC chains can ramp
             // up legitimate AS counts.  Operator can enforce upstream.
-            contacts.push(contact);
+            push_binding(contacts, contact);
         }
 
         let stored: Vec<_> = contacts
@@ -1714,6 +1735,10 @@ impl Registrar {
                     }
                 }
                 changed = kept.len() < before;
+                // Sized for the worst case (nothing removed); hand back only
+                // what survived, so a teardown that drops bindings does not
+                // leave the freed slots reserved for the lifetime of the AoR.
+                kept.shrink_to_fit();
                 *entry.value_mut() = kept;
                 // Cascade-clear orphaned AS records once no UE binding survives.
                 let any_ue_left = entry
@@ -1892,7 +1917,7 @@ impl Registrar {
         {
             *existing = contact;
         } else {
-            contacts.push(contact);
+            push_binding(contacts, contact);
         }
     }
 
@@ -2615,6 +2640,100 @@ mod tests {
         // The new connection's failure does.
         assert_eq!(registrar.unregister_flow(8), 1);
         assert!(!registrar.is_registered("sip:a@example.com"));
+    }
+
+    /// A one-binding AoR — nearly every AoR — must not reserve room for four.
+    ///
+    /// `Vec::push` on an empty vec jumps straight to capacity 4 for any element
+    /// of 1 KiB or less, and `Contact` is ~480 bytes, so the ordinary
+    /// registration used to reserve ~1.9 KB (a 2 KiB allocator size class) to
+    /// hold one contact. Asserting the exact capacity rather than an upper
+    /// bound is deliberate: the whole point is that nothing is reserved
+    /// speculatively.
+    #[test]
+    fn a_single_binding_reserves_exactly_one_slot() {
+        let registrar = Registrar::default();
+        registrar
+            .save(
+                "sip:alice@example.com",
+                contact_uri("alice", "10.0.0.1"),
+                3600,
+                1.0,
+                "call-1".into(),
+                1,
+            )
+            .unwrap();
+
+        let entry = registrar
+            .bindings
+            .get("sip:alice@example.com")
+            .expect("binding saved");
+        assert_eq!(entry.value().len(), 1);
+        assert_eq!(
+            entry.value().capacity(),
+            1,
+            "a single binding reserved {} slots of {} bytes each",
+            entry.value().capacity(),
+            std::mem::size_of::<Contact>()
+        );
+    }
+
+    /// Right-sizing must not cost a multi-device AoR any bindings: exact growth
+    /// is still growth.
+    #[test]
+    fn additional_bindings_still_grow_the_vec() {
+        let registrar = Registrar::default();
+        for (index, host) in ["10.0.0.1", "10.0.0.2", "10.0.0.3"].iter().enumerate() {
+            registrar
+                .save(
+                    "sip:alice@example.com",
+                    contact_uri("alice", host),
+                    3600,
+                    1.0,
+                    format!("call-{index}"),
+                    index as u32 + 1,
+                )
+                .unwrap();
+        }
+
+        let contacts = registrar.lookup("sip:alice@example.com");
+        assert_eq!(contacts.len(), 3, "all three devices stay registered");
+
+        let entry = registrar
+            .bindings
+            .get("sip:alice@example.com")
+            .expect("binding saved");
+        assert_eq!(
+            entry.value().capacity(),
+            3,
+            "three bindings should occupy three slots, not a doubled four"
+        );
+    }
+
+    /// A refresh replaces in place, so it must not reallocate — the capacity
+    /// after re-REGISTERing the same contact is still one.
+    #[test]
+    fn a_refresh_does_not_grow_the_binding_vec() {
+        let registrar = Registrar::default();
+        for cseq in 1..=5 {
+            registrar
+                .save(
+                    "sip:alice@example.com",
+                    contact_uri("alice", "10.0.0.1"),
+                    3600,
+                    1.0,
+                    "call-1".into(),
+                    cseq,
+                )
+                .unwrap();
+        }
+
+        let entry = registrar
+            .bindings
+            .get("sip:alice@example.com")
+            .expect("binding saved");
+        assert_eq!(entry.value().len(), 1, "a refresh replaces, never appends");
+        assert_eq!(entry.value().capacity(), 1);
     }
 
     #[test]
