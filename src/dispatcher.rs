@@ -2344,7 +2344,12 @@ const ORPHAN_CALL_TTL: std::time::Duration = std::time::Duration::from_secs(24 *
 async fn sweep_stale_entries(state: &DispatcherState) {
     let now = std::time::Instant::now();
     let ttl = state.transaction_timeout;
-    let expired_sessions = state.session_store.sweep_stale(ttl) as u64;
+    // Timer I (T4) is the ACK-absorption window (RFC 3261 §17.2.1), which is
+    // all a dialog owes once its 2xx ACK has been routed.
+    let expired_sessions = state
+        .session_store
+        .sweep_stale_with_ack_grace(ttl, crate::transaction::timer::DEFAULT_T4)
+        as u64;
 
     // Expire UAC pending requests whose response never arrived. Callers
     // (NAT keepalive, gateway health probe, proxy.send_request) apply a short
@@ -4027,6 +4032,16 @@ fn handle_request(
                 let from_tag = message.typed_from().ok().flatten().and_then(|na| na.tag);
                 if let (Some(cid), Some(ftag)) = (call_id, from_tag.as_deref()) {
                     if let Some(session_arc) = state.session_store.get_by_dialog_key(cid, ftag) {
+                        // Stamp before forwarding: the entry existed only to
+                        // route this ACK, and what is still owed afterwards is
+                        // absorbing a *retransmitted* ACK (the UAS sends one per
+                        // retransmitted 2xx), which Timer I bounds. Retiring on
+                        // that window instead of 64*T1 is what stops a proxy
+                        // pinning a whole `original_request` per answered call.
+                        // Stamped here rather than after the call because
+                        // `handle_ack_via_session` consumes `message`, which
+                        // `cid` borrows from; the ACK is routed either way.
+                        ProxySessionStore::mark_dialog_acked(&session_arc);
                         handle_ack_via_session(inbound, message, session_arc, state);
                         return;
                     }

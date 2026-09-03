@@ -6,6 +6,35 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
 ## [Unreleased]
 
+### Performance
+- **A proxy no longer pins a whole INVITE per answered call for the full
+  transaction timeout.** The `by_dialog_key` entry exists for one purpose:
+  routing the end-to-end 2xx ACK, which is a new request and so does not match
+  the INVITE server transaction (RFC 3261 §13.2.2.4). It was aged only by
+  64*T1 (32 s) from creation, so every *answered* call held its
+  `ProxySession` — including a full cloned `original_request` — for 32 s after
+  the call had otherwise finished. At 10k cps that is ~320k pinned INVITEs at
+  steady state, and it is the bulk of why a proxy row outweighs the equivalent
+  B2BUA row, which drops its call state at teardown.
+
+  Once that ACK has been routed the only thing still owed is absorbing a
+  *retransmitted* ACK, which the UAS sends in response to a retransmitted 2xx —
+  bounded by Timer I (T4, 5 s), not by the transaction timeout. Dialogs that
+  have seen their ACK now retire on that shorter window; dialogs still waiting
+  for one keep the full timeout unchanged, so a late ACK is never left
+  unroutable.
+
+  Measured on the reference box, `scripts/scale_test.sh 1200000 10000 8` (120 s
+  of sustained load, long enough for both arms to reach steady state), two
+  interleaved reps on jemalloc live bytes:
+
+  | | live bytes | peak CPS | peak CPU |
+  |---|---|---|---|
+  | before | 4147 / 4165 MB | 9952 / 9960 | 541 / 565 % |
+  | after | **2600 / 2628 MB** | 9928 / 9944 | 550 / 553 % |
+
+  **-1.54 GB (-37 %)**, with CPU a wash and CPS at parity.
+
 ### Changed
 - **`cdr.write(request|call, extra=…)` now attaches to the auto-emitted CDR
   instead of writing a second record.** With `cdr.auto_emit: true`, siphon

@@ -97,6 +97,22 @@ pub struct ProxySession {
     pub record_routed: bool,
     /// When this session was created (for TTL-based cleanup).
     pub created_at: Instant,
+    /// When the end-to-end 2xx ACK was routed through this session, if it has
+    /// been.
+    ///
+    /// The `by_dialog_key` entry exists for exactly one purpose: routing that
+    /// ACK (RFC 3261 §13.2.2.4 — a 2xx ACK is a new request, so it does not
+    /// match the INVITE server transaction). Once it has been routed, the only
+    /// thing still owed is absorbing a *retransmitted* ACK, which the UAS sends
+    /// in response to a retransmitted 2xx — bounded by Timer I (T4, 5 s), not by
+    /// the full transaction timeout.
+    ///
+    /// Ageing post-ACK entries by that shorter window rather than 64*T1 is what
+    /// keeps a proxy from pinning one whole `original_request` per *answered*
+    /// call for 32 s. At 10k cps that is 320k pinned INVITEs at steady state,
+    /// ~1.6 KB each — the bulk of why a proxy row outweighs the equivalent
+    /// B2BUA row, which drops its call state at teardown.
+    pub acked_at: Option<Instant>,
     /// Per-relay on_reply Python callback (called with `(request, reply)`).
     pub on_reply_callback: Option<Py<PyAny>>,
     /// Per-relay on_failure Python callback (called with `(request, code, reason)`).
@@ -148,6 +164,7 @@ impl ProxySession {
             original_request,
             record_routed,
             created_at: Instant::now(),
+            acked_at: None,
             on_reply_callback: None,
             on_failure_callback: None,
             final_response_sent: false,
@@ -526,8 +543,42 @@ impl ProxySessionStore {
         true
     }
 
+    /// Mark that the end-to-end 2xx ACK has been routed for this dialog, so the
+    /// sweep can retire the `by_dialog_key` entry on the short Timer I window
+    /// instead of the full transaction timeout.
+    ///
+    /// Takes the session the caller already resolved rather than re-keying the
+    /// map: the ACK path has just done that lookup, and repeating it costs a
+    /// hash plus a shard lock on every answered call.
+    ///
+    /// Idempotent: a retransmitted ACK keeps the first stamp, so the grace is
+    /// measured from the first ACK rather than being extended by each repeat.
+    pub fn mark_dialog_acked(session: &Arc<RwLock<ProxySession>>) {
+        if let Ok(mut guard) = session.write() {
+            if guard.acked_at.is_none() {
+                guard.acked_at = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Sweep sessions older than `ttl`, returning the number removed.
+    ///
+    /// `ack_grace` is the shorter window applied to `by_dialog_key` entries
+    /// whose 2xx ACK has already been routed — see [`ProxySession::acked_at`].
+    pub fn sweep_stale_with_ack_grace(
+        &self,
+        ttl: std::time::Duration,
+        ack_grace: std::time::Duration,
+    ) -> usize {
+        self.sweep_inner(ttl, ack_grace)
+    }
+
     /// Sweep sessions older than `ttl`, returning the number removed.
     pub fn sweep_stale(&self, ttl: std::time::Duration) -> usize {
+        self.sweep_inner(ttl, ttl)
+    }
+
+    fn sweep_inner(&self, ttl: std::time::Duration, ack_grace: std::time::Duration) -> usize {
         let now = Instant::now();
         let mut stale_server_keys = Vec::new();
 
@@ -565,7 +616,14 @@ impl ProxySessionStore {
         let mut stale_dialog_keys = Vec::new();
         for entry in self.by_dialog_key.iter() {
             if let Ok(session) = entry.value().read() {
-                if now.duration_since(session.created_at) > ttl {
+                // A dialog whose ACK has been routed only owes the Timer I
+                // absorption window; one still waiting for it keeps the full
+                // transaction timeout.
+                let (since, limit) = match session.acked_at {
+                    Some(acked) => (acked, ack_grace),
+                    None => (session.created_at, ttl),
+                };
+                if now.duration_since(since) > limit {
                     stale_dialog_keys.push(entry.key().clone());
                 }
             }
@@ -975,6 +1033,89 @@ mod tests {
         assert_eq!(swept, 1);
         assert_eq!(store.session_count(), 0);
         assert_eq!(store.client_key_count(), 0);
+    }
+
+    /// Once the 2xx ACK has been routed, the dialog entry retires on the short
+    /// Timer I window instead of the full transaction timeout.
+    ///
+    /// This is the whole point of the change: the entry exists only to route
+    /// that ACK, so holding a full `original_request` for 64*T1 after it has
+    /// been routed pins one INVITE per *answered* call for 32 s — at 10k cps,
+    /// 320k of them at steady state.
+    #[test]
+    fn an_acked_dialog_retires_on_the_timer_i_window() {
+        let store = ProxySessionStore::new();
+        store.insert(make_session());
+        assert_eq!(store.dialog_key_count(), 1);
+
+        let sess = store
+            .get_by_dialog_key("session-test", "abc")
+            .expect("dialog entry present");
+        ProxySessionStore::mark_dialog_acked(&sess);
+
+        // Full transaction timeout has NOT elapsed, but the ACK grace has.
+        let swept = store.sweep_stale_with_ack_grace(
+            std::time::Duration::from_secs(32),
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(
+            store.dialog_key_count(),
+            0,
+            "an acked dialog should retire on the ack grace, not the full ttl"
+        );
+        let _ = swept;
+    }
+
+    /// A dialog still waiting for its ACK keeps the full transaction timeout.
+    ///
+    /// The guard that matters: shortening the window must not retire an entry
+    /// whose ACK has not arrived, or the 2xx ACK becomes unroutable and the
+    /// call is left hanging at the UAS.
+    #[test]
+    fn an_unacked_dialog_keeps_the_full_timeout() {
+        let store = ProxySessionStore::new();
+        store.insert(make_session());
+
+        // Zero ack-grace, but no ACK seen — the full ttl still governs.
+        let swept = store.sweep_stale_with_ack_grace(
+            std::time::Duration::from_secs(3600),
+            std::time::Duration::ZERO,
+        );
+        assert_eq!(swept, 0);
+        assert_eq!(
+            store.dialog_key_count(),
+            1,
+            "a dialog with no ACK yet must survive the ack grace"
+        );
+    }
+
+    /// A retransmitted ACK must not extend the grace indefinitely.
+    #[test]
+    fn a_retransmitted_ack_does_not_extend_the_grace() {
+        let store = ProxySessionStore::new();
+        store.insert(make_session());
+
+        let sess = store
+            .get_by_dialog_key("session-test", "abc")
+            .expect("dialog entry present");
+        ProxySessionStore::mark_dialog_acked(&sess);
+        let first = store
+            .get_by_dialog_key("session-test", "abc")
+            .and_then(|s| s.read().ok().map(|g| g.acked_at));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let sess = store
+            .get_by_dialog_key("session-test", "abc")
+            .expect("dialog entry present");
+        ProxySessionStore::mark_dialog_acked(&sess);
+        let second = store
+            .get_by_dialog_key("session-test", "abc")
+            .and_then(|s| s.read().ok().map(|g| g.acked_at));
+
+        assert_eq!(
+            first, second,
+            "the stamp must stay at the first ACK, so repeats cannot hold the \
+             entry open forever"
+        );
     }
 
     #[test]
