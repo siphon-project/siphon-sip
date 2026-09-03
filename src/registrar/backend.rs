@@ -1410,12 +1410,18 @@ pub async fn restore_from_backend<B: RegistrarBackend>(
 
     for aor in &aors {
         let stored = backend.load(aor).await?;
-        let mut contacts_for_aor = Vec::new();
+        // Sized from the snapshot, then trimmed to what survived: an expired
+        // `StoredContact` decodes to `None` and is dropped. Growing from empty
+        // instead would round the common single-binding AoR up to four slots
+        // (see `push_binding`), which on a restart carrying a large binding
+        // set is the process's steady state, not a transient.
+        let mut contacts_for_aor = Vec::with_capacity(stored.len());
         for sc in &stored {
             if let Some(contact) = sc.to_contact() {
                 contacts_for_aor.push(contact);
             }
         }
+        contacts_for_aor.shrink_to_fit();
         if !contacts_for_aor.is_empty() {
             // Sort by q-value descending (same as Registrar::save)
             contacts_for_aor
@@ -1960,6 +1966,51 @@ mod tests {
         assert!(registrar.is_registered("sip:alice@example.com"));
         assert!(registrar.is_registered("sip:bob@example.com"));
         assert_eq!(registrar.lookup("sip:bob@example.com").len(), 2);
+    }
+
+    /// A restart carrying a large binding set must not re-create the
+    /// over-allocation `push_binding` exists to avoid: a restored one-binding
+    /// AoR gets one slot, and an AoR whose snapshot held an expired contact is
+    /// trimmed to what actually survived rather than keeping the dead slot
+    /// reserved for the life of the process.
+    #[tokio::test]
+    async fn restored_bindings_are_not_over_allocated() {
+        let now_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let backend = MemoryBackend::new();
+        backend
+            .save("sip:alice@example.com", &[sample_stored_contact()])
+            .await
+            .unwrap();
+
+        // Two stored, one already expired: the survivor must not keep the
+        // slot the dead one was sized for.
+        let mut expired = sample_stored_contact();
+        expired.uri = "sip:bob@10.0.0.9".to_string();
+        expired.expires_at = Some(now_epoch.saturating_sub(60));
+        let mut live = sample_stored_contact();
+        live.uri = "sip:bob@10.0.0.2".to_string();
+        backend
+            .save("sip:bob@example.com", &[expired, live])
+            .await
+            .unwrap();
+
+        let registrar = Registrar::default();
+        restore_from_backend(&backend, &registrar).await.unwrap();
+
+        for aor in ["sip:alice@example.com", "sip:bob@example.com"] {
+            let entry = registrar.bindings.get(aor).expect("binding restored");
+            assert_eq!(entry.value().len(), 1, "{aor} restored one live contact");
+            assert_eq!(
+                entry.value().capacity(),
+                1,
+                "{aor} reserved {} slots for one contact",
+                entry.value().capacity()
+            );
+        }
     }
 
     #[tokio::test]
