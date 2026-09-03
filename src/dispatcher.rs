@@ -118,7 +118,13 @@ struct DispatcherState {
     /// Transaction state machine manager.
     transaction_manager: Arc<TransactionManager>,
     /// Timer wheel — keyed by a unique timer ID string.
-    timer_wheel: Arc<DashMap<String, TimerEntry>>,
+    /// Boxed: `hashbrown` sizes its bucket array for peak concurrency and never
+    /// shrinks it, so an inline 176-byte `TimerEntry` meant a 200-byte bucket
+    /// retained for the life of the process at the busiest moment the box ever
+    /// saw. There is roughly one entry per live transaction timer, so the count
+    /// tracks `rate x Timer J` the same way the transaction map did. Boxed the
+    /// bucket is 32 bytes.
+    timer_wheel: Arc<DashMap<String, Box<TimerEntry>>>,
     /// RFC 3261 §17.1 retransmission schedules for siphon-originated B2BUA
     /// requests. The proxy datapath gets Timer A / Timer E from the client
     /// transactions it registers; the B2BUA registers none (it owns its legs
@@ -2085,7 +2091,9 @@ fn fire_expired_timers(state: &DispatcherState) {
 
     state.timer_wheel.retain(|_id, entry| {
         if now >= entry.fires_at {
-            fired.push(entry.clone());
+            // Deref out of the box: the wheel owns boxes, the fired list is
+            // consumed by value below.
+            fired.push((**entry).clone());
             false // remove from wheel
         } else {
             true
@@ -2257,7 +2265,7 @@ fn process_timer_actions_with_followups(
                 let timer_id = format!("{}:{:?}", key, name);
                 state.timer_wheel.insert(
                     timer_id,
-                    TimerEntry {
+                    Box::new(TimerEntry {
                         key: key.clone(),
                         name: *name,
                         fires_at: std::time::Instant::now() + *duration,
@@ -2265,7 +2273,7 @@ fn process_timer_actions_with_followups(
                         transport,
                         connection_id,
                         source_local_addr,
-                    },
+                    }),
                 );
             }
             Action::CancelTimer(name) => {
@@ -4368,7 +4376,7 @@ fn handle_request(
                     let timer_id = format!("{}:{:?}", key, name);
                     state.timer_wheel.insert(
                         timer_id,
-                        TimerEntry {
+                        Box::new(TimerEntry {
                             key: key.clone(),
                             name: *name,
                             fires_at: std::time::Instant::now() + *duration,
@@ -4379,7 +4387,7 @@ fn handle_request(
                             // Retransmit cached responses on the same SA's
                             // local endpoint (TS 33.203 §7.4).
                             source_local_addr: Some(inbound.local_addr),
-                        },
+                        }),
                     );
                 }
             }
@@ -5397,7 +5405,7 @@ fn relay_request(
                     let timer_id = format!("{}:{:?}", client_key, name);
                     state.timer_wheel.insert(
                         timer_id,
-                        TimerEntry {
+                        Box::new(TimerEntry {
                             key: client_key.clone(),
                             name: *name,
                             fires_at: std::time::Instant::now() + *duration,
@@ -5405,7 +5413,7 @@ fn relay_request(
                             transport: Some(outbound_transport),
                             connection_id: Some(placeholder_connection_id),
                             source_local_addr: retransmit_source,
-                        },
+                        }),
                     );
                 }
             }
@@ -5960,7 +5968,7 @@ fn relay_fork_branch(
                     let timer_id = format!("{}:{:?}", client_key, name);
                     state.timer_wheel.insert(
                         timer_id,
-                        TimerEntry {
+                        Box::new(TimerEntry {
                             key: client_key.clone(),
                             name: *name,
                             fires_at: std::time::Instant::now() + *duration,
@@ -5968,7 +5976,7 @@ fn relay_fork_branch(
                             transport: Some(outbound_transport),
                             connection_id: Some(placeholder_connection_id),
                             source_local_addr: retransmit_source,
-                        },
+                        }),
                     );
                 }
             }
@@ -6951,7 +6959,7 @@ fn handle_response(
                                 let timer_id = format!("{}:{:?}", key, name);
                                 state.timer_wheel.insert(
                                     timer_id,
-                                    TimerEntry {
+                                    Box::new(TimerEntry {
                                         key: key.clone(),
                                         name: *name,
                                         fires_at: std::time::Instant::now() + *duration,
@@ -6959,7 +6967,7 @@ fn handle_response(
                                         transport: None,
                                         connection_id: None,
                                         source_local_addr: None,
-                                    },
+                                    }),
                                 );
                             }
                             Action::ProtocolError(message) => {
@@ -27893,6 +27901,32 @@ fn handle_srs_bye(
 
 #[cfg(test)]
 mod tests {
+    /// The timer wheel stores a *pointer* to the entry, not the entry.
+    ///
+    /// Same shape as the transaction map: `hashbrown` sizes its bucket array
+    /// for peak concurrency and never shrinks it, and the wheel holds roughly
+    /// one entry per live transaction timer, so the count tracks
+    /// `rate x Timer J` too. Inline, a 176-byte `TimerEntry` made a 200-byte
+    /// bucket that the process kept at its busiest-ever moment for the rest of
+    /// its life.
+    #[test]
+    fn the_timer_wheel_stores_a_pointer_not_the_entry() {
+        let bucket = std::mem::size_of::<(String, Box<super::TimerEntry>)>();
+        let key_only = std::mem::size_of::<String>();
+        assert!(
+            bucket <= key_only + 16,
+            "wheel bucket is {bucket} B against a {key_only} B key — the entry is \
+             being stored inline again, and the table will retain it at peak \
+             concurrency forever"
+        );
+        let payload = std::mem::size_of::<super::TimerEntry>();
+        assert!(
+            payload >= 64,
+            "TimerEntry is down to {payload} B — re-check whether boxing still earns \
+             its indirection"
+        );
+    }
+
     use super::*;
     use crate::sip::builder::SipMessageBuilder;
     use crate::sip::message::Method;
