@@ -145,6 +145,17 @@ A-leg Call-ID that matched the offer (see [the SBC recipe](sbc.md)).
     inactivity timeout. Handle every teardown path — `on_bye`, `on_failure`,
     `on_cancel` (proxy: `@proxy.on_cancel`) — or media lingers.
 
+!!! note "A failed `answer` in `@b2bua.on_answer` fails the call"
+    If `rtpengine.answer()` raises there, siphon does not connect the call: the
+    caller gets a `500`, the answered B-leg is ACKed and BYEd, `on_failure`
+    fires, and no answer-time charging is reported. That is deliberate — the
+    B-leg has answered but the A-leg has not yet, so this is the last point at
+    which a call with no media path can still be stopped rather than billed.
+    Catch the exception yourself only if you can actually recover; swallowing it
+    to keep the call up gives you a connected call that carries no audio in
+    either direction. `call.terminate()` from the same handler does the same
+    thing explicitly.
+
 ## Built-in profiles
 
 | Profile | Interworking |

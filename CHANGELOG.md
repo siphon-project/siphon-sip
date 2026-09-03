@@ -47,6 +47,40 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   107 MB to 30 MB.
 
 ### Fixed
+- **A media failure at answer no longer connects the call and starts charging.**
+  An exception out of `@b2bua.on_answer` was logged and then ignored: the A-leg
+  2xx went out a millisecond later, the ACK followed, and the charging clock
+  started on a call that had no media path in either direction and never could
+  have had one. That handler is where the media backend is driven, so an engine
+  that refuses the answer — a codec it will not bridge, a pipeline it cannot
+  build — surfaces exactly there, and it surfaces *before* the caller is
+  answered. Nothing treated it as fatal, so the call connected, billed for as
+  long as the far end kept it, and read as answered in every record.
+
+  A raise from `@b2bua.on_answer` is now a decision to fail the call. The caller
+  receives `500`; the answered B-leg is ACKed (RFC 3261 §13.2.2.4, which stops
+  its 200 retransmitting) and then BYEd (§15); `@b2bua.on_failure` fires so a
+  script's own per-call teardown still runs; the media session is released; and
+  any Ro reservation `call.ro_authorize()` opened is closed. The answer-time Rf
+  `ACR-START` and Ro `CCR-UPDATE` now follow that gate instead of preceding it,
+  so a call siphon is about to fail is never reported as answered in the first
+  place.
+
+  **Behaviour change.** A handler that raises used to leave the call connected;
+  it now fails it. A script doing work in `on_answer` that is allowed to throw
+  must catch its own exceptions. Note also that `@b2bua.on_failure` can now fire
+  for a call whose B-leg *did* answer and has already been BYEd, so a handler
+  must not assume there was never a B-leg.
+
+- **`call.terminate()` now works from `@b2bua.on_answer`.** The deferred action a
+  handler left behind was read back only for `call.refer()`; everything else was
+  discarded on the grounds that the call is already answered. That is true of the
+  B-leg and false of the A-leg, whose 2xx is only sent afterwards — so terminate
+  was both meaningful there and the one lever a script had to stop a call it had
+  just discovered could not work, and it was the one being dropped. An action
+  that genuinely has no effect once the B-leg has answered is now logged by name
+  rather than discarded silently.
+
 - **Registrar lookups now canonicalise the AoR they are given.** `bindings` and
   `aliases` are both keyed on the normalised form, but `Registrar`'s own lookup
   methods took the caller's string as-is, so an AoR that was not already

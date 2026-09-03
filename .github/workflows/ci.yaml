@@ -1757,6 +1757,40 @@ jobs:
             siphon-rtpproxy-real.log
             rtpproxy-real.log
 
+  # ── A media failure at answer must fail the call, not connect and bill it ──
+  # @b2bua.on_answer is where the media backend is driven, so an answer the
+  # engine refuses surfaces there — and it surfaces BEFORE the A-leg 2xx is
+  # sent. Swallowing it answered the caller anyway and started the charging
+  # clock on a call with no media path in either direction, which then billed
+  # until the far end gave up. Deterministic and needs no capability: the B-leg
+  # answers for real, the handler fails, and both peers assert what they get —
+  # the caller demands a 500 (never a 2xx) and the answered callee demands the
+  # ACK *and* the BYE, so a run that leaves the callee's dialog established
+  # times out rather than passing quietly. Runs the binary natively rather than
+  # through compose because the scenario needs no second downstream.
+  sipp-b2bua-answer-fail:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Python 3.14 (free-threaded)
+        uses: deadsnakes/action@v3.2.0
+        with:
+          python-version: "3.14-dev"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install SIPp
+        run: sudo apt-get update && sudo apt-get install -y sip-tester
+
+      - name: Build siphon
+        run: PYO3_PYTHON=python3.14 cargo build --bin siphon
+
+      - name: A raised handler and call.terminate() must both fail the call
+        run: MODE=both PYO3_PYTHON=python3.14 scripts/b2bua_answer_fail_test.sh
+
   # ── Fuzz testing (nightly) ─────────────────────────────────────────────
   fuzz:
     runs-on: ubuntu-latest

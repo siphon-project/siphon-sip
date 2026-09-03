@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE scenario SYSTEM "sipp.dtd">
+
+<!--
+  Answer-time failure test — the caller (A-leg).
+
+  INVITE -> 100 -> 180 -> 500 -> ACK.
+
+  The B-leg ANSWERS this call (see b2bua_answer_fail_uas.xml) and
+  @b2bua.on_answer then fails, either by raising or by calling
+  call.terminate(). The caller must receive a final failure response and no
+  2xx: a media session that could not be built is found out in that handler,
+  and it is found out BEFORE the A-leg 2xx is sent, so answering the caller
+  anyway produces a connected call with no media path in either direction that
+  bills until the far end gives up.
+
+  Receiving 200 here is the regression this scenario exists to catch.
+-->
+<scenario name="B2BUA answer-time failure UAC">
+
+  <send retrans="500">
+    <![CDATA[
+INVITE sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>
+Call-ID: [call_id]
+CSeq: 1 INVITE
+Contact: <sip:alice@[local_ip]:[local_port];transport=[transport]>
+Max-Forwards: 70
+User-Agent: SIPp/b2bua-answer-fail-test
+Content-Type: application/sdp
+Content-Length: [len]
+
+v=0
+o=alice 53655765 2353687637 IN IP[local_ip_type] [local_ip]
+s=-
+c=IN IP[media_ip_type] [media_ip]
+t=0 0
+m=audio [media_port] RTP/AVP 0 8 101
+a=rtpmap:0 PCMU/8000
+a=rtpmap:8 PCMA/8000
+a=rtpmap:101 telephone-event/8000
+a=fmtp:101 0-15
+]]>
+  </send>
+
+  <recv response="100" optional="true" />
+  <recv response="180" optional="true" />
+
+  <!-- The failure the caller must get instead of the B-leg's answer. -->
+  <recv response="500" rtd="true" />
+
+  <send>
+    <![CDATA[
+ACK sip:bob@[remote_ip]:[remote_port] SIP/2.0
+Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+From: <sip:alice@[local_ip]>;tag=[pid]SIPpTag00[call_number]
+To: <sip:bob@[remote_ip]>[peer_tag_param]
+Call-ID: [call_id]
+CSeq: 1 ACK
+Max-Forwards: 70
+Content-Length: 0
+
+]]>
+  </send>
+
+</scenario>
