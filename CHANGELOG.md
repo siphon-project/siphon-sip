@@ -29,6 +29,35 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
 
   Read-only, no new state, no behaviour change.
 
+- **An LCR failover now leaves a trace, and a record.** A call whose first
+  carrier returned `500` and which then answered on the second showed nothing of
+  it at `log.level: info` — the four lines describing the failover were `debug`,
+  and the only thing kept was `best_error`, a single code that exists to pick
+  what the A-leg gets once every carrier is exhausted. A completed call that
+  burned a carrier on its way recorded that nowhere, so a failing carrier could
+  not be alerted on, trended, or taken to the carrier.
+
+  - Each failed attempt is now recorded against the carrier that was in flight
+    (`carrier_id`, `status`, `elapsed_ms`; a ring timeout as `408`) and reported
+    at `info` along with the advance to the next carrier.
+  - `call.route_attempts` exposes that list to scripts wherever the `Call` is —
+    notably in `@b2bua.on_answer`, so a call that *answered* after failing over
+    can still name what it burned. `call.active_route` is unchanged and still
+    names the winner.
+  - `@b2bua.on_route_failure(call, route, code)` fires once per failed attempt,
+    including the last. It fires for every non-2xx a carrier returns — a
+    definitive `486` as much as a `503` — which is the same set
+    `route_attempts` records, so the two can never disagree; filter on `code`
+    for what you treat as a carrier's fault. Purely a notification: the failover
+    decision is already made and raising in it does not change the call.
+  - With `cdr.auto_emit` on, the attempts are stamped onto the CDR as
+    `lcr_attempts` (a compact JSON array), alongside the winning carrier's
+    existing `cdr_fields`.
+
+  `best_error` is now derived from the attempt list rather than accumulated
+  alongside it, so the code the caller receives and the per-attempt record
+  cannot drift apart. Selection is unchanged (6xx > 5xx > 4xx).
+
 ### Fixed
 - **The INVITE a siphon-terminated transfer triggers now carries the REFER's
   `Referred-By` (RFC 3892 §3).** That INVITE is built from the referrer's own
@@ -52,6 +81,7 @@ the `siphon-sip` crate and the `siphon-sip` Python SDK, driven by the git tag.
   the whole of the damage lands on the target. Covered end to end by a new SIPp
   acceptance scenario (`b2bua-refer-terminate-busy`) that grades all three legs
   and pins both fixes.
+
 
 ## [1.8.1] — 2026-09-04
 
