@@ -544,6 +544,46 @@ impl PyRequest {
         self.transport_name.clone()
     }
 
+    /// Candidate `cdr_sessions` keys for this request's auto-emit CDR.
+    ///
+    /// The dispatcher tracks a proxy call under `<Call-ID>\0<INVITE From-tag>`.
+    /// An in-dialog request from the callee carries that tag as its *To*-tag,
+    /// so both are offered and the first that resolves wins — the same
+    /// caller/callee resolution `CdrProxyStop::finalize` does at teardown.
+    pub fn cdr_session_key_candidates(&self) -> Vec<String> {
+        let message = match self.message.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("lock poisoned in cdr_session_key_candidates, using poisoned guard");
+                poisoned.into_inner()
+            }
+        };
+        let Some(call_id) = message.headers.call_id() else {
+            return Vec::new();
+        };
+        let from_tag = message
+            .headers
+            .from()
+            .and_then(|v| NameAddr::parse(v).ok())
+            .and_then(|na| na.tag);
+        let to_tag = message
+            .headers
+            .to()
+            .and_then(|v| NameAddr::parse(v).ok())
+            .and_then(|na| na.tag);
+
+        let mut keys = Vec::with_capacity(2);
+        if let Some(tag) = &from_tag {
+            keys.push(format!("{call_id}\0{tag}"));
+        }
+        if let Some(tag) = &to_tag {
+            if from_tag.as_deref() != Some(tag.as_str()) {
+                keys.push(format!("{call_id}\0{tag}"));
+            }
+        }
+        keys
+    }
+
     /// Candidate Rf-session storage keys for the CDR auto-stamp lookup.
     ///
     /// Mirrors the keying scheme used by the dispatcher's auto-emit
@@ -1901,6 +1941,50 @@ mod tests {
     fn make_request() -> PyRequest {
         let message = Arc::new(Mutex::new(invite_request_message()));
         PyRequest::new(message, "udp".to_string(), "10.0.0.1".to_string(), 5060)
+    }
+
+    /// The dispatcher keys a proxy call's CDR on the INVITE's From-tag, so
+    /// that key has to be the first thing `cdr.write(request, extra=…)` tries
+    /// — otherwise the script's fields never reach the auto-emitted record.
+    #[test]
+    fn cdr_session_key_is_the_invite_dialog_key() {
+        let request = make_request();
+        assert_eq!(
+            request.cdr_session_key_candidates(),
+            vec!["a84b4c76e66710@pc33\u{0}1928301774".to_string()],
+        );
+    }
+
+    /// An in-dialog request from the callee (a BYE it sent) carries the
+    /// INVITE's From-tag as its To-tag, so both tags are offered.
+    #[test]
+    fn cdr_session_keys_offer_the_to_tag_for_the_callee_direction() {
+        let message = SipMessageBuilder::new()
+            .request(
+                Method::Bye,
+                SipUri::new("atlanta.com".to_string()).with_user("alice".to_string()),
+            )
+            .via("SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bK-bye".to_string())
+            .from("<sip:bob@biloxi.com>;tag=callee-tag".to_string())
+            .to("<sip:alice@atlanta.com>;tag=caller-tag".to_string())
+            .call_id("a84b4c76e66710@pc33".to_string())
+            .cseq("2 BYE".to_string())
+            .content_length(0)
+            .build()
+            .unwrap();
+        let request = PyRequest::new(
+            Arc::new(Mutex::new(message)),
+            "udp".to_string(),
+            "10.0.0.2".to_string(),
+            5060,
+        );
+        assert_eq!(
+            request.cdr_session_key_candidates(),
+            vec![
+                "a84b4c76e66710@pc33\0callee-tag".to_string(),
+                "a84b4c76e66710@pc33\0caller-tag".to_string(),
+            ],
+        );
     }
 
     /// A registered binding with an RFC 3327 Path vector, as `registrar.lookup()`

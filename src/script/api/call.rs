@@ -838,11 +838,25 @@ impl PyCall {
         self.transport_name.clone()
     }
 
+    /// Candidate `cdr_sessions` key for this call's auto-emit CDR.
+    ///
+    /// A B2BUA call is tracked under its internal call UUID (both legs carry
+    /// different Call-IDs and resolve to one record), which is exactly what
+    /// `call.id` exposes.
+    pub fn cdr_session_key_candidates(&self) -> Vec<String> {
+        vec![self.id.clone()]
+    }
+
     /// Candidate Rf-session storage keys for the CDR auto-stamp lookup.
     ///
     /// Mirrors [`PyRequest::cdr_rf_dialog_key_candidates`](super::request::PyRequest)
     /// so a `cdr.write(call)` from a B2BUA handler is annotated with the same
     /// `rf_session_id` / `rf_result_code` the proxy path stamps.
+    ///
+    /// The B2BUA record itself is keyed on the internal call UUID
+    /// (`rf_b2bua_key`), so that is offered first; the dialog-derived
+    /// candidates follow for a call whose Rf record was opened on the proxy
+    /// path (an AS leg, a call that changed mode mid-flight).
     pub fn cdr_rf_dialog_key_candidates(&self) -> Vec<String> {
         let message = match self.message.lock() {
             Ok(guard) => guard,
@@ -869,12 +883,14 @@ impl PyCall {
             .and_then(|v| crate::sip::headers::nameaddr::NameAddr::parse(v).ok())
             .and_then(|na| na.tag);
 
-        crate::diameter::rf_service::rf_lookup_candidates(
+        let mut keys = vec![crate::diameter::rf_service::rf_b2bua_key(&self.id)];
+        keys.extend(crate::diameter::rf_service::rf_lookup_candidates(
             icid.as_deref(),
             call_id.map(|s| s.as_str()),
             from_tag.as_deref(),
             to_tag.as_deref(),
-        )
+        ));
+        keys
     }
 
     /// Whether the script wants to preserve the A-leg Call-ID on the B-leg.
@@ -4134,12 +4150,33 @@ mod tests {
             "udp".to_string(),
         );
         let keys = call.cdr_rf_dialog_key_candidates();
+        // A B2BUA Rf record is keyed on the internal call UUID, not on either
+        // leg's dialog — offering only the dialog keys is why the Rf stamp
+        // never resolved for a B2BUA call.
+        assert_eq!(keys.first().map(String::as_str), Some("b2bua:test-id"));
         // make_invite() has Call-ID "call-test-1" and From-tag "abc"; the
         // dialog-keyed candidate must be present so the Rf auto-stamp can hit.
         assert!(
             keys.iter()
                 .any(|k| k.contains("call-test-1") && k.contains("abc")),
             "expected a dialog key with Call-ID + From-tag, got {keys:?}"
+        );
+    }
+
+    /// A B2BUA call's CDR is tracked under the internal call UUID (one record
+    /// for two dialogs), which is what `cdr.write(call, extra=…)` has to
+    /// resolve to reach it.
+    #[test]
+    fn call_cdr_session_key_is_the_internal_call_id() {
+        let call = PyCall::new(
+            "test-id".to_string(),
+            Arc::new(Mutex::new(make_invite())),
+            "10.0.0.1".to_string(),
+            "udp".to_string(),
+        );
+        assert_eq!(
+            call.cdr_session_key_candidates(),
+            vec!["test-id".to_string()]
         );
     }
 }

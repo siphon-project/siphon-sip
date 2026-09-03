@@ -257,7 +257,10 @@ The carrier that won is on `call.active_route` (a `Route`: `carrier_id`,
 `gateway_group`, `rate`, `currency`), so it flows into all three charging paths:
 
 - **CDR.** Stamp it into the record, as in the `@b2bua.on_answer` handler above:
-  `cdr.write(call, extra={"carrier_id": route.carrier_id, "rate": ...})`.
+  `cdr.write(call, extra={"carrier_id": route.carrier_id, "rate": ...})`. With
+  `cdr.auto_emit` on, that attaches to the record siphon is already keeping for
+  the call — the carrier fields and the call's duration land on one row, not
+  two.
 - **Rf offline.** Stamp the carrier's trunk group onto the offline record with
   `call.set_charging_param("outgoing-trunk-group-id", route.gateway_group)`. The
   Rf ACR auto-emit carries it as `Outgoing-Trunk-Group-Id` (TS 32.260).

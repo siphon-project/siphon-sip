@@ -553,6 +553,16 @@ pub fn rf_dialog_key(call_id: &str, tag: &str, role: RfRole) -> String {
     format!("dialog:{call_id}\0{tag}:{}", role.as_suffix())
 }
 
+/// B2BUA Rf-session storage key, from the internal call UUID.
+///
+/// A B2BUA call is one accounting record covering two dialogs with two
+/// Call-IDs, so it is keyed on the call siphon owns rather than on either
+/// dialog. Lives here so the CDR auto-stamp can offer it as a lookup candidate
+/// alongside the dialog-derived keys.
+pub fn rf_b2bua_key(internal_call_id: &str) -> String {
+    format!("b2bua:{internal_call_id}")
+}
+
 /// Storage keys that should be inserted at ACR-START time for a given
 /// (icid, call_id, from_tag, role) tuple.  Returns either one key
 /// (dialog fallback only when ICID absent) or two keys (ICID primary
@@ -712,6 +722,13 @@ pub fn apply_charging_params(ims: &mut ImsChargingData, params: Vec<(String, Str
 /// `<Call-ID>\0<From-tag>` for proxy mode.  The CDR API tries the
 /// caller's tag first and falls back to the callee's tag for
 /// callee-initiated BYEs.
+/// Whether an Rf-session lookup is installed at all — i.e. whether this
+/// process can ever resolve an accounting record for a dialog. Lets the CDR
+/// path skip building lookup keys on a deployment with no Rf configured.
+pub fn rf_lookup_installed() -> bool {
+    RF_LOOKUP.get().is_some()
+}
+
 pub fn lookup_rf_for_dialog(dialog_key: &str) -> Option<(String, Option<u32>)> {
     RF_LOOKUP.get().and_then(|f| f(dialog_key))
 }

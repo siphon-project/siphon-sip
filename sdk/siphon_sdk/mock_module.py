@@ -4276,19 +4276,71 @@ class MockCdr:
 
         from siphon_sdk.mock_module import get_cdr
         cdrs = get_cdr().records  # list of written CDR dicts
+
+    With ``cdr.auto_emit`` on, the engine does not write a second record: it
+    merges ``extra`` into the record it is already tracking for the call, so the
+    fields are emitted once at teardown alongside the timings and the disconnect
+    side.  Set ``auto_emit = True`` on the mock to test a script against that
+    shape::
+
+        cdr_mock = get_cdr()
+        cdr_mock.auto_emit = True
+        ...                                     # run the handler
+        assert cdr_mock.pending[call.id]["billing_id"] == "B-12345"
+        cdr_mock.finalize(call)                 # stands in for the BYE
+        assert cdr_mock.records[0]["billing_id"] == "B-12345"
     """
 
     def __init__(self) -> None:
         self._enabled: bool = True
         self.records: list[dict] = []
+        # Mirrors `cdr.auto_emit` in siphon.yaml (off by default, as in the
+        # engine): when on, `write()` attaches to the tracked record instead of
+        # queueing one of its own.
+        self.auto_emit: bool = False
+        # Fields attached to a call whose record has not been emitted yet,
+        # keyed the way the engine keys `cdr_sessions`.
+        self.pending: dict[str, dict] = {}
 
     @property
     def enabled(self) -> bool:
         """Whether the CDR system is enabled."""
         return self._enabled
 
+    @staticmethod
+    def session_key(source: "Any") -> str:
+        """The key the engine tracks this call's auto-emit record under.
+
+        A B2BUA call is keyed on its internal call id (one record for two
+        dialogs); a proxy call on ``<Call-ID>\\0<From-tag>``.
+        """
+        if hasattr(source, "id") and hasattr(source, "state"):
+            return str(source.id)
+        from_tag = getattr(source, "from_tag", "") or ""
+        return f"{getattr(source, 'call_id', '')}\0{from_tag}"
+
+    def finalize(self, source: "Any", **fields: "Any") -> "dict | None":
+        """Emit the record tracked for ``source`` — the mock's stand-in for the
+        BYE that ends the call.  Returns the emitted record, or ``None`` when
+        nothing was tracked.
+        """
+        record = self.pending.pop(self.session_key(source), None)
+        if record is None:
+            return None
+        record.update(fields)
+        self.records.append(record)
+        return record
+
     def write(self, source: "Any", extra: "dict[str, str] | None" = None) -> bool:
-        """Write a CDR for the given request or B2BUA call.
+        """Write a CDR for the given request or B2BUA call — or attach the
+        fields to the record siphon is already keeping for it.
+
+        With ``cdr.auto_emit`` on (``auto_emit = True`` on this mock), ``extra``
+        is merged into the tracked record instead of queueing a second one, so
+        the fields are emitted once at teardown on the record that also carries
+        the timings, ``duration_secs``, ``response_code`` and
+        ``disconnect_initiator``.  A standalone record is still written when
+        there is nothing to merge into.
 
         Args:
             source: The SIP ``Request`` (proxy handlers) OR the B2BUA ``Call``
@@ -4297,7 +4349,8 @@ class MockCdr:
             extra: Optional dict of extra fields to include in the CDR.
 
         Returns:
-            True if the CDR was queued successfully.
+            True if the fields reached a CDR — merged into the tracked record,
+            or queued as a record of their own.
 
         Raises:
             TypeError: if ``source`` is neither a ``Request`` nor a ``Call``.
@@ -4339,13 +4392,24 @@ class MockCdr:
             "transport": transport,
         }
         if extra:
-            record.update(extra)
+            record.update({str(k): str(v) for k, v in extra.items()})
+
+        if self.auto_emit:
+            # Attach to the record the call is already accumulating; it is
+            # emitted when the call ends, not here.
+            tracked = self.pending.setdefault(self.session_key(source), record)
+            if tracked is not record and extra:
+                tracked.update({str(k): str(v) for k, v in extra.items()})
+            return True
+
         self.records.append(record)
         return True
 
     def clear(self) -> None:
         """Reset CDR records (test helper)."""
         self.records.clear()
+        self.pending.clear()
+        self.auto_emit = False
         self._enabled = True
 
 

@@ -70,6 +70,44 @@ def test_write_from_call_defaults_transport_to_udp():
     assert cdr.records[-1]["transport"] == "udp"
 
 
+def test_auto_emit_merges_into_the_tracked_record():
+    """With auto_emit on, the fields attach to the record siphon already keeps
+    for the call — one row carrying both the script's fields and the timings,
+    not a billing row beside a duration row."""
+    cdr = get_cdr()
+    cdr.auto_emit = True
+    call = Call(call_id="call-3")
+
+    assert cdr.write(call, extra={"billing_id": "B-3"}) is True
+    assert cdr.records == [], "nothing is emitted until the call ends"
+    assert cdr.pending[call.id]["billing_id"] == "B-3"
+
+    # A second write merges on top rather than adding a record.
+    assert cdr.write(call, extra={"carrier_id": "carrier-a"}) is True
+    assert cdr.records == []
+
+    # The BYE emits the one record.
+    record = cdr.finalize(call, duration_secs=42.0, disconnect_initiator="caller")
+    assert record is not None
+    assert cdr.records == [record]
+    assert record["billing_id"] == "B-3"
+    assert record["carrier_id"] == "carrier-a"
+    assert record["duration_secs"] == 42.0
+    assert record["disconnect_initiator"] == "caller"
+
+
+def test_auto_emit_keys_a_proxy_request_on_the_dialog():
+    cdr = get_cdr()
+    cdr.auto_emit = True
+    request = Request(
+        method="BYE",
+        call_id="cid-9",
+        from_tag="tag-caller",
+    )
+    assert cdr.write(request, extra={"billing_id": "B-9"}) is True
+    assert cdr.pending["cid-9\0tag-caller"]["billing_id"] == "B-9"
+
+
 def test_write_rejects_other_types():
     cdr = get_cdr()
     with pytest.raises(TypeError):
